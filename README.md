@@ -57,6 +57,49 @@ break the build — the lock is load-bearing.
 
 ---
 
+## 3D Factory toolset
+
+Open **3D Factory** from the menu bar to model in the 3D panel beside the 2D canvas. Every tool
+lives in the panel's own toolbar (dropdown menus), and every construction plane keeps the
+**complete** 2D drafting + modify toolset — nothing is reimplemented.
+
+**Modelling**
+- **3D solids** — box, cylinder, and other primitives. Each is movable and scalable via a
+  3-axis gizmo, with a live properties panel (position · dimensions · colour).
+- **Building** — extrude a closed 2D outline into a solid mass at a set height (massing).
+- **Room** — build a complete enclosed room from an outline: **floor slab + perimeter walls +
+  ceiling**, with configurable **room height**, **floor thickness**, and an **open-to-sky**
+  option. Draw a room inside a building and the building is automatically **carved into an
+  annular wall** around it, so the room can be seen into.
+- **Storeys / levels** — stack levels and **duplicate floor** to repeat a plan upward.
+
+**Viewing**
+- **Hide ceilings** — hide room ceilings (and lift a solid building's roof over a room) so you
+  can see inside from any angle while the walls stay solid. Detection is geometric, so it keeps
+  working even when object tags drift.
+- **Plan** — toggle the 2D plan as a reference underlay inside the 3D view.
+- Orbit (middle-drag) · pan (Shift + L) · zoom (scroll) · **Frame** · navigator cube.
+
+**Detailing**
+- **Furniture** — import meshes (**OBJ** and **3DS**) into a per-project library and place
+  instances; each is movable, scalable, rotatable, and recolourable. Stored in the project file
+  for reuse.
+- **Textures / colours** — a colour palette applied per **object** or per **surface** (click an
+  individual face).
+
+**Sketch on any face**
+- Right-click a solid face → **Draw on this face** to sketch on that plane with the full 2D
+  toolset (draw, modify, fillet, …).
+- The 3D object is **projected onto the plane as a faint reference** (its feature edges), and
+  its edges and corners become live **object-snap** targets.
+- Re-picking a face **reopens its existing sketch**, so drawn work persists.
+
+**Persistence** — the whole 3D model (solids, walls, storeys, the furniture library + placed
+instances, per-object and per-surface colours, and hidden-ceiling state) is saved in a
+`<drawing>.simlux.json` sidecar next to the drawing.
+
+---
+
 ## Build
 
 ```bash

@@ -12,3 +12,12 @@ target-docker/
 *.log
 
 .git_commit_msg.txt
+
+# Editor / OS cruft
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+
+# SIMLUX sidecars written next to a drawing during local editing (per-drawing state).
+*.simlux.json
