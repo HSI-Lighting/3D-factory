@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn eval_is_deterministic() {
         let mut m = Model::default();
-        m.push(BoolOp::Union, Plane { kind: PlaneKind::XZ, offset: 0.3 }, Placement::default(), boxf(1.0, 1.0, 1.0));
+        m.push(BoolOp::Union, Plane { kind: PlaneKind::XZ, offset: 0.3, custom: None }, Placement::default(), boxf(1.0, 1.0, 1.0));
         let a = m.eval();
         let b = m.eval();
         assert_eq!(a.positions, b.positions, "same model must yield the same mesh");

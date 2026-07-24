@@ -4258,6 +4258,157 @@ impl CadApp {
         }
     }
 
+    /// Closed loops drawn on the ACTIVE sketch (the live `self.doc`), in the sketch's (u,v).
+    /// Only closed shapes (circles, closed polylines, rectangles) can become a solid; open
+    /// lines are ignored. These feed the extrude / cut tools.
+    fn factory_sketch_loops(&self) -> Vec<Vec<glam::Vec2>> {
+        let mut out = Vec::new();
+        for d in &self.doc.dobjects {
+            for path in cad_solid::geom_outlines(&d.geom) {
+                if path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3 {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    /// EXTRUDE the shapes drawn on the current face into solids that rise `element_height`
+    /// along the face's outward normal. `furniture` only changes the tint/label — the solid
+    /// is a normal movable feature either way; it NEVER cuts the building. Consumes the
+    /// sketch and returns to the model view. Returns how many solids were made.
+    fn factory_extrude_sketch(&mut self, furniture: bool) -> usize {
+        let Some(session) = self.factory.session.as_ref() else { return 0 };
+        let frame = self.factory.model.sketches[session.idx].frame;
+        let loops = self.factory_sketch_loops();
+        if loops.is_empty() {
+            self.factory.status = "draw a CLOSED shape on the face first, then Extrude".into();
+            return 0;
+        }
+        self.snapshot_factory();
+        let h = self.factory.element_height.max(0.02);
+        let plane = cad_solid::Plane::from_basis(frame.origin, frame.u, frame.v);
+        let colour = if furniture { [0.60, 0.62, 0.70] } else { [0.72, 0.66, 0.52] };
+        let mut made = 0;
+        let mut last = None;
+        for pts in loops {
+            if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
+                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 };
+                let id = self.factory.model.push(
+                    cad_solid::BoolOp::Union, plane, placement,
+                    cad_solid::Primitive::Extrusion { profile, h, w, d },
+                );
+                self.factory.feature_color.insert(id, colour);
+                last = Some(id);
+                made += 1;
+            }
+        }
+        if made == 0 {
+            self.undo_stack.pop();
+            self.factory.status = "shapes could not be extruded (degenerate / self-crossing)".into();
+            return 0;
+        }
+        let kind = if furniture { "furniture" } else { "element" };
+        if self.factory.keep_sketch {
+            // Keep the drawing & stay in the sketch; just show the new solid behind it.
+            self.factory.recompute();
+            self.factory.status = format!("{made} {kind} solid(s) extruded — shape kept");
+        } else {
+            self.doc.dobjects.clear(); // consume the drawing — it became a solid
+            self.factory_exit_sketch();
+            if let Some(id) = last {
+                self.factory.selection = vec![id];
+            }
+            self.factory.recompute();
+            self.factory.fit();
+            self.factory.status = format!("{made} {kind} solid(s) extruded {h:.2} m from the face");
+        }
+        made
+    }
+
+    /// CUT the shapes drawn on the current face into the solid that face belongs to. With
+    /// `through`, the cut punches all the way through (a window/door); otherwise it stops at
+    /// `element_height` depth (a recess / niche / blind pocket). The cut is a Difference
+    /// relocated to sit right after the target solid so the group-based eval subtracts it
+    /// from THAT body only. Returns count.
+    fn factory_cut_sketch(&mut self, through: bool) -> usize {
+        let Some(session) = self.factory.session.as_ref() else { return 0 };
+        let frame = self.factory.model.sketches[session.idx].frame;
+        let loops = self.factory_sketch_loops();
+        if loops.is_empty() {
+            self.factory.status = "draw a CLOSED shape on the face first, then Cut".into();
+            return 0;
+        }
+        // The solid to cut: the SMALLEST Union feature whose box contains the face point.
+        let o = frame.origin;
+        let mut target: Option<(usize, f32)> = None;
+        for (i, f) in self.factory.model.features.iter().enumerate() {
+            if f.op != cad_solid::BoolOp::Union {
+                continue;
+            }
+            let (mn, mx) = f.world_aabb();
+            let inside = o.x >= mn.x - 0.1 && o.x <= mx.x + 0.1
+                && o.y >= mn.y - 0.1 && o.y <= mx.y + 0.1
+                && o.z >= mn.z - 0.1 && o.z <= mx.z + 0.1;
+            if inside {
+                let vol = (mx.x - mn.x).max(0.01) * (mx.y - mn.y).max(0.01) * (mx.z - mn.z).max(0.01);
+                if target.map_or(true, |(_, v)| vol < v) {
+                    target = Some((i, vol));
+                }
+            }
+        }
+        let Some((tidx, _)) = target else {
+            self.factory.status = "no solid under this face to cut".into();
+            return 0;
+        };
+        let (mn, mx) = self.factory.model.features[tidx].world_aabb();
+        // Cutter geometry, in the plane's local Z (+Z is the outward face normal, the solid
+        // is at −Z). THROUGH: span the target's diagonal either side so it fully penetrates.
+        // RECESS: from just outside the face (+eps) down to −depth, a blind pocket.
+        const EPS: f32 = 0.01;
+        let (lift, h) = if through {
+            let span = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2) + (mx.z - mn.z).powi(2)).sqrt() + 0.2;
+            (-span, 2.0 * span)
+        } else {
+            let depth = self.factory.element_height.max(0.02);
+            (-depth, depth + EPS)
+        };
+        self.snapshot_factory();
+        let plane = cad_solid::Plane::from_basis(frame.origin, frame.u, frame.v);
+        let mut made = 0;
+        for pts in loops {
+            if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
+                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0 };
+                self.factory.model.push(
+                    cad_solid::BoolOp::Difference, plane, placement,
+                    cad_solid::Primitive::Extrusion { profile, h, w, d },
+                );
+                // Relocate the cut to right after the target so eval cuts THAT body.
+                if let Some(diff) = self.factory.model.features.pop() {
+                    self.factory.model.features.insert(tidx + 1, diff);
+                }
+                made += 1;
+            }
+        }
+        if made == 0 {
+            self.undo_stack.pop();
+            self.factory.status = "shapes could not be cut (degenerate / self-crossing)".into();
+            return 0;
+        }
+        let what = if through { "opening(s) cut through" } else { "recess(es) cut" };
+        if self.factory.keep_sketch {
+            self.factory.recompute();
+            self.factory.status = format!("{made} {what} the solid — shape kept");
+        } else {
+            self.doc.dobjects.clear();
+            self.factory_exit_sketch();
+            self.factory.recompute();
+            self.factory.fit();
+            self.factory.status = format!("{made} {what} the solid");
+        }
+        made
+    }
+
     /// DRAW3D dialog — the controllers for the primitive being created.
     ///
     /// The dialog OWNS its parameters (`factory.draw3d`) and nothing touches the model
@@ -4531,6 +4682,53 @@ impl CadApp {
                                 .small()
                                 .weak(),
                             );
+                            // ROOM ELEMENTS — turn the drawn shape into geometry on this face.
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("height / depth").small().weak());
+                                ui.add(
+                                    egui::DragValue::new(&mut self.factory.element_height)
+                                        .speed(0.05)
+                                        .suffix(" m"),
+                                );
+                                if ui
+                                    .button("⬆ Extrude")
+                                    .on_hover_text("Extrude the drawn closed shape into a solid element on this face")
+                                    .clicked()
+                                {
+                                    self.factory_extrude_sketch(false);
+                                }
+                                if ui
+                                    .button("◳ Cut through")
+                                    .on_hover_text("Cut the drawn shape ALL THE WAY THROUGH the wall/solid (window, door)")
+                                    .clicked()
+                                {
+                                    self.factory_cut_sketch(true);
+                                }
+                                if ui
+                                    .button("◱ Recess")
+                                    .on_hover_text("Cut a blind pocket of the given DEPTH into the solid (niche, reveal) — not through")
+                                    .clicked()
+                                {
+                                    self.factory_cut_sketch(false);
+                                }
+                                if ui
+                                    .button("🪑 As furniture")
+                                    .on_hover_text("Extrude the shape as a free-standing furniture solid — never cuts the building")
+                                    .clicked()
+                                {
+                                    self.factory_extrude_sketch(true);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.factory.keep_sketch, "keep shape")
+                                    .on_hover_text("Keep the drawing after Extrude/Cut so you can act on the SAME outline again (e.g. recess + through)");
+                                ui.label(
+                                    egui::RichText::new("· draw a CLOSED shape, then act on it")
+                                        .small()
+                                        .weak(),
+                                );
+                            });
                         });
                     ui.separator();
                 }
@@ -35289,6 +35487,69 @@ mod factory_sketch_tests {
         app.factory_enter_sketch(f2);
         assert_eq!(app.factory.model.sketches.len(), 1, "no new sketch — the old one reopened");
         assert_eq!(app.doc.dobjects.len(), 1, "the earlier drawing is back on the canvas");
+    }
+
+    /// Draw a closed shape on a face → Extrude makes a solid feature and consumes the sketch.
+    #[test]
+    fn extrude_sketch_makes_a_solid() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let before = app.factory.model.features.len();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 1.0,
+        })));
+        app.factory.element_height = 0.5;
+        let made = app.factory_extrude_sketch(false);
+        assert_eq!(made, 1, "one solid extruded");
+        assert_eq!(app.factory.model.features.len(), before + 1, "a Union feature was added");
+        assert!(app.factory.session.is_none(), "the sketch was consumed and closed");
+    }
+
+    /// Cut subtracts a Difference from the solid the face sits on (window/door/niche).
+    #[test]
+    fn cut_sketch_adds_a_difference_to_the_target_solid() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        // Put the sketch frame at the box centre so the cut resolves the box as its target.
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(c, glam::Vec3::Z));
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 0.3,
+        })));
+        let made = app.factory_cut_sketch(true);
+        assert_eq!(made, 1, "one opening cut");
+        assert!(
+            app.factory.model.features.iter().any(|f| f.op == cad_solid::BoolOp::Difference),
+            "a Difference cutter was added to the model"
+        );
+    }
+
+    /// A RECESS cut (not through) also adds a Difference, and KEEP-shape leaves the sketch
+    /// open with the drawing intact so the same outline can be reused.
+    #[test]
+    fn recess_cut_and_keep_shape_behave() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(c, glam::Vec3::Z));
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 0.3,
+        })));
+        app.factory.element_height = 0.15;
+        app.factory.keep_sketch = true;
+        let made = app.factory_cut_sketch(false); // recess
+        assert_eq!(made, 1, "one recess cut");
+        assert!(app.factory.session.is_some(), "keep-shape leaves the sketch open");
+        assert_eq!(app.doc.dobjects.len(), 1, "the drawing is kept for reuse");
     }
 
     /// A stale selection index from model space must not survive into the sketch.

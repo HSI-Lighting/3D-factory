@@ -75,25 +75,57 @@ impl PlaneKind {
     }
 }
 
-/// A construction / drawing plane: a world plane pushed `offset` along its normal.
-/// (3-point arbitrary planes are S2.)
+/// An arbitrarily-oriented plane: a world origin and its in-plane `(u, v)` axes. Stored as
+/// `[f32; 3]` arrays (not `glam::Vec3`) so a `Model` serialises — glam is built here without
+/// its `serde` feature. This is what lets a sketch on ANY picked face (a tilted or curved
+/// wall) become an extrusion that rises along that face's real normal.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct CustomBasis {
+    pub origin: [f32; 3],
+    pub u: [f32; 3],
+    pub v: [f32; 3],
+}
+
+/// A construction / drawing plane: a world plane pushed `offset` along its normal, OR — when
+/// `custom` is set — an arbitrarily-oriented plane taken straight from a picked face's frame.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Plane {
     pub kind: PlaneKind,
     pub offset: f32,
+    /// When set, OVERRIDES `kind`/`offset` with an arbitrary basis. `#[serde(default)]` so
+    /// every sidecar written before arbitrary planes existed still loads (as `None`).
+    #[serde(default)]
+    pub custom: Option<CustomBasis>,
 }
 
 impl Default for Plane {
     fn default() -> Self {
-        Self { kind: PlaneKind::XY, offset: 0.0 }
+        Self { kind: PlaneKind::XY, offset: 0.0, custom: None }
     }
 }
 
 impl Plane {
+    /// An arbitrary plane from a face frame: origin + orthonormal in-plane axes. The caller
+    /// must pass a right-handed `(u, v)` (so `u × v` is the outward normal).
+    pub fn from_basis(origin: Vec3, u: Vec3, v: Vec3) -> Self {
+        Self {
+            kind: PlaneKind::XY,
+            offset: 0.0,
+            custom: Some(CustomBasis {
+                origin: origin.to_array(),
+                u: u.normalize_or_zero().to_array(),
+                v: v.normalize_or_zero().to_array(),
+            }),
+        }
+    }
+
     /// The in-plane `(u, v)` axes. The normal is DERIVED as `u × v`, so the frame
     /// `[u | v | n]` is always right-handed (det +1) — csgrs booleans depend on
     /// consistent winding, and a mirrored (det −1) basis would flip every normal.
     pub fn axes(&self) -> (Vec3, Vec3) {
+        if let Some(c) = self.custom {
+            return (Vec3::from_array(c.u), Vec3::from_array(c.v));
+        }
         match self.kind {
             PlaneKind::XY => (Vec3::X, Vec3::Y),
             PlaneKind::XZ => (Vec3::X, Vec3::Z),
@@ -108,6 +140,9 @@ impl Plane {
 
     /// World position of the plane's local origin.
     pub fn origin(&self) -> Vec3 {
+        if let Some(c) = self.custom {
+            return Vec3::from_array(c.origin);
+        }
         self.normal() * self.offset
     }
 
@@ -840,12 +875,36 @@ mod tests {
         assert!(ray_aabb(Vec3::new(5.0, 0.0, -5.0), Vec3::Z, mn, mx).is_none());
     }
 
+    /// An extrusion on a CUSTOM (arbitrary) plane must rise along THAT plane's normal, not
+    /// world +Z — this is what makes "draw on a tilted face → extrude" land on the face.
+    #[test]
+    fn extrusion_on_a_custom_plane_rises_along_its_normal() {
+        // A plane whose normal is +X (u = +Y, v = +Z ⇒ u×v = +X), at the origin.
+        let plane = Plane::from_basis(Vec3::ZERO, Vec3::Y, Vec3::Z);
+        assert!((plane.normal() - Vec3::X).length() < 1e-5, "normal is +X");
+        let mut m = Model::default();
+        let (profile, centre, w, d) = m.add_profile(&[
+            Vec2::new(-0.5, -0.5), Vec2::new(0.5, -0.5),
+            Vec2::new(0.5, 0.5), Vec2::new(-0.5, 0.5),
+        ]).unwrap();
+        m.push(
+            BoolOp::Union, plane,
+            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 },
+            Primitive::Extrusion { profile, h: 3.0, w, d },
+        );
+        let (mn, mx) = m.eval().bounds().expect("has geometry");
+        // Extruded 3 m along +X ⇒ X spans ~0..3; the 1×1 profile stays thin in Y and Z.
+        assert!((mx[0] - mn[0] - 3.0).abs() < 0.05, "extrudes 3 m along the plane normal (+X)");
+        assert!((mx[1] - mn[1] - 1.0).abs() < 0.05 && (mx[2] - mn[2] - 1.0).abs() < 0.05,
+            "the 1×1 profile is preserved in the plane");
+    }
+
     #[test]
     fn world_aabb_follows_placement_and_offset() {
         let f = Feature {
             id: 1,
             op: BoolOp::Union,
-            plane: Plane { kind: PlaneKind::XY, offset: 2.0 },
+            plane: Plane { kind: PlaneKind::XY, offset: 2.0, custom: None },
             placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0 },
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
         };

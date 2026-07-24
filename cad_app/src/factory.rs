@@ -310,6 +310,13 @@ pub struct FactoryState {
     /// what a lighting calculation needs; turn this on only for a court/atrium open above.
     pub room_open_top: bool,
 
+    /// Height (m) a drawn face-sketch is extruded by for Room-elements / Furniture extrude,
+    /// and the depth of a Cut RECESS (a cut that stops short of going all the way through).
+    pub element_height: f32,
+    /// Keep the drawn shape after Extrude / Cut instead of consuming it, so you can extrude
+    /// and cut the SAME outline (e.g. a recessed frame around a hole) without redrawing.
+    pub keep_sketch: bool,
+
     /// Zoom, mirroring the 2D command. `zoom`/`z` arms `RealTime` (drag to dolly) and
     /// shows the choice menu; typing `w` switches to `Window` (a left drag rubber-bands a
     /// box that reframes on release). `zoom_drag`/`zoom_cur` are the live box corners.
@@ -896,6 +903,8 @@ impl Default for FactoryState {
             room_height: 2.7,
             room_floor: 0.2,
             room_open_top: false,
+            element_height: 1.0,
+            keep_sketch: false,
             // One storey at z = 0 — with a single level everything behaves exactly as it
             // did before storeys existed.
             storeys: vec![Storey { name: "Ground".into(), height: 3.0 }],
