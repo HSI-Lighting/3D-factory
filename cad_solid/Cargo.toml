@@ -1,0 +1,30 @@
+[package]
+name = "cad_solid"
+version = "0.1.0"
+edition = "2021"
+description = "SIMLUX free-3D solid modeler — parametric CSG (csgrs) sandbox, wired into the app later"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }   # reuse the 2D geometry + draw constructors + tessellation
+# crates.io csgrs 0.16–0.20 are all unbuildable: they hard-pin `core2 ^0.4`, whose
+# only release (0.4.0) is YANKED. The maintainer's main (→ 0.21.0) fixes it, so pin
+# that commit. Minimal features: `mesh` (BSP Mesh + booleans) + `f64` (the Real
+# scalar; also pulls parry/rapier, unavoidable). No STL/DXF/SVG/image/text IO.
+csgrs = { git = "https://github.com/timschmidt/csgrs", rev = "5e7a37a8803d4e56617734687edc9b98f4ebeed7", default-features = false, features = ["f64", "mesh", "earcut"] }
+# `earcut`: csgrs's `sketch` module compiles unconditionally and its triangulation
+# fns are body-gated on a backend feature (earcut|delaunay). Without one they're
+# empty → type errors. earcut (earcutr) is the light choice; delaunay pulls spade.
+glam     = "0.29"
+nalgebra = "0.34"                        # MUST match csgrs's nalgebra (Matrix4<f64> at the CSG boundary)
+serde    = { version = "1", features = ["derive"] }
+# csgrs (pure-Rust BSP CSG) added via `cargo add` so the version pins correctly.
+
+# The standalone sandbox window is an EXAMPLE, so egui/eframe are dev-deps only —
+# `cad_solid` itself (lib) is UI-agnostic. Mirrors cad_app's eframe feature set.
+[dev-dependencies]
+eframe    = { version = "0.30", default-features = false, features = ["default_fonts", "glow"] }
+egui      = "0.30"
+egui_glow = "0.30"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+eframe = { version = "0.30", default-features = false, features = ["wayland", "x11"] }

@@ -1,0 +1,8 @@
+[package]
+name    = "cad_kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust 2D CAD math kernel — primitives, intersections, parser. No UI dependencies."
+
+[dependencies]
+cad_nurbs = { path = "../cad_nurbs" }

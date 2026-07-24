@@ -1,0 +1,11 @@
+[package]
+name = "cad_light"
+version = "0.1.0"
+edition = "2021"
+description = "Physically-based lighting (lux) engine — IES photometry + ray-traced radiosity over a cad_kernel::Document. UI-agnostic (used by the SIMLUX egui app)."
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+glam = "0.29"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }

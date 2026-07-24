@@ -1,0 +1,485 @@
+<title>Handling the Mesh — simLUX 3D Factory, Steps 1–2</title>
+<style>
+  :root {
+    --bg: #e9ebef; --panel: #ffffff; --panel-2: #f4f6f9;
+    --ink: #1b1f27; --muted: #5b6472; --faint: #8b93a0;
+    --line: #d5dae1; --line-2: #e4e8ee;
+    --accent: #d07d10; --accent-soft: #f6e7cf;
+    --floor: #2f74d0; --wall: #6f7a8b; --ceiling: #c99a2f;
+    --good: #1f8f5f; --good-soft: #dcefe4;
+    --code-bg: #1a1e26; --code-ink: #e5e9f0;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 1020px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101319; --panel: #191d25; --panel-2: #141821;
+      --ink: #e7ebf1; --muted: #9aa4b2; --faint: #6b7482;
+      --line: #29303b; --line-2: #222833;
+      --accent: #f5a623; --accent-soft: #3a2f18;
+      --floor: #5a97e8; --wall: #9aa5b5; --ceiling: #e6bd5c;
+      --good: #43c489; --good-soft: #16281f;
+      --code-bg: #0d1015; --code-ink: #dfe4ec;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #e9ebef; --panel: #ffffff; --panel-2: #f4f6f9;
+    --ink: #1b1f27; --muted: #5b6472; --faint: #8b93a0;
+    --line: #d5dae1; --line-2: #e4e8ee;
+    --accent: #d07d10; --accent-soft: #f6e7cf;
+    --floor: #2f74d0; --wall: #6f7a8b; --ceiling: #c99a2f;
+    --good: #1f8f5f; --good-soft: #dcefe4;
+    --code-bg: #1a1e26; --code-ink: #e5e9f0;
+  }
+  :root[data-theme="dark"] {
+    --bg: #101319; --panel: #191d25; --panel-2: #141821;
+    --ink: #e7ebf1; --muted: #9aa4b2; --faint: #6b7482;
+    --line: #29303b; --line-2: #222833;
+    --accent: #f5a623; --accent-soft: #3a2f18;
+    --floor: #5a97e8; --wall: #9aa5b5; --ceiling: #e6bd5c;
+    --good: #43c489; --good-soft: #16281f;
+    --code-bg: #0d1015; --code-ink: #dfe4ec;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  /* ---- structural type ---- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--accent); font-weight: 600;
+  }
+  h1 {
+    font-family: var(--mono); font-weight: 700; letter-spacing: -.01em;
+    font-size: clamp(30px, 5.2vw, 52px); line-height: 1.05; margin: 14px 0 0;
+    text-wrap: balance;
+  }
+  h2 {
+    font-family: var(--mono); font-weight: 700; font-size: 20px;
+    letter-spacing: .01em; margin: 0;
+  }
+  h3 { font-size: 17px; margin: 0; font-weight: 650; }
+  p { margin: 0; }
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); }
+
+  /* ---- hero ---- */
+  .hero { padding: 68px 0 40px; border-bottom: 1px solid var(--line); }
+  .lede {
+    margin-top: 20px; max-width: 62ch; color: var(--muted);
+    font-size: clamp(16px, 2vw, 18px);
+  }
+  .lede strong { color: var(--ink); font-weight: 650; }
+
+  /* ---- pipeline endpoints ---- */
+  .pipe {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 18px;
+    align-items: stretch; margin-top: 40px;
+  }
+  @media (max-width: 780px) { .pipe { grid-template-columns: 1fr; } }
+  .node {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .node .tag {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--faint); display: flex; gap: 8px; align-items: center;
+  }
+  .node h3 { font-family: var(--mono); font-size: 15px; }
+  .node .sub { color: var(--muted); font-size: 13.5px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+  .fact {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    background: var(--panel-2); border: 1px solid var(--line-2);
+    border-radius: 999px; padding: 3px 9px;
+  }
+  .arrow {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; min-width: 90px; color: var(--accent);
+  }
+  .arrow .count {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .06em;
+    color: var(--accent); font-weight: 700; text-align: center;
+  }
+  .arrow .glyph { font-size: 26px; line-height: 1; }
+  @media (max-width: 780px) { .arrow .glyph { transform: rotate(90deg); } }
+
+  pre {
+    margin: 0; background: var(--code-bg); color: var(--code-ink);
+    border-radius: 9px; padding: 13px 14px; overflow-x: auto;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.55;
+  }
+  pre .k { color: #c792ea; } pre .t { color: #7fd6c2; }
+  pre .f { color: #f5a623; } pre .c { color: #6b7482; }
+  pre .n { color: #82aaff; }
+
+  /* ---- crux band ---- */
+  .crux {
+    margin: 42px 0; padding: 26px; border-radius: 14px;
+    background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    display: grid; grid-template-columns: auto 1fr; gap: 22px; align-items: center;
+  }
+  @media (max-width: 680px) { .crux { grid-template-columns: 1fr; } }
+  .crux .figure { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  canvas#mesh { width: 190px; height: 170px; display: block; }
+  .crux .cap { font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+  .crux .legend { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  .crux .legend span { font-family: var(--mono); font-size: 10.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .crux h2 { color: var(--ink); }
+  .crux p { color: color-mix(in srgb, var(--ink) 82%, var(--muted)); margin-top: 8px; max-width: 56ch; }
+
+  /* ---- phase sections ---- */
+  section.phase { padding: 48px 0 8px; }
+  .phase-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 16px; }
+  .phase-head .rn { font-family: var(--mono); font-size: 13px; color: var(--accent); font-weight: 700; letter-spacing: .04em; }
+  .phase-head .goal { color: var(--muted); font-size: 14px; margin-left: auto; font-family: var(--mono); }
+
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 26px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 18px 16px; display: flex; flex-direction: column; gap: 11px;
+    position: relative; overflow: hidden;
+  }
+  .card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent); opacity: .55; }
+  .card.keystone::before { opacity: 1; width: 4px; }
+  .card .num {
+    font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent);
+    letter-spacing: .05em; display: flex; align-items: center; gap: 9px;
+  }
+  .card .num .ks { font-size: 9.5px; letter-spacing: .12em; color: var(--panel); background: var(--accent); padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+  .card h3 { font-size: 16px; }
+  .card .body { color: var(--muted); font-size: 14px; }
+  .card .body code { color: var(--ink); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; border: 1px solid var(--line-2); }
+  .touch { display: flex; flex-wrap: wrap; gap: 6px; }
+  .touch .chip {
+    font-family: var(--mono); font-size: 11px; color: var(--ink);
+    background: var(--panel-2); border: 1px solid var(--line-2);
+    border-radius: 6px; padding: 3px 8px;
+  }
+  .proof {
+    display: flex; gap: 9px; align-items: flex-start; margin-top: 2px;
+    padding-top: 11px; border-top: 1px dashed var(--line);
+    font-size: 13px; color: color-mix(in srgb, var(--good) 72%, var(--ink));
+  }
+  .proof .lbl { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--good); background: var(--good-soft); padding: 3px 7px; border-radius: 5px; white-space: nowrap; flex-shrink: 0; margin-top: 1px; }
+
+  /* ---- downstream table ---- */
+  .downstream { padding: 52px 0 20px; }
+  .tablewrap { overflow-x: auto; margin-top: 22px; border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 13.5px; }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--line-2); vertical-align: top; }
+  thead th { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); background: var(--panel-2); }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--panel-2); }
+  td .step { font-family: var(--mono); color: var(--ink); font-weight: 600; }
+  td .art { font-family: var(--mono); color: var(--accent); font-size: 12.5px; }
+  td.easy { color: var(--good); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+
+  /* ---- footer ---- */
+  footer { margin: 46px 0 60px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  footer .run {
+    font-family: var(--mono); font-size: 13px; color: var(--ink);
+    background: var(--code-bg); color: var(--code-ink);
+    padding: 12px 14px; border-radius: 8px; margin-top: 14px; overflow-x: auto;
+  }
+  footer .meta { margin-top: 16px; display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--mono); font-size: 11.5px; color: var(--faint); }
+
+  @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">simLUX · 3D Factory · Roadmap steps 1 &amp; 2</div>
+    <h1>Handling the mesh</h1>
+    <p class="lede">
+      Everything DIALux and its peers hand to the light calc is the same thing: a <strong>watertight,
+      per-surface tessellated mesh with reflectance</strong>. The Factory already makes solids — but as a
+      flat, anonymous triangle soup. The whole of Steps&nbsp;1–2 is <strong>one transformation</strong>
+      across a single seam. Get this right and the rest of the roadmap is just <em>consuming</em> it —
+      which is exactly the instinct: <strong>once the mesh is fixed, the other parts fall into place.</strong>
+    </p>
+
+    <div class="pipe">
+      <div class="node">
+        <div class="tag"><span class="sw" style="background:var(--wall)"></span> Source · cad_solid</div>
+        <h3>SolidMesh</h3>
+        <pre><span class="k">pub struct</span> <span class="t">SolidMesh</span> {
+  <span class="k">pub</span> positions: <span class="t">Vec</span>&lt;[<span class="t">f32</span>; <span class="n">3</span>]&gt;, <span class="c">// 3 = 1 tri</span>
+  <span class="k">pub</span> normals:   <span class="t">Vec</span>&lt;[<span class="t">f32</span>; <span class="n">3</span>]&gt;, <span class="c">// per vertex</span>
+}</pre>
+        <div class="sub">Flat triangle soup. Metres, Z-up, f32.</div>
+        <div class="facts">
+          <span class="fact">no material</span>
+          <span class="fact">no grouping</span>
+          <span class="fact">shared edges duplicated</span>
+        </div>
+      </div>
+
+      <div class="arrow" aria-hidden="true">
+        <div class="count">10<br>transforms</div>
+        <div class="glyph">→</div>
+      </div>
+
+      <div class="node">
+        <div class="tag"><span class="sw" style="background:var(--accent)"></span> Target · cad_light &nbsp;×N</div>
+        <h3>Mesh</h3>
+        <pre><span class="k">pub struct</span> <span class="t">Mesh</span> {
+  <span class="k">pub</span> vertices:  <span class="t">Vec</span>&lt;<span class="t">Vertex</span>&gt;,
+  <span class="k">pub</span> triangles: <span class="t">Vec</span>&lt;<span class="t">Triangle</span>&gt;,
+  <span class="k">pub</span> material:  <span class="t">MaterialId</span>, <span class="c">// one / surface</span>
+}</pre>
+        <div class="sub">Indexed, per-surface. Fed to <code>calculate(&amp;[Mesh], …)</code>.</div>
+        <div class="facts">
+          <span class="fact">welded verts</span>
+          <span class="fact">1 face = 1 Mesh</span>
+          <span class="fact">= box_room() shape</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="crux">
+    <div class="figure">
+      <canvas id="mesh" width="380" height="340" aria-hidden="true"></canvas>
+      <div class="cap">Normal → surface class</div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--floor)"></span>Floor n·Z&gt;0</span>
+        <span><span class="sw" style="background:var(--wall)"></span>Wall |n·Z|≈0</span>
+        <span><span class="sw" style="background:var(--ceiling)"></span>Ceiling n·Z&lt;0</span>
+      </div>
+    </div>
+    <div>
+      <h2>The one hard part</h2>
+      <p>
+        The soup carries a normal per triangle but no identity. Welding it into an indexed mesh, walking
+        coplanar adjacency into <em>faces</em>, and classifying each face by its normal is what turns a
+        blob into a <strong>room the calc understands</strong>. Sub-steps 01 · 03 · 06 · 07 are the keystone;
+        every later roadmap step reuses their output rather than reinventing it.
+      </p>
+    </div>
+  </div>
+
+  <!-- ============ PHASE A ============ -->
+  <section class="phase">
+    <div class="phase-head">
+      <span class="rn">STEP 1</span>
+      <h2>Per-surface mesh identity</h2>
+      <span class="goal">goal: surfaces become addressable objects</span>
+    </div>
+
+    <div class="cards">
+      <div class="card keystone">
+        <div class="num">01 <span class="ks">keystone</span></div>
+        <h3>Weld soup → indexed vertices</h3>
+        <p class="body">Deduplicate <code>positions</code> by a quantised key (~1e-5&nbsp;m) into a shared vertex buffer with adjacency. This is also the watertight foundation — shared edges stop being seams.</p>
+        <div class="touch"><span class="chip">SolidMesh.positions</span><span class="chip">Vertex</span><span class="chip">Triangle</span></div>
+        <div class="proof"><span class="lbl">proof</span> A box's 36 soup points collapse to 8 verts / 12 tris.</div>
+      </div>
+
+      <div class="card">
+        <div class="num">02</div>
+        <h3>Per-triangle face normal</h3>
+        <p class="body">Take the csgrs normal (constant across a tri) or recompute <code>(b−a)×(c−a)</code>. This is the grouping <em>and</em> classification key that Steps&nbsp;3–4 later lean on for free.</p>
+        <div class="touch"><span class="chip">SolidMesh.normals</span><span class="chip">glam::Vec3::cross</span></div>
+        <div class="proof"><span class="lbl">proof</span> A box yields 6 distinct normals, ±X / ±Y / ±Z.</div>
+      </div>
+
+      <div class="card keystone">
+        <div class="num">03 <span class="ks">keystone</span></div>
+        <h3>Partition into coplanar faces</h3>
+        <p class="body">Reuse the existing adjacency walk over the welded mesh to group triangles into connected coplanar regions — one region = one surface.</p>
+        <div class="touch"><span class="chip">coplanar_face(positions, start)</span></div>
+        <div class="proof"><span class="lbl">proof</span> A box partitions into exactly 6 faces of 2 tris each.</div>
+      </div>
+
+      <div class="card">
+        <div class="num">04</div>
+        <h3>Stamp SurfaceId + provenance</h3>
+        <p class="body">Each face records <code>{ id, feature_id, normal, centroid, tris }</code>, tying the surface back to the <code>Feature</code> it came from so it stays addressable across re-eval.</p>
+        <div class="touch"><span class="chip">Feature.id</span><span class="chip">struct Surface</span></div>
+        <div class="proof"><span class="lbl">proof</span> Two features → surfaces carry distinct feature ids.</div>
+      </div>
+
+      <div class="card">
+        <div class="num">05</div>
+        <h3>Pick → highlight the face</h3>
+        <p class="body">Ray-pick a triangle (reuse the Factory's existing pick), look up its Surface, highlight all its triangles. Closes Step&nbsp;1 and pre-builds the Step&nbsp;8 material-picker interaction.</p>
+        <div class="touch"><span class="chip">factory.pick</span><span class="chip">cad_solid::ray_triangle</span></div>
+        <div class="proof"><span class="lbl">proof</span> Click a wall → its two triangles light up together.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ PHASE B ============ -->
+  <section class="phase">
+    <div class="phase-head">
+      <span class="rn">STEP 2</span>
+      <h2>Seam into the calc — uniform reflectance</h2>
+      <span class="goal">goal: "Factory is the room" · Phase 0</span>
+    </div>
+
+    <div class="cards">
+      <div class="card keystone">
+        <div class="num">06 <span class="ks">keystone</span></div>
+        <h3>Surface → cad_light::Mesh</h3>
+        <p class="body">One face becomes one <code>cad_light::Mesh</code> — its welded <code>vertices</code> + <code>triangles</code>, with <code>material</code> set to a single uniform default id. Per-class reflectance is deliberately deferred to Step&nbsp;4.</p>
+        <div class="touch"><span class="chip">Mesh { vertices, triangles, material }</span></div>
+        <div class="proof"><span class="lbl">proof</span> One face → one Mesh; vertices are welded, not soup.</div>
+      </div>
+
+      <div class="card keystone">
+        <div class="num">07 <span class="ks">keystone</span></div>
+        <h3>Assemble the scene Vec&lt;Mesh&gt;</h3>
+        <p class="body">Map every Surface of every Feature into <code>Vec&lt;cad_light::Mesh&gt;</code> — the whole Factory model as the calc's scene input, structurally identical to what <code>box_room()</code> hand-builds today.</p>
+        <div class="touch"><span class="chip">Vec&lt;cad_light::Mesh&gt;</span></div>
+        <div class="proof"><span class="lbl">proof</span> A box → Vec&lt;Mesh&gt; of len 6, matching box_room().</div>
+      </div>
+
+      <div class="card">
+        <div class="num">08</div>
+        <h3>Wire the calc + a default scene</h3>
+        <p class="body">A "Calculate" action builds the meshes, a <code>CalcPlane</code> from the model bounds at 0.8&nbsp;m, <code>default_materials()</code>, one test luminaire + IES, and calls the engine.</p>
+        <div class="touch"><span class="chip">calculate(…) -&gt; LuxGrid</span><span class="chip">CalcPlane</span><span class="chip">default_materials()</span></div>
+        <div class="proof"><span class="lbl">proof</span> "Calculate" returns a populated LuxGrid.</div>
+      </div>
+
+      <div class="card">
+        <div class="num">09</div>
+        <h3>Cache + dirty gate</h3>
+        <p class="body">Rebuild <code>Vec&lt;Mesh&gt;</code> only when <code>factory.cached</code> changes — mirror the existing dirty flag. Welding + csgrs aren't cheap; never reconvert per-frame.</p>
+        <div class="touch"><span class="chip">factory.cached</span><span class="chip">dirty</span></div>
+        <div class="proof"><span class="lbl">proof</span> Idle frames perform zero conversions.</div>
+      </div>
+
+      <div class="card keystone">
+        <div class="num">10 <span class="ks">keystone</span></div>
+        <h3>Proof harness — the box occludes</h3>
+        <p class="body">Unit test: box → convert → <code>calculate</code> → the grid is non-zero <em>and</em> a sensor beneath the box is darker than an open one. This is verbatim the roadmap's Step-2 proof — light bounces off the room the Factory made.</p>
+        <div class="touch"><span class="chip">#[test]</span><span class="chip">LuxGrid</span></div>
+        <div class="proof"><span class="lbl">phase 0</span> Sensor under box &lt; open sensor; grid &gt; 0. Done.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ DOWNSTREAM ============ -->
+  <section class="downstream">
+    <div class="phase-head">
+      <span class="rn">WHY</span>
+      <h2>Once the mesh is fixed, the rest is consumption</h2>
+      <span class="goal">roadmap steps 3–10 reuse these artifacts</span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Roadmap step</th><th>Reuses artifact from</th><th>What's left to do</th><th>Effort</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="step">3 · Classify surfaces</span></td><td><span class="art">02 normal · 04 Surface</span></td><td>Swap 06's uniform id for a normal-based class</td><td class="easy">trivial</td></tr>
+          <tr><td><span class="step">4 · Materials</span></td><td><span class="art">03 class → default_materials()</span></td><td>Map class → MaterialId (the table already exists)</td><td class="easy">trivial</td></tr>
+          <tr><td><span class="step">5 · Room shell</span></td><td><span class="art">01–07 whole pipeline</span></td><td>Walls extrude to SolidMesh → same weld path</td><td class="easy">reuse</td></tr>
+          <tr><td><span class="step">7 · Room objects</span></td><td><span class="art">01–07 whole pipeline</span></td><td>Primitives are SolidMesh → same weld path</td><td class="easy">reuse</td></tr>
+          <tr><td><span class="step">8 · Material UI</span></td><td><span class="art">05 pick → Surface</span></td><td>Selected surface → set its material</td><td class="easy">small</td></tr>
+          <tr><td><span class="step">9 · Watertight check</span></td><td><span class="art">01 welded index</span></td><td>Validate shared-edge manifold (weld is the seal)</td><td class="easy">small</td></tr>
+          <tr><td><span class="step">10 · Run the calc</span></td><td><span class="art">08 wiring</span></td><td>Already wired — add luminaires + report</td><td class="easy">reuse</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <div>Decomposition of roadmap Steps&nbsp;1–2 into ten concrete moves across the single <code class="mono">SolidMesh → cad_light::Mesh</code> seam. Companion to <span class="mono">ROADMAP_3D_TO_MESH_2026-07-22.md</span>. Sub-steps 01 · 03 · 06 · 07 are the keystone; the rest of the roadmap consumes their output.</div>
+    <div class="run">cd ~/workspace/simLUX/3D_Factory &amp;&amp; cargo run -p cad_app</div>
+    <div class="meta"><span>SOURCE cad_solid::SolidMesh</span><span>TARGET cad_light::Mesh × N</span><span>ENTRY calculate(&amp;[Mesh], …) -&gt; LuxGrid</span></div>
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  var cv = document.getElementById('mesh');
+  if (!cv) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.width, H = cv.height;
+  var css = getComputedStyle(document.documentElement);
+  function col(n) { return css.getPropertyValue(n).trim(); }
+
+  // unit box centred at origin, Z-up (metres-ish)
+  var v = [
+    [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
+    [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1]
+  ];
+  // faces: verts CCW + outward normal + class
+  var faces = [
+    { idx:[0,1,2,3], n:[0,0,-1], cls:'--floor'   }, // bottom, normal down? -> we treat +Z up: bottom faces up into room = floor
+    { idx:[4,7,6,5], n:[0,0, 1], cls:'--ceiling' }, // top
+    { idx:[0,4,5,1], n:[0,-1,0], cls:'--wall'    },
+    { idx:[1,5,6,2], n:[1,0,0],  cls:'--wall'    },
+    { idx:[2,6,7,3], n:[0,1,0],  cls:'--wall'    },
+    { idx:[3,7,4,0], n:[-1,0,0], cls:'--wall'    }
+  ];
+
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var ang = 0.6;
+
+  function rotY(p, a){ var c=Math.cos(a),s=Math.sin(a); return [p[0]*c+p[2]*s, p[1], -p[0]*s+p[2]*c]; }
+  function rotX(p, a){ var c=Math.cos(a),s=Math.sin(a); return [p[0], p[1]*c-p[2]*s, p[1]*s+p[2]*c]; }
+
+  function proj(p){
+    var d = 5.2, sc = 118;
+    var z = p[2] + d;
+    var f = sc / z;
+    return [W/2 + p[0]*f, H/2 - p[1]*f, p[2]];
+  }
+
+  function hexA(hex, a){
+    hex = hex.replace('#','');
+    if (hex.length===3) hex = hex.split('').map(function(c){return c+c;}).join('');
+    var r=parseInt(hex.substr(0,2),16),g=parseInt(hex.substr(2,2),16),b=parseInt(hex.substr(4,2),16);
+    return 'rgba('+r+','+g+','+b+','+a+')';
+  }
+
+  function frame(){
+    ctx.clearRect(0,0,W,H);
+    var pts = v.map(function(p){ return proj(rotX(rotY(p, ang), -0.42)); });
+
+    // depth-sort faces (painter)
+    var order = faces.map(function(f,i){
+      var z=0; f.idx.forEach(function(k){ z += pts[k][2]; });
+      return { i:i, z:z/4 };
+    }).sort(function(a,b){ return a.z - b.z; });
+
+    order.forEach(function(o){
+      var f = faces[o.i];
+      var back = o.z < 0; // farther faces (smaller z after rot) dimmer
+      var c = col(f.cls);
+      ctx.beginPath();
+      f.idx.forEach(function(k, j){
+        var p = pts[k];
+        if (j===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]);
+      });
+      ctx.closePath();
+      ctx.fillStyle = hexA(c, back ? 0.16 : 0.42);
+      ctx.fill();
+      ctx.lineWidth = back ? 1 : 1.8;
+      ctx.strokeStyle = hexA(c, back ? 0.4 : 0.95);
+      ctx.stroke();
+    });
+
+    if (!reduce) { ang += 0.006; requestAnimationFrame(frame); }
+  }
+  frame();
+
+  // repaint on theme flip so token colours refresh
+  var mo = new MutationObserver(function(){ css = getComputedStyle(document.documentElement); if (reduce) frame(); });
+  mo.observe(document.documentElement, { attributes:true, attributeFilter:['data-theme'] });
+})();
+</script>

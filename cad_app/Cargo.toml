@@ -1,0 +1,40 @@
+[package]
+name    = "cad_app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "simlux"
+path = "src/main.rs"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+cad_io     = { path = "../cad_io" }
+cad_wall   = { path = "../cad_wall" }
+cad_raster = { path = "../cad_raster" }
+cad_param  = { path = "../cad_param" }
+serde      = { version = "1", features = ["derive"] }   # SIMLUX sidecar (drawing.simlux.json)
+serde_json = "1"
+cad_light  = { path = "../cad_light" }   # SIMLUX lighting engine (IES + lux + Document extrude)
+# 3D_FACTORY: the 3D solid layer (Model/Feature/Plane/Frame + parametric CSG via csgrs) and
+# the 3D modifiers. UI-agnostic, so the app drives it the same way it drives cad_light.
+# This dep is the point of 3D_Factory: 3D lives HERE, where all 31.8k lines of 2D drafting
+# and modify already work — so every plane gets the FULL 2D toolset by construction, with
+# nothing reimplemented. See `mentor MD/VENUE_DECISION_2D_ON_EVERY_PLANE.md`.
+cad_solid  = { path = "../cad_solid" }
+glam       = "0.29"                       # SIMLUX 3D camera math (same version cad_light uses)
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+# Base eframe features shared across platforms. The Linux windowing backends
+# (wayland/x11) are added only on Linux below — on Windows eframe uses the
+# native Win32 backend automatically and those crates don't compile.
+eframe     = { version = "0.30", default-features = false, features = ["default_fonts", "glow"] }
+egui       = "0.30"
+egui_glow  = "0.30"
+glow       = "0.14"
+# Logo: SVG (vector → crisp at any size) via resvg; PNG fallback uses the
+# `image` dependency above (its feature set already includes "png").
+resvg      = { version = "0.44", default-features = false }
+
+# Linux-only windowing backends (the original Arch Linux build used these).
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.30", default-features = false, features = ["wayland", "x11"] }

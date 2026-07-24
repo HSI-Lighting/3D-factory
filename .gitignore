@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# User-customised ACI picker mapping. The wheel ships with a deterministic
+# default layout — this file is only written when the user clicks
+# "Save mapping" in the picker. Per-user, not per-codebase.
+/aci_mapping.json
+target-docker/
+
+# Local build / install logs captured during dev iteration (not source).
+*.log
+
+.git_commit_msg.txt

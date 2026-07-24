@@ -1,0 +1,11 @@
+[package]
+name        = "cad_param"
+version     = "0.1.0"
+edition     = "2021"
+description = "Independent 2D geometric constraint solver (parametric sketches) for RUST_CAD. Self-contained — depends on cad_kernel for Vec2 only; the core kernel/document never depends on this, so upstream-core merges stay clean."
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+# Vec2 only (read-only). The CORE never depends on cad_param — parametric is an
+# isolated module with its own data structure and file format (.rsmp).
+cad_kernel = { path = "../cad_kernel" }

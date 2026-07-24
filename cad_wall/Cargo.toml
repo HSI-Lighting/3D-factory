@@ -1,0 +1,10 @@
+[package]
+name        = "cad_wall"
+version     = "0.1.0"
+edition     = "2021"
+description = "Wall feature logic for RUST_CAD — junction solver, curved-wall derive (smart-dobject)"
+license     = "MIT OR Apache-2.0"
+repository  = "local"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }

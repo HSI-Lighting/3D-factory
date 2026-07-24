@@ -1,0 +1,1097 @@
+//! cad_solid — a free-3D **parametric solid modeler** for SIMLUX.
+//!
+//! UI-agnostic pure Rust: a construction-plane system, parametric [`Primitive`]s,
+//! and a boolean **feature history** ([`Model`]) evaluated through **csgrs** (BSP
+//! CSG) into a neutral triangle soup ([`SolidMesh`]). The standalone sandbox
+//! (`cargo run -p cad_solid --example sandbox`) drives it; nothing here depends on
+//! egui/eframe.
+//!
+//! Design: `Model{ features }` is an ordered CSG tree flattened into a history —
+//! each [`Feature`] applies its [`Primitive`] (posed on a [`Plane`]) to the running
+//! result via a [`BoolOp`]. Params are the identity; the mesh is DERIVED, so
+//! editing any param and re-`eval()`ing reproduces the solid (the "generator
+//! re-derives" contract). The eventual simLUX wire-in (S5) converts [`SolidMesh`]
+//! → `cad_light::Mesh` — the single coupling point.
+
+use cad_kernel::Vec2 as KVec2;
+use glam::{Mat4, Quat, Vec2, Vec3};
+use serde::{Deserialize, Serialize};
+
+mod csg;
+pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
+pub mod draw;
+pub mod modify;
+
+/// A flat triangle soup: `positions`/`normals` in lock-step, 3 consecutive
+/// entries = one triangle (metres, Z-up, f32). cad_solid's neutral output; the
+/// app converts it to `cad_light::Mesh` at wire-in.
+#[derive(Clone, Debug, Default)]
+pub struct SolidMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    /// The leading feature id of the body each TRIANGLE came from (`positions.len()/3`
+    /// entries). Lets the app colour a body by which feature it belongs to. May be empty
+    /// on meshes built without tagging (older paths); callers must tolerate that.
+    pub face_ids: Vec<u32>,
+}
+
+impl SolidMesh {
+    /// Number of triangles.
+    pub fn tri_count(&self) -> usize {
+        self.positions.len() / 3
+    }
+
+    /// Axis-aligned bounds `(min, max)`, or `None` when empty.
+    pub fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        let mut it = self.positions.iter();
+        let first = *it.next()?;
+        let (mut mn, mut mx) = (first, first);
+        for p in self.positions.iter() {
+            for k in 0..3 {
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        Some((mn, mx))
+    }
+}
+
+/// Which world plane the active construction plane is parallel to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaneKind {
+    XY,
+    XZ,
+    YZ,
+}
+
+impl PlaneKind {
+    pub const ALL: [PlaneKind; 3] = [PlaneKind::XY, PlaneKind::XZ, PlaneKind::YZ];
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaneKind::XY => "XY",
+            PlaneKind::XZ => "XZ",
+            PlaneKind::YZ => "YZ",
+        }
+    }
+}
+
+/// A construction / drawing plane: a world plane pushed `offset` along its normal.
+/// (3-point arbitrary planes are S2.)
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Plane {
+    pub kind: PlaneKind,
+    pub offset: f32,
+}
+
+impl Default for Plane {
+    fn default() -> Self {
+        Self { kind: PlaneKind::XY, offset: 0.0 }
+    }
+}
+
+impl Plane {
+    /// The in-plane `(u, v)` axes. The normal is DERIVED as `u × v`, so the frame
+    /// `[u | v | n]` is always right-handed (det +1) — csgrs booleans depend on
+    /// consistent winding, and a mirrored (det −1) basis would flip every normal.
+    pub fn axes(&self) -> (Vec3, Vec3) {
+        match self.kind {
+            PlaneKind::XY => (Vec3::X, Vec3::Y),
+            PlaneKind::XZ => (Vec3::X, Vec3::Z),
+            PlaneKind::YZ => (Vec3::Y, Vec3::Z),
+        }
+    }
+
+    pub fn normal(&self) -> Vec3 {
+        let (u, v) = self.axes();
+        u.cross(v).normalize()
+    }
+
+    /// World position of the plane's local origin.
+    pub fn origin(&self) -> Vec3 {
+        self.normal() * self.offset
+    }
+
+    /// Local → world transform for a primitive posed at `place`: rotate about the
+    /// plane normal (spin), then map local `X→u, Y→v, Z→n` and translate to the
+    /// placement point on the plane.
+    pub fn world_matrix(&self, place: &Placement) -> Mat4 {
+        let (u, v) = self.axes();
+        let n = u.cross(v).normalize();
+        let o = self.origin() + u * place.u + v * place.v + n * place.lift;
+        let basis = Mat4::from_cols(u.extend(0.0), v.extend(0.0), n.extend(0.0), o.extend(1.0));
+        basis * Mat4::from_rotation_z(place.spin_deg.to_radians())
+    }
+
+    /// World point → this plane's local `(u, v)` (drops the normal component) —
+    /// the 3D analog of a 2D pick on the drawing plane, used by the modifiers.
+    pub fn to_uv(&self, w: Vec3) -> Vec2 {
+        let (u, v) = self.axes();
+        let d = w - self.origin();
+        Vec2::new(d.dot(u), d.dot(v))
+    }
+
+    /// Local `(u, v)` → world point on the plane.
+    pub fn from_uv(&self, uv: Vec2) -> Vec3 {
+        let (u, v) = self.axes();
+        self.origin() + u * uv.x + v * uv.y
+    }
+}
+
+/// Pose of a primitive on its plane: in-plane `(u, v)`, `lift` along the normal,
+/// and `spin` about the normal.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default)]
+pub struct Placement {
+    pub u: f32,
+    pub v: f32,
+    pub lift: f32,
+    pub spin_deg: f32,
+}
+
+/// Twice the signed area of a closed ring (shoelace). Sign gives the winding.
+fn signed_area2(p: &[Vec2]) -> f32 {
+    let mut a = 0.0;
+    for i in 0..p.len() {
+        let q = p[(i + 1) % p.len()];
+        a += p[i].x * q.y - q.x * p[i].y;
+    }
+    a
+}
+
+/// Do two proper (non-adjacent) edges of the closed ring cross?
+///
+/// O(n²), which is right for building outlines (tens of points) and keeps the test exact
+/// rather than approximate. Adjacent edges are skipped — they legitimately share a vertex.
+fn self_intersects(p: &[Vec2]) -> bool {
+    let n = p.len();
+    let orient = |a: Vec2, b: Vec2, c: Vec2| {
+        let v = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if v > 1e-9 { 1 } else if v < -1e-9 { -1 } else { 0 }
+    };
+    for i in 0..n {
+        let (a1, a2) = (p[i], p[(i + 1) % n]);
+        for j in (i + 1)..n {
+            // skip edges sharing a vertex (including the wrap pair n-1 ↔ 0)
+            if j == i || (j + 1) % n == i || (i + 1) % n == j {
+                continue;
+            }
+            let (b1, b2) = (p[j], p[(j + 1) % n]);
+            let (d1, d2) = (orient(a1, a2, b1), orient(a1, a2, b2));
+            let (d3, d4) = (orient(b1, b2, a1), orient(b1, b2, a2));
+            if d1 != d2 && d3 != d4 && d1 != 0 && d2 != 0 && d3 != 0 && d4 != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Stable key into [`Model::profiles`]. Like a feature id, it is a KEY and not an index:
+/// removing a profile never renumbers the others.
+pub type ProfileId = u32;
+
+/// A closed 2D outline, stored once and referenced by [`Primitive::Extrusion`].
+///
+/// Points are `[f32; 2]`, not `glam::Vec2`, because glam is built here without its
+/// `serde` feature and a `Model` must serialize. They are CENTRED on their own bounding
+/// box, matching this module's canonical-local-coords convention (every primitive is
+/// centred on the local origin); the world position comes from the `Placement`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Profile {
+    pub id: ProfileId,
+    pub pts: Vec<[f32; 2]>,
+}
+
+/// Why a profile was refused. Reported, never swallowed: earcut's behaviour on a
+/// self-intersecting loop is undefined, and a non-watertight mesh would silently poison
+/// the light calc downstream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProfileError {
+    /// Fewer than 3 distinct points — no area to extrude.
+    TooFewPoints,
+    /// Zero (or near-zero) area: all points collinear.
+    Degenerate,
+    /// Two non-adjacent edges cross.
+    SelfIntersecting,
+}
+
+/// A parametric leaf shape, built in canonical local coords (footprint centred on
+/// the local origin, extruding +Z / sitting on the plane). The S2 primitives
+/// (Prism / Step / Ramp / Wall / Column) slot in here.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum Primitive {
+    /// Rectangular box `w×d` footprint, `h` tall.
+    Box { w: f32, d: f32, h: f32 },
+    /// Cylinder radius `r`, `h` tall, `sides` facets.
+    Cylinder { r: f32, h: f32, sides: u32 },
+    /// Sphere. `segments` = longitude slices, `stacks` = latitude rings.
+    /// Rests ON the plane (lifted by `r`), per this module's convention.
+    Sphere { r: f32, segments: u32, stacks: u32 },
+    /// Cone / frustum / prism / pyramid — one primitive, four shapes:
+    /// `r_top = 0` → **cone** · `r_top = r_bottom` → **prism** ·
+    /// `sides = 4, r_top = 0` → **pyramid** · else → **frustum**.
+    /// (This is why there is no separate Cone/Prism/Pyramid variant.)
+    Frustum { r_bottom: f32, r_top: f32, h: f32, sides: u32 },
+    /// Torus — `major_r` = ring radius, `minor_r` = tube thickness.
+    Torus { major_r: f32, minor_r: f32, seg_major: u32, seg_minor: u32 },
+    /// Capsule — a cylinder of length `h` with hemispherical caps of radius `r`.
+    /// **COMPOSED** (csgrs has no capsule): cylinder ∪ sphere ∪ sphere.
+    /// Total height = `h + 2r`.
+    Capsule { r: f32, h: f32, segments: u32, stacks: u32 },
+    /// Hollow tube — **COMPOSED** (csgrs has no tube): outer cylinder ∖ inner.
+    Tube { r_outer: f32, r_inner: f32, h: f32, sides: u32 },
+    /// Ellipsoid with independent radii. Rests on the plane (lifted by `rz`).
+    Ellipsoid { rx: f32, ry: f32, rz: f32, segments: u32, stacks: u32 },
+    /// **Vertical extrusion of an arbitrary closed profile** — the building outline.
+    ///
+    /// The profile lives in [`Model::profiles`] and is referenced by [`ProfileId`] rather
+    /// than held inline. That indirection IS the design: a `Vec<Vec2>` in this enum would
+    /// drop `Copy` from `Primitive` **and** from [`Feature`], which is returned by value
+    /// from `translated` / `rotated` / `scaled` / `mirrored` and passed by value across
+    /// the app. An id leaves every one of those sites untouched, and matches this crate's
+    /// existing "ids are stable keys, not indices" rule.
+    ///
+    /// `w`/`d` cache the profile's extents so [`Primitive::local_aabb`] — which drives
+    /// ray-pick selection and has no access to the `Model` — stays a pure function of the
+    /// primitive. Profiles are IMMUTABLE once created (an edit mints a new one), so the
+    /// cache cannot go stale.
+    Extrusion { profile: ProfileId, h: f32, w: f32, d: f32 },
+}
+
+impl Primitive {
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Primitive::Box { .. } => "Box",
+            Primitive::Cylinder { .. } => "Cylinder",
+            Primitive::Sphere { .. } => "Sphere",
+            Primitive::Frustum { r_top, sides, r_bottom, .. } => {
+                // one variant, four shapes — name it by what it actually is
+                if *r_top <= 1e-6 {
+                    if *sides == 4 { "Pyramid" } else { "Cone" }
+                } else if (*r_top - *r_bottom).abs() <= 1e-6 {
+                    "Prism"
+                } else {
+                    "Frustum"
+                }
+            }
+            Primitive::Extrusion { .. } => "Extrusion",
+            Primitive::Torus { .. } => "Torus",
+            Primitive::Capsule { .. } => "Capsule",
+            Primitive::Tube { .. } => "Tube",
+            Primitive::Ellipsoid { .. } => "Ellipsoid",
+        }
+    }
+
+    /// Local-space axis-aligned bounds `(min, max)` before placement (footprint
+    /// centred on the local origin, resting on z = 0).
+    pub fn local_aabb(&self) -> (Vec3, Vec3) {
+        match *self {
+            Primitive::Box { w, d, h } => (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h)),
+            Primitive::Cylinder { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h)),
+            // The cached extents exist precisely so this stays a pure function of the
+            // primitive — resolving the ProfileId here would need the Model.
+            Primitive::Extrusion { h, w, d, .. } => {
+                (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h))
+            }
+            // sphere/ellipsoid are lifted so they REST on the plane
+            Primitive::Sphere { r, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, 2.0 * r)),
+            Primitive::Ellipsoid { rx, ry, rz, .. } => {
+                (Vec3::new(-rx, -ry, 0.0), Vec3::new(rx, ry, 2.0 * rz))
+            }
+            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+                let r = r_bottom.max(r_top);
+                (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h))
+            }
+            // torus lies flat, lifted by minor_r → rests on the plane
+            Primitive::Torus { major_r, minor_r, .. } => {
+                let o = major_r + minor_r;
+                (Vec3::new(-o, -o, 0.0), Vec3::new(o, o, 2.0 * minor_r))
+            }
+            // capsule: caps of r at each end of an h-long barrel → total h + 2r
+            Primitive::Capsule { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h + 2.0 * r)),
+            Primitive::Tube { r_outer, h, .. } => {
+                (Vec3::new(-r_outer, -r_outer, 0.0), Vec3::new(r_outer, r_outer, h))
+            }
+        }
+    }
+}
+
+/// A boolean combination operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoolOp {
+    Union,
+    Difference,
+    Intersection,
+}
+
+impl BoolOp {
+    pub const ALL: [BoolOp; 3] = [BoolOp::Union, BoolOp::Difference, BoolOp::Intersection];
+    pub fn label(self) -> &'static str {
+        match self {
+            BoolOp::Union => "Union",
+            BoolOp::Difference => "Difference",
+            BoolOp::Intersection => "Intersection",
+        }
+    }
+    pub fn glyph(self) -> &'static str {
+        match self {
+            BoolOp::Union => "∪",
+            BoolOp::Difference => "−",
+            BoolOp::Intersection => "∩",
+        }
+    }
+}
+
+/// One step of the CSG history: apply `primitive` (posed on `plane` at `placement`)
+/// to the running result with `op`. The FIRST feature is the base (its `op` is
+/// ignored — nothing to combine with yet).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Feature {
+    pub id: u32,
+    pub op: BoolOp,
+    pub plane: Plane,
+    pub placement: Placement,
+    pub primitive: Primitive,
+}
+
+impl Feature {
+    /// World-space AABB of this feature's primitive, posed on its plane — used for
+    /// ray-pick selection and the selection highlight.
+    pub fn world_aabb(&self) -> (Vec3, Vec3) {
+        let (lmn, lmx) = self.primitive.local_aabb();
+        let m = self.plane.world_matrix(&self.placement);
+        let mut mn = Vec3::splat(f32::INFINITY);
+        let mut mx = Vec3::splat(f32::NEG_INFINITY);
+        for i in 0..8 {
+            let c = Vec3::new(
+                if i & 1 == 0 { lmn.x } else { lmx.x },
+                if i & 2 == 0 { lmn.y } else { lmx.y },
+                if i & 4 == 0 { lmn.z } else { lmx.z },
+            );
+            let w = m.transform_point3(c);
+            mn = mn.min(w);
+            mx = mx.max(w);
+        }
+        (mn, mx)
+    }
+
+    // ── Pure transforms — the 3D analogs of cad_kernel `Geom::translated`/
+    //    `rotated`/`scaled`/`mirrored`. Each returns a NEW feature (params are the
+    //    identity; the mesh re-derives). The modifier layer routes through these,
+    //    exactly as the 2D `apply_*` route through the `Geom` methods.
+
+    /// World position of the feature's local origin (footprint centre on its plane).
+    pub fn world_origin(&self) -> Vec3 {
+        let (u, v) = self.plane.axes();
+        self.plane.origin() + u * self.placement.u + v * self.placement.v + self.plane.normal() * self.placement.lift
+    }
+
+    /// Copy of this feature relocated so its local origin sits at world point `w`
+    /// (keeps its plane, spin, and primitive — only the placement is recomputed).
+    pub fn with_world_origin(&self, w: Vec3) -> Feature {
+        let (u, v) = self.plane.axes();
+        let d = w - self.plane.origin();
+        let mut f = *self;
+        f.placement.u = d.dot(u);
+        f.placement.v = d.dot(v);
+        f.placement.lift = d.dot(self.plane.normal());
+        f
+    }
+
+    /// Translate by a world vector (MOVE / COPY).
+    pub fn translated(&self, world_delta: Vec3) -> Feature {
+        self.with_world_origin(self.world_origin() + world_delta)
+    }
+
+    /// Rotate `angle_rad` about `pivot` around `axis` (ROTATE). When the feature's
+    /// plane normal is parallel to the axis (the coplanar, in-plane case), the spin
+    /// is updated too so the primitive turns; otherwise only the origin orbits.
+    pub fn rotated(&self, pivot: Vec3, axis: Vec3, angle_rad: f32) -> Feature {
+        let axis = axis.normalize_or_zero();
+        let o = self.world_origin();
+        let q = Quat::from_axis_angle(axis, angle_rad);
+        let mut f = self.with_world_origin(pivot + q * (o - pivot));
+        let align = self.plane.normal().dot(axis);
+        if align.abs() > 0.999 {
+            f.placement.spin_deg += angle_rad.to_degrees() * align.signum();
+        }
+        f
+    }
+
+    /// Uniform scale by `k` about `pivot` (SCALE) — moves the origin away from the
+    /// pivot and scales the primitive's dimensions.
+    pub fn scaled(&self, pivot: Vec3, k: f32) -> Feature {
+        let o = self.world_origin();
+        let mut f = self.with_world_origin(pivot + (o - pivot) * k);
+        match &mut f.primitive {
+            Primitive::Box { w, d, h } => {
+                *w = (*w * k).max(0.001);
+                *d = (*d * k).max(0.001);
+                *h = (*h * k).max(0.001);
+            }
+            Primitive::Cylinder { r, h, .. } => {
+                *r = (*r * k).max(0.001);
+                *h = (*h * k).max(0.001);
+            }
+            // Uniform scale: every LENGTH scales, every SEGMENT COUNT does not.
+            Primitive::Sphere { r, .. } => *r = (*r * k).max(0.001),
+            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+                *r_bottom = (*r_bottom * k).max(0.0); // 0 is legal — that IS a cone
+                *r_top = (*r_top * k).max(0.0);
+                *h = (*h * k).max(0.001);
+            }
+            Primitive::Torus { major_r, minor_r, .. } => {
+                *major_r = (*major_r * k).max(0.001);
+                *minor_r = (*minor_r * k).max(0.001);
+            }
+            // An extrusion's SHAPE lives in the shared profile table, which this method
+            // cannot reach (it has no `&mut Model`), and profiles are immutable because
+            // they are shared between storeys — scaling one in place would silently
+            // resize every other extrusion using it. So the feature MOVES relative to the
+            // pivot but keeps its size. Scaling the height alone would distort it, which
+            // is worse than not scaling.
+            //
+            // Doing this properly means minting a scaled profile, which needs a
+            // Model-level operation rather than a Feature-level one.
+            Primitive::Extrusion { .. } => {}
+            Primitive::Capsule { r, h, .. } => {
+                *r = (*r * k).max(0.001);
+                *h = (*h * k).max(0.0); // 0 is legal — that IS a sphere
+            }
+            Primitive::Tube { r_outer, r_inner, h, .. } => {
+                *r_outer = (*r_outer * k).max(0.001);
+                *r_inner = (*r_inner * k).max(0.0);
+                *h = (*h * k).max(0.001);
+            }
+            Primitive::Ellipsoid { rx, ry, rz, .. } => {
+                *rx = (*rx * k).max(0.001);
+                *ry = (*ry * k).max(0.001);
+                *rz = (*rz * k).max(0.001);
+            }
+        }
+        f
+    }
+
+    /// Reflect across the plane through `plane_pt` with unit-ish normal `plane_n`
+    /// (MIRROR). The origin reflects; the primitive (axis-symmetric) is unchanged.
+    pub fn mirrored(&self, plane_pt: Vec3, plane_n: Vec3) -> Feature {
+        let n = plane_n.normalize_or_zero();
+        let o = self.world_origin();
+        let refl = o - n * (2.0 * (o - plane_pt).dot(n));
+        self.with_world_origin(refl)
+    }
+}
+
+/// Ray vs axis-aligned box (slab method). Returns the entry distance (clamped to
+/// ≥ 0) when the ray `orig + t·dir` hits the box, else `None`. `dir` need not be
+/// unit. Zero components are handled via `f32` infinities.
+pub fn ray_aabb(orig: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let inv = dir.recip();
+    let t0 = (min - orig) * inv;
+    let t1 = (max - orig) * inv;
+    let enter = t0.min(t1).max_element();
+    let exit = t0.max(t1).min_element();
+    (exit >= enter.max(0.0)).then(|| enter.max(0.0))
+}
+
+/// Ray vs triangle (Möller–Trumbore). Returns the forward hit distance, or `None`.
+/// Used to pick a solid's **surface** (and its face normal) for sketch-on-face.
+pub fn ray_triangle(orig: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-7 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = orig - a;
+    let u = tv.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tv.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let dist = e2.dot(q) * inv;
+    (dist > 1e-6).then_some(dist)
+}
+
+/// The **face** containing triangle `start`: all triangles reachable from it
+/// through shared edges whose normal matches (a maximal coplanar-connected
+/// region of the surface mesh). `positions` is the flat triangle soup (3 per
+/// tri). Returns the triangle indices of the face. Used for face selection.
+pub fn coplanar_face(positions: &[[f32; 3]], start: usize) -> Vec<usize> {
+    use std::collections::HashMap;
+    let ntri = positions.len() / 3;
+    if start >= ntri {
+        return Vec::new();
+    }
+    // Weld vertices onto a grid so shared edges match despite float noise.
+    let key = |p: [f32; 3]| -> (i64, i64, i64) {
+        let q = 1.0e4;
+        ((p[0] as f64 * q).round() as i64, (p[1] as f64 * q).round() as i64, (p[2] as f64 * q).round() as i64)
+    };
+    let edge = |t: usize, e: usize| {
+        let (mut a, mut b) = (key(positions[3 * t + e]), key(positions[3 * t + (e + 1) % 3]));
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        (a, b)
+    };
+    let normal = |t: usize| -> Vec3 {
+        let a = Vec3::from(positions[3 * t]);
+        let b = Vec3::from(positions[3 * t + 1]);
+        let c = Vec3::from(positions[3 * t + 2]);
+        (b - a).cross(c - a).normalize_or_zero()
+    };
+    // Edge → adjacent triangles.
+    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    for t in 0..ntri {
+        for e in 0..3 {
+            edges.entry(edge(t, e)).or_default().push(t);
+        }
+    }
+    let n0 = normal(start);
+    let mut visited = vec![false; ntri];
+    let mut face = Vec::new();
+    let mut stack = vec![start];
+    visited[start] = true;
+    while let Some(t) = stack.pop() {
+        face.push(t);
+        for e in 0..3 {
+            if let Some(adj) = edges.get(&edge(t, e)) {
+                for &nt in adj {
+                    if !visited[nt] && normal(nt).dot(n0) > 0.999 {
+                        visited[nt] = true;
+                        stack.push(nt);
+                    }
+                }
+            }
+        }
+    }
+    face
+}
+
+/// A free (arbitrary) construction plane: an orthonormal `(u, v)` frame at an
+/// `origin` in world space. Unlike [`Plane`] (locked to XY/XZ/YZ), a `Frame` sits
+/// on any picked surface — the basis for **sketch-on-face**.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub origin: Vec3,
+    pub u: Vec3,
+    pub v: Vec3,
+}
+
+impl Frame {
+    /// Build a right-handed frame (`u × v = normal`) at `origin` facing `normal`.
+    /// The in-plane axes are chosen deterministically from a world reference.
+    pub fn from_point_normal(origin: Vec3, normal: Vec3) -> Self {
+        let n = normal.normalize_or_zero();
+        let reference = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+        let u = reference.cross(n).normalize_or_zero();
+        let v = n.cross(u).normalize_or_zero();
+        Self { origin, u, v }
+    }
+    pub fn normal(&self) -> Vec3 {
+        self.u.cross(self.v).normalize_or_zero()
+    }
+    pub fn to_uv(&self, w: Vec3) -> Vec2 {
+        let d = w - self.origin;
+        Vec2::new(d.dot(self.u), d.dot(self.v))
+    }
+    pub fn from_uv(&self, uv: Vec2) -> Vec3 {
+        self.origin + self.u * uv.x + self.v * uv.y
+    }
+}
+
+/// A 2D sketch on a [`Frame`] (typically a picked solid face). It holds a real
+/// `cad_kernel::Document` — the SAME 2D document the main app edits — so the app's
+/// draw / modifier / osnap code operates on it unchanged (flat sketch mode).
+#[derive(Clone)]
+pub struct Sketch {
+    pub frame: Frame,
+    pub doc: cad_kernel::Document,
+    /// Reference geometry (the selected face's outline, in u,v) — shown faintly so
+    /// the user sees WHERE they're drawing, and offered as osnap targets. Not part
+    /// of the drawing itself.
+    pub reference: Vec<cad_kernel::Geom>,
+}
+
+impl Sketch {
+    pub fn new(frame: Frame) -> Self {
+        Self { frame, doc: cad_kernel::Document::default(), reference: Vec::new() }
+    }
+}
+
+/// Flatten a kernel geom into uv-space polyline paths (each inner `Vec` is one
+/// path; closed shapes include the wrap point). Reuses the kernel's own geometry
+/// (arc/ellipse samplers + DXF bulge). Point returns a small cross (two paths).
+pub fn geom_outlines(g: &cad_kernel::Geom) -> Vec<Vec<Vec2>> {
+    use cad_kernel::Geom as G;
+    match g {
+        G::Line(l) => vec![vec![gvec(l.a), gvec(l.b)]],
+        G::Circle(c) => vec![circle_path(c.center, c.radius, 64)],
+        G::Arc(a) => vec![arc_path(a.center, a.radius, a.start_angle, a.sweep_angle, 48)],
+        G::Ellipse(e) => {
+            let n = 72;
+            vec![(0..=n).map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64))).collect()]
+        }
+        G::EllipseArc(ea) => {
+            let n = 48;
+            vec![(0..=n)
+                .map(|i| gvec(ea.ellipse.point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64)))
+                .collect()]
+        }
+        G::Polyline(p) => vec![polyline_path(p)],
+        G::Point(pt) => {
+            let c = gvec(pt.location);
+            let s = 0.15;
+            vec![
+                vec![c - Vec2::new(s, 0.0), c + Vec2::new(s, 0.0)],
+                vec![c - Vec2::new(0.0, s), c + Vec2::new(0.0, s)],
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[inline]
+fn gvec(p: KVec2) -> Vec2 {
+    Vec2::new(p.x as f32, p.y as f32)
+}
+
+fn circle_path(c: KVec2, r: f64, n: usize) -> Vec<Vec2> {
+    (0..=n)
+        .map(|i| {
+            let t = std::f64::consts::TAU * i as f64 / n as f64;
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+        })
+        .collect()
+}
+
+fn arc_path(c: KVec2, r: f64, start: f64, sweep: f64, n: usize) -> Vec<Vec2> {
+    (0..=n)
+        .map(|i| {
+            let t = start + sweep * i as f64 / n as f64;
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+        })
+        .collect()
+}
+
+/// Flatten a (possibly bulged / closed) polyline into a single uv path.
+fn polyline_path(p: &cad_kernel::Polyline) -> Vec<Vec2> {
+    let n = p.vertices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut path = Vec::new();
+    let segs = if p.closed { n } else { n - 1 };
+    for i in 0..segs {
+        let a = p.vertices[i];
+        let b = p.vertices[(i + 1) % n];
+        if a.bulge.abs() < 1e-9 {
+            path.push(gvec(a.pos));
+        } else if let Some((c, r, sa, sw)) = cad_kernel::bulge_arc(a.pos, b.pos, a.bulge) {
+            let steps = 16;
+            for k in 0..steps {
+                let t = sa + sw * k as f64 / steps as f64;
+                path.push(gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin())));
+            }
+        } else {
+            path.push(gvec(a.pos));
+        }
+    }
+    path.push(gvec(p.vertices[if p.closed { 0 } else { n - 1 }].pos));
+    path
+}
+
+/// The parametric solid: an ordered boolean feature history, plus any 2D sketches
+/// drawn on faces (not yet persisted — sketch serialization arrives with S5).
+/// (No `Debug` derive — `cad_kernel::Document` on `Sketch` isn't `Debug`.)
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Model {
+    pub features: Vec<Feature>,
+    /// Closed outlines referenced by [`Primitive::Extrusion`]. Held once and shared: every
+    /// storey of the same building outline points at ONE profile, so re-extruding an
+    /// outline never duplicates its geometry.
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
+    #[serde(skip)]
+    pub sketches: Vec<Sketch>,
+}
+
+impl Model {
+    /// Append a feature, assigning it a fresh id; returns that id.
+    pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
+        let id = self.features.iter().map(|f| f.id).max().map_or(1, |m| m + 1);
+        self.features.push(Feature { id, op, plane, placement, primitive });
+        id
+    }
+
+    /// Store a closed outline and return `(id, centre, w, d)`.
+    ///
+    /// The caller puts `centre` into the `Placement` (u,v) and `w`/`d` into the
+    /// `Extrusion` variant — the stored points are recentred on their own bounding box so
+    /// they obey this module's canonical-local-coords convention.
+    ///
+    /// The outline is CLOSED implicitly: a repeated final point is dropped, so the stored
+    /// ring never duplicates its first vertex. Winding is normalised to counter-clockwise
+    /// so extruded faces point consistently outward.
+    ///
+    /// Validation is refusal, not repair — see [`ProfileError`].
+    pub fn add_profile(&mut self, pts: &[Vec2]) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
+        // Drop a repeated wrap point, then collapse consecutive duplicates.
+        let mut p: Vec<Vec2> = Vec::with_capacity(pts.len());
+        for &q in pts {
+            if p.last().is_none_or(|l: &Vec2| (*l - q).length() > 1e-6) {
+                p.push(q);
+            }
+        }
+        if p.len() > 1 && (p[0] - p[p.len() - 1]).length() <= 1e-6 {
+            p.pop();
+        }
+        if p.len() < 3 {
+            return Err(ProfileError::TooFewPoints);
+        }
+        // Self-intersection is checked BEFORE area: a symmetric bow-tie has exactly zero
+        // shoelace area, so an area-first order would report the vaguer "degenerate" for
+        // the very shape the user can actually see is crossed.
+        if self_intersects(&p) {
+            return Err(ProfileError::SelfIntersecting);
+        }
+        let area2 = signed_area2(&p);
+        if area2.abs() < 1e-8 {
+            return Err(ProfileError::Degenerate);
+        }
+        if area2 < 0.0 {
+            p.reverse(); // normalise to CCW
+        }
+        let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for q in &p {
+            mn = mn.min(*q);
+            mx = mx.max(*q);
+        }
+        let centre = (mn + mx) * 0.5;
+        let (w, d) = (mx.x - mn.x, mx.y - mn.y);
+        let id = self.profiles.iter().map(|x| x.id).max().map_or(1, |m| m + 1);
+        self.profiles.push(Profile {
+            id,
+            pts: p.iter().map(|q| [q.x - centre.x, q.y - centre.y]).collect(),
+        });
+        Ok((id, centre, w, d))
+    }
+
+    /// Look up a profile by id. `None` for a stale id — never panics.
+    pub fn profile(&self, id: ProfileId) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.id == id)
+    }
+
+    /// World-space triangle positions (3 per triangle) of one feature's raw mesh — for
+    /// ray-pick against the real surface rather than the bounding box.
+    pub fn feature_world_positions(&self, f: &Feature) -> Vec<[f32; 3]> {
+        crate::csg::feature_world_positions(self, f)
+    }
+
+    /// Next free feature id.
+    pub fn next_id(&self) -> u32 {
+        self.features.iter().map(|f| f.id).max().map_or(1, |m| m + 1)
+    }
+
+    /// Append a fully-formed feature, re-stamping it with a fresh id (COPY).
+    pub fn push_feature(&mut self, mut f: Feature) -> u32 {
+        let id = self.next_id();
+        f.id = id;
+        self.features.push(f);
+        id
+    }
+
+    /// Mutable access to a feature by id.
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut Feature> {
+        self.features.iter_mut().find(|f| f.id == id)
+    }
+
+    /// Remove the feature with `id`; returns true if one was removed.
+    pub fn remove(&mut self, id: u32) -> bool {
+        let n = self.features.len();
+        self.features.retain(|f| f.id != id);
+        self.features.len() != n
+    }
+
+    /// Fold the whole history through csgrs into a triangle soup. Re-run on ANY
+    /// param edit — this IS the parametric re-derivation.
+    pub fn eval(&self) -> SolidMesh {
+        csg::eval(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ray_hits_box_ahead_and_misses_beside() {
+        let (mn, mx) = (Vec3::new(-1.0, -1.0, -1.0), Vec3::new(1.0, 1.0, 1.0));
+        // Ray from -Z straight at the box.
+        let hit = ray_aabb(Vec3::new(0.0, 0.0, -5.0), Vec3::Z, mn, mx);
+        assert!(hit.is_some());
+        assert!((hit.unwrap() - 4.0).abs() < 1e-4, "enters the box at t=4");
+        // Ray parallel but offset well outside → miss.
+        assert!(ray_aabb(Vec3::new(5.0, 0.0, -5.0), Vec3::Z, mn, mx).is_none());
+    }
+
+    #[test]
+    fn world_aabb_follows_placement_and_offset() {
+        let f = Feature {
+            id: 1,
+            op: BoolOp::Union,
+            plane: Plane { kind: PlaneKind::XY, offset: 2.0 },
+            placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0 },
+            primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
+        };
+        let (mn, mx) = f.world_aabb();
+        // Centred at u=3 on X → x spans 2..4; sits on plane at z=offset=2 → z 2..3.
+        assert!((mn.x - 2.0).abs() < 1e-4 && (mx.x - 4.0).abs() < 1e-4);
+        assert!((mn.z - 2.0).abs() < 1e-4 && (mx.z - 3.0).abs() < 1e-4);
+    }
+
+    fn box_at(u: f32, v: f32) -> Feature {
+        Feature {
+            id: 1,
+            op: BoolOp::Union,
+            plane: Plane::default(),
+            placement: Placement { u, v, lift: 0.0, spin_deg: 0.0 },
+            primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        }
+    }
+
+    #[test]
+    fn translate_moves_world_origin() {
+        let f = box_at(1.0, 1.0).translated(Vec3::new(2.0, 0.0, 0.0));
+        let o = f.world_origin();
+        assert!((o - Vec3::new(3.0, 1.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn rotate_90_about_z_at_origin() {
+        // A feature at (1,0) rotated +90° about Z lands at (0,1), spin +90.
+        let f = box_at(1.0, 0.0).rotated(Vec3::ZERO, Vec3::Z, std::f32::consts::FRAC_PI_2);
+        let o = f.world_origin();
+        assert!((o - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-4, "origin orbits to (0,1), got {o:?}");
+        assert!((f.placement.spin_deg - 90.0).abs() < 1e-3, "spin picks up +90°");
+    }
+
+    #[test]
+    fn scale_2x_doubles_dims_and_pushes_origin() {
+        let f = box_at(1.0, 0.0).scaled(Vec3::ZERO, 2.0);
+        assert!((f.world_origin() - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-4);
+        match f.primitive {
+            Primitive::Box { w, d, h } => assert!((w - 2.0).abs() < 1e-4 && (d - 2.0).abs() < 1e-4 && (h - 2.0).abs() < 1e-4),
+            _ => panic!("still a box"),
+        }
+    }
+
+    #[test]
+    fn ray_triangle_hits_and_misses() {
+        // Triangle in the z=1 plane; ray from below straight up hits at t=1.
+        let (a, b, c) = (Vec3::new(-1.0, -1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(0.0, 1.0, 1.0));
+        let t = ray_triangle(Vec3::ZERO, Vec3::Z, a, b, c);
+        assert!(t.map_or(false, |t| (t - 1.0).abs() < 1e-4));
+        // A ray off to the side misses.
+        assert!(ray_triangle(Vec3::new(5.0, 5.0, 0.0), Vec3::Z, a, b, c).is_none());
+    }
+
+    #[test]
+    fn frame_uv_round_trips_on_a_tilted_face() {
+        let f = Frame::from_point_normal(Vec3::new(1.0, 2.0, 3.0), Vec3::new(1.0, 1.0, 0.0));
+        let uv = Vec2::new(0.7, -1.3);
+        let back = f.to_uv(f.from_uv(uv));
+        assert!((back - uv).length() < 1e-4, "uv→world→uv is identity");
+        // The reconstructed world point lies in the plane (normal component ~0).
+        let w = f.from_uv(uv);
+        assert!((w - f.origin).dot(f.normal()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coplanar_face_groups_only_the_same_plane() {
+        // Two coplanar tris (z=0 quad) + one tri on the x=0 plane sharing an edge.
+        let positions = vec![
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], // tri 0 (z=0)
+            [0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], // tri 1 (z=0, adjacent)
+            [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], // tri 2 (x=0)
+        ];
+        let face = coplanar_face(&positions, 0);
+        assert_eq!(face.len(), 2, "the z=0 face is the two coplanar tris");
+        assert!(face.contains(&0) && face.contains(&1));
+        assert!(!face.contains(&2), "the perpendicular tri is a different face");
+    }
+
+    #[test]
+    fn circle_geom_outlines_to_a_closed_loop() {
+        let g = cad_kernel::Geom::Circle(cad_kernel::Circle { center: KVec2::new(0.0, 0.0), radius: 2.0 });
+        let paths = geom_outlines(&g);
+        assert_eq!(paths.len(), 1);
+        let p = &paths[0];
+        assert!(p.len() > 8);
+        // first ≈ last (closed) and every point is ~radius from centre.
+        assert!((p[0] - p[p.len() - 1]).length() < 1e-3);
+        assert!(p.iter().all(|q| (q.length() - 2.0).abs() < 1e-3));
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn ell() -> Vec<Vec2> {
+        vec![
+            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 2.0),
+            Vec2::new(2.0, 2.0), Vec2::new(2.0, 4.0), Vec2::new(0.0, 4.0),
+        ]
+    }
+
+    /// The point of the whole design: `Primitive` and `Feature` must STAY `Copy`. A
+    /// `Vec<Vec2>` inside the enum would have dropped it from both, and `Feature` is
+    /// returned by value from `translated`/`rotated`/`scaled`/`mirrored`.
+    ///
+    /// This is a compile-time proof — if `Copy` were lost, this would not build.
+    #[test]
+    fn primitive_and_feature_are_still_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<Primitive>();
+        assert_copy::<Feature>();
+    }
+
+    /// An outline is stored once, recentred on its own bounds, and reports the extents
+    /// the `Extrusion` variant caches for `local_aabb`.
+    #[test]
+    fn a_profile_is_stored_centred_with_its_extents() {
+        let mut m = Model::default();
+        let (id, centre, w, d) = m.add_profile(&ell()).expect("an L is a valid outline");
+        assert_eq!((w, d), (4.0, 4.0));
+        assert_eq!(centre, Vec2::new(2.0, 2.0));
+        let p = m.profile(id).expect("the profile must be retrievable by id");
+        assert_eq!(p.pts.len(), 6, "6 corners, no repeated wrap point");
+        let (mut mnx, mut mxx) = (f32::INFINITY, f32::NEG_INFINITY);
+        for q in &p.pts {
+            mnx = mnx.min(q[0]);
+            mxx = mxx.max(q[0]);
+        }
+        assert!((mnx + mxx).abs() < 1e-6, "stored points must be centred on the origin");
+    }
+
+    /// A closed ring must not keep its repeated first point, or the extrusion would carry
+    /// a zero-length edge into earcut.
+    #[test]
+    fn a_repeated_wrap_point_is_dropped() {
+        let mut m = Model::default();
+        let mut closed = ell();
+        closed.push(closed[0]);
+        let (id, ..) = m.add_profile(&closed).unwrap();
+        assert_eq!(m.profile(id).unwrap().pts.len(), 6);
+    }
+
+    /// Winding is normalised so extruded faces point consistently outward.
+    #[test]
+    fn winding_is_normalised_to_ccw() {
+        let mut m = Model::default();
+        let mut cw = ell();
+        cw.reverse();
+        let (id, ..) = m.add_profile(&cw).unwrap();
+        let pts: Vec<Vec2> =
+            m.profile(id).unwrap().pts.iter().map(|q| Vec2::new(q[0], q[1])).collect();
+        assert!(signed_area2(&pts) > 0.0, "stored winding must be CCW whatever came in");
+    }
+
+    /// Refusal, not repair. earcut's behaviour on a self-intersecting loop is undefined,
+    /// and a non-watertight mesh would silently poison the light calc downstream.
+    #[test]
+    fn bad_outlines_are_refused_with_a_reason() {
+        let mut m = Model::default();
+        assert_eq!(
+            m.add_profile(&[Vec2::ZERO, Vec2::new(1.0, 0.0)]),
+            Err(ProfileError::TooFewPoints)
+        );
+        assert_eq!(
+            m.add_profile(&[Vec2::ZERO, Vec2::new(2.0, 0.0), Vec2::new(4.0, 0.0)]),
+            Err(ProfileError::Degenerate),
+            "collinear points enclose nothing"
+        );
+        // A bow-tie: the two diagonals cross.
+        assert_eq!(
+            m.add_profile(&[
+                Vec2::new(0.0, 0.0), Vec2::new(4.0, 4.0),
+                Vec2::new(4.0, 0.0), Vec2::new(0.0, 4.0),
+            ]),
+            Err(ProfileError::SelfIntersecting)
+        );
+        assert!(m.profiles.is_empty(), "a refused outline must not be stored");
+    }
+
+    /// A convex square is NOT self-intersecting — the adjacency skip must not produce
+    /// false positives, or every legitimate outline would be rejected.
+    #[test]
+    fn an_ordinary_outline_is_not_flagged() {
+        let mut m = Model::default();
+        assert!(m
+            .add_profile(&[
+                Vec2::ZERO, Vec2::new(4.0, 0.0), Vec2::new(4.0, 4.0), Vec2::new(0.0, 4.0)
+            ])
+            .is_ok());
+        assert!(m.add_profile(&ell()).is_ok(), "an L-shape is a valid building outline");
+    }
+
+    /// Ids are KEYS, not indices — the rule the rest of this crate already follows.
+    #[test]
+    fn profile_ids_are_stable_keys() {
+        let mut m = Model::default();
+        let (a, ..) = m.add_profile(&ell()).unwrap();
+        let (b, ..) = m.add_profile(&ell()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(m.profile(a).map(|p| p.id), Some(a));
+        assert!(m.profile(999).is_none(), "a stale id resolves to None, never a panic");
+    }
+
+    /// The whole point: an L-shaped outline becomes a real solid — the shape no Box
+    /// could represent. Proven through csgrs, not just the data structures.
+    #[test]
+    fn an_l_shaped_outline_extrudes_to_a_real_solid() {
+        let mut m = Model::default();
+        let (id, centre, w, d) = m.add_profile(&ell()).unwrap();
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 },
+            Primitive::Extrusion { profile: id, h: 3.0, w, d },
+        );
+        let mesh = m.eval();
+        assert!(mesh.tri_count() > 0, "the extrusion must produce geometry");
+        let (mn, mx) = mesh.bounds().expect("a solid has bounds");
+        assert!((mx[2] - mn[2] - 3.0).abs() < 1e-3, "it must rise to its height");
+        assert!((mx[0] - mn[0] - 4.0).abs() < 1e-3, "and span the outline's width");
+    }
+
+    /// A dangling profile id must degrade to empty geometry, never a panic — a stale id
+    /// should not take the app down.
+    #[test]
+    fn a_stale_profile_id_yields_no_geometry_and_does_not_panic() {
+        let mut m = Model::default();
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Extrusion { profile: 404, h: 2.0, w: 1.0, d: 1.0 },
+        );
+        assert_eq!(m.eval().tri_count(), 0);
+    }
+
+    /// `local_aabb` must stay a pure function of the primitive (it drives ray-pick and
+    /// has no Model) — which is why the extents are cached in the variant.
+    #[test]
+    fn local_aabb_uses_the_cached_extents() {
+        let p = Primitive::Extrusion { profile: 1, h: 3.0, w: 4.0, d: 6.0 };
+        let (mn, mx) = p.local_aabb();
+        assert_eq!(mn, Vec3::new(-2.0, -3.0, 0.0));
+        assert_eq!(mx, Vec3::new(2.0, 3.0, 3.0));
+    }
+}

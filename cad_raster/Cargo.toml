@@ -1,0 +1,17 @@
+[package]
+name        = "cad_raster"
+version     = "0.1.0"
+edition     = "2021"
+description = "Raster → vector subsystem for RUST_CAD — human-in-the-loop layer-by-layer peel (see RASTER_TO_VECTOR.md)"
+license     = "MIT OR Apache-2.0"
+repository  = "local"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+# Pure-Rust, permissive (MIT/Apache) raster library — decode + grayscale +
+# pixel access. The high-level analysis / tracing is ours (cad_raster).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+
+[dev-dependencies]
+# Only the `trace_to_dxf` example needs the DXF writer.
+cad_io = { path = "../cad_io" }

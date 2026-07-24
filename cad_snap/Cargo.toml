@@ -1,0 +1,12 @@
+[package]
+name        = "cad_snap"
+version     = "0.1.0"
+edition     = "2021"
+description = "Object-snap engine for 2D CAD — END, MID, CEN, QUA, INT, PER, TAN, NEA"
+license     = "MIT OR Apache-2.0"
+repository  = "local"
+readme      = "README.md"
+keywords    = ["cad", "snap", "geometry", "osnap", "2d"]
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }

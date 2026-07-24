@@ -1,0 +1,7 @@
+[package]
+name    = "cad_io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }

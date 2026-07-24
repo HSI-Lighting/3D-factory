@@ -1,0 +1,10 @@
+[package]
+name    = "cad_nurbs"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust 2D NURBS / B-spline curves — De Boor evaluation, knot vectors, rational weights. Standard algorithms from The NURBS Book (Piegl & Tiller). No UI dependencies."
+
+[dependencies]
+# none — pure-math crate, no workspace siblings as deps.
+# Keeping it self-contained means cad_kernel can take cad_nurbs as a
+# dep (for Geom::Spline) without a circular dep.

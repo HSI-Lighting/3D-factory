@@ -1,0 +1,11 @@
+[package]
+name    = "cad_cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cad_cli"
+path = "src/main.rs"
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
