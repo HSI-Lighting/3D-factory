@@ -276,7 +276,7 @@ impl Sandbox {
         model.push(
             BoolOp::Difference,
             Plane::default(),
-            Placement { u: 0.0, v: 0.0, lift: -0.3, spin_deg: 0.0 },
+            Placement { u: 0.0, v: 0.0, lift: -0.3, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Cylinder { r: 0.55, h: 1.6, sides: 32 },
         );
         let cached = model.eval();

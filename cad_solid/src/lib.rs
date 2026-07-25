@@ -154,7 +154,12 @@ impl Plane {
         let n = u.cross(v).normalize();
         let o = self.origin() + u * place.u + v * place.v + n * place.lift;
         let basis = Mat4::from_cols(u.extend(0.0), v.extend(0.0), n.extend(0.0), o.extend(1.0));
-        basis * Mat4::from_rotation_z(place.spin_deg.to_radians())
+        // Local rotation: spin about Z(=n), pitch about X(=u), roll about Y(=v). Applied
+        // before the basis maps local→world, so each angle rotates about that plane axis.
+        let rot = Mat4::from_rotation_z(place.spin_deg.to_radians())
+            * Mat4::from_rotation_x(place.pitch_deg.to_radians())
+            * Mat4::from_rotation_y(place.roll_deg.to_radians());
+        basis * rot
     }
 
     /// World point → this plane's local `(u, v)` (drops the normal component) —
@@ -173,13 +178,20 @@ impl Plane {
 }
 
 /// Pose of a primitive on its plane: in-plane `(u, v)`, `lift` along the normal,
-/// and `spin` about the normal.
+/// and rotation about the three LOCAL axes — `spin` about the normal (local Z),
+/// `pitch` about local X (= plane u), `roll` about local Y (= plane v). The two
+/// tilt angles are `#[serde(default)]` so sidecars written before 3-axis rotation
+/// still load (they read back as 0 = upright, the old behaviour).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Default)]
 pub struct Placement {
     pub u: f32,
     pub v: f32,
     pub lift: f32,
     pub spin_deg: f32,
+    #[serde(default)]
+    pub pitch_deg: f32,
+    #[serde(default)]
+    pub roll_deg: f32,
 }
 
 /// Twice the signed area of a closed ring (shoelace). Sign gives the winding.
@@ -889,7 +901,7 @@ mod tests {
         ]).unwrap();
         m.push(
             BoolOp::Union, plane,
-            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 },
+            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Extrusion { profile, h: 3.0, w, d },
         );
         let (mn, mx) = m.eval().bounds().expect("has geometry");
@@ -899,13 +911,37 @@ mod tests {
             "the 1×1 profile is preserved in the plane");
     }
 
+    /// A shape drawn OFF-CENTRE on a custom plane must land at ONE world spot, not also its
+    /// mirror image — the "shows up on the opposite side too" report.
+    #[test]
+    fn custom_plane_extrusion_is_not_mirrored() {
+        // Plane normal +X (u=Y, v=Z), origin at (5,0,0).
+        let plane = Plane::from_basis(Vec3::new(5.0, 0.0, 0.0), Vec3::Y, Vec3::Z);
+        let mut m = Model::default();
+        // A 1×1 square centred at uv (2, 1).
+        let (profile, centre, w, d) = m.add_profile(&[
+            Vec2::new(1.5, 0.5), Vec2::new(2.5, 0.5),
+            Vec2::new(2.5, 1.5), Vec2::new(1.5, 1.5),
+        ]).unwrap();
+        m.push(
+            BoolOp::Union, plane,
+            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            Primitive::Extrusion { profile, h: 2.0, w, d },
+        );
+        let (mn, mx) = m.eval().bounds().unwrap();
+        // world = (5,0,0) + Y*2 + Z*1 = (5,2,1); extrude +X by 2 ⇒ x 5..7, y 1.5..2.5, z 0.5..1.5.
+        assert!(mn[0] > 4.9 && mx[0] < 7.1, "x spans 5..7, got {}..{}", mn[0], mx[0]);
+        assert!(mn[1] > 1.4 && mx[1] < 2.6, "y around 2, got {}..{}", mn[1], mx[1]);
+        assert!(mn[2] > 0.4 && mx[2] < 1.6, "z around 1, got {}..{}", mn[2], mx[2]);
+    }
+
     #[test]
     fn world_aabb_follows_placement_and_offset() {
         let f = Feature {
             id: 1,
             op: BoolOp::Union,
             plane: Plane { kind: PlaneKind::XY, offset: 2.0, custom: None },
-            placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0 },
+            placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
         };
         let (mn, mx) = f.world_aabb();
@@ -919,7 +955,7 @@ mod tests {
             id: 1,
             op: BoolOp::Union,
             plane: Plane::default(),
-            placement: Placement { u, v, lift: 0.0, spin_deg: 0.0 },
+            placement: Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
         }
     }
@@ -1120,7 +1156,7 @@ mod profile_tests {
         m.push(
             BoolOp::Union,
             Plane::default(),
-            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 },
+            Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Extrusion { profile: id, h: 3.0, w, d },
         );
         let mesh = m.eval();

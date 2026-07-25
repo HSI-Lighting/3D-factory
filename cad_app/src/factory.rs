@@ -235,6 +235,11 @@ pub struct FactoryState {
     pub gizmo_grab_ground: Option<Vec3>,
     pub gizmo_start_center: Vec3,
 
+    /// Which manipulation the gizmo performs (Move arms vs Rotate rings).
+    pub gizmo_mode: GizmoMode,
+    /// In-progress rotation-ring drag (`None` = idle).
+    pub rot_drag: Option<RotDrag>,
+
     /// True while a dimension field in the properties panel is mid-interaction, so the
     /// whole drag/type is ONE undo step rather than one per keystroke.
     pub dim_edit_active: bool,
@@ -494,7 +499,17 @@ pub fn primitive_dim_fields(ui: &mut egui::Ui, p: &mut Primitive) -> bool {
     c
 }
 
-/// One draggable handle of the move gizmo.
+/// Which manipulation the on-screen gizmo performs. Toggled from the 3D Factory bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GizmoMode {
+    /// Translate arms + centre free-move (the original gizmo).
+    #[default]
+    Move,
+    /// Three rotation rings (one per axis) — drag a ring to spin about that axis.
+    Rotate,
+}
+
+/// One draggable handle of the gizmo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GizmoHandle {
     /// Constrain the move to the world X / Y / Z axis.
@@ -504,28 +519,61 @@ pub enum GizmoHandle {
     /// Free move — the centre cube where the three arms meet; slides the object across the
     /// ground plane (a combination of X and Y at once).
     Free,
+    /// Rotation ring about axis 0 / 1 / 2 (world axes for furniture, plane-local for a
+    /// feature). Coloured red / green / blue like the move axes.
+    RotX,
+    RotY,
+    RotZ,
 }
 
 impl GizmoHandle {
     /// World-axis direction, or `None` for Free.
     pub fn axis(self) -> Option<Vec3> {
         match self {
-            GizmoHandle::X => Some(Vec3::X),
-            GizmoHandle::Y => Some(Vec3::Y),
-            GizmoHandle::Z => Some(Vec3::Z),
+            GizmoHandle::X | GizmoHandle::RotX => Some(Vec3::X),
+            GizmoHandle::Y | GizmoHandle::RotY => Some(Vec3::Y),
+            GizmoHandle::Z | GizmoHandle::RotZ => Some(Vec3::Z),
             GizmoHandle::Free => None,
+        }
+    }
+
+    /// Which of the three axes (0/1/2) this handle rotates about, if it's a ring.
+    pub fn ring_axis(self) -> Option<usize> {
+        match self {
+            GizmoHandle::RotX => Some(0),
+            GizmoHandle::RotY => Some(1),
+            GizmoHandle::RotZ => Some(2),
+            _ => None,
         }
     }
 
     /// Axis colour: X red, Y green, Z blue — the universal convention.
     pub fn color(self) -> egui::Color32 {
         match self {
-            GizmoHandle::X => egui::Color32::from_rgb(235, 80, 80),
-            GizmoHandle::Y => egui::Color32::from_rgb(90, 210, 90),
-            GizmoHandle::Z => egui::Color32::from_rgb(90, 150, 245),
+            GizmoHandle::X | GizmoHandle::RotX => egui::Color32::from_rgb(235, 80, 80),
+            GizmoHandle::Y | GizmoHandle::RotY => egui::Color32::from_rgb(90, 210, 90),
+            GizmoHandle::Z | GizmoHandle::RotZ => egui::Color32::from_rgb(90, 150, 245),
             GizmoHandle::Free => egui::Color32::from_rgb(230, 230, 230),
         }
     }
+}
+
+/// In-progress rotation-ring drag. Captured on grab so the whole gesture is one undo step
+/// and the rotation is measured relative to where you first grabbed the ring.
+#[derive(Clone, Copy, Debug)]
+pub struct RotDrag {
+    pub handle: GizmoHandle,
+    /// Unit rotation axis in WORLD space (a world axis for furniture; a plane-local axis for
+    /// a feature).
+    pub axis: Vec3,
+    pub center: Vec3,
+    /// Reference vector (in the rotation plane) where the grab started.
+    pub r0: Vec3,
+    /// Start rotation of the target: furniture Euler `[x,y,z]°`, or feature `[pitch,roll,spin]°`.
+    pub start_rot: [f32; 3],
+    /// For a feature, which placement angle (0=pitch,1=roll,2=spin) this ring drives.
+    pub feat_axis: usize,
+    pub is_furniture: bool,
 }
 
 /// One projected arm of the gizmo.
@@ -542,6 +590,22 @@ pub struct GizmoView {
     pub center_s: egui::Pos2,
     pub len_w: f32,
     pub arms: [Option<GizmoArm>; 3],
+}
+
+/// One rotation ring projected to screen: the axis it spins about + its screen polyline.
+pub struct Ring {
+    pub handle: GizmoHandle,
+    pub axis: Vec3,           // world-space unit rotation axis
+    pub pts: Vec<egui::Pos2>, // projected circle (screen space)
+}
+
+/// The rotation gizmo projected to screen for one frame — three rings + centre.
+pub struct RingView {
+    pub center: Vec3,
+    pub center_s: egui::Pos2,
+    pub radius: f32,
+    pub rings: Vec<Ring>,
+    pub is_furniture: bool,
 }
 
 /// Gizmo sizing / pick tolerances (pixels).
@@ -655,10 +719,23 @@ pub struct FurnitureInst {
     pub asset: usize,
     pub pos: [f32; 3],
     pub scale: f32,
-    /// Rotation about the vertical (Z) axis, degrees.
-    pub rot_deg: f32,
+    /// Euler rotation in DEGREES about the world X, Y, Z axes (applied X→Y→Z), pivoting
+    /// on the instance's base-centre. `rot[2]` is the old yaw (Z), so upgrades are clean.
+    pub rot: [f32; 3],
     /// Linear RGB, applied in the Textures menu (default a warm neutral).
     pub color: [f32; 3],
+}
+
+impl FurnitureInst {
+    /// World rotation matrix (X→Y→Z Euler). Applied to a scaled local point/normal.
+    pub fn rot_mat(&self) -> glam::Mat3 {
+        glam::Mat3::from_euler(
+            glam::EulerRot::XYZ,
+            self.rot[0].to_radians(),
+            self.rot[1].to_radians(),
+            self.rot[2].to_radians(),
+        )
+    }
 }
 
 /// One level of the building.
@@ -913,6 +990,8 @@ impl Default for FactoryState {
             gizmo_drag: None,
             gizmo_grab_ground: None,
             gizmo_start_center: Vec3::ZERO,
+            gizmo_mode: GizmoMode::Move,
+            rot_drag: None,
             dim_edit_active: false,
             show_plan: true,
             ceilings: std::collections::HashSet::new(),
@@ -1185,17 +1264,17 @@ impl FactoryState {
             asset,
             pos: [at.x, at.y, self.active_base_z()],
             scale: 1.0,
-            rot_deg: 0.0,
+            rot: [0.0, 0.0, 0.0],
             color,
         });
         self.select_furniture(self.furniture.len() - 1);
     }
 
-    /// World-space vertex of instance `i`'s local mesh point — pose applied.
+    /// World-space vertex of instance `i`'s local mesh point — pose applied
+    /// (scale → 3-axis rotate → translate).
     fn furniture_point(&self, inst: &FurnitureInst, p: [f32; 3]) -> Vec3 {
-        let (c, s) = (inst.rot_deg.to_radians().cos(), inst.rot_deg.to_radians().sin());
         let lp = Vec3::new(p[0] * inst.scale, p[1] * inst.scale, p[2] * inst.scale);
-        Vec3::new(lp.x * c - lp.y * s, lp.x * s + lp.y * c, lp.z) + Vec3::from(inst.pos)
+        inst.rot_mat() * lp + Vec3::from(inst.pos)
     }
 
     /// World AABB of a placed furniture instance.
@@ -1464,6 +1543,26 @@ impl FactoryState {
         }
     }
 
+    /// Set one of a feature's rotation angles (degrees) about its plane-LOCAL axes:
+    /// axis 0 = pitch (about plane u), 1 = roll (about plane v), 2 = spin (about the
+    /// normal). Drives both the numeric fields and the rotation-ring gizmo.
+    pub fn set_feature_rotation(&mut self, id: u32, axis: usize, deg: f32) {
+        if let Some(f) = self.model.get_mut(id) {
+            match axis {
+                0 => f.placement.pitch_deg = deg,
+                1 => f.placement.roll_deg = deg,
+                _ => f.placement.spin_deg = deg,
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// A feature's current rotation `[pitch, roll, spin]` in degrees, for the panel/gizmo.
+    pub fn feature_rotation(&self, id: u32) -> Option<[f32; 3]> {
+        let f = self.model.features.iter().find(|f| f.id == id)?;
+        Some([f.placement.pitch_deg, f.placement.roll_deg, f.placement.spin_deg])
+    }
+
     /// The primitive of the single selected feature, for the properties panel.
     pub fn selected_primitive(&self) -> Option<(u32, Primitive, Vec3)> {
         let id = self.selected_single()?;
@@ -1535,6 +1634,134 @@ impl FactoryState {
             }
         }
         best.map(|(_, h)| h)
+    }
+
+    // ===================================================================
+    // Rotation-ring gizmo
+    // ===================================================================
+
+    /// The rotation target: `(center_world, [axis0, axis1, axis2], is_furniture)`. Furniture
+    /// rotates about WORLD axes; a single feature about its plane's LOCAL axes (u, v, n) — so
+    /// ring 0→pitch(u), 1→roll(v), 2→spin(n), matching `set_feature_rotation`. `None` unless
+    /// exactly one furniture OR one feature is selected.
+    fn rot_target(&self) -> Option<(Vec3, [Vec3; 3], bool)> {
+        let (mn, mx) = self.selection_aabb()?;
+        let center = (mn + mx) * 0.5;
+        if self.sel_furniture.is_some() {
+            return Some((center, [Vec3::X, Vec3::Y, Vec3::Z], true));
+        }
+        let id = self.selected_single()?;
+        let f = self.model.features.iter().find(|f| f.id == id)?;
+        let (u, v) = f.plane.axes();
+        let (u, v) = (u.normalize_or_zero(), v.normalize_or_zero());
+        let n = u.cross(v).normalize_or_zero();
+        Some((center, [u, v, n], false))
+    }
+
+    /// Rotation gizmo geometry for this frame — three rings sized like the move arms.
+    pub fn rotation_rings(&self, rect: egui::Rect, mvp: &[f32; 16]) -> Option<RingView> {
+        let (center, axes, is_furniture) = self.rot_target()?;
+        let (mn, mx) = self.selection_aabb()?;
+        let half = ((mx - mn) * 0.5).max_element().max(1e-3);
+        let ppw = self.px_per_world(center, rect, mvp);
+        let min_world = if ppw > 1e-6 { GIZMO_MIN_PX / ppw } else { half };
+        let radius = (half * 1.3).max(min_world);
+        let center_s = world_to_screen(center, rect, mvp)?;
+        let handles = [GizmoHandle::RotX, GizmoHandle::RotY, GizmoHandle::RotZ];
+        const SEG: usize = 48;
+        let mut rings = Vec::with_capacity(3);
+        for i in 0..3 {
+            let (a, b) = (axes[(i + 1) % 3], axes[(i + 2) % 3]);
+            let mut pts = Vec::with_capacity(SEG + 1);
+            for k in 0..=SEG {
+                let t = (k as f32) / (SEG as f32) * std::f32::consts::TAU;
+                let w = center + (a * t.cos() + b * t.sin()) * radius;
+                if let Some(s) = world_to_screen(w, rect, mvp) {
+                    pts.push(s);
+                }
+            }
+            rings.push(Ring { handle: handles[i], axis: axes[i], pts });
+        }
+        Some(RingView { center, center_s, radius, rings, is_furniture })
+    }
+
+    /// Which rotation ring is under the cursor (nearest ring polyline within tolerance).
+    pub fn pick_ring(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<GizmoHandle> {
+        let rv = self.rotation_rings(rect, mvp)?;
+        let mut best: Option<(f32, GizmoHandle)> = None;
+        for ring in &rv.rings {
+            let mut d = f32::INFINITY;
+            for seg in ring.pts.windows(2) {
+                d = d.min(dist_point_segment(cursor, seg[0], seg[1]));
+            }
+            if d <= GIZMO_AXIS_PICK && best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, ring.handle));
+            }
+        }
+        best.map(|(_, h)| h)
+    }
+
+    /// The unit vector from the ring centre to where the cursor ray meets the ring's plane
+    /// (axis-component removed). `None` if the ray is parallel to the plane or hits the centre.
+    fn ray_to_ring_vec(&self, cursor: egui::Pos2, center: Vec3, axis: Vec3, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let denom = dir.dot(axis);
+        if denom.abs() < 1e-5 { return None; }
+        let t = (center - orig).dot(axis) / denom;
+        if t <= 0.0 { return None; }
+        let p = orig + dir * t;
+        let r = (p - center) - axis * (p - center).dot(axis);
+        let len = r.length();
+        if len < 1e-5 { return None; }
+        Some(r / len)
+    }
+
+    /// Begin a rotation-ring drag on `handle`. Captures the grab reference + start rotation so
+    /// the gesture is one undo step. Returns false if the grab can't be established.
+    pub fn rot_begin(&mut self, handle: GizmoHandle, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> bool {
+        let Some((center, axes, is_furniture)) = self.rot_target() else { return false };
+        let Some(ai) = handle.ring_axis() else { return false };
+        let axis = axes[ai];
+        let Some(r0) = self.ray_to_ring_vec(cursor, center, axis, rect, mvp) else { return false };
+        let start_rot = if is_furniture {
+            self.sel_furniture.and_then(|fi| self.furniture.get(fi)).map(|f| f.rot).unwrap_or([0.0; 3])
+        } else {
+            self.selected_single().and_then(|id| self.feature_rotation(id)).unwrap_or([0.0; 3])
+        };
+        self.rot_drag = Some(RotDrag {
+            handle, axis, center, r0, start_rot,
+            feat_axis: ai, is_furniture,
+        });
+        true
+    }
+
+    /// Apply the current cursor position to the live rotation drag. Furniture composes a
+    /// world-axis quaternion (kept as Euler for the numeric fields); a feature adds the swept
+    /// angle to the ring's plane-local placement angle.
+    pub fn rot_update(&mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) {
+        let Some(d) = self.rot_drag else { return };
+        let Some(r1) = self.ray_to_ring_vec(cursor, d.center, d.axis, rect, mvp) else { return };
+        // Signed angle r0→r1 about the axis (radians).
+        let angle = d.r0.cross(r1).dot(d.axis).atan2(d.r0.dot(r1));
+        if d.is_furniture {
+            if let Some(inst) = self.sel_furniture.and_then(|fi| self.furniture.get_mut(fi)) {
+                let q_start = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    d.start_rot[0].to_radians(), d.start_rot[1].to_radians(), d.start_rot[2].to_radians(),
+                );
+                let q = glam::Quat::from_axis_angle(d.axis, angle) * q_start;
+                let (x, y, z) = q.to_euler(glam::EulerRot::XYZ);
+                inst.rot = [x.to_degrees(), y.to_degrees(), z.to_degrees()];
+            }
+        } else if let Some(id) = self.selected_single() {
+            let deg = d.start_rot[d.feat_axis] + angle.to_degrees();
+            self.set_feature_rotation(id, d.feat_axis, deg);
+        }
+    }
+
+    /// End a rotation drag.
+    pub fn rot_end(&mut self) {
+        self.rot_drag = None;
     }
 
     // ===================================================================
@@ -1645,7 +1872,7 @@ impl FactoryState {
         let (profile, centre, w, d) = self.model.add_profile(footprint).ok()?;
         // An extrusion rises +Z from its placement, so lift so the TOP face lands on
         // `top_z` — a floor's top is what you stand on, a ceiling's underside what you see.
-        let placement = Placement { u: centre.x, v: centre.y, lift: top_z - t, spin_deg: 0.0 };
+        let placement = Placement { u: centre.x, v: centre.y, lift: top_z - t, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
         let p = Primitive::Extrusion { profile, h: t, w, d };
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.dirty = true;
@@ -1666,6 +1893,7 @@ impl FactoryState {
         let (profile, centre, w, d) = self.model.add_profile(footprint)?;
         let placement = Placement {
             u: centre.x, v: centre.y, lift: self.active_base_z(), spin_deg: 0.0,
+            pitch_deg: 0.0, roll_deg: 0.0,
         };
         let id = self.model.push(
             BoolOp::Union,
@@ -1719,7 +1947,7 @@ impl FactoryState {
             return false;
         };
         let void_h = (top - base).max(0.1) + 0.02; // punch fully through the building
-        let placement = Placement { u: centre.x, v: centre.y, lift: base, spin_deg: 0.0 };
+        let placement = Placement { u: centre.x, v: centre.y, lift: base, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
         self.model.push(
             BoolOp::Difference,
             Plane::default(),
@@ -1880,7 +2108,8 @@ impl FactoryState {
                     asset: f.asset,
                     pos: f.pos,
                     scale: f.scale,
-                    rot_deg: f.rot_deg,
+                    rot_deg: f.rot[2],
+                    rot_xy: [f.rot[0], f.rot[1]],
                     color: f.color,
                 })
                 .collect(),
@@ -1973,7 +2202,7 @@ impl FactoryState {
                 asset: f.asset,
                 pos: f.pos,
                 scale: if f.scale > 0.0 { f.scale } else { 1.0 },
-                rot_deg: f.rot_deg,
+                rot: [f.rot_xy[0], f.rot_xy[1], f.rot_deg],
                 color: f.color,
             })
             .collect();
@@ -2012,6 +2241,7 @@ impl FactoryState {
         // level 2 is active must build on level 2, not under it.
         let placement = Placement {
             u: uv.x + ox, v: uv.y + oy, lift: self.active_base_z(), spin_deg: 0.0,
+            pitch_deg: 0.0, roll_deg: 0.0,
         };
         let id = self.model.push(BoolOp::Union, plane, placement, p);
         self.selection = vec![id];
@@ -2048,6 +2278,7 @@ impl FactoryState {
         let p = Primitive::Box { w: len, d: thickness, h: height };
         let placement = Placement {
             u: mid.x, v: mid.y, lift: base_z, spin_deg: d.y.atan2(d.x).to_degrees(),
+            pitch_deg: 0.0, roll_deg: 0.0,
         };
         Some(self.model.push(BoolOp::Union, Plane::default(), placement, p))
     }
@@ -2318,6 +2549,20 @@ impl FactoryState {
         self.ensure_sel_mesh();
     }
 
+    /// Upper bound for `cam_dist`, scaled to the model so you can always dolly back far
+    /// enough to frame the WHOLE scene — a fixed cap (was 400) was too small for large
+    /// imports (e.g. an architectural DXF in millimetres, span 100 000+). 20× the largest
+    /// span, never below 400 so small/empty scenes keep the old generous headroom.
+    pub fn max_cam_dist(&self) -> f32 {
+        self.cached
+            .bounds()
+            .map(|(mn, mx)| {
+                let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
+                (span * 20.0).max(400.0)
+            })
+            .unwrap_or(400.0)
+    }
+
     /// Zoom-extents: the ONLY thing that moves `cam_target`.
     pub fn fit(&mut self) {
         if let Some((mn, mx)) = self.cached.bounds() {
@@ -2327,7 +2572,7 @@ impl FactoryState {
                 (mn[2] + mx[2]) * 0.5,
             ];
             let span = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
-            self.cam_dist = (span * 2.5).clamp(1.0, 400.0);
+            self.cam_dist = (span * 2.5).clamp(1.0, self.max_cam_dist());
         } else {
             self.cam_target = [0.0, 0.0, 0.0];
             self.cam_dist = 12.0;
@@ -2380,7 +2625,8 @@ impl FactoryState {
     /// Dolly the camera by a factor: `<1` zooms in (closer), `>1` zooms out. The same
     /// clamp as the scroll wheel, so command / gizmo / wheel all agree.
     pub fn zoom_by(&mut self, factor: f32) {
-        self.cam_dist = (self.cam_dist * factor).clamp(0.4, 400.0);
+        let max = self.max_cam_dist();
+        self.cam_dist = (self.cam_dist * factor).clamp(0.4, max);
     }
 
     /// Reframe the camera to a screen rectangle — the 2D "zoom window", in 3D. Moves the
@@ -2424,7 +2670,8 @@ impl FactoryState {
         let t = Vec3::from(self.cam_target) + right * (ndc_x * half_w) + up * (ndc_y * half_h);
         self.cam_target = [t.x, t.y, t.z];
         let factor = (bh / vp.height().max(1.0)).clamp(0.02, 1.0);
-        self.cam_dist = (self.cam_dist * factor).clamp(0.4, 400.0);
+        let max = self.max_cam_dist();
+        self.cam_dist = (self.cam_dist * factor).clamp(0.4, max);
     }
 
     /// One-line screen-zoom status for the session recorder: how zoomed-in the camera is
@@ -2565,20 +2812,20 @@ impl FactoryState {
     }
 
     /// Placed furniture as shaded triangles, ready to draw alongside the scene. Each
-    /// instance's mesh is posed by its `pos` / `scale` / `rot_deg` and tinted by its colour.
+    /// instance's mesh is posed by its `pos` / `scale` / `rot` (3-axis) and tinted by its colour.
     pub fn furniture_verts(&self) -> Vec<V3> {
         let mut out = Vec::new();
         for inst in &self.furniture {
             let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
-            let (s, c) = (inst.scale, inst.rot_deg.to_radians().cos());
-            let sn = inst.rot_deg.to_radians().sin();
+            let s = inst.scale;
+            let rm = inst.rot_mat();
             let pos = Vec3::from(inst.pos);
             for (i, p) in asset.positions.iter().enumerate() {
-                // scale → rotate about Z → translate
+                // scale → 3-axis rotate → translate (normals rotate the same way)
                 let lp = Vec3::new(p[0] * s, p[1] * s, p[2] * s);
-                let wp = Vec3::new(lp.x * c - lp.y * sn, lp.x * sn + lp.y * c, lp.z) + pos;
+                let wp = rm * lp + pos;
                 let n = asset.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                let wn = Vec3::new(n[0] * c - n[1] * sn, n[0] * sn + n[1] * c, n[2]);
+                let wn = rm * Vec3::from(n);
                 out.push(v(wp, shade_furniture(inst.color, wn)));
             }
         }
@@ -2799,6 +3046,30 @@ impl FactoryState {
                 let o = sk.frame.origin;
                 seg(&mut out, o, o + sk.frame.u * 1.5, [1.0, 0.3, 0.3]);
                 seg(&mut out, o, o + sk.frame.v * 1.5, [0.3, 1.0, 0.3]);
+            }
+        }
+        out
+    }
+
+    /// The ACTIVE sketch's LIVE geometry — which lives in the app's swapped-in document,
+    /// passed in here — lifted onto its frame, so what you draw on a face appears in the 3D
+    /// view immediately (2D↔3D linked). `sketch_lines` can't show it because the active
+    /// sketch's own `doc` is empty while it is being edited.
+    pub fn live_sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
+        let mut out = Vec::new();
+        let Some(session) = self.session.as_ref() else { return out };
+        let Some(sk) = self.model.sketches.get(session.idx) else { return out };
+        let c = [1.0, 0.62, 0.12]; // hot — the sketch you are drawing right now
+        for d in &doc.dobjects {
+            for poly in cad_solid::geom_outlines(&d.geom) {
+                for w in poly.windows(2) {
+                    seg(
+                        &mut out,
+                        sk.frame.from_uv(Vec2::new(w[0].x, w[0].y)),
+                        sk.frame.from_uv(Vec2::new(w[1].x, w[1].y)),
+                        c,
+                    );
+                }
             }
         }
         out
@@ -3036,6 +3307,50 @@ mod furniture_and_color_tests {
         st.place_furniture(idx, Vec3::ZERO);   // selects the furniture
         assert_eq!(st.sel_furniture, Some(0));
         assert!(st.selection.is_empty(), "selecting furniture clears the feature selection");
+    }
+
+    /// Furniture rotates about all three axes: yaw 90°/Z sends local +X→+Y; pitch 90°/X
+    /// sends +Y→+Z. (Single-axis cases hold regardless of Euler order.)
+    #[test]
+    fn furniture_rotation_is_three_axis() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("x".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.furniture[0].rot = [0.0, 0.0, 90.0];
+        let p = st.furniture_point(&st.furniture[0], [1.0, 0.0, 0.0]);
+        assert!(p.x.abs() < 1e-4 && (p.y - 1.0).abs() < 1e-4, "yaw 90° sends +X→+Y, got {p:?}");
+        st.furniture[0].rot = [90.0, 0.0, 0.0];
+        let q = st.furniture_point(&st.furniture[0], [0.0, 1.0, 0.0]);
+        assert!((q.z - 1.0).abs() < 1e-4, "pitch 90° sends +Y→+Z, got {q:?}");
+    }
+
+    /// The 3-axis furniture rotation survives the sidecar (Z via `rot_deg`, X/Y via `rot_xy`).
+    #[test]
+    fn furniture_three_axis_rotation_survives_the_sidecar() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("x".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.furniture[0].rot = [12.0, 34.0, 56.0];
+        let json = serde_json::to_string(&st.to_persist()).unwrap();
+        let back: crate::simlux_io::FactoryDoc = serde_json::from_str(&json).unwrap();
+        let mut re = FactoryState::default();
+        re.apply_persist(back);
+        let r = re.furniture[0].rot;
+        assert!((r[0] - 12.0).abs() < 1e-3 && (r[1] - 34.0).abs() < 1e-3 && (r[2] - 56.0).abs() < 1e-3,
+            "3-axis rot round-trips, got {r:?}");
+    }
+
+    /// A feature's local rotation is settable, reads back, and the model still meshes.
+    #[test]
+    fn feature_rotation_setter_round_trips() {
+        let mut st = FactoryState::default();
+        st.add_box();
+        let id = st.selected_single().unwrap();
+        st.set_feature_rotation(id, 2, 45.0); // spin (about normal)
+        st.set_feature_rotation(id, 0, 30.0); // pitch (about u)
+        assert_eq!(st.feature_rotation(id), Some([30.0, 0.0, 45.0]));
+        st.recompute();
+        assert!(!st.cached.positions.is_empty(), "rotated feature still produces a mesh");
     }
 
     /// The gizmo drives furniture: move_selection shifts the selected instance's position,
@@ -3296,10 +3611,10 @@ mod gizmo_and_props_tests {
         let mut st = FactoryState::default();
         // Two boxes, far apart in X.
         let a = st.model.push(cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement { u: -3.0, v: 0.0, lift: 0.0, spin_deg: 0.0 },
+            cad_solid::Placement { u: -3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Box { w: 0.5, d: 0.5, h: 0.5 });
         let b = st.model.push(cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0 },
+            cad_solid::Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Box { w: 0.5, d: 0.5, h: 0.5 });
         st.selection.clear();
         st.recompute();

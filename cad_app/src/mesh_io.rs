@@ -299,9 +299,291 @@ fn flat_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     }
 }
 
+// ============================================================================
+//   FBX (binary) reader
+// ============================================================================
+//
+// FBX is the format most 3D tools (Blender, Maya, 3ds Max, SketchUp) export for
+// furniture. The common on-disk form is BINARY: a magic header, a `u32` version, then a
+// tree of NODE records. Each node = (EndOffset, NumProps, PropsLen, NameLen, Name, props…,
+// child nodes…, null-terminator). We walk the tree, pull every `Vertices` (f64 array) and
+// `PolygonVertexIndex` (i32 array, polygons terminated by a bit-negated last index), pair
+// them in document order, and fan-triangulate into the same triangle soup OBJ/3DS produce.
+//
+// Array properties may be zlib-DEFLATE compressed (Encoding==1); we inflate with
+// `miniz_oxide` (already in the build via image/png). Normals in the file are ignored — we
+// compute a flat per-triangle normal, exactly like the OBJ path, so shading always works.
+//
+// AXIS: FBX defaults to Y-up; the 3D Factory is Z-up. We rotate Y-up→Z-up ((x,y,z)→(x,-z,y))
+// so imported furniture stands upright. (UpAxis override in GlobalSettings isn't read yet —
+// if a model imports lying down, that's the case to add.)
+//
+// Robustness: never panics. Any truncation / unknown structure just stops the walk and
+// returns whatever triangles were recovered (0 → the caller reports "no triangles").
+
+/// Parse a binary FBX into a triangle soup. ASCII FBX and truncated files yield an empty
+/// mesh (the caller then reports "no triangles found").
+pub fn parse_fbx(data: &[u8]) -> ObjMesh {
+    let mut out = ObjMesh::default();
+    // Magic: "Kaydara FBX Binary  \x00\x1a\x00" (23 bytes) + u32 version.
+    const MAGIC: &[u8] = b"Kaydara FBX Binary  \x00\x1a\x00";
+    if data.len() < 27 || &data[..MAGIC.len()] != MAGIC {
+        return out; // not binary FBX (ASCII unsupported)
+    }
+    let version = u32::from_le_bytes([data[23], data[24], data[25], data[26]]);
+    let v75 = version >= 7500; // 7.5+ uses 64-bit node offsets
+    let mut verts_list: Vec<Vec<f64>> = Vec::new();
+    let mut idx_list: Vec<Vec<i32>> = Vec::new();
+    let mut cur = FbxCursor { buf: data, pos: 27 };
+    // Top level: sibling nodes until a null record / EOF.
+    while let Some(more) = fbx_walk(&mut cur, v75, &mut verts_list, &mut idx_list) {
+        if !more { break; }
+    }
+    // Pair each geometry's vertices with its polygon indices (document order).
+    for (verts, indices) in verts_list.iter().zip(idx_list.iter()) {
+        fbx_triangulate(verts, indices, &mut out);
+    }
+    out
+}
+
+/// Little-endian byte cursor over the FBX buffer. Every read is bounds-checked; a short
+/// read returns `None` so the walk unwinds cleanly instead of panicking.
+struct FbxCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FbxCursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> { self.take(1).map(|b| b[0]) }
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        self.take(8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    }
+    /// A node offset field: `u64` on FBX 7.5+, else `u32`.
+    fn offset(&mut self, v75: bool) -> Option<u64> {
+        if v75 { self.u64() } else { self.u32().map(|x| x as u64) }
+    }
+}
+
+/// Read ONE node record at the cursor. Returns `Some(true)` if a real node was read,
+/// `Some(false)` on the null-record terminator (end of a sibling list), `None` on EOF /
+/// malformed. Named `Vertices` / `PolygonVertexIndex` arrays are captured into the lists;
+/// children are walked recursively.
+fn fbx_walk(
+    cur: &mut FbxCursor,
+    v75: bool,
+    verts: &mut Vec<Vec<f64>>,
+    idxs: &mut Vec<Vec<i32>>,
+) -> Option<bool> {
+    let end_offset = cur.offset(v75)?;
+    let num_props = cur.offset(v75)?;
+    let _prop_len = cur.offset(v75)?;
+    let name_len = cur.u8()?;
+    // Null record: all-zero header terminates the current sibling list.
+    if end_offset == 0 && num_props == 0 && name_len == 0 {
+        return Some(false);
+    }
+    let name = cur.take(name_len as usize)?.to_vec();
+    let want = matches!(name.as_slice(), b"Vertices" | b"PolygonVertexIndex");
+    // Read every property (must advance the cursor correctly even for ones we ignore).
+    let mut got_f64: Option<Vec<f64>> = None;
+    let mut got_i32: Option<Vec<i32>> = None;
+    for _ in 0..num_props {
+        match fbx_property(cur, want)? {
+            FbxProp::F64Arr(a) if got_f64.is_none() => got_f64 = Some(a),
+            FbxProp::I32Arr(a) if got_i32.is_none() => got_i32 = Some(a),
+            _ => {}
+        }
+    }
+    if name.as_slice() == b"Vertices" {
+        if let Some(a) = got_f64 { verts.push(a); }
+    } else if name.as_slice() == b"PolygonVertexIndex" {
+        if let Some(a) = got_i32 { idxs.push(a); }
+    }
+    // Nested child nodes occupy [cur.pos, end_offset). A null record ends them.
+    let end = end_offset as usize;
+    while cur.pos < end {
+        match fbx_walk(cur, v75, verts, idxs) {
+            Some(true) => {}
+            _ => break,
+        }
+    }
+    // Jump to the recorded end so trailing padding / unread props never desync the walk.
+    if end >= cur.pos && end <= cur.buf.len() {
+        cur.pos = end;
+    }
+    Some(true)
+}
+
+/// A decoded FBX property value — we only materialise the array kinds we use.
+enum FbxProp {
+    F64Arr(Vec<f64>),
+    I32Arr(Vec<i32>),
+    Skip,
+}
+
+/// Read one property, advancing the cursor. When `decode` is false, array payloads are
+/// skipped without decoding (cheaper for the arrays we don't want, e.g. Normals/UVs).
+fn fbx_property(cur: &mut FbxCursor, decode: bool) -> Option<FbxProp> {
+    let ty = cur.u8()?;
+    match ty {
+        b'Y' => { cur.take(2)?; Some(FbxProp::Skip) }               // i16
+        b'C' => { cur.take(1)?; Some(FbxProp::Skip) }               // bool
+        b'I' => { cur.take(4)?; Some(FbxProp::Skip) }               // i32
+        b'F' => { cur.take(4)?; Some(FbxProp::Skip) }               // f32
+        b'D' => { cur.take(8)?; Some(FbxProp::Skip) }               // f64
+        b'L' => { cur.take(8)?; Some(FbxProp::Skip) }               // i64
+        b'S' | b'R' => { let n = cur.u32()? as usize; cur.take(n)?; Some(FbxProp::Skip) }
+        b'f' | b'd' | b'l' | b'i' | b'b' => {
+            let len = cur.u32()? as usize;      // element count
+            let encoding = cur.u32()?;          // 0 = raw, 1 = zlib
+            let comp_len = cur.u32()? as usize; // bytes on disk
+            let raw = cur.take(comp_len)?;
+            let elem = match ty { b'd' | b'l' => 8, b'f' | b'i' => 4, _ => 1 };
+            if !decode || (ty != b'd' && ty != b'i') {
+                return Some(FbxProp::Skip); // wrong type for us, or skipping
+            }
+            let bytes: Vec<u8> = if encoding == 1 {
+                match miniz_oxide::inflate::decompress_to_vec_zlib(raw) {
+                    Ok(b) => b,
+                    Err(_) => return Some(FbxProp::Skip),
+                }
+            } else {
+                raw.to_vec()
+            };
+            if bytes.len() < len * elem { return Some(FbxProp::Skip); }
+            match ty {
+                b'd' => Some(FbxProp::F64Arr(
+                    bytes.chunks_exact(8).take(len)
+                        .map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect(),
+                )),
+                b'i' => Some(FbxProp::I32Arr(
+                    bytes.chunks_exact(4).take(len)
+                        .map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect(),
+                )),
+                _ => Some(FbxProp::Skip),
+            }
+        }
+        _ => None, // unknown property type → bail (walk unwinds)
+    }
+}
+
+/// Fan-triangulate one FBX geometry (flat `verts` xyz-triples + `PolygonVertexIndex`) into
+/// `out`, converting Y-up→Z-up. A negative index is the bit-negated LAST vertex of a
+/// polygon (`real = !neg`), so polygons of any size are handled.
+fn fbx_triangulate(verts: &[f64], indices: &[i32], out: &mut ObjMesh) {
+    let vcount = verts.len() / 3;
+    let pos = |i: usize| -> [f32; 3] {
+        let (x, y, z) = (verts[3 * i] as f32, verts[3 * i + 1] as f32, verts[3 * i + 2] as f32);
+        [x, -z, y] // Y-up → Z-up
+    };
+    let mut poly: Vec<usize> = Vec::new();
+    for &raw in indices {
+        let (idx, last) = if raw < 0 { ((!raw) as usize, true) } else { (raw as usize, false) };
+        if idx < vcount { poly.push(idx); }
+        if last {
+            // fan: (0, k, k+1)
+            for k in 1..poly.len().saturating_sub(1) {
+                let (a, b, c) = (pos(poly[0]), pos(poly[k]), pos(poly[k + 1]));
+                let n = flat_normal(a, b, c);
+                out.positions.push(a); out.positions.push(b); out.positions.push(c);
+                out.normals.push(n); out.normals.push(n); out.normals.push(n);
+            }
+            poly.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- FBX synthetic-file helpers -----------------------------------------
+    fn fbx_prop_array(ty: u8, raw: &[u8], count: usize, compress: bool) -> Vec<u8> {
+        let mut p = vec![ty];
+        p.extend((count as u32).to_le_bytes());
+        if compress {
+            let z = miniz_oxide::deflate::compress_to_vec_zlib(raw, 6);
+            p.extend(1u32.to_le_bytes());
+            p.extend((z.len() as u32).to_le_bytes());
+            p.extend(z);
+        } else {
+            p.extend(0u32.to_le_bytes());
+            p.extend((raw.len() as u32).to_le_bytes());
+            p.extend_from_slice(raw);
+        }
+        p
+    }
+    fn fbx_prop_d(vals: &[f64], compress: bool) -> Vec<u8> {
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fbx_prop_array(b'd', &raw, vals.len(), compress)
+    }
+    fn fbx_prop_i(vals: &[i32], compress: bool) -> Vec<u8> {
+        let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        fbx_prop_array(b'i', &raw, vals.len(), compress)
+    }
+    fn fbx_node(start: usize, name: &[u8], num_props: u32, props: &[u8], children: &[u8]) -> Vec<u8> {
+        let end = start + 13 + name.len() + props.len() + children.len(); // 13 = 4+4+4+1 (32-bit)
+        let mut out = Vec::new();
+        out.extend((end as u32).to_le_bytes());
+        out.extend(num_props.to_le_bytes());
+        out.extend((props.len() as u32).to_le_bytes());
+        out.push(name.len() as u8);
+        out.extend_from_slice(name);
+        out.extend_from_slice(props);
+        out.extend_from_slice(children);
+        out
+    }
+    /// Build a minimal binary FBX with one Geometry (a single triangle), optionally with
+    /// the arrays zlib-compressed — exercising the exact path a real exporter uses.
+    fn synth_fbx(compress: bool) -> Vec<u8> {
+        let magic_len = 27;
+        let geo_header = 13 + b"Geometry".len();
+        let children_start = magic_len + geo_header; // Geometry has no props
+        let vprops = fbx_prop_d(&[0., 0., 0., 1., 0., 0., 0., 1., 0.], compress);
+        let vnode = fbx_node(children_start, b"Vertices", 1, &vprops, &[]);
+        let iprops = fbx_prop_i(&[0, 1, !2], compress); // !2 = -3 → closes poly (0,1,2)
+        let pnode = fbx_node(children_start + vnode.len(), b"PolygonVertexIndex", 1, &iprops, &[]);
+        let mut children = Vec::new();
+        children.extend_from_slice(&vnode);
+        children.extend_from_slice(&pnode);
+        children.extend_from_slice(&[0u8; 13]); // null record ends Geometry's children
+        let geo = fbx_node(magic_len, b"Geometry", 0, &[], &children);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"Kaydara FBX Binary  \x00\x1a\x00");
+        buf.extend(7400u32.to_le_bytes());
+        buf.extend_from_slice(&geo);
+        buf
+    }
+
+    #[test]
+    fn fbx_binary_reads_one_triangle_uncompressed() {
+        let m = parse_fbx(&synth_fbx(false));
+        assert_eq!(m.tri_count(), 1, "one polygon → one triangle");
+        // Y-up → Z-up: (0,1,0) becomes (0,0,1).
+        assert_eq!(m.positions[2], [0.0, 0.0, 1.0]);
+        assert_eq!(m.normals.len(), m.positions.len());
+    }
+
+    #[test]
+    fn fbx_binary_reads_one_triangle_zlib_compressed() {
+        let m = parse_fbx(&synth_fbx(true));
+        assert_eq!(m.tri_count(), 1, "compressed arrays inflate to the same triangle");
+        assert_eq!(m.positions[1], [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fbx_rejects_non_fbx_bytes() {
+        assert_eq!(parse_fbx(b"not an fbx file at all").tri_count(), 0);
+    }
 
     /// A unit tetrahedron: 4 triangular faces → 12 positions (3 per tri).
     #[test]

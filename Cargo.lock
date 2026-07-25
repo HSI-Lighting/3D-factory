@@ -272,6 +272,7 @@ dependencies = [
  "glam 0.29.3",
  "glow 0.14.2",
  "image",
+ "miniz_oxide",
  "resvg",
  "serde",
  "serde_json",

@@ -141,7 +141,11 @@ pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho
         let z = (dist * 20.0).max(200.0);
         Mat4::orthographic_rh_gl(-hw, hw, -hh, hh, -z, z)
     } else {
-        Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), 0.05, (dist * 6.0).max(80.0))
+        // Near scales with distance so the depth buffer keeps precision when dollied far
+        // back over a large plan (fixed 0.05 vs a 600k far plane = severe z-fighting). The
+        // 0.05 floor preserves close-up behaviour exactly for normal-sized models.
+        let near = (dist * 0.001).max(0.05);
+        Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), near, (dist * 6.0).max(80.0))
     };
     (proj * view).to_cols_array()
 }

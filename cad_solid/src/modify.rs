@@ -475,7 +475,7 @@ mod tests {
         let id = m.push(
             BoolOp::Union,
             Plane::default(),
-            Placement { u, v, lift: 0.0, spin_deg: 0.0 },
+            Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
         );
         (m, id)

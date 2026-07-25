@@ -227,6 +227,39 @@ pub enum DbgEvent {
         elapsed_us:  u64,
     },
 
+    /// One STAGE of opening a drawing (`.dxf`/`.dwg`/`.rsm`) — read-from-disk, parse,
+    /// install, fit-view, sidecar, … each timed separately so a slow open names the
+    /// stage responsible instead of showing one opaque gap. `stage` is the phase label
+    /// ("read file", "parse dxf", "install doc", "fit view", "sidecar", "TOTAL do_open"),
+    /// `dobjects` the object count known at that point (0 before parse), `detail` any
+    /// extra note (path, bytes, error). Emitted only while recording, so it costs
+    /// nothing in normal use. The event timeline's `elapsed_ms` also captures the gaps
+    /// between `do_open` returning and the first index rebuild / render.
+    ImportStage {
+        stage:       String,
+        dobjects:    usize,
+        elapsed_us:  u64,
+        detail:      String,
+    },
+
+    /// One 3D-Factory operation — extrude / cut-through / recess / furniture-extrude /
+    /// mesh-import / delete / recompute. This is the "record what's going on in 3D" tap:
+    /// when a solid does not show up, the dump names the op, its SOURCE (face sketch / 2D
+    /// selection / picked geometry), the exact geometry (`detail` carries loops, height or
+    /// depth, the sketch frame origin+normal, the cut SPAN endpoints, the chosen target
+    /// feature id, the through flag), and the model size before→after so a no-op or a
+    /// cut that hit the wrong body is visible without guessing. `bodies`/`tris` are the
+    /// resulting CSG body and triangle counts. Emitted only while recording.
+    FactoryOp {
+        op:              String,
+        source:          String,
+        detail:          String,
+        features_before: usize,
+        features_after:  usize,
+        bodies:          usize,
+        tris:            usize,
+    },
+
     /// On-demand snapshot of the user-selected smart-dobject CANDIDATE —
     /// the full geometry (coordinates) of the chosen dobjects, whether an
     /// exploded set OR a block (then the block's DEFINITION-space contents
@@ -746,6 +779,25 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
                 name, success, before_dobj_count, after_dobj_count, detail),
         DbgEvent::MemoryEvent { name, bytes, elapsed_us } =>
             format!("🧠 {} ~{} bytes in {} µs", name, bytes, elapsed_us),
+        DbgEvent::ImportStage { stage, dobjects, elapsed_us, detail } => {
+            let ms = *elapsed_us as f64 / 1000.0;
+            // 16 ms = one frame @ 60 Hz — anything past that the user SEES as a stall.
+            let flag = if *elapsed_us >= 16_000 { "  ⚠ SLOW" } else { "" };
+            let det = if detail.is_empty() { String::new() } else { format!("  — {detail}") };
+            format!("📂 IMPORT [{stage}] ⏱ {ms:.1} ms  ({dobjects} dobj){flag}{det}")
+        }
+        DbgEvent::FactoryOp { op, source, detail, features_before, features_after, bodies, tris } => {
+            // Flag a no-op (feature count unchanged) — the usual shape of "nothing showed
+            // up". Ops that legitimately add no CSG feature (recompute, delete, mesh
+            // import — furniture is a separate mesh instance) are exempt.
+            let exempt = matches!(op.as_str(), "recompute" | "delete-selected" | "import-mesh");
+            let flag = if features_after == features_before && !exempt {
+                "  ⚠ NO FEATURE ADDED"
+            } else { "" };
+            format!(
+                "🧱 FACTORY [{op}] src={source}  feat {features_before}→{features_after}  bodies={bodies} tris={tris}{flag}\n         {detail}"
+            )
+        }
         DbgEvent::GeometryCapture { label, entries } => {
             let mut s = format!(
                 "📐 GEOMETRY CAPTURE — {} ({} entr{})",

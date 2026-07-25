@@ -250,7 +250,7 @@ mod tests {
         let mut m = Model::default();
         m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(2.0, 2.0, 1.0));
         m.push(BoolOp::Union, Plane::default(),
-            Placement { u: 10.0, v: 0.0, lift: 0.0, spin_deg: 0.0 }, boxf(2.0, 2.0, 1.0));
+            Placement { u: 10.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 }, boxf(2.0, 2.0, 1.0));
         assert_eq!(m.eval().tri_count(), 24, "two Union bodies concatenate, not merge");
     }
 
@@ -262,11 +262,11 @@ mod tests {
         // Body 1: a box with a smaller box subtracted (a "room").
         m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 4.0, 3.0));
         m.push(BoolOp::Difference, Plane::default(),
-            Placement { u: 0.0, v: 0.0, lift: 0.5, spin_deg: 0.0 }, boxf(2.0, 2.0, 3.0));
+            Placement { u: 0.0, v: 0.0, lift: 0.5, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 }, boxf(2.0, 2.0, 3.0));
         let carved = m.eval().tri_count();
         // Body 2: an independent "ceiling" added afterward.
         m.push(BoolOp::Union, Plane::default(),
-            Placement { u: 0.0, v: 0.0, lift: 3.0, spin_deg: 0.0 }, boxf(4.0, 4.0, 0.2));
+            Placement { u: 0.0, v: 0.0, lift: 3.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 }, boxf(4.0, 4.0, 0.2));
         let with_ceiling = m.eval().tri_count();
         // The ceiling ADDS its own triangles; it does not re-fill (reduce) the carved body.
         assert!(with_ceiling > carved, "the ceiling is added, not merged into the carve");
@@ -280,7 +280,7 @@ mod tests {
         m.push(
             BoolOp::Difference,
             Plane::default(),
-            Placement { u: 0.0, v: 0.0, lift: 0.5, spin_deg: 0.0 },
+            Placement { u: 0.0, v: 0.0, lift: 0.5, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             Primitive::Cylinder { r: 0.5, h: 2.0, sides: 24 },
         );
         let cut = m.eval();

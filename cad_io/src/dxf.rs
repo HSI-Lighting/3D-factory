@@ -30,11 +30,11 @@ pub fn read_dxf(text: &str) -> Result<Document, String> {
     let mut doc = Document::default();
     let mut i = 0;
     while i < pairs.len() {
-        let (code, value) = &pairs[i];
-        if *code == 0 && value == "SECTION" && i + 1 < pairs.len() {
-            let (c2, name) = &pairs[i + 1];
-            if *c2 == 2 {
-                match name.as_str() {
+        let (code, value) = pairs[i];
+        if code == 0 && value == "SECTION" && i + 1 < pairs.len() {
+            let (c2, name) = pairs[i + 1];
+            if c2 == 2 {
+                match name {
                     "TABLES"   => i = read_tables(&pairs, i + 2, &mut doc),
                     // BLOCKS precedes ENTITIES in the file, so block defs land
                     // in the table before any INSERT in ENTITIES resolves them.
@@ -53,9 +53,17 @@ pub fn read_dxf(text: &str) -> Result<Document, String> {
 /// Tokenize the source into (code, value) pairs. DXF files use CRLF or
 /// LF; we tolerate either. The line *after* the code line is the value;
 /// trailing whitespace is trimmed.
-fn parse_pairs(text: &str) -> Result<Vec<(i32, String)>, String> {
+///
+/// ZERO-COPY: each value BORROWS a slice of `text` instead of allocating a
+/// fresh `String`. On a large drawing this is the whole ball game — tens of
+/// millions of tiny heap allocations (measured ≈20 s parsing a 734 MB file)
+/// collapse to none; the pairs vec is the only allocation, and it is reserved
+/// up front so it barely re-grows. The returned slices live as long as `text`.
+fn parse_pairs(text: &str) -> Result<Vec<(i32, &str)>, String> {
     let mut lines = text.lines();
-    let mut out = Vec::new();
+    // ~1 pair per 24 source bytes is a safe under-estimate for typical DXF, so
+    // the vec re-grows a couple of times at most rather than dozens.
+    let mut out: Vec<(i32, &str)> = Vec::with_capacity(text.len() / 24 + 16);
     while let Some(code_line) = lines.next() {
         let code_str = code_line.trim();
         if code_str.is_empty() { continue; }
@@ -63,30 +71,30 @@ fn parse_pairs(text: &str) -> Result<Vec<(i32, String)>, String> {
             .ok_or_else(|| "DXF: code line without value line".to_string())?;
         let code: i32 = code_str.parse()
             .map_err(|_| format!("DXF: bad group code '{}'", code_str))?;
-        out.push((code, value_line.trim().to_string()));
+        out.push((code, value_line.trim()));
     }
     Ok(out)
 }
 
-fn skip_to_endsec(pairs: &[(i32, String)], start: usize) -> usize {
+fn skip_to_endsec(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDSEC" { return i + 1; }
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDSEC" { return i + 1; }
         i += 1;
     }
     pairs.len()
 }
 
-fn read_tables(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+fn read_tables(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDSEC" { return i + 1; }
-        if *c == 0 && v == "TABLE" && i + 1 < pairs.len() {
-            let (c2, name) = &pairs[i + 1];
-            if *c2 == 2 {
-                match name.as_str() {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDSEC" { return i + 1; }
+        if c == 0 && v == "TABLE" && i + 1 < pairs.len() {
+            let (c2, name) = pairs[i + 1];
+            if c2 == 2 {
+                match name {
                     "LAYER" => i = read_layer_table(pairs, i + 2, doc),
                     "LTYPE" => i = read_ltype_table(pairs, i + 2, doc),
                     _       => i = skip_to_endtab(pairs, i + 2),
@@ -99,22 +107,22 @@ fn read_tables(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
     pairs.len()
 }
 
-fn skip_to_endtab(pairs: &[(i32, String)], start: usize) -> usize {
+fn skip_to_endtab(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDTAB" { return i + 1; }
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDTAB" { return i + 1; }
         i += 1;
     }
     pairs.len()
 }
 
-fn read_layer_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+fn read_layer_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDTAB" { return i + 1; }
-        if *c == 0 && v == "LAYER" {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDTAB" { return i + 1; }
+        if c == 0 && v == "LAYER" {
             // Accumulate this layer's fields until the next 0-group.
             let mut name = String::new();
             let mut color = Color::Aci(7);   // ACI 7 = white default
@@ -123,7 +131,7 @@ fn read_layer_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -
             i += 1;
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name    = pairs[i].1.clone(),
+                    2  => name    = pairs[i].1.to_string(),
                     62 => {
                         let aci: i32 = pairs[i].1.parse().unwrap_or(7);
                         // Negative ACI = layer off; magnitude = the color.
@@ -132,7 +140,7 @@ fn read_layer_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -
                         color = Color::Aci(abs);
                         if off { flags |= 0x01; }   // mark hidden
                     }
-                    6  => lt_name = pairs[i].1.clone(),
+                    6  => lt_name = pairs[i].1.to_string(),
                     70 => flags |= pairs[i].1.parse::<i32>().unwrap_or(0),
                     _ => {}
                 }
@@ -170,20 +178,20 @@ fn read_layer_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -
     pairs.len()
 }
 
-fn read_ltype_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+fn read_ltype_table(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDTAB" { return i + 1; }
-        if *c == 0 && v == "LTYPE" {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDTAB" { return i + 1; }
+        if c == 0 && v == "LTYPE" {
             let mut name = String::new();
             let mut desc = String::new();
             let mut pattern: Vec<f32> = Vec::new();
             i += 1;
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name = pairs[i].1.clone(),
-                    3  => desc = pairs[i].1.clone(),
+                    2  => name = pairs[i].1.to_string(),
+                    3  => desc = pairs[i].1.to_string(),
                     49 => {
                         // dash length (positive) or gap (negative) — convert to
                         // alternating positive lengths for our pattern repr
@@ -205,21 +213,21 @@ fn read_ltype_table(pairs: &[(i32, String)], start: usize, doc: &mut Document) -
     pairs.len()
 }
 
-fn read_entities(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+fn read_entities(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDSEC" { return i + 1; }
-        if *c == 0 {
-            let entity_kind = v.clone();
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDSEC" { return i + 1; }
+        if c == 0 {
+            let entity_kind = v;
             // Collect this entity's fields until the next 0-group.
-            let mut fields: Vec<(i32, String)> = Vec::new();
+            let mut fields: Vec<(i32, &str)> = Vec::new();
             i += 1;
             while i < pairs.len() && pairs[i].0 != 0 {
-                fields.push(pairs[i].clone());
+                fields.push(pairs[i]);
                 i += 1;
             }
-            if let Some(d) = build_entity(&entity_kind, &fields, doc) {
+            if let Some(d) = build_entity(entity_kind, &fields, doc) {
                 doc.push(d);
             }
             continue;
@@ -235,7 +243,7 @@ fn read_entities(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> u
 /// (names starting with `*` — *Model_Space, *Paper_Space, *U### hatch/dim
 /// blocks) are skipped: their geometry already lives in ENTITIES, and importing
 /// them would duplicate it. INSERTs in ENTITIES resolve to these by name.
-fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usize {
+fn read_blocks(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
     // TWO passes so nested INSERTs resolve regardless of definition order:
     //   pass 1 registers every real block name (empty placeholder, fixes ids);
     //   pass 2 fills each block's base + entities (build_entity now resolves
@@ -245,13 +253,13 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
     let mut i = start;
     loop {
         if i >= pairs.len() { end = pairs.len(); break; }
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDSEC" { end = i + 1; break; }
-        if *c == 0 && v == "BLOCK" {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDSEC" { end = i + 1; break; }
+        if c == 0 && v == "BLOCK" {
             let name = block_name(pairs, i + 1);
-            if is_real_block(&name) && doc.blocks.find(&name).is_none() {
+            if is_real_block(name) && doc.blocks.find(name).is_none() {
                 doc.blocks.add(Block {
-                    name, base: Vec2::new(0.0, 0.0), dobjects: Vec::new(),
+                    name: name.to_string(), base: Vec2::new(0.0, 0.0), dobjects: Vec::new(),
                     smart: false, params: Vec::new(), cut_edges: Vec::new(),
                 });
             }
@@ -263,14 +271,14 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
     // ---- pass 2: fill base point + contained entities -------------------
     let mut i = start;
     while i < end {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "BLOCK" {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "BLOCK" {
             i += 1;
             let mut name = String::new();
             let mut base = Vec2::new(0.0, 0.0);
             while i < pairs.len() && pairs[i].0 != 0 {
                 match pairs[i].0 {
-                    2  => name   = pairs[i].1.clone(),
+                    2  => name   = pairs[i].1.to_string(),
                     10 => base.x = pairs[i].1.parse().unwrap_or(0.0),
                     20 => base.y = pairs[i].1.parse().unwrap_or(0.0),
                     _  => {}
@@ -279,22 +287,22 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
             }
             let mut dobjects: Vec<DObject> = Vec::new();
             while i < pairs.len() {
-                let (c2, v2) = &pairs[i];
-                if *c2 == 0 && (v2 == "ENDBLK" || v2 == "ENDSEC") {
+                let (c2, v2) = pairs[i];
+                if c2 == 0 && (v2 == "ENDBLK" || v2 == "ENDSEC") {
                     if v2 == "ENDBLK" { i += 1; }
                     break;
                 }
-                if *c2 == 0 {
-                    let kind = v2.clone();
+                if c2 == 0 {
+                    let kind = v2;
                     i += 1;
-                    let mut fields: Vec<(i32, String)> = Vec::new();
+                    let mut fields: Vec<(i32, &str)> = Vec::new();
                     while i < pairs.len() && pairs[i].0 != 0 {
-                        fields.push(pairs[i].clone());
+                        fields.push(pairs[i]);
                         i += 1;
                     }
                     // build_entity resolves nested INSERTs via doc.blocks (all
                     // names are registered now, so order doesn't matter).
-                    if let Some(d) = build_entity(&kind, &fields, doc) { dobjects.push(d); }
+                    if let Some(d) = build_entity(kind, &fields, doc) { dobjects.push(d); }
                     continue;
                 }
                 i += 1;
@@ -311,21 +319,21 @@ fn read_blocks(pairs: &[(i32, String)], start: usize, doc: &mut Document) -> usi
 }
 
 /// First `2` (name) group of a BLOCK header, scanning until the next 0-group.
-fn block_name(pairs: &[(i32, String)], start: usize) -> String {
+fn block_name<'a>(pairs: &[(i32, &'a str)], start: usize) -> &'a str {
     let mut i = start;
     while i < pairs.len() && pairs[i].0 != 0 {
-        if pairs[i].0 == 2 { return pairs[i].1.clone(); }
+        if pairs[i].0 == 2 { return pairs[i].1; }
         i += 1;
     }
-    String::new()
+    ""
 }
 
-fn skip_to_endblk(pairs: &[(i32, String)], start: usize) -> usize {
+fn skip_to_endblk(pairs: &[(i32, &str)], start: usize) -> usize {
     let mut i = start;
     while i < pairs.len() {
-        let (c, v) = &pairs[i];
-        if *c == 0 && v == "ENDBLK" { return i + 1; }
-        if *c == 0 && v == "ENDSEC" { return i; }
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDBLK" { return i + 1; }
+        if c == 0 && v == "ENDSEC" { return i; }
         i += 1;
     }
     pairs.len()
@@ -342,22 +350,22 @@ fn is_real_block(name: &str) -> bool {
     !(u.starts_with("*MODEL_SPACE") || u.starts_with("*PAPER_SPACE"))
 }
 
-fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<DObject> {
-    let mut layer_name = String::new();
+fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DObject> {
+    let mut layer_name: &str = "";
     let mut color: Option<Color> = None;
-    let mut linetype_name: Option<String> = None;
+    let mut linetype_name: Option<&str> = None;
     let mut visible = true;
     // helpers — return None when the field is missing or unparseable
     let get_f = |code: i32| -> Option<f64> {
-        fields.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
+        fields.iter().find(|&&(c, _)| c == code).and_then(|&(_, v)| v.parse().ok())
     };
     let get_i = |code: i32| -> Option<i32> {
-        fields.iter().find(|(c, _)| *c == code).and_then(|(_, v)| v.parse().ok())
+        fields.iter().find(|&&(c, _)| c == code).and_then(|&(_, v)| v.parse().ok())
     };
 
-    for (c, v) in fields {
-        match *c {
-            8  => layer_name = v.clone(),
+    for &(c, v) in fields {
+        match c {
+            8  => layer_name = v,
             62 => {
                 if let Ok(aci) = v.parse::<i32>() {
                     color = Some(if aci == 256 { Color::ByLayer }
@@ -365,7 +373,7 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
                                  else { Color::Aci(aci.unsigned_abs() as u8) });
                 }
             }
-            6  => linetype_name = Some(v.clone()),
+            6  => linetype_name = Some(v),
             60 => visible = v.parse::<i32>().unwrap_or(0) == 0,
             _  => {}
         }
@@ -431,8 +439,8 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
             let mut cur_sw = 0.0_f64;   // 40 = start width of segment at this vertex
             let mut cur_ew = 0.0_f64;   // 41 = end width
             let mut const_w = 0.0_f64;  // 43 = constant width for the whole pline
-            for (c, v) in fields {
-                match *c {
+            for &(c, v) in fields {
+                match c {
                     10 => {
                         if let Some(p) = cur.take() {
                             vertices.push(PolyVertex { pos: p, bulge: cur_bulge });
@@ -478,8 +486,8 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
             // a positive magnitude + mirror_x + a rotation adjustment so the
             // |sx|==|sy| (similarity) case (the common furniture mirror) is
             // exact. Non-uniform |sx|≠|sy| isn't modelled (uses |41|).
-            let bname = fields.iter().find(|(c, _)| *c == 2).map(|(_, v)| v.clone())?;
-            let block = doc.blocks.find(&bname)?;   // unknown/skipped block → drop
+            let bname = fields.iter().find(|&&(c, _)| c == 2).map(|&(_, v)| v)?;
+            let block = doc.blocks.find(bname)?;   // unknown/skipped block → drop
             let sx = get_f(41).unwrap_or(1.0);
             let sy = get_f(42).unwrap_or(1.0);
             // Factor signs out into mirror_x + a π rotation; the per-axis
@@ -503,14 +511,14 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
     let mut style = cad_kernel::Style::default();
     if let Some(c) = color { style.color = c; }
     if !layer_name.is_empty() {
-        if let Some(lid) = doc.layers.find(&layer_name) {
+        if let Some(lid) = doc.layers.find(layer_name) {
             style.layer = lid;
         }
         // If the layer wasn't seen in TABLES we'd have to create it here.
         // For now we silently fall back to layer "0" — TODO when needed.
     }
     if let Some(lt) = linetype_name {
-        if let Some(ltid) = doc.linetypes.find(&lt) {
+        if let Some(ltid) = doc.linetypes.find(lt) {
             style.linetype = ltid;
         }
     }

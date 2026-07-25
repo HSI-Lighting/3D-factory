@@ -99,7 +99,12 @@ pub struct FurnitureInstRec {
     pub asset: usize,
     pub pos: [f32; 3],
     pub scale: f32,
+    /// Yaw about Z, degrees (kept for back-compat: old sidecars had only this).
     pub rot_deg: f32,
+    /// Tilt about world X and Y, degrees. `#[serde(default)]` so old sidecars (which have
+    /// only `rot_deg`) still load — they read back as [0,0] = upright.
+    #[serde(default)]
+    pub rot_xy: [f32; 2],
     pub color: [f32; 3],
 }
 

@@ -3792,6 +3792,14 @@ impl CadApp {
                     return;
                 }
             }
+        } else if lower.ends_with(".fbx") {
+            match std::fs::read(path) {
+                Ok(bytes) => crate::mesh_io::parse_fbx(&bytes),
+                Err(e) => {
+                    self.history.push(format!("  ! furniture import: {e}"));
+                    return;
+                }
+            }
         } else {
             match std::fs::read_to_string(path) {
                 Ok(t) => crate::mesh_io::parse_obj(&t),
@@ -3809,12 +3817,31 @@ impl CadApp {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "furniture".into());
+        let features_before = self.factory.model.features.len();
         self.snapshot_factory();
         let tris = mesh.tri_count();
+        let verts = mesh.positions.len();
         let idx = self.factory.add_furniture_asset(name.clone(), mesh);
-        self.factory.place_furniture(idx, glam::Vec3::ZERO);
+        // Drop it at the MODEL's centre, not world origin. Imported drawings live at their
+        // DXF coordinates (e.g. X≈3619, Y≈956), so placing at (0,0,0) put furniture km away,
+        // off-screen — it looked like the import "did nothing". Land it where the building is.
+        let at = match self.factory.cached.bounds() {
+            Some((mn, mx)) => glam::Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, 0.0),
+            None => glam::Vec3::ZERO,
+        };
+        self.factory.place_furniture(idx, at);
         self.factory.open = true;
         self.factory.fit();
+        // Furniture is a mesh INSTANCE, not a CSG feature — so it never shows up in the
+        // Union body count and can't be a cut target; record it so a "where did my import
+        // go?" is answerable from the dump (asset idx, mesh size, live instance count).
+        let detail = format!(
+            "file={name} fmt={} mesh_tris={tris} mesh_verts={verts} asset_idx={idx} \
+             furniture_insts={}",
+            if lower.ends_with(".3ds") { "3ds" } else { "obj" },
+            self.factory.furniture.len(),
+        );
+        self.factory_op_evt("import-mesh", "file", detail, features_before);
         self.history.push(format!("  furniture '{name}' imported ({tris} tris) and placed"));
     }
 
@@ -3877,7 +3904,7 @@ impl CadApp {
                 ui.label(egui::RichText::new(format!("Furniture · {name}")).strong());
                 let mut pos = inst.pos;
                 let mut scale = inst.scale;
-                let mut rot = inst.rot_deg;
+                let mut rot = inst.rot;
                 ui.label(egui::RichText::new("Position").small().weak());
                 for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
                     ui.horizontal(|ui| {
@@ -3893,12 +3920,15 @@ impl CadApp {
                     if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                     if r.changed() { self.factory.furniture[fi].scale = scale; }
                 });
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new("rotation").small().weak()));
-                    let r = ui.add(egui::DragValue::new(&mut rot).speed(1.0).suffix("°"));
-                    if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                    if r.changed() { self.factory.furniture[fi].rot_deg = rot; }
-                });
+                ui.label(egui::RichText::new("Rotation (°)").small().weak());
+                for (axis, lbl) in [(0usize, "rot X"), (1, "rot Y"), (2, "rot Z")] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                        if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                        if r.changed() { self.factory.furniture[fi].rot[axis] = rot[axis]; }
+                    });
+                }
                 self.factory_color_section(ui);
                 self.factory_delete_button(ui);
                 return;
@@ -3968,6 +3998,23 @@ impl CadApp {
                 if ui.small_button("×2").clicked() { self.snapshot_factory(); self.factory.scale_selection(2.0); }
                 if ui.small_button("÷2").clicked() { self.snapshot_factory(); self.factory.scale_selection(0.5); }
             });
+
+            // Rotation about the object's LOCAL axes (pitch/roll/spin) — same values the
+            // rotation-ring gizmo writes. Degrees.
+            if let Some(mut rot) = self.factory.feature_rotation(id) {
+                ui.label(egui::RichText::new("Rotation (°)").small().weak());
+                for (axis, lbl) in [(0usize, "pitch X"), (1, "roll Y"), (2, "spin Z")] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                        if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                        if r.changed() {
+                            self.factory.set_feature_rotation(id, axis, rot[axis]);
+                            self.factory.recompute();
+                        }
+                    });
+                }
+            }
 
             self.factory_color_section(ui);
             self.factory_delete_button(ui);
@@ -4258,12 +4305,11 @@ impl CadApp {
         }
     }
 
-    /// Closed loops drawn on the ACTIVE sketch (the live `self.doc`), in the sketch's (u,v).
-    /// Only closed shapes (circles, closed polylines, rectangles) can become a solid; open
-    /// lines are ignored. These feed the extrude / cut tools.
-    fn factory_sketch_loops(&self) -> Vec<Vec<glam::Vec2>> {
+    /// Closed loops in a document, in its (u,v). Only closed shapes (circles, closed
+    /// polylines, rectangles) can become a solid; open lines are ignored.
+    fn closed_loops_of(doc: &cad_kernel::Document) -> Vec<Vec<glam::Vec2>> {
         let mut out = Vec::new();
-        for d in &self.doc.dobjects {
+        for d in &doc.dobjects {
             for path in cad_solid::geom_outlines(&d.geom) {
                 if path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3 {
                     out.push(path);
@@ -4273,18 +4319,148 @@ impl CadApp {
         out
     }
 
+    /// Pick a GROUND-PLANE 2D object from a click in the 3D view — so plan geometry shown in
+    /// 3D can be selected there and fed to the extrude / cut tools. Prefers the smallest
+    /// closed shape CONTAINING the click; else the nearest line within a small tolerance.
+    fn factory_pick_ground_dobject(
+        &self, pos: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+    ) -> Option<usize> {
+        let w = self.factory.cursor_on_plane(pos, rect, mvp)?;
+        let p = glam::Vec2::new(w.x, w.y);
+        let mut best_inside: Option<(f32, usize)> = None;
+        let mut best_near: Option<(f32, usize)> = None;
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            for path in cad_solid::geom_outlines(&d.geom) {
+                let closed = path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3;
+                if closed {
+                    // even–odd point-in-polygon
+                    let (mut inside, n) = (false, path.len());
+                    let mut j = n - 1;
+                    for k in 0..n {
+                        let (a, b) = (path[k], path[j]);
+                        if (a.y > p.y) != (b.y > p.y)
+                            && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x
+                        {
+                            inside = !inside;
+                        }
+                        j = k;
+                    }
+                    if inside {
+                        let mut a2 = 0.0;
+                        for k in 0..n {
+                            let q = path[(k + 1) % n];
+                            a2 += path[k].x * q.y - q.x * path[k].y;
+                        }
+                        let area = a2.abs() * 0.5;
+                        if best_inside.map_or(true, |(ba, _)| area < ba) {
+                            best_inside = Some((area, i));
+                        }
+                    }
+                }
+                for s in path.windows(2) {
+                    let (a, b) = (s[0], s[1]);
+                    let ab = b - a;
+                    let t = ((p - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
+                    let dist = (a + ab * t - p).length();
+                    if best_near.map_or(true, |(bd, _)| dist < bd) {
+                        best_near = Some((dist, i));
+                    }
+                }
+            }
+        }
+        if let Some((_, i)) = best_inside {
+            return Some(i);
+        }
+        best_near.filter(|(d, _)| *d < 0.3).map(|(_, i)| i)
+    }
+
+    /// Closed loops among the CURRENTLY SELECTED 2D objects, in world XY — so you can select
+    /// a shape on the drawing and extrude/cut it without any face sketch.
+    fn selected_closed_loops(&self) -> Vec<Vec<glam::Vec2>> {
+        let mut out = Vec::new();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                for path in cad_solid::geom_outlines(&d.geom) {
+                    if path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3 {
+                        out.push(path);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// What the extrude / cut tools act on, as `(frame, closed loops, finished-sketch index,
+    /// is-selection)`. Priority:
+    ///   1. the face sketch you are ACTIVELY drafting (loops from live `self.doc`),
+    ///   2. the current 2D SELECTION — extruded flat on the active ground plane,
+    ///   3. the most recent FINISHED face sketch that still holds a closed shape.
+    /// `None` when nothing anywhere holds a closed shape.
+    fn factory_resolve_extrude(
+        &self,
+    ) -> Option<(cad_solid::Frame, Vec<Vec<glam::Vec2>>, Option<usize>, bool)> {
+        if let Some(session) = self.factory.session.as_ref() {
+            let frame = self.factory.model.sketches.get(session.idx)?.frame;
+            let loops = Self::closed_loops_of(&self.doc);
+            return (!loops.is_empty()).then_some((frame, loops, None, false));
+        }
+        // A 2D selection → extrude on the active ground plane (u=X, v=Y so world XY maps 1:1).
+        if !self.selection.is_empty() {
+            let loops = self.selected_closed_loops();
+            if !loops.is_empty() {
+                let z = self.factory.active_base_z();
+                let frame = cad_solid::Frame {
+                    origin: glam::Vec3::new(0.0, 0.0, z),
+                    u: glam::Vec3::X,
+                    v: glam::Vec3::Y,
+                };
+                return Some((frame, loops, None, true));
+            }
+        }
+        for (i, sk) in self.factory.model.sketches.iter().enumerate().rev() {
+            let loops = Self::closed_loops_of(&sk.doc);
+            if !loops.is_empty() {
+                return Some((sk.frame, loops, Some(i), false));
+            }
+        }
+        None
+    }
+
+    /// Consume the drawn shape after an extrude / cut (unless "keep shape" is on, or it came
+    /// from the 2D selection — a selected drawing is never deleted). Clears the live sketch
+    /// and exits it, or clears the finished sketch's doc.
+    fn factory_consume_sketch(&mut self, finished_idx: Option<usize>, is_selection: bool) {
+        if self.factory.keep_sketch || is_selection {
+            return;
+        }
+        match finished_idx {
+            None => {
+                self.doc.dobjects.clear();
+                self.factory_exit_sketch();
+            }
+            Some(i) => {
+                if let Some(sk) = self.factory.model.sketches.get_mut(i) {
+                    sk.doc.dobjects.clear();
+                }
+            }
+        }
+    }
+
     /// EXTRUDE the shapes drawn on the current face into solids that rise `element_height`
     /// along the face's outward normal. `furniture` only changes the tint/label — the solid
     /// is a normal movable feature either way; it NEVER cuts the building. Consumes the
     /// sketch and returns to the model view. Returns how many solids were made.
     fn factory_extrude_sketch(&mut self, furniture: bool) -> usize {
-        let Some(session) = self.factory.session.as_ref() else { return 0 };
-        let frame = self.factory.model.sketches[session.idx].frame;
-        let loops = self.factory_sketch_loops();
-        if loops.is_empty() {
-            self.factory.status = "draw a CLOSED shape on the face first, then Extrude".into();
+        let Some((frame, loops, fin_idx, is_sel)) = self.factory_resolve_extrude() else {
+            self.factory.status =
+                "select a closed shape, or draw one on a face (right-click a face → Draw on this face), then Extrude".into();
             return 0;
-        }
+        };
+        let source = if is_sel { "2d-selection" }
+            else if fin_idx.is_some() { "finished-sketch" }
+            else { "active-face-sketch" };
+        let features_before = self.factory.model.features.len();
+        let n_loops = loops.len();
         self.snapshot_factory();
         let h = self.factory.element_height.max(0.02);
         let plane = cad_solid::Plane::from_basis(frame.origin, frame.u, frame.v);
@@ -4293,7 +4469,7 @@ impl CadApp {
         let mut last = None;
         for pts in loops {
             if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
-                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0 };
+                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
                 let id = self.factory.model.push(
                     cad_solid::BoolOp::Union, plane, placement,
                     cad_solid::Primitive::Extrusion { profile, h, w, d },
@@ -4309,20 +4485,29 @@ impl CadApp {
             return 0;
         }
         let kind = if furniture { "furniture" } else { "element" };
-        if self.factory.keep_sketch {
-            // Keep the drawing & stay in the sketch; just show the new solid behind it.
-            self.factory.recompute();
-            self.factory.status = format!("{made} {kind} solid(s) extruded — shape kept");
-        } else {
-            self.doc.dobjects.clear(); // consume the drawing — it became a solid
-            self.factory_exit_sketch();
-            if let Some(id) = last {
-                self.factory.selection = vec![id];
-            }
-            self.factory.recompute();
-            self.factory.fit();
-            self.factory.status = format!("{made} {kind} solid(s) extruded {h:.2} m from the face");
+        self.factory_consume_sketch(fin_idx, is_sel);
+        // Always SELECT the new solid (and clear any furniture selection) so it can be moved,
+        // recoloured, or Deleted straight away — otherwise the just-made piece felt stuck.
+        if let Some(id) = last {
+            self.factory.sel_furniture = None;
+            self.factory.selection = vec![id];
         }
+        self.factory.recompute();
+        let detail = format!(
+            "furniture={furniture} height={h:.3} loops={n_loops} made={made} new_feat={} \
+             plane_origin=({:.2},{:.2},{:.2})",
+            last.map(|id| format!("#{id}")).unwrap_or_else(|| "none".into()),
+            frame.origin.x, frame.origin.y, frame.origin.z,
+        );
+        self.factory_op_evt(if furniture { "furniture-extrude" } else { "extrude" },
+            source, detail, features_before);
+        self.factory.status = if self.factory.keep_sketch {
+            format!("{made} {kind} solid(s) extruded — shape kept")
+        } else if is_sel {
+            format!("{made} {kind} solid(s) extruded {h:.2} m from the selected shape")
+        } else {
+            format!("{made} {kind} solid(s) extruded {h:.2} m from the face")
+        };
         made
     }
 
@@ -4332,15 +4517,24 @@ impl CadApp {
     /// relocated to sit right after the target solid so the group-based eval subtracts it
     /// from THAT body only. Returns count.
     fn factory_cut_sketch(&mut self, through: bool) -> usize {
-        let Some(session) = self.factory.session.as_ref() else { return 0 };
-        let frame = self.factory.model.sketches[session.idx].frame;
-        let loops = self.factory_sketch_loops();
-        if loops.is_empty() {
-            self.factory.status = "draw a CLOSED shape on the face first, then Cut".into();
+        let Some((frame, loops, fin_idx, is_sel)) = self.factory_resolve_extrude() else {
+            self.factory.status =
+                "select a closed shape, or draw one on a face, then Cut".into();
             return 0;
-        }
-        // The solid to cut: the SMALLEST Union feature whose box contains the face point.
-        let o = frame.origin;
+        };
+        let source = if is_sel { "2d-selection" }
+            else if fin_idx.is_some() { "finished-sketch" }
+            else { "active-face-sketch" };
+        let features_before = self.factory.model.features.len();
+        let n_loops = loops.len();
+        // The solid to cut: the SMALLEST Union feature whose box contains a point UNDER the
+        // shape (its first loop's centre, mapped to the plane) — works for a face OR a 2D
+        // selection sitting over a building.
+        let o = {
+            let l = &loops[0];
+            let c = l.iter().copied().fold(glam::Vec2::ZERO, |a, p| a + p) / (l.len().max(1) as f32);
+            frame.from_uv(c)
+        };
         let mut target: Option<(usize, f32)> = None;
         for (i, f) in self.factory.model.features.iter().enumerate() {
             if f.op != cad_solid::BoolOp::Union {
@@ -4361,31 +4555,101 @@ impl CadApp {
             self.factory.status = "no solid under this face to cut".into();
             return 0;
         };
+        let target_id = self.factory.model.features[tidx].id;
         let (mn, mx) = self.factory.model.features[tidx].world_aabb();
-        // Cutter geometry, in the plane's local Z (+Z is the outward face normal, the solid
-        // is at −Z). THROUGH: span the target's diagonal either side so it fully penetrates.
-        // RECESS: from just outside the face (+eps) down to −depth, a blind pocket.
+
+        // ---- Direction: cut INWARD only, never both sides ---------------------------
+        // Inward = INTO the solid. For a picked FACE, `pick_face` returns an OUTWARD normal,
+        // so inward is simply −n — robust even when the target body is a thin sliver (where a
+        // centroid test is unstable because the centroid sits almost ON the face). For a 2D
+        // GROUND selection the plane normal is world +Z, so there orient by the target
+        // centroid (the solid sits below/around the plane).
         const EPS: f32 = 0.01;
-        let (lift, h) = if through {
-            let span = ((mx.x - mn.x).powi(2) + (mx.y - mn.y).powi(2) + (mx.z - mn.z).powi(2)).sqrt() + 0.2;
-            (-span, 2.0 * span)
+        let n = frame.u.cross(frame.v).normalize_or_zero();
+        let center = (mn + mx) * 0.5;
+        let inward = if is_sel {
+            if n.dot(center - frame.origin) > 0.0 { n } else { -n }
         } else {
-            let depth = self.factory.element_height.max(0.02);
-            (-depth, depth + EPS)
+            -n
         };
+
+        // ---- Depth + which bodies to cut -------------------------------------------
+        // Ray-march EVERY Union body along the cut axis. THROUGH must open the FULL wall
+        // thickness from BOTH faces: depending on which surface you picked, a one-sided cut
+        // leaves the opposite skin ("visible inside, not outside" — the reported symptom). So
+        // measure how far solid runs OUTWARD (−inward) and INWARD (+inward) from the drawn
+        // face, each bounded by ITS OWN gap (so the wall across the room is never reached),
+        // and span the cutter across the whole run + a margin on each face. RECESS stays a
+        // one-sided blind pocket, capped so it can never break through.
+        const MARGIN: f32 = 0.1;
+        let want = self.factory.element_height.max(0.02);
+        let (in_depth, _in_ids) = self.assembly_span(o, inward);
+        let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 }; // sign of inward along +Z(=n)
+        // First decide how far the cutter reaches on each face → lift/h in plane-local Z.
+        let (lift, h, out_depth): (f32, f32, f32) = if through {
+            let (out_depth, _out_ids) = self.assembly_span(o, -inward);
+            let zeta_in = s_in * (in_depth + MARGIN);
+            let zeta_out = -s_in * (out_depth + MARGIN);
+            let (lo, hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
+            (lo, hi - lo, out_depth)
+        } else {
+            // recess: blind pocket from the picked face inward by `want` (never through).
+            let wall = (in_depth - EPS).max(EPS);
+            let d = want.min(wall);
+            let (lift, h) = if s_in > 0.0 { (-EPS, d + EPS) } else { (-d, d + EPS) };
+            (lift, h, 0.0)
+        };
+        // Which bodies to cut: EVERY Union body whose world AABB overlaps the cutter's swept
+        // box. A single probe ray misses bodies the opening actually passes through (the
+        // reported bug — the exterior shell was a separate body the ray never touched). The
+        // swept box is gap-bounded (in_depth/out_depth), so it stays local to this wall and
+        // never reaches the wall across the room; a Difference that doesn't touch a body is a
+        // harmless no-op, so over-selecting is safe.
+        let mut bmin = glam::Vec3::splat(f32::INFINITY);
+        let mut bmax = glam::Vec3::splat(f32::NEG_INFINITY);
+        for lp in &loops {
+            for &p in lp {
+                let w = frame.from_uv(p);
+                for z in [lift, lift + h] {
+                    let q = w + n * z;
+                    bmin = bmin.min(q);
+                    bmax = bmax.max(q);
+                }
+            }
+        }
+        let pad = 0.05;
+        let mut targets: Vec<u32> = Vec::new();
+        for f in &self.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            let (amn, amx) = f.world_aabb();
+            if amn.x <= bmax.x + pad && amx.x >= bmin.x - pad
+                && amn.y <= bmax.y + pad && amx.y >= bmin.y - pad
+                && amn.z <= bmax.z + pad && amx.z >= bmin.z - pad
+            {
+                targets.push(f.id);
+            }
+        }
+        if targets.is_empty() { targets.push(target_id); }
         self.snapshot_factory();
         let plane = cad_solid::Plane::from_basis(frame.origin, frame.u, frame.v);
         let mut made = 0;
         for pts in loops {
             if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
-                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0 };
-                self.factory.model.push(
-                    cad_solid::BoolOp::Difference, plane, placement,
-                    cad_solid::Primitive::Extrusion { profile, h, w, d },
-                );
-                // Relocate the cut to right after the target so eval cuts THAT body.
-                if let Some(diff) = self.factory.model.features.pop() {
-                    self.factory.model.features.insert(tidx + 1, diff);
+                // One Difference per target body, each relocated to sit right AFTER its body
+                // so the group-based eval subtracts it from THAT body. Re-find the body by id
+                // every time, because each insert shifts the indices of the ones after it.
+                for &tid in &targets {
+                    let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+                    self.factory.model.push(
+                        cad_solid::BoolOp::Difference, plane, placement,
+                        cad_solid::Primitive::Extrusion { profile, h, w, d },
+                    );
+                    if let Some(diff) = self.factory.model.features.pop() {
+                        match self.factory.model.features.iter().position(|f| f.id == tid) {
+                            Some(ti) => self.factory.model.features.insert(ti + 1, diff),
+                            None => self.factory.model.features.push(diff),
+                        }
+                    }
                 }
                 made += 1;
             }
@@ -4396,17 +4660,72 @@ impl CadApp {
             return 0;
         }
         let what = if through { "opening(s) cut through" } else { "recess(es) cut" };
-        if self.factory.keep_sketch {
-            self.factory.recompute();
-            self.factory.status = format!("{made} {what} the solid — shape kept");
+        self.factory_consume_sketch(fin_idx, is_sel);
+        self.factory.recompute();
+        let detail = format!(
+            "through={through} primary=#{target_id} targets={targets:?} \
+             probe=({:.2},{:.2},{:.2}) normal=({:.2},{:.2},{:.2}) inward=({:.2},{:.2},{:.2}) \
+             in_depth={in_depth:.3} out_depth={out_depth:.3} lift={:.3} h={:.3} loops={n_loops} bodies_cut={} made={made}",
+            o.x, o.y, o.z, n.x, n.y, n.z, inward.x, inward.y, inward.z,
+            lift, h, targets.len(),
+        );
+        self.factory_op_evt(if through { "cut-through" } else { "recess" }, source, detail, features_before);
+        self.factory.status = if self.factory.keep_sketch {
+            format!("{made} {what} the solid — shape kept")
         } else {
-            self.doc.dobjects.clear();
-            self.factory_exit_sketch();
-            self.factory.recompute();
-            self.factory.fit();
-            self.factory.status = format!("{made} {what} the solid");
-        }
+            format!("{made} {what} the solid")
+        };
         made
+    }
+
+    /// Emit a `FactoryOp` recorder event stamped with the current model size (features,
+    /// Union bodies, triangles). `features_before` is captured by the caller before the
+    /// op ran. No-op unless recording — this is the "record what's going on in 3D" tap.
+    fn factory_op_evt(&mut self, op: &str, source: &str, detail: String, features_before: usize) {
+        if !self.dbg.recording { return; }
+        let features_after = self.factory.model.features.len();
+        let bodies = self.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Union).count();
+        let tris = self.factory.cached.positions.len() / 3;
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::FactoryOp {
+            op: op.to_string(), source: source.to_string(), detail,
+            features_before, features_after, bodies, tris,
+        });
+    }
+
+    /// Ray-march EVERY Union body from `origin` along `dir` and return `(depth, body_ids)` —
+    /// how far solid material runs before the first big interior gap (`GAP`), plus the ids of
+    /// every body in that run. Called once per direction (inward and outward) so a THROUGH
+    /// cut spans the whole local wall assembly regardless of which face was picked, while the
+    /// per-side gap keeps it from reaching the wall across the room. Reuses the kernel's
+    /// `ray_triangle`, the same primitive the 3D picker uses.
+    fn assembly_span(&self, origin: glam::Vec3, dir: glam::Vec3) -> (f32, Vec<u32>) {
+        const GAP: f32 = 0.4;     // an empty span bigger than this = the room → stop
+        let start = origin + dir * 1e-3;
+        // Every surface crossing along the ray, tagged with the body it belongs to.
+        let mut hits: Vec<(f32, u32)> = Vec::new();
+        for f in &self.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            let tris = self.factory.model.feature_world_positions(f);
+            for c in tris.chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                    if t > 1e-4 { hits.push((t, f.id)); }
+                }
+            }
+        }
+        hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Walk from the face outward; a gap larger than GAP means we have left the assembly.
+        let mut depth = 0.0_f32;
+        let mut prev = 0.0_f32;
+        let mut ids: Vec<u32> = Vec::new();
+        for (t, id) in hits {
+            if t - prev > GAP { break; }
+            prev = t;
+            depth = t;
+            if !ids.contains(&id) { ids.push(id); }
+        }
+        (depth, ids)
     }
 
     /// DRAW3D dialog — the controllers for the primitive being created.
@@ -4844,10 +5163,57 @@ impl CadApp {
                     .response
                     .on_hover_text("Carve interior rooms out of a building solid");
 
+                    ui.menu_button("▼ Room elements", |ui| {
+                        ui.label(
+                            egui::RichText::new("  Extrude / cut a shape drawn on a face")
+                                .small()
+                                .weak(),
+                        );
+                        ui.separator();
+                        // How to feed these tools — draw on a face; you can act on it while
+                        // drafting OR after Finishing (the last drawn face-sketch is used).
+                        ui.label(egui::RichText::new("  1. Right-click a face → “Draw on this face”").small().weak());
+                        ui.label(egui::RichText::new("  2. Draw a CLOSED shape (rectangle / circle)").small().weak());
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.add_sized([94.0, 18.0], egui::Label::new(egui::RichText::new("  height / depth").small().weak()));
+                            ui.add(egui::DragValue::new(&mut self.factory.element_height).speed(0.05).range(0.02..=100.0).suffix(" m"));
+                        });
+                        ui.checkbox(&mut self.factory.keep_sketch, "  keep shape after")
+                            .on_hover_text("Reuse the SAME outline for more than one action (e.g. recess then cut through)");
+                        ui.separator();
+                        if ui
+                            .button("⬆  Extrude element")
+                            .on_hover_text("Raise the drawn shape into a solid on the face")
+                            .clicked()
+                        {
+                            self.factory_extrude_sketch(false);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("◳  Cut through (window / door)")
+                            .on_hover_text("Cut the shape all the way through the wall/solid")
+                            .clicked()
+                        {
+                            self.factory_cut_sketch(true);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("◱  Recess (blind pocket)")
+                            .on_hover_text("Cut a pocket of the given DEPTH — a niche/reveal, not through")
+                            .clicked()
+                        {
+                            self.factory_cut_sketch(false);
+                            ui.close_menu();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Extrude or cut shapes drawn on a face — enabled while drafting on a face");
+
                     ui.menu_button("▼ Furniture", |ui| {
                         if ui
-                            .button("⭳  Import OBJ / 3DS…")
-                            .on_hover_text("Import a furniture mesh (.obj or .3ds). Stored in the project for reuse.")
+                            .button("⭳  Import OBJ / 3DS / FBX…")
+                            .on_hover_text("Import a furniture mesh (.obj, .3ds or .fbx). Stored in the project for reuse.")
                             .clicked()
                         {
                             self.open_file_dialog(FileDialogMode::ImportObj, ".obj");
@@ -4887,9 +5253,19 @@ impl CadApp {
                                 .weak(),
                             );
                         }
+                        ui.separator();
+                        ui.label(egui::RichText::new("  Make furniture by drawing").small().weak());
+                        if ui
+                            .button("⬆  Extrude drawn shape")
+                            .on_hover_text("Right-click a face → Draw on this face, draw a shape, then this extrudes it into a free-standing furniture solid (never cuts the building)")
+                            .clicked()
+                        {
+                            self.factory_extrude_sketch(true);
+                            ui.close_menu();
+                        }
                     })
                     .response
-                    .on_hover_text("Import furniture (.obj) and place it — stored in the project");
+                    .on_hover_text("Import furniture (.obj/.3ds), place it, or extrude a drawn shape into furniture");
 
                     ui.menu_button("▼ Textures", |ui| {
                         self.factory_textures_menu(ui);
@@ -4931,6 +5307,20 @@ impl CadApp {
                             self.factory.status =
                                 "no ceilings to hide — try 'Cutaway' to see inside anything".into();
                         }
+                    }
+                    ui.separator();
+                    // Gizmo mode: Move arms vs Rotate rings. Applies to the selected
+                    // furniture or room-element solid.
+                    let mode = self.factory.gizmo_mode;
+                    if ui.selectable_label(mode == crate::factory::GizmoMode::Move, "↔ Move")
+                        .on_hover_text("Drag the arms to move the selection").clicked()
+                    {
+                        self.factory.gizmo_mode = crate::factory::GizmoMode::Move;
+                    }
+                    if ui.selectable_label(mode == crate::factory::GizmoMode::Rotate, "⟳ Rotate")
+                        .on_hover_text("Drag a ring to rotate the selection about that axis (X red · Y green · Z blue)").clicked()
+                    {
+                        self.factory.gizmo_mode = crate::factory::GizmoMode::Rotate;
                     }
                     ui.separator();
                     if ui.button("⌖ Frame").clicked() {
@@ -5007,15 +5397,9 @@ impl CadApp {
                         }
                     }
                 });
-                // Room dimensions — ALWAYS VISIBLE (not buried in a dropdown), because a
-                // small room height was silently making rooms look like flat pancakes.
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Room  height").small().weak());
-                    ui.add(egui::DragValue::new(&mut self.factory.room_height).speed(0.05).range(0.3..=30.0).suffix(" m"));
-                    ui.label(egui::RichText::new("floor").small().weak());
-                    ui.add(egui::DragValue::new(&mut self.factory.room_floor).speed(0.01).range(0.02..=2.0).suffix(" m"));
-                    ui.checkbox(&mut self.factory.room_open_top, "open top");
-                });
+                // Room dimensions live in the ▼ Room menu (set them before Make room). The
+                // old always-on row here was redundant with that menu — removed. A built
+                // solid's real size is edited in the PROPERTIES panel when it's selected.
                 if self.factory.zoom_mode != crate::factory::ZoomMode::Off
                     || self.factory.place_pending.is_some()
                     || !self.factory.status.is_empty()
@@ -5086,8 +5470,9 @@ impl CadApp {
                 if resp.hovered() {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.0 {
+                        let max = self.factory.max_cam_dist();
                         self.factory.cam_dist =
-                            (self.factory.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.4, 400.0);
+                            (self.factory.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.4, max);
                     }
                 }
 
@@ -5193,8 +5578,9 @@ impl CadApp {
                             let dy = resp.drag_delta().y;
                             if dy != 0.0 {
                                 // drag UP (dy<0) zooms in, DOWN zooms out — AutoCAD real-time
+                                let max = self.factory.max_cam_dist();
                                 self.factory.cam_dist =
-                                    (self.factory.cam_dist * (1.0 + dy * 0.006)).clamp(0.4, 400.0);
+                                    (self.factory.cam_dist * (1.0 + dy * 0.006)).clamp(0.4, max);
                             }
                         }
                         if resp.drag_stopped() {
@@ -5320,7 +5706,8 @@ impl CadApp {
                     && self.factory.zoom_mode == crate::factory::ZoomMode::Off
                     && self.factory.selected_wall().is_none()
                     && self.factory.has_any_selection();
-                if gizmo_active {
+                let rotate_mode = self.factory.gizmo_mode == crate::factory::GizmoMode::Rotate;
+                if gizmo_active && !rotate_mode {
                     // Begin a drag: pick a handle under the cursor.
                     if self.factory.gizmo_drag.is_none()
                         && resp.drag_started_by(egui::PointerButton::Primary)
@@ -5410,6 +5797,38 @@ impl CadApp {
                         }
                     }
                 }
+                // ---- ROTATE mode: drag a ring to spin about its axis ---------------
+                if gizmo_active && rotate_mode {
+                    if self.factory.rot_drag.is_none()
+                        && resp.drag_started_by(egui::PointerButton::Primary)
+                    {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            if let Some(h) = self.factory.pick_ring(pos, rect, &mvp) {
+                                // rot_begin captures the grab + start angles WITHOUT mutating,
+                                // so snapshotting after it still records the pre-rotation state.
+                                if self.factory.rot_begin(h, pos, rect, &mvp) {
+                                    self.snapshot_factory();
+                                    handles_took_input = true;
+                                }
+                            }
+                        }
+                    }
+                    if self.factory.rot_drag.is_some() {
+                        if resp.dragged_by(egui::PointerButton::Primary) {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                self.factory.rot_update(pos, rect, &mvp);
+                                if self.factory.sel_furniture.is_none() {
+                                    self.factory.recompute();
+                                }
+                            }
+                            handles_took_input = true;
+                        }
+                        if resp.drag_stopped() {
+                            self.factory.rot_end();
+                            self.factory_note("3D rotate".into());
+                        }
+                    }
+                }
 
                 // 2D PLAN underlay — painted on a foreground layer so it shows THROUGH the
                 // solids (a plan hidden behind the model would be pointless).
@@ -5425,6 +5844,7 @@ impl CadApp {
                     && !handles_took_input
                     && self.factory.zoom_mode == crate::factory::ZoomMode::Off
                     && self.factory.gizmo_drag.is_none()
+                    && self.factory.rot_drag.is_none()
                     && self.factory.wall_drag.is_none()
                     && self.factory.place_pending.is_none()
                     && self.factory.modify.is_none()
@@ -5590,7 +6010,7 @@ impl CadApp {
                 // Foreground layer, same reason as the wall handles: the 3D scene is an
                 // opaque texture painted over this. Arms are X/Y/Z coloured; the centre
                 // cube is the free-move grab.
-                if gizmo_active {
+                if gizmo_active && !rotate_mode {
                     if let Some(v) = self.factory.gizmo_view(rect, &mvp) {
                         let fg = ui.ctx().layer_painter(egui::LayerId::new(
                             egui::Order::Foreground,
@@ -5617,6 +6037,27 @@ impl CadApp {
                         let cube = egui::Rect::from_center_size(v.center_s, egui::vec2(s * 2.0, s * 2.0));
                         fg.rect_filled(cube, 1.5, egui::Color32::from_rgb(240, 240, 240));
                         fg.rect_stroke(cube, 1.5, egui::Stroke::new(1.2, egui::Color32::from_rgb(30, 40, 50)));
+                    }
+                }
+                // ---- ROTATE GIZMO drawing (three rings) ----------------------
+                if gizmo_active && rotate_mode {
+                    if let Some(rv) = self.factory.rotation_rings(rect, &mvp) {
+                        let fg = ui.ctx().layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("factory_rotate_gizmo"),
+                        )).with_clip_rect(rect);
+                        let hover = resp.hover_pos();
+                        for ring in &rv.rings {
+                            let hot = self.factory.rot_drag.map(|d| d.handle) == Some(ring.handle)
+                                || hover.is_some_and(|h| ring.pts.windows(2)
+                                    .any(|s| crate::factory::seg_dist(h, s[0], s[1]) <= 8.0));
+                            let w = if hot { 3.5 } else { 2.0 };
+                            for s in ring.pts.windows(2) {
+                                fg.line_segment([s[0], s[1]], egui::Stroke::new(w, ring.handle.color()));
+                            }
+                        }
+                        // small centre dot for reference
+                        fg.circle_filled(rv.center_s, 3.0, egui::Color32::from_rgb(230, 230, 230));
                     }
                 }
 
@@ -5716,8 +6157,23 @@ impl CadApp {
                                 }
                             }
                             (None, None) => {
-                                if !add {
+                                // No solid/furniture hit — try a 2D plan shape on the ground,
+                                // so geometry drawn in 2D can be selected FROM the 3D view and
+                                // then extruded / cut.
+                                if let Some(i) = self.factory_pick_ground_dobject(pos, rect, &mvp) {
+                                    self.factory.clear_selection(); // drop any 3D feature selection
+                                    if add {
+                                        if !self.selection.contains(&i) {
+                                            self.selection.push(i);
+                                        }
+                                    } else {
+                                        self.selection = vec![i];
+                                    }
+                                    self.factory.status =
+                                        "2D shape selected — ▼ Room elements ▸ Extrude / Cut".into();
+                                } else if !add {
                                     self.factory.clear_selection();
+                                    self.selection.clear();
                                 }
                             }
                         }
@@ -5782,6 +6238,7 @@ impl CadApp {
                 verts.extend(self.factory.furniture_verts()); // placed furniture meshes
                 let mut lines = self.factory.overlay_lines();
                 lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
+                lines.extend(self.factory.live_sketch_lines(&self.doc)); // active sketch, live
                 // NOTE: the 2D PLAN is NOT added to `lines` — those are depth-tested GL
                 // segments the opaque solids would hide. The plan must read THROUGH the
                 // model, so it is painted on a foreground egui layer below (see
@@ -15431,33 +15888,76 @@ impl CadApp {
 
     fn do_open(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
+        // Whole-open timer + a "begin" marker so the session recorder timeline starts
+        // the instant the file is chosen. Every stage below is timed separately, so a
+        // slow open pins the blame on ONE stage (read / parse / install / fit / sidecar)
+        // instead of showing one opaque gap. All of this is a no-op unless recording.
+        let t_open = std::time::Instant::now();
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::ImportStage {
+            stage: "begin".into(), dobjects: 0, elapsed_us: 0, detail: path.to_string(),
+        });
+
+        // ---- Stage 1+2: read bytes/text from disk, then PARSE into a Document. -------
         let doc_result = if lower.ends_with(".dxf") {
-            match std::fs::read_to_string(path) {
-                Ok(text) => cad_io::dxf::read_dxf(&text),
+            let t = std::time::Instant::now();
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
                 Err(e) => {
+                    self.stage_evt("read file", 0, t.elapsed(), &format!("READ ERROR: {e}"));
                     self.history.push(format!("  ! open '{}' failed: {}", path, e));
                     return;
                 }
-            }
+            };
+            self.stage_evt("read file", 0, t.elapsed(), &format!("{} bytes", text.len()));
+            let t = std::time::Instant::now();
+            let r = cad_io::dxf::read_dxf(&text);
+            let n = r.as_ref().map(|d| d.dobjects.len()).unwrap_or(0);
+            self.stage_evt("parse dxf", n, t.elapsed(),
+                if r.is_ok() { "" } else { "PARSE ERROR" });
+            r
         } else if lower.ends_with(".rsm") {
-            match std::fs::read(path) {
-                Ok(bytes) => cad_io::rsm::read_rsm(&bytes),
+            let t = std::time::Instant::now();
+            let bytes = match std::fs::read(path) {
+                Ok(bytes) => bytes,
                 Err(e) => {
+                    self.stage_evt("read file", 0, t.elapsed(), &format!("READ ERROR: {e}"));
                     self.history.push(format!("  ! open '{}' failed: {}", path, e));
                     return;
                 }
-            }
+            };
+            self.stage_evt("read file", 0, t.elapsed(), &format!("{} bytes", bytes.len()));
+            let t = std::time::Instant::now();
+            let r = cad_io::rsm::read_rsm(&bytes);
+            let n = r.as_ref().map(|d| d.dobjects.len()).unwrap_or(0);
+            self.stage_evt("parse rsm", n, t.elapsed(),
+                if r.is_ok() { "" } else { "PARSE ERROR" });
+            r
         } else if lower.ends_with(".dwg") {
             // DWG isn't read natively — convert to DXF via the external
             // converter (ACadSharp), then parse the DXF.
-            match self.convert_dwg_to_dxf(path) {
-                Ok(dxf) => match std::fs::read_to_string(&dxf) {
-                    Ok(text) => cad_io::dxf::read_dxf(&text),
-                    Err(e) => {
-                        self.history.push(format!("  ! open '{}' failed: {}", path, e));
-                        return;
-                    }
-                },
+            let t = std::time::Instant::now();
+            let conv = self.convert_dwg_to_dxf(path);
+            self.stage_evt("dwg→dxf convert", 0, t.elapsed(),
+                if conv.is_ok() { "external converter" } else { "CONVERT FAILED" });
+            match conv {
+                Ok(dxf) => {
+                    let t = std::time::Instant::now();
+                    let text = match std::fs::read_to_string(&dxf) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            self.stage_evt("read file", 0, t.elapsed(), &format!("READ ERROR: {e}"));
+                            self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                            return;
+                        }
+                    };
+                    self.stage_evt("read file", 0, t.elapsed(), &format!("{} bytes", text.len()));
+                    let t = std::time::Instant::now();
+                    let r = cad_io::dxf::read_dxf(&text);
+                    let n = r.as_ref().map(|d| d.dobjects.len()).unwrap_or(0);
+                    self.stage_evt("parse dxf", n, t.elapsed(),
+                        if r.is_ok() { "" } else { "PARSE ERROR" });
+                    r
+                }
                 Err(e) => {
                     self.history.push(format!("  ! DWG convert '{}': {}", path, e));
                     return;
@@ -15470,6 +15970,8 @@ impl CadApp {
             Ok(doc) => {
                 let n = doc.dobjects.len();
                 let l = doc.layers.len();
+                // ---- Stage 3: install the parsed doc + invalidate caches. -----------
+                let t = std::time::Instant::now();
                 self.doc = doc;
                 self.selection.clear();
                 self.selection_prev.clear();
@@ -15477,16 +15979,39 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
-                // Jump straight to the drawing — no manual ZOOM needed.
-                self.fit_view_to_drawing();
+                self.stage_evt("install doc", n, t.elapsed(), &format!("{l} layer(s)"));
+                // ---- Stage 4: frame the drawing (bbox sweep). ----------------------
+                let t = std::time::Instant::now();
+                self.fit_view_to_drawing(); // jump straight to the drawing — no manual ZOOM
+                self.stage_evt("fit view", n, t.elapsed(), "");
                 self.current_file = Some(std::path::PathBuf::from(path));
+                // ---- Stage 5: SIMLUX sidecar (may rebuild the 3D model). -----------
+                let t = std::time::Instant::now();
                 self.load_simlux_sidecar(std::path::Path::new(path));
+                self.stage_evt("sidecar", n, t.elapsed(), "");
                 self.history.push(format!(
                     "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
                 ));
+                self.stage_evt("TOTAL do_open", n, t_open.elapsed(),
+                    "index+GPU+render still deferred — see later IndexRebuild / SlowFrame");
             }
-            Err(e) => self.history.push(format!("  ! open '{}': {}", path, e)),
+            Err(e) => {
+                self.history.push(format!("  ! open '{}': {}", path, e));
+                self.stage_evt("TOTAL do_open", 0, t_open.elapsed(), "FAILED");
+            }
         }
+    }
+
+    /// Emit one `ImportStage` recorder event (no-op unless recording). Centralised so
+    /// every `do_open` stage records identically — see [`Self::do_open`].
+    #[track_caller]
+    fn stage_evt(&mut self, stage: &str, dobjects: usize, dur: std::time::Duration, detail: &str) {
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::ImportStage {
+            stage:      stage.to_string(),
+            dobjects,
+            elapsed_us: dur.as_micros() as u64,
+            detail:     detail.to_string(),
+        });
     }
 
     /// Move the current selection onto a dedicated **SIMLUX** layer (created if
@@ -15920,7 +16445,8 @@ impl CadApp {
                             ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
                                 .iter().any(|x| lname.ends_with(&format!(".{x}"))),
                         FileDialogMode::ImportObj =>
-                            lname.ends_with(".obj") || lname.ends_with(".3ds"),
+                            lname.ends_with(".obj") || lname.ends_with(".3ds")
+                            || lname.ends_with(".fbx"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
                     };
                     if is_dir {
@@ -15939,7 +16465,7 @@ impl CadApp {
             FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
-            FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS",
+            FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX",
             FileDialogMode::Save => "Save As",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
@@ -16042,7 +16568,7 @@ impl CadApp {
                                 .hint_text(match dlg.mode {
                                     FileDialogMode::Open => "pick a file above",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "pick an image above",
-                                    FileDialogMode::ImportObj => "pick an .obj or .3ds above",
+                                    FileDialogMode::ImportObj => "pick an .obj, .3ds or .fbx above",
                                     FileDialogMode::Save => "drawing name",
                                 }));
                         });
@@ -25272,6 +25798,7 @@ impl eframe::App for CadApp {
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
+
         // Install the global design-token Visuals so every default-styled widget
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
         // theme. Also fixes square menu corners (menu_rounding = ZERO).
@@ -27512,6 +28039,8 @@ impl eframe::App for CadApp {
             self.draw_raster_underlays(&painter, rect);
             // A 3D-Factory face sketch shows the object it is drawn on as a faint reference.
             self.draw_factory_sketch_reference(&painter, rect);
+            // All finished face-sketches, projected onto the plan — always visible.
+            self.draw_factory_sketches_2d(&painter, rect);
             // SIMLUX: lux heatmap + luminaire markers on the 2D plan (overlay default off).
             self.paint_lux_overlay(&painter, rect);
             self.paint_luminaires_2d(&painter, rect);
@@ -34638,6 +35167,34 @@ impl CadApp {
         }
     }
 
+    /// Draw every FINISHED face-sketch onto the 2D plan, projected to XY — so all the
+    /// sketches you've made stay visible in the plan all the time (2D↔3D linked), not only in
+    /// 3D. The sketch you are ACTIVELY drafting is skipped here: it already IS the live 2D
+    /// canvas. A wall sketch projects to its plan footprint (edge-on), which is what a plan
+    /// view should show.
+    fn draw_factory_sketches_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.factory.open {
+            return;
+        }
+        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 170, 205, 130));
+        for (i, sk) in self.factory.model.sketches.iter().enumerate() {
+            if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
+                continue; // the active sketch is the live canvas — don't double-draw it
+            }
+            for d in &sk.doc.dobjects {
+                for path in cad_solid::geom_outlines(&d.geom) {
+                    for w in path.windows(2) {
+                        let a = sk.frame.from_uv(glam::Vec2::new(w[0].x, w[0].y));
+                        let b = sk.frame.from_uv(glam::Vec2::new(w[1].x, w[1].y));
+                        let pa = self.w2s(Vec2::new(a.x as f64, a.y as f64), rect);
+                        let pb = self.w2s(Vec2::new(b.x as f64, b.y as f64), rect);
+                        painter.line_segment([pa, pb], stroke);
+                    }
+                }
+            }
+        }
+    }
+
     /// Draw the reference raster underlays behind the geometry.
     fn draw_raster_underlays(&self, painter: &egui::Painter, rect: egui::Rect) {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
@@ -35528,6 +36085,64 @@ mod factory_sketch_tests {
             app.factory.model.features.iter().any(|f| f.op == cad_solid::BoolOp::Difference),
             "a Difference cutter was added to the model"
         );
+    }
+
+    /// The active sketch renders LIVE in 3D (its geometry is in the app's live doc), and once
+    /// finished it shows via `sketch_lines` — so 2D drawing and 3D stay linked.
+    #[test]
+    fn active_sketch_renders_live_in_3d() {
+        let mut app = CadApp::default();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 1.0,
+        })));
+        assert!(!app.factory.live_sketch_lines(&app.doc).is_empty(), "the live sketch shows in 3D as drawn");
+        app.factory_exit_sketch();
+        assert!(!app.factory.sketch_lines().is_empty(), "the finished sketch stays visible in 3D");
+    }
+
+    /// SELECT a closed 2D shape and Extrude it — no face sketch needed. The solid is made on
+    /// the ground plane at the shape's location, and the 2D drawing is NOT deleted.
+    #[test]
+    fn extrude_works_on_a_2d_selection() {
+        let mut app = CadApp::default();
+        let idx = app.doc.dobjects.len();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(5.0, 3.0),
+            radius: 1.0,
+        })));
+        app.selection = vec![idx];
+        let before = app.factory.model.features.len();
+        let made = app.factory_extrude_sketch(false);
+        assert_eq!(made, 1, "the selected shape extruded");
+        assert_eq!(app.factory.model.features.len(), before + 1, "a solid was added");
+        assert!(app.doc.dobjects.get(idx).is_some(), "the selected 2D drawing is preserved");
+        // The solid sits at the shape's world location (~x5, y3), not the origin.
+        let f = app.factory.model.features.last().unwrap();
+        let (mn, mx) = f.world_aabb();
+        let (cx, cy) = ((mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5);
+        assert!((cx - 5.0).abs() < 0.3 && (cy - 3.0).abs() < 0.3, "solid at the shape, got ({cx:.1},{cy:.1})");
+    }
+
+    /// The extrude tool must work AFTER Finishing the sketch — the last drawn face-sketch is
+    /// used — so the toolbar menu buttons aren't dead when you're not actively drafting.
+    #[test]
+    fn extrude_works_after_finishing_the_sketch() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let before = app.factory.model.features.len();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0),
+            radius: 1.0,
+        })));
+        app.factory_exit_sketch(); // FINISH — session None, the drawing lives in the sketch
+        assert!(app.factory.session.is_none());
+        let made = app.factory_extrude_sketch(false);
+        assert_eq!(made, 1, "extrude resolves the finished sketch");
+        assert_eq!(app.factory.model.features.len(), before + 1, "a solid was added");
     }
 
     /// A RECESS cut (not through) also adds a Difference, and KEEP-shape leaves the sketch
