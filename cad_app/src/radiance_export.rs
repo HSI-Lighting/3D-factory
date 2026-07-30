@@ -115,43 +115,49 @@ pub fn sky_rad(lat_deg: f32, lon_deg: f32, utc_offset: f32, month: u32, day: u32
     )
 }
 
-/// The `rpict` view flags for the current camera.
-fn view_flags(eye: [f32; 3], target: [f32; 3]) -> String {
+/// The `rpict` view flags for the current camera — the SAME framing as the in-app path tracer:
+/// 45° VERTICAL field of view, horizontal widened to the image aspect (`2·atan(tan(22.5°)·w/h)`).
+/// The old hardcoded `-vh 45 -vv 32` was a much narrower cone than the viewport, which is why a
+/// Radiance render showed only a portion of the scene.
+fn view_flags(eye: [f32; 3], target: [f32; 3], w: u32, h: u32) -> String {
     let d = [target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]];
     let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-4);
     let vd = [d[0] / len, d[1] / len, d[2] / len];
+    let vv = 45.0f32;
+    let aspect = w as f32 / h.max(1) as f32;
+    let vh = 2.0 * ((vv.to_radians() * 0.5).tan() * aspect).atan().to_degrees();
     format!(
-        "-vtv -vp {:.4} {:.4} {:.4} -vd {:.4} {:.4} {:.4} -vu 0 0 1 -vh 45 -vv 32",
+        "-vtv -vp {:.4} {:.4} {:.4} -vd {:.4} {:.4} {:.4} -vu 0 0 1 -vh {vh:.2} -vv {vv:.2}",
         eye[0], eye[1], eye[2], vd[0], vd[1], vd[2]
     )
 }
 
-/// Build a Windows `render.bat`.
-pub fn render_bat(eye: [f32; 3], target: [f32; 3]) -> String {
+/// Build a Windows `render.bat` rendering at `w`×`h`.
+pub fn render_bat(eye: [f32; 3], target: [f32; 3], w: u32, h: u32) -> String {
     format!(
         "@echo off\r\n\
          REM Requires Radiance on PATH (https://github.com/LBNL-ETA/Radiance).\r\n\
          oconv sky.rad scene.rad > scene.oct\r\n\
-         rpict {view} -ab 3 -ad 1024 -as 512 -aa 0.15 -x 1600 -y 1000 scene.oct > render.hdr\r\n\
-         pfilt -x /2 -y /2 render.hdr > render_small.hdr\r\n\
+         rpict {view} -ab 3 -ad 1024 -as 512 -aa 0.15 -x {w} -y {h} scene.oct > render.hdr\r\n\
+         pfilt render.hdr > render_small.hdr\r\n\
          ra_bmp render_small.hdr render.bmp\r\n\
          echo Wrote render.bmp\r\n",
-        view = view_flags(eye, target)
+        view = view_flags(eye, target, w, h)
     )
 }
 
-/// Build a POSIX `render.sh`.
-pub fn render_sh(eye: [f32; 3], target: [f32; 3]) -> String {
+/// Build a POSIX `render.sh` rendering at `w`×`h`.
+pub fn render_sh(eye: [f32; 3], target: [f32; 3], w: u32, h: u32) -> String {
     format!(
         "#!/bin/sh\n\
          # Requires Radiance on PATH (https://github.com/LBNL-ETA/Radiance).\n\
          set -e\n\
          oconv sky.rad scene.rad > scene.oct\n\
-         rpict {view} -ab 3 -ad 1024 -as 512 -aa 0.15 -x 1600 -y 1000 scene.oct > render.hdr\n\
-         pfilt -x /2 -y /2 render.hdr > render_small.hdr\n\
+         rpict {view} -ab 3 -ad 1024 -as 512 -aa 0.15 -x {w} -y {h} scene.oct > render.hdr\n\
+         pfilt render.hdr > render_small.hdr\n\
          ra_bmp render_small.hdr render.bmp\n\
          echo 'Wrote render.bmp'\n",
-        view = view_flags(eye, target)
+        view = view_flags(eye, target, w, h)
     )
 }
 
@@ -213,9 +219,16 @@ mod tests {
 
     #[test]
     fn render_script_aims_the_camera() {
-        let b = render_bat([5.0, -5.0, 2.0], [0.0, 0.0, 1.0]);
+        let b = render_bat([5.0, -5.0, 2.0], [0.0, 0.0, 1.0], 1280, 960);
         assert!(b.contains("oconv sky.rad scene.rad"));
         assert!(b.contains("-vp 5.0000 -5.0000 2.0000"));
         assert!(b.contains("rpict"));
+        assert!(b.contains("-x 1280 -y 960"), "chosen resolution reaches rpict");
+        // Same framing as the path tracer: 45° vertical; horizontal widened by the 4:3 aspect
+        // (2·atan(tan 22.5°·4/3) ≈ 57.8°).
+        assert!(b.contains("-vv 45.00"), "45° vertical fov: {b}");
+        assert!(b.contains("-vh 57.7") || b.contains("-vh 57.8"), "aspect-matched horizontal fov: {b}");
+        // pfilt must NOT downscale — the picked size is the delivered size.
+        assert!(!b.contains("-x /2"), "no half-size pfilt");
     }
 }

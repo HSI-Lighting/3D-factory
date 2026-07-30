@@ -1774,6 +1774,10 @@ pub struct CadApp {
     pt_gl: Option<StdArc<eframe::glow::Context>>,
     pt_preview: Option<egui::TextureHandle>,
     pt_last_pass: u32,
+    /// Radiance render size choice (same table as the path tracer's `pt_res`).
+    rad_res: u32,
+    /// When the folder-picker confirms: run the pipeline (true) or export only (false).
+    rad_run_after_pick: bool,
     /// A background Radiance pipeline run + its result window state.
     rad_job: Option<StdArc<Mutex<RadState>>>,
     rad_started: Option<std::time::Instant>,
@@ -2647,7 +2651,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture, PickFolder }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -3434,6 +3438,8 @@ impl Default for CadApp {
             pt_gl: None,
             pt_preview: None,
             pt_last_pass: 0,
+            rad_res: 2, // 1280×960 — a good accuracy/time default for rpict
+            rad_run_after_pick: false,
             rad_job: None,
             rad_started: None,
             rad_preview: None,
@@ -4275,12 +4281,44 @@ impl CadApp {
         }
 
         ui.add_space(2.0);
-        let furniture = self.factory.sel_furniture.is_some();
+        // The property EDITORS moved to the 🎨 Materials Factory (one place for all material
+        // editing — pattern/colours/tiling/opacity/PBR live in its node inspector). This button
+        // resolves the tuning target (minting a copy-on-write material for an isolated face/piece,
+        // exactly as the old sliders did) and opens it there.
         let isolated = face_sel.is_some() || feat_sel.as_ref().map_or(false, |v| !v.is_empty());
-        ui.label(
-            egui::RichText::new(if isolated { "Adjust — selected piece only" } else { "Adjust" })
-                .small().weak(),
-        );
+        if ui
+            .button(if isolated { "🎨  Edit piece material…" } else { "🎨  Edit material…" })
+            .on_hover_text("Open this surface's material in the Materials Factory — colours, pattern, tiling, opacity (Alpha), metallic/roughness and maps are edited there and update live.")
+            .clicked()
+        {
+            self.snapshot_factory();
+            if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) {
+                self.materials.graphs.remove(&ti); // re-seed from the material's current state
+                self.materials.sel = Some(ti);
+                self.materials.sel_node = None;
+                self.materials_open = true;
+            }
+        }
+        if ui
+            .small_button(egui::RichText::new("Remove texture").color(egui::Color32::from_rgb(230, 170, 170)))
+            .clicked()
+        {
+            if let Some((fi, groups)) = &face_sel {
+                // Remove only THIS piece's per-face textures, leaving the rest of the object.
+                self.snapshot_factory();
+                if let Some(inst) = self.factory.furniture.get_mut(*fi) {
+                    for g in groups { inst.surface_texture.remove(g); }
+                }
+                self.factory.status = "piece texture removed".into();
+            } else {
+                self.remove_texture_from_selection();
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn factory_adjust_legacy(&mut self, ui: &mut egui::Ui, face_sel: Option<(usize, Vec<u32>)>, feat_sel: Option<Vec<u32>>, tex_idx: Option<usize>) {
+        let furniture = self.factory.sel_furniture.is_some();
         // Is the surface a PROCEDURAL material? Its pattern/colours/grain are edited below; the
         // image-only tiling/move/rotate controls are hidden (it's world-space, not UV-mapped).
         let proc_def: Option<crate::factory::ProcDef> = tex_idx.and_then(|ti| self.factory.textures.get(ti)).and_then(|t| t.proc);
@@ -4976,7 +5014,10 @@ impl CadApp {
                     Some((sfi, groups)) if sfi == fi => {
                         self.snapshot_factory();
                         self.factory.apply_face_texture(fi, &groups, idx);
-                        self.factory.furn_tex_brush = Some(idx); // stay armed to paint more faces
+                        // Applied → DESELECT the face and disarm (Esc also deselects); the next
+                        // click on the object selects a fresh face.
+                        self.factory.furn_face_sel = None;
+                        self.factory.furn_tex_brush = None;
                         let painted = self.factory.furniture_textured_tri_count(fi);
                         let total = self.factory.furniture.get(fi)
                             .and_then(|f| self.factory.furniture_lib.get(f.asset))
@@ -7439,14 +7480,6 @@ impl CadApp {
                     }
 
                     if ui
-                        .selectable_label(self.materials_open, "🎨 Materials")
-                        .on_hover_text("Materials Factory — a node-based material editor (Texture → Principled BSDF → Output), like Blender's shader graph. Edits update the 3D view live.")
-                        .clicked()
-                    {
-                        self.materials_open = !self.materials_open;
-                    }
-
-                    if ui
                         .selectable_label(self.render_modal_open, "⏺ Render")
                         .on_hover_text("Path-traced render (raytracing): true global illumination, reflections, soft shadows and glass — refines progressively, like Blender's Cycles. Choose CPU or GPU in the dialog.")
                         .clicked()
@@ -8441,6 +8474,15 @@ impl CadApp {
                     if self.factory.session.is_some() { self.factory_exit_sketch(); }
                     self.factory.status = "path sweep cancelled".into();
                 }
+                // Esc DESELECTS a targeted face/piece and disarms the texture brush (the sweep
+                // flow above owns Esc while it runs).
+                else if (self.factory.furn_face_sel.is_some() || self.factory.furn_tex_brush.is_some())
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.factory.furn_face_sel = None;
+                    self.factory.furn_tex_brush = None;
+                    self.factory.status = "face/piece deselected".into();
+                }
                 // PATH-SWEEP flow — Enter finishes the current stage (section → offer views;
                 // path → build). Only while a sketch is open, so it doesn't clash elsewhere.
                 if self.factory.sweep_flow.is_some()
@@ -8508,15 +8550,44 @@ impl CadApp {
                             if let Some(ti) = self.factory.furn_tex_brush {
                                 self.snapshot_factory();
                                 self.factory.apply_face_texture(fi, &groups, ti);
-                                self.factory.furn_face_sel = Some((fi, groups));
-                                self.factory.status = "textured — click another face, or switch to Whole object".into();
+                                // Painted → no lingering selection (the brush stays armed for the
+                                // next face; Esc disarms it).
+                                self.factory.furn_face_sel = None;
+                                self.materials.sel = Some(ti); // MF follows the painted material
+                                self.factory.status = "painted — click more faces, or Esc to stop".into();
                                 self.history.push(format!("  furniture {} textured", if piece { "piece" } else { "face" }));
                             } else {
+                                // SYNC the Materials Factory to the clicked face's material, so its
+                                // properties (Alpha/colour/tiling in the node editor) edit exactly
+                                // what was clicked — the reason "change the opacity of a face"
+                                // silently did nothing before: the edit landed on whichever
+                                // material happened to be selected there.
+                                let face_mat = groups.first().and_then(|g| {
+                                    self.factory
+                                        .furniture
+                                        .get(fi)
+                                        .and_then(|inst| inst.surface_texture.get(g).copied().or(inst.texture))
+                                });
                                 self.factory.furn_face_sel = Some((fi, groups));
-                                self.factory.status = format!(
-                                    "{} selected — Apply a material (🎨 Materials Factory) or pick a texture (▼ Textures)",
-                                    if piece { "piece" } else { "face" }
-                                );
+                                if let Some(mi) = face_mat {
+                                    if self.materials.sel != Some(mi) {
+                                        // Re-seed the graph from the material's CURRENT state, so
+                                        // the editor opens showing the truth (not a stale seed).
+                                        self.materials.graphs.remove(&mi);
+                                    }
+                                    self.materials.sel = Some(mi);
+                                    self.materials.sel_node = None;
+                                    let mname = self.factory.textures.get(mi).map(|t| t.name.clone()).unwrap_or_default();
+                                    self.factory.status = format!(
+                                        "{} selected — its material '{mname}' is open in 🎨 Materials Factory (edit Alpha there for opacity)",
+                                        if piece { "piece" } else { "face" }
+                                    );
+                                } else {
+                                    self.factory.status = format!(
+                                        "{} selected (no material yet) — Apply one from 🎨 Materials Factory or ▼ Textures",
+                                        if piece { "piece" } else { "face" }
+                                    );
+                                }
                             }
                         }
                         // A miss (clicked empty space / off the object) falls through to selection.
@@ -18901,17 +18972,27 @@ impl CadApp {
                 ui.horizontal(|ui| {
                     if ui
                         .button("▶  Export + run Radiance")
-                        .on_hover_text("Write the Radiance scene AND run the full pipeline (oconv → rpict → pfilt → ra_bmp) right now, showing the finished render in-app. Needs Radiance installed (on PATH).")
+                        .on_hover_text("Choose an output folder, then write the Radiance scene AND run the full pipeline (oconv → rpict → pfilt → ra_bmp), showing the finished render in-app. Same framing as the viewport / path tracer.")
                         .clicked()
                     {
-                        self.run_radiance();
+                        self.pick_radiance_folder(true);
                     }
+                    ui.label("Size");
+                    egui::ComboBox::from_id_salt("rad_res")
+                        .selected_text(["640×480", "960×720", "1280×960", "1600×1200"][self.rad_res.min(3) as usize])
+                        .show_ui(ui, |ui| {
+                            for (k, name) in ["640×480", "960×720", "1280×960", "1600×1200"].iter().enumerate() {
+                                ui.selectable_value(&mut self.rad_res, k as u32, *name);
+                            }
+                        })
+                        .response
+                        .on_hover_text("Radiance output resolution — bigger = sharper but rpict takes longer.");
                     if ui
                         .button("⬈  Export only…")
-                        .on_hover_text("Write a Radiance scene (.rad geometry + gensky sky matched to these settings + render script) to run yourself later.")
+                        .on_hover_text("Choose a folder and write the Radiance scene (.rad geometry + gensky sky + render script) to run yourself later.")
                         .clicked()
                     {
-                        self.export_radiance_scene();
+                        self.pick_radiance_folder(false);
                     }
                 });
                 if !self.factory.status.is_empty() {
@@ -18985,6 +19066,21 @@ impl CadApp {
                     );
                     self.materials.sel = Some(idx);
                     self.materials.sel_node = None;
+                }
+                if ui.small_button("🖼").on_hover_text("Paste an image from the clipboard as a new material").clicked() {
+                    let before = self.factory.textures.len();
+                    self.paste_texture_onto_selection();
+                    if self.factory.textures.len() > before {
+                        self.materials.sel = Some(before);
+                        self.materials.sel_node = None;
+                    }
+                }
+                if ui.small_button("📂").on_hover_text("Load an image file (PNG/JPG) as a new material").clicked() {
+                    let cc0 = std::path::Path::new("assets/cc0/textures");
+                    if cc0.is_dir() {
+                        self.file_dialog_dir = Some(cc0.to_path_buf());
+                    }
+                    self.open_file_dialog(FileDialogMode::ImportTexture, "");
                 }
             });
         });
@@ -19338,9 +19434,20 @@ impl CadApp {
             ui.label(egui::RichText::new("No material selected.").weak());
             return;
         };
-        let Some(nid) = self.materials.sel_node else {
-            ui.label(egui::RichText::new("Click a node on the canvas to edit it.").small().weak());
-            return;
+        // No node picked → default to the Principled BSDF, so the properties area always shows the
+        // material's main parameters (colour, metallic, roughness, Alpha/opacity, emission…).
+        let nid = match self.materials.sel_node {
+            Some(n) => n,
+            None => match self.materials.graphs.get(&i).and_then(|g| g.principled_id()) {
+                Some(p) => {
+                    self.materials.sel_node = Some(p);
+                    p
+                }
+                None => {
+                    ui.label(egui::RichText::new("Click a node on the canvas to edit it.").small().weak());
+                    return;
+                }
+            },
         };
         let tex_names: Vec<String> = self.factory.textures.iter().enumerate().map(|(k, t)| format!("{k}: {}", t.name)).collect();
         let n_tex = self.factory.textures.len();
@@ -19349,6 +19456,13 @@ impl CadApp {
             let Some(graph) = self.materials.graphs.get_mut(&i) else { return; };
             let pid = graph.principled_id();
             let is_output = matches!(graph.node(nid).map(|n| &n.kind), Some(NodeKind::Output));
+            // When the Principled is shown, its Base-Color SOURCE node's properties are rendered
+            // inline below (pattern/grain or tiling/rotate) — the whole material in one panel.
+            let src_id = if pid == Some(nid) {
+                graph.source_of(nid, crate::material_graph::pin::BASE_COLOR).map(|n| n.id)
+            } else {
+                None
+            };
             if let Some(node) = graph.node_mut(nid) {
                 ui.label(egui::RichText::new(node.kind.title()).strong().color(crate::theme::color::ACCENT));
                 ui.add_space(4.0);
@@ -19367,7 +19481,21 @@ impl CadApp {
                             ui.color_edit_button_rgb(&mut p.emission);
                         });
                         ui.add(egui::Slider::new(&mut p.emission_strength, 0.0..=20.0).text("Emission str"));
-                        ui.label(egui::RichText::new("A wired input overrides its socket value.").small().weak());
+                        // Roughness MAP (red channel) — a direct material property (the graph's
+                        // Roughness scalar is the fallback where the map isn't set).
+                        if let Some(t) = self.factory.textures.get_mut(i) {
+                            let cur = match t.rough_map {
+                                Some(k) => tex_names.get(k).cloned().unwrap_or_else(|| "(missing)".into()),
+                                None => "(none)".into(),
+                            };
+                            egui::ComboBox::from_label("Rough map").selected_text(cur).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut t.rough_map, None, "(none)");
+                                for k in 0..n_tex {
+                                    ui.selectable_value(&mut t.rough_map, Some(k), tex_names[k].clone());
+                                }
+                            });
+                        }
+                        ui.label(egui::RichText::new("A wired input overrides its socket value. Alpha = surface opacity.").small().weak());
                     }
                     NodeKind::Rgb(c) => {
                         ui.horizontal(|ui| {
@@ -19379,27 +19507,7 @@ impl CadApp {
                         ui.add(egui::Slider::new(v, 0.0..=1.0).text("Value"));
                     }
                     NodeKind::Procedural(def) => {
-                        egui::ComboBox::from_label("Pattern")
-                            .selected_text(def.pattern.label())
-                            .show_ui(ui, |ui| {
-                                for p in crate::factory::ProcPattern::ALL {
-                                    ui.selectable_value(&mut def.pattern, p, p.label());
-                                }
-                            });
-                        ui.horizontal(|ui| {
-                            ui.label("A");
-                            ui.color_edit_button_rgb(&mut def.col_a);
-                            ui.label("B");
-                            ui.color_edit_button_rgb(&mut def.col_b);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Grain");
-                            for k in 0..3 {
-                                ui.add(egui::DragValue::new(&mut def.scale[k]).speed(0.5).range(0.1..=400.0));
-                            }
-                        });
-                        ui.add(egui::Slider::new(&mut def.contrast, 0.2..=4.0).text("Contrast"));
-                        ui.add(egui::Slider::new(&mut def.detail, 1.0..=8.0).text("Detail"));
+                        Self::mf_edit_procedural(ui, def);
                     }
                     NodeKind::NormalMap { tex, strength } => {
                         let cur = match tex {
@@ -19416,9 +19524,36 @@ impl CadApp {
                     }
                     NodeKind::ImageTex => {
                         ui.label(egui::RichText::new("Uses this material's own bound bitmap as the base colour.").small().weak());
+                        if let Some(t) = self.factory.textures.get_mut(i) {
+                            Self::mf_edit_placement(ui, t);
+                        }
                     }
                     NodeKind::Output => {
                         ui.label(egui::RichText::new("The material's final surface.").small().weak());
+                    }
+                }
+            }
+            // Base-Color SOURCE inline (when the Principled is shown): pattern/grain for a
+            // procedural, tiling/move/rotate for an image, the swatch for a plain colour — the
+            // full material stack edited in ONE panel, no canvas hunting.
+            if let Some(sid) = src_id {
+                if let Some(src) = graph.node_mut(sid) {
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("Base Color — {}", src.kind.title())).strong().color(crate::theme::color::ACCENT));
+                    match &mut src.kind {
+                        NodeKind::Procedural(def) => Self::mf_edit_procedural(ui, def),
+                        NodeKind::Rgb(c) => {
+                            ui.horizontal(|ui| {
+                                ui.label("Color");
+                                ui.color_edit_button_rgb(c);
+                            });
+                        }
+                        NodeKind::ImageTex => {
+                            if let Some(t) = self.factory.textures.get_mut(i) {
+                                Self::mf_edit_placement(ui, t);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -19440,9 +19575,53 @@ impl CadApp {
         }
     }
 
+    /// Procedural-pattern editor (pattern / ramp colours / grain / contrast / detail) — shared by
+    /// the Procedural node arm and the inline Base-Color source section.
+    fn mf_edit_procedural(ui: &mut egui::Ui, def: &mut crate::factory::ProcDef) {
+        egui::ComboBox::from_label("Pattern")
+            .selected_text(def.pattern.label())
+            .show_ui(ui, |ui| {
+                for p in crate::factory::ProcPattern::ALL {
+                    ui.selectable_value(&mut def.pattern, p, p.label());
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label("A");
+            ui.color_edit_button_rgb(&mut def.col_a);
+            ui.label("B");
+            ui.color_edit_button_rgb(&mut def.col_b);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Grain");
+            for k in 0..3 {
+                ui.add(egui::DragValue::new(&mut def.scale[k]).speed(0.5).range(0.1..=400.0));
+            }
+        });
+        ui.add(egui::Slider::new(&mut def.contrast, 0.2..=4.0).text("Contrast"));
+        ui.add(egui::Slider::new(&mut def.detail, 1.0..=8.0).text("Detail"));
+    }
+
+    /// Image placement editor (tiling / move / rotate) — direct material properties (not
+    /// graph-compiled), shared by the ImageTex node arm and the inline source section.
+    fn mf_edit_placement(ui: &mut egui::Ui, t: &mut crate::factory::TextureAsset) {
+        ui.add(egui::DragValue::new(&mut t.scale).speed(0.05).range(0.05..=200.0).prefix("tiling "))
+            .on_hover_text("Tiles per metre (features) / repeats across the piece (furniture)");
+        ui.horizontal(|ui| {
+            ui.label("move");
+            ui.add(egui::DragValue::new(&mut t.offset[0]).speed(0.01).prefix("u "));
+            ui.add(egui::DragValue::new(&mut t.offset[1]).speed(0.01).prefix("v "));
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut t.rot_deg).speed(1.0).range(-360.0..=360.0).prefix("rotate ").suffix("°"));
+            if ui.small_button("⟳ 90°").clicked() {
+                t.rot_deg = (t.rot_deg + 90.0).rem_euclid(360.0);
+            }
+        });
+    }
+
     /// Write a compiled graph result onto material `i`'s flat renderer fields. Everything here is
     /// uniform-driven (procedural params / roughness / metallic / opacity / normal map), so the 3D
-    /// view updates the SAME frame with no GPU texture re-upload and no CSG recompute.
+    /// view updates the SAME frame with no GPU re-upload and no CSG recompute.
     fn apply_compiled_material(&mut self, i: usize, c: &crate::material_graph::CompiledMaterial) {
         let Some(t) = self.factory.textures.get_mut(i) else { return; };
         t.roughness = c.roughness;
@@ -19678,17 +19857,10 @@ impl CadApp {
         }
     }
 
-    /// Write the Radiance render bundle (scene.rad + sky.rad + render.bat/.sh + README) to a folder
-    /// next to the current file (or the user's home), matched to the ☀ Sun settings + camera.
-    /// Returns the folder on success so "Export + run" can execute the pipeline in it.
-    fn export_radiance_scene(&mut self) -> Option<std::path::PathBuf> {
-        let tris = self.factory.export_render_tris();
-        if tris.is_empty() {
-            self.factory.status = "Radiance export: nothing in the scene to export".into();
-            return None;
-        }
-        // Output folder: <current-file-stem>_radiance next to the project, else home\3dfactory_radiance.
-        let dir = match self.current_file.as_ref() {
+    /// The SUGGESTED Radiance output folder — where the folder-picker dialog starts:
+    /// `<current-file-stem>_radiance` next to the project, else `home\3dfactory_radiance`.
+    fn radiance_default_dir(&self) -> std::path::PathBuf {
+        match self.current_file.as_ref() {
             Some(p) => {
                 let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "scene".into());
                 p.parent().map(|d| d.join(format!("{stem}_radiance"))).unwrap_or_else(|| std::path::PathBuf::from(format!("{stem}_radiance")))
@@ -19697,17 +19869,38 @@ impl CadApp {
                 let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
                 std::path::Path::new(&home).join("3dfactory_radiance")
             }
-        };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        }
+    }
+
+    /// Open the folder-picker for the Radiance output. `run_after` = execute the pipeline once a
+    /// folder is chosen (vs export-only). Starts in the suggested default folder.
+    fn pick_radiance_folder(&mut self, run_after: bool) {
+        self.rad_run_after_pick = run_after;
+        let dir = self.radiance_default_dir();
+        let _ = std::fs::create_dir_all(&dir); // so the picker can start inside the suggestion
+        self.file_dialog_dir = Some(dir);
+        self.open_file_dialog(FileDialogMode::PickFolder, "");
+    }
+
+    /// Write the Radiance render bundle (scene.rad + sky.rad + render.bat/.sh + README) into the
+    /// CHOSEN folder, matched to the ☀ Sun settings + camera. Returns false on failure.
+    fn export_radiance_scene_to(&mut self, dir: &std::path::Path) -> bool {
+        let tris = self.factory.export_render_tris();
+        if tris.is_empty() {
+            self.factory.status = "Radiance export: nothing in the scene to export".into();
+            return false;
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
             self.factory.status = format!("Radiance export failed: {e}");
-            return None;
+            return false;
         }
         let s = &self.factory.sun;
         let (eye, target) = self.factory.export_camera();
         let scene = crate::radiance_export::scene_rad(&tris);
         let sky = crate::radiance_export::sky_rad(s.lat_deg, s.lon_deg, s.utc_offset, s.month, s.day, s.hour);
-        let bat = crate::radiance_export::render_bat(eye, target);
-        let sh = crate::radiance_export::render_sh(eye, target);
+        let (rw, rh) = [(640, 480), (960, 720), (1280, 960), (1600, 1200)][self.rad_res.min(3) as usize];
+        let bat = crate::radiance_export::render_bat(eye, target, rw, rh);
+        let sh = crate::radiance_export::render_sh(eye, target, rw, rh);
         let readme = crate::radiance_export::readme();
         let writes = [
             ("scene.rad", scene),
@@ -19719,19 +19912,66 @@ impl CadApp {
         for (name, body) in writes {
             if let Err(e) = std::fs::write(dir.join(name), body) {
                 self.factory.status = format!("Radiance export: failed writing {name}: {e}");
-                return None;
+                return false;
             }
         }
         self.factory.status = format!("Radiance scene exported ({} triangles) → {}", tris.len(), dir.display());
         self.history.push(format!("  exported Radiance scene ({} tris) to {}", tris.len(), dir.display()));
-        Some(dir)
+        true
+    }
+
+    /// Find the LBNL Radiance `bin` folder: anywhere on PATH holding `oconv.exe`, else the
+    /// standard install locations. `None` = Radiance is not installed on this machine.
+    fn find_radiance_bin() -> Option<std::path::PathBuf> {
+        if let Some(path) = std::env::var_os("PATH") {
+            for d in std::env::split_paths(&path) {
+                if d.join("oconv.exe").is_file() {
+                    return Some(d);
+                }
+            }
+        }
+        for d in ["C:/Radiance/bin", "C:/Program Files/Radiance/bin", "C:/Program Files (x86)/Radiance/bin"] {
+            let p = std::path::PathBuf::from(d);
+            if p.join("oconv.exe").is_file() {
+                return Some(p);
+            }
+        }
+        None
     }
 
     /// Export the Radiance bundle AND run the pipeline (`render.bat`: oconv → rpict → pfilt →
-    /// ra_bmp) in a background thread, streaming into [`Self::rad_job`]. Needs Radiance installed
-    /// (on PATH) — a missing install surfaces in the job log, not a crash.
-    fn run_radiance(&mut self) {
-        let Some(dir) = self.export_radiance_scene() else { return };
+    /// ra_bmp) in a background thread, streaming into [`Self::rad_job`]. Preflights the Radiance
+    /// install (PATH + standard folders) so a missing toolkit gives ONE clear message, and wires
+    /// PATH/RAYPATH for the child so a non-PATH install still runs.
+    fn run_radiance_in(&mut self, dir: std::path::PathBuf) {
+        if !self.export_radiance_scene_to(&dir) {
+            return;
+        }
+        // NB: this run needs the actual LBNL Radiance PROGRAMS. It is unrelated to the ☀ Sun
+        // toggle — the viewport sun is our built-in port of Radiance's solar model, and the
+        // exported sky always embeds the dialog's location/time either way.
+        let Some(bin) = Self::find_radiance_bin() else {
+            self.rad_job = Some(StdArc::new(Mutex::new(RadState {
+                done: true,
+                ok: false,
+                log: format!(
+                    "Radiance is not installed on this machine (oconv.exe not found on PATH, C:\\Radiance\\bin, or Program Files).\n\n\
+                     The scene was still exported to:\n  {}\n\n\
+                     To render with Radiance:\n\
+                     1. Download the Windows installer from github.com/LBNL-ETA/Radiance/releases\n\
+                     2. Install (the default C:\\Radiance is fine — it does not need to be on PATH)\n\
+                     3. Press ▶ Run Radiance again.",
+                    dir.display()
+                ),
+                image: None,
+                dir: dir.clone(),
+            })));
+            self.rad_started = Some(std::time::Instant::now());
+            self.rad_preview = None;
+            self.rad_loaded = false;
+            self.factory.status = "Radiance not installed — scene exported; see the Radiance window".into();
+            return;
+        };
         let shared = StdArc::new(Mutex::new(RadState {
             done: false,
             ok: false,
@@ -19743,6 +19983,17 @@ impl CadApp {
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new("cmd");
             cmd.args(["/C", "render.bat"]).current_dir(&dir);
+            // Make the toolkit visible to the child even when Radiance isn't on the user's PATH,
+            // and point RAYPATH at its lib (gensky needs it for the sky primitives).
+            let old_path = std::env::var("PATH").unwrap_or_default();
+            cmd.env("PATH", format!("{};{}", bin.display(), old_path));
+            if std::env::var_os("RAYPATH").is_none() {
+                if let Some(lib) = bin.parent().map(|r| r.join("lib")) {
+                    if lib.is_dir() {
+                        cmd.env("RAYPATH", lib);
+                    }
+                }
+            }
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -21810,6 +22061,7 @@ impl CadApp {
                             || lname.ends_with(".fbx") || lname.ends_with(".glb")
                             || lname.ends_with(".gltf"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
+                        FileDialogMode::PickFolder => false, // folders only
                     };
                     if is_dir {
                         dirs.push(name);
@@ -21830,6 +22082,7 @@ impl CadApp {
             FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX / glTF",
             FileDialogMode::ImportTexture => "Load texture  ·  PNG / JPG image",
             FileDialogMode::Save => "Save As",
+            FileDialogMode::PickFolder => "Choose output folder  ·  Radiance render",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
         // Open / Cancel) are never pushed off-screen.
@@ -21908,24 +22161,27 @@ impl CadApp {
                     .resizable(false)
                     .show_inside(ui, |ui| {
                         ui.add_space(3.0);
-                        ui.horizontal(|ui| {
-                            ui.label(match dlg.mode {
-                                FileDialogMode::Open => "Type  ",
-                                FileDialogMode::ImportImage | FileDialogMode::ImportRaster
-                                | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Type  ",
-                                FileDialogMode::Save => "Format",
+                        if dlg.mode != FileDialogMode::PickFolder {
+                            ui.horizontal(|ui| {
+                                ui.label(match dlg.mode {
+                                    FileDialogMode::Open => "Type  ",
+                                    FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                                    | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Type  ",
+                                    FileDialogMode::Save => "Format",
+                                    FileDialogMode::PickFolder => unreachable!(),
+                                });
+                                let before = dlg.ext.clone();
+                                ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF (*.dxf)");
+                                ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "Native (*.rsm)");
+                                if dlg.mode == FileDialogMode::Open && dlg.ext != before
+                                    && !dlg.filename.to_ascii_lowercase().ends_with(&dlg.ext)
+                                {
+                                    dlg.filename.clear();
+                                }
                             });
-                            let before = dlg.ext.clone();
-                            ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF (*.dxf)");
-                            ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "Native (*.rsm)");
-                            if dlg.mode == FileDialogMode::Open && dlg.ext != before
-                                && !dlg.filename.to_ascii_lowercase().ends_with(&dlg.ext)
-                            {
-                                dlg.filename.clear();
-                            }
-                        });
+                        }
                         ui.horizontal(|ui| {
-                            ui.label("File");
+                            ui.label(if dlg.mode == FileDialogMode::PickFolder { "Subfolder" } else { "File" });
                             ui.add(egui::TextEdit::singleline(&mut dlg.filename)
                                 .desired_width(260.0)
                                 .hint_text(match dlg.mode {
@@ -21934,6 +22190,7 @@ impl CadApp {
                                     | FileDialogMode::ImportTexture => "pick an image above",
                                     FileDialogMode::ImportObj => "pick an .obj, .3ds, .fbx, .glb or .gltf above",
                                     FileDialogMode::Save => "drawing name",
+                                    FileDialogMode::PickFolder => "optional — new subfolder to create here",
                                 }));
                         });
                         if let Some(err) = &dlg.error {
@@ -21949,6 +22206,7 @@ impl CadApp {
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
                                     | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Open",
                                     FileDialogMode::Save => "Save",
+                                    FileDialogMode::PickFolder => "Use this folder",
                                 };
                                 if ui.button(label).clicked() { do_confirm = true; }
                             });
@@ -22069,7 +22327,7 @@ impl CadApp {
         if do_confirm {
             self.file_dialog_dir = Some(dlg.dir.clone());
             let name = dlg.filename.trim();
-            if name.is_empty() {
+            if name.is_empty() && dlg.mode != FileDialogMode::PickFolder {
                 dlg.error = Some("enter or pick a file name".into());
                 self.file_dialog = Some(dlg);
                 return;
@@ -22106,6 +22364,15 @@ impl CadApp {
                     };
                     let path = dlg.dir.join(fname);
                     self.do_save(&path.to_string_lossy());
+                }
+                FileDialogMode::PickFolder => {
+                    // The Radiance output folder: the browsed dir, or a new subfolder in it.
+                    let dir = if name.is_empty() { dlg.dir.clone() } else { dlg.dir.join(name) };
+                    if self.rad_run_after_pick {
+                        self.run_radiance_in(dir);
+                    } else {
+                        self.export_radiance_scene_to(&dir);
+                    }
                 }
             }
             self.file_preview = None;   // drop cached preview doc
@@ -32740,7 +33007,7 @@ impl eframe::App for CadApp {
                         .on_hover_text("Export the scene and run LBNL Radiance (oconv → rpict) for a physically-accurate daylight render, shown in-app when done. Needs Radiance installed.")
                         .clicked()
                     {
-                        self.run_radiance();
+                        self.pick_radiance_folder(true);
                         ui.close_menu();
                     }
                     ui.add_space(4.0);
