@@ -81,20 +81,133 @@ pub struct FactoryDoc {
     /// the surface key is a tuple and JSON map keys must be strings.
     #[serde(default)]
     pub surface_colors: Vec<(u32, i32, i32, i32, i32, [f32; 3])>,
+    /// Clipboard TEXTURES pasted onto objects. Stored PNG-compressed + base64 so a screenshot
+    /// doesn't bloat the sidecar into megabytes of raw pixels.
+    #[serde(default)]
+    pub textures: Vec<TextureRec>,
+    /// Per-feature texture assignment: `(feature_id, texture_index)`.
+    #[serde(default)]
+    pub feature_textures: Vec<(u32, usize)>,
+    /// Per-surface texture: `(feature_id, nx, ny, nz, offset, texture_index)` — flat because
+    /// the surface key is a tuple. Lets each wall face carry its own image.
+    #[serde(default)]
+    pub surface_textures: Vec<(u32, i32, i32, i32, i32, usize)>,
+    /// GROUPS of CSG features: `(feature_id, group_id)` — members select/move/delete as one.
+    #[serde(default)]
+    pub feature_groups: Vec<(u32, u32)>,
 }
 
+/// One pasted texture as persisted: PNG bytes, base64-encoded. Mirrors `factory::TextureAsset`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct TextureRec {
+    pub name: String,
+    pub w: u32,
+    pub h: u32,
+    #[serde(default = "one")]
+    pub scale: f32,
+    /// Texture MOVE (UV offset) and ROTATE (degrees). `#[serde(default)]` so older sidecars load.
+    #[serde(default)]
+    pub offset: [f32; 2],
+    #[serde(default)]
+    pub rot_deg: f32,
+    /// Surface OPACITY (1.0 = opaque) and REFLECTION (0.0 = matte). `#[serde(default*)]` so older
+    /// sidecars load as opaque + matte.
+    #[serde(default = "one")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub reflect: f32,
+    /// PNG-encoded pixels, base64. Decoded back to RGBA8 on load. For a procedural texture this is
+    /// just a 1×1 fallback swatch; the real definition lives in `proc`.
+    pub png_b64: String,
+    /// PROCEDURAL material definition — `Some` for a shader-evaluated pattern (wood/marble/…),
+    /// `None` (the default, so older sidecars load) for a plain pasted image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc: Option<ProcRec>,
+    /// Texture Phase 2 — PBR maps: normal/roughness map texture indices + scalar roughness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_map: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rough_map: Option<usize>,
+    #[serde(default = "half")]
+    pub roughness: f32,
+    /// Principled BSDF params from the Materials Factory node editor. `#[serde(default*)]` so older
+    /// sidecars load as non-metallic, IOR 1.5, no emission (the previous plastic look).
+    #[serde(default)]
+    pub metallic: f32,
+    #[serde(default = "ior_default")]
+    pub ior: f32,
+    #[serde(default)]
+    pub emission: [f32; 3],
+    #[serde(default)]
+    pub emission_strength: f32,
+}
+
+fn half() -> f32 {
+    0.5
+}
+
+fn ior_default() -> f32 {
+    1.5
+}
+
+/// A procedural material as persisted. `pattern` is a stable tag ("wood"|"marble"|"noise"|"checker").
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ProcRec {
+    pub pattern: String,
+    pub col_a: [f32; 3],
+    pub col_b: [f32; 3],
+    pub scale: [f32; 3],
+    pub detail: f32,
+    pub rough: f32,
+    pub contrast: f32,
+    pub ramp: [f32; 2],
+}
+
+fn one() -> f32 { 1.0 }
+
 /// A furniture mesh as persisted (triangle soup). Mirrors `factory::FurnitureAsset`.
+///
+/// Geometry is stored COMPACTLY as base64 of deflated little-endian f32 bytes (`*_b64`). The
+/// old JSON `Vec<[f32;3]>` fields remain only to READ pre-existing sidecars — writing millions
+/// of vertices as JSON numbers made a heavy mesh take ~20s to load/save.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct FurnitureAssetRec {
     pub name: String,
+    /// LEGACY JSON geometry (old sidecars). New writes leave these empty and use `*_b64`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positions: Vec<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub normals: Vec<[f32; 3]>,
     #[serde(default)]
     pub color: [f32; 3],
+    /// LEGACY JSON UVs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uvs: Vec<[f32; 2]>,
+    /// Compact geometry: base64(deflate(LE f32 bytes)). `pos`/`nrm` are xyz triples, `uv` pairs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pos_b64: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nrm_b64: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub uv_b64: String,
+    /// Compact PER-VERTEX OPACITY: base64(deflate(LE f32)). EMPTY for a fully-opaque asset (the
+    /// common case) and for sidecars written before transparency existed — both load as opaque.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alpha_b64: String,
+    /// Absolute path the mesh came from, so a stale project can re-derive transparency on load.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
+    /// True once alpha was resolved from the source (avoids a repeat on-load re-parse).
+    #[serde(default)]
+    pub alpha_resolved: bool,
+    /// Per-TRIANGLE part id for GENERATED objects (each tread/riser/baluster) so a reloaded
+    /// staircase keeps its per-piece selection. Empty for imported meshes. Small (one u32/tri).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub part_ids: Vec<u32>,
 }
 
 /// A placed furniture instance. Mirrors `factory::FurnitureInst`.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct FurnitureInstRec {
     pub asset: usize,
     pub pos: [f32; 3],
@@ -106,6 +219,17 @@ pub struct FurnitureInstRec {
     #[serde(default)]
     pub rot_xy: [f32; 2],
     pub color: [f32; 3],
+    /// Index into `FactoryDoc::textures` when a clipboard texture is applied to this piece.
+    #[serde(default)]
+    pub texture: Option<usize>,
+    /// Non-uniform local scale for an APERTURE (door/window stretched to fill an opening).
+    /// `None`/absent for ordinary furniture. `#[serde(default)]` so old sidecars still load.
+    #[serde(default)]
+    pub fit: Option<[f32; 3]>,
+    /// PER-SURFACE textures: `(face_group_id, texture_index)` pairs (flattened `FurnitureInst::
+    /// surface_texture`). `#[serde(default)]` so old sidecars load as whole-object only.
+    #[serde(default)]
+    pub surface_texture: Vec<(u32, usize)>,
 }
 
 impl FactoryDoc {
@@ -174,10 +298,16 @@ pub fn load(drawing: &Path) -> Result<Option<SimluxConfig>, String> {
     Ok(Some(cfg))
 }
 
-/// Write the sidecar for `drawing`. Returns the path written.
+/// Write the sidecar for `drawing`. Returns the path written. Written ATOMICALLY (temp + rename)
+/// so an interrupted write (crash / close during autosave) can't corrupt the previous sidecar.
 pub fn save(drawing: &Path, cfg: &SimluxConfig) -> Result<PathBuf, String> {
     let p = sidecar_path(drawing);
     let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    std::fs::write(&p, text).map_err(|e| e.to_string())?;
+    let tmp = p.with_extension("json.savetmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     Ok(p)
 }

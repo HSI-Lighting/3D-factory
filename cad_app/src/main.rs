@@ -8,10 +8,15 @@ mod gpu;
 mod hatch_trace;
 mod light;
 mod light3d;
+mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
 mod mesh_io;      // OBJ furniture import
 mod param_editor;
+mod pathtrace; // in-app progressive path tracer — shared core + CPU backend
+mod pathtrace_gpu; // GPU backend: the same tracer in a GL 3.3 fragment shader
+mod radiance_export; // offline Radiance render export (.rad geometry + gensky sky)
 mod settings;
 mod simlux_io;
+mod solar;      // Radiance-based sun position for daylight rendering
 mod theme;
 mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).

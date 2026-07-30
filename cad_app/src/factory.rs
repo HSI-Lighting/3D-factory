@@ -82,23 +82,236 @@ pub struct SketchSession {
     pub saved_redo: Vec<crate::app::UndoStep>,
 }
 
-/// Fixed key light, matching `light3d`'s shading so the two 3D views look alike.
+/// Daylight settings the user edits (▼ Environment) — where/when the building is, so the sun can be
+/// located with Radiance's model ([`crate::solar`]) and the scene lit accordingly. Not the render
+/// output; the resolved directional light is pushed to [`set_sun_light`] each frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SunEnv {
+    /// Light the scene by the sun. Off → the original fixed studio key light (no visual change).
+    pub enabled: bool,
+    pub lat_deg: f32,
+    /// Longitude, degrees, **positive east**.
+    pub lon_deg: f32,
+    /// UTC offset in hours, **positive east** (BST = +1, PST = −8).
+    pub utc_offset: f32,
+    pub month: u32,
+    pub day: u32,
+    /// Local standard time, hours 0..24.
+    pub hour: f32,
+    /// Rotate true north off world +Y (degrees) so the building can face any way.
+    pub north_offset_deg: f32,
+    /// Overall sun brightness multiplier.
+    pub intensity: f32,
+    /// Cast shadows from the sun (shadow-map pass). Independent of `enabled` lighting so it can be
+    /// turned off if the shadow map misbehaves on a given scene.
+    pub shadows: bool,
+}
+
+impl Default for SunEnv {
+    fn default() -> Self {
+        // London, midsummer noon — a pleasant high sun; OFF by default so nothing changes until
+        // the user opts in.
+        Self { enabled: false, lat_deg: 51.5, lon_deg: -0.13, utc_offset: 1.0, month: 6, day: 21, hour: 13.0, north_offset_deg: 0.0, intensity: 1.0, shadows: true }
+    }
+}
+
+impl SunEnv {
+    /// Fold the settings into a render-cache signature so any change re-bakes the shaded buffers.
+    fn hash_into(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        self.enabled.hash(h);
+        for x in [self.lat_deg, self.lon_deg, self.utc_offset, self.hour, self.north_offset_deg, self.intensity] {
+            x.to_bits().hash(h);
+        }
+        self.month.hash(h);
+        self.day.hash(h);
+    }
+
+    /// Resolve the current settings to a directional light: the sun direction (via [`crate::solar`])
+    /// plus a warm direct term and a HEMISPHERIC ambient (cool sky from above + warm ground bounce
+    /// from below), all dimming as the sun nears/goes below the horizon. Returns
+    /// `(enabled, dir, sun_rgb, sky_rgb, ground_rgb)` ready for [`set_sun_light`].
+    pub fn resolve(&self) -> (bool, Vec3, [f32; 3], [f32; 3], [f32; 3]) {
+        let doy = crate::solar::day_of_year(self.month, self.day);
+        let p = crate::solar::sun_position(self.lat_deg, self.lon_deg, self.utc_offset, doy, self.hour, self.north_offset_deg);
+        // Daylight factor f = sin(altitude): 0 at the horizon, 1 with the sun overhead.
+        let f = p.dir.z.max(0.0).clamp(0.0, 1.0);
+        // Direct sun: amber + dim near the horizon, bright near-WHITE when high (a midday sun is not
+        // yellow). These are HDR radiances — values exceed 1 on purpose; the shaders + CPU shade
+        // tone-map (1 − e⁻ˣ) so highlights roll off to a photographic bright-day look instead of
+        // clipping to flat white.
+        let w = smoothstep(0.06, 0.35, f); // whiten quickly once the sun clears the horizon
+        let warm = [1.0, lerp(0.42, 0.97, w), lerp(0.16, 0.92, w)];
+        let direct = self.intensity * (0.35 + 2.0 * f); // strong at noon
+        let sun = [warm[0] * direct, warm[1] * direct, warm[2] * direct];
+        // HEMISPHERIC ambient — the biggest thing missing before. Real daylight is not a flat fill:
+        // the SKY lights everything from above and the sunlit GROUND bounces warm light back up (fake
+        // GI). Blender's convincing render gets this from a bright sky dome + ray-traced bounce; we
+        // approximate it with two colours the shaders/CPU blend by surface normal. Both scale with
+        // `intensity`, so the brightness slider lifts the shadow side too — previously only the direct
+        // term scaled, so a façade in shade stayed dusk-dark at any slider value.
+        let sky_i = self.intensity * (0.35 + 0.95 * f); // cool skylight from ABOVE (was ~2× dimmer)
+        let sky = [0.85 * sky_i + 0.04, 0.92 * sky_i + 0.05, 1.05 * sky_i + 0.07];
+        let gnd_i = self.intensity * (0.15 + 0.80 * f); // warm ground BOUNCE from below
+        let ground = [0.90 * gnd_i + 0.03, 0.85 * gnd_i + 0.03, 0.75 * gnd_i + 0.03];
+        (self.enabled, p.dir, sun, sky, ground)
+    }
+}
+
+/// The RESOLVED directional light that the CPU shaders read — recomputed from [`SunEnv`] by the app
+/// each frame and pushed via [`set_sun_light`]. `Copy` so the thread-local read is a cheap value.
+#[derive(Clone, Copy)]
+struct SunLightRaw {
+    enabled: bool,
+    dir: Vec3,
+    sun: [f32; 3],    // warm direct term (already intensity-scaled)
+    sky: [f32; 3],    // cool ambient fill from ABOVE
+    ground: [f32; 3], // warm ground bounce from BELOW (fake GI); hemispheric-blended by normal.z
+}
+
+impl Default for SunLightRaw {
+    fn default() -> Self {
+        Self { enabled: false, dir: Vec3::new(0.35, 0.25, 0.9).normalize(), sun: [1.0, 0.96, 0.88], sky: [0.32, 0.34, 0.40], ground: [0.20, 0.19, 0.17] }
+    }
+}
+
+thread_local! {
+    /// The active sun light for shading on THIS (render) thread. Buffer building is single-threaded
+    /// on the main thread, so a thread-local is both correct and lock-free per vertex.
+    static SUN: std::cell::Cell<SunLightRaw> = const { std::cell::Cell::new(SunLightRaw { enabled: false, dir: Vec3::new(0.0, 0.0, 1.0), sun: [1.0, 0.96, 0.88], sky: [0.32, 0.34, 0.40], ground: [0.20, 0.19, 0.17] }) };
+}
+
+/// Push the resolved sun light (call before building any shaded buffers). `dir` points TO the sun.
+pub fn set_sun_light(enabled: bool, dir: Vec3, sun: [f32; 3], sky: [f32; 3], ground: [f32; 3]) {
+    SUN.with(|c| c.set(SunLightRaw { enabled, dir: dir.normalize_or_zero(), sun, sky, ground }));
+}
+
+fn sun_light() -> SunLightRaw {
+    SUN.with(|c| c.get())
+}
+
+thread_local! {
+    /// CLAY mode: override every surface to a flat neutral grey (glass keeps its transparency) so
+    /// light/shadow/bounce can be judged without material colour muddying it — the villa build's
+    /// "light-meter". Set on the render thread before building buffers, like [`set_sun_light`].
+    static CLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The neutral clay grey (matte).
+pub const CLAY_GREY: [f32; 3] = [0.62, 0.62, 0.62];
+
+/// Enable/disable clay mode for shading on this (render) thread.
+pub fn set_clay(on: bool) {
+    CLAY.with(|c| c.set(on));
+}
+
+fn clay_on() -> bool {
+    CLAY.with(|c| c.get())
+}
+
+/// Linear interpolate a→b by t.
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// GLSL-style smoothstep: 0 below `e0`, 1 above `e1`, a smooth Hermite ramp between.
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Exposure tone-map (1 − e⁻ˣ) — compresses the HDR daylight radiances into 0..1 so bright sun
+/// highlights roll off smoothly (photographic) instead of clipping to flat white, while lifting the
+/// shadow side into visible daylight. Must MATCH the shader's `tonemap()` (light3d TEX_FS) so the
+/// CPU-baked flat geometry and the in-shader textured surfaces read identically. Applied only on the
+/// sun-lit path; the fixed studio light (sun off) keeps its original LDR look.
+fn tonemap(c: [f32; 3]) -> [f32; 3] {
+    [1.0 - (-c[0]).exp(), 1.0 - (-c[1]).exp(), 1.0 - (-c[2]).exp()]
+}
+
+/// Hemispheric ambient at a surface with normal `n`: the cool sky (from above) blended toward the
+/// warm ground bounce (from below) by the normal's up-component — up-facing → full sky, undersides →
+/// ground bounce, verticals → the midpoint. This fakes the sky-dome + ground-bounce GI that makes
+/// Blender's render read as convincing daylight instead of a flat, dim fill. Must match the shader.
+fn hemi_ambient(s: &SunLightRaw, n: Vec3) -> [f32; 3] {
+    let up = (0.5 + 0.5 * n.z).clamp(0.0, 1.0);
+    [
+        lerp(s.ground[0], s.sky[0], up),
+        lerp(s.ground[1], s.sky[1], up),
+        lerp(s.ground[2], s.sky[2], up),
+    ]
+}
+
+/// Fixed key light, matching `light3d`'s shading so the two 3D views look alike. When the sun is
+/// enabled this instead lights by the real sun direction (warm direct + hemispheric sky/ground fill),
+/// so the lit and shadowed sides read as daylight and rotate as the sun moves.
 fn shade(base: [f32; 3], n: Vec3) -> [f32; 3] {
-    let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
-    let k = 0.35 + 0.65 * n.dot(dir).abs();
-    [base[0] * k, base[1] * k, base[2] * k]
+    let base = if clay_on() { CLAY_GREY } else { base };
+    let s = sun_light();
+    if !s.enabled {
+        let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
+        let k = 0.35 + 0.65 * n.dot(dir).abs();
+        return [base[0] * k, base[1] * k, base[2] * k];
+    }
+    let a = hemi_ambient(&s, n);
+    let lit = n.dot(s.dir).max(0.0);
+    tonemap([
+        base[0] * (a[0] + s.sun[0] * lit),
+        base[1] * (a[1] + s.sun[1] * lit),
+        base[2] * (a[2] + s.sun[2] * lit),
+    ])
 }
 
 /// Brighter shading for imported furniture — a higher ambient floor (0.6) so meshes read
 /// clearly instead of coming out murky-dark, which is how many imports looked.
 fn shade_furniture(base: [f32; 3], n: Vec3) -> [f32; 3] {
-    let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
-    let k = 0.6 + 0.4 * n.dot(dir).abs();
-    [(base[0] * k).min(1.0), (base[1] * k).min(1.0), (base[2] * k).min(1.0)]
+    let base = if clay_on() { CLAY_GREY } else { base };
+    let s = sun_light();
+    if !s.enabled {
+        let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
+        let k = 0.6 + 0.4 * n.dot(dir).abs();
+        return [(base[0] * k).min(1.0), (base[1] * k).min(1.0), (base[2] * k).min(1.0)];
+    }
+    // A touch more fill than the scene so furniture never reads murky.
+    let a = hemi_ambient(&s, n);
+    let lit = n.dot(s.dir).max(0.0);
+    let amb = 0.05;
+    tonemap([
+        base[0] * (a[0] + amb + s.sun[0] * lit),
+        base[1] * (a[1] + amb + s.sun[1] * lit),
+        base[2] * (a[2] + amb + s.sun[2] * lit),
+    ])
+}
+
+/// Scalar lighting for TEXTURED surfaces — the `TexVtx.s` that multiplies the sampled image/procedural
+/// colour. Sun-aware when enabled (the luminance of the directional response), else the fixed studio
+/// scalar. `furniture` selects the brighter ambient floor. Keeps textured/procedural surfaces (e.g.
+/// the cabin's oak) responding to the sun alongside flat-coloured ones.
+fn shade_scalar(n: Vec3, furniture: bool) -> f32 {
+    let s = sun_light();
+    if !s.enabled {
+        let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
+        return if furniture { 0.6 + 0.4 * n.dot(dir).abs() } else { 0.35 + 0.65 * n.dot(dir).abs() };
+    }
+    let lum = |c: [f32; 3]| 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    let lit = n.dot(s.dir).max(0.0);
+    let amb = if furniture { 0.05 } else { 0.0 };
+    // Tone-map the scalar so it matches the colour paths' 1 − e⁻ˣ rolloff (this path lights the
+    // textured pieces only when the sun is OFF in-shader; kept consistent for the faceted remainder).
+    1.0 - (-(lum(hemi_ambient(&s, n)) + amb + lum(s.sun) * lit)).exp()
 }
 
 fn v(p: Vec3, c: [f32; 3]) -> V3 {
     V3 { x: p.x, y: p.y, z: p.z, r: c[0], g: c[1], b: c[2] }
+}
+
+/// Whether the triangle whose first vertex is `base` is see-through — any of its three
+/// vertices carries below-opaque alpha. Used to sort furniture triangles into the solid
+/// pass vs. the blended transparent pass.
+fn tri_is_translucent(asset: &FurnitureAsset, base: usize) -> bool {
+    asset.vertex_alpha(base) < ALPHA_OPAQUE
+        || asset.vertex_alpha(base + 1) < ALPHA_OPAQUE
+        || asset.vertex_alpha(base + 2) < ALPHA_OPAQUE
 }
 
 /// Even–odd ray-cast point-in-polygon test in XY. Used to tell whether a ceiling triangle
@@ -151,6 +364,17 @@ fn aabb_lines(out: &mut Vec<V3>, mn: Vec3, mx: Vec3, c: [f32; 3]) {
     }
 }
 
+/// Cache backing [`FactoryState::opaque_verts`]: the last-built opaque render buffer
+/// (CSG solids + posed furniture) and a cheap signature of the inputs that produced it.
+/// The buffer is an `Arc` so a paint callback can hold a reference-counted handle to the
+/// exact same vertices with no per-frame copy.
+#[derive(Default)]
+struct RenderCache {
+    sig: u64,
+    ready: bool,
+    verts: std::sync::Arc<Vec<V3>>,
+}
+
 /// 3D Factory state — the model + its view. Lives on `CadApp` as one field.
 pub struct FactoryState {
     pub open: bool,
@@ -159,6 +383,12 @@ pub struct FactoryState {
     pub cached: SolidMesh,
     pub dirty: bool,
     pub selection: Vec<u32>,
+    /// GROUPS of CSG features: `feature_id → group_id`. Members of a group select / move / delete
+    /// as one entity; "Explode" clears the tag. A feature is in at most one group. Furniture is not
+    /// grouped here (it is single-select). Persisted + snapshotted for undo.
+    pub feature_group: std::collections::HashMap<u32, u32>,
+    /// Next group id to hand out (monotonic; never reused so undo/redo stay unambiguous).
+    pub next_group_id: u32,
 
     // orbit camera — `cam_target` is STORED, never recomputed from bounds each frame,
     // so the view does not jump when a solid is added or moved (sandbox lesson).
@@ -286,6 +516,34 @@ pub struct FactoryState {
     /// gizmo and properties panel always act on exactly one thing.
     pub sel_furniture: Option<usize>,
 
+    /// Guided PATH-SWEEP pick, if one is running (see [`SweepPick`]). While `Some`, a click in
+    /// the 3D view designates the cross-section then the path instead of selecting.
+    pub sweep_flow: Option<SweepFlow>,
+
+    /// Cached opaque render buffer (solids + posed furniture) behind a cheap signature,
+    /// so orbiting past a heavy imported mesh doesn't re-transform every vertex each frame
+    /// (that was the post-import lag). See [`Self::opaque_verts`].
+    render_cache: std::cell::RefCell<RenderCache>,
+    /// Per-instance memo of [`Self::furniture_faceted`]: index → (cheap signature, built split).
+    /// Rebuilding the per-surface TexVtx buckets of a heavy multi-material import (e.g. an 800k-tri
+    /// glTF) every frame cost ~600 ms; this returns the cached `Arc` until the assignment or a
+    /// referenced texture actually changes. Pose is irrelevant (the split is in LOCAL space).
+    faceted_cache: std::cell::RefCell<
+        std::collections::HashMap<usize, (u64, std::sync::Arc<FacetedFurniture>)>,
+    >,
+    /// Bumped on every [`Self::recompute`]; lets the render cache notice a geometry change
+    /// without hashing the (large) triangle buffer.
+    pub geom_version: u64,
+
+    /// Daylight (sun) settings — where/when the building is. Off by default (studio key light).
+    /// When changed, the render caches re-bake so shading follows the sun (see [`Self::opaque_sig`]
+    /// and [`Self::furniture_key`], which fold it in).
+    pub sun: SunEnv,
+
+    /// CLAY mode — flatten every material to neutral grey (glass keeps transparency) for a
+    /// light-only study. Folded into the render-cache signatures so toggling re-bakes.
+    pub clay_mode: bool,
+
     /// Per-feature colour (Textures menu): CSG feature id → linear RGB. A feature with no
     /// entry renders in the default neutral. Furniture carries its colour on the instance.
     pub feature_color: std::collections::HashMap<u32, [f32; 3]>,
@@ -298,6 +556,34 @@ pub struct FactoryState {
     pub paint_surface_mode: bool,
     /// Last colour chosen in the Textures picker, so it persists across opens of the menu.
     pub last_pick_color: [f32; 3],
+
+    /// Bitmaps pasted from the clipboard, available to texture objects. Not persisted to
+    /// the sidecar yet (image blobs are large) — a re-paste restores them. See
+    /// [`TextureAsset`] and [`Self::add_texture`].
+    pub textures: Vec<TextureAsset>,
+    /// CSG feature id → index into [`Self::textures`]. Furniture carries its own texture
+    /// index on the instance; this is the equivalent for built solids and walls.
+    pub feature_texture: std::collections::HashMap<u32, usize>,
+    /// Per-SURFACE texture: one flat face → texture index. Lets each wall face carry its OWN
+    /// image instead of the whole solid sharing one. Takes priority over `feature_texture`.
+    pub surface_texture: std::collections::HashMap<SurfaceKey, usize>,
+    /// The texture "brush" for paint-single-surface mode: while set, clicking a face applies
+    /// this texture to just that surface (set when a texture is applied with paint-mode on).
+    pub surface_tex_brush: Option<usize>,
+    /// How an applied texture lands on the SELECTED FURNITURE object: the whole object, one
+    /// clicked flat face, or one clicked connected piece. See [`FurnPaintMode`].
+    pub furn_paint_mode: FurnPaintMode,
+    /// The armed furniture texture brush: while set (and `furn_paint_mode` is Face/Piece), the
+    /// next click on the selected object textures the clicked face/piece with this texture.
+    pub furn_tex_brush: Option<usize>,
+    /// The face/piece the user clicked on the selected object (instance index + its face-group
+    /// ids), in Face/Piece mode. The NEXT texture applied lands here — the "click a face, then pick
+    /// a texture" order. Cleared when the mode returns to Whole object or another object is picked.
+    pub furn_face_sel: Option<(usize, Vec<u32>)>,
+
+    /// Copy/paste buffer for 3D objects (Ctrl+C / Ctrl+V) — one furniture instance or one
+    /// CSG feature, captured with its colour/texture so a paste is a faithful clone.
+    pub clip: Option<FactoryClip>,
 
     /// BUILDING section — the storey height the structure rises to, in metres. Held on
     /// the state (not in the dialog) because it is a property of the BUILDING, so it
@@ -342,6 +628,14 @@ pub struct FactoryState {
     pub queued: Option<cad_solid::modify::ModifyOp>,
     /// Live prompt for the running/queued 3D op.
     pub status: String,
+    /// True while a cutout is open for 2D reshape (via `factory_edit_cutout`). Drives the
+    /// prominent "drag the points, then Apply" banner in the sketch panel and makes finishing
+    /// the sketch re-cut the opening automatically. Cleared when the sketch is exited/applied.
+    pub editing_cutout: bool,
+    /// Cached library index of the default DOOR / WINDOW aperture mesh, once loaded from
+    /// `assets/apertures/`. `[door, window]`. `None` until first used, so the bundled meshes are
+    /// only parsed on demand and reused across every aperture placed.
+    pub aperture_asset: [Option<usize>; 2],
     /// The selected features' own mesh + the selection it was built from (the cache
     /// key). Rebuilt only when the selection changes — never per frame.
     sel_mesh: SolidMesh,
@@ -495,6 +789,9 @@ pub fn primitive_dim_fields(ui: &mut egui::Ui, p: &mut Primitive) -> bool {
             c |= f(ui, "height", h, 0.001);
             ui.label(egui::RichText::new("  outline shape is fixed").small().weak());
         }
+        Primitive::Sweep { .. } => {
+            ui.label(egui::RichText::new("  swept along a path — section & path are fixed").small().weak());
+        }
     }
     c
 }
@@ -609,6 +906,11 @@ pub struct RingView {
 }
 
 /// Gizmo sizing / pick tolerances (pixels).
+/// APX render mode: a placed furniture mesh with MORE triangles than this is drawn as a
+/// 12-triangle bounding-box proxy instead of its full geometry, so heavy scenes stay smooth.
+/// Light pieces (and everything in GPU / CPU mode) always draw in full.
+const APX_FURNITURE_TRIS: usize = 5_000;
+
 const GIZMO_MIN_PX: f32 = 65.0;   // shortest on-screen arm length, so tiny objects stay grabbable
 const GIZMO_AXIS_PICK: f32 = 8.0;
 const GIZMO_CUBE_PICK: f32 = 9.0;
@@ -710,20 +1012,750 @@ pub struct FurnitureAsset {
     /// Default colour for new instances — the file's diffuse if it had one, else a neutral
     /// light grey (NOT the old tan). The user can recolour per instance afterward.
     pub color: [f32; 3],
+    /// LOCAL-space bounding box (min, max) over `positions`, computed ONCE at construction.
+    /// A placed instance's world AABB is the transform of these 8 corners — O(8), not a
+    /// per-frame sweep of every vertex (which, at ~90k verts, tanked the framerate whenever
+    /// a heavy piece was selected: the gizmo + highlight both asked for the AABB each frame).
+    pub local_min: [f32; 3],
+    pub local_max: [f32; 3],
+    /// Per-vertex UVs (parallel to `positions`) from a glTF import. EMPTY when the source had
+    /// no texture coords — then a textured instance falls back to box-projection UVs.
+    pub uvs: Vec<[f32; 2]>,
+    /// Per-vertex OPACITY (1.0 = opaque), parallel to `positions`, from the import's materials
+    /// (OBJ/MTL `d`/`Tr`, glTF `alphaMode:BLEND`). EMPTY ⇒ fully opaque — the mesh takes the
+    /// original single-pass draw. When present, translucent triangles are peeled into a
+    /// separate blended pass so glass panes read as see-through. See [`Self::is_translucent`].
+    pub alpha: Vec<f32>,
+    /// Absolute path the mesh was imported from, when known — so a project saved by an older build
+    /// (or awaiting a parser that learns a new transparency source) can RE-DERIVE per-vertex alpha
+    /// on load without a manual re-import. `None` for meshes with no on-disk source (bundled/test).
+    pub source_path: Option<String>,
+    /// True once [`Self::alpha`] has been resolved from the source and is authoritative — set when
+    /// freshly imported, and after a one-time on-load re-parse. Guards against re-parsing a heavy
+    /// opaque mesh on every load just to re-confirm it has no glass.
+    pub alpha_resolved: bool,
+    /// Lazily-built DISPLAY level-of-detail (decimated positions + flat normals) for very heavy
+    /// meshes. Drawing a 2M-triangle piece — let alone several copies — at full detail every
+    /// frame is ~140 ms/frame; this coarse proxy keeps the shape but a fraction of the tris.
+    /// Only built for heavy, UNTEXTURED assets (welding vertices would scramble real UVs).
+    pub lod: std::cell::RefCell<Option<std::sync::Arc<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>>,
+    /// Lazily-built per-triangle grouping (coplanar faces + connected bodies) for per-surface
+    /// texturing. Computed once from `positions`; see [`Self::group_geom`].
+    pub groups: std::cell::RefCell<Option<std::sync::Arc<FurnGroups>>>,
+    /// Optional per-triangle PART id (parallel to `positions`), set for GENERATED objects (e.g. a
+    /// staircase, where each tread/riser/baluster is a distinct primitive). When present it drives
+    /// the "piece" grouping so clicking a tread selects that ONE tread — not the whole welded run,
+    /// which is what a geometry-only connected-component grouping would give. Empty for imported
+    /// meshes (they fall back to welded connected components).
+    pub part_ids: Vec<u32>,
+}
+
+/// How an applied texture lands on the selected furniture object.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FurnPaintMode {
+    /// The texture covers the entire object (the classic behaviour).
+    #[default]
+    WholeObject,
+    /// Arm a brush; the next click textures the single flat face clicked.
+    Face,
+    /// Arm a brush; the next click textures the whole connected piece clicked.
+    Piece,
+}
+
+/// Per-triangle grouping of a furniture asset for per-surface texturing (one id per triangle).
+/// `face[t]` = coplanar-connected flat surface id; `body[t]` = connected-component (welded sub-part)
+/// id. Built once per asset by [`cad_solid::surface_groups`].
+#[derive(Clone, Debug, Default)]
+pub struct FurnGroups {
+    pub face: Vec<u32>,
+    pub body: Vec<u32>,
+}
+
+/// The split draw lists for a per-surface-textured furniture instance: `opaque` is one
+/// `(texture_index, buffer_key, verts)` group per texture used across the piece's faces; `flat` is
+/// the untextured remainder as flat-shaded verts (`None` when every face is textured). Built by
+/// [`FactoryState::furniture_faceted`].
+pub struct FacetedFurniture {
+    pub opaque: Vec<(usize, u64, Vec<crate::light3d::TexVtx>)>,
+    /// Texture groups whose surface is SEE-THROUGH (the texture's opacity < 1, or the mesh's own
+    /// glass alpha) — drawn in the blended textured pass, back-to-front.
+    pub translucent: Vec<(usize, u64, Vec<crate::light3d::TexVtx>)>,
+    pub flat: Option<(u64, Vec<V3>)>,
+}
+
+/// Above this triangle count a furniture asset gets a decimated display proxy.
+pub const LOD_TRI_THRESHOLD: usize = 200_000;
+
+/// At/above this opacity a vertex is treated as fully opaque (drawn in the solid pass). Below
+/// it, the triangle is peeled into the blended transparent pass.
+pub const ALPHA_OPAQUE: f32 = 0.996;
+
+impl FurnitureAsset {
+    /// Build an asset and cache its local AABB. All construction goes through here so the
+    /// cached bounds can never be stale or forgotten.
+    pub fn new(name: String, positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>, color: [f32; 3]) -> Self {
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in &positions {
+            for k in 0..3 {
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        if !mn[0].is_finite() {
+            mn = [0.0; 3];
+            mx = [0.0; 3];
+        }
+        Self { name, positions, normals, color, local_min: mn, local_max: mx, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new() }
+    }
+
+    /// The per-triangle face/body grouping, built once and cached. Used for per-surface texturing.
+    ///
+    /// `body` is the PART id grouping when this is a generated object that carries `part_ids` (so
+    /// "one piece" = one tread/baluster), otherwise the geometry-welded connected components.
+    ///
+    /// `face` is the coplanar-connected grouping — BUT, like Blender's per-polygon materials, a face
+    /// must never span two primitives. Abutting boxes (a tread + its riser + the next tread) share
+    /// the SAME plane along the stair's side and connect edge-to-edge, so a naive coplanar flood
+    /// fill merges the whole side into ONE face; texturing it would paint the entire side. So when
+    /// `part_ids` exist we REFINE each coplanar region by part id → a face is at most one flat side
+    /// of one primitive.
+    pub fn group_geom(&self) -> std::sync::Arc<FurnGroups> {
+        if let Some(g) = self.groups.borrow().as_ref() {
+            return g.clone();
+        }
+        let ntri = self.positions.len() / 3;
+        let (face_coplanar, welded_body) = cad_solid::surface_groups(&self.positions);
+        let has_parts = self.part_ids.len() == ntri;
+        let body = if has_parts { self.part_ids.clone() } else { welded_body };
+        let face = if has_parts {
+            // Split every coplanar region at part boundaries so a face stays within one primitive.
+            let mut remap = std::collections::HashMap::new();
+            let mut next = 0u32;
+            (0..ntri)
+                .map(|t| {
+                    let key = (face_coplanar[t], self.part_ids[t]);
+                    *remap.entry(key).or_insert_with(|| {
+                        let id = next;
+                        next += 1;
+                        id
+                    })
+                })
+                .collect()
+        } else {
+            face_coplanar
+        };
+        let g = std::sync::Arc::new(FurnGroups { face, body });
+        *self.groups.borrow_mut() = Some(g.clone());
+        g
+    }
+
+    /// This vertex's opacity (1.0 when the asset carries no alpha, or the index is past its end).
+    #[inline]
+    pub fn vertex_alpha(&self, i: usize) -> f32 {
+        self.alpha.get(i).copied().unwrap_or(1.0)
+    }
+
+    /// True when any triangle is see-through, i.e. the mesh has a translucent material. Cheap:
+    /// `alpha` is empty for the opaque common case, so this is usually a length check + scan.
+    pub fn is_translucent(&self) -> bool {
+        self.alpha.iter().any(|&a| a < ALPHA_OPAQUE)
+    }
+
+    /// True when this asset is heavy enough to warrant the decimated display proxy. Skipped for
+    /// UV-mapped (glTF) assets — clustering welds vertices and would break their texture coords.
+    pub fn needs_lod(&self) -> bool {
+        // Translucent assets skip decimation: welding/dropping vertices would break the
+        // per-vertex `alpha` correspondence used to split opaque vs. see-through triangles.
+        self.uvs.is_empty() && self.alpha.is_empty() && self.positions.len() / 3 > LOD_TRI_THRESHOLD
+    }
+
+    /// The decimated (positions, normals), built once and cached.
+    pub fn lod_geom(&self) -> std::sync::Arc<(Vec<[f32; 3]>, Vec<[f32; 3]>)> {
+        {
+            let c = self.lod.borrow();
+            if let Some(a) = c.as_ref() {
+                return a.clone();
+            }
+        }
+        let built = std::sync::Arc::new(cluster_decimate(&self.positions, 64));
+        *self.lod.borrow_mut() = Some(built.clone());
+        built
+    }
+}
+
+/// Vertex-cluster decimation: snap every vertex to a `grid`³ lattice over the mesh bounds, weld
+/// coincident cells to their centroid, and keep only triangles whose three vertices land in
+/// distinct cells. Flat per-face normals are recomputed. Deterministic and silhouette-
+/// preserving — a fast display proxy of a multi-million-triangle import.
+///
+/// Uses a FLAT grid array (no per-vertex HashMap) so 6M vertices decimate in tens of ms, not
+/// the ~half-second the hashed version cost (which showed up as spikes as heavy pieces loaded).
+pub fn cluster_decimate(pos: &[[f32; 3]], grid: u32) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    if pos.len() < 3 {
+        return (pos.to_vec(), vec![[0.0, 0.0, 1.0]; pos.len()]);
+    }
+    let (mut mn, mut mx) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in pos {
+        for k in 0..3 { mn[k] = mn[k].min(p[k]); mx[k] = mx[k].max(p[k]); }
+    }
+    let ext = [(mx[0] - mn[0]).max(1e-6), (mx[1] - mn[1]).max(1e-6), (mx[2] - mn[2]).max(1e-6)];
+    let gi = grid.clamp(2, 128) as usize;
+    let gf = gi as f32;
+    let idx = |p: &[f32; 3]| -> usize {
+        let c = |v: f32, mnk: f32, ek: f32| (((v - mnk) / ek * gf).floor() as i64).clamp(0, gi as i64 - 1) as usize;
+        (c(p[0], mn[0], ext[0]) * gi + c(p[1], mn[1], ext[1])) * gi + c(p[2], mn[2], ext[2])
+    };
+    // Flat cell grid → running centroid (sum x,y,z,count). ~8 MB at grid=64 (transient).
+    let mut acc = vec![[0.0f64; 4]; gi * gi * gi];
+    for p in pos {
+        let a = &mut acc[idx(p)];
+        a[0] += p[0] as f64; a[1] += p[1] as f64; a[2] += p[2] as f64; a[3] += 1.0;
+    }
+    let centroid = |i: usize| -> [f32; 3] {
+        let a = acc[i];
+        [(a[0] / a[3]) as f32, (a[1] / a[3]) as f32, (a[2] / a[3]) as f32]
+    };
+    let mut out_p = Vec::new();
+    let mut out_n = Vec::new();
+    for t in pos.chunks_exact(3) {
+        let (ia, ib, ic) = (idx(&t[0]), idx(&t[1]), idx(&t[2]));
+        if ia == ib || ib == ic || ia == ic {
+            continue; // collapses to a sliver/point after welding
+        }
+        let (a, b, c) = (centroid(ia), centroid(ib), centroid(ic));
+        let n = (Vec3::from(b) - Vec3::from(a))
+            .cross(Vec3::from(c) - Vec3::from(a))
+            .normalize_or_zero();
+        let n = [n.x, n.y, n.z];
+        out_p.push(a); out_p.push(b); out_p.push(c);
+        out_n.push(n); out_n.push(n); out_n.push(n);
+    }
+    (out_p, out_n)
+}
+
+/// Which step of the PATH-SWEEP flow is active.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SweepStage {
+    /// Drawing the cross-section on a picked face.
+    Section,
+    /// Section captured; the app is offering the two perpendicular views for the path.
+    ChooseView,
+    /// Drawing the path on the chosen perpendicular plane.
+    Path,
+}
+
+/// A PATH-SWEEP in progress: cross-section on a face → pick a perpendicular view → draw the
+/// path → build. `cut` selects Difference vs Union; `furniture` only tints a Union result.
+#[derive(Clone, Debug)]
+pub struct SweepFlow {
+    pub cut: bool,
+    pub furniture: bool,
+    pub stage: SweepStage,
+    /// The face the section was drawn on (captured when the section is finished).
+    pub section_frame: Option<Frame>,
+    /// The cross-section loop, in the section frame's (u,v).
+    pub section_loop: Option<Vec<glam::Vec2>>,
+    /// The two perpendicular drawing planes offered for the path: (view-name, frame).
+    pub views: Vec<(String, Frame)>,
+    /// The plane the user chose to draw the path on.
+    pub path_frame: Option<Frame>,
 }
 
 /// One PLACED copy of a library asset.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FurnitureInst {
     /// Index into [`FactoryState::furniture_lib`].
     pub asset: usize,
     pub pos: [f32; 3],
     pub scale: f32,
+    /// Optional NON-UNIFORM scale `[sx, sy, sz]` in the asset's local axes. `None` → the piece
+    /// scales uniformly by `scale` (the normal case). `Some` is used by APERTURES (doors/windows),
+    /// which stretch to exactly fill a drawn opening. `scale` still multiplies on top, so the
+    /// scale gizmo keeps working.
+    pub fit: Option<[f32; 3]>,
     /// Euler rotation in DEGREES about the world X, Y, Z axes (applied X→Y→Z), pivoting
     /// on the instance's base-centre. `rot[2]` is the old yaw (Z), so upgrades are clean.
     pub rot: [f32; 3],
     /// Linear RGB, applied in the Textures menu (default a warm neutral).
     pub color: [f32; 3],
+    /// Index into [`FactoryState::textures`] when a clipboard texture is applied. Phase 1
+    /// only records the assignment (the visible effect is the texture's average colour
+    /// baked into `color`); the UV-mapped render pass reads this in Phase 2.
+    pub texture: Option<usize>,
+    /// PER-SURFACE textures: `face_group_id → texture index`. A face-group id comes from the
+    /// asset's [`FurnGroups::face`] grouping (a coplanar flat surface). When present for a
+    /// triangle's group it overrides `texture` (the whole-object texture) for that surface — so
+    /// one object can carry different textures on different faces/pieces. Empty ⇒ whole-object only.
+    pub surface_texture: std::collections::HashMap<u32, usize>,
+}
+
+/// One copied 3D object held in the paste buffer — a furniture instance or a CSG feature
+/// (with its colour/texture), so Ctrl+V reproduces it faithfully.
+#[derive(Clone)]
+pub enum FactoryClip {
+    Furniture(FurnitureInst),
+    Feature {
+        op: BoolOp,
+        plane: Plane,
+        placement: Placement,
+        primitive: Primitive,
+        color: Option<[f32; 3]>,
+        texture: Option<usize>,
+        /// Per-FACE paint, captured as `(world normal, plane offset d, colour)` — the PRECISE
+        /// plane, not the lossy `SurfaceKey`, so it can be re-keyed exactly after the paste's
+        /// translation shifts each face's offset by `n·delta`.
+        surface_colors: Vec<([f32; 3], f32, [f32; 3])>,
+        /// Per-face texture assignments, same precise `(normal, d, texture_index)` form.
+        surface_textures: Vec<([f32; 3], f32, usize)>,
+    },
+}
+
+/// A PROCEDURAL texture pattern — evaluated in the shader from world position (no pixels). The
+/// engine's answer to Blender's noise→ColorRamp materials. See [`crate::light3d::ProcParams`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcPattern {
+    /// Anisotropic fbm straight into the ramp — the timber-grain recipe.
+    Wood,
+    /// fbm turbulence folded through a sine band — veined stone.
+    Marble,
+    /// Plain fractal noise between the two colours.
+    Noise,
+    /// Hard world-space cells between the two colours.
+    Checker,
+}
+
+impl ProcPattern {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProcPattern::Wood => "Wood grain",
+            ProcPattern::Marble => "Marble",
+            ProcPattern::Noise => "Noise",
+            ProcPattern::Checker => "Checker",
+        }
+    }
+    /// The shader mode id (matches [`crate::light3d::ProcParams::mode`]).
+    pub fn mode(self) -> i32 {
+        match self {
+            ProcPattern::Wood => 1,
+            ProcPattern::Marble => 2,
+            ProcPattern::Noise => 3,
+            ProcPattern::Checker => 4,
+        }
+    }
+    /// Stable persistence tag.
+    pub fn tag(self) -> &'static str {
+        match self {
+            ProcPattern::Wood => "wood",
+            ProcPattern::Marble => "marble",
+            ProcPattern::Noise => "noise",
+            ProcPattern::Checker => "checker",
+        }
+    }
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "marble" => ProcPattern::Marble,
+            "noise" => ProcPattern::Noise,
+            "checker" => ProcPattern::Checker,
+            _ => ProcPattern::Wood,
+        }
+    }
+    pub const ALL: [ProcPattern; 4] = [ProcPattern::Wood, ProcPattern::Marble, ProcPattern::Noise, ProcPattern::Checker];
+}
+
+/// A procedural material definition: two colours, an anisotropic world-space scale (tiles/m across,
+/// along, through the grain) and the noise/ramp shaping. Grain runs continuously across every piece
+/// because it reads WORLD position (Blender's object-coordinate trick, for free).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProcDef {
+    pub pattern: ProcPattern,
+    pub col_a: [f32; 3],
+    pub col_b: [f32; 3],
+    pub scale: [f32; 3],
+    pub detail: f32,
+    pub rough: f32,
+    pub contrast: f32,
+    pub ramp: [f32; 2],
+}
+
+impl ProcDef {
+    /// A believable oak veneer — the cabin front default, ported from `cabin_v1.py`'s `make_wood`
+    /// (anisotropic scale (110,26,2.6), dark→light ramp). Scaled to metres for our world coords.
+    pub fn oak() -> Self {
+        Self {
+            pattern: ProcPattern::Wood,
+            col_a: [0.30, 0.20, 0.11], // dark grain
+            col_b: [0.66, 0.52, 0.34], // light oak
+            scale: [42.0, 10.0, 2.0],
+            detail: 7.0,
+            rough: 0.62,
+            contrast: 1.4,
+            ramp: [0.40, 0.62],
+        }
+    }
+    /// A SOLID colour as a (degenerate) procedural: both ramp stops the same, so any pattern renders
+    /// a flat colour. This lets the Materials Factory drive a plain base colour through the LIVE
+    /// per-frame procedural uniforms (no GPU texture re-upload), so colour edits show instantly.
+    pub fn solid(c: [f32; 3]) -> Self {
+        Self { pattern: ProcPattern::Noise, col_a: c, col_b: c, scale: [1.0, 1.0, 1.0], detail: 1.0, rough: 0.5, contrast: 1.0, ramp: [0.0, 1.0] }
+    }
+    /// Whether this is a solid colour (both ramp stops equal) — the inverse of [`Self::solid`], so the
+    /// node editor can show it as an RGB node rather than a pattern.
+    pub fn is_solid(&self) -> bool {
+        (0..3).all(|k| (self.col_a[k] - self.col_b[k]).abs() < 1e-4)
+    }
+    /// Its representative flat colour (ramp midpoint) — used for the 1×1 fallback swatch + avg tint.
+    pub fn avg_color(&self) -> [f32; 3] {
+        [
+            (self.col_a[0] + self.col_b[0]) * 0.5,
+            (self.col_a[1] + self.col_b[1]) * 0.5,
+            (self.col_a[2] + self.col_b[2]) * 0.5,
+        ]
+    }
+    /// Pack into the renderer's uniform bundle.
+    pub fn params(&self) -> crate::light3d::ProcParams {
+        crate::light3d::ProcParams {
+            mode: self.pattern.mode(),
+            col_a: self.col_a,
+            col_b: self.col_b,
+            scale: self.scale,
+            detail: self.detail,
+            rough: self.rough,
+            contrast: self.contrast,
+            ramp: self.ramp,
+        }
+    }
+}
+
+/// A ready-made material for the Materials Factory library — a named Principled + procedural recipe
+/// (the subset of the classic material-type catalogues — Physical/PBR woods, stones, metals, glass,
+/// paints, emitters — our engine represents). Applying one mints a normal [`TextureAsset`].
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialPreset {
+    pub category: &'static str,
+    pub name: &'static str,
+    /// The base-colour source: a real pattern, or [`ProcDef::solid`] for a plain colour.
+    pub def: ProcDef,
+    pub metallic: f32,
+    pub roughness: f32,
+    pub ior: f32,
+    pub opacity: f32,
+    pub emission: [f32; 3],
+    pub emission_strength: f32,
+}
+
+impl MaterialPreset {
+    const fn flat(category: &'static str, name: &'static str, def: ProcDef) -> Self {
+        Self { category, name, def, metallic: 0.0, roughness: 0.6, ior: 1.5, opacity: 1.0, emission: [0.0; 3], emission_strength: 0.0 }
+    }
+}
+
+/// The built-in material library, grouped by category (order = display order). Everything here is
+/// expressible in the live renderer AND the path tracers: procedural/solid base colour + metallic /
+/// roughness / IOR / opacity / emission.
+pub fn material_presets() -> Vec<MaterialPreset> {
+    use ProcPattern::*;
+    let pat = |pattern, col_a, col_b, scale, detail, rough, contrast, ramp| ProcDef { pattern, col_a, col_b, scale, detail, rough, contrast, ramp };
+    let mut v: Vec<MaterialPreset> = Vec::new();
+    let mut p = |m: MaterialPreset| v.push(m);
+
+    // ---- Wood ----
+    p(MaterialPreset { roughness: 0.62, ..MaterialPreset::flat("Wood", "Oak", ProcDef::oak()) });
+    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Wood", "Walnut", pat(Wood, [0.14, 0.09, 0.05], [0.36, 0.23, 0.13], [42.0, 10.0, 2.0], 7.0, 0.62, 1.5, [0.38, 0.62])) });
+    p(MaterialPreset { roughness: 0.65, ..MaterialPreset::flat("Wood", "Pine", pat(Wood, [0.55, 0.42, 0.26], [0.79, 0.66, 0.45], [36.0, 9.0, 2.0], 6.0, 0.6, 1.3, [0.4, 0.62])) });
+    p(MaterialPreset { metallic: 0.22, roughness: 0.28, ..MaterialPreset::flat("Wood", "Varnished oak", ProcDef::oak()) });
+    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Wood", "Wenge (dark)", pat(Wood, [0.07, 0.05, 0.04], [0.2, 0.14, 0.1], [48.0, 12.0, 2.2], 7.0, 0.6, 1.6, [0.38, 0.6])) });
+
+    // ---- Stone & masonry ----
+    p(MaterialPreset { roughness: 0.22, ..MaterialPreset::flat("Stone", "White marble", pat(Marble, [0.92, 0.92, 0.9], [0.55, 0.56, 0.58], [3.0, 3.0, 3.0], 6.0, 0.55, 1.6, [0.35, 0.65])) });
+    p(MaterialPreset { roughness: 0.25, ..MaterialPreset::flat("Stone", "Black marble", pat(Marble, [0.06, 0.06, 0.07], [0.34, 0.34, 0.36], [3.0, 3.0, 3.0], 6.0, 0.55, 1.7, [0.35, 0.65])) });
+    p(MaterialPreset { roughness: 0.92, ..MaterialPreset::flat("Stone", "Concrete", pat(Noise, [0.57, 0.56, 0.54], [0.44, 0.435, 0.42], [8.0, 8.0, 8.0], 7.0, 0.6, 1.1, [0.3, 0.7])) });
+    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Stone", "Granite", pat(Noise, [0.34, 0.33, 0.32], [0.18, 0.17, 0.17], [60.0, 60.0, 60.0], 8.0, 0.7, 1.8, [0.35, 0.65])) });
+    p(MaterialPreset { roughness: 0.95, ..MaterialPreset::flat("Stone", "Sandstone", pat(Noise, [0.76, 0.68, 0.54], [0.6, 0.52, 0.4], [14.0, 14.0, 14.0], 6.0, 0.55, 1.2, [0.3, 0.7])) });
+
+    // ---- Metal ----
+    p(MaterialPreset { metallic: 1.0, roughness: 0.05, ..MaterialPreset::flat("Metal", "Chrome", ProcDef::solid([0.9, 0.91, 0.92])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.3, ..MaterialPreset::flat("Metal", "Stainless steel", ProcDef::solid([0.7, 0.71, 0.73])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.42, ..MaterialPreset::flat("Metal", "Brushed aluminium", pat(Wood, [0.62, 0.63, 0.65], [0.78, 0.79, 0.81], [160.0, 6.0, 2.0], 5.0, 0.55, 1.2, [0.35, 0.65])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.25, ..MaterialPreset::flat("Metal", "Copper", ProcDef::solid([0.9, 0.55, 0.42])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.2, ..MaterialPreset::flat("Metal", "Gold", ProcDef::solid([1.0, 0.78, 0.34])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.45, ..MaterialPreset::flat("Metal", "Black steel", ProcDef::solid([0.11, 0.11, 0.12])) });
+
+    // ---- Glass ----
+    p(MaterialPreset { roughness: 0.05, ior: 1.52, opacity: 0.08, ..MaterialPreset::flat("Glass", "Clear glass", ProcDef::solid([0.85, 0.9, 0.92])) });
+    p(MaterialPreset { roughness: 0.5, ior: 1.52, opacity: 0.42, ..MaterialPreset::flat("Glass", "Frosted glass", ProcDef::solid([0.88, 0.9, 0.92])) });
+    p(MaterialPreset { roughness: 0.08, ior: 1.52, opacity: 0.22, ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24])) });
+    p(MaterialPreset { roughness: 0.06, ior: 1.52, opacity: 0.16, ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85])) });
+
+    // ---- Paint & plaster ----
+    p(MaterialPreset { roughness: 0.7, ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.88, 0.87, 0.86])) });
+    p(MaterialPreset { metallic: 0.12, roughness: 0.28, ..MaterialPreset::flat("Paint", "Satin white", ProcDef::solid([0.88, 0.87, 0.86])) });
+    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Paint", "Anthracite", ProcDef::solid([0.06, 0.065, 0.07])) });
+    p(MaterialPreset { roughness: 0.85, ..MaterialPreset::flat("Paint", "Warm plaster", pat(Noise, [0.85, 0.81, 0.73], [0.78, 0.74, 0.66], [10.0, 10.0, 10.0], 5.0, 0.5, 1.0, [0.3, 0.7])) });
+    p(MaterialPreset { metallic: 0.75, roughness: 0.25, ..MaterialPreset::flat("Paint", "Car paint red", ProcDef::solid([0.58, 0.05, 0.08])) });
+
+    // ---- Fabric ----
+    p(MaterialPreset { roughness: 1.0, ..MaterialPreset::flat("Fabric", "Grey fabric", pat(Noise, [0.5, 0.5, 0.52], [0.42, 0.42, 0.44], [90.0, 90.0, 90.0], 6.0, 0.6, 1.1, [0.3, 0.7])) });
+    p(MaterialPreset { roughness: 1.0, ..MaterialPreset::flat("Fabric", "Beige carpet", pat(Noise, [0.62, 0.56, 0.46], [0.5, 0.45, 0.36], [70.0, 70.0, 70.0], 7.0, 0.6, 1.1, [0.3, 0.7])) });
+
+    // ---- Floor ----
+    p(MaterialPreset { roughness: 0.3, ..MaterialPreset::flat("Floor", "Checker tiles", pat(Checker, [0.85, 0.85, 0.84], [0.12, 0.12, 0.13], [2.0, 2.0, 2.0], 1.0, 0.5, 1.0, [0.0, 1.0])) });
+    p(MaterialPreset { roughness: 0.35, ..MaterialPreset::flat("Floor", "Terrazzo", pat(Noise, [0.82, 0.8, 0.76], [0.45, 0.44, 0.42], [90.0, 90.0, 90.0], 8.0, 0.75, 2.2, [0.42, 0.58])) });
+
+    // ---- Emission ----
+    p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.85, 0.6], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED warm", ProcDef::solid([1.0, 0.88, 0.7])) });
+    p(MaterialPreset { roughness: 0.4, emission: [0.85, 0.9, 1.0], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED cool", ProcDef::solid([0.88, 0.92, 1.0])) });
+    p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.08, 0.08], emission_strength: 8.0, ..MaterialPreset::flat("Emission", "Neon red", ProcDef::solid([1.0, 0.25, 0.25])) });
+
+    v
+}
+
+impl FactoryState {
+    /// Add a library [`MaterialPreset`] as a scene material, returning its texture index. The
+    /// Materials Factory then behaves as with any material: node graph, live highlight, apply.
+    pub fn add_preset_material(&mut self, p: &MaterialPreset) -> usize {
+        let idx = self.add_procedural_texture(p.name.to_string(), p.def);
+        let t = &mut self.textures[idx];
+        t.metallic = p.metallic;
+        t.roughness = p.roughness;
+        t.ior = p.ior;
+        t.opacity = p.opacity.clamp(0.01, 1.0);
+        t.emission = p.emission;
+        t.emission_strength = p.emission_strength;
+        // Metallic drives the raster's glossy sheen (same mapping as the node compiler).
+        t.reflect = (p.metallic * (1.0 - 0.6 * p.roughness)).clamp(0.0, 1.0);
+        idx
+    }
+}
+
+/// A bitmap captured from the OS clipboard and stored for texturing, OR a procedural pattern. For an
+/// image, `rgba` is row-major RGBA8 (top row first) and `avg` its average linear-RGB colour (a flat
+/// tint fallback); for a procedural material `proc` is `Some` and `rgba` is a 1×1 fallback swatch.
+#[derive(Clone, Debug)]
+pub struct TextureAsset {
+    pub name: String,
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    pub avg: [f32; 3],
+    /// Tiling factor: for a feature it's tiles-per-metre, for furniture it's the repeat count
+    /// across the piece. 1.0 = the default (features tile once per metre, furniture wraps once).
+    pub scale: f32,
+    /// MOVE the texture: UV offset `[u, v]` applied after scale+rotation. Shifts the image across
+    /// the surface (in tile units). `[0, 0]` = no shift.
+    pub offset: [f32; 2],
+    /// ROTATE the texture, degrees, about the tile centre. `0` = upright.
+    pub rot_deg: f32,
+    /// Surface OPACITY, `0.01..=1.0` (UI 1..100). 1.0 = fully opaque (the default); below it the
+    /// surface is drawn see-through in the blended pass (multiplies the per-vertex alpha).
+    pub opacity: f32,
+    /// Surface REFLECTION, `0.0..=1.0` (UI 1..100). 0 = matte (default); higher adds a
+    /// view-dependent glossy sheen in the textured shader (a fresnel highlight, not a true mirror).
+    pub reflect: f32,
+    /// Cached PNG+base64 encoding for the sidecar. `rgba` never changes after creation, so the
+    /// (expensive) encode is computed once on the first save and reused — otherwise EVERY save
+    /// re-PNG-encoded every texture on the main thread (a visible save-time lag spike).
+    pub png_cache: std::cell::RefCell<Option<String>>,
+    /// `Some` when this is a PROCEDURAL material (evaluated in-shader from world position) rather
+    /// than a pasted image. The `rgba` above is then just a 1×1 fallback swatch.
+    pub proc: Option<ProcDef>,
+    /// Texture Phase 2 — PBR maps. Index of another texture used as a tangent-space NORMAL map, and
+    /// one used as a ROUGHNESS map (its red channel). `roughness` is the scalar fallback (0 = glossy,
+    /// 1 = matte). All `None`/default → an ordinary albedo texture (unchanged).
+    pub normal_map: Option<usize>,
+    pub rough_map: Option<usize>,
+    pub roughness: f32,
+    /// Principled BSDF parameters authored in the Materials Factory node editor. `metallic` drives the
+    /// raster glossy sheen; all four are read by the path tracer. Defaults (0, 1.5, black, 0) reproduce
+    /// the previous plastic look, so existing materials are unchanged until edited.
+    pub metallic: f32,
+    pub ior: f32,
+    pub emission: [f32; 3],
+    pub emission_strength: f32,
+}
+
+impl TextureAsset {
+    /// Build from raw RGBA8 (as `arboard` hands it over), computing the average colour.
+    pub fn new(name: String, w: u32, h: u32, rgba: Vec<u8>) -> Self {
+        let mut sum = [0.0f64; 3];
+        let mut n = 0.0f64;
+        for px in rgba.chunks_exact(4) {
+            // Weight by alpha so transparent padding doesn't wash the tint toward black.
+            let a = px[3] as f64 / 255.0;
+            sum[0] += px[0] as f64 * a;
+            sum[1] += px[1] as f64 * a;
+            sum[2] += px[2] as f64 * a;
+            n += a;
+        }
+        let avg = if n > 0.0 {
+            [
+                (sum[0] / n / 255.0) as f32,
+                (sum[1] / n / 255.0) as f32,
+                (sum[2] / n / 255.0) as f32,
+            ]
+        } else {
+            [0.8, 0.8, 0.82]
+        };
+        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 0.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, roughness: 0.5, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0 }
+    }
+
+    /// Build a PROCEDURAL texture from a [`ProcDef`]. Carries a 1×1 fallback swatch (the ramp
+    /// midpoint) so non-shader paths (avg tint, thumbnails, old renderers) still show a colour.
+    pub fn procedural(name: String, def: ProcDef) -> Self {
+        let c = def.avg_color();
+        let px = [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, 255];
+        Self {
+            name,
+            w: 1,
+            h: 1,
+            rgba: px.to_vec(),
+            avg: c,
+            scale: 1.0,
+            offset: [0.0, 0.0],
+            rot_deg: 0.0,
+            opacity: 1.0,
+            reflect: 0.0,
+            png_cache: std::cell::RefCell::new(None),
+            proc: Some(def),
+            normal_map: None,
+            rough_map: None,
+            roughness: 0.5,
+            metallic: 0.0,
+            ior: 1.5,
+            emission: [0.0, 0.0, 0.0],
+            emission_strength: 0.0,
+        }
+    }
+
+    /// Map a base UV `(uc, vc)` through this texture's tiling / rotation / offset — the ONE place
+    /// the move+rotate+scale transform lives, called by both the furniture and feature textured
+    /// meshes. Rotation is about the tile centre `(0.5, 0.5)` so it spins in place; then tiling
+    /// (`scale`) multiplies, then `offset` shifts.
+    pub fn map_uv(&self, uc: f32, vc: f32) -> [f32; 2] {
+        let a = self.rot_deg.to_radians();
+        let (ca, sa) = (a.cos(), a.sin());
+        let (cu, cv) = (uc - 0.5, vc - 0.5); // centre so rotation spins in place
+        let (ru, rv) = (ca * cu - sa * cv, sa * cu + ca * cv);
+        [
+            (ru + 0.5) * self.scale + self.offset[0],
+            (rv + 0.5) * self.scale + self.offset[1],
+        ]
+    }
+
+    /// The renderer's PBR-map bundle (normal/roughness map indices + scalar roughness).
+    pub fn pbr_params(&self) -> crate::light3d::PbrParams {
+        crate::light3d::PbrParams {
+            normal_idx: self.normal_map,
+            rough_idx: self.rough_map,
+            roughness: self.roughness,
+        }
+    }
+    /// Whether any PBR map / non-default roughness is set (so the app only ships PBR params when used).
+    pub fn has_pbr(&self) -> bool {
+        self.normal_map.is_some() || self.rough_map.is_some() || (self.roughness - 0.5).abs() > 1e-3
+    }
+
+    /// PNG+base64 for the sidecar, computed once and cached (the pixels are immutable).
+    pub fn encoded_png(&self) -> String {
+        let mut c = self.png_cache.borrow_mut();
+        if c.is_none() {
+            *c = Some(encode_texture_png_b64(self.w, self.h, &self.rgba));
+        }
+        c.clone().unwrap()
+    }
+}
+
+/// Encode a flat `f32` slice as base64 of deflated little-endian bytes — compact, and (unlike a
+/// JSON number array) near-instant to parse for multi-million-vertex furniture geometry.
+pub fn encode_f32_blob(floats: &[f32]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(floats.len() * 4);
+    for f in floats {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    // Level 1 — fast; the geometry is already float-dense, so higher levels barely shrink it.
+    let comp = miniz_oxide::deflate::compress_to_vec(&bytes, 1);
+    base64::engine::general_purpose::STANDARD.encode(comp)
+}
+
+/// Decode a blob written by [`encode_f32_blob`] back into `f32`s (empty on any error).
+pub fn decode_f32_blob(s: &str) -> Vec<f32> {
+    use base64::Engine;
+    let Ok(comp) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) else { return Vec::new() };
+    let Ok(bytes) = miniz_oxide::inflate::decompress_to_vec(&comp) else { return Vec::new() };
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// Flatten `[f32; 3]` vertices to a contiguous `f32` list (a plain memcpy, fast even for millions).
+fn flat3(v: &[[f32; 3]]) -> Vec<f32> {
+    let mut o = Vec::with_capacity(v.len() * 3);
+    for p in v { o.extend_from_slice(p); }
+    o
+}
+/// Flatten `[f32; 2]` UVs to a contiguous `f32` list.
+fn flat2(v: &[[f32; 2]]) -> Vec<f32> {
+    let mut o = Vec::with_capacity(v.len() * 2);
+    for p in v { o.extend_from_slice(p); }
+    o
+}
+
+/// One furniture mesh's geometry, FLATTENED but NOT yet compressed. Handed to a save worker so the
+/// expensive deflate runs off the UI thread; see [`FactoryState::furniture_geom_flat`].
+pub struct FurnitureGeomRaw {
+    pub pos: Vec<f32>,
+    pub nrm: Vec<f32>,
+    pub uv: Vec<f32>,
+    /// Per-vertex opacity (empty ⇒ opaque). Compressed off-thread like the rest of the geometry.
+    pub alpha: Vec<f32>,
+}
+
+/// PNG-encode RGBA8 pixels and base64 the result, for compact sidecar storage.
+pub fn encode_texture_png_b64(w: u32, h: u32, rgba: &[u8]) -> String {
+    use base64::Engine;
+    use image::ImageEncoder;
+    let mut png = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut png);
+    if enc.write_image(rgba, w, h, image::ExtendedColorType::Rgba8).is_err() {
+        return String::new();
+    }
+    base64::engine::general_purpose::STANDARD.encode(&png)
+}
+
+/// Decode a persisted [`crate::simlux_io::TextureRec`] back into a [`TextureAsset`].
+pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAsset> {
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD.decode(r.png_b64.as_bytes()).ok()?;
+    let img = image::load_from_memory(&png).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let mut a = TextureAsset::new(r.name.clone(), w, h, img.into_raw());
+    a.scale = if r.scale > 0.0 { r.scale } else { 1.0 };
+    a.offset = r.offset;
+    a.rot_deg = r.rot_deg;
+    a.opacity = if r.opacity > 0.0 { r.opacity.clamp(0.01, 1.0) } else { 1.0 };
+    a.reflect = r.reflect.clamp(0.0, 1.0);
+    // The sidecar ALREADY holds this texture's PNG — reuse it as the cache so a re-save of a
+    // loaded project doesn't re-encode every image (that was the save-time lag spike).
+    *a.png_cache.borrow_mut() = Some(r.png_b64.clone());
+    if let Some(p) = &r.proc {
+        a.proc = Some(ProcDef {
+            pattern: ProcPattern::from_tag(&p.pattern),
+            col_a: p.col_a,
+            col_b: p.col_b,
+            scale: p.scale,
+            detail: p.detail,
+            rough: p.rough,
+            contrast: p.contrast,
+            ramp: p.ramp,
+        });
+    }
+    a.normal_map = r.normal_map;
+    a.rough_map = r.rough_map;
+    a.roughness = if r.roughness > 0.0 { r.roughness.clamp(0.0, 1.0) } else { 0.5 };
+    a.metallic = r.metallic.clamp(0.0, 1.0);
+    a.ior = if r.ior > 0.0 { r.ior.clamp(1.0, 4.0) } else { 1.5 };
+    a.emission = r.emission;
+    a.emission_strength = r.emission_strength.max(0.0);
+    Some(a)
 }
 
 impl FurnitureInst {
@@ -735,6 +1767,40 @@ impl FurnitureInst {
             self.rot[1].to_radians(),
             self.rot[2].to_radians(),
         )
+    }
+
+    /// Per-axis scale actually applied to the local mesh: the non-uniform `fit` (apertures) if
+    /// present, else uniform `scale`. `scale` always multiplies on top so the scale gizmo works
+    /// for both. This is the ONE place scale is resolved — every pose site calls it.
+    pub fn scale_vec(&self) -> glam::Vec3 {
+        match self.fit {
+            Some(f) => glam::Vec3::new(f[0], f[1], f[2]) * self.scale,
+            None => glam::Vec3::splat(self.scale),
+        }
+    }
+}
+
+/// The two built-in aperture types placed into wall openings. Each maps to a bundled default
+/// mesh under `assets/apertures/` and to a slot in [`FactoryState::aperture_asset`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApertureKind {
+    Door,
+    Window,
+}
+
+impl ApertureKind {
+    pub fn idx(self) -> usize {
+        match self { ApertureKind::Door => 0, ApertureKind::Window => 1 }
+    }
+    pub fn label(self) -> &'static str {
+        match self { ApertureKind::Door => "Door", ApertureKind::Window => "Window" }
+    }
+    /// Bundled default mesh, relative to the working dir. Both use the app's own OBJ/FBX readers.
+    pub fn asset_path(self) -> &'static str {
+        match self {
+            ApertureKind::Door => "assets/apertures/door.fbx",
+            ApertureKind::Window => "assets/apertures/window.obj",
+        }
     }
 }
 
@@ -827,6 +1893,9 @@ impl Draw3dDialog {
             // `app.rs`), so this arm exists only for exhaustiveness and must not touch the
             // dialog: writing a kind here would misreport the solid.
             Primitive::Extrusion { .. } => {}
+            // A sweep is a profile + path in the shared tables, not a set of scalars —
+            // nothing to load into the dialog (same as Extrusion).
+            Primitive::Sweep { .. } => {}
             Primitive::Box { w, d, h } => {
                 self.kind = Draw3dKind::Box;
                 self.w = w; self.d = d; self.h = h;
@@ -956,6 +2025,8 @@ impl Default for FactoryState {
             cached: SolidMesh::default(),
             dirty: false,
             selection: Vec::new(),
+            feature_group: std::collections::HashMap::new(),
+            next_group_id: 1,
             cam_yaw: 0.9,
             cam_pitch: 0.5,
             cam_dist: 12.0,
@@ -1004,10 +2075,24 @@ impl Default for FactoryState {
             furniture_lib: Vec::new(),
             furniture: Vec::new(),
             sel_furniture: None,
+            sweep_flow: None,
+            render_cache: std::cell::RefCell::new(RenderCache::default()),
+            faceted_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            geom_version: 0,
+            sun: SunEnv::default(),
+            clay_mode: false,
             feature_color: std::collections::HashMap::new(),
             surface_color: std::collections::HashMap::new(),
             paint_surface_mode: false,
             last_pick_color: [0.8, 0.8, 0.82],
+            textures: Vec::new(),
+            feature_texture: std::collections::HashMap::new(),
+            surface_texture: std::collections::HashMap::new(),
+            surface_tex_brush: None,
+            furn_paint_mode: FurnPaintMode::WholeObject,
+            furn_tex_brush: None,
+            furn_face_sel: None,
+            clip: None,
             zoom_mode: ZoomMode::Off,
             zoom_drag: None,
             zoom_cur: None,
@@ -1016,6 +2101,8 @@ impl Default for FactoryState {
             modify: None,
             queued: None,
             status: String::new(),
+            editing_cutout: false,
+            aperture_asset: [None, None],
             sel_mesh: SolidMesh::default(),
             sel_key: Vec::new(),
         }
@@ -1230,6 +2317,7 @@ impl FactoryState {
         let asset_color = mesh.color.unwrap_or([0.82, 0.82, 0.84]); // file diffuse, else neutral
         let mut positions = mesh.positions;
         let normals = mesh.normals;
+        let alpha = mesh.alpha; // per-vertex opacity (empty ⇒ opaque); recentring below is xyz-only
         let bounds = {
             let mut mn = [f32::INFINITY; 3];
             let mut mx = [f32::NEG_INFINITY; 3];
@@ -1249,8 +2337,144 @@ impl FactoryState {
                 p[2] = (p[2] - mn[2]) * k;                  // base on z = 0
             }
         }
-        self.furniture_lib.push(FurnitureAsset { name, positions, normals, color: asset_color });
+        let mut fa = FurnitureAsset::new(name, positions, normals, asset_color);
+        fa.alpha = alpha;
+        self.furniture_lib.push(fa);
         self.furniture_lib.len() - 1
+    }
+
+    /// A sensible world point to drop a new furniture copy: the CENTRE of the current
+    /// model. Imported drawings live at their DXF coordinates (e.g. X≈3619, Y≈956), so
+    /// placing at world origin puts the piece kilometres away, off-screen — it looks like
+    /// nothing happened. Falls back to the origin when there is no model yet.
+    pub fn default_place_at(&self) -> Vec3 {
+        match self.cached.bounds() {
+            Some((mn, mx)) => Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, 0.0),
+            None => Vec3::ZERO,
+        }
+    }
+
+    /// Copy the current 3D selection (a furniture instance OR a single CSG feature) into the
+    /// paste buffer, with its colour/texture. Returns true if something was captured.
+    pub fn copy_selection(&mut self) -> bool {
+        if let Some(fi) = self.sel_furniture {
+            if let Some(inst) = self.furniture.get(fi).cloned() {
+                self.clip = Some(FactoryClip::Furniture(inst));
+                return true;
+            }
+        }
+        if let Some(id) = self.selected_single() {
+            if let Some(f) = self.model.features.iter().find(|f| f.id == id) {
+                let (op, plane, placement, primitive) =
+                    (f.op, f.plane.clone(), f.placement.clone(), f.primitive.clone());
+                let (surface_colors, surface_textures) = self.capture_surface_paint(id);
+                self.clip = Some(FactoryClip::Feature {
+                    op,
+                    plane,
+                    placement,
+                    primitive,
+                    color: self.feature_color.get(&id).copied(),
+                    texture: self.feature_texture.get(&id).copied(),
+                    surface_colors,
+                    surface_textures,
+                });
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Capture feature `id`'s PER-FACE paint as precise `(normal, plane-offset d, value)` tuples,
+    /// one per painted face. Walks the cached geometry (which is why it uses the real triangle
+    /// normal + offset, not the quantised `SurfaceKey`): storing the exact plane lets paste re-key
+    /// each face after its offset shifts by `n·delta`, so per-face paint survives copy/paste.
+    fn capture_surface_paint(
+        &self,
+        id: u32,
+    ) -> (Vec<([f32; 3], f32, [f32; 3])>, Vec<([f32; 3], f32, usize)>) {
+        if self.surface_color.is_empty() && self.surface_texture.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut cols: std::collections::HashMap<SurfaceKey, ([f32; 3], f32, [f32; 3])> =
+            std::collections::HashMap::new();
+        let mut texs: std::collections::HashMap<SurfaceKey, ([f32; 3], f32, usize)> =
+            std::collections::HashMap::new();
+        for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
+            let Some(fid) = self.cached.face_ids.get(i).copied() else { continue };
+            if fid != id {
+                continue;
+            }
+            let key = surface_key(fid, tri[0], tri[1], tri[2]);
+            let av = Vec3::from(tri[0]);
+            let n = (Vec3::from(tri[1]) - av).cross(Vec3::from(tri[2]) - av).normalize_or_zero();
+            let d = n.dot(av);
+            if let Some(&c) = self.surface_color.get(&key) {
+                cols.entry(key).or_insert(([n.x, n.y, n.z], d, c));
+            }
+            if let Some(&t) = self.surface_texture.get(&key) {
+                texs.entry(key).or_insert(([n.x, n.y, n.z], d, t));
+            }
+        }
+        (cols.into_values().collect(), texs.into_values().collect())
+    }
+
+    /// Paste the buffer as a new object, offset so the copy is visible, and select it. Returns
+    /// `Some(is_feature)` when a paste happened (`true` → caller must `recompute()`), else `None`.
+    pub fn paste_clipboard(&mut self) -> Option<bool> {
+        const OFF: f32 = 0.3; // metres, so the copy doesn't sit exactly on the original
+        match self.clip.clone()? {
+            FactoryClip::Furniture(mut inst) => {
+                inst.pos[0] += OFF;
+                inst.pos[1] += OFF;
+                self.furniture.push(inst);
+                self.select_furniture(self.furniture.len() - 1);
+                Some(false)
+            }
+            FactoryClip::Feature {
+                op, plane, mut placement, primitive, color, texture,
+                surface_colors, surface_textures,
+            } => {
+                placement.u += OFF;
+                placement.v += OFF;
+                // World translation the paste applied, so each captured face's plane offset shifts
+                // by n·delta and its re-keyed SurfaceKey matches the pasted geometry exactly.
+                let (ua, va) = plane.axes();
+                let delta = ua * OFF + va * OFF;
+                let id = self.model.push(op, plane, placement, primitive);
+                if let Some(c) = color { self.feature_color.insert(id, c); }
+                if let Some(t) = texture { self.feature_texture.insert(id, t); }
+                let rekey = |n: [f32; 3], d: f32| -> SurfaceKey {
+                    let nv = Vec3::from(n);
+                    let nd = d + nv.dot(delta);
+                    (
+                        id,
+                        (n[0] * 50.0).round() as i32,
+                        (n[1] * 50.0).round() as i32,
+                        (n[2] * 50.0).round() as i32,
+                        (nd * 100.0).round() as i32,
+                    )
+                };
+                for (n, d, c) in surface_colors { self.surface_color.insert(rekey(n, d), c); }
+                for (n, d, t) in surface_textures { self.surface_texture.insert(rekey(n, d), t); }
+                self.sel_furniture = None;
+                self.selection = vec![id];
+                self.dirty = true;
+                Some(true)
+            }
+        }
+    }
+
+    /// Store a clipboard bitmap as a texture asset and return its index. Computes the
+    /// average colour up front so callers can tint immediately.
+    pub fn add_texture(&mut self, name: String, w: u32, h: u32, rgba: Vec<u8>) -> usize {
+        self.textures.push(TextureAsset::new(name, w, h, rgba));
+        self.textures.len() - 1
+    }
+
+    /// Register a PROCEDURAL texture (evaluated in-shader from world position) and return its index.
+    pub fn add_procedural_texture(&mut self, name: String, def: ProcDef) -> usize {
+        self.textures.push(TextureAsset::procedural(name, def));
+        self.textures.len() - 1
     }
 
     /// Place a copy of library asset `asset` at world point `at` (seated on the plane),
@@ -1264,16 +2488,105 @@ impl FactoryState {
             asset,
             pos: [at.x, at.y, self.active_base_z()],
             scale: 1.0,
+            fit: None,
             rot: [0.0, 0.0, 0.0],
             color,
+            texture: None,
+            surface_texture: std::collections::HashMap::new(),
         });
         self.select_furniture(self.furniture.len() - 1);
+    }
+
+    /// Place aperture library asset `asset` (a door/window mesh) so it exactly FILLS an opening
+    /// described in WORLD space: `center` is the opening's centre (at mid-wall-depth), `u_h` is
+    /// the opening's horizontal in-plane axis (unit, level), and `width` / `height` / `depth` are
+    /// its size (height is vertical, depth is the wall thickness). The mesh — authored with local
+    /// X=width, Y=depth, Z=height — is stretched to fill and yawed so its face aligns with the
+    /// wall. Returns the new instance index (also selected). Pure geometry, unit-tested.
+    ///
+    /// The transform is self-consistent with [`FurnitureInst::rot_mat`]/[`FurnitureInst::scale_vec`]:
+    /// a local point `p` maps to `center + R·(fit·(p − localCentre))`, so the mesh's own centre
+    /// lands on `center` and its extents span exactly the opening.
+    pub fn place_aperture(
+        &mut self,
+        asset: usize,
+        center: Vec3,
+        u_h: Vec3,
+        width: f32,
+        height: f32,
+        depth: f32,
+    ) -> Option<usize> {
+        let a = self.furniture_lib.get(asset)?;
+        let (lmn, lmx) = (a.local_min, a.local_max);
+        let sx = (lmx[0] - lmn[0]).max(1e-4);
+        let sy = (lmx[1] - lmn[1]).max(1e-4);
+        let sz = (lmx[2] - lmn[2]).max(1e-4);
+        // Stretch each local axis to fill: X→width, Y→wall depth, Z→height.
+        let fit = [width / sx, depth / sy, height / sz];
+        let s = Vec3::new(fit[0], fit[1], fit[2]);
+        // Yaw so local +X aligns to the horizontal opening axis; local +Z stays world-up.
+        let theta = u_h.y.atan2(u_h.x); // radians
+        let rm = glam::Mat3::from_rotation_z(theta);
+        let lc = Vec3::new(
+            (lmn[0] + lmx[0]) * 0.5,
+            (lmn[1] + lmx[1]) * 0.5,
+            (lmn[2] + lmx[2]) * 0.5,
+        );
+        // center = pos + R·(s·lc)  ⇒  pos = center − R·(s·lc), so the mesh centre lands on `center`.
+        let pos = center - rm * (s * lc);
+        let color = a.color;
+        self.furniture.push(FurnitureInst {
+            asset,
+            pos: [pos.x, pos.y, pos.z],
+            scale: 1.0,
+            fit: Some(fit),
+            rot: [0.0, 0.0, theta.to_degrees()],
+            color,
+            texture: None,
+            surface_texture: std::collections::HashMap::new(),
+        });
+        let i = self.furniture.len() - 1;
+        self.select_furniture(i);
+        Some(i)
+    }
+
+    /// Place an aperture asset at its NATIVE size (no stretch) — for a parametric door built to the
+    /// opening's exact dimensions, so its mouldings and hardware aren't distorted. `anchor` is the
+    /// mesh-local point (e.g. the door's structural-opening centre) that should land on `center`;
+    /// the mesh is yawed so local +X → `u_h` and local +Z stays world-up (same frame as
+    /// [`Self::place_aperture`], just fit = 1).
+    pub fn place_aperture_native(
+        &mut self,
+        asset: usize,
+        center: Vec3,
+        u_h: Vec3,
+        anchor: Vec3,
+    ) -> Option<usize> {
+        let a = self.furniture_lib.get(asset)?;
+        let color = a.color;
+        let theta = u_h.y.atan2(u_h.x);
+        let rm = glam::Mat3::from_rotation_z(theta);
+        let pos = center - rm * anchor; // land `anchor` on `center`
+        self.furniture.push(FurnitureInst {
+            asset,
+            pos: [pos.x, pos.y, pos.z],
+            scale: 1.0,
+            fit: Some([1.0, 1.0, 1.0]),
+            rot: [0.0, 0.0, theta.to_degrees()],
+            color,
+            texture: None,
+            surface_texture: std::collections::HashMap::new(),
+        });
+        let i = self.furniture.len() - 1;
+        self.select_furniture(i);
+        Some(i)
     }
 
     /// World-space vertex of instance `i`'s local mesh point — pose applied
     /// (scale → 3-axis rotate → translate).
     fn furniture_point(&self, inst: &FurnitureInst, p: [f32; 3]) -> Vec3 {
-        let lp = Vec3::new(p[0] * inst.scale, p[1] * inst.scale, p[2] * inst.scale);
+        let sv = inst.scale_vec();
+        let lp = Vec3::new(p[0] * sv.x, p[1] * sv.y, p[2] * sv.z);
         inst.rot_mat() * lp + Vec3::from(inst.pos)
     }
 
@@ -1281,12 +2594,24 @@ impl FactoryState {
     pub fn furniture_aabb(&self, i: usize) -> Option<(Vec3, Vec3)> {
         let inst = self.furniture.get(i)?;
         let asset = self.furniture_lib.get(inst.asset)?;
+        // Transform the 8 corners of the asset's CACHED local box — O(8), not a per-frame
+        // sweep of every vertex. The gizmo + selection highlight both call this each frame,
+        // so at ~90k verts the old loop cost ~100 ms/frame while a heavy piece was selected.
+        // `rot_mat()` is built ONCE here (it used to be rebuilt per vertex inside the loop).
+        let rm = inst.rot_mat();
+        let s = inst.scale_vec();
+        let pos = Vec3::from(inst.pos);
+        let (lmn, lmx) = (asset.local_min, asset.local_max);
         let mut mn = Vec3::splat(f32::INFINITY);
         let mut mx = Vec3::splat(f32::NEG_INFINITY);
-        for p in &asset.positions {
-            let w = self.furniture_point(inst, *p);
-            mn = mn.min(w);
-            mx = mx.max(w);
+        for cx in [lmn[0], lmx[0]] {
+            for cy in [lmn[1], lmx[1]] {
+                for cz in [lmn[2], lmx[2]] {
+                    let w = rm * (Vec3::new(cx, cy, cz) * s) + pos;
+                    mn = mn.min(w);
+                    mx = mx.max(w);
+                }
+            }
         }
         mn.x.is_finite().then_some((mn, mx))
     }
@@ -1299,8 +2624,20 @@ impl FactoryState {
         let mut best: Option<(f32, usize)> = None;
         for (i, inst) in self.furniture.iter().enumerate() {
             let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            // CHEAP REJECT: skip furniture whose world AABB the ray misses. Without this a
+            // pick ray-tested EVERY triangle of EVERY piece — a 2M-triangle mesh cost ~6M
+            // vertex transforms per click (the select/drag lag spike). The AABB is O(8).
+            match self.furniture_aabb(i) {
+                Some((mn, mx)) if cad_solid::ray_aabb(orig, dir, mn, mx).is_some() => {}
+                Some(_) => continue, // ray misses this piece entirely
+                None => continue,
+            }
+            // Pick against the DISPLAY geometry — the decimated proxy for heavy pieces — so a
+            // click on a 2M-triangle import doesn't ray-test millions of triangles per click.
+            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
             let mut ft: Option<f32> = None;
-            for tri in asset.positions.chunks_exact(3) {
+            for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
                 let b = self.furniture_point(inst, tri[1]);
                 let c = self.furniture_point(inst, tri[2]);
@@ -1319,16 +2656,116 @@ impl FactoryState {
         best.map(|(_, i)| i)
     }
 
+    /// One pass over furniture returning BOTH the nearest hit of any kind AND the nearest APERTURE
+    /// hit (door/window, `fit.is_some()`), each as `(index, ray_t)`. Tracking the aperture
+    /// separately is what lets selection give it priority over the wall it sits in even when some
+    /// other furniture happens to be the global-nearest along that ray — the single-nearest
+    /// `pick_furniture` could not express that, which made aperture selection inconsistent.
+    pub fn pick_furniture_ex(
+        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+    ) -> (Option<(usize, f32)>, Option<(usize, f32)>) {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let mut best: Option<(f32, usize)> = None;
+        let mut best_ap: Option<(f32, usize)> = None;
+        for (i, inst) in self.furniture.iter().enumerate() {
+            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            match self.furniture_aabb(i) {
+                Some((mn, mx)) if cad_solid::ray_aabb(orig, dir, mn, mx).is_some() => {}
+                _ => continue,
+            }
+            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
+            let mut ft: Option<f32> = None;
+            for tri in positions.chunks_exact(3) {
+                let a = self.furniture_point(inst, tri[0]);
+                let b = self.furniture_point(inst, tri[1]);
+                let c = self.furniture_point(inst, tri[2]);
+                if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                    if ft.map_or(true, |x| t < x) { ft = Some(t); }
+                }
+            }
+            if let Some(t) = ft {
+                if best.map_or(true, |(bt, _)| t < bt) { best = Some((t, i)); }
+                // Recognise apertures broadly (fit OR a door/window asset), not just `fit`, so a
+                // free-standing/imported window flush in a wall still gets selection priority.
+                if self.is_aperture(i) && best_ap.map_or(true, |(bt, _)| t < bt) { best_ap = Some((t, i)); }
+            }
+        }
+        (best.map(|(t, i)| (i, t)), best_ap.map(|(t, i)| (i, t)))
+    }
+
+    /// Nearest Union feature under the cursor WITH its ray distance — the depth-aware counterpart
+    /// of [`Self::pick_feature`] (which returns only the id).
+    pub fn pick_feature_t(
+        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+    ) -> Option<(u32, f32)> {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let mut best: Option<(f32, f32, u32)> = None; // (t, aabb volume, id)
+        for f in &self.model.features {
+            if f.op != cad_solid::BoolOp::Union {
+                continue;
+            }
+            if self.hide_ceilings && self.is_hidden_ceiling(f.id) {
+                continue;
+            }
+            let tris = self.model.feature_world_positions(f);
+            let mut ft: Option<f32> = None;
+            for c in tris.chunks_exact(3) {
+                let (a, b, cc) = (Vec3::from(c[0]), Vec3::from(c[1]), Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, cc) {
+                    if ft.map_or(true, |x| t < x) { ft = Some(t); }
+                }
+            }
+            if let Some(t) = ft {
+                let (mn, mx) = f.world_aabb();
+                let s = mx - mn;
+                let vol = s.x.abs() * s.y.abs() * s.z.abs();
+                let better = match best {
+                    None => true,
+                    Some((bt, bv, _)) => t < bt - 1e-3 || (t < bt + 1e-3 && vol < bv),
+                };
+                if better { best = Some((t, vol, f.id)); }
+            }
+        }
+        best.map(|(t, _, id)| (id, t))
+    }
+
+    /// Depth tolerance (metres) by which an aperture `i` may sit BEHIND the nearest wall/other
+    /// surface and still win the click. Scaled to the aperture's own thinnest dimension (≈ the
+    /// wall thickness it fills), so a door in a thick wall is as grabbable as one in a thin wall.
+    pub fn aperture_pick_tol(&self, i: usize) -> f32 {
+        // Floor of 0.5 m: a free-standing window can sit recessed several cm-to-decimetres behind
+        // the wall face (observed up to ~0.4 m in the pick diagnostic), and its own mesh may be
+        // thin, so the tolerance can't be driven by thickness alone.
+        match self.furniture_aabb(i) {
+            Some((mn, mx)) => ((mx - mn).min_element() * 1.5 + 0.1).clamp(0.5, 3.0),
+            None => 0.5,
+        }
+    }
+
     /// Is furniture instance `fi` in front of feature `id` along the pick ray? Used to
-    /// break a tie when a click hits both.
+    /// break a tie when a click hits both. Exact depth compare (tolerance 0).
     pub fn furniture_nearer_than_feature(
         &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], fi: usize, id: u32,
+    ) -> bool {
+        self.furniture_beats_feature(cursor, rect, mvp, fi, id, 0.0)
+    }
+
+    /// Like [`Self::furniture_nearer_than_feature`] but the furniture wins as long as it is no more
+    /// than `tol` metres BEHIND the feature. This is what makes an APERTURE (a door/window placed
+    /// flush INSIDE a wall opening) selectable: viewed at an angle, the wall's opening reveal sits
+    /// at nearly the same depth as the aperture's face and would otherwise steal every click. The
+    /// caller passes a generous `tol` (≈ wall thickness) for apertures and a tiny one otherwise.
+    pub fn furniture_beats_feature(
+        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], fi: usize, id: u32, tol: f32,
     ) -> bool {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let fur_t = self.furniture.get(fi).and_then(|inst| {
             let asset = self.furniture_lib.get(inst.asset)?;
+            let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
             let mut best: Option<f32> = None;
-            for tri in asset.positions.chunks_exact(3) {
+            for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
                 let b = self.furniture_point(inst, tri[1]);
                 let c = self.furniture_point(inst, tri[2]);
@@ -1350,10 +2787,33 @@ impl FactoryState {
             best
         });
         match (fur_t, feat_t) {
-            (Some(a), Some(b)) => a <= b,
+            (Some(a), Some(b)) => a <= b + tol,
             (Some(_), None) => true,
             _ => false,
         }
+    }
+
+    /// True when furniture instance `i` is an APERTURE — a door or window that lives inside a wall
+    /// and so gets selection priority over that wall. Recognised three ways, because an aperture
+    /// can reach the scene by more than one route:
+    ///  1. a non-uniform `fit` — set only by the "draw on a wall" flow (`place_aperture`);
+    ///  2. its asset is a registered bundled door/window (`aperture_asset`);
+    ///  3. its asset is NAMED "door"/"window" — covers a bundled aperture IMPORTED free-standing
+    ///     (`factory_import_aperture` → `place_furniture`, no `fit`) then moved into an opening.
+    /// Without (2)/(3), an imported/free-standing window sitting flush in a wall was invisible to
+    /// the aperture priority and the wall stole the click (confirmed via the pick diagnostic).
+    pub fn is_aperture(&self, i: usize) -> bool {
+        let Some(inst) = self.furniture.get(i) else { return false };
+        if inst.fit.is_some() {
+            return true;
+        }
+        if self.aperture_asset.iter().any(|&a| a == Some(inst.asset)) {
+            return true;
+        }
+        self.furniture_lib.get(inst.asset).map_or(false, |a| {
+            let n = a.name.trim().to_ascii_lowercase();
+            n == "door" || n == "window"
+        })
     }
 
     /// Select a furniture instance — clears the CSG feature selection (they are mutually
@@ -1375,6 +2835,70 @@ impl FactoryState {
     // ===================================================================
     // Selection: bounds, move, delete, per-object properties
     // ===================================================================
+
+    /// GROUP the currently-selected features into one entity. All selected features (expanded to
+    /// whole groups first, so re-grouping merges) get a fresh group id. Needs ≥ 2 features. Returns
+    /// the count grouped, or 0 if there was nothing to group.
+    pub fn group_selection(&mut self) -> usize {
+        self.expand_selection_to_groups();
+        let members: Vec<u32> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| self.model.features.iter().any(|f| f.id == *id))
+            .collect();
+        if members.len() < 2 {
+            return 0;
+        }
+        let gid = self.next_group_id;
+        self.next_group_id += 1;
+        for id in &members {
+            self.feature_group.insert(*id, gid);
+        }
+        members.len()
+    }
+
+    /// EXPLODE: dissolve the group(s) of the selected features so each piece is independent again.
+    /// Returns the number of features released.
+    pub fn ungroup_selection(&mut self) -> usize {
+        let gids: std::collections::HashSet<u32> = self
+            .selection
+            .iter()
+            .filter_map(|id| self.feature_group.get(id).copied())
+            .collect();
+        if gids.is_empty() {
+            return 0;
+        }
+        let before = self.feature_group.len();
+        self.feature_group.retain(|_, g| !gids.contains(g));
+        before - self.feature_group.len()
+    }
+
+    /// Expand the current selection so that picking ONE member of a group selects the WHOLE group —
+    /// the reason a group behaves as a single entity for move / delete / colour.
+    pub fn expand_selection_to_groups(&mut self) {
+        let gids: std::collections::HashSet<u32> = self
+            .selection
+            .iter()
+            .filter_map(|id| self.feature_group.get(id).copied())
+            .collect();
+        if gids.is_empty() {
+            return;
+        }
+        for (&fid, &gid) in &self.feature_group {
+            if gids.contains(&gid) && !self.selection.contains(&fid) {
+                self.selection.push(fid);
+            }
+        }
+    }
+
+    /// The group id of the current selection, if every selected feature shares ONE group (so the UI
+    /// can show "Explode" instead of "Group").
+    pub fn selection_group(&self) -> Option<u32> {
+        let mut it = self.selection.iter().map(|id| self.feature_group.get(id).copied());
+        let first = it.next()??;
+        it.all(|g| g == Some(first)).then_some(first)
+    }
 
     /// The single selected feature id, if exactly one solid is selected. Position and
     /// dimension editing act on ONE object; a multi-selection has no single set of
@@ -1522,6 +3046,302 @@ impl FactoryState {
             return true;
         }
         false
+    }
+
+    /// Apply `tex_idx` to the SINGLE surface under the cursor (per-face texturing). Mirrors
+    /// [`Self::paint_surface`] but writes `surface_texture`; clears any per-surface colour on
+    /// that face so the image shows. Returns true if a surface was hit.
+    pub fn paint_surface_texture(
+        &mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], tex_idx: usize,
+    ) -> bool {
+        if tex_idx >= self.textures.len() {
+            return false;
+        }
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let mut best: Option<(f32, SurfaceKey)> = None;
+        for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
+            let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
+            if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    let fid = self.cached.face_ids.get(i).copied().unwrap_or(0);
+                    best = Some((t, surface_key(fid, tri[0], tri[1], tri[2])));
+                }
+            }
+        }
+        if let Some((_, key)) = best {
+            self.surface_color.remove(&key);
+            self.surface_texture.insert(key, tex_idx);
+            self.dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Resolve the cursor to the FACE-GROUP ids of FURNITURE instance `i` under it: the single flat
+    /// face clicked, or (if `whole_piece`) every face-group of the connected body it belongs to.
+    /// Ray-tests the asset's local triangles (the world ray is transformed into the instance's local
+    /// space). Returns `None` if the object isn't under the cursor, or the asset is heavy
+    /// (LOD)/translucent (per-surface unsupported there). See [`FurnGroups`].
+    pub fn furniture_face_at(
+        &self, i: usize, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], whole_piece: bool,
+    ) -> Option<Vec<u32>> {
+        let asset_idx = self.furniture.get(i)?.asset;
+        let model = self.furniture_model_matrix(i)?;
+        let asset = self.furniture_lib.get(asset_idx)?;
+        // NB: translucent assets are pickable — a mesh with glass (e.g. the villa, whose panes
+        // carry per-vertex alpha since the FBX opacity import) must still take face/piece clicks;
+        // the per-surface render path handles translucency. Only LOD-heavy meshes bail.
+        if asset.needs_lod() {
+            return None;
+        }
+        // World ray → the instance's LOCAL space (positions are stored local).
+        let (ow, dw) = Self::ray(cursor, rect, mvp);
+        let inv = glam::Mat4::from_cols_array(&model).inverse();
+        let ol = inv.transform_point3(ow);
+        let dl = inv.transform_vector3(dw).normalize_or_zero();
+        let mut best: Option<(f32, usize)> = None;
+        for (ti, tri) in asset.positions.chunks_exact(3).enumerate() {
+            let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
+            if let Some(t) = cad_solid::ray_triangle(ol, dl, a, b, c) {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, ti));
+                }
+            }
+        }
+        let (_, ht) = best?;
+        let groups = asset.group_geom();
+        Some(if whole_piece {
+            let bid = groups.body.get(ht).copied().unwrap_or(0);
+            let mut set = std::collections::BTreeSet::new();
+            for t in 0..groups.face.len() {
+                if groups.body.get(t) == Some(&bid) {
+                    set.insert(groups.face[t]);
+                }
+            }
+            set.into_iter().collect()
+        } else {
+            vec![groups.face.get(ht).copied().unwrap_or(0)]
+        })
+    }
+
+    /// Find (or create) a 1×1 solid-colour texture for `c`. A per-face COLOUR is stored as a tiny
+    /// solid texture so it flows through the SAME per-surface machinery as an image — mirroring
+    /// Blender, where a face's material can be a flat colour or a texture. Reuses an existing swatch
+    /// so repeated colours don't bloat the library.
+    pub fn ensure_solid_color_texture(&mut self, c: [f32; 3]) -> usize {
+        let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let rgba = [to8(c[0]), to8(c[1]), to8(c[2]), 255];
+        for (i, t) in self.textures.iter().enumerate() {
+            if t.w == 1 && t.h == 1 && t.rgba == rgba {
+                return i;
+            }
+        }
+        self.add_texture(
+            format!("colour #{:02x}{:02x}{:02x}", rgba[0], rgba[1], rgba[2]),
+            1, 1, rgba.to_vec(),
+        )
+    }
+
+    /// True when this furniture asset carries per-primitive part ids (a generated object). Used by
+    /// diagnostics + to decide whether "piece"/"face" split cleanly.
+    pub fn furniture_has_parts(&self, i: usize) -> bool {
+        self.furniture.get(i)
+            .and_then(|inst| self.furniture_lib.get(inst.asset))
+            .map_or(false, |a| a.part_ids.len() == a.positions.len() / 3)
+    }
+
+    /// How many triangles of instance `i` currently carry a PER-FACE texture (for diagnostics —
+    /// confirms an apply hit only the intended face, not the whole object).
+    pub fn furniture_textured_tri_count(&self, i: usize) -> usize {
+        let Some(inst) = self.furniture.get(i) else { return 0 };
+        if inst.surface_texture.is_empty() {
+            return 0;
+        }
+        let Some(asset) = self.furniture_lib.get(inst.asset) else { return 0 };
+        let g = asset.group_geom();
+        g.face.iter().filter(|fg| inst.surface_texture.contains_key(fg)).count()
+    }
+
+    /// Record `tex_idx` against `face_groups` of furniture instance `i` (per-surface texturing).
+    /// Per-surface texturing is AUTHORITATIVE: applying to a face drops any WHOLE-OBJECT texture
+    /// (and its baked-in avg-colour tint), so only the painted faces show a texture and the rest
+    /// return to the asset's own colour — otherwise the whole-object texture would keep masking
+    /// every un-painted face and it looks like "the texture went on the whole object".
+    pub fn apply_face_texture(&mut self, i: usize, face_groups: &[u32], tex_idx: usize) {
+        if tex_idx >= self.textures.len() {
+            return;
+        }
+        let asset_col = self
+            .furniture
+            .get(i)
+            .and_then(|inst| self.furniture_lib.get(inst.asset))
+            .map(|a| a.color);
+        if let Some(inst) = self.furniture.get_mut(i) {
+            if inst.texture.take().is_some() {
+                // was whole-object textured → reset the tinted colour to the asset default
+                if let Some(c) = asset_col {
+                    inst.color = c;
+                }
+            }
+            for &fg in face_groups {
+                inst.surface_texture.insert(fg, tex_idx);
+            }
+        }
+    }
+
+    /// The per-face texture bound to `face_groups` of instance `i`, if any — the material a
+    /// face/piece "wears" (the first painted group's texture; `None` if none are painted).
+    pub fn face_material(&self, i: usize, face_groups: &[u32]) -> Option<usize> {
+        let inst = self.furniture.get(i)?;
+        face_groups.iter().find_map(|fg| inst.surface_texture.get(fg).copied())
+    }
+
+    /// Is texture `ti` referenced ANYWHERE other than exactly `face_groups` of instance `i`? Drives
+    /// copy-on-write: tuning one piece's opacity/reflection/tiling must not touch any OTHER surface
+    /// that happens to share the same texture (including the same object's whole-object texture).
+    pub fn texture_used_outside(&self, ti: usize, i: usize, face_groups: &[u32]) -> bool {
+        let want: std::collections::HashSet<u32> = face_groups.iter().copied().collect();
+        for (j, inst) in self.furniture.iter().enumerate() {
+            if inst.texture == Some(ti) {
+                return true; // a whole-object texture is "outside" the piece
+            }
+            for (&fg, &t) in &inst.surface_texture {
+                if t == ti && !(j == i && want.contains(&fg)) {
+                    return true;
+                }
+            }
+        }
+        self.feature_texture.values().any(|&t| t == ti)
+            || self.surface_texture.values().any(|&t| t == ti)
+    }
+
+    /// Deep-copy texture `ti` into a new asset (own pixels + fresh PNG cache), keeping its
+    /// tiling/opacity/reflection, and return the new index. Used to give a piece its OWN material.
+    pub fn clone_texture(&mut self, ti: usize) -> usize {
+        let Some(src) = self.textures.get(ti) else { return ti };
+        let mut t = TextureAsset::new(format!("{} (copy)", src.name), src.w, src.h, src.rgba.clone());
+        t.scale = src.scale;
+        t.offset = src.offset;
+        t.rot_deg = src.rot_deg;
+        t.opacity = src.opacity;
+        t.reflect = src.reflect;
+        self.textures.push(t);
+        self.textures.len() - 1
+    }
+
+    /// Give the selected face/piece a material that is EXCLUSIVE to it, so tuning its
+    /// opacity/reflection/tiling changes ONLY that piece and nothing else. Seeds from the piece's
+    /// own per-face texture, else the whole-object texture, else a solid swatch of the piece's
+    /// colour; clones it copy-on-write when anything else shares it; binds it to `face_groups`
+    /// (WITHOUT dropping the whole-object texture — the rest of the object keeps its look). Returns
+    /// the exclusive texture index to write. Idempotent once the piece owns its material.
+    pub fn private_piece_material(&mut self, i: usize, face_groups: &[u32]) -> usize {
+        let seed = if let Some(t) = self.face_material(i, face_groups) {
+            t
+        } else if let Some(t) = self.furniture.get(i).and_then(|f| f.texture) {
+            t
+        } else {
+            let col = self.furniture.get(i).map(|f| f.color).unwrap_or([0.8, 0.8, 0.82]);
+            self.ensure_solid_color_texture(col)
+        };
+        let ti = if self.texture_used_outside(seed, i, face_groups) {
+            self.clone_texture(seed)
+        } else {
+            seed
+        };
+        if let Some(inst) = self.furniture.get_mut(i) {
+            for &fg in face_groups {
+                inst.surface_texture.insert(fg, ti);
+            }
+        }
+        ti
+    }
+
+    /// Is texture `ti` referenced by any surface OTHER than the given feature `ids`? The feature
+    /// analog of [`Self::texture_used_outside`] — drives per-solid copy-on-write so tuning one
+    /// CSG solid's opacity/reflection doesn't drag every solid that shares the texture.
+    pub fn feature_texture_used_outside(&self, ti: usize, ids: &[u32]) -> bool {
+        let want: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        for inst in &self.furniture {
+            if inst.texture == Some(ti) || inst.surface_texture.values().any(|&t| t == ti) {
+                return true;
+            }
+        }
+        if self.surface_texture.values().any(|&t| t == ti) {
+            return true;
+        }
+        self.feature_texture.iter().any(|(&id, &t)| t == ti && !want.contains(&id))
+    }
+
+    /// Give the selected CSG feature(s) a material EXCLUSIVE to them, so tuning its opacity /
+    /// reflection / tiling changes ONLY those solids. Seeds from the first selected feature's
+    /// texture, else a solid swatch of its colour; clones copy-on-write when anything else shares
+    /// it; binds it to every selected feature. Recomputes ONCE if a previously-untextured feature
+    /// was newly textured (its triangles must move to the textured pass). Returns the index to write.
+    pub fn private_feature_material(&mut self, ids: &[u32]) -> usize {
+        let seed = if let Some(t) = ids.iter().find_map(|id| self.feature_texture.get(id).copied()) {
+            t
+        } else {
+            let col = ids
+                .iter()
+                .find_map(|id| self.feature_color.get(id).copied())
+                .unwrap_or([0.8, 0.8, 0.82]);
+            self.ensure_solid_color_texture(col)
+        };
+        let ti = if self.feature_texture_used_outside(seed, ids) {
+            self.clone_texture(seed)
+        } else {
+            seed
+        };
+        let mut minted = false;
+        for &id in ids {
+            if self.feature_texture.insert(id, ti).is_none() {
+                minted = true; // a newly-textured feature — its tris leave the flat batch
+            }
+        }
+        if minted {
+            self.recompute();
+        }
+        ti
+    }
+
+    /// Screen-space edge segments outlining the currently-targeted furniture face/piece
+    /// (`furn_face_sel`) — so the user can SEE which surface a texture will land on. Every triangle
+    /// in the selected face-groups is projected (posed by the instance model matrix) and its three
+    /// edges emitted. Empty when nothing is targeted.
+    pub fn furniture_face_highlight_segments(
+        &self, rect: egui::Rect, mvp: &[f32; 16],
+    ) -> Vec<[egui::Pos2; 2]> {
+        let mut out = Vec::new();
+        let Some((fi, groups)) = self.furn_face_sel.as_ref() else { return out };
+        let Some(inst) = self.furniture.get(*fi) else { return out };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else { return out };
+        if asset.needs_lod() {
+            return out;
+        }
+        let fg = asset.group_geom();
+        let want: std::collections::HashSet<u32> = groups.iter().copied().collect();
+        let model = glam::Mat4::from_cols_array(&self.furniture_model_matrix(*fi).unwrap_or([
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ]));
+        for t in 0..fg.face.len() {
+            if !want.contains(&fg.face[t]) {
+                continue;
+            }
+            let base = t * 3;
+            let s: Vec<Option<egui::Pos2>> = (0..3)
+                .map(|k| {
+                    let wp = model.transform_point3(Vec3::from(asset.positions[base + k]));
+                    world_to_screen(wp, rect, mvp)
+                })
+                .collect();
+            for e in 0..3 {
+                if let (Some(a), Some(b)) = (s[e], s[(e + 1) % 3]) {
+                    out.push([a, b]);
+                }
+            }
+        }
+        out
     }
 
     /// Set a feature's world origin directly — the Position fields in the properties
@@ -2067,7 +3887,34 @@ impl FactoryState {
     /// PERSISTENCE: capture the 3D model for the sidecar. Camera, selection and any live
     /// sketch session are deliberately NOT captured — they are view state, not the
     /// building.
+    /// Persist the full model with furniture geometry ENCODED inline (blobs). Used by the
+    /// synchronous (dead) save path and by tests. The threaded save path uses [`Self::to_persist_lite`]
+    /// + [`Self::furniture_geom_flat`] so the deflate happens on a worker.
     pub fn to_persist(&self) -> crate::simlux_io::FactoryDoc {
+        self.build_persist(true)
+    }
+
+    /// Persist everything EXCEPT furniture geometry (blobs left empty). Pair with
+    /// [`Self::furniture_geom_flat`] and encode the geometry on a worker thread.
+    pub fn to_persist_lite(&self) -> crate::simlux_io::FactoryDoc {
+        self.build_persist(false)
+    }
+
+    /// Each furniture asset's flattened geometry, for off-thread compression. Order matches
+    /// `to_persist_lite().furniture_lib`, so a worker can fill blob `i` from raw `i`.
+    pub fn furniture_geom_flat(&self) -> Vec<FurnitureGeomRaw> {
+        self.furniture_lib
+            .iter()
+            .map(|a| FurnitureGeomRaw {
+                pos: flat3(&a.positions),
+                nrm: flat3(&a.normals),
+                uv: if a.uvs.is_empty() { Vec::new() } else { flat2(&a.uvs) },
+                alpha: a.alpha.clone(),
+            })
+            .collect()
+    }
+
+    fn build_persist(&self, encode_geom: bool) -> crate::simlux_io::FactoryDoc {
         crate::simlux_io::FactoryDoc {
             model: self.model.clone(),
             walls: self
@@ -2096,9 +3943,19 @@ impl FactoryState {
                 .iter()
                 .map(|a| crate::simlux_io::FurnitureAssetRec {
                     name: a.name.clone(),
-                    positions: a.positions.clone(),
-                    normals: a.normals.clone(),
+                    positions: Vec::new(), // geometry rides in the compact blobs below (or a worker)
+                    normals: Vec::new(),
                     color: a.color,
+                    uvs: Vec::new(),
+                    // When `encode_geom` is false the blobs are left EMPTY and a save worker fills
+                    // them from `furniture_geom_flat()` — keeping the deflate off the UI thread.
+                    pos_b64: if encode_geom { encode_f32_blob(&flat3(&a.positions)) } else { String::new() },
+                    nrm_b64: if encode_geom { encode_f32_blob(&flat3(&a.normals)) } else { String::new() },
+                    uv_b64: if encode_geom && !a.uvs.is_empty() { encode_f32_blob(&flat2(&a.uvs)) } else { String::new() },
+                    alpha_b64: if encode_geom && !a.alpha.is_empty() { encode_f32_blob(&a.alpha) } else { String::new() },
+                    source_path: a.source_path.clone().unwrap_or_default(),
+                    alpha_resolved: a.alpha_resolved,
+                    part_ids: a.part_ids.clone(),
                 })
                 .collect(),
             furniture: self
@@ -2111,6 +3968,9 @@ impl FactoryState {
                     rot_deg: f.rot[2],
                     rot_xy: [f.rot[0], f.rot[1]],
                     color: f.color,
+                    texture: f.texture,
+                    fit: f.fit,
+                    surface_texture: f.surface_texture.iter().map(|(&g, &t)| (g, t)).collect(),
                 })
                 .collect(),
             feature_colors: self.feature_color.iter().map(|(&k, &v)| (k, v)).collect(),
@@ -2119,6 +3979,45 @@ impl FactoryState {
                 .iter()
                 .map(|(&(f, a, b, c, d), &col)| (f, a, b, c, d, col))
                 .collect(),
+            textures: self
+                .textures
+                .iter()
+                .map(|t| crate::simlux_io::TextureRec {
+                    name: t.name.clone(),
+                    w: t.w,
+                    h: t.h,
+                    scale: t.scale,
+                    offset: t.offset,
+                    rot_deg: t.rot_deg,
+                    opacity: t.opacity,
+                    reflect: t.reflect,
+                    png_b64: t.encoded_png(),
+                    proc: t.proc.map(|p| crate::simlux_io::ProcRec {
+                        pattern: p.pattern.tag().to_string(),
+                        col_a: p.col_a,
+                        col_b: p.col_b,
+                        scale: p.scale,
+                        detail: p.detail,
+                        rough: p.rough,
+                        contrast: p.contrast,
+                        ramp: p.ramp,
+                    }),
+                    normal_map: t.normal_map,
+                    rough_map: t.rough_map,
+                    roughness: t.roughness,
+                    metallic: t.metallic,
+                    ior: t.ior,
+                    emission: t.emission,
+                    emission_strength: t.emission_strength,
+                })
+                .collect(),
+            feature_textures: self.feature_texture.iter().map(|(&k, &v)| (k, v)).collect(),
+            surface_textures: self
+                .surface_texture
+                .iter()
+                .map(|(&(f, a, b, c, d), &ti)| (f, a, b, c, d, ti))
+                .collect(),
+            feature_groups: self.feature_group.iter().map(|(&f, &g)| (f, g)).collect(),
         }
     }
 
@@ -2132,7 +4031,50 @@ impl FactoryState {
     ///
     /// Leaves the model `dirty` rather than re-evaluating: `recompute()` walks a BSP per
     /// boolean, and the caller decides when to pay that.
-    pub fn apply_persist(&mut self, d: crate::simlux_io::FactoryDoc) -> usize {
+    ///
+    /// Decodes furniture geometry inline (blob → mesh + AABB). For a multi-million-vertex asset
+    /// that decode is SECONDS of CPU — the threaded load path instead calls
+    /// [`Self::decode_furniture_lib`] on a worker and hands the result to
+    /// [`Self::apply_persist_prebuilt`], so the UI thread never blocks.
+    pub fn apply_persist(&mut self, mut d: crate::simlux_io::FactoryDoc) -> usize {
+        let lib = Self::decode_furniture_lib(std::mem::take(&mut d.furniture_lib));
+        self.apply_persist_prebuilt(d, lib)
+    }
+
+    /// Decode furniture records (blob/JSON → `FurnitureAsset` with its cached AABB). Pure (no
+    /// `self`), so a worker thread can run it off the UI thread — this is the heavy part of a load.
+    pub fn decode_furniture_lib(recs: Vec<crate::simlux_io::FurnitureAssetRec>) -> Vec<FurnitureAsset> {
+        recs.into_iter()
+            .map(|a| {
+                let color = if a.color == [0.0, 0.0, 0.0] { [0.82, 0.82, 0.84] } else { a.color };
+                // Prefer the compact blobs; fall back to legacy JSON arrays for old sidecars.
+                let un3 = |v: Vec<f32>| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[f32; 3]>>();
+                let un2 = |v: Vec<f32>| v.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>();
+                let positions = if !a.pos_b64.is_empty() { un3(decode_f32_blob(&a.pos_b64)) } else { a.positions };
+                let normals = if !a.nrm_b64.is_empty() { un3(decode_f32_blob(&a.nrm_b64)) } else { a.normals };
+                let uvs = if !a.uv_b64.is_empty() { un2(decode_f32_blob(&a.uv_b64)) } else { a.uvs };
+                let alpha = if !a.alpha_b64.is_empty() { decode_f32_blob(&a.alpha_b64) } else { Vec::new() };
+                let mut fa = FurnitureAsset::new(a.name, positions, normals, color);
+                fa.uvs = uvs;
+                fa.alpha = alpha;
+                fa.source_path = (!a.source_path.is_empty()).then_some(a.source_path);
+                fa.alpha_resolved = a.alpha_resolved;
+                if a.part_ids.len() == fa.positions.len() / 3 {
+                    fa.part_ids = a.part_ids; // keep per-piece grouping across a reload
+                }
+                fa
+            })
+            .collect()
+    }
+
+    /// Install a persisted model whose furniture library was ALREADY decoded (see
+    /// [`Self::decode_furniture_lib`]). Everything here is cheap — it does NOT touch furniture
+    /// geometry — so it is safe to run on the main thread after a worker did the heavy decode.
+    pub fn apply_persist_prebuilt(
+        &mut self,
+        d: crate::simlux_io::FactoryDoc,
+        furniture_lib: Vec<FurnitureAsset>,
+    ) -> usize {
         let have: std::collections::HashSet<u32> =
             d.model.features.iter().map(|f| f.id).collect();
         let mut dropped = 0usize;
@@ -2184,14 +4126,16 @@ impl FactoryState {
         let have: std::collections::HashSet<u32> =
             self.model.features.iter().map(|f| f.id).collect();
         self.ceilings = d.ceilings.into_iter().filter(|id| have.contains(id)).collect();
-        self.furniture_lib = d
-            .furniture_lib
-            .into_iter()
-            .map(|a| {
-                let color = if a.color == [0.0, 0.0, 0.0] { [0.82, 0.82, 0.84] } else { a.color };
-                FurnitureAsset { name: a.name, positions: a.positions, normals: a.normals, color }
-            })
+        // Furniture library was already decoded (off-thread on the live load path).
+        self.furniture_lib = furniture_lib;
+        // Textures first — furniture/feature assignments index into this list. Decode each;
+        // a texture that fails to decode becomes a 1×1 placeholder so LATER indices stay valid.
+        self.textures = d
+            .textures
+            .iter()
+            .map(|r| decode_texture_rec(r).unwrap_or_else(|| TextureAsset::new(r.name.clone(), 1, 1, vec![200, 200, 200, 255])))
             .collect();
+        let ntex = self.textures.len();
         // Keep only instances whose asset still exists.
         let nlib = self.furniture_lib.len();
         self.furniture = d
@@ -2202,16 +4146,42 @@ impl FactoryState {
                 asset: f.asset,
                 pos: f.pos,
                 scale: if f.scale > 0.0 { f.scale } else { 1.0 },
+                fit: f.fit,
                 rot: [f.rot_xy[0], f.rot_xy[1], f.rot_deg],
                 color: f.color,
+                texture: f.texture.filter(|&t| t < ntex), // drop a dangling index
+                surface_texture: f
+                    .surface_texture
+                    .iter()
+                    .filter(|(_, t)| *t < ntex)
+                    .map(|(g, t)| (*g, *t))
+                    .collect(),
             })
             .collect();
         self.feature_color = d.feature_colors.into_iter().collect();
+        self.feature_texture = d
+            .feature_textures
+            .into_iter()
+            .filter(|&(id, t)| have.contains(&id) && t < ntex)
+            .collect();
         self.surface_color = d
             .surface_colors
             .into_iter()
             .map(|(f, a, b, c, dd, col)| ((f, a, b, c, dd), col))
             .collect();
+        self.surface_texture = d
+            .surface_textures
+            .into_iter()
+            .filter(|&(f, ..)| have.contains(&f))
+            .filter(|&(.., ti)| ti < ntex)
+            .map(|(f, a, b, c, dd, ti)| ((f, a, b, c, dd), ti))
+            .collect();
+        self.feature_group = d
+            .feature_groups
+            .into_iter()
+            .filter(|&(id, _)| have.contains(&id))
+            .collect();
+        self.next_group_id = self.feature_group.values().copied().max().unwrap_or(0) + 1;
         // Ids are safe to carry across: `Model::push` mints `max(id) + 1`, so restored
         // ids are never reused. Selection, though, indexed the OLD model — drop it.
         self.clear_selection();
@@ -2432,6 +4402,71 @@ impl FactoryState {
         for id in std::mem::take(&mut self.selection) {
             self.model.remove(id);
             self.ceilings.remove(&id); // keep the ceiling set in step with the model
+            self.feature_group.remove(&id); // drop it from any group
+        }
+        self.dirty = true;
+    }
+
+    /// One representative feature id per CUTOUT OPENING. A through-cut makes one `Difference`
+    /// per body it passes through (e.g. the building shell AND the room), all sharing a profile
+    /// and placement — those are ONE opening, so the list shows one row, not one per body.
+    pub fn cutout_ids(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut seen: Vec<(u32, i32, i32)> = Vec::new(); // (profile, u·1e3, v·1e3)
+        for f in &self.model.features {
+            if f.op != cad_solid::BoolOp::Difference {
+                continue;
+            }
+            // Extrusion cuts (the real openings) dedup by profile+placement; any other
+            // Difference is listed on its own.
+            if let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive {
+                let key = (profile, (f.placement.u * 1000.0) as i32, (f.placement.v * 1000.0) as i32);
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.push(key);
+            }
+            out.push(f.id);
+        }
+        out
+    }
+
+    /// Every `Difference` feature that belongs to the SAME opening as `id` (same profile +
+    /// placement) — the sibling cuts in the shell, the room, etc. Moving or deleting them
+    /// together keeps the opening coherent.
+    pub fn cutout_siblings(&self, id: u32) -> Vec<u32> {
+        let Some(f) = self.model.features.iter().find(|g| g.id == id) else { return vec![id] };
+        let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive else { return vec![id] };
+        let (pu, pv) = (f.placement.u, f.placement.v);
+        self.model.features.iter()
+            .filter(|g| g.op == cad_solid::BoolOp::Difference)
+            .filter(|g| matches!(g.primitive, cad_solid::Primitive::Extrusion { profile: pp, .. } if pp == profile))
+            .filter(|g| (g.placement.u - pu).abs() < 1e-4 && (g.placement.v - pv).abs() < 1e-4)
+            .map(|g| g.id)
+            .collect()
+    }
+
+    /// A cutout's world size `[w, h, d]` (from its AABB), for labelling the list.
+    pub fn cutout_size(&self, id: u32) -> Option<[f32; 3]> {
+        let f = self.model.features.iter().find(|f| f.id == id)?;
+        let (mn, mx) = f.world_aabb();
+        Some([mx.x - mn.x, mx.y - mn.y, mx.z - mn.z])
+    }
+
+    /// Select an opening — ALL sibling cuts — so it highlights and its Position/Dimensions load
+    /// into the panel, and a 3D move/nudge moves every body's hole together (not just one).
+    pub fn select_cutout(&mut self, id: u32) {
+        self.sel_furniture = None;
+        self.selection = self.cutout_siblings(id);
+    }
+
+    /// Remove an opening (all its sibling cuts) so the hole fills back in on the next re-eval.
+    pub fn delete_cutout(&mut self, id: u32) {
+        for sib in self.cutout_siblings(id) {
+            self.model.remove(sib);
+            self.selection.retain(|&s| s != sib);
+            self.feature_color.remove(&sib);
+            self.feature_texture.remove(&sib);
         }
         self.dirty = true;
     }
@@ -2456,6 +4491,8 @@ impl FactoryState {
         self.sel_key.clear(); // the model changed → the selection's mesh is stale
         self.ensure_sel_mesh();
         self.dirty = false;
+        // The solids changed → the cached opaque render buffer is stale.
+        self.geom_version = self.geom_version.wrapping_add(1);
     }
 
     /// Is feature `id` hidden while "Hide ceilings" is on? True if it is a tracked room
@@ -2564,6 +4601,151 @@ impl FactoryState {
     }
 
     /// Zoom-extents: the ONLY thing that moves `cam_target`.
+    /// World-space AABB of everything drawn — the CSG scene UNION every furniture instance's posed
+    /// bounding box. Used to frame the sun's shadow map. `None` when the scene is empty.
+    pub fn render_bounds(&self) -> Option<(Vec3, Vec3)> {
+        let mut mn = Vec3::splat(f32::MAX);
+        let mut mx = Vec3::splat(f32::MIN);
+        let mut any = false;
+        if let Some((a, b)) = self.cached.bounds() {
+            mn = mn.min(Vec3::from(a));
+            mx = mx.max(Vec3::from(b));
+            any = true;
+        }
+        for (i, inst) in self.furniture.iter().enumerate() {
+            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(model) = self.furniture_model_matrix(i) else { continue };
+            let m = glam::Mat4::from_cols_array(&model);
+            let (lo, hi) = (asset.local_min, asset.local_max);
+            for cx in [lo[0], hi[0]] {
+                for cy in [lo[1], hi[1]] {
+                    for cz in [lo[2], hi[2]] {
+                        let w = m.transform_point3(Vec3::new(cx, cy, cz));
+                        mn = mn.min(w);
+                        mx = mx.max(w);
+                        any = true;
+                    }
+                }
+            }
+        }
+        if any {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    }
+
+    /// A texture's representative solid appearance for the offline render export: `(rgb, roughness,
+    /// opacity)`. Procedural → its ramp midpoint; image → its average colour.
+    fn export_tex_rep(&self, ti: usize) -> ([f32; 3], f32, f32) {
+        match self.textures.get(ti) {
+            Some(t) => {
+                let rgb = t.proc.map(|p| p.avg_color()).unwrap_or(t.avg);
+                (rgb, t.roughness, t.opacity)
+            }
+            None => ([0.72, 0.72, 0.72], 0.5, 1.0),
+        }
+    }
+
+    /// Gather the whole drawn scene as world-space triangles with a resolved appearance each, for
+    /// [`crate::radiance_export`]. CSG building + every furniture instance, each triangle's colour /
+    /// roughness / opacity resolved from its per-surface or whole-object texture, else its colour.
+    /// Geometry is rotated by `−north_offset` about Z so the model's north lines up with gensky's
+    /// (true) north — so the exported `gensky` sun matches the viewport.
+    pub fn export_render_tris(&self) -> Vec<crate::radiance_export::ExportTri> {
+        const DEF: [f32; 3] = [0.72, 0.72, 0.72];
+        let clay = self.clay_mode; // flat grey for a light study (glass keeps its transparency)
+        let off = -self.sun.north_offset_deg.to_radians();
+        let (c, s) = (off.cos(), off.sin());
+        let rot = |p: [f32; 3]| [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]];
+        let mut out = Vec::new();
+
+        // Principled extras (metallic / IOR / emission) for a texture index — read by the path
+        // tracer; zeroed under clay so a light study stays matte and unlit-by-materials.
+        let extras = |ti: Option<usize>| -> (f32, f32, [f32; 3]) {
+            if clay {
+                return (0.0, 1.5, [0.0; 3]);
+            }
+            match ti.and_then(|t| self.textures.get(t)) {
+                Some(t) => {
+                    let e = t.emission;
+                    let s = t.emission_strength;
+                    (t.metallic, t.ior, [e[0] * s, e[1] * s, e[2] * s])
+                }
+                None => (0.0, 1.5, [0.0; 3]),
+            }
+        };
+
+        // ── CSG building (cached is world-space). ──
+        for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
+            let id = self.cached.face_ids.get(i).copied().unwrap_or(0);
+            let sk = surface_key(id, tri[0], tri[1], tri[2]);
+            let tex = self.surface_texture.get(&sk).or_else(|| self.feature_texture.get(&id)).copied();
+            let (rgb, rough, op) = if let Some(ti) = tex {
+                self.export_tex_rep(ti)
+            } else {
+                let col = self.surface_color.get(&sk).or_else(|| self.feature_color.get(&id)).copied().unwrap_or(DEF);
+                (col, 0.5, 1.0)
+            };
+            let rgb = if clay { CLAY_GREY } else { rgb };
+            let (metallic, ior, emission) = extras(tex);
+            out.push(crate::radiance_export::ExportTri {
+                verts: [rot(tri[0]), rot(tri[1]), rot(tri[2])],
+                rgb,
+                roughness: rough,
+                opacity: op,
+                metallic,
+                ior,
+                emission,
+            });
+        }
+
+        // ── Furniture (local mesh → world via the model matrix). ──
+        for (i, inst) in self.furniture.iter().enumerate() {
+            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            let Some(model) = self.furniture_model_matrix(i) else { continue };
+            let m = glam::Mat4::from_cols_array(&model);
+            let groups = asset.group_geom();
+            let ntri = asset.positions.len() / 3;
+            for t in 0..ntri {
+                let fg = groups.face.get(t).copied().unwrap_or(0);
+                let eff = inst.surface_texture.get(&fg).copied().or(inst.texture);
+                let (rgb, rough, op) = eff.map(|ti| self.export_tex_rep(ti)).unwrap_or((inst.color, 0.5, 1.0));
+                let rgb = if clay { CLAY_GREY } else { rgb };
+                let (metallic, ior, emission) = extras(eff);
+                // Imported glass (per-vertex alpha, e.g. the villa panes) has no texture — carry the
+                // mesh's own translucency so the tracer refracts it too.
+                let op = if eff.is_none() && tri_is_translucent(asset, t * 3) {
+                    op.min(asset.vertex_alpha(t * 3))
+                } else {
+                    op
+                };
+                let mut vs = [[0.0f32; 3]; 3];
+                for (k, v) in vs.iter_mut().enumerate() {
+                    let p = asset.positions[t * 3 + k];
+                    let w = m.transform_point3(Vec3::new(p[0], p[1], p[2]));
+                    *v = rot([w.x, w.y, w.z]);
+                }
+                out.push(crate::radiance_export::ExportTri { verts: vs, rgb, roughness: rough, opacity: op, metallic, ior, emission });
+            }
+        }
+        out
+    }
+
+    /// The current viewport camera as `(eye, target)` in the EXPORT frame (rotated by −north_offset
+    /// like [`Self::export_render_tris`]), so the Radiance view matches what's on screen.
+    pub fn export_camera(&self) -> ([f32; 3], [f32; 3]) {
+        let (cp, sp) = (self.cam_pitch.cos(), self.cam_pitch.sin());
+        let (cy, sy) = (self.cam_yaw.cos(), self.cam_yaw.sin());
+        let t = self.cam_target;
+        let d = self.cam_dist;
+        let eye = [t[0] + cp * cy * d, t[1] + cp * sy * d, t[2] + sp * d];
+        let off = -self.sun.north_offset_deg.to_radians();
+        let (c, s) = (off.cos(), off.sin());
+        let rot = |p: [f32; 3]| [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]];
+        (rot(eye), rot(t))
+    }
+
     pub fn fit(&mut self) {
         if let Some((mn, mx)) = self.cached.bounds() {
             self.cam_target = [
@@ -2576,6 +4758,19 @@ impl FactoryState {
         } else {
             self.cam_target = [0.0, 0.0, 0.0];
             self.cam_dist = 12.0;
+        }
+    }
+
+    /// Frame the WHOLE scene — CSG building AND furniture (via [`Self::render_bounds`]) — so an
+    /// imported furniture-only model (e.g. the villa) is centred in view, which [`Self::fit`] can't
+    /// do (it only knows the CSG bounds).
+    pub fn fit_all(&mut self) {
+        if let Some((mn, mx)) = self.render_bounds() {
+            self.cam_target = [(mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5, (mn.z + mx.z) * 0.5];
+            let span = (mx.x - mn.x).max(mx.y - mn.y).max(mx.z - mn.z);
+            self.cam_dist = (span * 1.6).clamp(1.0, self.max_cam_dist());
+        } else {
+            self.fit();
         }
     }
 
@@ -2796,6 +4991,15 @@ impl FactoryState {
             if self.cutaway && tri.iter().all(|p| p[2] >= self.cutaway_z - 1e-4) {
                 continue;
             }
+            // TEXTURED triangles (whole-feature OR a single painted surface) are drawn by the
+            // image-mapped pass (see `feature_textured_meshes`) — keep them OUT of the flat
+            // batch. A per-surface texture wins over a whole-feature one.
+            if let Some(id) = fid {
+                let skey = surface_key(id, tri[0], tri[1], tri[2]);
+                if self.surface_texture.contains_key(&skey) || self.feature_texture.contains_key(&id) {
+                    continue;
+                }
+            }
             let base = fid
                 .and_then(|id| {
                     let key = surface_key(id, tri[0], tri[1], tri[2]);
@@ -2811,18 +5015,88 @@ impl FactoryState {
         out
     }
 
+    /// World-space TEXTURED triangle soup for every feature that carries a pasted texture,
+    /// grouped by texture index: `(texture_index, verts)`. UVs use WORLD box projection at
+    /// ~1 tile / metre, so a wall or floor tiles the image at a real, consistent scale (the
+    /// classic "wallpaper / floor tile" mapping). Honours hide-ceilings and cutaway exactly
+    /// like [`Self::scene_verts`], and the triangles are the ones that method skips.
+    pub fn feature_textured_meshes(&self) -> Vec<(usize, Vec<crate::light3d::TexVtx>)> {
+        if self.feature_texture.is_empty() && self.surface_texture.is_empty() {
+            return Vec::new();
+        }
+        let mut groups: std::collections::HashMap<usize, Vec<crate::light3d::TexVtx>> =
+            std::collections::HashMap::new();
+        for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
+            let Some(id) = self.cached.face_ids.get(i).copied() else { continue };
+            // Per-surface texture wins over the whole-feature one.
+            let tex_idx = self
+                .surface_texture
+                .get(&surface_key(id, tri[0], tri[1], tri[2]))
+                .copied()
+                .or_else(|| self.feature_texture.get(&id).copied());
+            let Some(tex_idx) = tex_idx else { continue };
+            if tex_idx >= self.textures.len() {
+                continue;
+            }
+            if self.hide_ceilings && self.is_hidden_ceiling(id) {
+                continue;
+            }
+            if self.cutaway && tri.iter().all(|p| p[2] >= self.cutaway_z - 1e-4) {
+                continue;
+            }
+            let tex = &self.textures[tex_idx]; // tiling (tiles/metre) + move + rotate
+            let g = groups.entry(tex_idx).or_default();
+            for (k, p) in tri.iter().enumerate() {
+                let n = Vec3::from(self.cached.normals.get(i * 3 + k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
+                let (uc, vc) = if ax >= ay && ax >= az {
+                    (p[1], p[2]) // X-facing wall → YZ
+                } else if ay >= az {
+                    (p[0], p[2]) // Y-facing wall → XZ
+                } else {
+                    (p[0], p[1]) // floor / ceiling → XY
+                };
+                let s = shade_scalar(n, false); // sun-aware; matches `shade`
+                let uv = tex.map_uv(uc, vc);
+                g.push(crate::light3d::TexVtx {
+                    x: p[0], y: p[1], z: p[2],
+                    // Carry the texture's opacity so a see-through feature routes to the blended
+                    // pass (opacity 1 = opaque, unchanged). Frag alpha = image.a · this.
+                    u: uv[0], v: uv[1], s, a: tex.opacity,
+                });
+            }
+        }
+        groups.into_iter().collect()
+    }
+
     /// Placed furniture as shaded triangles, ready to draw alongside the scene. Each
     /// instance's mesh is posed by its `pos` / `scale` / `rot` (3-axis) and tinted by its colour.
-    pub fn furniture_verts(&self) -> Vec<V3> {
+    ///
+    /// `apx` is the APX render mode: a piece whose mesh exceeds [`APX_FURNITURE_TRIS`] is
+    /// drawn as a cheap 12-triangle BOUNDING-BOX proxy instead of its full mesh, so a heavy
+    /// scene stays smooth. GPU / CPU modes pass `apx = false` and always draw the full mesh.
+    /// `skip` excludes one instance (the one being dragged) so the cached buffer stays stable
+    /// during a move/rotate — the dragged piece is drawn live via [`Self::furniture_ghost_verts`]
+    /// instead. Without this, dragging re-transformed EVERY furniture every frame (~70 ms for
+    /// one 90k-tri couch, ~200 ms for three) — the move/rotate stutter.
+    pub fn furniture_verts(&self, apx: bool, skip: Option<usize>) -> Vec<V3> {
         let mut out = Vec::new();
-        for inst in &self.furniture {
+        for (idx, inst) in self.furniture.iter().enumerate() {
+            if Some(idx) == skip { continue; }
             let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
-            let s = inst.scale;
+            let s = inst.scale_vec();
             let rm = inst.rot_mat();
             let pos = Vec3::from(inst.pos);
+            // APX proxy for a heavy mesh — a box (12 tris) spanning its cached local bounds.
+            if apx && asset.positions.len() / 3 > APX_FURNITURE_TRIS {
+                Self::push_furniture_box(
+                    &mut out, asset.local_min, asset.local_max, s, rm, pos, inst.color,
+                );
+                continue;
+            }
             for (i, p) in asset.positions.iter().enumerate() {
                 // scale → 3-axis rotate → translate (normals rotate the same way)
-                let lp = Vec3::new(p[0] * s, p[1] * s, p[2] * s);
+                let lp = Vec3::new(p[0] * s.x, p[1] * s.y, p[2] * s.z);
                 let wp = rm * lp + pos;
                 let n = asset.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 let wn = rm * Vec3::from(n);
@@ -2830,6 +5104,527 @@ impl FactoryState {
             }
         }
         out
+    }
+
+    /// Furniture instance `i`'s LOCAL mesh (asset positions, unposed), shaded by the instance
+    /// colour + the LOCAL normal. Drawn via a GPU model matrix during a drag (see
+    /// [`Self::furniture_model_matrix`]) so moving/rotating a heavy piece keeps its FULL form
+    /// with no per-frame CPU vertex transform. Built once per drag and reused.
+    pub fn furniture_local_mesh(&self, i: usize) -> Vec<V3> {
+        let Some(inst) = self.furniture.get(i) else { return Vec::new() };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else { return Vec::new() };
+        // Heavy pieces render from a decimated proxy (built once) so 8 imports don't crawl.
+        if asset.needs_lod() {
+            let lod = asset.lod_geom();
+            return lod.0.iter().zip(lod.1.iter())
+                .map(|(p, n)| v(Vec3::from(*p), shade_furniture(inst.color, Vec3::from(*n))))
+                .collect();
+        }
+        // Opaque common case: emit every triangle (fast path, unchanged).
+        if !asset.is_translucent() {
+            return asset
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(k, p)| {
+                    let n = asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                    v(Vec3::from(*p), shade_furniture(inst.color, Vec3::from(n)))
+                })
+                .collect();
+        }
+        // Mixed asset (glass + frame): the solid pass takes ONLY the opaque triangles; the
+        // translucent ones are peeled into [`Self::furniture_translucent_mesh`].
+        let mut out = Vec::with_capacity(asset.positions.len());
+        for t in 0..asset.positions.len() / 3 {
+            let base = t * 3;
+            if tri_is_translucent(asset, base) {
+                continue;
+            }
+            for k in base..base + 3 {
+                let p = asset.positions[k];
+                let n = asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                out.push(v(Vec3::from(p), shade_furniture(inst.color, Vec3::from(n))));
+            }
+        }
+        out
+    }
+
+    /// The TRANSLUCENT triangles of furniture instance `i` (glass panes etc.) as `V3A` with
+    /// per-vertex opacity, plus a stable GPU-buffer key. `None` when the asset is fully opaque —
+    /// then nothing is drawn in the blended pass. Coordinates are LOCAL (drawn with the
+    /// instance's model matrix, exactly like [`Self::furniture_local_mesh`]).
+    pub fn furniture_translucent_mesh(&self, i: usize) -> Option<(u64, Vec<crate::light3d::V3A>)> {
+        use std::hash::{Hash, Hasher};
+        let inst = self.furniture.get(i)?;
+        let asset = self.furniture_lib.get(inst.asset)?;
+        if !asset.is_translucent() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for t in 0..asset.positions.len() / 3 {
+            let base = t * 3;
+            if !tri_is_translucent(asset, base) {
+                continue;
+            }
+            for k in base..base + 3 {
+                let p = asset.positions[k];
+                let n = asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                let c = shade_furniture(inst.color, Vec3::from(n));
+                out.push(crate::light3d::V3A {
+                    x: p[0], y: p[1], z: p[2],
+                    r: c[0], g: c[1], b: c[2],
+                    a: asset.vertex_alpha(k),
+                });
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        // Key = asset + colour, tagged distinct from the opaque `furniture_key` so the two
+        // never share a GPU buffer.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        inst.asset.hash(&mut h);
+        for x in inst.color { x.to_bits().hash(&mut h); }
+        0xA1A1_A1A1u32.hash(&mut h);
+        Some((h.finish(), out))
+    }
+
+    /// Build the full TEXTURED local mesh for instance `i` when it carries a pasted texture:
+    /// `(texture_index, base_key, verts)` in LOCAL coords (drawn with the instance's model
+    /// matrix, exactly like [`Self::furniture_local_mesh`]). UVs use BOX PROJECTION — each
+    /// vertex is projected onto the plane it most faces and normalised to the asset's local
+    /// bounding box, so the image wraps the piece once and reads correctly on axis-aligned
+    /// faces (tables, cabinets, panels). `s` bakes the flat-shade lighting factor and `a` the
+    /// per-vertex opacity. Callers ([`Self::furniture_textured_mesh`] /
+    /// [`Self::furniture_textured_translucent_mesh`]) split this into the opaque + glass passes.
+    fn textured_vtx(&self, i: usize) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
+        use std::hash::{Hash, Hasher};
+        let inst = self.furniture.get(i)?;
+        let tex_idx = inst.texture?;
+        if tex_idx >= self.textures.len() {
+            return None;
+        }
+        let asset = self.furniture_lib.get(inst.asset)?;
+        let tex = &self.textures[tex_idx]; // tiling / move / rotate live here
+        let (mn, mx) = (asset.local_min, asset.local_max);
+        let ext = [
+            (mx[0] - mn[0]).max(1e-4),
+            (mx[1] - mn[1]).max(1e-4),
+            (mx[2] - mn[2]).max(1e-4),
+        ];
+        // Real UVs (from a glTF import) map the texture as the artist intended; otherwise box
+        // projection normalised to the local bbox.
+        let has_uv = asset.uvs.len() == asset.positions.len();
+        // Heavy untextured pieces render from the decimated proxy (needs_lod ⇒ no real UVs).
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let (src_pos, src_nrm): (&[[f32; 3]], &[[f32; 3]]) = match &lod {
+            Some(a) => (&a.0, &a.1),
+            None => (&asset.positions, &asset.normals),
+        };
+        let mut out = Vec::with_capacity(src_pos.len());
+        for (k, p) in src_pos.iter().enumerate() {
+            let n = Vec3::from(src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
+            let (uc, vc) = if has_uv {
+                let t = asset.uvs[k];
+                (t[0], t[1])
+            } else {
+                let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
+                if ax >= ay && ax >= az {
+                    ((p[1] - mn[1]) / ext[1], (p[2] - mn[2]) / ext[2]) // X-facing → YZ
+                } else if ay >= az {
+                    ((p[0] - mn[0]) / ext[0], (p[2] - mn[2]) / ext[2]) // Y-facing → XZ
+                } else {
+                    ((p[0] - mn[0]) / ext[0], (p[1] - mn[1]) / ext[1]) // Z-facing → XY
+                }
+            };
+            let s = shade_scalar(n, true); // sun-aware; matches `shade_furniture`
+            let uv = tex.map_uv(uc, vc); // tiling + move + rotate
+            out.push(crate::light3d::TexVtx {
+                x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s, a: asset.vertex_alpha(k) * tex.opacity,
+            });
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        inst.asset.hash(&mut h);
+        tex_idx.hash(&mut h);
+        // A tiling / offset / rotation change must yield a fresh GPU buffer.
+        tex.scale.to_bits().hash(&mut h);
+        tex.offset[0].to_bits().hash(&mut h);
+        tex.offset[1].to_bits().hash(&mut h);
+        tex.rot_deg.to_bits().hash(&mut h);
+        tex.opacity.to_bits().hash(&mut h);
+        Some((tex_idx, h.finish(), out))
+    }
+
+    /// The OPAQUE textured triangles of instance `i` (a textured piece minus any glass), keyed
+    /// by asset+texture+tiling. For a fully-opaque textured asset this is the whole mesh (fast
+    /// path); a mixed piece keeps only its solid faces here, glass going to
+    /// [`Self::furniture_textured_translucent_mesh`]. `None` if it has no texture or no opaque tris.
+    pub fn furniture_textured_mesh(&self, i: usize) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
+        let (tex_idx, key, all) = self.textured_vtx(i)?;
+        // See-through if the mesh has glass OR the texture's opacity < 1 (baked into vertex `a`).
+        if !all.iter().any(|v| v.a < ALPHA_OPAQUE) {
+            return Some((tex_idx, key, all)); // every triangle opaque → draw as one mesh
+        }
+        let mut out = Vec::with_capacity(all.len());
+        for t in 0..all.len() / 3 {
+            let b = t * 3;
+            let tr = all[b].a < ALPHA_OPAQUE || all[b + 1].a < ALPHA_OPAQUE || all[b + 2].a < ALPHA_OPAQUE;
+            if !tr {
+                out.extend_from_slice(&all[b..b + 3]);
+            }
+        }
+        (!out.is_empty()).then_some((tex_idx, key, out))
+    }
+
+    /// The TRANSLUCENT textured triangles of instance `i` (textured glass), with per-vertex
+    /// opacity, for the blended textured pass. Keyed distinctly from the opaque mesh so the two
+    /// never share a GPU buffer. `None` when the asset is fully opaque or carries no texture.
+    pub fn furniture_textured_translucent_mesh(&self, i: usize) -> Option<(usize, u64, Vec<crate::light3d::TexVtx>)> {
+        let (tex_idx, key, all) = self.textured_vtx(i)?;
+        let mut out = Vec::new();
+        for t in 0..all.len() / 3 {
+            let b = t * 3;
+            let tr = all[b].a < ALPHA_OPAQUE || all[b + 1].a < ALPHA_OPAQUE || all[b + 2].a < ALPHA_OPAQUE;
+            if tr {
+                out.extend_from_slice(&all[b..b + 3]);
+            }
+        }
+        if out.is_empty() {
+            return None;
+        }
+        Some((tex_idx, key ^ 0x5151_5151_5151_5151, out))
+    }
+
+    /// Build the split draws for a PER-SURFACE-textured instance: one textured group per texture
+    /// actually used across its faces, plus the flat (untextured) remainder. Returns `None` when
+    /// the instance has no per-surface textures (the caller uses the ordinary whole-object path),
+    /// or the asset is heavy/translucent (per-surface unsupported there). Each triangle's effective
+    /// texture is its face-group's `surface_texture` entry if any, else the whole-object `texture`,
+    /// else none (flat). Keys fold in the full assignment so any paint change yields fresh buffers.
+    pub fn furniture_faceted(&self, i: usize) -> Option<std::sync::Arc<FacetedFurniture>> {
+        use std::hash::{Hash, Hasher};
+        let inst = self.furniture.get(i)?;
+        if inst.surface_texture.is_empty() {
+            return None;
+        }
+        let asset = self.furniture_lib.get(inst.asset)?;
+        // NB: a translucent asset is NOT bailed here — the per-surface split below peels glass
+        // face-groups into `translucent` buckets (the blended pass) while its solid materials stay
+        // opaque, so a multi-material piece with glass (e.g. the villa) still renders every region.
+        if asset.needs_lod() {
+            return None;
+        }
+
+        // Cheap per-instance signature: everything the split depends on EXCEPT pose (the buckets are
+        // in local space). If it matches the memo we skip the O(tri) rebuild entirely — the reason a
+        // heavy multi-material glTF stopped pegging the frame at ~600 ms.
+        let mut sig = std::collections::hash_map::DefaultHasher::new();
+        inst.asset.hash(&mut sig);
+        inst.texture.hash(&mut sig);
+        for c in inst.color { c.to_bits().hash(&mut sig); }
+        let mut sig_entries: Vec<(u32, usize)> =
+            inst.surface_texture.iter().map(|(&g, &t)| (g, t)).collect();
+        sig_entries.sort_unstable();
+        sig_entries.hash(&mut sig);
+        // Fold in the transform/opacity of every texture the assignment references (a slider tweak
+        // must invalidate the memo). O(#faces mapped), not O(tris).
+        for &t in inst.surface_texture.values().chain(inst.texture.iter()) {
+            if let Some(tex) = self.textures.get(t) {
+                tex.scale.to_bits().hash(&mut sig);
+                tex.offset[0].to_bits().hash(&mut sig);
+                tex.offset[1].to_bits().hash(&mut sig);
+                tex.rot_deg.to_bits().hash(&mut sig);
+                tex.opacity.to_bits().hash(&mut sig);
+            }
+        }
+        self.sun.hash_into(&mut sig); // sun change → re-shade the flat remainder of a faceted piece
+        self.clay_mode.hash(&mut sig); // clay toggle → re-bake
+        let sig = sig.finish();
+        if let Some((cached_sig, arc)) = self.faceted_cache.borrow().get(&i) {
+            if *cached_sig == sig {
+                return Some(arc.clone());
+            }
+        }
+
+        let groups = asset.group_geom();
+        let (mn, mx) = (asset.local_min, asset.local_max);
+        let ext = [(mx[0] - mn[0]).max(1e-4), (mx[1] - mn[1]).max(1e-4), (mx[2] - mn[2]).max(1e-4)];
+        let has_uv = asset.uvs.len() == asset.positions.len();
+        let ntri = asset.positions.len() / 3;
+
+        // Assignment fingerprint: whole-object texture + the sorted per-face map. Folded into every
+        // buffer key so a paint (which changes this) rebuilds only that instance's GPU meshes.
+        let mut ah = std::collections::hash_map::DefaultHasher::new();
+        inst.texture.hash(&mut ah);
+        let mut entries: Vec<(u32, usize)> = inst.surface_texture.iter().map(|(&g, &t)| (g, t)).collect();
+        entries.sort_unstable();
+        entries.hash(&mut ah);
+        let assign_hash = ah.finish();
+
+        let uv_of = |k: usize, p: &[f32; 3], n: Vec3| -> (f32, f32) {
+            if has_uv {
+                let t = asset.uvs[k];
+                (t[0], t[1])
+            } else {
+                let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
+                if ax >= ay && ax >= az {
+                    ((p[1] - mn[1]) / ext[1], (p[2] - mn[2]) / ext[2])
+                } else if ay >= az {
+                    ((p[0] - mn[0]) / ext[0], (p[2] - mn[2]) / ext[2])
+                } else {
+                    ((p[0] - mn[0]) / ext[0], (p[1] - mn[1]) / ext[1])
+                }
+            }
+        };
+
+        use std::collections::BTreeMap;
+        let mut buckets: BTreeMap<usize, Vec<crate::light3d::TexVtx>> = BTreeMap::new();
+        let mut flat: Vec<V3> = Vec::new();
+        for t in 0..ntri {
+            let fg = groups.face.get(t).copied().unwrap_or(0);
+            let eff = inst
+                .surface_texture
+                .get(&fg)
+                .copied()
+                .or(inst.texture)
+                .filter(|&ti| ti < self.textures.len());
+            let base = t * 3;
+            match eff {
+                Some(ti) => {
+                    let tex = &self.textures[ti];
+                    let buf = buckets.entry(ti).or_default();
+                    for k in base..base + 3 {
+                        let p = asset.positions[k];
+                        let n = Vec3::from(asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                        let (uc, vc) = uv_of(k, &p, n);
+                        let s = shade_scalar(n, true);
+                        let uv = tex.map_uv(uc, vc);
+                        // Surface transparency multiplies the mesh's own per-vertex opacity.
+                        let a = asset.vertex_alpha(k) * tex.opacity;
+                        buf.push(crate::light3d::TexVtx { x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s, a });
+                    }
+                }
+                None => {
+                    for k in base..base + 3 {
+                        let p = asset.positions[k];
+                        let n = Vec3::from(asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                        flat.push(v(Vec3::from(p), shade_furniture(inst.color, n)));
+                    }
+                }
+            }
+        }
+
+        let mut opaque = Vec::new();
+        let mut translucent = Vec::new();
+        for (ti, verts) in buckets {
+            let tex = &self.textures[ti];
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            inst.asset.hash(&mut h);
+            ti.hash(&mut h);
+            tex.scale.to_bits().hash(&mut h);
+            tex.offset[0].to_bits().hash(&mut h);
+            tex.offset[1].to_bits().hash(&mut h);
+            tex.rot_deg.to_bits().hash(&mut h);
+            tex.opacity.to_bits().hash(&mut h); // a transparency change → fresh buffer
+            assign_hash.hash(&mut h);
+            0xFACEu32.hash(&mut h);
+            // A see-through surface (its texture opacity < 1, or any glass vertex) goes to the
+            // blended pass; everything else stays in the fast opaque pass.
+            let see_through = tex.opacity < ALPHA_OPAQUE || verts.iter().any(|v| v.a < ALPHA_OPAQUE);
+            if see_through {
+                translucent.push((ti, h.finish() ^ 0x5151_5151_5151_5151, verts));
+            } else {
+                opaque.push((ti, h.finish(), verts));
+            }
+        }
+        let flat = if flat.is_empty() {
+            None
+        } else {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            inst.asset.hash(&mut h);
+            for c in inst.color {
+                c.to_bits().hash(&mut h);
+            }
+            assign_hash.hash(&mut h);
+            0xF1A7u32.hash(&mut h);
+            Some((h.finish(), flat))
+        };
+        let arc = std::sync::Arc::new(FacetedFurniture { opaque, translucent, flat });
+        self.faceted_cache.borrow_mut().insert(i, (sig, arc.clone()));
+        Some(arc)
+    }
+
+    /// Stable key for instance `i`'s GPU buffer: its asset + colour. Instances that share both
+    /// share one uploaded mesh (the local geometry is identical); a recolour yields a new key.
+    pub fn furniture_key(&self, i: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        if let Some(inst) = self.furniture.get(i) {
+            inst.asset.hash(&mut h);
+            for x in inst.color { x.to_bits().hash(&mut h); }
+        }
+        self.sun.hash_into(&mut h); // sun change → re-shade furniture
+        self.clay_mode.hash(&mut h); // clay toggle → re-bake
+        h.finish()
+    }
+
+    /// World matrix (translate · rotate · scale) of furniture instance `i`, column-major for GL.
+    /// Applied to the LOCAL mesh it reproduces `furniture_point`: `pos + rot·(scale·p)`.
+    pub fn furniture_model_matrix(&self, i: usize) -> Option<[f32; 16]> {
+        let inst = self.furniture.get(i)?;
+        let m = glam::Mat4::from_scale_rotation_translation(
+            inst.scale_vec(),
+            glam::Quat::from_mat3(&inst.rot_mat()),
+            glam::Vec3::from(inst.pos),
+        );
+        Some(m.to_cols_array())
+    }
+
+    /// The single furniture instance `i`, posed and shaded, for LIVE drawing during a drag
+    /// (it is excluded from the cached opaque buffer while dragging). A heavy mesh draws as its
+    /// bounding-box proxy so even a 90k-tri piece stays smooth while you move/rotate it.
+    #[allow(dead_code)]
+    pub fn furniture_ghost_verts(&self, i: usize) -> Vec<V3> {
+        let Some(inst) = self.furniture.get(i) else { return Vec::new() };
+        let Some(asset) = self.furniture_lib.get(inst.asset) else { return Vec::new() };
+        let mut out = Vec::new();
+        let s = inst.scale_vec();
+        let rm = inst.rot_mat();
+        let pos = Vec3::from(inst.pos);
+        if asset.positions.len() / 3 > APX_FURNITURE_TRIS {
+            Self::push_furniture_box(&mut out, asset.local_min, asset.local_max, s, rm, pos, inst.color);
+        } else {
+            for (k, p) in asset.positions.iter().enumerate() {
+                let lp = Vec3::new(p[0] * s.x, p[1] * s.y, p[2] * s.z);
+                let wp = rm * lp + pos;
+                let n = asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                let wn = rm * Vec3::from(n);
+                out.push(v(wp, shade_furniture(inst.color, wn)));
+            }
+        }
+        out
+    }
+
+    /// Emit a box (6 faces × 2 tris = 36 verts) spanning the local AABB `[lmn, lmx]`, posed
+    /// by `scale`/`rot`/`pos` and tinted like the instance. This is the APX proxy for a heavy
+    /// furniture mesh — 12 triangles instead of ~90 000.
+    fn push_furniture_box(
+        out: &mut Vec<V3>, lmn: [f32; 3], lmx: [f32; 3],
+        s: Vec3, rm: glam::Mat3, pos: Vec3, color: [f32; 3],
+    ) {
+        let corner = |xi: usize, yi: usize, zi: usize| -> Vec3 {
+            let lx = if xi == 0 { lmn[0] } else { lmx[0] };
+            let ly = if yi == 0 { lmn[1] } else { lmx[1] };
+            let lz = if zi == 0 { lmn[2] } else { lmx[2] };
+            rm * (Vec3::new(lx, ly, lz) * s) + pos
+        };
+        // Six faces, each as a quad of corner picks (x,y,z ∈ {min=0, max=1}) + a local normal.
+        let faces: [([(usize, usize, usize); 4], Vec3); 6] = [
+            ([(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 0, 1)], Vec3::NEG_X),
+            ([(1, 0, 0), (1, 0, 1), (1, 1, 1), (1, 1, 0)], Vec3::X),
+            ([(0, 0, 0), (0, 0, 1), (1, 0, 1), (1, 0, 0)], Vec3::NEG_Y),
+            ([(0, 1, 0), (1, 1, 0), (1, 1, 1), (0, 1, 1)], Vec3::Y),
+            ([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)], Vec3::NEG_Z),
+            ([(0, 0, 1), (0, 1, 1), (1, 1, 1), (1, 0, 1)], Vec3::Z),
+        ];
+        for (quad, ln) in faces {
+            let c = shade_furniture(color, rm * ln);
+            let p = [
+                corner(quad[0].0, quad[0].1, quad[0].2),
+                corner(quad[1].0, quad[1].1, quad[1].2),
+                corner(quad[2].0, quad[2].1, quad[2].2),
+                corner(quad[3].0, quad[3].1, quad[3].2),
+            ];
+            for &(a, b, d) in &[(0usize, 1usize, 2usize), (0, 2, 3)] {
+                out.push(v(p[a], c));
+                out.push(v(p[b], c));
+                out.push(v(p[d], c));
+            }
+        }
+    }
+
+    /// Triangle count of the single heaviest PLACED furniture mesh (0 if none). The usual
+    /// culprit when the 3D view goes slow after an import — surfaced in the perf monitor.
+    pub fn heaviest_furniture_tris(&self) -> usize {
+        self.furniture
+            .iter()
+            .filter_map(|inst| self.furniture_lib.get(inst.asset))
+            .map(|a| a.positions.len() / 3)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Signature of the opaque CSG buffer's inputs. Furniture is NO LONGER part of this buffer
+    /// (each furniture is a GPU-instanced draw with its own model matrix — see the app's
+    /// furniture draw list), so the opaque buffer holds only the building solids and rebuilds
+    /// only on a real geometry/colour/toggle change — never on a furniture import or move.
+    fn opaque_sig(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.geom_version.hash(&mut h);
+        self.hide_ceilings.hash(&mut h);
+        self.cutaway.hash(&mut h);
+        self.cutaway_z.to_bits().hash(&mut h);
+        self.sun.hash_into(&mut h); // sun change → re-shade the scene
+        self.clay_mode.hash(&mut h); // clay toggle → re-bake grey/coloured
+        // Colour maps: combine per-entry hashes order-independently (XOR/add) so a recolour
+        // of an existing key changes the signature even though the map length is unchanged.
+        let mut fc: u64 = 0;
+        for (k, c) in &self.feature_color {
+            let mut e = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut e);
+            for x in c { x.to_bits().hash(&mut e); }
+            fc = fc.wrapping_add(e.finish());
+        }
+        fc.hash(&mut h);
+        let mut sc: u64 = 0;
+        for (k, c) in &self.surface_color {
+            let mut e = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut e);
+            for x in c { x.to_bits().hash(&mut e); }
+            sc = sc.wrapping_add(e.finish());
+        }
+        sc.hash(&mut h);
+        // Feature→texture map: applying/removing a texture changes which triangles the flat
+        // batch emits (textured ones are skipped), so it must move the signature.
+        let mut ft: u64 = 0;
+        for (k, &t) in &self.feature_texture {
+            let mut e = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut e);
+            t.hash(&mut e);
+            ft = ft.wrapping_add(e.finish());
+        }
+        ft.hash(&mut h);
+        // Per-surface texture map: same reason — a painted face leaves the flat batch.
+        let mut st: u64 = 0;
+        for (k, &t) in &self.surface_texture {
+            let mut e = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut e);
+            t.hash(&mut e);
+            st = st.wrapping_add(e.finish());
+        }
+        st.hash(&mut h);
+        h.finish()
+    }
+
+    /// The opaque CSG scene (building solids only) as a shared, cached buffer, rebuilt only
+    /// when [`Self::opaque_sig`] changes. Furniture is drawn separately as GPU instances, so
+    /// this buffer stays tiny and a furniture import/move never touches it.
+    pub fn opaque_verts(&self) -> std::sync::Arc<Vec<V3>> {
+        let sig = self.opaque_sig();
+        {
+            let c = self.render_cache.borrow();
+            if c.ready && c.sig == sig {
+                return c.verts.clone();
+            }
+        }
+        let scene = self.scene_verts();
+        let arc = std::sync::Arc::new(scene);
+        let mut c = self.render_cache.borrow_mut();
+        c.verts = arc.clone();
+        c.sig = sig;
+        c.ready = true;
+        arc
     }
 
     /// Grid on the construction plane + a cyan AABB around each selected feature.
@@ -3276,8 +6071,196 @@ mod furniture_and_color_tests {
         assert_eq!(st.furniture_lib.len(), 1);
         st.place_furniture(idx, Vec3::new(2.0, 3.0, 0.0));
         assert_eq!(st.furniture.len(), 1);
-        assert!(!st.furniture_verts().is_empty(), "placed furniture must produce geometry");
+        assert!(!st.furniture_verts(false, None).is_empty(), "placed furniture must produce geometry");
         assert!((st.furniture[0].pos[0] - 2.0).abs() < 1e-4, "placed at the given point");
+    }
+
+    /// The opaque CSG buffer is CACHED: repeated calls with no change hand back the SAME Arc.
+    /// Furniture is NO LONGER part of it (furniture is GPU-instanced), so placing or moving
+    /// furniture must NOT rebuild it — only a real geometry change (recompute) does. This is
+    /// what keeps a furniture import/move cheap however heavy the mesh.
+    #[test]
+    fn opaque_render_buffer_is_cached_until_the_scene_changes() {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+
+        let a = st.opaque_verts();
+        let b = st.opaque_verts();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "unchanged scene reuses the cached buffer");
+
+        // Placing / moving furniture must NOT touch the opaque buffer (it's GPU-instanced).
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::new(2.0, 3.0, 0.0));
+        let c = st.opaque_verts();
+        assert!(std::sync::Arc::ptr_eq(&a, &c), "furniture is not in the opaque buffer");
+        st.furniture[0].pos[0] += 5.0;
+        let d = st.opaque_verts();
+        assert!(std::sync::Arc::ptr_eq(&a, &d), "moving furniture does not rebuild the opaque buffer");
+
+        // A real geometry change (recompute) DOES invalidate it.
+        st.add_box();
+        st.recompute();
+        let e = st.opaque_verts();
+        assert!(!std::sync::Arc::ptr_eq(&a, &e), "a geometry change invalidates the cache");
+    }
+
+    /// APX render mode replaces a HEAVY furniture mesh with a 12-triangle box proxy, while
+    /// GPU/CPU (apx=false) draw it in full and LIGHT furniture is unaffected by the mode.
+    #[test]
+    fn apx_mode_proxies_heavy_furniture_only() {
+        let mut st = FactoryState::default();
+        // Heavy mesh: 6000 tris (> APX_FURNITURE_TRIS = 5000).
+        let heavy = st.add_furniture_asset(
+            "couch".into(),
+            crate::mesh_io::ObjMesh {
+                positions: (0..18_000).map(|i| [(i % 7) as f32, (i % 5) as f32, (i % 3) as f32]).collect(),
+                normals: vec![[0.0, 0.0, 1.0]; 18_000],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        st.place_furniture(heavy, Vec3::ZERO);
+
+        let full = st.furniture_verts(false, None).len();
+        let proxy = st.furniture_verts(true, None).len();
+        assert_eq!(full, 18_000, "GPU/CPU draws the full mesh");
+        assert_eq!(proxy, 36, "APX draws a 12-triangle box (36 verts) for the heavy piece");
+        assert!(proxy < full, "APX is lighter");
+
+        // A LIGHT piece (4 tris) is drawn in full even in APX — no proxy.
+        let mut st2 = FactoryState::default();
+        let light = st2.add_furniture_asset("stool".into(), tetra());
+        st2.place_furniture(light, Vec3::ZERO);
+        assert_eq!(
+            st2.furniture_verts(false, None).len(),
+            st2.furniture_verts(true, None).len(),
+            "light furniture is identical in both modes",
+        );
+    }
+
+    /// The perf monitor's inputs are correct: the heaviest placed mesh is reported, and the
+    /// FactoryPerf line surfaces the load + a SLOW flag when the build blows a frame budget.
+    #[test]
+    fn perf_monitor_reports_the_heaviest_mesh_and_flags_slow() {
+        use crate::dbg_recorder::{format_event_oneline, DbgEvent};
+        let mut st = FactoryState::default();
+        assert_eq!(st.heaviest_furniture_tris(), 0, "no furniture → 0");
+        let light = st.add_furniture_asset("stool".into(), tetra()); // 4 tris
+        st.place_furniture(light, Vec3::ZERO);
+        // A synthetic heavy mesh (300 tris) placed alongside the light one.
+        let heavy = st.add_furniture_asset(
+            "couch".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0]; 900],
+                normals: vec![[0.0, 0.0, 1.0]; 900],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        st.place_furniture(heavy, Vec3::ZERO);
+        assert_eq!(st.heaviest_furniture_tris(), 300, "reports the heaviest, not the total");
+
+        let line = format_event_oneline(&DbgEvent::FactoryPerf {
+            phase: "buffer-rebuilt".into(),
+            frame_us: 0,
+            build_us: 20_000, // 20 ms — over one refresh
+            scene_tris: 94_247,
+            furniture_insts: 2,
+            heaviest_tris: 94_247,
+            upload_bytes: 7_000_000,
+            cache_rebuilt: true,
+        });
+        assert!(line.contains("FACTORY PERF"), "labelled: {line}");
+        assert!(line.contains("tris=94247") && line.contains("heaviest=94247"), "load shown: {line}");
+        assert!(line.contains("⚠ SLOW"), "a 20 ms build is flagged slow: {line}");
+    }
+
+    /// `furniture_aabb` transforms the CACHED 8 local-box corners (O(8)) instead of sweeping
+    /// every vertex each frame — the fix for the fps crater when a heavy piece is SELECTED
+    /// (the gizmo + highlight both ask for the AABB per frame). It must still ENCLOSE every
+    /// transformed vertex, and be EXACT under scale+translation with no rotation.
+    #[test]
+    fn furniture_aabb_encloses_all_verts_cheaply() {
+        let mut st = FactoryState::default();
+        // A skewed tetra so a rotation actually changes the bounds.
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            color: None,
+            alpha: Vec::new(),
+        };
+        let idx = st.add_furniture_asset("wedge".into(), mesh);
+        st.place_furniture(idx, Vec3::new(5.0, -2.0, 0.0));
+        st.furniture[0].scale = 1.5;
+        st.furniture[0].rot = [15.0, 40.0, 25.0]; // full 3-axis rotation
+
+        let (mn, mx) = st.furniture_aabb(0).expect("has bounds");
+        // Brute-force truth: min/max over every transformed vertex.
+        let asset = &st.furniture_lib[idx];
+        let mut bmn = Vec3::splat(f32::INFINITY);
+        let mut bmx = Vec3::splat(f32::NEG_INFINITY);
+        for p in &asset.positions {
+            let w = st.furniture_point(&st.furniture[0], *p);
+            bmn = bmn.min(w);
+            bmx = bmx.max(w);
+        }
+        // The 8-corner box must CONTAIN the true vertex bounds (a valid enclosing AABB).
+        assert!(mn.x <= bmn.x + 1e-3 && mn.y <= bmn.y + 1e-3 && mn.z <= bmn.z + 1e-3, "encloses min");
+        assert!(mx.x >= bmx.x - 1e-3 && mx.y >= bmx.y - 1e-3 && mx.z >= bmx.z - 1e-3, "encloses max");
+
+        // With no rotation the corner box is EXACT.
+        st.furniture[0].rot = [0.0, 0.0, 0.0];
+        let (mn2, mx2) = st.furniture_aabb(0).unwrap();
+        let mut emn = Vec3::splat(f32::INFINITY);
+        let mut emx = Vec3::splat(f32::NEG_INFINITY);
+        for p in &asset.positions {
+            let w = st.furniture_point(&st.furniture[0], *p);
+            emn = emn.min(w);
+            emx = emx.max(w);
+        }
+        assert!((mn2 - emn).length() < 1e-3 && (mx2 - emx).length() < 1e-3, "exact without rotation");
+    }
+
+    /// The drag-time GPU model matrix must reproduce the CPU pose EXACTLY, so the dragged
+    /// furniture doesn't jump when the drag ends and it rejoins the cached (CPU-posed) buffer.
+    #[test]
+    fn furniture_model_matrix_matches_cpu_pose() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("wedge".into(), crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            color: None,
+            alpha: Vec::new(),
+        });
+        st.place_furniture(idx, Vec3::new(2.0, 3.0, 1.0));
+        st.furniture[0].scale = 1.7;
+        st.furniture[0].rot = [20.0, 35.0, 50.0];
+
+        let m = glam::Mat4::from_cols_array(&st.furniture_model_matrix(0).unwrap());
+        let asset = &st.furniture_lib[idx];
+        for p in &asset.positions {
+            let via_matrix = m.transform_point3(Vec3::from(*p));   // GPU path
+            let via_point = st.furniture_point(&st.furniture[0], *p); // cached CPU path
+            assert!((via_matrix - via_point).length() < 1e-4,
+                "model matrix must match furniture_point (no jump on drag-end)");
+        }
+    }
+
+    /// A copy placed from the library menu lands on the MODEL, not at world origin — the
+    /// fix for "loading from the furniture library shows nothing" (it was km off-screen).
+    #[test]
+    fn default_place_at_is_the_model_centre() {
+        let mut st = FactoryState::default();
+        // No model yet → origin.
+        assert_eq!(st.default_place_at(), Vec3::ZERO);
+        // Build a box far from the origin (like a DXF-coordinate import) and re-check.
+        let p = Primitive::Box { w: 4.0, d: 4.0, h: 3.0 };
+        let placement = Placement { u: 3620.0, v: 958.0, ..Placement::default() };
+        st.model.push(BoolOp::Union, Plane::default(), placement, p);
+        st.recompute();
+        let at = st.default_place_at();
+        assert!(at.x > 3000.0 && at.y > 900.0, "lands where the building is, not at (0,0)");
     }
 
     /// The library persists across save/reload, and instances keep their asset/pose.
@@ -3293,7 +6276,7 @@ mod furniture_and_color_tests {
         re.apply_persist(back);
         assert_eq!(re.furniture_lib.len(), 1, "the imported mesh is stored in the project");
         assert_eq!(re.furniture.len(), 1);
-        assert!(!re.furniture_verts().is_empty(), "and still renders after reload");
+        assert!(!re.furniture_verts(false, None).is_empty(), "and still renders after reload");
     }
 
     /// Furniture is selectable, and selecting it clears the feature selection (they are
@@ -4538,6 +7521,1243 @@ mod building_tests {
         st.building_height = 4.25;
         st.add_box();   // an unrelated modelling op must not disturb it
         assert_eq!(st.building_height, 4.25);
+    }
+}
+
+#[cfg(test)]
+mod persist_perf_tests {
+    use super::*;
+
+    /// The f32 blob codec round-trips exactly (compact binary geometry, not JSON floats).
+    #[test]
+    fn f32_blob_round_trips() {
+        let v: Vec<f32> = (0..300).map(|i| (i as f32) * 0.12345 - 7.0).collect();
+        let dec = decode_f32_blob(&encode_f32_blob(&v));
+        assert_eq!(dec.len(), v.len());
+        assert!(v.iter().zip(&dec).all(|(a, b)| (a - b).abs() < 1e-6), "exact f32 round-trip");
+    }
+
+    /// A furniture mesh survives a sidecar round-trip through the compact blobs.
+    #[test]
+    fn furniture_geometry_persists_via_blob() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset(
+            "m".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 2.5, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        st.place_furniture(idx, Vec3::new(1.0, 1.0, 0.0));
+        let before = st.furniture_lib[idx].positions.clone();
+
+        let doc = st.to_persist();
+        // The heavy JSON arrays must be empty — geometry rides in the blob.
+        assert!(doc.furniture_lib[idx].positions.is_empty(), "no JSON float arrays written");
+        assert!(!doc.furniture_lib[idx].pos_b64.is_empty(), "blob written");
+
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        let after = st2.furniture_lib[idx].positions.clone();
+        assert_eq!(before.len(), after.len(), "vertex count preserved");
+        assert!(before.iter().zip(&after).all(|(a, b)|
+            (a[0]-b[0]).abs()<1e-4 && (a[1]-b[1]).abs()<1e-4 && (a[2]-b[2]).abs()<1e-4),
+            "positions round-trip");
+    }
+
+    /// A mixed opaque+glass asset splits correctly and its per-vertex opacity survives a
+    /// sidecar round-trip (so a reopened window keeps its see-through panes).
+    #[test]
+    fn translucent_furniture_splits_and_persists() {
+        // Two triangles: tri 0 opaque (frame), tri 1 glass (alpha 0.2).
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![
+                [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 6],
+            color: None,
+            alpha: vec![1.0, 1.0, 1.0, 0.2, 0.2, 0.2],
+        };
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("window".into(), mesh);
+        st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        assert!(st.furniture_lib[idx].is_translucent(), "asset flagged translucent");
+
+        // Solid pass gets ONLY the opaque triangle; the blended pass gets ONLY the glass one.
+        assert_eq!(st.furniture_local_mesh(0).len(), 3, "one opaque tri in the solid pass");
+        let (_key, glass) = st.furniture_translucent_mesh(0).expect("glass split out");
+        assert_eq!(glass.len(), 3, "one glass tri in the transparent pass");
+        assert!(glass.iter().all(|v| (v.a - 0.2).abs() < 1e-6), "glass carries its opacity");
+
+        // Round-trip through the compact sidecar blob.
+        let doc = st.to_persist();
+        assert!(!doc.furniture_lib[idx].alpha_b64.is_empty(), "alpha blob written");
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        assert!(st2.furniture_lib[idx].is_translucent(), "still translucent after reload");
+        assert_eq!(st2.furniture_lib[idx].alpha.len(), 6, "per-vertex opacity preserved");
+    }
+
+    /// REGRESSION: a TRANSLUCENT asset (glass panes — e.g. the villa after the FBX opacity import)
+    /// must still take face/piece clicks. `furniture_face_at` used to bail on `is_translucent()`,
+    /// which silently broke per-surface painting on any model containing glass.
+    #[test]
+    fn face_pick_works_on_translucent_asset() {
+        // A 1×1 quad at z=0 (two tris), one vertex-run glass. Identity MVP ⇒ NDC == world, so a
+        // click at the rect centre fires a +Z ray through (0,0) — square in the quad.
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![
+                [-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.5, 0.5, 0.0],
+                [-0.5, -0.5, 0.0], [0.5, 0.5, 0.0], [-0.5, 0.5, 0.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 6],
+            color: None,
+            alpha: vec![0.1; 6], // all glass → asset is translucent
+        };
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("pane".into(), mesh);
+        st.place_furniture(idx, Vec3::ZERO);
+        assert!(st.furniture_lib[idx].is_translucent());
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let mvp = glam::Mat4::IDENTITY.to_cols_array();
+        let hit = st.furniture_face_at(0, egui::pos2(50.0, 50.0), rect, &mvp, false);
+        assert!(hit.is_some(), "glass asset takes a face pick");
+        let miss = st.furniture_face_at(0, egui::pos2(1.0, 1.0), rect, &mvp, false);
+        assert!(miss.is_none(), "a click off the quad still misses");
+    }
+
+    /// The OFF-THREAD save/load path: `to_persist_lite` writes empty blobs + `furniture_geom_flat`
+    /// supplies the raw geometry a worker compresses; `decode_furniture_lib` restores it. This
+    /// mirrors exactly what the save/load workers do, so a mismatch here = corrupted furniture.
+    #[test]
+    fn furniture_geometry_persists_via_deferred_worker_path() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset(
+            "m".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 2.5, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        st.place_furniture(idx, Vec3::new(1.0, 1.0, 0.0));
+        let before = st.furniture_lib[idx].positions.clone();
+
+        // Main thread: config with EMPTY furniture blobs + the raw flattened geometry.
+        let mut doc = st.to_persist_lite();
+        let geom = st.furniture_geom_flat();
+        assert!(doc.furniture_lib[idx].pos_b64.is_empty(), "lite leaves blobs empty");
+        assert_eq!(geom.len(), doc.furniture_lib.len(), "one raw geom per asset");
+
+        // Worker: compress the raw geometry into the blobs (what save_file_worker does).
+        for (rec, g) in doc.furniture_lib.iter_mut().zip(geom.iter()) {
+            rec.pos_b64 = encode_f32_blob(&g.pos);
+            rec.nrm_b64 = encode_f32_blob(&g.nrm);
+        }
+        assert!(!doc.furniture_lib[idx].pos_b64.is_empty(), "worker filled the blob");
+
+        // Load worker: decode furniture off-thread; main thread installs the prebuilt lib.
+        let lib = FactoryState::decode_furniture_lib(std::mem::take(&mut doc.furniture_lib));
+        let mut st2 = FactoryState::default();
+        st2.apply_persist_prebuilt(doc, lib);
+        let after = st2.furniture_lib[idx].positions.clone();
+        assert_eq!(before.len(), after.len(), "vertex count preserved");
+        assert!(before.iter().zip(&after).all(|(a, b)|
+            (a[0]-b[0]).abs()<1e-4 && (a[1]-b[1]).abs()<1e-4 && (a[2]-b[2]).abs()<1e-4),
+            "positions round-trip through the deferred worker path");
+    }
+}
+
+#[cfg(test)]
+mod aperture_tests {
+    use super::*;
+
+    /// A furniture asset whose LOCAL box is exactly width×depth×height (X,Y,Z), so the fit math
+    /// is checkable. `add_furniture_asset` centres X/Y and seats the base at z=0; with the longest
+    /// side < 20 it applies no auto-scale, so the local box is [-w/2,w/2]×[-d/2,d/2]×[0,h].
+    fn box_asset(st: &mut FactoryState, w: f32, d: f32, h: f32) -> usize {
+        let positions = vec![
+            [-w/2.0, -d/2.0, 0.0], [w/2.0, -d/2.0, 0.0], [w/2.0, d/2.0, 0.0],
+            [-w/2.0, d/2.0, h],    [w/2.0, d/2.0, h],    [-w/2.0, -d/2.0, h],
+        ];
+        let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
+        st.add_furniture_asset("box".into(), crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() })
+    }
+
+    /// scale_vec resolves uniform vs non-uniform correctly, and `scale` multiplies on top.
+    #[test]
+    fn scale_vec_resolves_uniform_and_fit() {
+        let mut inst = FurnitureInst { asset: 0, pos: [0.0;3], scale: 2.0, fit: None, rot: [0.0;3], color: [0.8;3], texture: None, surface_texture: std::collections::HashMap::new() };
+        assert_eq!(inst.scale_vec(), Vec3::splat(2.0), "uniform");
+        inst.scale = 1.0;
+        inst.fit = Some([1.2, 3.0, 1.05]);
+        assert_eq!(inst.scale_vec(), Vec3::new(1.2, 3.0, 1.05), "fit used verbatim at scale 1");
+        inst.scale = 2.0;
+        assert_eq!(inst.scale_vec(), Vec3::new(2.4, 6.0, 2.1), "scale multiplies fit");
+    }
+
+    /// place_aperture fills the opening exactly: the placed instance's world AABB matches the
+    /// opening's width/depth/height and is centred on the opening centre (axis-aligned wall).
+    #[test]
+    fn aperture_fills_the_opening_axis_aligned() {
+        let mut st = FactoryState::default();
+        let a = box_asset(&mut st, 1.0, 0.1, 2.0);
+        let center = Vec3::new(10.0, 5.0, 1.5);
+        let (w, h, depth) = (1.2, 2.1, 0.3);
+        let i = st.place_aperture(a, center, Vec3::X, w, h, depth).unwrap();
+        let (mn, mx) = st.furniture_aabb(i).unwrap();
+        let sz = mx - mn;
+        assert!((sz.x - w).abs() < 1e-3, "width along X: {} vs {w}", sz.x);
+        assert!((sz.y - depth).abs() < 1e-3, "depth along Y: {} vs {depth}", sz.y);
+        assert!((sz.z - h).abs() < 1e-3, "height along Z: {} vs {h}", sz.z);
+        let c = (mn + mx) * 0.5;
+        assert!((c - center).length() < 1e-3, "centred on the opening: {c:?} vs {center:?}");
+    }
+
+    /// An aperture (placed with `fit`) is flagged `is_aperture`; ordinary uniform-scale furniture
+    /// is not — this is the signal that gives a door/window selection priority over its wall.
+    #[test]
+    fn is_aperture_flags_only_fitted_pieces() {
+        let mut st = FactoryState::default();
+        let a = box_asset(&mut st, 1.0, 0.1, 2.0);
+        let ap = st.place_aperture(a, Vec3::new(1.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.2).unwrap();
+        assert!(st.is_aperture(ap), "a fitted door/window is an aperture");
+        st.place_furniture(a, Vec3::new(5.0, 5.0, 0.0));
+        let plain = st.furniture.len() - 1;
+        assert!(!st.is_aperture(plain), "uniform-scale furniture is not an aperture");
+    }
+
+    /// A bundled door/window IMPORTED free-standing (so it has no `fit`) is still recognised as an
+    /// aperture by its asset name — this is the case the pick diagnostic showed failing (ap=None).
+    #[test]
+    fn is_aperture_recognizes_named_window_without_fit() {
+        let mut st = FactoryState::default();
+        let win = {
+            let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 2.0]];
+            let normals = vec![[0.0, 1.0, 0.0]; 3];
+            st.add_furniture_asset("Window".into(),
+                crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() })
+        };
+        st.place_furniture(win, Vec3::new(0.0, 0.0, 0.0)); // free-standing → no fit
+        let i = st.furniture.len() - 1;
+        assert!(st.furniture[i].fit.is_none(), "placed without a fit");
+        assert!(st.is_aperture(i), "a Window-named asset is an aperture even without fit");
+    }
+
+    /// The aperture selection tolerance scales with the wall thickness it fills, so a door in a
+    /// thick wall is as easy to click as one in a thin wall (and is clamped to a usable range).
+    #[test]
+    fn aperture_pick_tol_scales_with_thickness() {
+        let mut st = FactoryState::default();
+        let a = box_asset(&mut st, 1.0, 0.1, 2.0);
+        let thin = st.place_aperture(a, Vec3::new(0.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 0.1).unwrap();
+        let thick = st.place_aperture(a, Vec3::new(5.0, 0.0, 1.0), Vec3::X, 1.0, 2.0, 1.0).unwrap();
+        let (t_thin, t_thick) = (st.aperture_pick_tol(thin), st.aperture_pick_tol(thick));
+        assert!(t_thick > t_thin, "thicker wall → larger tolerance: {t_thin} vs {t_thick}");
+        assert!((0.2..=3.0).contains(&t_thin), "clamped to a usable range: {t_thin}");
+    }
+
+    /// A wall running along world-Y (opening horizontal axis = Y): width/height/depth still match,
+    /// just remapped to world axes, and the piece stays centred. Guards the yaw math.
+    #[test]
+    fn aperture_fills_the_opening_rotated_wall() {
+        let mut st = FactoryState::default();
+        let a = box_asset(&mut st, 1.0, 0.1, 2.0);
+        let center = Vec3::new(-3.0, 7.0, 1.4);
+        let (w, h, depth) = (0.9, 2.0, 0.25);
+        let i = st.place_aperture(a, center, Vec3::Y, w, h, depth).unwrap();
+        let (mn, mx) = st.furniture_aabb(i).unwrap();
+        let sz = mx - mn;
+        // u_h = +Y → width along Y, depth along X, height along Z.
+        assert!((sz.y - w).abs() < 1e-3, "width along Y: {} vs {w}", sz.y);
+        assert!((sz.x - depth).abs() < 1e-3, "depth along X: {} vs {depth}", sz.x);
+        assert!((sz.z - h).abs() < 1e-3, "height along Z: {} vs {h}", sz.z);
+        let c = (mn + mx) * 0.5;
+        assert!((c - center).length() < 1e-3, "centred on the opening: {c:?}");
+    }
+
+    /// The non-uniform `fit` survives a sidecar round-trip (so a placed door/window keeps its
+    /// stretched shape after save/reload).
+    #[test]
+    fn aperture_fit_persists() {
+        let mut st = FactoryState::default();
+        let a = box_asset(&mut st, 1.0, 0.1, 2.0);
+        st.place_aperture(a, Vec3::new(2.0, 2.0, 1.0), Vec3::X, 1.1, 2.0, 0.2);
+        let fit_before = st.furniture[0].fit;
+        assert!(fit_before.is_some(), "aperture carries a non-uniform fit");
+
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        assert_eq!(st2.furniture.len(), 1, "instance restored");
+        let fit_after = st2.furniture[0].fit.expect("fit restored");
+        let fb = fit_before.unwrap();
+        assert!((0..3).all(|k| (fit_after[k] - fb[k]).abs() < 1e-5), "fit round-trips: {fit_after:?} vs {fb:?}");
+    }
+}
+
+#[cfg(test)]
+mod cutout_tests {
+    use super::*;
+
+    /// Cutouts (Difference features) are listed and can be deleted, filling the opening back in.
+    #[test]
+    fn cutout_list_and_delete() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+        );
+        st.recompute();
+        let plain = st.scene_verts().len();
+
+        st.model.push(
+            cad_solid::BoolOp::Difference, cad_solid::Plane::default(),
+            cad_solid::Placement::default(), Primitive::Box { w: 0.5, d: 0.5, h: 3.0 },
+        );
+        st.recompute();
+        assert_ne!(st.scene_verts().len(), plain, "the cut changed the geometry");
+
+        let ids = st.cutout_ids();
+        assert_eq!(ids.len(), 1, "one cutout listed");
+        let id = ids[0];
+        assert!(st.cutout_size(id).is_some(), "cutout has a size");
+
+        st.select_cutout(id);
+        assert_eq!(st.selected_single(), Some(id), "the cutout is selected");
+
+        st.delete_cutout(id);
+        st.recompute();
+        assert!(st.cutout_ids().is_empty(), "cutout removed");
+        assert_eq!(st.scene_verts().len(), plain, "the opening filled back to the plain solid");
+    }
+}
+
+#[cfg(test)]
+mod decimation_tests {
+    use super::*;
+
+    /// Vertex clustering drops sub-cell slivers and keeps genuine triangles (welded to cell
+    /// centroids), so a dense mesh collapses toward its silhouette.
+    #[test]
+    fn cluster_decimate_drops_slivers_keeps_shape() {
+        let pos = vec![
+            [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], // spans distinct cells → kept
+            [0.0, 0.0, 0.0], [0.001, 0.0, 0.0], [0.0, 0.001, 0.0], // sub-cell sliver → dropped
+        ];
+        let (dp, dn) = cluster_decimate(&pos, 8);
+        assert_eq!(dp.len() / 3, 1, "one real triangle survives, the sliver is dropped");
+        assert_eq!(dp.len(), dn.len(), "a normal per vertex");
+    }
+
+    /// A normal-sized asset is never decimated; the LOD is reserved for very heavy imports.
+    #[test]
+    fn small_asset_skips_lod() {
+        let a = FurnitureAsset::new(
+            "x".into(),
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0.0, 0.0, 1.0]; 3],
+            [0.8, 0.8, 0.8],
+        );
+        assert!(!a.needs_lod(), "3-triangle asset needs no proxy");
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    fn tri_mesh() -> crate::mesh_io::ObjMesh {
+        crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            color: None,
+            alpha: Vec::new(),
+        }
+    }
+
+    /// Ctrl+C / Ctrl+V on furniture: a paste adds an offset clone and selects the copy.
+    #[test]
+    fn copy_paste_furniture_clones_offset() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tri_mesh());
+        st.place_furniture(idx, Vec3::new(1.0, 2.0, 0.0));
+        st.select_furniture(0);
+        let orig = st.furniture[0].pos;
+
+        assert!(st.copy_selection(), "furniture copied");
+        assert_eq!(st.paste_clipboard(), Some(false), "furniture paste (not a feature)");
+        assert_eq!(st.furniture.len(), 2, "one clone added");
+        let copy = st.furniture[1].pos;
+        assert!((copy[0] - orig[0] - 0.3).abs() < 1e-4 && (copy[1] - orig[1] - 0.3).abs() < 1e-4, "offset by 0.3 m");
+        assert_eq!(st.sel_furniture, Some(1), "the copy is selected");
+    }
+
+    /// Ctrl+C / Ctrl+V on a CSG feature: clones it (new id), carries the colour, offsets it.
+    #[test]
+    fn copy_paste_feature_clones_with_colour() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        st.recompute();
+        let id = st.model.features.last().unwrap().id;
+        st.feature_color.insert(id, [1.0, 0.0, 0.0]);
+        st.selection = vec![id];
+        let n = st.model.features.len();
+
+        assert!(st.copy_selection(), "feature copied");
+        assert_eq!(st.paste_clipboard(), Some(true), "feature paste needs recompute");
+        assert_eq!(st.model.features.len(), n + 1, "one feature added");
+        let new_id = *st.selection.first().unwrap();
+        assert_ne!(new_id, id, "the clone has a fresh id");
+        assert_eq!(st.feature_color.get(&new_id).copied(), Some([1.0, 0.0, 0.0]), "colour carried");
+        let f = st.model.features.iter().find(|f| f.id == new_id).unwrap();
+        assert!((f.placement.u - 0.3).abs() < 1e-4 && (f.placement.v - 0.3).abs() < 1e-4, "placement offset");
+    }
+
+    /// Pasting with an empty buffer is a no-op.
+    #[test]
+    fn paste_empty_clipboard_is_none() {
+        let mut st = FactoryState::default();
+        assert_eq!(st.paste_clipboard(), None);
+    }
+
+    /// A drawn APERTURE (door/window) is a furniture instance with a non-uniform `fit`; copy/paste
+    /// must clone it — stretched shape and all — exactly like an imported piece.
+    #[test]
+    fn copy_paste_aperture_preserves_fit() {
+        let mut st = FactoryState::default();
+        let a = st.add_furniture_asset("door".into(), crate::mesh_io::ObjMesh {
+            positions: vec![
+                [-0.5, -0.05, 0.0], [0.5, -0.05, 0.0], [0.5, 0.05, 0.0],
+                [-0.5, 0.05, 2.0],  [0.5, 0.05, 2.0],  [-0.5, -0.05, 2.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 6],
+            color: Some([0.7, 0.7, 0.7]),
+            alpha: Vec::new(),
+        });
+        st.place_aperture(a, Vec3::new(5.0, 3.0, 1.0), Vec3::X, 1.2, 2.1, 0.3);
+        let fit0 = st.furniture[0].fit;
+        assert!(fit0.is_some(), "aperture carries a non-uniform fit");
+        st.select_furniture(0);
+        assert!(st.copy_selection(), "aperture furniture copied");
+        assert_eq!(st.paste_clipboard(), Some(false), "furniture paste (not a feature)");
+        assert_eq!(st.furniture.len(), 2, "one clone added");
+        assert_eq!(st.furniture[1].fit, fit0, "the copy keeps the stretched fit");
+        assert_eq!(st.sel_furniture, Some(1), "the copy is selected");
+    }
+
+    /// An EXTRUDED solid (the "As furniture" extrude → a Union Extrusion feature) copy/pastes as a
+    /// cloned feature — new id, carried colour, and a valid re-evaluated mesh.
+    #[test]
+    fn copy_paste_extruded_solid_clones() {
+        let mut st = FactoryState::default();
+        let sq = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+        let (profile, c, w, d) = st.model.add_profile(&sq).unwrap();
+        let mut placement = Placement::default();
+        placement.u = c.x;
+        placement.v = c.y;
+        let id = st.model.push(BoolOp::Union, Plane::default(), placement,
+            Primitive::Extrusion { profile, h: 0.8, w, d });
+        st.feature_color.insert(id, [0.6, 0.62, 0.70]);
+        st.recompute();
+        let n = st.model.features.len();
+        st.sel_furniture = None;
+        st.selection = vec![id];
+
+        assert!(st.copy_selection(), "extruded solid copied");
+        assert_eq!(st.paste_clipboard(), Some(true), "feature paste needs recompute");
+        st.recompute();
+        assert_eq!(st.model.features.len(), n + 1, "one clone added");
+        let new_id = *st.selection.first().unwrap();
+        assert_ne!(new_id, id, "fresh id");
+        assert_eq!(st.feature_color.get(&new_id).copied(), Some([0.6, 0.62, 0.70]), "colour carried");
+        assert!(!st.scene_verts().is_empty(), "both solids render");
+    }
+
+    /// Pasting empty per-face vectors doesn't add spurious surface entries.
+    #[test]
+    fn paste_feature_without_paint_adds_no_surface_entries() {
+        let mut st = FactoryState::default();
+        st.model.push(BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        st.recompute();
+        st.selection = vec![st.model.features[0].id];
+        assert!(st.copy_selection());
+        assert_eq!(st.paste_clipboard(), Some(true));
+        assert!(st.surface_color.is_empty() && st.surface_texture.is_empty(), "no stray per-face entries");
+    }
+}
+
+/// Property-style robustness for the 2D→3D bridge: thousands of RANDOM closed sketches are
+/// extruded and the result is checked for the invariants a valid solid must hold (finite coords,
+/// non-empty triangle soup, height bounded by the extrude depth, footprint within the sketch).
+/// Deterministic (a seeded LCG — no external crate, no `Math::random`), so a failure reproduces.
+/// This is the "does the bridge crash on a degenerate sketch?" guard the report can cite.
+#[cfg(test)]
+mod extrude_property_tests {
+    use super::*;
+
+    /// Tiny deterministic PRNG (a linear congruential generator) — reproducible random inputs.
+    struct Lcg(u64);
+    impl Lcg {
+        fn u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn f32(&mut self) -> f32 { self.u32() as f32 / u32::MAX as f32 }
+        fn range(&mut self, a: f32, b: f32) -> f32 { a + (b - a) * self.f32() }
+    }
+
+    /// A simple (non-self-intersecting) polygon: random radii at ANGULARLY SORTED vertices around
+    /// a centre — star-shaped, so it's always a valid closed outline `add_profile` accepts.
+    fn simple_poly(rng: &mut Lcg, n: usize, cx: f32, cy: f32, r: f32) -> Vec<Vec2> {
+        let mut angs: Vec<f32> = (0..n).map(|_| rng.range(0.0, std::f32::consts::TAU)).collect();
+        angs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        angs.into_iter()
+            .map(|a| {
+                let rr = r * rng.range(0.55, 1.0);
+                Vec2::new(cx + rr * a.cos(), cy + rr * a.sin())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn random_extrusions_are_finite_and_bounded() {
+        let mut rng = Lcg(0x1234_5678_9abc_def0);
+        let mut extruded = 0;
+        for _ in 0..600 {
+            let n = 3 + (rng.u32() % 9) as usize; // 3..=11 vertices
+            let (cx, cy) = (rng.range(-6.0, 6.0), rng.range(-6.0, 6.0));
+            let r = rng.range(0.2, 4.0);
+            let h = rng.range(0.05, 3.0);
+            let pts = simple_poly(&mut rng, n, cx, cy, r);
+
+            let mut st = FactoryState::default();
+            let Ok((profile, centre, w, d)) = st.model.add_profile(&pts) else { continue };
+            st.model.push(
+                BoolOp::Union, Plane::default(), Placement::default(),
+                Primitive::Extrusion { profile, h, w, d },
+            );
+            st.recompute(); // MUST NOT panic on any random valid sketch
+
+            let pos = &st.cached.positions;
+            assert!(!pos.is_empty(), "a valid sketch extrudes to triangles");
+            assert_eq!(pos.len() % 3, 0, "triangle soup (3 verts per tri)");
+            assert!(pos.len() < 2_000_000, "triangle count stays sane");
+            let (mut zmn, mut zmx) = (f32::MAX, f32::MIN);
+            let (mut xmn, mut xmx, mut ymn, mut ymx) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+            for p in pos {
+                assert!(p[0].is_finite() && p[1].is_finite() && p[2].is_finite(), "no NaN/Inf vertices");
+                zmn = zmn.min(p[2]); zmx = zmx.max(p[2]);
+                xmn = xmn.min(p[0]); xmx = xmx.max(p[0]);
+                ymn = ymn.min(p[1]); ymx = ymx.max(p[1]);
+            }
+            assert!(zmx - zmn > 0.0 && zmx - zmn <= h + 1e-2, "solid height ≈ extrude depth");
+            // The extruded footprint can't exceed the sketch's own bbox (+ a small margin).
+            assert!(xmx - xmn <= w + 1e-2 && ymx - ymn <= d + 1e-2, "footprint within the sketch");
+            let _ = centre;
+            extruded += 1;
+        }
+        assert!(extruded > 500, "most random polygons extruded successfully ({extruded}/600)");
+    }
+
+    /// Degenerate / malformed sketches are REJECTED cleanly (a typed error), never a panic — the
+    /// edge cases users actually hit: too few points, collinear, and a zero-height extrude.
+    #[test]
+    fn degenerate_sketches_are_rejected_without_panicking() {
+        let mut st = FactoryState::default();
+        // Fewer than 3 distinct points.
+        assert!(st.model.add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)]).is_err());
+        // All duplicates → collapses below 3.
+        assert!(st.model.add_profile(&[Vec2::splat(2.0); 5]).is_err());
+        // Collinear → zero area.
+        assert!(st.model
+            .add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(2.0, 0.0)])
+            .is_err());
+        // Bow-tie (self-intersecting).
+        assert!(st.model
+            .add_profile(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)])
+            .is_err());
+        // A valid square extruded to ZERO height must not panic (may yield a flat/empty mesh).
+        let sq = [Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)];
+        if let Ok((profile, _c, w, d)) = st.model.add_profile(&sq) {
+            st.model.push(BoolOp::Union, Plane::default(), Placement::default(),
+                Primitive::Extrusion { profile, h: 0.0, w, d });
+            st.recompute(); // no panic
+        }
+    }
+
+    /// PER-FACE paint survives copy/paste. Paint one face of a box, copy, paste; the pasted
+    /// feature (translated + re-evaluated) must carry that paint on the CORRESPONDING face —
+    /// which only holds if the surface key was re-derived with the paste's `n·delta` offset shift.
+    #[test]
+    fn per_face_paint_survives_copy_paste() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+        );
+        st.recompute();
+        let id = st.model.features[0].id;
+        // Paint the box's first face.
+        let (t0, t1, t2) = {
+            let p = &st.cached.positions;
+            (p[0], p[1], p[2])
+        };
+        let key = surface_key(id, t0, t1, t2);
+        let paint = [0.9, 0.15, 0.15];
+        st.surface_color.insert(key, paint);
+        st.selection = vec![id];
+        st.sel_furniture = None;
+
+        assert!(st.copy_selection(), "feature copied");
+        assert_eq!(st.paste_clipboard(), Some(true));
+        st.recompute();
+        let new_id = *st.selection.first().unwrap();
+        assert_ne!(new_id, id);
+
+        // A face of the PASTED feature must resolve (via its real geometry) to the copied paint.
+        let mut found = false;
+        for (i, tri) in st.cached.positions.chunks_exact(3).enumerate() {
+            if st.cached.face_ids.get(i).copied() != Some(new_id) { continue; }
+            let k = surface_key(new_id, tri[0], tri[1], tri[2]);
+            if st.surface_color.get(&k) == Some(&paint) { found = true; break; }
+        }
+        assert!(found, "per-face paint transferred to the matching face of the pasted feature");
+    }
+}
+
+#[cfg(test)]
+mod texture_tests {
+    use super::*;
+
+    /// A clipboard bitmap's average colour drives the immediate tint. A 2×1 image of one
+    /// black and one white pixel must average to mid-grey (0.5), and alpha must weight the
+    /// average so fully-transparent pixels don't drag it toward black.
+    #[test]
+    fn texture_average_is_alpha_weighted() {
+        // Opaque black + opaque white → mid-grey.
+        let rgba = vec![0, 0, 0, 255, 255, 255, 255, 255];
+        let t = TextureAsset::new("t".into(), 2, 1, rgba);
+        assert!((t.avg[0] - 0.5).abs() < 1e-3, "avg R = {}", t.avg[0]);
+
+        // Opaque red + fully-transparent green → the green must not count, so avg ≈ red.
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 0];
+        let t = TextureAsset::new("t".into(), 2, 1, rgba);
+        assert!(t.avg[0] > 0.99 && t.avg[1] < 0.01, "avg = {:?}", t.avg);
+    }
+
+    /// `add_texture` stores the bitmap and hands back its index.
+    #[test]
+    fn add_texture_appends_and_indexes() {
+        let mut st = FactoryState::default();
+        let i0 = st.add_texture("a".into(), 1, 1, vec![10, 20, 30, 255]);
+        let i1 = st.add_texture("b".into(), 1, 1, vec![40, 50, 60, 255]);
+        assert_eq!((i0, i1), (0, 1));
+        assert_eq!(st.textures.len(), 2);
+        assert_eq!(st.textures[1].w, 1);
+    }
+
+    /// `furniture_textured_mesh` is None until a texture is assigned, then yields one UV'd
+    /// vertex per position with UVs normalised into [0,1] by box projection.
+    #[test]
+    fn furniture_textured_mesh_uvs_are_normalised() {
+        let mut st = FactoryState::default();
+        // A unit-ish triangle mesh spanning the local box [0,0,0]..[1,1,0] (Z-facing).
+        let idx = st.add_furniture_asset(
+            "t".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        assert!(st.furniture_textured_mesh(0).is_none(), "no texture yet → None");
+
+        let ti = st.add_texture("img".into(), 2, 2, vec![255; 16]);
+        st.furniture[0].texture = Some(ti);
+        let (tex_idx, _key, verts) = st.furniture_textured_mesh(0).expect("textured mesh");
+        assert_eq!(tex_idx, ti);
+        assert_eq!(verts.len(), 3, "one vertex per position");
+        for v in &verts {
+            assert!((0.0..=1.0).contains(&v.u) && (0.0..=1.0).contains(&v.v), "uv in [0,1]: {},{}", v.u, v.v);
+            assert!(v.s > 0.0 && v.s <= 1.0, "shade in (0,1]: {}", v.s);
+        }
+        // Z-facing face → UV comes from XY: the (1,0,0) vertex maps to u=1, the (0,1,0) to v=1.
+        assert!((verts[1].u - 1.0).abs() < 1e-4 && verts[2].v - 1.0 < 1e-4);
+    }
+
+    /// Build a triangle soup of one axis-aligned box at `o` (12 tris). Helper for the per-face tests.
+    fn box_soup(o: [f32; 3]) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+        let vtx = |x: f32, y: f32, z: f32| [o[0] + x, o[1] + y, o[2] + z];
+        let c = [
+            vtx(0.0, 0.0, 0.0), vtx(1.0, 0.0, 0.0), vtx(1.0, 1.0, 0.0), vtx(0.0, 1.0, 0.0),
+            vtx(0.0, 0.0, 1.0), vtx(1.0, 0.0, 1.0), vtx(1.0, 1.0, 1.0), vtx(0.0, 1.0, 1.0),
+        ];
+        let mut pos = Vec::new();
+        let mut nrm = Vec::new();
+        let mut quad = |a: usize, b: usize, cc: usize, d: usize| {
+            let (pa, pb, pcc, pd) = (Vec3::from(c[a]), Vec3::from(c[b]), Vec3::from(c[cc]), Vec3::from(c[d]));
+            let n = (pb - pa).cross(pcc - pa).normalize_or_zero().to_array();
+            for p in [c[a], c[b], c[cc], c[a], c[cc], c[d]] {
+                pos.push(p);
+                nrm.push(n);
+            }
+        };
+        quad(0, 1, 2, 3);
+        quad(4, 5, 6, 7);
+        quad(0, 1, 5, 4);
+        quad(3, 2, 6, 7);
+        quad(0, 3, 7, 4);
+        quad(1, 2, 6, 5);
+        (pos, nrm)
+    }
+
+    /// Grouping: group ≥ 2 features → picking any member expands to the whole group; explode
+    /// releases them; deleting a member drops it from the group.
+    #[test]
+    fn feature_grouping_selects_moves_and_explodes_as_one() {
+        let mut st = FactoryState::default();
+        let mut add_box = || {
+            st.model.push(
+                cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+                Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            )
+        };
+        let (a, b, c) = (add_box(), add_box(), add_box());
+
+        // Group A + B.
+        st.selection = vec![a, b];
+        assert_eq!(st.group_selection(), 2);
+        assert_eq!(st.selection_group(), st.feature_group.get(&a).copied());
+
+        // Picking just A expands to {A, B} but not C.
+        st.selection = vec![a];
+        st.expand_selection_to_groups();
+        assert!(st.selection.contains(&a) && st.selection.contains(&b));
+        assert!(!st.selection.contains(&c));
+
+        // Deleting B drops it from the group.
+        st.selection = vec![b];
+        st.erase_selection();
+        assert!(!st.feature_group.contains_key(&b));
+        assert!(st.feature_group.contains_key(&a));
+
+        // Explode releases the rest.
+        st.selection = vec![a];
+        assert_eq!(st.ungroup_selection(), 1);
+        assert!(st.feature_group.is_empty());
+    }
+
+    /// Per-surface texturing: painting one face-group textures only that flat face; the rest stay
+    /// flat. Painting a whole body textures every face of that connected piece.
+    #[test]
+    fn per_surface_furniture_faceted_split() {
+        let mut st = FactoryState::default();
+        // Two disjoint boxes = one asset with two bodies, 6 flat faces each.
+        let (mut pos, mut nrm) = box_soup([0.0, 0.0, 0.0]);
+        let (p2, n2) = box_soup([5.0, 0.0, 0.0]);
+        pos.extend(p2);
+        nrm.extend(n2);
+        let idx = st.add_furniture_asset(
+            "twobox".into(),
+            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+        );
+        st.place_furniture(idx, Vec3::ZERO);
+        let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
+
+        let groups = st.furniture_lib[idx].group_geom();
+        // No per-face textures yet → faceted returns None (whole-object path handles it).
+        assert!(st.furniture_faceted(0).is_none());
+
+        // Texture ONLY the face-group of triangle 0 (one flat face = 2 tris = 6 verts).
+        let fg0 = groups.face[0];
+        st.furniture[0].surface_texture.insert(fg0, ti);
+        let fac = st.furniture_faceted(0).expect("faceted split");
+        assert_eq!(fac.opaque.len(), 1, "one texture used");
+        assert_eq!(fac.opaque[0].0, ti);
+        assert_eq!(fac.opaque[0].2.len(), 6, "only that flat face's 2 tris are textured");
+        let flat = fac.flat.as_ref().expect("flat remainder");
+        assert_eq!(flat.1.len(), st.furniture_lib[idx].positions.len() - 6, "everything else stays flat");
+
+        // Now paint the WHOLE first body: all 6 faces (12 tris = 36 verts) of box 0 textured.
+        st.furniture[0].surface_texture.clear();
+        let body0 = groups.body[0];
+        for t in 0..groups.face.len() {
+            if groups.body[t] == body0 {
+                st.furniture[0].surface_texture.insert(groups.face[t], ti);
+            }
+        }
+        let fac = st.furniture_faceted(0).expect("faceted split");
+        assert_eq!(fac.opaque[0].2.len(), 36, "the whole first box (12 tris) is textured");
+        assert_eq!(fac.flat.as_ref().expect("remainder").1.len(), 36, "the second box stays flat");
+    }
+
+    /// A GENERATED staircase carries per-primitive part ids, so "piece" grouping gives one tread
+    /// per piece — NOT the whole welded run (which geometry-only connectivity would give).
+    #[test]
+    fn generated_stair_pieces_are_per_primitive_not_the_whole_run() {
+        use cad_solid::architecture::{build_stairs, StairParams};
+        let sp = StairParams { total_height: 2.0, desired_riser_height: 0.2, ..Default::default() };
+        let m = build_stairs(&sp).unwrap();
+        let part_ids = m.face_ids.clone();
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset(
+            "stair".into(),
+            crate::mesh_io::ObjMesh { positions: m.positions, normals: m.normals, color: None, alpha: Vec::new() },
+        );
+        // Mirror arch_build_and_place: tag the asset with its per-primitive part ids.
+        assert_eq!(part_ids.len(), st.furniture_lib[idx].positions.len() / 3);
+        st.furniture_lib[idx].part_ids = part_ids;
+
+        let g = st.furniture_lib[idx].group_geom();
+        let ntri = st.furniture_lib[idx].positions.len() / 3;
+        let bodies = g.body.iter().copied().max().unwrap() + 1;
+        assert!(bodies > 10, "many pieces (treads/risers/rails/balusters), got {bodies}");
+        // No single piece is the whole object (the old welded-run bug).
+        for b in 0..bodies {
+            let cnt = g.body.iter().filter(|&&x| x == b).count();
+            assert!(cnt * 3 < ntri, "piece {b} is not the whole run ({cnt} of {ntri} tris)");
+        }
+        // FACE groups must not span primitives: no face group covers a big chunk of the mesh
+        // (the coplanar-sides-merge bug — a stair side is coplanar-connected across every tread).
+        let faces = g.face.iter().copied().max().unwrap() + 1;
+        let biggest = (0..faces)
+            .map(|f| g.face.iter().filter(|&&x| x == f).count())
+            .max()
+            .unwrap();
+        assert!(
+            biggest < ntri / 8,
+            "no face spans the object: biggest face has {biggest} of {ntri} tris ({faces} faces)"
+        );
+    }
+
+    /// A GENERATED helical ramp is a SMOOTH swept deck (one continuous piece) plus a balustrade of
+    /// separate rail/post pieces — the deck is deliberately one solid (a ramp, not steps), while
+    /// rails and posts remain their own selectable components.
+    #[test]
+    fn generated_helical_ramp_deck_is_one_smooth_piece_plus_balustrade() {
+        use cad_solid::architecture::{build_helical_ramp, HelicalRampParams};
+        let m = build_helical_ramp(&HelicalRampParams { segments_per_turn: 48, ..Default::default() }).unwrap();
+        let part_ids = m.face_ids.clone();
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset(
+            "ramp".into(),
+            crate::mesh_io::ObjMesh { positions: m.positions, normals: m.normals, color: None, alpha: Vec::new() },
+        );
+        assert_eq!(part_ids.len(), st.furniture_lib[idx].positions.len() / 3, "one part id per triangle");
+        st.furniture_lib[idx].part_ids = part_ids;
+        st.place_furniture(idx, Vec3::ZERO);
+        assert!(st.furniture_has_parts(0), "the placed ramp carries part ids");
+
+        let g = st.furniture_lib[idx].group_geom();
+        // Many pieces overall — the deck is ONE, but each rail and post is its own piece.
+        let bodies = g.body.iter().copied().max().unwrap() + 1;
+        assert!(bodies > 20, "rails + posts are many separate pieces, got {bodies}");
+    }
+
+    /// Painting a face is AUTHORITATIVE: it drops any whole-object texture so the rest of the
+    /// object doesn't stay masked (the "texture went on the whole object" bug).
+    #[test]
+    fn apply_face_texture_clears_whole_object_texture() {
+        let mut st = FactoryState::default();
+        let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
+        let idx = st.add_furniture_asset(
+            "box".into(),
+            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+        );
+        st.place_furniture(idx, Vec3::ZERO);
+        let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
+        // Start whole-object textured (as if applied in Whole-object mode first).
+        st.furniture[0].texture = Some(ti);
+        st.furniture[0].color = [0.3, 0.2, 0.1]; // a baked tint
+
+        let groups = st.furniture_lib[idx].group_geom();
+        let fg0 = groups.face[0];
+        st.apply_face_texture(0, &[fg0], ti);
+
+        assert_eq!(st.furniture[0].texture, None, "whole-object texture dropped");
+        assert_eq!(st.furniture[0].surface_texture.get(&fg0).copied(), Some(ti), "face textured");
+        // Only that one face is textured now; the rest are flat (no whole-object mask).
+        let fac = st.furniture_faceted(0).expect("faceted");
+        assert_eq!(fac.opaque.len(), 1);
+        assert_eq!(fac.opaque[0].2.len(), 6, "just the clicked face");
+        assert!(fac.flat.is_some(), "the rest is flat, not whole-object textured");
+    }
+
+    /// Tuning a PIECE's opacity/reflection must not touch the rest of the object: the piece gets
+    /// its OWN material (copy-on-write) so the whole-object texture is left intact. Regression for
+    /// "opacity/reflection get applied to the whole object instead of the selected piece".
+    #[test]
+    fn private_piece_material_isolates_from_the_whole_object() {
+        let mut st = FactoryState::default();
+        let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
+        let idx = st.add_furniture_asset(
+            "box".into(),
+            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+        );
+        st.place_furniture(idx, Vec3::ZERO);
+        let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
+        st.furniture[0].texture = Some(ti); // whole object textured with `ti`
+
+        let groups = st.furniture_lib[idx].group_geom();
+        let fg0 = groups.face[0];
+
+        // Tuning a piece seeded from the whole-object texture must CLONE (ti is used outside).
+        let piece_ti = st.private_piece_material(0, &[fg0]);
+        assert_ne!(piece_ti, ti, "the piece got its OWN copy, not the shared whole-object texture");
+        assert_eq!(st.furniture[0].surface_texture.get(&fg0).copied(), Some(piece_ti), "piece bound to its copy");
+        assert_eq!(st.furniture[0].texture, Some(ti), "the whole-object texture is left intact");
+
+        // Changing the piece's opacity leaves the whole-object texture's opacity unchanged.
+        st.textures[piece_ti].opacity = 0.3;
+        assert_eq!(st.textures[ti].opacity, 1.0, "whole-object opacity untouched");
+
+        // Idempotent: the piece already owns an exclusive material → no further clone.
+        let n = st.textures.len();
+        let again = st.private_piece_material(0, &[fg0]);
+        assert_eq!(again, piece_ti, "reuses the piece's own material");
+        assert_eq!(st.textures.len(), n, "no extra texture minted");
+    }
+
+    /// Tuning ONE CSG feature-solid's opacity/reflection must isolate to it (copy-on-write), and a
+    /// see-through feature routes its verts to the blended pass carrying the texture's opacity.
+    /// Regression for "opacity/reflection applied to the whole stair instead of the selected solid".
+    #[test]
+    fn private_feature_material_isolates_and_routes_transparency() {
+        let mut st = FactoryState::default();
+        // Two boxes → two features sharing one texture (as if the whole stair were textured at once).
+        let a = st.model.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        let b = st.model.push(BoolOp::Union, Plane::default(), Placement { u: 3.0, ..Default::default() }, Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        st.recompute();
+        let ti = st.add_texture("shared".into(), 1, 1, vec![200, 200, 210, 255]);
+        st.feature_texture.insert(a, ti);
+        st.feature_texture.insert(b, ti);
+        st.recompute();
+
+        // Tuning solid `a` alone must clone (ti is shared with `b`) and rebind only `a`.
+        let pa = st.private_feature_material(&[a]);
+        assert_ne!(pa, ti, "solid A got its own copy");
+        assert_eq!(st.feature_texture.get(&a).copied(), Some(pa), "A rebound to its copy");
+        assert_eq!(st.feature_texture.get(&b).copied(), Some(ti), "B still on the shared texture");
+
+        // Make A see-through; B stays opaque. The textured-feature verts split by opacity.
+        st.textures[pa].opacity = 0.3;
+        assert_eq!(st.textures[ti].opacity, 1.0, "B's texture opacity untouched");
+        let groups = st.feature_textured_meshes();
+        let a_verts = groups.iter().find(|(t, _)| *t == pa).map(|(_, v)| v).expect("A group");
+        let b_verts = groups.iter().find(|(t, _)| *t == ti).map(|(_, v)| v).expect("B group");
+        assert!(a_verts.iter().all(|v| (v.a - 0.3).abs() < 1e-3), "A carries its opacity → blended pass");
+        assert!(b_verts.iter().all(|v| v.a >= ALPHA_OPAQUE), "B stays opaque");
+    }
+
+    /// A TEXTURED piece with glass splits between the opaque image pass and the blended textured
+    /// pass: opaque faces keep their texture, glass faces carry per-vertex opacity and a distinct
+    /// buffer key. This is the textured-glass path (e.g. a glTF window whose frame is textured).
+    #[test]
+    fn textured_glass_splits_into_opaque_and_blended() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset(
+            "win".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], // frame (opaque)
+                    [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0], // glass (0.25)
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 6],
+                color: None,
+                alpha: vec![1.0, 1.0, 1.0, 0.25, 0.25, 0.25],
+            },
+        );
+        st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        let ti = st.add_texture("frame".into(), 2, 2, vec![255; 16]);
+        st.furniture[0].texture = Some(ti);
+
+        let (_ti1, opaque_key, opaque) = st.furniture_textured_mesh(0).expect("opaque textured tris");
+        assert_eq!(opaque.len(), 3, "only the frame triangle is opaque");
+        assert!(opaque.iter().all(|v| v.a >= ALPHA_OPAQUE), "opaque verts carry full opacity");
+
+        let (_ti2, glass_key, glass) = st.furniture_textured_translucent_mesh(0).expect("glass tris");
+        assert_eq!(glass.len(), 3, "only the glass triangle is translucent");
+        assert!(glass.iter().all(|v| (v.a - 0.25).abs() < 1e-6), "glass carries its opacity");
+        assert_ne!(opaque_key, glass_key, "opaque and glass use distinct GPU buffers");
+    }
+
+    /// Texturing a FEATURE moves its triangles out of the flat batch and into the textured
+    /// pass (same triangle count), so a wall/floor shows the image instead of a flat colour.
+    #[test]
+    fn feature_texture_moves_tris_to_the_textured_pass() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement::default(), Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+        );
+        st.recompute();
+        let id = st.model.features.last().unwrap().id;
+        let flat_before = st.scene_verts().len();
+        assert!(flat_before > 0);
+
+        let ti = st.add_texture("img".into(), 2, 2, vec![255; 16]);
+        st.feature_texture.insert(id, ti);
+
+        let flat_after = st.scene_verts().len();
+        assert!(flat_after < flat_before, "textured feature leaves the flat batch");
+
+        let groups = st.feature_textured_meshes();
+        assert_eq!(groups.len(), 1, "one texture group");
+        let (gi, verts) = &groups[0];
+        assert_eq!(*gi, ti);
+        assert_eq!(verts.len(), flat_before - flat_after, "moved tris == removed tris");
+        assert!(verts.iter().all(|v| v.s > 0.0 && v.s <= 1.0), "shade in (0,1]");
+    }
+
+    /// Textures + their assignments + tiling survive a sidecar round-trip (PNG/base64), and a
+    /// 2×2 image decodes back to the same pixels.
+    #[test]
+    fn textures_persist_through_the_sidecar() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        st.recompute();
+        let id = st.model.features.last().unwrap().id;
+        // A distinct 2×2 RGBA image so a decode error would be caught.
+        let px: Vec<u8> = vec![
+            255, 0, 0, 255,   0, 255, 0, 255,
+            0, 0, 255, 255,   255, 255, 0, 255,
+        ];
+        let ti = st.add_texture("img".into(), 2, 2, px.clone());
+        st.textures[ti].scale = 3.5;
+        st.feature_texture.insert(id, ti);
+
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+
+        assert_eq!(st2.textures.len(), 1, "texture restored");
+        assert_eq!(st2.textures[0].w, 2);
+        assert_eq!(st2.textures[0].rgba, px, "pixels round-trip exactly");
+        assert!((st2.textures[0].scale - 3.5).abs() < 1e-4, "tiling restored");
+        assert_eq!(st2.feature_texture.get(&id).copied(), Some(0), "assignment restored");
+    }
+
+    /// The sun light drives the CPU shading: enabling it makes a surface facing the sun brighter
+    /// than one facing away, and disabling it restores the fixed two-sided studio key light.
+    #[test]
+    fn sun_light_drives_directional_shading() {
+        use glam::Vec3;
+        // Disabled → the fixed two-sided key light (front and back shade equally under |n·dir|).
+        set_sun_light(false, Vec3::new(0.0, 0.0, 1.0), [1.0, 1.0, 1.0], [0.3, 0.3, 0.3], [0.2, 0.2, 0.2]);
+        let up = shade([1.0, 1.0, 1.0], Vec3::Z);
+        let down = shade([1.0, 1.0, 1.0], -Vec3::Z);
+        assert!((up[0] - down[0]).abs() < 1e-6, "studio light is two-sided");
+
+        // Enabled, sun straight up → an up-facing surface is lit, a down-facing one gets only ambient.
+        set_sun_light(true, Vec3::new(0.0, 0.0, 1.0), [1.0, 0.95, 0.85], [0.2, 0.22, 0.28], [0.1, 0.1, 0.1]);
+        let lit = shade([1.0, 1.0, 1.0], Vec3::Z);
+        let shadow = shade([1.0, 1.0, 1.0], -Vec3::Z);
+        assert!(lit[0] > shadow[0] + 0.3, "sun-facing brighter than shadow side: {lit:?} vs {shadow:?}");
+        // Reset so other tests see the default.
+        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], [0.32, 0.34, 0.40], [0.2, 0.19, 0.17]);
+    }
+
+    /// Clay mode overrides the shaded base colour to neutral grey (same for any input colour),
+    /// and turning it off restores the real colour.
+    #[test]
+    fn clay_mode_flattens_the_shade() {
+        use glam::Vec3;
+        set_sun_light(false, Vec3::Z, [1.0; 3], [0.3; 3], [0.2; 3]);
+        set_clay(true);
+        let red = shade([0.9, 0.1, 0.1], Vec3::Z);
+        let blue = shade([0.1, 0.1, 0.9], Vec3::Z);
+        assert!((red[0] - blue[0]).abs() < 1e-6 && (red[2] - blue[2]).abs() < 1e-6, "clay greys any colour the same");
+        set_clay(false);
+        let red2 = shade([0.9, 0.1, 0.1], Vec3::Z);
+        assert!(red2[0] > red2[2] + 0.2, "colour restored when clay off");
+    }
+
+    /// [`SunEnv::resolve`] returns a normalized daytime sun direction and a dimmer light at night.
+    #[test]
+    fn sun_env_resolves_day_and_night() {
+        let noon = SunEnv { enabled: true, hour: 13.0, ..Default::default() };
+        let (en, dir, sun, _sky, _gnd) = noon.resolve();
+        assert!(en && dir.z > 0.5, "midday sun is high");
+        assert!((dir.length() - 1.0).abs() < 1e-3, "unit direction");
+        let night = SunEnv { enabled: true, hour: 1.0, ..Default::default() };
+        let (_e, ndir, nsun, _s, _g) = night.resolve();
+        assert!(ndir.z < 0.0, "sun below horizon at 1 am");
+        assert!(nsun[0] < sun[0], "night direct light dimmer than noon");
+    }
+
+    /// Every library preset mints a usable material: unique (category, name), fields carried onto
+    /// the texture asset, glass translucent, metals metallic, emitters emitting.
+    #[test]
+    fn material_presets_build_into_assets() {
+        let presets = material_presets();
+        assert!(presets.len() >= 25, "a real library, not a stub: {}", presets.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut st = FactoryState::default();
+        for p in &presets {
+            assert!(seen.insert((p.category, p.name)), "duplicate preset {}/{}", p.category, p.name);
+            let idx = st.add_preset_material(p);
+            let t = &st.textures[idx];
+            assert_eq!(t.name, p.name);
+            assert!((t.metallic - p.metallic).abs() < 1e-6 && (t.roughness - p.roughness).abs() < 1e-6);
+            assert!(t.proc.is_some(), "every preset is procedural/solid (live-uniform driven)");
+        }
+        // Spot checks: glass see-through, chrome metallic-glossy, LED emits.
+        let glass = presets.iter().find(|p| p.name == "Clear glass").unwrap();
+        assert!(glass.opacity < 0.5);
+        let chrome = presets.iter().find(|p| p.name == "Chrome").unwrap();
+        assert!(chrome.metallic > 0.99 && chrome.roughness < 0.1);
+        let led = presets.iter().find(|p| p.name == "LED warm").unwrap();
+        assert!(led.emission_strength > 1.0);
+    }
+
+    /// PBR maps + roughness survive the sidecar round-trip and `has_pbr` reflects them.
+    #[test]
+    fn pbr_maps_persist() {
+        let mut st = FactoryState::default();
+        let base = st.add_texture("albedo".into(), 1, 1, vec![200, 180, 160, 255]);
+        let nrm = st.add_texture("normal".into(), 1, 1, vec![128, 128, 255, 255]);
+        st.textures[base].normal_map = Some(nrm);
+        st.textures[base].roughness = 0.2;
+        assert!(st.textures[base].has_pbr());
+
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        assert_eq!(st2.textures[base].normal_map, Some(nrm), "normal map index restored");
+        assert!((st2.textures[base].roughness - 0.2).abs() < 1e-4, "roughness restored");
+    }
+
+    /// A PROCEDURAL texture (wood grain) survives the sidecar round-trip — pattern + colours + grain
+    /// scale come back, and its 1×1 fallback swatch reflects the ramp midpoint.
+    #[test]
+    fn procedural_texture_persists() {
+        let mut st = FactoryState::default();
+        let def = ProcDef::oak();
+        let ti = st.add_procedural_texture("oak".into(), def);
+        assert!(st.textures[ti].proc.is_some(), "created as procedural");
+        assert_eq!(st.textures[ti].w, 1, "carries a 1×1 fallback swatch");
+        assert_eq!(st.textures[ti].proc.unwrap().pattern.mode(), 1, "wood mode");
+
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+
+        let p = st2.textures[0].proc.expect("procedural restored");
+        assert_eq!(p.pattern, ProcPattern::Wood);
+        assert_eq!(p.col_a, def.col_a);
+        assert_eq!(p.col_b, def.col_b);
+        assert_eq!(p.scale, def.scale);
+        assert!((p.detail - def.detail).abs() < 1e-4 && (p.contrast - def.contrast).abs() < 1e-4);
+    }
+
+    /// A furniture instance's PER-FACE textures survive the sidecar round-trip; a dangling texture
+    /// index is dropped on load.
+    #[test]
+    fn per_face_furniture_textures_persist() {
+        let mut st = FactoryState::default();
+        let (pos, nrm) = box_soup([0.0, 0.0, 0.0]);
+        let idx = st.add_furniture_asset(
+            "box".into(),
+            crate::mesh_io::ObjMesh { positions: pos, normals: nrm, color: None, alpha: Vec::new() },
+        );
+        st.place_furniture(idx, Vec3::ZERO);
+        let ti = st.add_texture("img".into(), 1, 1, vec![255; 4]);
+        st.furniture[0].surface_texture.insert(3, ti); // face-group 3 → texture 0
+        st.furniture[0].surface_texture.insert(9, ti);
+
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        let sm = &st2.furniture[0].surface_texture;
+        assert_eq!(sm.len(), 2, "both per-face assignments restored");
+        assert_eq!(sm.get(&3).copied(), Some(0));
+        assert_eq!(sm.get(&9).copied(), Some(0));
+    }
+
+    /// Texture MOVE (offset) + ROTATE persist through the sidecar alongside tiling.
+    #[test]
+    fn texture_move_and_rotate_persist() {
+        let mut st = FactoryState::default();
+        let ti = st.add_texture("t".into(), 2, 2, vec![200; 16]);
+        st.textures[ti].scale = 2.0;
+        st.textures[ti].offset = [0.25, -0.5];
+        st.textures[ti].rot_deg = 90.0;
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        let t = &st2.textures[0];
+        assert!((t.scale - 2.0).abs() < 1e-4, "tiling restored");
+        assert!((t.offset[0] - 0.25).abs() < 1e-4 && (t.offset[1] + 0.5).abs() < 1e-4, "move restored");
+        assert!((t.rot_deg - 90.0).abs() < 1e-3, "rotation restored");
+    }
+
+    /// `map_uv` — the one place tiling/move/rotate is applied. Identity at defaults; tiling scales
+    /// about the origin; offset shifts; a 90° rotation about the tile centre maps right→top.
+    #[test]
+    fn map_uv_applies_tiling_move_rotate() {
+        let mut t = TextureAsset::new("t".into(), 2, 2, vec![255; 16]);
+        assert_eq!(t.map_uv(0.3, 0.7), [0.3, 0.7], "identity at defaults");
+        t.scale = 2.0;
+        let uv = t.map_uv(1.0, 0.0);
+        assert!((uv[0] - 2.0).abs() < 1e-4 && uv[1].abs() < 1e-4, "tiling ×2: {uv:?}");
+        t.scale = 1.0;
+        t.offset = [0.1, 0.2];
+        let uv = t.map_uv(0.3, 0.7);
+        assert!((uv[0] - 0.4).abs() < 1e-4 && (uv[1] - 0.9).abs() < 1e-4, "offset shifts: {uv:?}");
+        t.offset = [0.0, 0.0];
+        t.rot_deg = 90.0;
+        let uv = t.map_uv(1.0, 0.5); // right-centre → top-centre under a 90° spin about (0.5,0.5)
+        assert!((uv[0] - 0.5).abs() < 1e-3 && (uv[1] - 1.0).abs() < 1e-3, "90° rotate: {uv:?}");
+    }
+
+    /// A per-SURFACE texture moves only that face's triangles out of the flat batch (the other
+    /// faces stay flat), and they show up in the textured pass under that texture.
+    #[test]
+    fn per_surface_texture_moves_only_that_face() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        st.recompute();
+        let flat_before = st.scene_verts().len();
+        assert!(flat_before > 12, "a box has several faces of triangles");
+
+        let ti = st.add_texture("img".into(), 2, 2, vec![255; 16]);
+        // Texture just the first triangle's surface (its coplanar face).
+        let fid = st.cached.face_ids[0];
+        let p = &st.cached.positions;
+        let key = surface_key(fid, p[0], p[1], p[2]);
+        st.surface_texture.insert(key, ti);
+
+        let flat_after = st.scene_verts().len();
+        assert!(flat_after < flat_before, "the painted face leaves the flat batch");
+        assert!(flat_after > 0, "the OTHER faces stay flat-shaded");
+
+        let groups = st.feature_textured_meshes();
+        assert_eq!(groups.len(), 1, "one texture group");
+        assert_eq!(groups[0].0, ti);
+        assert_eq!(groups[0].1.len(), flat_before - flat_after, "moved tris == removed tris");
+
+        // Round-trips through the sidecar.
+        let doc = st.to_persist();
+        let mut st2 = FactoryState::default();
+        st2.apply_persist(doc);
+        assert_eq!(st2.surface_texture.get(&key).copied(), Some(0), "surface texture restored");
     }
 }
 

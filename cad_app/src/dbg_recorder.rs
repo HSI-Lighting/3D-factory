@@ -260,6 +260,37 @@ pub enum DbgEvent {
         tris:            usize,
     },
 
+    /// 3D-Factory RENDER LOAD & FRAME COST — the "why did the app get slow after I imported
+    /// furniture" tap. Furniture is a triangle-soup mesh INSTANCE (not a CSG feature), so it
+    /// never appears in `FactoryOp`'s body/feature counts; a 90k-triangle couch can tank the
+    /// framerate while every other event looks normal. This makes that load VISIBLE.
+    ///
+    /// Two phases:
+    ///   * `buffer-rebuilt` — the opaque render buffer (solids + posed furniture) was rebuilt
+    ///     this frame (a furniture import / placement / pose / colour / geometry edit). Carries
+    ///     `build_us` (the CPU cost to transform + shade the whole buffer) and the resulting
+    ///     load. This is where the import's weight shows up: right after the import, one line
+    ///     says "94 247 tris, 6.7 MB, rebuilt in 12 ms".
+    ///   * `slow-frame` — a continuously-repainting frame (orbit / drag) that blew the refresh
+    ///     budget while the 3D view is open. Throttled so it can't flood the dump.
+    ///
+    /// Emitted only while recording. On a healthy, unchanging scene NEITHER phase fires (the
+    /// buffer is cached and served from an `Arc` with no rebuild), so it costs nothing.
+    FactoryPerf {
+        phase:            String,
+        /// Whole-frame wall time in µs (`slow-frame`); 0 when not measured.
+        frame_us:         u64,
+        /// CPU µs spent building the opaque vertex buffer this frame (0 on a cache hit).
+        build_us:         u64,
+        scene_tris:       usize,
+        furniture_insts:  usize,
+        /// Triangle count of the single heaviest placed furniture mesh — the usual culprit.
+        heaviest_tris:    usize,
+        /// Bytes re-uploaded to the GPU for the opaque buffer this frame.
+        upload_bytes:     usize,
+        cache_rebuilt:    bool,
+    },
+
     /// On-demand snapshot of the user-selected smart-dobject CANDIDATE —
     /// the full geometry (coordinates) of the chosen dobjects, whether an
     /// exploded set OR a block (then the block's DEFINITION-space contents
@@ -796,6 +827,27 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             } else { "" };
             format!(
                 "🧱 FACTORY [{op}] src={source}  feat {features_before}→{features_after}  bodies={bodies} tris={tris}{flag}\n         {detail}"
+            )
+        }
+        DbgEvent::FactoryPerf {
+            phase, frame_us, build_us, scene_tris, furniture_insts, heaviest_tris,
+            upload_bytes, cache_rebuilt,
+        } => {
+            let mb = *upload_bytes as f64 / (1024.0 * 1024.0);
+            let build_ms = *build_us as f64 / 1000.0;
+            // A frame @ 60 Hz is 16.7 ms — past that the user SEES the stall. Flag whichever
+            // cost blew the budget so a slow line stands out while skimming.
+            let slow = *frame_us >= 16_700 || *build_us >= 16_700;
+            let frame = if *frame_us > 0 {
+                format!("frame {:.1} ms  ", *frame_us as f64 / 1000.0)
+            } else {
+                String::new()
+            };
+            format!(
+                "📊 FACTORY PERF [{phase}]  {frame}build {build_ms:.1} ms  \
+                 tris={scene_tris} furn={furniture_insts} heaviest={heaviest_tris}  \
+                 upload={mb:.1} MB  rebuilt={cache_rebuilt}{}",
+                if slow { "  ⚠ SLOW" } else { "" },
             )
         }
         DbgEvent::GeometryCapture { label, entries } => {

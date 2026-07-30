@@ -17,6 +17,13 @@ use cad_kernel::Vec2 as KVec2;
 use glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+pub mod architecture; // staircase / spiral / ramp generators → SolidMesh
+pub mod dogleg; // parametric half-turn (dog-leg) staircase → editable CSG parts
+pub mod spiral; // parametric helical (spiral) staircase → editable CSG parts
+pub mod door; // parametric panelled door (leaf + lining + casing + hardware) → SolidMesh
+pub mod cupboard; // parametric cabinet configurator (grid of bays × tiers) → SolidMesh + per-part material
+pub mod kitchen; // parametric kitchen cabinet run (base + optional wall lanes, worktop, plinth) → SolidMesh
+pub mod cabin; // parametric handleless cabinet UNIT (close-range joinery: overlay fronts, grips, pin rows) → SolidMesh
 mod csg;
 pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
 pub mod draw;
@@ -248,6 +255,19 @@ pub struct Profile {
     pub pts: Vec<[f32; 2]>,
 }
 
+/// Stable key into [`Model::paths`] — same "key not index" rule as [`ProfileId`].
+pub type PathId = u32;
+
+/// An OPEN 3D polyline referenced by [`Primitive::Sweep`] — the route a cross-section is
+/// swept along. Unlike a [`Profile`] it is NOT closed and NOT recentred: it carries the
+/// tube's position in the primitive's local frame (the sweep places the centred profile at
+/// each of these points). Points are `[f32; 3]` for the same serde reason as `Profile`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Path {
+    pub id: PathId,
+    pub pts: Vec<[f32; 3]>,
+}
+
 /// Why a profile was refused. Reported, never swallowed: earcut's behaviour on a
 /// self-intersecting loop is undefined, and a non-watertight mesh would silently poison
 /// the light calc downstream.
@@ -302,6 +322,12 @@ pub enum Primitive {
     /// primitive. Profiles are IMMUTABLE once created (an edit mints a new one), so the
     /// cache cannot go stale.
     Extrusion { profile: ProfileId, h: f32, w: f32, d: f32 },
+    /// **Sweep** — a closed cross-section (`profile`) swept along an open path (`path`),
+    /// the section kept perpendicular to the path (csgrs `Sketch::sweep`). Both live in the
+    /// shared tables and are referenced by id (keeps `Primitive` `Copy`, same as
+    /// [`Primitive::Extrusion`]). `bmin`/`bmax` cache the local AABB so [`Primitive::local_aabb`]
+    /// stays a pure function without the `Model` (a swept solid's bounds aren't a simple box).
+    Sweep { profile: ProfileId, path: PathId, bmin: [f32; 3], bmax: [f32; 3] },
 }
 
 impl Primitive {
@@ -321,6 +347,7 @@ impl Primitive {
                 }
             }
             Primitive::Extrusion { .. } => "Extrusion",
+            Primitive::Sweep { .. } => "Sweep",
             Primitive::Torus { .. } => "Torus",
             Primitive::Capsule { .. } => "Capsule",
             Primitive::Tube { .. } => "Tube",
@@ -339,6 +366,8 @@ impl Primitive {
             Primitive::Extrusion { h, w, d, .. } => {
                 (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h))
             }
+            // Cached at creation — the swept solid's true bounds (path bbox ± section reach).
+            Primitive::Sweep { bmin, bmax, .. } => (Vec3::from(bmin), Vec3::from(bmax)),
             // sphere/ellipsoid are lifted so they REST on the plane
             Primitive::Sphere { r, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, 2.0 * r)),
             Primitive::Ellipsoid { rx, ry, rz, .. } => {
@@ -500,6 +529,9 @@ impl Feature {
             // Doing this properly means minting a scaled profile, which needs a
             // Model-level operation rather than a Feature-level one.
             Primitive::Extrusion { .. } => {}
+            // Same as Extrusion: shape lives in the shared profile/path tables, so it moves
+            // relative to the pivot but keeps its size.
+            Primitive::Sweep { .. } => {}
             Primitive::Capsule { r, h, .. } => {
                 *r = (*r * k).max(0.001);
                 *h = (*h * k).max(0.0); // 0 is legal — that IS a sphere
@@ -618,6 +650,90 @@ pub fn coplanar_face(positions: &[[f32; 3]], start: usize) -> Vec<usize> {
         }
     }
     face
+}
+
+/// Group a triangle soup into `(face_groups, body_groups)`, one id per triangle:
+/// * `face_groups[t]` — a maximal **coplanar-connected** region (triangles reachable through shared
+///   edges whose normal matches the seed's), i.e. one flat surface. Used for "paint this face".
+/// * `body_groups[t]` — a **connected component** (triangles reachable through shared edges, any
+///   normal), i.e. one welded sub-part. Used for "paint this whole piece".
+///
+/// Ids are dense (0..n). `positions` is the flat soup (3 verts per tri). Vertices are welded onto a
+/// grid so coincident-but-noisy edges still match — the same welding [`coplanar_face`] uses.
+pub fn surface_groups(positions: &[[f32; 3]]) -> (Vec<u32>, Vec<u32>) {
+    use std::collections::HashMap;
+    let ntri = positions.len() / 3;
+    let key = |p: [f32; 3]| -> (i64, i64, i64) {
+        let q = 1.0e4;
+        ((p[0] as f64 * q).round() as i64, (p[1] as f64 * q).round() as i64, (p[2] as f64 * q).round() as i64)
+    };
+    let edge = |t: usize, e: usize| {
+        let (mut a, mut b) = (key(positions[3 * t + e]), key(positions[3 * t + (e + 1) % 3]));
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        (a, b)
+    };
+    let normal = |t: usize| -> Vec3 {
+        let a = Vec3::from(positions[3 * t]);
+        let b = Vec3::from(positions[3 * t + 1]);
+        let c = Vec3::from(positions[3 * t + 2]);
+        (b - a).cross(c - a).normalize_or_zero()
+    };
+    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    for t in 0..ntri {
+        for e in 0..3 {
+            edges.entry(edge(t, e)).or_default().push(t);
+        }
+    }
+    // Connected components (bodies): any shared edge bridges.
+    let mut body = vec![u32::MAX; ntri];
+    let mut bid = 0u32;
+    for s in 0..ntri {
+        if body[s] != u32::MAX {
+            continue;
+        }
+        let mut stack = vec![s];
+        body[s] = bid;
+        while let Some(t) = stack.pop() {
+            for e in 0..3 {
+                if let Some(adj) = edges.get(&edge(t, e)) {
+                    for &nt in adj {
+                        if body[nt] == u32::MAX {
+                            body[nt] = bid;
+                            stack.push(nt);
+                        }
+                    }
+                }
+            }
+        }
+        bid += 1;
+    }
+    // Coplanar-connected regions (faces): a shared edge bridges only if the normal matches the seed.
+    let mut face = vec![u32::MAX; ntri];
+    let mut fid = 0u32;
+    for s in 0..ntri {
+        if face[s] != u32::MAX {
+            continue;
+        }
+        let n0 = normal(s);
+        let mut stack = vec![s];
+        face[s] = fid;
+        while let Some(t) = stack.pop() {
+            for e in 0..3 {
+                if let Some(adj) = edges.get(&edge(t, e)) {
+                    for &nt in adj {
+                        if face[nt] == u32::MAX && normal(nt).dot(n0) > 0.999 {
+                            face[nt] = fid;
+                            stack.push(nt);
+                        }
+                    }
+                }
+            }
+        }
+        fid += 1;
+    }
+    (face, body)
 }
 
 /// A free (arbitrary) construction plane: an orthonormal `(u, v)` frame at an
@@ -764,6 +880,10 @@ pub struct Model {
     /// outline never duplicates its geometry.
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    /// Open polylines referenced by [`Primitive::Sweep`] — the sweep paths. Same shared-table
+    /// pattern as `profiles`.
+    #[serde(default)]
+    pub paths: Vec<Path>,
     #[serde(skip)]
     pub sketches: Vec<Sketch>,
 }
@@ -834,6 +954,34 @@ impl Model {
         self.profiles.iter().find(|p| p.id == id)
     }
 
+    /// Store an OPEN sweep path and return `(id, bbox_min, bbox_max)`. Unlike a profile the
+    /// path is NOT recentred (it carries the tube's position) and NOT closed. Consecutive
+    /// duplicate points are dropped; `None` if fewer than 2 distinct points remain.
+    pub fn add_path(&mut self, pts: &[Vec3]) -> Option<(PathId, Vec3, Vec3)> {
+        let mut p: Vec<Vec3> = Vec::with_capacity(pts.len());
+        for &q in pts {
+            if p.last().is_none_or(|l: &Vec3| (*l - q).length() > 1e-6) {
+                p.push(q);
+            }
+        }
+        if p.len() < 2 {
+            return None;
+        }
+        let (mut mn, mut mx) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+        for q in &p {
+            mn = mn.min(*q);
+            mx = mx.max(*q);
+        }
+        let id = self.paths.iter().map(|x| x.id).max().map_or(1, |m| m + 1);
+        self.paths.push(Path { id, pts: p.iter().map(|q| [q.x, q.y, q.z]).collect() });
+        Some((id, mn, mx))
+    }
+
+    /// Look up a sweep path by id. `None` for a stale id — never panics.
+    pub fn path(&self, id: PathId) -> Option<&Path> {
+        self.paths.iter().find(|p| p.id == id)
+    }
+
     /// World-space triangle positions (3 per triangle) of one feature's raw mesh — for
     /// ray-pick against the real surface rather than the bounding box.
     pub fn feature_world_positions(&self, f: &Feature) -> Vec<[f32; 3]> {
@@ -875,6 +1023,39 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_groups_split_bodies_and_faces() {
+        // Two SEPARATE unit cubes (12 tris each) far apart → 2 bodies, 6 flat faces each = 12.
+        let cube = |o: [f32; 3], out: &mut Vec<[f32; 3]>| {
+            let v = |x: f32, y: f32, z: f32| [o[0] + x, o[1] + y, o[2] + z];
+            // 8 corners, 6 faces × 2 tris.
+            let c = [
+                v(0.0, 0.0, 0.0), v(1.0, 0.0, 0.0), v(1.0, 1.0, 0.0), v(0.0, 1.0, 0.0),
+                v(0.0, 0.0, 1.0), v(1.0, 0.0, 1.0), v(1.0, 1.0, 1.0), v(0.0, 1.0, 1.0),
+            ];
+            let quad = |a: usize, b: usize, cc: usize, d: usize, out: &mut Vec<[f32; 3]>| {
+                out.extend_from_slice(&[c[a], c[b], c[cc], c[a], c[cc], c[d]]);
+            };
+            quad(0, 1, 2, 3, out); // bottom
+            quad(4, 5, 6, 7, out); // top
+            quad(0, 1, 5, 4, out); // front
+            quad(3, 2, 6, 7, out); // back
+            quad(0, 3, 7, 4, out); // left
+            quad(1, 2, 6, 5, out); // right
+        };
+        let mut pos: Vec<[f32; 3]> = Vec::new();
+        cube([0.0, 0.0, 0.0], &mut pos);
+        cube([10.0, 0.0, 0.0], &mut pos);
+        let (face, body) = surface_groups(&pos);
+        assert_eq!(face.len(), pos.len() / 3);
+        let nbody = body.iter().copied().max().unwrap() + 1;
+        let nface = face.iter().copied().max().unwrap() + 1;
+        assert_eq!(nbody, 2, "two disjoint cubes → two bodies");
+        assert_eq!(nface, 12, "each cube has 6 flat faces → 12 total");
+        // Every triangle of cube 0 shares one body id, distinct from cube 1's.
+        assert_ne!(body[0], body[body.len() - 1], "the two cubes are different bodies");
+    }
 
     #[test]
     fn ray_hits_box_ahead_and_misses_beside() {

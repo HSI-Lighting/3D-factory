@@ -25,6 +25,8 @@ cad_solid  = { path = "../cad_solid" }
 glam       = "0.29"                       # SIMLUX 3D camera math (same version cad_light uses)
 miniz_oxide = "0.8"                       # zlib inflate for FBX binary arrays (furniture import); already in tree via image/png
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
+arboard    = "3"                          # read images from the OS clipboard (paste-as-texture); already in tree via egui-winit
+base64     = "0.22"                        # compact texture blobs in the sidecar (PNG bytes → base64)
 # Base eframe features shared across platforms. The Linux windowing backends
 # (wayland/x11) are added only on Linux below — on Windows eframe uses the
 # native Win32 backend automatically and those crates don't compile.

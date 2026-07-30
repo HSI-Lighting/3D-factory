@@ -526,6 +526,196 @@ const ALL_ARC_METHODS: &[ArcMethod] = &[
 /// Build an axis-aligned rectangle (CLOSED 4-vertex Polyline) from two
 /// opposite corners. Vertices are emitted CCW-ish in corner order; `closed`
 /// makes the 4th→1st edge implicit. Mirrors AutoCAD RECTANG (one LWPOLYLINE).
+/// A file operation running on a BACKGROUND worker thread, shown as a modal loading/saving
+/// overlay. The UI thread never blocks on the read/parse/serialize/write — it paints the
+/// overlay once (`painted`), then spawns the worker (`rx` becomes `Some`) and polls it each
+/// frame. Because the UI thread keeps returning, Windows can never mark the window
+/// "(Not Responding)" no matter how large the project is.
+struct BusyOp {
+    kind: BusyKind,
+    path: String,
+    subtitle: String,
+    started: std::time::Instant,
+    est_ms: u64,
+    /// The overlay has been rendered at least once — safe to spawn the worker next frame.
+    painted: bool,
+    /// Worker result channel. `None` until the worker is spawned (one frame after `painted`).
+    rx: Option<std::sync::mpsc::Receiver<BusyMsg>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BusyKind { Load, Save }
+
+/// What a background file worker sends back when it finishes.
+enum BusyMsg {
+    Loaded(Result<Box<LoadPayload>, String>),
+    Saved(Result<SavePayload, String>),
+}
+
+/// Everything a load worker parsed OFF the UI thread. Installing it into the app
+/// (`apply_loaded`) is fast and happens back on the main thread.
+struct LoadPayload {
+    doc: Document,
+    /// The parsed SIMLUX sidecar, if one exists beside the drawing. Its `factory.furniture_lib`
+    /// has been drained — the decoded meshes are in `furniture` below.
+    sidecar: Option<crate::simlux_io::SimluxConfig>,
+    /// Furniture meshes DECODED on the worker (blob → verts + AABB) — the multi-second part of a
+    /// load, kept off the UI thread. Empty when there is no sidecar.
+    furniture: Vec<crate::factory::FurnitureAsset>,
+    /// Per-stage timings (ms) captured in the worker, re-emitted to the recorder on the main
+    /// thread: `(read, parse, sidecar-read+parse, furniture-decode)`.
+    read_ms: u64,
+    parse_ms: u64,
+    sidecar_ms: u64,
+    furn_ms: u64,
+}
+
+/// Result of a save worker: bytes written + a note for the history log.
+struct SavePayload {
+    bytes: usize,
+    note: String,
+}
+
+/// The file's stem (name without directory or extension), for the overlay subtitle.
+fn file_stem_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Resolve a BUNDLED asset path (e.g. `assets/architecture/normal_stairs.fbx`) to a real file,
+/// searching the current directory AND locations relative to the executable — so a bundled model
+/// loads whether the app was launched from the repo root (`cargo run`, cwd = root) or by
+/// double-clicking `target/debug/simlux.exe` (cwd elsewhere; the assets sit two levels up from the
+/// exe). Returns the first existing candidate, or `None` if the asset genuinely isn't on disk.
+#[allow(dead_code)] // kept for future bundled-asset loads (e.g. retrofitting aperture paths)
+fn resolve_asset_path(rel: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut tries: Vec<PathBuf> = vec![PathBuf::from(rel)];
+    if let Ok(exe) = std::env::current_exe() {
+        // Walk up a few levels from the exe dir (…/target/debug/, …/target/release/, or a
+        // packaged bin dir) looking for `<ancestor>/<rel>`.
+        let mut dir = exe.parent();
+        for _ in 0..4 {
+            let Some(d) = dir else { break };
+            tries.push(d.join(rel));
+            dir = d.parent();
+        }
+    }
+    tries.into_iter().find(|p| p.exists())
+}
+
+/// Read + parse a drawing (and its SIMLUX sidecar) entirely OFF the UI thread. A pure function
+/// of the path, so it runs on a worker; `CadApp::apply_loaded` installs the result on the main
+/// thread. This is what makes a 22-second load stop freezing the window — all the reading and
+/// `serde` parsing happens here while the UI keeps painting the "Loading…" overlay.
+fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
+    let lower = path.to_ascii_lowercase();
+    let t = std::time::Instant::now();
+    // ---- read + parse the 2D document (DWG is converted to DXF first) -----------------
+    let (doc, read_ms, parse_ms) = if lower.ends_with(".dxf") {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read '{path}': {e}"))?;
+        let read_ms = t.elapsed().as_millis() as u64;
+        let t2 = std::time::Instant::now();
+        let doc = cad_io::dxf::read_dxf(&text).map_err(|e| format!("parse dxf: {e}"))?;
+        (doc, read_ms, t2.elapsed().as_millis() as u64)
+    } else if lower.ends_with(".rsm") {
+        let bytes = std::fs::read(path).map_err(|e| format!("read '{path}': {e}"))?;
+        let read_ms = t.elapsed().as_millis() as u64;
+        let t2 = std::time::Instant::now();
+        let doc = cad_io::rsm::read_rsm(&bytes).map_err(|e| format!("parse rsm: {e}"))?;
+        (doc, read_ms, t2.elapsed().as_millis() as u64)
+    } else if lower.ends_with(".dwg") {
+        let conv = dwg_converter().ok_or_else(|| {
+            "no DWG converter found — set RUSTCAD_DWGCONV or build tools/dwgconv".to_string()
+        })?;
+        let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
+        run_dwg_conversion(&conv, path, &out)?;
+        let text = std::fs::read_to_string(&out).map_err(|e| format!("read converted dxf: {e}"))?;
+        let read_ms = t.elapsed().as_millis() as u64;
+        let t2 = std::time::Instant::now();
+        let doc = cad_io::dxf::read_dxf(&text).map_err(|e| format!("parse dxf: {e}"))?;
+        (doc, read_ms, t2.elapsed().as_millis() as u64)
+    } else {
+        return Err(format!("unknown extension on '{path}': expected .dxf, .dwg or .rsm"));
+    };
+    // ---- read + parse the SIMLUX sidecar (historically the slow, freezing stage) ------
+    let t3 = std::time::Instant::now();
+    let mut sidecar = crate::simlux_io::load(std::path::Path::new(path))
+        .map_err(|e| format!("sidecar: {e}"))?;
+    let sidecar_ms = t3.elapsed().as_millis() as u64;
+    // ---- decode furniture geometry HERE, off the UI thread ----------------------------
+    // A 2M-triangle asset is ~74 MB of floats; decoding it (base64+inflate) + computing its
+    // AABB took ~8 s on the main thread and froze the window. Draining it into `furniture`
+    // means the main-thread install just moves ready meshes in.
+    let t4 = std::time::Instant::now();
+    let furniture = match sidecar.as_mut() {
+        Some(cfg) => crate::factory::FactoryState::decode_furniture_lib(
+            std::mem::take(&mut cfg.factory.furniture_lib),
+        ),
+        None => Vec::new(),
+    };
+    let furn_ms = t4.elapsed().as_millis() as u64;
+    Ok(Box::new(LoadPayload { doc, sidecar, furniture, read_ms, parse_ms, sidecar_ms, furn_ms }))
+}
+
+/// Serialize + write a drawing and its SIMLUX sidecar entirely OFF the UI thread. The caller
+/// (`spawn_busy_worker`) has already cloned the doc and built `cfg` on the main thread, so this
+/// worker only does the heavy `serde`/IO — keeping the "Saving…" overlay animating smoothly.
+/// Write `bytes` to `path` atomically: to a sibling temp file, then rename over the target.
+/// `std::fs::rename` replaces the destination on Windows and POSIX, so a reader never sees a
+/// half-written file and an interrupted write leaves the previous file untouched.
+fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.savetmp");
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => { let _ = std::fs::remove_file(&tmp); Err(e) }
+    }
+}
+
+fn save_file_worker(
+    path: &str,
+    doc: Document,
+    mut cfg: crate::simlux_io::SimluxConfig,
+    furn_geom: Vec<crate::factory::FurnitureGeomRaw>,
+) -> Result<SavePayload, String> {
+    // Compress furniture geometry HERE (deflate of tens of MB) — the expensive part of a save,
+    // kept off the UI thread. `cfg` came from `build_simlux_config_lite` with empty blobs, in
+    // the same order as `furn_geom`.
+    for (rec, g) in cfg.factory.furniture_lib.iter_mut().zip(furn_geom.iter()) {
+        rec.pos_b64 = crate::factory::encode_f32_blob(&g.pos);
+        rec.nrm_b64 = crate::factory::encode_f32_blob(&g.nrm);
+        rec.uv_b64 = if g.uv.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.uv) };
+        rec.alpha_b64 = if g.alpha.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.alpha) };
+    }
+    let lower = path.to_ascii_lowercase();
+    let bytes: Vec<u8> = if lower.ends_with(".dxf") {
+        cad_io::dxf::write_dxf(&doc).into_bytes()
+    } else if lower.ends_with(".rsm") {
+        cad_io::rsm::write_rsm(&doc)
+    } else {
+        return Err("unknown extension (expected .dxf or .rsm)".to_string());
+    };
+    // Write ATOMICALLY (temp file + rename) so an interrupted write — e.g. a crash or a close
+    // during an autosave — can never truncate the real file; the rename either happens whole or
+    // not at all, leaving the previous good file intact.
+    atomic_write(path, &bytes).map_err(|e| format!("write '{path}': {e}"))?;
+    // The sidecar is always written (matching the old synchronous path); it carries SIMLUX +
+    // the 3D model. Any sidecar failure is reported but does not fail the drawing save.
+    let solids = cfg.factory.model.features.len();
+    let walls = cfg.factory.walls.len();
+    let note = match crate::simlux_io::save(std::path::Path::new(path), &cfg) {
+        Ok(_) if solids > 0 => format!(
+            "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s)",
+            path, bytes.len(), solids, walls),
+        Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX", path, bytes.len()),
+        Err(e) => format!("  saved '{}'  ({} bytes) · ! SIMLUX save: {}", path, bytes.len(), e),
+    };
+    Ok(SavePayload { bytes: bytes.len(), note })
+}
+
 fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
     let v = |x: f64, y: f64| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
     Geom::Polyline(Polyline {
@@ -898,6 +1088,42 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::Spline,   _) => "spline: keep clicking control points; Enter finishes (open)",
         (Tool::Arc,    _) => arc_method.hint(n),
     }
+}
+
+/// Which generator the Architecture modal is editing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchTab {
+    Staircase,
+    Spiral,
+    Ramp,
+    /// Parametric half-turn (dog-leg) stair — built as EDITABLE, boolean-able CSG solids.
+    Dogleg,
+    /// Parametric helical (spiral) stair — built as EDITABLE, boolean-able CSG solids.
+    SpiralCsg,
+    /// Parametric panelled door — built as a furniture mesh (leaf + lining + casing + hardware).
+    Door,
+    /// Parametric helical (spiral) ramp — a sloped annular deck with balustrades, as a furniture mesh.
+    HelicalRamp,
+    /// Parametric cabinet configurator — a grid of bays × tiers, each cell independently filled.
+    Cupboard,
+    /// Parametric kitchen cabinet run — base + optional wall lanes, worktop, plinth, tall units.
+    Kitchen,
+    /// Parametric handleless cabinet UNIT — close-range joinery, overlay outline fronts, grips.
+    Cabin,
+}
+
+/// Build the sun's light-space matrix (orthographic, framed to the scene AABB) for the shadow map.
+/// `dir` points TO the sun; the light looks back along `-dir` at the scene centre.
+fn sun_light_matrix(mn: glam::Vec3, mx: glam::Vec3, dir: glam::Vec3) -> [f32; 16] {
+    let center = (mn + mx) * 0.5;
+    let radius = ((mx - mn) * 0.5).length().max(0.5);
+    let d = dir.normalize_or_zero();
+    let up = if d.z.abs() > 0.95 { glam::Vec3::Y } else { glam::Vec3::Z };
+    let eye = center + d * (radius * 2.0);
+    let view = glam::Mat4::look_at_rh(eye, center, up);
+    let r = radius * 1.1;
+    let proj = glam::Mat4::orthographic_rh_gl(-r, r, -r, r, radius * 0.1, radius * 3.9);
+    (proj * view).to_cols_array()
 }
 
 pub struct CadApp {
@@ -1363,6 +1589,32 @@ pub struct CadApp {
     light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
+    /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
+    /// (scene changed — e.g. a furniture import) is detected by `Arc` identity; the instant
+    /// of the previous 3D frame, for the whole-frame delta; and a throttle so `slow-frame`
+    /// events can't flood the dump. Purely diagnostic — all `None` until the 3D view paints.
+    factory_perf_prev: Option<StdArc<Vec<crate::light3d::V3>>>,
+    factory_perf_last_frame: Option<std::time::Instant>,
+    factory_perf_last_slow: Option<std::time::Instant>,
+    /// LOCAL mesh of the furniture currently being dragged (instance idx + baked verts), built
+    /// once per drag and drawn via a GPU model matrix so a move/rotate keeps full form without
+    /// re-transforming vertices each frame. `None` when not dragging furniture.
+    /// Cache of furniture LOCAL meshes (baked once, keyed by asset+colour), handed to the
+    /// renderer which uploads each to its own GPU buffer once. Furniture is then drawn with
+    /// just a model matrix — never CPU-transformed on import/move/rotate, however heavy.
+    furniture_gpu_meshes: std::collections::HashMap<u64, StdArc<Vec<crate::light3d::V3>>>,
+    /// Per-key TEXTURED furniture meshes (box-projected UVs), cached like `furniture_gpu_meshes`
+    /// so a textured piece is built once and drawn from a persistent GPU buffer thereafter.
+    furniture_tex_meshes: std::collections::HashMap<u64, StdArc<Vec<crate::light3d::TexVtx>>>,
+    /// Per-key TRANSLUCENT furniture meshes (glass panes), cached like `furniture_gpu_meshes`
+    /// so the see-through triangles are built once and drawn from a persistent GPU buffer.
+    furniture_transp_meshes: std::collections::HashMap<u64, StdArc<Vec<crate::light3d::V3A>>>,
+    /// Clipboard-texture pixels shared into the GL paint closure as `Arc` (cheap per-frame
+    /// clone, no pixel copy). The renderer uploads each to a GL texture once, keyed by index.
+    texture_rgba: std::collections::HashMap<usize, StdArc<Vec<u8>>>,
+    /// Version of the opaque CSG buffer's GPU upload, bumped only when the scene actually
+    /// changes — so a static scene isn't re-uploaded every frame.
+    factory_scene_ver: u64,
     /// Which viewport is ACTIVE (last interacted with) — the modifier dispatch signal.
     active_view: ActiveView,
     /// O(1) "is dobject i selected?" lookup for the DRAW LOOP, rebuilt once per frame.
@@ -1496,6 +1748,80 @@ pub struct CadApp {
     /// Path of the currently open/saved drawing — set on successful open/save.
     /// `Save` writes here directly; `None` falls back to Save As.
     current_file: Option<std::path::PathBuf>,
+    /// True when the drawing has edits not yet written to disk. Set on every snapshot (an edit),
+    /// cleared on open/save. Drives the close-confirmation prompt so an accidental window-close
+    /// can't silently discard work.
+    unsaved: bool,
+    /// While `true`, the "You have unsaved changes" modal is showing (a window/menu close was
+    /// vetoed and is waiting on the user's Save / Don't Save / Cancel choice).
+    close_confirm: bool,
+    /// Architecture generator modal (staircase / spiral / ramp): open flag, active tab, and the
+    /// live parameter sets. Kept on the app so edits persist while the dialog is open.
+    arch_modal_open: bool,
+    /// The ☀ Sun / daylight settings window is open.
+    sun_modal_open: bool,
+    /// The 🎨 Materials Factory (node-based material editor) window is open.
+    materials_open: bool,
+    /// Materials Factory authoring state (per-material node graphs + canvas interaction).
+    materials: MaterialsFactoryState,
+    /// The ⏺ Render (path tracer) window is open.
+    render_modal_open: bool,
+    /// The running/finished path-trace job, its live preview texture, and the last pass uploaded.
+    pt_job: Option<crate::pathtrace::RenderJob>,
+    /// The GPU render job (fragment-shader tracer), stepped from the UI thread each frame.
+    pt_gpu: Option<crate::pathtrace_gpu::GpuTracer>,
+    /// The app's glow context, captured from eframe each frame — the GPU tracer renders on it.
+    pt_gl: Option<StdArc<eframe::glow::Context>>,
+    pt_preview: Option<egui::TextureHandle>,
+    pt_last_pass: u32,
+    /// A background Radiance pipeline run + its result window state.
+    rad_job: Option<StdArc<Mutex<RadState>>>,
+    rad_started: Option<std::time::Instant>,
+    rad_preview: Option<egui::TextureHandle>,
+    rad_loaded: bool,
+    /// Render settings chosen in the dialog.
+    pt_device: crate::pathtrace::Device,
+    pt_res: u32,
+    pt_passes: u32,
+    /// One-shot: on the first frame, auto-load the villa test model (for texture + Radiance testing).
+    villa_autoloaded: bool,
+    arch_tab: ArchTab,
+    arch_stair: cad_solid::architecture::StairParams,
+    arch_spiral: cad_solid::architecture::SpiralParams,
+    arch_ramp: cad_solid::architecture::RampParams,
+    arch_dogleg: cad_solid::dogleg::DoglegInput,
+    arch_dogleg_treads: bool,
+    arch_spiral_csg: cad_solid::spiral::SpiralInput,
+    arch_door: cad_solid::door::DoorInput,
+    arch_helical: cad_solid::architecture::HelicalRampParams,
+    arch_cupboard: cad_solid::cupboard::CupboardInput,
+    arch_kitchen: cad_solid::kitchen::KitchenInput,
+    arch_cabin: cad_solid::cabin::CabinInput,
+    /// Set when the user chose "Save and close": the async save is running, and [`Self::apply_saved`]
+    /// will close the window once the bytes are on disk.
+    close_after_save: bool,
+    /// One-shot: send the real close command next frame (the point where `ctx` is available), with
+    /// `unsaved` already cleared so the close isn't vetoed again.
+    pending_close: bool,
+    /// Autosave: silently re-save the CURRENT file in the background every few minutes when there
+    /// are unsaved edits, so a crash or power loss can't wipe an afternoon's work. On by default;
+    /// only ever writes to an already-saved `.dxf`/`.rsm` (never an untitled doc).
+    autosave_on: bool,
+    /// The background autosave worker's result channel while one is running (`None` = idle).
+    autosave_rx: Option<std::sync::mpsc::Receiver<BusyMsg>>,
+    /// When the last autosave fired — the interval timer.
+    last_autosave: std::time::Instant,
+    /// Monotonic edit counter, bumped on every snapshot (2D or 3D). An autosave records the value
+    /// it captured; on completion it clears `unsaved` ONLY if the counter is unchanged — so an edit
+    /// made WHILE the save ran is not mistaken for saved.
+    edit_seq: u64,
+    /// The `edit_seq` value captured when the running autosave was spawned.
+    autosave_seq: u64,
+    /// A pending load/save shown behind a modal progress overlay (see [`BusyOp`]).
+    busy: Option<BusyOp>,
+    /// Last measured open / save durations (ms), so the overlay's time estimate self-calibrates.
+    last_load_ms: u64,
+    last_save_ms: u64,
     /// Clipboard for Copy / Paste — clones of the copied dobjects. Paste
     /// re-adds them with fresh handles (via `DObject::with_style`).
     clipboard_dobjects: Vec<DObject>,
@@ -1709,6 +2035,13 @@ pub struct FactorySnap {
     furniture: Vec<crate::factory::FurnitureInst>,
     feature_color: std::collections::HashMap<u32, [f32; 3]>,
     surface_color: std::collections::HashMap<crate::factory::SurfaceKey, [f32; 3]>,
+    feature_texture: std::collections::HashMap<u32, usize>,
+    surface_texture: std::collections::HashMap<crate::factory::SurfaceKey, usize>,
+    /// Feature groups (`feature_id → group_id`) so Group / Explode are undoable.
+    feature_group: std::collections::HashMap<u32, u32>,
+    /// Per-texture (tiling, move, rotate, opacity, reflect) — the LIGHT parts, so those edits are
+    /// undoable WITHOUT cloning every texture's pixels into every 3D-edit snapshot.
+    texture_xforms: Vec<(f32, [f32; 2], f32, f32, f32)>,
 }
 
 /// One reversible step.
@@ -2314,7 +2647,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -2867,6 +3200,38 @@ impl ActiveView {
     }
 }
 
+/// Transient authoring state for the **Materials Factory** node editor. The node graphs live here,
+/// keyed by texture index; each is seeded from its [`crate::factory::TextureAsset`] on first open and
+/// compiled back onto it on every edit, so nothing extra is persisted (the material's flat fields
+/// already round-trip). See [`crate::material_graph`].
+#[derive(Default)]
+pub struct MaterialsFactoryState {
+    /// The material (texture index) currently being edited.
+    pub sel: Option<usize>,
+    /// One authoring graph per material, built lazily.
+    pub graphs: std::collections::HashMap<usize, crate::material_graph::MaterialGraph>,
+    /// Canvas pan offset (screen px).
+    pub pan: egui::Vec2,
+    /// A wire being dragged from an OUTPUT socket `(node_id, out_index)` toward an input.
+    pub drag_from: Option<(crate::material_graph::NodeId, u8)>,
+    /// A node being dragged by its header `(node_id)` — so the header owns the drag, not the canvas.
+    pub drag_node: Option<crate::material_graph::NodeId>,
+    /// The node selected on the canvas (its properties show in the inspector).
+    pub sel_node: Option<crate::material_graph::NodeId>,
+}
+
+/// State of a background Radiance run (`render.bat`: oconv → rpict → pfilt → ra_bmp), shared
+/// between the worker thread and the "Radiance — offline render" window.
+pub struct RadState {
+    pub done: bool,
+    pub ok: bool,
+    /// Combined stdout+stderr of the pipeline (shown when it fails).
+    pub log: String,
+    /// The finished `render.bmp` as RGBA8.
+    pub image: Option<(usize, usize, Vec<u8>)>,
+    pub dir: std::path::PathBuf,
+}
+
 impl Default for CadApp {
     fn default() -> Self {
         // Build the command registry from the seed arrays FIRST, then derive the
@@ -3015,6 +3380,14 @@ impl Default for CadApp {
             light:               crate::light::LightState::new(),
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             factory:             crate::factory::FactoryState::default(),
+            factory_perf_prev:       None,
+            factory_perf_last_frame: None,
+            factory_perf_last_slow:  None,
+            furniture_gpu_meshes:    std::collections::HashMap::new(),
+            furniture_tex_meshes:    std::collections::HashMap::new(),
+            furniture_transp_meshes: std::collections::HashMap::new(),
+            texture_rgba:            std::collections::HashMap::new(),
+            factory_scene_ver:       0,
             active_view:         ActiveView::TwoD,
             sel_mask:            Vec::new(),
             gpu_dirty:    true,
@@ -3049,6 +3422,48 @@ impl Default for CadApp {
             file_dialog_dir: None,
             file_preview: None,
             current_file: None,
+            unsaved: false,
+            close_confirm: false,
+            arch_modal_open: false,
+            sun_modal_open: false,
+            materials_open: false,
+            materials: MaterialsFactoryState::default(),
+            render_modal_open: false,
+            pt_job: None,
+            pt_gpu: None,
+            pt_gl: None,
+            pt_preview: None,
+            pt_last_pass: 0,
+            rad_job: None,
+            rad_started: None,
+            rad_preview: None,
+            rad_loaded: false,
+            pt_device: crate::pathtrace::Device::Gpu, // falls back to CPU if the driver refuses
+            pt_res: 1,
+            pt_passes: 64,
+            villa_autoloaded: false,
+            arch_tab: ArchTab::Staircase,
+            arch_stair: cad_solid::architecture::StairParams::default(),
+            arch_spiral: cad_solid::architecture::SpiralParams::default(),
+            arch_ramp: cad_solid::architecture::RampParams::default(),
+            arch_dogleg: cad_solid::dogleg::DoglegInput::default(),
+            arch_dogleg_treads: true,
+            arch_spiral_csg: cad_solid::spiral::SpiralInput::default(),
+            arch_door: cad_solid::door::DoorInput::default(),
+            arch_helical: cad_solid::architecture::HelicalRampParams::default(),
+            arch_cupboard: cad_solid::cupboard::CupboardInput::default(),
+            arch_kitchen: cad_solid::kitchen::KitchenInput::default(),
+            arch_cabin: cad_solid::cabin::CabinInput::default(),
+            close_after_save: false,
+            pending_close: false,
+            autosave_on: true,
+            autosave_rx: None,
+            last_autosave: std::time::Instant::now(),
+            edit_seq: 0,
+            autosave_seq: 0,
+            busy: None,
+            last_load_ms: 1200, // seeded; self-calibrates after the first real open/save
+            last_save_ms: 400,
             clipboard_dobjects: Vec::new(),
             paste_state: PasteState::Off,
             pedit_state: PeditState::Off,
@@ -3721,10 +4136,621 @@ impl CadApp {
         if let Some(c) = self.factory_color_palette(ui) {
             self.apply_color_to_selection(c);
         }
+        self.factory_texture_section(ui);
+    }
+
+    /// Texture controls for the current selection — only shown when it carries a pasted
+    /// texture. Lets the user retune the tiling (image repeats) and remove the texture.
+    fn factory_texture_section(&mut self, ui: &mut egui::Ui) {
+        // PER-SURFACE apply mode — shown whenever a FURNITURE object is selected, so the user can
+        // choose Whole object / Face / Piece BEFORE picking a texture from the Textures menu.
+        if let Some(fi) = self.factory.sel_furniture {
+            use crate::factory::FurnPaintMode as M;
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("Apply texture to").small().weak());
+            let mut mode = self.factory.furn_paint_mode;
+            let label = |m: M| match m {
+                M::WholeObject => "Whole object",
+                M::Face => "One face",
+                M::Piece => "One piece",
+            };
+            // A ComboBox (not a 3-button row) so it fits the narrow properties column.
+            egui::ComboBox::from_id_salt("furn_tex_mode")
+                .selected_text(label(mode))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut mode, M::WholeObject, label(M::WholeObject))
+                        .on_hover_text("A picked texture covers the entire object.");
+                    ui.selectable_value(&mut mode, M::Face, label(M::Face))
+                        .on_hover_text("Pick a texture, then click a flat face to texture just that surface.");
+                    ui.selectable_value(&mut mode, M::Piece, label(M::Piece))
+                        .on_hover_text("Pick a texture, then click a connected sub-part to texture the whole piece.");
+                });
+            if mode != self.factory.furn_paint_mode {
+                self.factory.furn_paint_mode = mode;
+                if mode == M::WholeObject {
+                    self.factory.furn_tex_brush = None; // leaving paint mode disarms the brush
+                    self.factory.furn_face_sel = None;
+                }
+            }
+            if mode != M::WholeObject {
+                let has_sel = self.factory.furn_face_sel.as_ref().map_or(false, |(f, _)| *f == fi);
+                let armed = self.factory.furn_tex_brush.is_some();
+                let msg = if armed {
+                    "  ▸ click faces of the object to texture them"
+                } else if has_sel {
+                    "  ▸ face selected — pick a texture (▼ Textures) to apply"
+                } else {
+                    "  ▸ click a face of the object, then pick a texture (▼ Textures)"
+                };
+                ui.label(egui::RichText::new(msg).small().color(crate::theme::color::ACCENT));
+            }
+            let has_faces = self.factory.furniture.get(fi).map_or(false, |f| !f.surface_texture.is_empty());
+            if has_faces
+                && ui.small_button(egui::RichText::new("Clear per-face textures").color(egui::Color32::from_rgb(230, 170, 170))).clicked()
+            {
+                self.snapshot_factory();
+                if let Some(f) = self.factory.furniture.get_mut(fi) { f.surface_texture.clear(); }
+                self.factory.status = "per-face textures cleared".into();
+            }
+        }
+
+        // Inline texture picker — apply or CHANGE a texture RIGHT HERE on the object (not only via
+        // the ▼ Textures menu). Colour and texture are the same surface property, so they sit
+        // together: pick a colour swatch above, or a texture here.
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Texture").small().weak());
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .small_button("📂 Load…")
+                .on_hover_text("Apply an image file (PNG/JPG) to the selection — e.g. the bundled CC0 textures")
+                .clicked()
+            {
+                let cc0 = std::path::Path::new("assets/cc0/textures");
+                if cc0.is_dir() {
+                    self.file_dialog_dir = Some(cc0.to_path_buf());
+                }
+                self.open_file_dialog(FileDialogMode::ImportTexture, "");
+            }
+            if ui
+                .small_button("🖼 Paste")
+                .on_hover_text("Apply the image currently on the clipboard")
+                .clicked()
+            {
+                self.paste_texture_onto_selection();
+            }
+            if ui
+                .small_button("🌫 Procedural…")
+                .on_hover_text("Apply a shader-evaluated material (wood grain, marble, noise, checker) — no image needed, and it runs continuously across every piece. Edit its pattern/colours below.")
+                .clicked()
+            {
+                let i = self.factory.add_procedural_texture("Procedural wood".into(), crate::factory::ProcDef::oak());
+                self.apply_texture_index_to_selection(i, "Procedural wood", 1, 1);
+            }
+        });
+        // The library of every texture captured so far — click one to apply or CHANGE the texture.
+        if let Some(i) = self.factory_texture_library(ui) {
+            if let Some(t) = self.factory.textures.get(i) {
+                let (name, w, h) = (t.name.clone(), t.w, t.h);
+                self.apply_texture_index_to_selection(i, &name, w, h);
+            }
+        }
+
+        // WHAT are we tuning? A selected face/piece has its OWN material (so opacity/reflection/
+        // tiling land on JUST that piece); otherwise the whole object / feature. `face_sel` is the
+        // active per-face selection on the selected furniture (in Face/Piece mode).
+        let face_sel: Option<(usize, Vec<u32>)> = if let Some(fi) = self.factory.sel_furniture {
+            if self.factory.furn_paint_mode != crate::factory::FurnPaintMode::WholeObject {
+                self.factory.furn_face_sel.clone().filter(|(f, _)| *f == fi)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // Selected CSG feature-solid(s) — e.g. individual treads of a boolean stair. Each gets its
+        // own material on tune (copy-on-write), so opacity/reflection land on JUST those solids.
+        let feat_sel: Option<Vec<u32>> = if self.factory.sel_furniture.is_none() && !self.factory.selection.is_empty() {
+            Some(self.factory.selection.clone())
+        } else {
+            None
+        };
+        // The index whose CURRENT values we display: the piece's material if painted, else the
+        // whole-object texture (the piece splits off its own copy on first change); for features,
+        // the first selected solid's texture.
+        let tex_idx: Option<usize> = if let Some((fi, ref groups)) = face_sel {
+            self.factory
+                .face_material(fi, groups)
+                .or_else(|| self.factory.furniture.get(fi).and_then(|f| f.texture))
+        } else if let Some(fi) = self.factory.sel_furniture {
+            self.factory.furniture.get(fi).and_then(|f| f.texture)
+        } else if let Some(ref ids) = feat_sel {
+            ids.iter().find_map(|id| self.factory.feature_texture.get(id).copied())
+        } else {
+            None
+        };
+        // A selected piece/solid can ALWAYS be tuned (its material is minted on first change);
+        // otherwise there must be a texture to tune. If none, the picker above is all there is.
+        if tex_idx.is_none() && face_sel.is_none() && feat_sel.is_none() {
+            return;
+        }
+
+        ui.add_space(2.0);
+        let furniture = self.factory.sel_furniture.is_some();
+        let isolated = face_sel.is_some() || feat_sel.as_ref().map_or(false, |v| !v.is_empty());
+        ui.label(
+            egui::RichText::new(if isolated { "Adjust — selected piece only" } else { "Adjust" })
+                .small().weak(),
+        );
+        // Is the surface a PROCEDURAL material? Its pattern/colours/grain are edited below; the
+        // image-only tiling/move/rotate controls are hidden (it's world-space, not UV-mapped).
+        let proc_def: Option<crate::factory::ProcDef> = tex_idx.and_then(|ti| self.factory.textures.get(ti)).and_then(|t| t.proc);
+        if let Some(mut d) = proc_def {
+            use crate::factory::ProcPattern;
+            let mut changed = false;
+            let mut started = false;
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("pattern").small().weak()));
+                egui::ComboBox::from_id_salt("proc_pattern").width(110.0)
+                    .selected_text(d.pattern.label())
+                    .show_ui(ui, |ui| {
+                        for p in ProcPattern::ALL {
+                            if ui.selectable_value(&mut d.pattern, p, p.label()).changed() { changed = true; started = true; }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("colours").small().weak()))
+                    .on_hover_text("Dark→light ramp for wood/marble/noise; the two cells for checker.");
+                let ra = ui.color_edit_button_rgb(&mut d.col_a);
+                let rb = ui.color_edit_button_rgb(&mut d.col_b);
+                for r in [&ra, &rb] {
+                    if r.changed() { changed = true; }
+                    if r.drag_started() { started = true; }
+                }
+            });
+            // Grain scale — anisotropic: across / along / through. Bigger = finer/denser grain.
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("grain").small().weak()))
+                    .on_hover_text("World-space scale across / along / through the grain (anisotropic — squash across, stretch along, for timber).");
+                for k in 0..3 {
+                    let r = ui.add(egui::DragValue::new(&mut d.scale[k]).speed(0.2).range(0.1..=400.0));
+                    if r.changed() { changed = true; }
+                    if r.drag_started() { started = true; }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("detail").small().weak()))
+                    .on_hover_text("Noise octaves (fractal detail) and ramp contrast.");
+                let rd = ui.add(egui::DragValue::new(&mut d.detail).speed(0.1).range(1.0..=8.0).prefix("oct "));
+                let rc = ui.add(egui::DragValue::new(&mut d.contrast).speed(0.02).range(0.2..=4.0).prefix("×"));
+                for r in [&rd, &rc] {
+                    if r.changed() { changed = true; }
+                    if r.drag_started() { started = true; }
+                }
+            });
+            if changed {
+                if started { self.snapshot_factory(); }
+                if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) {
+                    if let Some(t) = self.factory.textures.get_mut(ti) {
+                        t.proc = Some(d);
+                        t.avg = d.avg_color();
+                    }
+                }
+            }
+        }
+        let is_proc = proc_def.is_some();
+        // Seed the slider values from the display texture, or sensible defaults for an untextured
+        // piece (opacity 100 = opaque, reflect 1 = matte).
+        let (mut scale, mut off, mut rot, mut opacity_pct, mut reflect_pct) =
+            match tex_idx.and_then(|ti| self.factory.textures.get(ti)) {
+                Some(t) => (
+                    t.scale, t.offset, t.rot_deg,
+                    (t.opacity * 100.0).round().clamp(1.0, 100.0),
+                    (t.reflect * 100.0).round().clamp(1.0, 100.0),
+                ),
+                None => (1.0, [0.0, 0.0], 0.0, 100.0, 1.0),
+            };
+        if !is_proc {
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("tiling").small().weak()))
+                .on_hover_text(if furniture {
+                    "How many times the image repeats across the piece."
+                } else {
+                    "Image repeats per metre of surface."
+                });
+            let r = ui.add(egui::DragValue::new(&mut scale).speed(0.05).range(0.05..=200.0));
+            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].scale = scale; } }
+        });
+        // MOVE: slide the image across the surface (in tile units).
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("move").small().weak()))
+                .on_hover_text("Shift the image across the surface (U/V, in tile units).");
+            let ru = ui.add(egui::DragValue::new(&mut off[0]).speed(0.02).prefix("U ").range(-100.0..=100.0));
+            let rv = ui.add(egui::DragValue::new(&mut off[1]).speed(0.02).prefix("V ").range(-100.0..=100.0));
+            for r in [&ru, &rv] {
+                if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+            }
+            if ru.changed() || rv.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].offset = off; } }
+        });
+        // ROTATE: spin the image about the tile centre.
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("rotate").small().weak()))
+                .on_hover_text("Rotate the image on the surface (degrees).");
+            let r = ui.add(egui::DragValue::new(&mut rot).speed(1.0).suffix("°").range(-360.0..=360.0));
+            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].rot_deg = rot; } }
+            if ui.small_button("⟳ 90°").on_hover_text("Rotate 90°").clicked() {
+                self.snapshot_factory();
+                if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].rot_deg = (rot + 90.0).rem_euclid(360.0); }
+            }
+        });
+        } // end !is_proc (image-only tiling/move/rotate)
+        // TRANSPARENCY: 1 = fully see-through, 100 = opaque (spec-style 1..100 slider).
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("opacity").small().weak()))
+                .on_hover_text("Surface transparency: 1 = fully transparent, 100 = fully opaque.");
+            let r = ui.add(egui::Slider::new(&mut opacity_pct, 1.0..=100.0).show_value(true));
+            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].opacity = (opacity_pct / 100.0).clamp(0.01, 1.0); } }
+        });
+        // REFLECTION: 1 = matte, 100 = mirror-like glossy sheen (view-dependent highlight).
+        ui.horizontal(|ui| {
+            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("reflect").small().weak()))
+                .on_hover_text("Surface reflection: 1 = no reflection (matte), 100 = maximum glossy sheen.");
+            let r = ui.add(egui::Slider::new(&mut reflect_pct, 1.0..=100.0).show_value(true));
+            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].reflect = ((reflect_pct - 1.0) / 99.0).clamp(0.0, 1.0); } }
+        });
+
+        // ── Surface (PBR maps) — a tangent-space NORMAL map + ROUGHNESS, lit by the sun (Texture
+        // Phase 2). Roughness works everywhere; the normal/roughness MAPS need the ☀ Sun enabled to
+        // show. Maps are picked from textures already in the library (load them first).
+        {
+            let cur = tex_idx.and_then(|ti| self.factory.textures.get(ti));
+            let mut roughness = cur.map(|t| t.roughness).unwrap_or(0.5);
+            let cur_nrm = cur.and_then(|t| t.normal_map);
+            let cur_rgh = cur.and_then(|t| t.rough_map);
+            let lib: Vec<(usize, String)> =
+                self.factory.textures.iter().enumerate().map(|(i, t)| (i, t.name.clone())).collect();
+            let name_of = |o: Option<usize>| -> String {
+                o.and_then(|i| lib.iter().find(|(j, _)| *j == i)).map(|(_, n)| n.clone()).unwrap_or_else(|| "none".into())
+            };
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new("Surface (PBR maps · needs ☀ Sun)").small().weak());
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("rough").small().weak()))
+                    .on_hover_text("Roughness: 0 = glossy (tight highlight), 1 = matte. Lit by the sun.");
+                let r = ui.add(egui::Slider::new(&mut roughness, 0.0..=1.0).show_value(true));
+                if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].roughness = roughness; } }
+            });
+            let mut new_nrm = cur_nrm;
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("normal").small().weak()))
+                    .on_hover_text("A tangent-space normal map (load it as a texture first, then pick it here).");
+                egui::ComboBox::from_id_salt("pbr_nrm_map").width(120.0).selected_text(name_of(cur_nrm))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut new_nrm, None, "none");
+                        for (i, n) in &lib { ui.selectable_value(&mut new_nrm, Some(*i), n); }
+                    });
+            });
+            if new_nrm != cur_nrm {
+                self.snapshot_factory();
+                if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].normal_map = new_nrm; }
+            }
+            let mut new_rgh = cur_rgh;
+            ui.horizontal(|ui| {
+                ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("r-map").small().weak()))
+                    .on_hover_text("A roughness map (its red channel drives roughness). Optional.");
+                egui::ComboBox::from_id_salt("pbr_rgh_map").width(120.0).selected_text(name_of(cur_rgh))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut new_rgh, None, "none");
+                        for (i, n) in &lib { ui.selectable_value(&mut new_rgh, Some(*i), n); }
+                    });
+            });
+            if new_rgh != cur_rgh {
+                self.snapshot_factory();
+                if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].rough_map = new_rgh; }
+            }
+        }
+
+        if ui
+            .small_button(egui::RichText::new("Remove texture").color(egui::Color32::from_rgb(230, 170, 170)))
+            .clicked()
+        {
+            if let Some((fi, groups)) = &face_sel {
+                // Remove only THIS piece's per-face textures, leaving the rest of the object.
+                self.snapshot_factory();
+                if let Some(inst) = self.factory.furniture.get_mut(*fi) {
+                    for g in groups { inst.surface_texture.remove(g); }
+                }
+                self.factory.status = "piece texture removed".into();
+            } else {
+                self.remove_texture_from_selection();
+            }
+        }
+    }
+
+    /// The texture index a tuning slider should WRITE to. For a selected furniture face/piece OR
+    /// CSG feature-solid(s) it mints (copy-on-write) a material EXCLUSIVE to that selection so the
+    /// change is isolated; otherwise the shared whole-object texture (`whole_ti`). `None` only when
+    /// there is nothing to tune.
+    fn tune_target(&mut self, face_sel: &Option<(usize, Vec<u32>)>, feat_sel: &Option<Vec<u32>>, whole_ti: Option<usize>) -> Option<usize> {
+        if let Some((fi, groups)) = face_sel {
+            Some(self.factory.private_piece_material(*fi, groups))
+        } else if let Some(ids) = feat_sel {
+            if ids.is_empty() { whole_ti } else { Some(self.factory.private_feature_material(ids)) }
+        } else {
+            whole_ti
+        }
+    }
+
+    /// Drop the texture from the current selection (furniture instance or feature). One undo
+    /// step; a feature move needs a re-eval so its triangles rejoin the flat batch.
+    fn remove_texture_from_selection(&mut self) {
+        self.snapshot_factory();
+        if let Some(fi) = self.factory.sel_furniture {
+            // Drop the baked-in tint back to the asset's own colour, else the piece stays
+            // stuck at the texture's average colour after removal.
+            let asset_col = self.factory.furniture.get(fi)
+                .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                .map(|a| a.color);
+            if let Some(f) = self.factory.furniture.get_mut(fi) {
+                f.texture = None;
+                f.surface_texture.clear(); // …and any per-face textures
+                if let Some(c) = asset_col { f.color = c; }
+            }
+            self.factory.status = "texture removed".into();
+        } else {
+            for id in self.factory.selection.clone() {
+                self.factory.feature_texture.remove(&id);
+                self.factory.feature_color.remove(&id); // back to the default neutral, not the tint
+            }
+            self.factory.recompute();
+            self.factory.status = "texture removed".into();
+        }
     }
 
     /// The Textures menu — the same palette (applied to the selection) plus the phased
     /// create-texture entry.
+    /// The Apertures menu — doors & windows. Two ways in: IMPORT one as a free-standing piece to
+    /// position by hand, or DRAW a rectangle on a wall and let the app cut the opening and fit a
+    /// scaled door/window into it. The draw actions read the rectangle from the active face sketch.
+    fn factory_apertures_menu(&mut self, ui: &mut egui::Ui) {
+        use crate::factory::ApertureKind;
+        let drafting = self.factory.session.is_some();
+
+        ui.label(egui::RichText::new("  Draw an opening").small().weak());
+        ui.label(
+            egui::RichText::new("  Right-click a wall → Draw on this face, draw a rectangle, then:")
+                .small().weak(),
+        );
+        ui.add_enabled_ui(drafting, |ui| {
+            if ui
+                .button("🚪  Door in drawn rectangle")
+                .on_hover_text("Cut the drawn rectangle through the wall and fit a DOOR scaled to the opening")
+                .clicked()
+            {
+                self.factory_draw_aperture(ApertureKind::Door);
+                ui.close_menu();
+            }
+            if ui
+                .button("🪟  Window in drawn rectangle")
+                .on_hover_text("Cut the drawn rectangle through the wall and fit a WINDOW scaled to the opening")
+                .clicked()
+            {
+                self.factory_draw_aperture(ApertureKind::Window);
+                ui.close_menu();
+            }
+        });
+        if !drafting {
+            ui.label(
+                egui::RichText::new("  (enabled while drafting on a wall face)")
+                    .small().weak(),
+            );
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("  Insert by parameters").small().weak());
+        if ui
+            .button("🚪  Door (enter parameters)…")
+            .on_hover_text("Open the parametric door dialog — set the leaf/frame/casing sizes, then build it")
+            .clicked()
+        {
+            self.arch_tab = ArchTab::Door;
+            self.arch_modal_open = true;
+            ui.close_menu();
+        }
+
+        ui.separator();
+        ui.label(egui::RichText::new("  Import free-standing").small().weak());
+        if ui
+            .button("🚪  Import door")
+            .on_hover_text("Drop the default door at the model centre — move/scale it yourself (no cut)")
+            .clicked()
+        {
+            self.factory_import_aperture(ApertureKind::Door);
+            ui.close_menu();
+        }
+        if ui
+            .button("🪟  Import window")
+            .on_hover_text("Drop the default window at the model centre — move/scale it yourself (no cut)")
+            .clicked()
+        {
+            self.factory_import_aperture(ApertureKind::Window);
+            ui.close_menu();
+        }
+    }
+
+    /// The Architecture menu — open the generator modal on the chosen tab. Each entry just picks a
+    /// generator and shows the dialog; all parameters and the Build action live in
+    /// [`Self::render_arch_dialog`].
+    fn factory_architecture_menu(&mut self, ui: &mut egui::Ui) {
+        for (tab, glyph, label, hint) in [
+            (ArchTab::Staircase, "🪜", "Generate staircase", "Open-sided straight flight or U-shape switchback, with a balustrade"),
+            (ArchTab::Spiral, "🌀", "Generate spiral", "Helical treads around a round central post, with a handrail"),
+            (ArchTab::Ramp, "📐", "Generate ramp", "A straight inclined deck"),
+            (ArchTab::HelicalRamp, "🌀", "Helical ramp", "A sloped annular deck winding around a free inner edge, balustrades on both edges"),
+            (ArchTab::Dogleg, "🧱", "Dog-leg stair (editable / boolean)", "Half-turn stair as EDITABLE CSG solids you can cut, union and re-proportion"),
+            (ArchTab::SpiralCsg, "🌀", "Spiral stair (editable / boolean)", "Helical stair as EDITABLE CSG solids — set turns, height, radius; cut/union like any solid"),
+        ] {
+            if ui.button(format!("{glyph}  {label}…")).on_hover_text(hint).clicked() {
+                self.arch_tab = tab;
+                self.arch_modal_open = true;
+                ui.close_menu();
+            }
+        }
+    }
+
+    /// The Openings menu — every cutout (window/door/recess = a Difference feature) listed so
+    /// it can be SELECTED (→ its Position/Dimensions load into the properties panel for resize/
+    /// move) or DELETED (the opening fills back in). Clicking a cutout in the 3D view is
+    /// ambiguous (the hole shows the wall behind), so the list is the reliable way to reach one.
+    fn factory_openings_menu(&mut self, ui: &mut egui::Ui) {
+        let ids = self.factory.cutout_ids();
+        if ids.is_empty() {
+            ui.label(egui::RichText::new("  No cutouts yet.").small().weak());
+            ui.label(egui::RichText::new("  Draw on a face → Cut, to make a window/door.").small().weak());
+            return;
+        }
+        ui.label(egui::RichText::new(format!("  {} cutout(s)", ids.len())).small().weak());
+        ui.label(egui::RichText::new("  ✏ Edit in 2D reshapes the opening on its plane.").small().weak());
+        ui.separator();
+        let selected = self.factory.selected_single();
+        let mut to_delete: Option<u32> = None;
+        let mut to_select: Option<u32> = None;
+        let mut to_edit: Option<u32> = None;
+        for (n, id) in ids.iter().enumerate() {
+            let size = self.factory.cutout_size(*id).unwrap_or([0.0; 3]);
+            // The two largest extents are the opening's face size; the smallest is its depth.
+            let mut s = size;
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let label = format!("Opening {}  ·  {:.2} × {:.2} m", n + 1, s[2], s[1]);
+            ui.horizontal(|ui| {
+                if ui.selectable_label(selected == Some(*id), label).clicked() {
+                    to_select = Some(*id);
+                }
+                if ui
+                    .small_button("✏")
+                    .on_hover_text("Edit in 2D — reshape/move the opening on its wall plane, then re-Cut")
+                    .clicked()
+                {
+                    to_edit = Some(*id);
+                }
+                if ui
+                    .small_button(egui::RichText::new("🗑").color(egui::Color32::from_rgb(230, 150, 150)))
+                    .on_hover_text("Delete this cutout — the opening fills back in")
+                    .clicked()
+                {
+                    to_delete = Some(*id);
+                }
+            });
+        }
+        if let Some(id) = to_edit {
+            self.factory_edit_cutout(id);
+            ui.close_menu();
+        }
+        if let Some(id) = to_select {
+            self.factory.select_cutout(id);
+            self.active_view = ActiveView::ThreeD;
+            self.factory.status = "cutout selected — or ✏ Edit in 2D to reshape it".into();
+            ui.close_menu();
+        }
+        if let Some(id) = to_delete {
+            self.snapshot_factory();
+            self.factory.delete_cutout(id);
+            self.factory.recompute();
+            self.factory.status = "cutout removed".into();
+            self.history.push("  cutout deleted".into());
+        }
+    }
+
+    /// EDIT A CUTOUT IN 2D: recover the opening's outline, delete the baked cut, and re-open
+    /// the outline as an editable closed polyline ON ITS OWN PLANE in the 2D canvas. The user
+    /// reshapes/moves it with the normal 2D tools, then ▼ Room elements ▸ Cut re-applies it.
+    /// This is why a cutout is edited here and not nudged in 3D: its natural axes are the
+    /// wall-face plane, and a world-space nudge pushes it INTO the wall instead of along it.
+    fn factory_edit_cutout(&mut self, id: u32) {
+        let Some(f) = self.factory.model.features.iter().find(|g| g.id == id).copied() else { return };
+        let cad_solid::Primitive::Extrusion { profile, .. } = f.primitive else {
+            self.factory.status = "this cutout can't be edited in 2D (not an extrusion)".into();
+            return;
+        };
+        let Some(prof) = self.factory.model.profiles.iter().find(|p| p.id == profile).cloned() else {
+            self.factory.status = "cutout outline not found".into();
+            return;
+        };
+        if prof.pts.len() < 3 {
+            self.factory.status = "cutout outline is degenerate".into();
+            return;
+        }
+        // Outline → plane-local (u,v) sketch coordinates: the profile is centred, the placement
+        // holds its centre on the plane.
+        let (pu, pv) = (f.placement.u, f.placement.v);
+        let verts: Vec<PolyVertex> = prof.pts.iter()
+            .map(|q| PolyVertex { pos: Vec2::new((pu + q[0]) as f64, (pv + q[1]) as f64), bulge: 0.0 })
+            .collect();
+        // The wall-face plane as a drafting frame.
+        let (ua, va) = f.plane.axes();
+        let frame = cad_solid::Frame { origin: f.plane.origin(), u: ua, v: va };
+
+        self.snapshot_factory();
+        // Delete every Difference that is THIS opening (same profile + coincident centre) — a
+        // through cut may have made one per body; they all rebuild from the re-cut.
+        let same: Vec<u32> = self.factory.model.features.iter()
+            .filter(|g| g.op == cad_solid::BoolOp::Difference)
+            .filter(|g| matches!(g.primitive, cad_solid::Primitive::Extrusion { profile: pp, .. } if pp == profile))
+            .filter(|g| (g.placement.u - pu).abs() < 1e-4 && (g.placement.v - pv).abs() < 1e-4)
+            .map(|g| g.id)
+            .collect();
+        for gid in same {
+            self.factory.model.remove(gid);
+        }
+        self.factory.recompute();
+        // Re-open the outline on its plane for editing.
+        self.factory_enter_sketch(frame);
+        self.add_dobject(
+            Geom::Polyline(Polyline { vertices: verts, closed: true, widths: Vec::new() }),
+            "cutout-edit",
+        );
+        // SELECT the outline we just added so its vertex grips show immediately — otherwise the
+        // polyline is inert and "drag the points" does nothing until the user thinks to click it.
+        // (The polyline is the last dobject pushed.)
+        if !self.doc.dobjects.is_empty() {
+            let last = self.doc.dobjects.len() - 1;
+            self.selection = vec![last];
+            self.selected = Some(last);
+        }
+        // Remember we are reshaping an opening → the sketch panel shows a prominent
+        // "drag the points, then Apply" banner and Finish re-cuts automatically.
+        self.factory.editing_cutout = true;
+        self.active_view = ActiveView::TwoD;
+        self.factory.status =
+            "opening opened in 2D — drag its corner points, then ✔ Apply reshape".into();
+        self.history.push("  cutout opened for 2D editing".into());
+    }
+
+    /// APPLY a cutout reshape: re-cut the (possibly edited) outline through every body it
+    /// passes through, close the sketch, and return to 3D so the reshaped hole is visible.
+    /// Counterpart to [`Self::factory_edit_cutout`]; the "✔ Apply reshape" button and finishing
+    /// the sketch both route here so a dragged point actually changes the opening.
+    fn factory_apply_cutout_reshape(&mut self) {
+        // Must run while the sketch session is still active — `factory_cut_sketch` reads the
+        // outline from the live sketch document.
+        let made = self.factory_cut_sketch(true);
+        self.factory.editing_cutout = false;
+        self.factory_exit_sketch();
+        self.active_view = ActiveView::ThreeD;
+        if made > 0 {
+            self.factory.status = "opening reshaped".into();
+            self.history.push("  opening reshaped (re-cut through)".into());
+        } else {
+            self.factory.status =
+                "reshape not applied — the outline must stay a single closed shape".into();
+        }
+    }
+
     fn factory_textures_menu(&mut self, ui: &mut egui::Ui) {
         // Paint mode: click individual faces instead of colouring the whole object.
         let mut paint = self.factory.paint_surface_mode;
@@ -3734,43 +4760,308 @@ impl CadApp {
             .changed()
         {
             self.factory.paint_surface_mode = paint;
+            if !paint { self.factory.surface_tex_brush = None; } // leaving paint mode disarms it
         }
         if self.factory.paint_surface_mode {
-            ui.label(egui::RichText::new("  → pick a colour, then click faces").small().weak());
+            if let Some(ti) = self.factory.surface_tex_brush {
+                let name = self.factory.textures.get(ti).map(|t| t.name.clone()).unwrap_or_default();
+                ui.label(egui::RichText::new(format!("  🖌 brush: texture '{name}' — click faces")).small().weak());
+            } else {
+                ui.label(egui::RichText::new("  → pick a colour or load a texture, then click faces").small().weak());
+            }
         } else if self.factory.has_any_selection() {
-            ui.label(egui::RichText::new("  Colour the selected object").small().weak());
+            ui.label(egui::RichText::new("  Colour / texture the selected object").small().weak());
         } else {
             ui.label(egui::RichText::new("  Select an object first").small().weak());
         }
         if let Some(c) = self.factory_color_palette(ui) {
-            // In paint mode the palette just sets the brush colour; the click does the work.
-            if !self.factory.paint_surface_mode {
+            if self.factory.paint_surface_mode {
+                // Picking a colour in paint mode switches the brush back to colour.
+                self.factory.surface_tex_brush = None;
+            } else {
                 self.apply_color_to_selection(c);
                 ui.close_menu();
             }
         }
         ui.separator();
-        // Phased: create texture from a clipboard screenshot.
-        ui.add_enabled(false, egui::Button::new("  🖼 Create texture (from clipboard)"))
-            .on_disabled_hover_text(
-                "Coming next: paste a screenshot from the clipboard and map it onto a \
-                 surface. (Needs image paste + UV mapping.)",
-            );
+        // Texture from a clipboard image: copy a picture (or screenshot region) to the
+        // clipboard, select an object, then click this. Phase 1 applies the image's
+        // average colour as a tint and stores the bitmap; the UV-mapped render pass that
+        // shows the actual picture on the faces is the next phase.
+        // In paint mode a texture arms the face brush, so no selection is required.
+        let can_paste = self.factory.has_any_selection() || self.factory.paint_surface_mode;
+        let btn = ui.add_enabled(
+            can_paste,
+            egui::Button::new("  🖼 Paste texture from clipboard"),
+        );
+        if !can_paste {
+            btn.clone().on_disabled_hover_text("Select an object first, then paste.");
+        }
+        if btn
+            .on_hover_text(
+                "Reads the image currently on the clipboard and maps it onto the selected object.",
+            )
+            .clicked()
+        {
+            self.paste_texture_onto_selection();
+            ui.close_menu();
+        }
+        // Load a texture image from disk — feeds the bundled CC0 library in
+        // assets/cc0/textures (wood, brick, marble, fabric, …).
+        let file_btn = ui.add_enabled(can_paste, egui::Button::new("  📂 Load texture from file…"));
+        if !can_paste {
+            file_btn.clone().on_disabled_hover_text("Select an object first, then load.");
+        }
+        if file_btn
+            .on_hover_text("Apply a PNG/JPG image (e.g. the bundled CC0 textures) to the selected object.")
+            .clicked()
+        {
+            // Default the picker to the bundled CC0 texture folder when it exists.
+            let cc0 = std::path::Path::new("assets/cc0/textures");
+            if cc0.is_dir() {
+                self.file_dialog_dir = Some(cc0.to_path_buf());
+            }
+            self.open_file_dialog(FileDialogMode::ImportTexture, "");
+            ui.close_menu();
+        }
+        // TEXTURE LIBRARY — every texture loaded/pasted so far, clickable to (re)apply. Without
+        // this there was no way to CHANGE a texture once applied or reuse one across objects; the
+        // only entry points were Paste/Load, which each need a fresh clipboard image or file.
+        if let Some(i) = self.factory_texture_library(ui) {
+            if let Some(t) = self.factory.textures.get(i) {
+                let (name, w, h) = (t.name.clone(), t.w, t.h);
+                self.apply_texture_index_to_selection(i, &name, w, h);
+            }
+            ui.close_menu();
+        }
+    }
+
+    /// Clickable list of every captured/loaded texture — pick one to (re)apply to the selection
+    /// (or, in paint-single-surface mode, to arm the face brush). This is how a texture is
+    /// CHANGED or reused without re-loading it. Returns the chosen index. Each row shows the
+    /// texture's average-colour chip + name/size, and the current one is highlighted.
+    fn factory_texture_library(&mut self, ui: &mut egui::Ui) -> Option<usize> {
+        if self.factory.textures.is_empty() {
+            return None;
+        }
+        let current = self.factory_selected_texture();
+        let mut chosen = None;
+        ui.separator();
+        ui.label(egui::RichText::new("  Textures — click to apply").small().weak());
+        // Snapshot the rows first so the loop doesn't borrow `self.factory.textures` while the
+        // click handler needs `self`.
+        let rows: Vec<(usize, String, u32, u32, [f32; 3])> = self
+            .factory
+            .textures
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i, t.name.clone(), t.w, t.h, t.avg))
+            .collect();
+        for (i, name, w, h, avg) in rows {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let col = egui::Color32::from_rgb(
+                    (avg[0] * 255.0) as u8, (avg[1] * 255.0) as u8, (avg[2] * 255.0) as u8);
+                ui.painter().rect_filled(rect, 3.0, col);
+                ui.painter().rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
+                if ui
+                    .selectable_label(current == Some(i), format!("{name}  ({w}×{h})"))
+                    .clicked()
+                {
+                    chosen = Some(i);
+                }
+            });
+        }
+        chosen
+    }
+
+    /// The texture index currently on the selection (furniture instance or single feature), if any.
+    fn factory_selected_texture(&self) -> Option<usize> {
+        if let Some(fi) = self.factory.sel_furniture {
+            self.factory.furniture.get(fi).and_then(|f| f.texture)
+        } else if self.factory.paint_surface_mode {
+            self.factory.surface_tex_brush
+        } else {
+            self.factory.selected_single().and_then(|id| self.factory.feature_texture.get(&id).copied())
+        }
+    }
+
+    /// Read the image on the OS clipboard, store it as a texture asset, and apply it to the
+    /// current selection. The visible effect for now is the image's average colour (the
+    /// existing colour pipeline); the bitmap is kept for the UV-mapped pass. One undo step.
+    fn paste_texture_onto_selection(&mut self) {
+        if !self.factory.has_any_selection() && !self.factory.paint_surface_mode {
+            self.factory.status = "select an object first, then paste a texture".into();
+            return;
+        }
+        let img = match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
+            Ok(img) => img,
+            Err(e) => {
+                self.factory.status =
+                    format!("no image on the clipboard — copy a picture first ({e})");
+                self.history.push(format!("  ! paste texture: {e}"));
+                return;
+            }
+        };
+        let (w, h) = (img.width as u32, img.height as u32);
+        let rgba = img.bytes.into_owned(); // arboard hands over RGBA8, top row first
+        if w == 0 || h == 0 || rgba.len() < (w as usize * h as usize * 4) {
+            self.factory.status = "clipboard image was empty or malformed".into();
+            return;
+        }
+        let name = format!("clip-{}x{}-#{}", w, h, self.factory.textures.len() + 1);
+        let idx = self.factory.add_texture(name.clone(), w, h, rgba);
+        self.apply_texture_index_to_selection(idx, &name, w, h);
+    }
+
+    /// Load an image FILE (PNG/JPG/…), store it as a texture asset, and apply it to the
+    /// current selection — the on-disk counterpart of the clipboard paste. Feeds the bundled
+    /// CC0 texture library (`assets/cc0/textures`).
+    fn load_texture_from_file(&mut self, path: &str) {
+        if !self.factory.has_any_selection() && !self.factory.paint_surface_mode {
+            self.factory.status = "select an object first, then load a texture".into();
+            return;
+        }
+        let img = match image::open(path) {
+            Ok(i) => i.to_rgba8(),
+            Err(e) => {
+                self.factory.status = format!("could not read image: {e}");
+                self.history.push(format!("  ! load texture: {e}"));
+                return;
+            }
+        };
+        let (w, h) = (img.width(), img.height());
+        let rgba = img.into_raw();
+        if w == 0 || h == 0 {
+            self.factory.status = "image was empty".into();
+            return;
+        }
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "texture".into());
+        let idx = self.factory.add_texture(name.clone(), w, h, rgba);
+        self.apply_texture_index_to_selection(idx, &name, w, h);
+    }
+
+    /// Assign stored texture `idx` to the current selection (furniture instance or feature[s])
+    /// and tint by its average colour so it shows even before the textured pass. One undo step.
+    fn apply_texture_index_to_selection(&mut self, idx: usize, name: &str, w: u32, h: u32) {
+        // PAINT-SINGLE-SURFACE mode: don't cover the whole solid — arm this texture as the
+        // brush and let the user click individual faces (each wall face its own texture).
+        if self.factory.paint_surface_mode {
+            self.factory.surface_tex_brush = Some(idx);
+            self.factory.status =
+                format!("texture '{name}' ready — click each face to apply it ({w}×{h})");
+            self.history.push(format!("  texture '{name}' armed for per-surface painting"));
+            return;
+        }
+        // PER-SURFACE FURNITURE (Face/Piece mode). Two orders:
+        //  • the user already clicked a face (furn_face_sel set) → apply the texture to it NOW;
+        //  • otherwise ARM the brush so the next face click textures it.
+        if let Some(fi) = self.factory.sel_furniture {
+            if self.factory.furn_paint_mode != crate::factory::FurnPaintMode::WholeObject {
+                let what = if self.factory.furn_paint_mode == crate::factory::FurnPaintMode::Piece { "piece" } else { "face" };
+                let sel = self.factory.furn_face_sel.clone();
+                if self.dbg.recording {
+                    crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                        message: format!(
+                            "TEX APPLY '{name}' → per-{what} path; face_sel={:?} (matches inst#{fi}: {})",
+                            sel.as_ref().map(|(f, g)| (*f, g.len())),
+                            sel.as_ref().map_or(false, |(f, _)| *f == fi),
+                        )
+                    });
+                }
+                match sel {
+                    Some((sfi, groups)) if sfi == fi => {
+                        self.snapshot_factory();
+                        self.factory.apply_face_texture(fi, &groups, idx);
+                        self.factory.furn_tex_brush = Some(idx); // stay armed to paint more faces
+                        let painted = self.factory.furniture_textured_tri_count(fi);
+                        let total = self.factory.furniture.get(fi)
+                            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                            .map(|a| a.positions.len() / 3).unwrap_or(0);
+                        if self.dbg.recording {
+                            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                                message: format!("TEX APPLIED to {what}: now {painted}/{total} tris textured ({} group(s))", groups.len())
+                            });
+                        }
+                        self.factory.status = format!("texture '{name}' applied to the {what} — {painted}/{total} tris ({w}×{h})");
+                        self.history.push(format!("  texture '{name}' applied to a {what} ({painted}/{total} tris)"));
+                    }
+                    _ => {
+                        self.factory.furn_tex_brush = Some(idx);
+                        self.factory.status = format!("texture '{name}' ready — click a {what} of the object to apply it ({w}×{h})");
+                        self.history.push(format!("  texture '{name}' armed for per-{what} painting"));
+                    }
+                }
+                return;
+            }
+        }
+        let tint = self.factory.textures.get(idx).map(|t| t.avg).unwrap_or([0.8, 0.8, 0.82]);
+        self.snapshot_factory();
+        if let Some(fi) = self.factory.sel_furniture {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.texture = Some(idx);
+                inst.color = tint;
+            }
+        } else {
+            for id in self.factory.selection.clone() {
+                self.factory.feature_texture.insert(id, idx);
+                self.factory.feature_color.insert(id, tint);
+            }
+            self.factory.recompute();
+        }
+        self.factory.status = format!("texture '{name}' applied ({w}×{h})");
+        self.history.push(format!("  texture '{name}' applied ({w}×{h})"));
     }
 
     /// Apply a colour to whatever is selected — a CSG feature (building/wall/…) or, if no
     /// feature is selected, the most recently placed furniture. One undo step.
     fn apply_color_to_selection(&mut self, c: [f32; 3]) {
         if let Some(fi) = self.factory.sel_furniture {
+            // PER-FACE COLOUR: in Face/Piece mode a colour lands on the clicked face/piece (as a
+            // 1×1 solid texture), NOT the whole object — matching how per-face TEXTURE works. This
+            // is the fix for "I selected a face and the colour changed the whole object".
+            if self.factory.furn_paint_mode != crate::factory::FurnPaintMode::WholeObject {
+                let what = if self.factory.furn_paint_mode == crate::factory::FurnPaintMode::Piece { "piece" } else { "face" };
+                match self.factory.furn_face_sel.clone() {
+                    Some((sfi, groups)) if sfi == fi => {
+                        let idx = self.factory.ensure_solid_color_texture(c);
+                        self.snapshot_factory();
+                        self.factory.apply_face_texture(fi, &groups, idx);
+                        let painted = self.factory.furniture_textured_tri_count(fi);
+                        let total = self.factory.furniture.get(fi)
+                            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                            .map(|a| a.positions.len() / 3).unwrap_or(0);
+                        if self.dbg.recording {
+                            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+                                message: format!("COLOUR to {what}: now {painted}/{total} tris coloured")
+                            });
+                        }
+                        self.factory.status = format!("colour applied to the {what} — {painted}/{total} tris");
+                        self.history.push(format!("  colour applied to a {what} ({painted}/{total} tris)"));
+                    }
+                    _ => {
+                        self.factory.status = format!("{what} mode: click a {what} of the object first, then pick a colour");
+                    }
+                }
+                return;
+            }
             self.snapshot_factory();
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.color = c;
+                inst.texture = None; // a colour REPLACES the texture, else it stays masked
+                inst.surface_texture.clear(); // …including any per-face textures
             }
             self.history.push("  furniture colour applied".into());
         } else if !self.factory.selection.is_empty() {
             self.snapshot_factory();
             for id in self.factory.selection.clone() {
                 self.factory.feature_color.insert(id, c);
+                // A whole-object colour replaces its texture(s), else the texture keeps masking it.
+                self.factory.feature_texture.remove(&id);
+                self.factory.surface_texture.retain(|k, _| k.0 != id);
             }
             self.factory.recompute();
             self.history.push("  colour applied".into());
@@ -3784,6 +5075,10 @@ impl CadApp {
     /// persists in the project. Format is chosen by file extension.
     fn import_furniture_obj(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
+        // FBX diagnostics, captured so a broken import is answerable from the dump.
+        let mut fbx_note = String::new();
+        // glTF PBR extras (real UVs + base-colour image), applied after the asset is added.
+        let mut gltf_pbr: Option<crate::mesh_io::GltfPbr> = None;
         let mesh = if lower.ends_with(".3ds") {
             match std::fs::read(path) {
                 Ok(bytes) => crate::mesh_io::parse_3ds(&bytes),
@@ -3792,9 +5087,65 @@ impl CadApp {
                     return;
                 }
             }
+        } else if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let base = std::path::Path::new(path).parent();
+                    let (m, pbr) = crate::mesh_io::parse_gltf_ex(&bytes, base);
+                    gltf_pbr = Some(pbr);
+                    m
+                }
+                Err(e) => {
+                    self.history.push(format!("  ! furniture import: {e}"));
+                    return;
+                }
+            }
         } else if lower.ends_with(".fbx") {
             match std::fs::read(path) {
-                Ok(bytes) => crate::mesh_io::parse_fbx(&bytes),
+                Ok(bytes) => {
+                    let base = std::path::Path::new(path).parent();
+                    if crate::mesh_io::is_ascii_fbx(&bytes) {
+                        // TEXT FBX (SketchUp / FBX SDK): parse geometry + UVs + the material/texture
+                        // graph, flowing textures through the same per-part channel glTF uses.
+                        let (m, pbr) = crate::mesh_io::parse_fbx_ascii(&bytes, base);
+                        fbx_note = format!(
+                            " fbx_ascii=true fbx_tris={} fbx_mats={} fbx_uv={}",
+                            m.tri_count(), pbr.textures.len(), !pbr.uvs.is_empty(),
+                        );
+                        if m.tri_count() == 0 {
+                            self.factory.status =
+                                "ASCII FBX parsed but produced no triangles — send me this .fbx to fix it".into();
+                            self.history.push(format!("  ! furniture import: ASCII FBX yielded 0 triangles ({fbx_note})"));
+                            return;
+                        }
+                        gltf_pbr = Some(pbr);
+                        m
+                    } else {
+                        // BINARY FBX. Read geometry AND each material's diffuse colour, flowing the
+                        // colours through the same per-part channel glTF uses so a flat-material
+                        // model (e.g. the villa) shows its own colours per region instead of one
+                        // uniform grey — and each material becomes a selectable/paintable part.
+                        let (m, pbr) = crate::mesh_io::parse_fbx_pbr(&bytes);
+                        fbx_note = format!(
+                            " fbx_binary=true fbx_tris={} fbx_mats={}",
+                            m.tri_count(), pbr.textures.len(),
+                        );
+                        if m.tri_count() == 0 {
+                            // Fall back to the geometry-only reader for the richer diagnostic.
+                            let (_m2, info2) = crate::mesh_io::parse_fbx_ex(&bytes);
+                            self.factory.status = format!(
+                                "FBX parsed but produced no triangles (geometries={}, verts={}) — send me this .fbx to fix it",
+                                info2.geometries, info2.total_verts,
+                            );
+                            self.history.push(format!("  ! furniture import: FBX yielded 0 triangles ({fbx_note})"));
+                            return;
+                        }
+                        if !pbr.textures.is_empty() {
+                            gltf_pbr = Some(pbr); // per-material colours → per-region binding below
+                        }
+                        m
+                    }
+                }
                 Err(e) => {
                     self.history.push(format!("  ! furniture import: {e}"));
                     return;
@@ -3802,7 +5153,7 @@ impl CadApp {
             }
         } else {
             match std::fs::read_to_string(path) {
-                Ok(t) => crate::mesh_io::parse_obj(&t),
+                Ok(t) => crate::mesh_io::parse_obj_dir(&t, std::path::Path::new(path).parent()),
                 Err(e) => {
                     self.history.push(format!("  ! furniture import: {e}"));
                     return;
@@ -3810,6 +5161,11 @@ impl CadApp {
             }
         };
         if mesh.tri_count() == 0 {
+            // Surface it on screen too — a silent history line looked like "nothing happened".
+            self.factory.status = format!(
+                "'{}' imported no geometry — unsupported/compressed mesh or an empty file",
+                std::path::Path::new(path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+            );
             self.history.push("  ! furniture import: no triangles found in the file".into());
             return;
         }
@@ -3822,27 +5178,361 @@ impl CadApp {
         let tris = mesh.tri_count();
         let verts = mesh.positions.len();
         let idx = self.factory.add_furniture_asset(name.clone(), mesh);
+        // Remember where it came from + that its alpha is authoritative, so a project saved now can
+        // re-derive transparency on a later load (see `refresh_imported_furniture_transparency`).
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.source_path = std::fs::canonicalize(path)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .or_else(|| Some(path.to_string()));
+            a.alpha_resolved = true;
+        }
+        // glTF PBR passthrough: real UVs + per-primitive PART ids + EVERY material's base colour,
+        // so a multi-material model shows each region's own texture (and each primitive is its own
+        // selectable piece). `per_part_tex` maps each part id → the global texture index to bind
+        // AFTER the instance is placed (via its per-face `surface_texture`).
+        let mut gltf_tex_note = String::new();
+        let mut per_part_tex: Vec<Option<usize>> = Vec::new();
+        if let Some(pbr) = gltf_pbr {
+            let ntri = self.factory.furniture_lib.get(idx).map(|a| a.positions.len() / 3).unwrap_or(0);
+            if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+                if !pbr.uvs.is_empty() {
+                    a.uvs = pbr.uvs;
+                }
+                if pbr.part_ids.len() == ntri {
+                    a.part_ids = pbr.part_ids; // each glTF primitive = one selectable piece
+                }
+            }
+            // Register every distinct material image/colour as a texture → global indices.
+            let globals: Vec<usize> = pbr.textures.iter().enumerate()
+                .map(|(i, (tw, th, rgba))| self.factory.add_texture(format!("{name} mat{i}"), *tw, *th, rgba.clone()))
+                .collect();
+            per_part_tex = pbr.part_texture.iter().map(|slot| slot.and_then(|s| globals.get(s).copied())).collect();
+            gltf_tex_note = format!(" gltf_mats={} parts={}", globals.len(), per_part_tex.len());
+        }
         // Drop it at the MODEL's centre, not world origin. Imported drawings live at their
         // DXF coordinates (e.g. X≈3619, Y≈956), so placing at (0,0,0) put furniture km away,
         // off-screen — it looked like the import "did nothing". Land it where the building is.
-        let at = match self.factory.cached.bounds() {
-            Some((mn, mx)) => glam::Vec3::new((mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, 0.0),
-            None => glam::Vec3::ZERO,
-        };
-        self.factory.place_furniture(idx, at);
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at); // selects the new instance (sel_furniture)
+        // Bind each material to its region via the per-face system: every face-group inherits the
+        // texture of the PART (glTF primitive) it belongs to, so each material shows on its own
+        // area (real UVs map the image). A single-material model → every face-group → the one tex.
+        if !per_part_tex.is_empty() {
+            if let Some(fi) = self.factory.sel_furniture {
+                let asset_idx = self.factory.furniture.get(fi).map(|f| f.asset);
+                if let Some(ai) = asset_idx {
+                    if let Some(a) = self.factory.furniture_lib.get(ai) {
+                        let g = a.group_geom();
+                        let ntri = a.positions.len() / 3;
+                        let mut fg_tex: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+                        for t in 0..ntri {
+                            let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                            if let Some(Some(gtex)) = per_part_tex.get(part) {
+                                fg_tex.insert(g.face[t], *gtex);
+                            }
+                        }
+                        if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                            inst.surface_texture = fg_tex;
+                        }
+                    }
+                }
+            }
+        }
         self.factory.open = true;
-        self.factory.fit();
+        // Do NOT re-frame the scene on import — the furniture lands at the model centre,
+        // which is already in view, and a `fit()` here yanks the camera out to a zoomed-out
+        // "whole canvas" angle every time. Keep the user's current viewpoint.
         // Furniture is a mesh INSTANCE, not a CSG feature — so it never shows up in the
         // Union body count and can't be a cut target; record it so a "where did my import
         // go?" is answerable from the dump (asset idx, mesh size, live instance count).
+        let fmt = if lower.ends_with(".3ds") { "3ds" }
+            else if lower.ends_with(".fbx") { "fbx" }
+            else if lower.ends_with(".glb") { "glb" }
+            else if lower.ends_with(".gltf") { "gltf" }
+            else { "obj" };
         let detail = format!(
-            "file={name} fmt={} mesh_tris={tris} mesh_verts={verts} asset_idx={idx} \
-             furniture_insts={}",
-            if lower.ends_with(".3ds") { "3ds" } else { "obj" },
+            "file={name} fmt={fmt} mesh_tris={tris} mesh_verts={verts} asset_idx={idx} \
+             furniture_insts={}{fbx_note}{gltf_tex_note}",
             self.factory.furniture.len(),
         );
         self.factory_op_evt("import-mesh", "file", detail, features_before);
         self.history.push(format!("  furniture '{name}' imported ({tris} tris) and placed"));
+    }
+
+    /// Read + parse a mesh file (`.obj` / `.fbx` / `.3ds` / `.glb` / `.gltf`) into an `ObjMesh`.
+    /// The shared parser dispatch behind furniture AND aperture loading (no UI, no placement).
+    fn factory_parse_mesh_file(path: &str) -> Option<crate::mesh_io::ObjMesh> {
+        let lower = path.to_ascii_lowercase();
+        let m = if lower.ends_with(".3ds") {
+            crate::mesh_io::parse_3ds(&std::fs::read(path).ok()?)
+        } else if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+            let bytes = std::fs::read(path).ok()?;
+            crate::mesh_io::parse_gltf_ex(&bytes, std::path::Path::new(path).parent()).0
+        } else if lower.ends_with(".fbx") {
+            let bytes = std::fs::read(path).ok()?;
+            if crate::mesh_io::is_ascii_fbx(&bytes) {
+                crate::mesh_io::parse_fbx_ascii(&bytes, std::path::Path::new(path).parent()).0
+            } else {
+                crate::mesh_io::parse_fbx_ex(&bytes).0
+            }
+        } else {
+            crate::mesh_io::parse_obj_dir(
+                &std::fs::read_to_string(path).ok()?,
+                std::path::Path::new(path).parent(),
+            )
+        };
+        (m.tri_count() > 0).then_some(m)
+    }
+
+    /// Ensure the bundled default mesh for `kind` is loaded into the furniture library, returning
+    /// its asset index. Parsed once (from `assets/apertures/`), then cached in
+    /// `factory.aperture_asset` and reused by every door/window placed.
+    fn factory_ensure_aperture_asset(&mut self, kind: crate::factory::ApertureKind) -> Option<usize> {
+        if let Some(i) = self.factory.aperture_asset[kind.idx()] {
+            if i < self.factory.furniture_lib.len() {
+                return Some(i);
+            }
+        }
+        // After a reload the cache is empty but the mesh is already in the library (persisted);
+        // reuse it by name so we don't import a duplicate copy each time.
+        if let Some(i) = self.factory.furniture_lib.iter().position(|a| a.name == kind.label()) {
+            self.factory.aperture_asset[kind.idx()] = Some(i);
+            return Some(i);
+        }
+        // The DOOR is now a PARAMETRIC build (default "Door classic" proportions), not a bundled
+        // FBX — so it's clean geometry with per-component pieces. The window still loads its OBJ.
+        if kind == crate::factory::ApertureKind::Door {
+            let idx = self.factory_add_door_asset(&cad_solid::door::DoorInput::default(), kind.label())?;
+            self.factory.aperture_asset[kind.idx()] = Some(idx);
+            return Some(idx);
+        }
+        let path = kind.asset_path();
+        let mesh = match Self::factory_parse_mesh_file(path) {
+            Some(m) => m,
+            None => {
+                self.history.push(format!(
+                    "  ! aperture: could not load default {} mesh at '{}'",
+                    kind.label(), path
+                ));
+                return None;
+            }
+        };
+        let idx = self.factory.add_furniture_asset(kind.label().to_string(), mesh);
+        self.factory.aperture_asset[kind.idx()] = Some(idx);
+        Some(idx)
+    }
+
+    /// Build the parametric door as a furniture ASSET (no placement) and return its library index.
+    /// Each structural component (leaf / lining / casing / hardware) is tagged via `part_ids`, so
+    /// "select a piece" picks one part and it can be recoloured on its own. Shared by the default
+    /// aperture door, the fitted (drawn) door, and the parameters dialog.
+    fn factory_add_door_asset(&mut self, inp: &cad_solid::door::DoorInput, name: &str) -> Option<usize> {
+        let (_m, mesh) = match cad_solid::door::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Door: {e}");
+                return None;
+            }
+        };
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.62, 0.50, 0.38]), // wood; recolour a piece via Textures
+            alpha: Vec::new(),
+        };
+        let idx = self.factory.add_furniture_asset(name.to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        Some(idx)
+    }
+
+    /// Re-derive glass transparency on the bundled APERTURE window after a load. A project saved
+    /// before the transparency feature has its "Window" asset stored WITHOUT per-vertex alpha, and
+    /// because apertures are reused BY NAME ([`Self::factory_ensure_aperture_asset`]), even a newly
+    /// drawn window would inherit that stale opaque asset — so the glass fix would appear not to
+    /// work on any pre-existing project. Re-parse the bundled source (deterministic, identical
+    /// vertex order) and copy its alpha onto the loaded asset when the vertex counts line up; this
+    /// repairs every existing window instance AND every future placement at once. Best-effort:
+    /// silently skipped if the file can't be read or the geometry no longer matches.
+    fn refresh_aperture_transparency(&mut self) {
+        use crate::factory::ApertureKind;
+        // Only the window carries glass; the door mesh is opaque (and FBX alpha isn't parsed).
+        let kind = ApertureKind::Window;
+        let path = kind.asset_path();
+        if !path.to_ascii_lowercase().ends_with(".obj") {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        let parsed = crate::mesh_io::parse_obj_dir(&text, std::path::Path::new(path).parent());
+        if parsed.alpha.is_empty() {
+            return; // bundled window declares no transparency — nothing to copy
+        }
+        let label = kind.label();
+        let mut fixed = 0usize;
+        for a in self.factory.furniture_lib.iter_mut() {
+            if a.name == label && !a.is_translucent() && a.positions.len() == parsed.positions.len() {
+                a.alpha = parsed.alpha.clone();
+                fixed += 1;
+            }
+        }
+        if fixed > 0 {
+            self.history.push(format!(
+                "  aperture window: recovered glass transparency on {fixed} loaded asset(s)"
+            ));
+        }
+        self.refresh_imported_furniture_transparency();
+    }
+
+    /// Re-derive glass transparency for IMPORTED furniture from its stored source file, once, for a
+    /// project saved before the alpha was persisted. Only meshes with a known `source_path` in a
+    /// format our parser reads transparency from (OBJ/glTF) are re-parsed, and only while their
+    /// alpha is still unresolved — so a heavy opaque piece is never re-parsed on every load.
+    /// Best-effort: a moved/deleted source is simply left for a later load. Furniture imported by
+    /// a build that predates `source_path` has none stored and can only be fixed by re-importing.
+    fn refresh_imported_furniture_transparency(&mut self) {
+        let mut fixed = 0usize;
+        for a in self.factory.furniture_lib.iter_mut() {
+            if a.alpha_resolved {
+                continue;
+            }
+            let Some(path) = a.source_path.clone() else { continue };
+            let lower = path.to_ascii_lowercase();
+            let dir = std::path::Path::new(&path).parent();
+            let parsed = if lower.ends_with(".obj") {
+                std::fs::read_to_string(&path).ok().map(|t| crate::mesh_io::parse_obj_dir(&t, dir))
+            } else if lower.ends_with(".glb") || lower.ends_with(".gltf") {
+                std::fs::read(&path).ok().map(|b| crate::mesh_io::parse_gltf_ex(&b, dir).0)
+            } else {
+                // FBX/3DS transparency isn't parsed — nothing to re-derive; don't retry it.
+                a.alpha_resolved = true;
+                continue;
+            };
+            let Some(m) = parsed else { continue }; // unreadable now → retry on a later load
+            if !m.alpha.is_empty() && m.positions.len() == a.positions.len() && !a.is_translucent() {
+                a.alpha = m.alpha;
+                fixed += 1;
+            }
+            a.alpha_resolved = true; // parsed OK → authoritative, don't re-parse next load
+        }
+        if fixed > 0 {
+            self.history.push(format!(
+                "  furniture: recovered glass transparency on {fixed} imported asset(s) from source"
+            ));
+        }
+    }
+
+    /// IMPORT a door/window as a free-standing piece at the model centre (no cut). The user then
+    /// positions it manually — the counterpart to the "draw an aperture" flow that cuts + fits.
+    fn factory_import_aperture(&mut self, kind: crate::factory::ApertureKind) {
+        let Some(idx) = self.factory_ensure_aperture_asset(kind) else { return };
+        self.snapshot_factory();
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at); // uniform scale, user moves/sizes it
+        self.factory.open = true;
+        self.factory.status = format!("{} imported — move it into place", kind.label());
+        self.history.push(format!("  {} imported (free-standing)", kind.label()));
+    }
+
+    /// DRAW AN APERTURE: turn the rectangle the user drew on a wall face into a real opening —
+    /// cut it through the wall AND drop a door/window scaled to fill it exactly. Reuses the
+    /// existing through-cut, then places the aperture with [`crate::factory::FactoryState::place_aperture`].
+    /// Everything (cut + placed mesh) reverts in ONE undo because `factory_cut_sketch` snapshots
+    /// the whole factory (furniture included) before it runs.
+    fn factory_draw_aperture(&mut self, kind: crate::factory::ApertureKind) {
+        // 1. The drawn rectangle + its wall plane.
+        let Some((frame, loops, _, _)) = self.factory_resolve_extrude() else {
+            self.factory.status =
+                "draw a rectangle on a wall face first, then place the door/window".into();
+            return;
+        };
+        let loop0 = &loops[0];
+        if loop0.len() < 3 {
+            self.factory.status = "the opening outline needs at least 3 points".into();
+            return;
+        }
+        let n = frame.normal();
+        // World corners of the drawn outline.
+        let corners: Vec<glam::Vec3> = loop0.iter().map(|p| frame.from_uv(*p)).collect();
+        // Opening axes, derived from the WALL (not the sketch basis, which may be rotated):
+        //  - vertical = world-up projected into the wall plane (exact +Z for a vertical wall)
+        //  - horizontal = wall-normal × vertical (level, in-plane)
+        let up = glam::Vec3::Z - n * glam::Vec3::Z.dot(n);
+        let vert = if up.length_squared() > 1e-6 { up.normalize() } else { frame.v.normalize_or_zero() };
+        let mut u_h = n.cross(vert);
+        u_h = if u_h.length_squared() < 1e-9 { frame.u.normalize_or_zero() } else { u_h.normalize() };
+        // Extents of the outline along those axes → width, height + the in-plane centre.
+        let (mut umin, mut umax) = (f32::MAX, f32::MIN);
+        let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
+        for w in &corners {
+            let du = w.dot(u_h);
+            let dv = w.dot(vert);
+            umin = umin.min(du); umax = umax.max(du);
+            vmin = vmin.min(dv); vmax = vmax.max(dv);
+        }
+        let width = umax - umin;
+        let height = vmax - vmin;
+        if width < 1e-3 || height < 1e-3 {
+            self.factory.status = "opening is too small to place a door/window".into();
+            return;
+        }
+        let d_n = corners[0].dot(n); // plane offset (all corners share it)
+        let center_face = u_h * ((umin + umax) * 0.5) + vert * ((vmin + vmax) * 0.5) + n * d_n;
+        // Wall thickness at the opening: probe the solid along the normal both ways; the side that
+        // runs INTO the wall gives the full thickness (the other exits immediately).
+        let din = self.assembly_span(center_face, -n).0;
+        let dout = self.assembly_span(center_face, n).0;
+        let (thick, inward) = if din >= dout { (din, -n) } else { (dout, n) };
+        let thick = thick.max(0.05);
+        let center_mid = center_face + inward * (thick * 0.5);
+
+        // 2. Cut the opening THROUGH the wall (this snapshots the whole factory for undo). Do this
+        //    BEFORE building any bespoke asset, so undo cleanly removes the cut, the asset and the
+        //    placement together.
+        let made = self.factory_cut_sketch(true);
+        if made == 0 {
+            self.factory.status =
+                "couldn't cut an opening here — draw the rectangle on a wall face".into();
+            return;
+        }
+        // 3. Drop the door/window into the opening.
+        if kind == crate::factory::ApertureKind::Door {
+            // Build a PARAMETRIC door FITTED to this opening: its structural opening (door +
+            // 2·frame_face_width) equals the cut hole, so the lining beds into the reveal and the
+            // casing overhangs the wall face — mouldings and hardware at their true (unstretched)
+            // proportions. Placed at native size, not stretched.
+            let d = cad_solid::door::DoorInput::default();
+            let inp = cad_solid::door::DoorInput {
+                door_width: (width - 2.0 * d.frame_face_width).max(0.30),
+                door_height: (height - d.frame_face_width - d.door_gap_bottom).max(0.50),
+                frame_depth: thick.max(d.door_thickness + 0.005),
+                ..d
+            };
+            if let Some(asset) = self.factory_add_door_asset(&inp, "Door") {
+                // The door's structural-opening centre, mid-wall, lands on the opening centre.
+                let anchor = glam::Vec3::new(0.0, -thick * 0.5, height * 0.5);
+                self.factory.place_aperture_native(asset, center_mid, u_h, anchor);
+            }
+        } else {
+            let Some(asset) = self.factory_ensure_aperture_asset(kind) else { return };
+            // Window: stretch the bundled mesh to fill the opening exactly.
+            self.factory.place_aperture(asset, center_mid, u_h, width, height, thick);
+        }
+        // 5. Leave the sketch and show the result in 3D.
+        self.factory_exit_sketch();
+        self.active_view = ActiveView::ThreeD;
+        self.factory.status = format!(
+            "{} placed — {:.2} × {:.2} m opening", kind.label(), width, height
+        );
+        self.history.push(format!(
+            "  {} aperture: cut + placed ({:.2}×{:.2} m, wall {:.2} m)",
+            kind.label(), width, height, thick
+        ));
     }
 
     /// Paint the 2D drawing on the ground plane as a reference underlay, projected to
@@ -3894,7 +5584,7 @@ impl CadApp {
 
         // A selected FURNITURE instance: position, scale, rotation, colour, delete.
         if let Some(fi) = self.factory.sel_furniture {
-            if let Some(inst) = self.factory.furniture.get(fi).copied() {
+            if let Some(inst) = self.factory.furniture.get(fi).cloned() {
                 let name = self
                     .factory
                     .furniture_lib
@@ -3905,31 +5595,44 @@ impl CadApp {
                 let mut pos = inst.pos;
                 let mut scale = inst.scale;
                 let mut rot = inst.rot;
-                ui.label(egui::RichText::new("Position").small().weak());
-                for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                // Three side-by-side columns so the wide panel isn't wasted: placement on
+                // the left, rotation in the middle, colour/texture on the right. `columns`
+                // splits the panel's ACTUAL width three ways — no fixed min-widths that
+                // could overflow the dock and collapse the viewport below it.
+                ui.columns(3, |cols| {
+                    // Column 1 — Position + uniform scale.
+                    let ui = &mut cols[0];
+                    ui.label(egui::RichText::new("Position").small().weak());
+                    for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
+                            let r = ui.add(egui::DragValue::new(&mut pos[axis]).speed(0.02).suffix(" m"));
+                            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                            if r.changed() { self.factory.furniture[fi].pos[axis] = pos[axis]; }
+                        });
+                    }
                     ui.horizontal(|ui| {
-                        ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                        let r = ui.add(egui::DragValue::new(&mut pos[axis]).speed(0.02).suffix(" m"));
+                        ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new("scale").small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut scale).speed(0.01).range(0.01..=100.0));
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                        if r.changed() { self.factory.furniture[fi].pos[axis] = pos[axis]; }
+                        if r.changed() { self.factory.furniture[fi].scale = scale; }
                     });
-                }
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new("scale ×").small().weak()));
-                    let r = ui.add(egui::DragValue::new(&mut scale).speed(0.01).range(0.01..=100.0));
-                    if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                    if r.changed() { self.factory.furniture[fi].scale = scale; }
+
+                    // Column 2 — Rotation about world X/Y/Z.
+                    let ui = &mut cols[1];
+                    ui.label(egui::RichText::new("Rotation (°)").small().weak());
+                    for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
+                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                            if r.changed() { self.factory.furniture[fi].rot[axis] = rot[axis]; }
+                        });
+                    }
+
+                    // Column 3 — Colour / texture swatches.
+                    self.factory_color_section(&mut cols[2]);
                 });
-                ui.label(egui::RichText::new("Rotation (°)").small().weak());
-                for (axis, lbl) in [(0usize, "rot X"), (1, "rot Y"), (2, "rot Z")] {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                        let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
-                        if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                        if r.changed() { self.factory.furniture[fi].rot[axis] = rot[axis]; }
-                    });
-                }
-                self.factory_color_section(ui);
                 self.factory_delete_button(ui);
                 return;
             }
@@ -3941,17 +5644,23 @@ impl CadApp {
                 ui.label(egui::RichText::new("Wall").strong());
                 let mut h = self.factory.walls[wi].height;
                 let mut t = self.factory.walls[wi].thickness;
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new("height").small().weak()));
-                    let r = ui.add(egui::DragValue::new(&mut h).speed(0.02).range(0.05..=100.0).suffix(" m"));
-                    if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                    if r.changed() { self.factory.set_wall_height(fid, h); }
-                });
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new("thickness").small().weak()));
-                    let r = ui.add(egui::DragValue::new(&mut t).speed(0.01).range(0.02..=5.0).suffix(" m"));
-                    if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                    if r.changed() { self.factory.set_wall_thickness(fid, t); }
+                // Two columns: dimensions on the left, colour/texture on the right.
+                ui.columns(2, |cols| {
+                    let ui = &mut cols[0];
+                    ui.label(egui::RichText::new("Dimensions").small().weak());
+                    ui.horizontal(|ui| {
+                        ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("height").small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut h).speed(0.02).range(0.05..=100.0).suffix(" m"));
+                        if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                        if r.changed() { self.factory.set_wall_height(fid, h); }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("thickness").small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut t).speed(0.01).range(0.02..=5.0).suffix(" m"));
+                        if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                        if r.changed() { self.factory.set_wall_thickness(fid, t); }
+                    });
+                    self.factory_color_section(&mut cols[1]);
                 });
                 self.factory_delete_button(ui);
                 return;
@@ -3961,62 +5670,66 @@ impl CadApp {
         // A single selected SOLID: position + dimensions.
         if let Some((id, mut prim, origin)) = self.factory.selected_primitive() {
             ui.label(egui::RichText::new(prim.kind_label()).strong());
-
-            ui.label(egui::RichText::new("Position").small().weak());
-            for (axis, name) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
-                let mut v = origin[axis];
-                ui.horizontal(|ui| {
-                    ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(name).small().weak()));
-                    let r = ui.add(egui::DragValue::new(&mut v).speed(0.02).suffix(" m"));
-                    if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                    if r.changed() { self.factory.set_feature_origin_axis(id, axis, v); }
-                });
-            }
-
-            ui.label(egui::RichText::new("Dimensions").small().weak());
-            // The dimension editor reports whether anything changed; snapshot on the first
-            // change of an interaction only (a held drag keeps the same undo step).
-            let before = prim;
-            if crate::factory::primitive_dim_fields(ui, &mut prim) {
-                if !self.factory.dim_edit_active {
-                    self.snapshot_factory();
-                    self.factory.dim_edit_active = true;
-                }
-                self.factory.set_feature_primitive(id, prim);
-            } else if !ui.ctx().input(|i| i.pointer.any_down()) {
-                // Interaction finished — the next edit starts a fresh undo step.
-                self.factory.dim_edit_active = false;
-            }
-            let _ = before;
-
-            // Uniform scale about the object's centre — a quick "make it bigger/smaller"
-            // that scales every dimension at once (the fields above set exact sizes).
-            ui.horizontal(|ui| {
-                ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new("scale ×").small().weak()));
-                if ui.small_button("−10%").clicked() { self.snapshot_factory(); self.factory.scale_selection(0.9); }
-                if ui.small_button("+10%").clicked() { self.snapshot_factory(); self.factory.scale_selection(1.1); }
-                if ui.small_button("×2").clicked() { self.snapshot_factory(); self.factory.scale_selection(2.0); }
-                if ui.small_button("÷2").clicked() { self.snapshot_factory(); self.factory.scale_selection(0.5); }
-            });
-
-            // Rotation about the object's LOCAL axes (pitch/roll/spin) — same values the
-            // rotation-ring gizmo writes. Degrees.
-            if let Some(mut rot) = self.factory.feature_rotation(id) {
-                ui.label(egui::RichText::new("Rotation (°)").small().weak());
-                for (axis, lbl) in [(0usize, "pitch X"), (1, "roll Y"), (2, "spin Z")] {
+            // Three columns to match the furniture panel: placement + size + scale on the
+            // left, rotation in the middle, colour/texture on the right.
+            ui.columns(3, |cols| {
+                // Column 0 — Position, Dimensions, uniform scale.
+                let ui = &mut cols[0];
+                ui.label(egui::RichText::new("Position").small().weak());
+                for (axis, name) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
+                    let mut v = origin[axis];
                     ui.horizontal(|ui| {
-                        ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                        let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                        ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(name).small().weak()));
+                        let r = ui.add(egui::DragValue::new(&mut v).speed(0.02).suffix(" m"));
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-                        if r.changed() {
-                            self.factory.set_feature_rotation(id, axis, rot[axis]);
-                            self.factory.recompute();
-                        }
+                        if r.changed() { self.factory.set_feature_origin_axis(id, axis, v); }
                     });
                 }
-            }
+                ui.label(egui::RichText::new("Dimensions").small().weak());
+                // The dimension editor reports whether anything changed; snapshot on the
+                // first change of an interaction only (a held drag keeps the same undo step).
+                if crate::factory::primitive_dim_fields(ui, &mut prim) {
+                    if !self.factory.dim_edit_active {
+                        self.snapshot_factory();
+                        self.factory.dim_edit_active = true;
+                    }
+                    self.factory.set_feature_primitive(id, prim);
+                } else if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    // Interaction finished — the next edit starts a fresh undo step.
+                    self.factory.dim_edit_active = false;
+                }
+                // Uniform scale about the object's centre — a quick "make it bigger/smaller".
+                ui.label(egui::RichText::new("scale ×").small().weak());
+                ui.horizontal(|ui| {
+                    if ui.small_button("−10%").clicked() { self.snapshot_factory(); self.factory.scale_selection(0.9); }
+                    if ui.small_button("+10%").clicked() { self.snapshot_factory(); self.factory.scale_selection(1.1); }
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("×2").clicked() { self.snapshot_factory(); self.factory.scale_selection(2.0); }
+                    if ui.small_button("÷2").clicked() { self.snapshot_factory(); self.factory.scale_selection(0.5); }
+                });
 
-            self.factory_color_section(ui);
+                // Column 1 — Rotation about the object's LOCAL axes (pitch/roll/spin), the
+                // same values the rotation-ring gizmo writes. Degrees.
+                if let Some(mut rot) = self.factory.feature_rotation(id) {
+                    let ui = &mut cols[1];
+                    ui.label(egui::RichText::new("Rotation (°)").small().weak());
+                    for (axis, lbl) in [(0usize, "pitch"), (1, "roll"), (2, "spin")] {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
+                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                            if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
+                            if r.changed() {
+                                self.factory.set_feature_rotation(id, axis, rot[axis]);
+                                self.factory.recompute();
+                            }
+                        });
+                    }
+                }
+
+                // Column 2 — Colour / texture swatches.
+                self.factory_color_section(&mut cols[2]);
+            });
             self.factory_delete_button(ui);
             return;
         }
@@ -4028,15 +5741,82 @@ impl CadApp {
         self.factory_delete_button(ui);
     }
 
-    /// Delete-selected button + reminder that the Delete key does the same.
+    /// Duplicate + delete buttons for the current 3D selection (with keyboard-shortcut hints).
     fn factory_delete_button(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        if ui
-            .button(egui::RichText::new("🗑 Delete selected").color(egui::Color32::from_rgb(240, 150, 150)))
-            .on_hover_text("Remove the selected object(s). Shortcut: Delete key.")
-            .clicked()
-        {
-            self.factory_delete_selection();
+        ui.horizontal(|ui| {
+            if ui
+                .button("⧉ Duplicate")
+                .on_hover_text("Make an offset copy of the selected object — furniture, an extruded solid, or a door/window. Also: Ctrl+C then Ctrl+V.")
+                .clicked()
+            {
+                self.factory_duplicate_selection();
+            }
+            if ui
+                .button(egui::RichText::new("🗑 Delete").color(egui::Color32::from_rgb(240, 150, 150)))
+                .on_hover_text("Remove the selected object(s). Shortcut: Delete key.")
+                .clicked()
+            {
+                self.factory_delete_selection();
+            }
+        });
+        // GROUP / EXPLODE — only for CSG solids (a multi-selection or an existing group). A group
+        // moves / deletes / selects as one entity; Explode dissolves it back to individual pieces.
+        let grouped = self.factory.selection_group().is_some();
+        let can_group = self.factory.selection.len() >= 2;
+        if grouped || can_group {
+            ui.horizontal(|ui| {
+                if grouped {
+                    if ui.button("💥 Explode")
+                        .on_hover_text("Ungroup — release the pieces so each is independent again.")
+                        .clicked()
+                    {
+                        self.snapshot_factory();
+                        let n = self.factory.ungroup_selection();
+                        self.factory.status = format!("exploded — {n} pieces released");
+                        self.history.push(format!("  exploded group ({n} pieces)"));
+                    }
+                } else if ui.button("🧩 Group")
+                    .on_hover_text("Group the selected solids into ONE entity — they then select, move and delete together. Shift-click to multi-select first.")
+                    .clicked()
+                {
+                    self.snapshot_factory();
+                    let n = self.factory.group_selection();
+                    if n >= 2 {
+                        self.factory.status = format!("grouped {n} objects — click any to select all");
+                        self.history.push(format!("  grouped {n} objects"));
+                    } else {
+                        self.undo_stack.pop();
+                        self.factory.status = "select 2+ solids (shift-click) to group".into();
+                    }
+                }
+            });
+        }
+    }
+
+    /// Duplicate the current 3D selection in place (offset copy), whatever its type — an imported
+    /// furniture instance, a drawn APERTURE (door/window mesh), or an EXTRUDED solid / any CSG
+    /// feature. Copy + paste in one action, so it doesn't depend on the OS clipboard or keyboard
+    /// event form. The counterpart of Ctrl+C→Ctrl+V, but always reliable and discoverable.
+    fn factory_duplicate_selection(&mut self) {
+        if !self.factory.copy_selection() {
+            self.factory.status = "select a single 3D object to duplicate".into();
+            return;
+        }
+        self.snapshot_factory();
+        match self.factory.paste_clipboard() {
+            Some(is_feature) => {
+                if is_feature {
+                    self.factory.recompute();
+                }
+                self.factory.status =
+                    "duplicated (offset 0.3 m) — drag or arrow-nudge to place".into();
+                self.history.push("  duplicated selection".into());
+            }
+            None => {
+                self.undo_stack.pop(); // nothing pasted → discard the snapshot
+                self.factory.status = "nothing to duplicate".into();
+            }
         }
     }
 
@@ -4290,6 +6070,7 @@ impl CadApp {
     /// model-space document + its undo history.
     fn factory_exit_sketch(&mut self) {
         self.factory.sketch_ref.clear();
+        self.factory.editing_cutout = false; // any cutout-edit ends when the sketch closes
         if let Some(s) = self.factory.session.take() {
             let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
             if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
@@ -4424,6 +6205,140 @@ impl CadApp {
             }
         }
         None
+    }
+
+    /// First usable polyline in a document, in its (u,v). Used to read the path a user drew
+    /// (open or closed) — the sweep only needs the point sequence.
+    fn first_polyline_of(doc: &cad_kernel::Document) -> Option<Vec<glam::Vec2>> {
+        for d in &doc.dobjects {
+            for pl in cad_solid::geom_outlines(&d.geom) {
+                if pl.len() >= 2 { return Some(pl); }
+            }
+        }
+        None
+    }
+
+    /// The two drawing planes PERPENDICULAR to the section face, each containing the extrusion
+    /// (normal) direction — the only planes where a path can carry the section "into depth".
+    /// Both share the face's origin (so the sweep is anchored at the face). Returned with a
+    /// human view-name (nearest world axis of each plane's normal).
+    fn sweep_path_planes(section: &cad_solid::Frame) -> [(String, cad_solid::Frame); 2] {
+        let n = section.normal();
+        // Plane 1: spanned by (normal, v) — for a front face this is the SIDE (left/right).
+        let f1 = cad_solid::Frame { origin: section.origin, u: n, v: section.v };
+        // Plane 2: spanned by (normal, u) — for a front face this is the TOP.
+        let f2 = cad_solid::Frame { origin: section.origin, u: n, v: section.u };
+        [(Self::view_name(f1.normal()), f1), (Self::view_name(f2.normal()), f2)]
+    }
+
+    /// Nearest standard-view name for a plane normal (informative label only).
+    fn view_name(n: glam::Vec3) -> String {
+        let axes = [
+            (glam::Vec3::X, "Right"), (glam::Vec3::NEG_X, "Left"),
+            (glam::Vec3::Y, "Back"), (glam::Vec3::NEG_Y, "Front"),
+            (glam::Vec3::Z, "Top"), (glam::Vec3::NEG_Z, "Bottom"),
+        ];
+        axes.iter()
+            .max_by(|a, b| n.dot(a.0).partial_cmp(&n.dot(b.0)).unwrap())
+            .map(|(_, s)| s.to_string())
+            .unwrap_or_else(|| "Side".into())
+    }
+
+    /// Start the PATH-SWEEP flow. Step 1: the user right-clicks a face, draws the CROSS-SECTION,
+    /// and presses Enter / Finish — then the app offers the perpendicular views for the path.
+    fn factory_begin_sweep_flow(&mut self, cut: bool, furniture: bool) {
+        self.factory.modify = None;
+        self.factory.open = true;
+        self.factory.sweep_flow = Some(crate::factory::SweepFlow {
+            cut, furniture,
+            stage: crate::factory::SweepStage::Section,
+            section_frame: None,
+            section_loop: None,
+            views: Vec::new(),
+            path_frame: None,
+        });
+        let what = if cut { "Path cut" } else if furniture { "Path extrude → furniture" } else { "Path extrude" };
+        self.factory.status = format!(
+            "{what}: right-click a face → “Draw on this face”, draw the CROSS-SECTION, then press Enter."
+        );
+    }
+
+    /// Finish the current sweep stage (called on Enter / “Finish sketch” while a sweep flow is
+    /// active). Section stage → capture the profile + offer the perpendicular views. Path stage
+    /// → capture the path and build the sweep.
+    fn factory_finish_sweep_stage(&mut self) {
+        let Some(flow) = self.factory.sweep_flow.clone() else {
+            self.factory_exit_sketch();
+            return;
+        };
+        match flow.stage {
+            crate::factory::SweepStage::Section => {
+                // The section is whatever closed loop was drawn on the face.
+                let frame = self.factory.session.as_ref()
+                    .and_then(|s| self.factory.model.sketches.get(s.idx))
+                    .map(|sk| sk.frame);
+                let loop_ = Self::closed_loops_of(&self.doc).into_iter().next();
+                self.factory_exit_sketch();
+                match (frame, loop_) {
+                    (Some(frame), Some(loop_)) => {
+                        let views = Self::sweep_path_planes(&frame);
+                        let mut f = flow;
+                        f.section_frame = Some(frame);
+                        f.section_loop = Some(loop_);
+                        f.views = views.to_vec();
+                        f.stage = crate::factory::SweepStage::ChooseView;
+                        self.factory.status = "Cross-section captured — pick which view to draw the PATH on.".into();
+                        self.factory.sweep_flow = Some(f);
+                    }
+                    _ => {
+                        self.factory.sweep_flow = None;
+                        self.factory.status = "no closed cross-section was drawn — path sweep cancelled".into();
+                    }
+                }
+            }
+            crate::factory::SweepStage::Path => {
+                let path = Self::first_polyline_of(&self.doc);
+                self.factory_exit_sketch();
+                match (flow.section_frame, flow.section_loop.clone(), flow.path_frame, path) {
+                    (Some(sf), Some(section), Some(pf), Some(path)) => {
+                        self.factory.sweep_flow = None;
+                        let made = self.factory_build_sweep(sf, section, pf, path, flow.cut, flow.furniture);
+                        // Clear the section + path sketches so they don't linger as stray lines
+                        // in the 3D view (unless the user asked to keep drawings).
+                        if made > 0 && !self.factory.keep_sketch {
+                            self.factory_clear_sketch_on(sf);
+                            self.factory_clear_sketch_on(pf);
+                        }
+                    }
+                    _ => {
+                        self.factory.sweep_flow = None;
+                        self.factory.status = "no path was drawn — path sweep cancelled".into();
+                    }
+                }
+            }
+            crate::factory::SweepStage::ChooseView => {}
+        }
+    }
+
+    /// Clear the drawing of the sketch coplanar with `frame` (used to consume the section /
+    /// path sketches after a sweep so they don't linger as stray reference lines).
+    fn factory_clear_sketch_on(&mut self, frame: cad_solid::Frame) {
+        if let Some(sk) = self.factory.model.sketches.iter_mut()
+            .find(|s| Self::frames_coplanar(&s.frame, &frame))
+        {
+            sk.doc.dobjects.clear();
+        }
+    }
+
+    /// The user picked one of the perpendicular views: enter a sketch on that plane for the path.
+    fn factory_choose_sweep_view(&mut self, which: usize) {
+        let Some(mut flow) = self.factory.sweep_flow.clone() else { return };
+        let Some((name, frame)) = flow.views.get(which).cloned() else { return };
+        flow.stage = crate::factory::SweepStage::Path;
+        flow.path_frame = Some(frame);
+        self.factory.sweep_flow = Some(flow);
+        self.factory_enter_sketch(frame);
+        self.factory.status = format!("Draw the PATH on the {name} view, then press Enter.");
     }
 
     /// Consume the drawn shape after an extrude / cut (unless "keep shape" is on, or it came
@@ -4676,6 +6591,119 @@ impl CadApp {
             format!("{made} {what} the solid")
         };
         made
+    }
+
+    /// Build a swept solid (Union) or cutter (Difference): the CROSS-SECTION drawn on
+    /// `section_frame` is swept along the PATH drawn on `path_frame` (a plane perpendicular to
+    /// the section). The path is re-expressed in the section's local frame — so its component
+    /// along the section NORMAL becomes the extrusion depth — then csgrs sweeps the profile
+    /// perpendicular along it (parallel-transport frames). For a CUT the Difference is relocated
+    /// right after the body under the path so group-eval subtracts it from THAT body only.
+    fn factory_build_sweep(
+        &mut self,
+        section_frame: cad_solid::Frame,
+        section: Vec<glam::Vec2>,
+        path_frame: cad_solid::Frame,
+        path: Vec<glam::Vec2>,
+        cut: bool,
+        furniture: bool,
+    ) -> usize {
+        let source = "sweep-flow";
+        let features_before = self.factory.model.features.len();
+        let (o, u, v, n) = (
+            section_frame.origin, section_frame.u, section_frame.v, section_frame.normal(),
+        );
+        // Path points → WORLD (via the path plane) → SECTION-LOCAL (x=u, y=v, z=normal/depth).
+        let path_local: Vec<glam::Vec3> = path.iter().map(|p| {
+            let w = path_frame.from_uv(*p);
+            let dp = w - o;
+            glam::Vec3::new(dp.dot(u), dp.dot(v), dp.dot(n))
+        }).collect();
+
+        // For a CUT, find the target body under the path's WORLD centroid BEFORE mutating.
+        let target = if cut {
+            let c = path.iter().copied().fold(glam::Vec2::ZERO, |a, p| a + p)
+                / (path.len().max(1) as f32);
+            let probe = path_frame.from_uv(c);
+            let mut best: Option<(u32, f32)> = None;
+            for f in &self.factory.model.features {
+                if f.op != cad_solid::BoolOp::Union { continue; }
+                let (mn, mx) = f.world_aabb();
+                let inside = probe.x >= mn.x - 0.1 && probe.x <= mx.x + 0.1
+                    && probe.y >= mn.y - 0.1 && probe.y <= mx.y + 0.1
+                    && probe.z >= mn.z - 0.1 && probe.z <= mx.z + 0.1;
+                if inside {
+                    let s = mx - mn;
+                    let vol = s.x.abs().max(0.01) * s.y.abs().max(0.01) * s.z.abs().max(0.01);
+                    if best.map_or(true, |(_, v)| vol < v) { best = Some((f.id, vol)); }
+                }
+            }
+            match best {
+                Some((tid, _)) => Some(tid),
+                None => { self.factory.status = "no solid under this path to cut".into(); return 0; }
+            }
+        } else {
+            None
+        };
+
+        self.snapshot_factory();
+        let Ok((profile, _centre, w, d)) = self.factory.model.add_profile(&section) else {
+            self.undo_stack.pop();
+            self.factory.status = "cross-section unusable (degenerate / self-crossing)".into();
+            return 0;
+        };
+        let Some((path_id, pmn, pmx)) = self.factory.model.add_path(&path_local) else {
+            self.undo_stack.pop();
+            self.factory.status = "path needs at least two points".into();
+            return 0;
+        };
+        let (bmin, bmax) = Self::sweep_local_aabb(pmn, pmx, w, d);
+        let plane = cad_solid::Plane::from_basis(o, u, v);
+        let op = if cut { cad_solid::BoolOp::Difference } else { cad_solid::BoolOp::Union };
+        let id = self.factory.model.push(
+            op, plane, cad_solid::Placement::default(),
+            cad_solid::Primitive::Sweep { profile, path: path_id, bmin, bmax },
+        );
+        match target {
+            Some(tid) => {
+                // Relocate the Difference to sit right after its target body.
+                if let Some(diff) = self.factory.model.features.pop() {
+                    match self.factory.model.features.iter().position(|f| f.id == tid) {
+                        Some(ti) => self.factory.model.features.insert(ti + 1, diff),
+                        None => self.factory.model.features.push(diff),
+                    }
+                }
+            }
+            None => {
+                let colour = if furniture { [0.60, 0.62, 0.70] } else { [0.72, 0.66, 0.52] };
+                self.factory.feature_color.insert(id, colour);
+                self.factory.sel_furniture = None;
+                self.factory.selection = vec![id];
+            }
+        }
+        self.factory.recompute();
+        let op_name = if cut { "path-cut" }
+            else if furniture { "path-extrude-furniture" }
+            else { "path-extrude" };
+        let detail = format!(
+            "furniture={furniture} cut={cut} section_verts={} path_verts={} target={:?}",
+            section.len(), path.len(), target,
+        );
+        self.factory_op_evt(op_name, source, detail, features_before);
+        self.factory.status = if cut {
+            format!("channel cut along a {}-point path", path.len())
+        } else {
+            format!("swept solid created along a {}-point path", path.len())
+        };
+        1
+    }
+
+    /// Conservative LOCAL AABB of a swept solid: the path's bbox expanded by the section's
+    /// reach (half its diagonal) on every axis, since the section can face any direction
+    /// along the path.
+    fn sweep_local_aabb(pmn: glam::Vec3, pmx: glam::Vec3, w: f32, d: f32) -> ([f32; 3], [f32; 3]) {
+        let r = 0.5 * (w * w + d * d).sqrt() + 0.02;
+        ([pmn.x - r, pmn.y - r, pmn.z - r], [pmx.x + r, pmx.y + r, pmx.z + r])
     }
 
     /// Emit a `FactoryOp` recorder event stamped with the current model size (features,
@@ -4984,20 +7012,49 @@ impl CadApp {
                         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
                         .rounding(4.0)
                         .show(ui, |ui| {
+                            let editing_cutout = self.factory.editing_cutout;
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    egui::RichText::new("✎ drafting on plane")
-                                        .color(egui::Color32::from_rgb(255, 178, 60))
-                                        .strong(),
+                                    egui::RichText::new(if editing_cutout {
+                                        "✎ reshaping opening"
+                                    } else {
+                                        "✎ drafting on plane"
+                                    })
+                                    .color(egui::Color32::from_rgb(255, 178, 60))
+                                    .strong(),
                                 );
-                                if ui.button("✔ Finish sketch").clicked() {
+                                if editing_cutout {
+                                    // The one button that actually applies a dragged-point edit:
+                                    // re-cut the opening through every body and return to 3D.
+                                    if ui
+                                        .button(egui::RichText::new("✔ Apply reshape").strong())
+                                        .on_hover_text("Re-cut the opening with the edited outline through the whole wall, then show it in 3D")
+                                        .clicked()
+                                    {
+                                        self.factory_apply_cutout_reshape();
+                                    }
+                                    if ui
+                                        .button("✖ Cancel")
+                                        .on_hover_text("Discard the reshape and leave the opening as it was")
+                                        .clicked()
+                                    {
+                                        // Leave the sketch FIRST so the model-space undo stack is
+                                        // restored, then undo the snapshot taken before the cut
+                                        // was deleted — putting the original opening back.
+                                        self.factory_exit_sketch();
+                                        self.do_undo();
+                                        self.active_view = ActiveView::ThreeD;
+                                    }
+                                } else if ui.button("✔ Finish sketch").clicked() {
                                     self.factory_exit_sketch();
                                 }
                             });
                             ui.label(
-                                egui::RichText::new(
-                                    "the 2D canvas is this plane — full toolset (try: f → r → 10)",
-                                )
+                                egui::RichText::new(if editing_cutout {
+                                    "drag the opening's corner points to resize/reshape it, then ✔ Apply reshape"
+                                } else {
+                                    "the 2D canvas is this plane — full toolset (try: f → r → 10)"
+                                })
                                 .small()
                                 .weak(),
                             );
@@ -5037,6 +7094,23 @@ impl CadApp {
                                     .clicked()
                                 {
                                     self.factory_extrude_sketch(true);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("path sweep").small().weak());
+                                if ui
+                                    .button("〰 Path extrude")
+                                    .on_hover_text("Draw the cross-section on a face → Enter → pick a perpendicular view → draw the path → Enter. Sweeps the section along the path.")
+                                    .clicked()
+                                {
+                                    self.factory_begin_sweep_flow(false, false);
+                                }
+                                if ui
+                                    .button("〰 Path cut")
+                                    .on_hover_text("Draw the cross-section on a face → Enter → pick a perpendicular view → draw the path → Enter. Cuts a channel along the path.")
+                                    .clicked()
+                                {
+                                    self.factory_begin_sweep_flow(true, false);
                                 }
                             });
                             ui.horizontal(|ui| {
@@ -5206,16 +7280,38 @@ impl CadApp {
                             self.factory_cut_sketch(false);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        if ui
+                            .button("〰 Path extrude")
+                            .on_hover_text("Sweep a cross-section along a path into a solid (moldings, beams, pipes). Draw the section on a face → Enter → pick a perpendicular view → draw the path → Enter.")
+                            .clicked()
+                        {
+                            self.factory_begin_sweep_flow(false, false);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("〰 Path cut (channel)")
+                            .on_hover_text("Subtract a swept cross-section along a path — a routed channel / shaped opening. Draw the section on a face → Enter → pick a perpendicular view → draw the path → Enter.")
+                            .clicked()
+                        {
+                            self.factory_begin_sweep_flow(true, false);
+                            ui.close_menu();
+                        }
                     })
                     .response
                     .on_hover_text("Extrude or cut shapes drawn on a face — enabled while drafting on a face");
 
                     ui.menu_button("▼ Furniture", |ui| {
                         if ui
-                            .button("⭳  Import OBJ / 3DS / FBX…")
-                            .on_hover_text("Import a furniture mesh (.obj, .3ds or .fbx). Stored in the project for reuse.")
+                            .button("⭳  Import OBJ / 3DS / FBX / glTF…")
+                            .on_hover_text("Import a furniture mesh (.obj, .3ds, .fbx, .glb or .gltf). Stored in the project for reuse.")
                             .clicked()
                         {
+                            // Default the picker to the bundled CC0 furniture folder if present.
+                            let cc0 = std::path::Path::new("assets/cc0/furniture");
+                            if cc0.is_dir() {
+                                self.file_dialog_dir = Some(cc0.to_path_buf());
+                            }
                             self.open_file_dialog(FileDialogMode::ImportObj, ".obj");
                             ui.close_menu();
                         }
@@ -5235,11 +7331,17 @@ impl CadApp {
                             for (i, name) in names {
                                 if ui
                                     .button(format!("  ▫ {name}"))
-                                    .on_hover_text("Place another copy at the origin")
+                                    .on_hover_text("Place another copy at the model centre")
                                     .clicked()
                                 {
                                     self.snapshot_factory();
-                                    self.factory.place_furniture(i, glam::Vec3::ZERO);
+                                    // Drop it where the building is, NOT at world origin —
+                                    // otherwise it lands km away (DXF coords) and is invisible.
+                                    let at = self.factory.default_place_at();
+                                    self.factory.place_furniture(i, at);
+                                    // No fit() — placing furniture must not yank the camera
+                                    // out to a zoomed-out view; it lands at the model centre,
+                                    // already on screen. (Matches import_furniture_obj.)
                                     ui.close_menu();
                                 }
                             }
@@ -5254,6 +7356,35 @@ impl CadApp {
                             );
                         }
                         ui.separator();
+                        ui.label(egui::RichText::new("  Make furniture by parameters").small().weak());
+                        if ui
+                            .button("🗄  Cupboard (grid configurator)…")
+                            .on_hover_text("A cabinet as a grid of bays × tiers — fill each cell with a door, glass, drawers, a niche or a panel")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::Cupboard;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("🍳  Kitchen cabinets (run)…")
+                            .on_hover_text("A kitchen run — base cabinets + worktop + plinth, with optional hung wall (upper) cabinets you can toggle on/off")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::Kitchen;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("🚪  Cabinet unit (handleless)…")
+                            .on_hover_text("A single close-range cabinet: full-overlay fronts, real joinery, shadow gaps and a grip (handleless / J-groove / bar / rail). Grid of doors, drawers, open and panel cells.")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::Cabin;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         ui.label(egui::RichText::new("  Make furniture by drawing").small().weak());
                         if ui
                             .button("⬆  Extrude drawn shape")
@@ -5263,15 +7394,65 @@ impl CadApp {
                             self.factory_extrude_sketch(true);
                             ui.close_menu();
                         }
+                        if ui
+                            .button("〰 Path extrude")
+                            .on_hover_text("Sweep a cross-section along a path into a furniture piece (tubular frames, rails, trim). Draw the section on a face → Enter → pick a perpendicular view → draw the path → Enter.")
+                            .clicked()
+                        {
+                            self.factory_begin_sweep_flow(false, true);
+                            ui.close_menu();
+                        }
                     })
                     .response
-                    .on_hover_text("Import furniture (.obj/.3ds), place it, or extrude a drawn shape into furniture");
+                    .on_hover_text("Import furniture (.obj/.3ds/.fbx), place it, or extrude/sweep a drawn shape into furniture");
 
                     ui.menu_button("▼ Textures", |ui| {
                         self.factory_textures_menu(ui);
                     })
                     .response
-                    .on_hover_text("Colour the selected object; create textures (soon)");
+                    .on_hover_text("Colour or texture the selected object (paste/load an image, or reuse one from the library); tune tiling · opacity · reflection in the properties panel");
+
+                    ui.menu_button("▼ Openings", |ui| {
+                        self.factory_openings_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("Select, resize or delete cutouts (windows/doors/recesses)");
+
+                    ui.menu_button("▼ Apertures", |ui| {
+                        self.factory_apertures_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("Doors & windows: import one, or draw a rectangle on a wall and the app cuts the opening + fits a door/window into it");
+
+                    ui.menu_button("▼ Architecture", |ui| {
+                        self.factory_architecture_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("Generate a staircase (straight or U-shape), a spiral stair, or a ramp (doors are in ▼ Apertures, cupboards in ▼ Furniture)");
+
+                    if ui
+                        .button(if self.factory.sun.enabled { "☀ Sun" } else { "☀ Sun…" })
+                        .on_hover_text("Daylight: locate the sun from the building's latitude/longitude, date and time (Radiance's model) and light the scene by it")
+                        .clicked()
+                    {
+                        self.sun_modal_open = !self.sun_modal_open;
+                    }
+
+                    if ui
+                        .selectable_label(self.materials_open, "🎨 Materials")
+                        .on_hover_text("Materials Factory — a node-based material editor (Texture → Principled BSDF → Output), like Blender's shader graph. Edits update the 3D view live.")
+                        .clicked()
+                    {
+                        self.materials_open = !self.materials_open;
+                    }
+
+                    if ui
+                        .selectable_label(self.render_modal_open, "⏺ Render")
+                        .on_hover_text("Path-traced render (raytracing): true global illumination, reflections, soft shadows and glass — refines progressively, like Blender's Cycles. Choose CPU or GPU in the dialog.")
+                        .clicked()
+                    {
+                        self.render_modal_open = !self.render_modal_open;
+                    }
 
                     ui.separator();
                     // 2D plan underlay toggle — a highlighted button when on.
@@ -5413,7 +7594,33 @@ impl CadApp {
                 // ---- PROPERTIES — appears only when something is selected ----
                 // Replaces the old always-on wall-height/thickness sliders (which did
                 // nothing until a wall existed). Everything here is a type-in field.
-                self.factory_properties_panel(ui);
+                //
+                // The panel is wrapped in a COLLAPSIBLE + height-RESIZABLE region so a
+                // tall selection (transform + texture editors) can't crowd the 3D
+                // preview below (which fills whatever vertical space is left): the user
+                // drags the handle to set its height, or collapses the header entirely.
+                if self.factory.has_any_selection() {
+                    egui::CollapsingHeader::new("Selection properties")
+                        .id_salt("factory_props_collapse")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::Resize::default()
+                                .id_salt("factory_props_resize")
+                                .resizable([false, true])
+                                .default_height(260.0)
+                                .min_height(90.0)
+                                .show(ui, |ui| {
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            self.factory_properties_panel(ui);
+                                        });
+                                });
+                        });
+                } else {
+                    // Nothing selected — just the one-line hint, no chrome to collapse.
+                    self.factory_properties_panel(ui);
+                }
                 ui.label(
                     egui::RichText::new(format!(
                         "{} feature(s) · {} tris · {} selected",
@@ -5448,15 +7655,15 @@ impl CadApp {
                 let alt = ui.input(|i| i.modifiers.alt);
                 let shift = ui.input(|i| i.modifiers.shift);
                 let mut return_after_click = false; // a running 3D op consumed the click
-                // PAN — Shift + Left drag slides the view (moves the camera target in its
-                // own right/up plane). Tested BEFORE gizmo / select, and it suppresses
-                // them via `panning`, so a shifted drag never also grabs a handle.
-                let panning = shift && resp.dragged_by(egui::PointerButton::Primary);
+                // PAN — Shift + MIDDLE (scroll-wheel button) drag slides the view. Middle alone
+                // orbits, so holding Shift with it pans. The LEFT button stays free for picks /
+                // gizmo drags. Tested BEFORE gizmo / select and suppresses them via `panning`.
+                let panning = shift && resp.dragged_by(egui::PointerButton::Middle);
                 if panning {
                     let d = resp.drag_delta();
                     self.factory.pan(d.x, d.y);
                 }
-                // ORBIT — unchanged: middle drag, or Alt + Right drag.
+                // ORBIT — middle drag (WITHOUT shift), or Alt + Right drag.
                 let orbiting = !panning
                     && (resp.dragged_by(egui::PointerButton::Middle)
                         || (alt && resp.dragged_by(egui::PointerButton::Secondary)));
@@ -5473,6 +7680,105 @@ impl CadApp {
                         let max = self.factory.max_cam_dist();
                         self.factory.cam_dist =
                             (self.factory.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.4, max);
+                    }
+                }
+
+                // ---- ARROW-KEY NUDGE — fine placement of the selected object ----------
+                // Arrows nudge the selection in the ground plane, PageUp/Dn in Z; Shift = a
+                // coarser 5× step. Works for furniture (instant) and CSG features (re-eval'd).
+                //
+                // ROOT CAUSE (confirmed by the `nudge blocked … kbd_free=false` dump): a
+                // Position/Rotation DragValue in the properties panel keeps keyboard focus
+                // after you touch it, and the 3D viewport is NOT focusable, so clicking a
+                // furniture never clears that focus. A focus-based gate therefore blocked
+                // EVERY arrow. The right signal is not "is the keyboard free" but "is the
+                // pointer over the 3D viewport" — if so, the arrows are meant for nudging.
+                let over_viewport = resp.hovered() || resp.contains_pointer();
+                let can_nudge = (self.active_view == ActiveView::ThreeD || over_viewport)
+                    && self.factory.session.is_none()
+                    && self.factory.has_any_selection();
+                if can_nudge {
+                    // CONSUME the keys (with the current Shift state) so a still-focused
+                    // DragValue can't also react to them.
+                    let mods = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+                    let (mut dx, mut dy, mut dz) = (0.0f32, 0.0f32, 0.0f32);
+                    ui.input_mut(|i| {
+                        if i.consume_key(mods, egui::Key::ArrowRight) { dx += 1.0; }
+                        if i.consume_key(mods, egui::Key::ArrowLeft)  { dx -= 1.0; }
+                        if i.consume_key(mods, egui::Key::ArrowUp)    { dy += 1.0; }
+                        if i.consume_key(mods, egui::Key::ArrowDown)  { dy -= 1.0; }
+                        if i.consume_key(mods, egui::Key::PageUp)     { dz += 1.0; }
+                        if i.consume_key(mods, egui::Key::PageDown)   { dz -= 1.0; }
+                    });
+                    if dx != 0.0 || dy != 0.0 || dz != 0.0 {
+                        // Drop any lingering DragValue focus so the next press is clean and
+                        // the field doesn't keep stealing the keyboard.
+                        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+                            ui.ctx().memory_mut(|m| m.surrender_focus(id));
+                        }
+                        // Step SCALES WITH ZOOM (cam_dist): zoomed far out → coarse moves that
+                        // keep pace with the view; zoomed right in → millimetre steps for fine
+                        // placement. Shift = a coarser 5× step. Clamped so it's never zero.
+                        let base = (self.factory.cam_dist * 0.01).clamp(0.002, 20.0);
+                        let step = if shift { base * 5.0 } else { base };
+                        let delta = glam::Vec3::new(dx * step, dy * step, dz * step);
+                        self.snapshot_factory();
+                        self.factory.move_selection(delta);
+                        // Furniture is not in the CSG model; a feature move needs a re-eval.
+                        if self.factory.sel_furniture.is_none() {
+                            self.factory.recompute();
+                        }
+                        self.factory.status = format!(
+                            "nudged ({:+.3}, {:+.3}, {:+.3}) m (step {:.3} m, zoom-scaled) — arrows: X/Y · PgUp/PgDn: Z · Shift: ×5",
+                            delta.x, delta.y, delta.z, step,
+                        );
+                        ui.ctx().request_repaint();
+                    }
+                }
+
+                // ---- COPY / PASTE (Ctrl+C / Ctrl+V) — 3D objects --------------
+                // Gated like the nudge: 3D view active or pointer over the viewport, no sketch
+                // open. Keys are CONSUMED so the 2D canvas's own copy/paste doesn't also fire.
+                if (self.active_view == ActiveView::ThreeD || over_viewport)
+                    && self.factory.session.is_none()
+                {
+                    // eframe usually delivers Ctrl+C/V as Event::Copy/Paste (NOT raw Key
+                    // presses), so catch BOTH forms — otherwise 3D copy/paste silently misses on
+                    // platforms that only emit the events. Consuming them keeps the command line
+                    // from also reacting.
+                    let (do_copy, do_paste) = ui.input_mut(|i| {
+                        let mut c = i.consume_key(egui::Modifiers::COMMAND, egui::Key::C);
+                        let mut v = i.consume_key(egui::Modifiers::COMMAND, egui::Key::V);
+                        i.events.retain(|e| match e {
+                            egui::Event::Copy | egui::Event::Cut => { c = true; false }
+                            egui::Event::Paste(_) => { v = true; false }
+                            _ => true,
+                        });
+                        (c, v)
+                    });
+                    if do_copy {
+                        if self.factory.copy_selection() {
+                            self.factory.status = "copied — Ctrl+V to paste".into();
+                        } else {
+                            self.factory.status = "select a 3D object first, then Ctrl+C".into();
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    if do_paste {
+                        self.snapshot_factory();
+                        match self.factory.paste_clipboard() {
+                            Some(is_feature) => {
+                                if is_feature {
+                                    self.factory.recompute();
+                                }
+                                self.factory.status = "pasted a copy (offset 0.3 m) — drag or arrow-nudge to place".into();
+                            }
+                            None => {
+                                self.undo_stack.pop(); // nothing pasted → discard the snapshot
+                                self.factory.status = "clipboard is empty — Ctrl+C to copy first".into();
+                            }
+                        }
+                        ui.ctx().request_repaint();
                     }
                 }
 
@@ -6061,6 +8367,22 @@ impl CadApp {
                     }
                 }
 
+                // ---- PER-SURFACE TARGET highlight ---------------------------
+                // Outline the face/piece the user clicked (Face/Piece texture mode), so it's clear
+                // that a SURFACE — not the whole object — is targeted.
+                if self.factory.furn_face_sel.is_some() {
+                    let segs = self.factory.furniture_face_highlight_segments(rect, &mvp);
+                    if !segs.is_empty() {
+                        let fg = ui.ctx().layer_painter(egui::LayerId::new(
+                            egui::Order::Foreground,
+                            egui::Id::new("factory_face_highlight"),
+                        )).with_clip_rect(rect);
+                        for s in &segs {
+                            fg.line_segment(*s, egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 255)));
+                        }
+                    }
+                }
+
                 // ---- LEFT CLICK = SELECT (never camera) ----------------------
                 // Part B of the mouse rule: the left button is the selector. Shift
                 // adds, a click on empty space clears. The camera is untouched.
@@ -6111,15 +8433,116 @@ impl CadApp {
                         }
                     }
                 }
+                // PATH-SWEEP flow — Esc cancels it and leaves any open sketch.
+                if self.factory.sweep_flow.is_some()
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.factory.sweep_flow = None;
+                    if self.factory.session.is_some() { self.factory_exit_sketch(); }
+                    self.factory.status = "path sweep cancelled".into();
+                }
+                // PATH-SWEEP flow — Enter finishes the current stage (section → offer views;
+                // path → build). Only while a sketch is open, so it doesn't clash elsewhere.
+                if self.factory.sweep_flow.is_some()
+                    && self.factory.session.is_some()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    self.factory_finish_sweep_stage();
+                }
+                // PER-SURFACE FURNITURE — a furniture object is SELECTED and the user clicks ON IT
+                // again: the click drills into the face/piece under the cursor (the DCC convention:
+                // first click = object, second click = face) — NO mode prerequisite. The Face/Piece
+                // scope comes from `furn_paint_mode` when set; a drill from Whole-object mode
+                // auto-switches to Face so the Apply UI and the click agree. Two orders both work:
+                //  • a texture was picked first (brush armed) → the click TEXTURES the face now;
+                //  • no brush yet → the click TARGETS the face (furn_face_sel); the next texture
+                //    applied lands on it ("click a face, then pick a texture").
+                // A click that MISSES the selected object falls through to normal selection.
+                // `furn_handled` suppresses the normal selection/paint branches when we consumed it.
+                let mut furn_handled = false;
+                if self.factory.sel_furniture.is_some()
+                    && resp.clicked()
+                    && !return_after_click
+                {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let fi = self.factory.sel_furniture.unwrap();
+                        let piece = self.factory.furn_paint_mode == crate::factory::FurnPaintMode::Piece;
+                        let hit = self.factory.furniture_face_at(fi, pos, rect, &mvp, piece);
+                        // Diagnostic: which face/piece the click resolved to (or why it missed).
+                        if self.dbg.recording {
+                            let asset_tris = self.factory.sel_furniture
+                                .and_then(|i| self.factory.furniture.get(i))
+                                .and_then(|inst| self.factory.furniture_lib.get(inst.asset))
+                                .map(|a| a.positions.len() / 3)
+                                .unwrap_or(0);
+                            let has_parts = self.factory.furniture_has_parts(fi);
+                            // How many TRIANGLES the picked groups cover (the real "how much will
+                            // this paint" number — a group count of 1 can still be the whole side).
+                            let sel_tris = hit.as_ref().map(|g| {
+                                let set: std::collections::HashSet<u32> = g.iter().copied().collect();
+                                self.factory.furniture.get(fi)
+                                    .and_then(|inst| self.factory.furniture_lib.get(inst.asset))
+                                    .map(|a| a.group_geom().face.iter().filter(|f| set.contains(f)).count())
+                                    .unwrap_or(0)
+                            }).unwrap_or(0);
+                            let msg = match &hit {
+                                Some(g) => format!(
+                                    "FURN FACE pick @({:.0},{:.0}) inst#{fi} mode={} → {} group(s) = {sel_tris}/{asset_tris} tris {:?} (part_ids={has_parts}, brush={:?})",
+                                    pos.x, pos.y, if piece { "piece" } else { "face" }, g.len(),
+                                    &g[..g.len().min(6)], self.factory.furn_tex_brush,
+                                ),
+                                None => format!(
+                                    "FURN FACE pick @({:.0},{:.0}) inst#{fi} mode={} → MISS (ray didn't hit the mesh)",
+                                    pos.x, pos.y, if piece { "piece" } else { "face" },
+                                ),
+                            };
+                            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: msg });
+                        }
+                        if let Some(groups) = hit {
+                            furn_handled = true;
+                            // Drilling from Whole-object auto-switches the scope to Face so the
+                            // Apply UI (Materials Factory / Textures panel) matches what's selected.
+                            if self.factory.furn_paint_mode == crate::factory::FurnPaintMode::WholeObject {
+                                self.factory.furn_paint_mode = crate::factory::FurnPaintMode::Face;
+                            }
+                            if let Some(ti) = self.factory.furn_tex_brush {
+                                self.snapshot_factory();
+                                self.factory.apply_face_texture(fi, &groups, ti);
+                                self.factory.furn_face_sel = Some((fi, groups));
+                                self.factory.status = "textured — click another face, or switch to Whole object".into();
+                                self.history.push(format!("  furniture {} textured", if piece { "piece" } else { "face" }));
+                            } else {
+                                self.factory.furn_face_sel = Some((fi, groups));
+                                self.factory.status = format!(
+                                    "{} selected — Apply a material (🎨 Materials Factory) or pick a texture (▼ Textures)",
+                                    if piece { "piece" } else { "face" }
+                                );
+                            }
+                        }
+                        // A miss (clicked empty space / off the object) falls through to selection.
+                    }
+                }
                 // PAINT SURFACE mode — a click colours the face under the cursor instead
                 // of selecting. One undo step per paint.
-                if self.factory.paint_surface_mode && resp.clicked() && !return_after_click {
+                if furn_handled {
+                    // consumed by per-surface furniture handling above
+                }
+                else if self.factory.paint_surface_mode && resp.clicked() && !return_after_click {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let c = self.factory.last_pick_color;
                         self.snapshot_factory();
-                        if self.factory.paint_surface(pos, rect, &mvp, c) {
-                            self.history.push("  surface painted".into());
+                        // A texture "brush" (set when a texture is applied in paint mode) paints
+                        // the clicked face with that image; otherwise the palette colour.
+                        let hit = if let Some(ti) = self.factory.surface_tex_brush {
+                            let ok = self.factory.paint_surface_texture(pos, rect, &mvp, ti);
+                            if ok { self.factory.recompute(); self.history.push("  surface textured".into()); }
+                            ok
                         } else {
+                            let c = self.factory.last_pick_color;
+                            let ok = self.factory.paint_surface(pos, rect, &mvp, c);
+                            if ok { self.history.push("  surface painted".into()); }
+                            ok
+                        };
+                        if !hit {
                             self.undo_stack.pop(); // missed — no-op, drop the snapshot
                             self.factory.status = "click a surface to paint it".into();
                         }
@@ -6128,52 +8551,98 @@ impl CadApp {
                 else if resp.clicked() && !return_after_click {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let add = ui.input(|i| i.modifiers.shift);
-                        // Furniture is picked by its real triangles; a hit wins over a CSG
-                        // feature only if it is nearer. Simplest correct rule: pick both,
-                        // prefer whichever is in front. `pick_furniture` and `pick_feature`
-                        // each already return their nearest, so compare by trying furniture
-                        // first and falling back to features.
-                        let fur = self.factory.pick_furniture(pos, rect, &mvp);
-                        let feat = self.factory.pick_feature(pos, rect, &mvp);
-                        match (fur, feat) {
-                            // Both hit → whichever is nearer along the ray.
-                            (Some(fi), Some(id)) => {
-                                if self.factory.furniture_nearer_than_feature(pos, rect, &mvp, fi, id) {
-                                    self.factory.select_furniture(fi);
-                                } else {
-                                    self.factory.sel_furniture = None;
-                                    self.factory.selection = vec![id];
+                        // Pick the nearest furniture, the nearest APERTURE, and the nearest feature
+                        // — each WITH its ray depth. An aperture (door/window) is embedded flush in
+                        // the wall, so it gets PRIORITY: if it is hit and sits within its own
+                        // thickness of the nearest other surface, it wins even when the wall (or
+                        // another furniture piece) is marginally in front. Tracking the aperture
+                        // separately fixes the inconsistency where the "nearest furniture" was some
+                        // other piece and the aperture never got considered.
+                        let (fur, ap) = self.factory.pick_furniture_ex(pos, rect, &mvp);
+                        let feat = self.factory.pick_feature_t(pos, rect, &mvp);
+                        // Depth of the nearest NON-aperture surface (other furniture or the feature).
+                        let other_t = {
+                            let f_t = fur
+                                .filter(|&(fi, _)| ap.map_or(true, |(ai, _)| ai != fi))
+                                .map(|(_, t)| t);
+                            [f_t, feat.map(|(_, t)| t)].into_iter().flatten().fold(f32::INFINITY, f32::min)
+                        };
+                        let ap_wins = ap.map_or(false, |(ai, at)| {
+                            at <= other_t + self.factory.aperture_pick_tol(ai)
+                        });
+
+                        // Diagnostic: exact picks + depths + decision, so a mis-selection is
+                        // answerable straight from a session dump.
+                        if self.dbg.recording {
+                            let r3 = |t: f32| (t * 1000.0).round() / 1000.0;
+                            let decision = if ap_wins {
+                                format!("aperture#{}", ap.map(|(i, _)| i).unwrap_or(usize::MAX))
+                            } else {
+                                match (fur, feat) {
+                                    (Some((fi, ft)), Some((id, gt))) =>
+                                        if ft <= gt + 0.02 { format!("furniture#{fi}") } else { format!("feature#{id}") },
+                                    (Some((fi, _)), None) => format!("furniture#{fi}"),
+                                    (None, Some((id, _))) => format!("feature#{id}"),
+                                    (None, None) => "none".into(),
                                 }
+                            };
+                            let msg = format!(
+                                "3D pick @({:.1},{:.1}): fur={:?} ap={:?} feat={:?} other_t={:.3} tol={:.3} → {decision}",
+                                pos.x, pos.y,
+                                fur.map(|(i, t)| (i, r3(t))),
+                                ap.map(|(i, t)| (i, r3(t))),
+                                feat.map(|(id, t)| (id, r3(t))),
+                                if other_t.is_finite() { other_t } else { -1.0 },
+                                ap.map(|(ai, _)| self.factory.aperture_pick_tol(ai)).unwrap_or(0.0),
+                            );
+                            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: msg });
+                        }
+
+                        // Helper: select a feature id, honouring shift-add. Picking a grouped
+                        // feature selects the WHOLE group so it behaves as one entity.
+                        let mut select_feature = |app: &mut Self, id: u32| {
+                            app.factory.sel_furniture = None;
+                            if add {
+                                if !app.factory.selection.contains(&id) { app.factory.selection.push(id); }
+                            } else {
+                                app.factory.selection = vec![id];
                             }
-                            (Some(fi), None) => self.factory.select_furniture(fi),
-                            (None, Some(id)) => {
-                                self.factory.sel_furniture = None;
-                                if add {
-                                    if !self.factory.selection.contains(&id) {
-                                        self.factory.selection.push(id);
-                                    }
-                                } else {
-                                    self.factory.selection = vec![id];
-                                }
-                            }
-                            (None, None) => {
-                                // No solid/furniture hit — try a 2D plan shape on the ground,
-                                // so geometry drawn in 2D can be selected FROM the 3D view and
-                                // then extruded / cut.
-                                if let Some(i) = self.factory_pick_ground_dobject(pos, rect, &mvp) {
-                                    self.factory.clear_selection(); // drop any 3D feature selection
-                                    if add {
-                                        if !self.selection.contains(&i) {
-                                            self.selection.push(i);
-                                        }
+                            app.factory.expand_selection_to_groups();
+                        };
+
+                        if let (true, Some((ai, _))) = (ap_wins, ap) {
+                            self.factory.select_furniture(ai);
+                        } else {
+                            match (fur, feat) {
+                                (Some((fi, ft)), Some((id, gt))) => {
+                                    // 2 cm tolerance so furniture flush against a wall still wins.
+                                    if ft <= gt + 0.02 {
+                                        self.factory.select_furniture(fi);
                                     } else {
-                                        self.selection = vec![i];
+                                        select_feature(self, id);
                                     }
-                                    self.factory.status =
-                                        "2D shape selected — ▼ Room elements ▸ Extrude / Cut".into();
-                                } else if !add {
-                                    self.factory.clear_selection();
-                                    self.selection.clear();
+                                }
+                                (Some((fi, _)), None) => self.factory.select_furniture(fi),
+                                (None, Some((id, _))) => select_feature(self, id),
+                                (None, None) => {
+                                    // No solid/furniture hit — try a 2D plan shape on the ground,
+                                    // so geometry drawn in 2D can be selected FROM the 3D view and
+                                    // then extruded / cut.
+                                    if let Some(i) = self.factory_pick_ground_dobject(pos, rect, &mvp) {
+                                        self.factory.clear_selection(); // drop any 3D feature selection
+                                        if add {
+                                            if !self.selection.contains(&i) {
+                                                self.selection.push(i);
+                                            }
+                                        } else {
+                                            self.selection = vec![i];
+                                        }
+                                        self.factory.status =
+                                            "2D shape selected — ▼ Room elements ▸ Extrude / Cut".into();
+                                    } else if !add {
+                                        self.factory.clear_selection();
+                                        self.selection.clear();
+                                    }
                                 }
                             }
                         }
@@ -6193,6 +8662,32 @@ impl CadApp {
                 let sketching = self.factory.session.is_some();
                 let mut want_sketch: Option<cad_solid::Frame> = None;
                 let mut want_finish = false;
+                let mut want_choose_view: Option<usize> = None;
+
+                // PATH-SWEEP "which view?" overlay — shown after the cross-section is finished.
+                // Offers the two perpendicular planes for drawing the path (path defines where
+                // the swept solid runs). Deferred via `want_choose_view` (can't borrow self here).
+                if let Some(flow) = self.factory.sweep_flow.as_ref() {
+                    if flow.stage == crate::factory::SweepStage::ChooseView {
+                        let views = flow.views.clone();
+                        egui::Area::new(egui::Id::new("sweep_view_picker"))
+                            .fixed_pos(rect.left_top() + egui::vec2(10.0, 40.0))
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Draw the PATH on which view?").strong());
+                                    ui.label(egui::RichText::new("(perpendicular to the section)").small().weak());
+                                    for (i, (name, _)) in views.iter().enumerate() {
+                                        if ui.button(format!("▦  {name} view")).clicked() {
+                                            want_choose_view = Some(i);
+                                        }
+                                    }
+                                    if ui.button("✕  Cancel").clicked() {
+                                        want_choose_view = Some(usize::MAX);
+                                    }
+                                });
+                            });
+                    }
+                }
                 resp.context_menu(|ui| {
                     ui.set_min_width(210.0);
                     if sketching {
@@ -6234,8 +8729,269 @@ impl CadApp {
                     }
                 });
 
-                let mut verts = self.factory.scene_verts();
-                verts.extend(self.factory.furniture_verts()); // placed furniture meshes
+                // Opaque solids + placed furniture, from a cache that only rebuilds when
+                // the scene actually changes — so orbiting past a heavy imported mesh no
+                // longer re-transforms every vertex each frame (was the post-import lag).
+                //
+                // ---- PERF MONITOR (session recorder) -----------------------
+                // Furniture is a triangle-soup mesh INSTANCE, invisible to FactoryOp's
+                // feature/body counts, so a 90k-tri import's LOAD and frame cost show up
+                // nowhere else. Time the buffer build, detect a rebuild by Arc identity, and
+                // measure the whole-frame delta — then log it on the import/edit moment (a
+                // rebuild) or on a slow orbit frame (throttled so it can't flood the dump).
+                let now = std::time::Instant::now();
+                let mut frame_us = self
+                    .factory_perf_last_frame
+                    .map(|t| now.saturating_duration_since(t).as_micros() as u64)
+                    .unwrap_or(0);
+                // A >1 s "frame" means the 3D view was closed/idle, not a stall — don't
+                // mistake reopening the view for a dropped frame.
+                if frame_us > 1_000_000 { frame_us = 0; }
+                self.factory_perf_last_frame = Some(now);
+
+                // Push the resolved sun light to the (thread-local) shader BEFORE any shaded buffer
+                // is built this frame, so the scene + furniture bake under the current daylight.
+                // Also derive the per-frame sun uniforms + shadow-map matrix passed to render().
+                let (sun_en, sun_dir, sun_col, sky_col, ground_col) = self.factory.sun.resolve();
+                crate::factory::set_sun_light(sun_en, sun_dir, sun_col, sky_col, ground_col);
+                crate::factory::set_clay(self.factory.clay_mode);
+                let clay = self.factory.clay_mode;
+                // Materials Factory selection → pulse-highlight that material's surfaces in the
+                // scene, so the user sees WHERE it is while tuning it. Only while the editor is open.
+                let mf_highlight: Option<(usize, f32)> = if self.materials_open {
+                    self.materials.sel.map(|i| {
+                        let t = ctx.input(|inp| inp.time);
+                        (i, (0.55 + 0.45 * (t * 4.0).sin()) as f32)
+                    })
+                } else {
+                    None
+                };
+                let sun_uniform: Option<([f32; 3], [f32; 3], [f32; 3], [f32; 3])> =
+                    if sun_en { Some(([sun_dir.x, sun_dir.y, sun_dir.z], sun_col, sky_col, ground_col)) } else { None };
+                // Shadows only while the sun is meaningfully above the horizon (a near-horizon sun
+                // makes an enormous, useless frustum). Framed to the whole drawn scene.
+                let shadow_mvp: Option<[f32; 16]> = if sun_en && self.factory.sun.shadows && sun_dir.z > 0.05 {
+                    self.factory.render_bounds().map(|(mn, mx)| sun_light_matrix(mn, mx, sun_dir))
+                } else {
+                    None
+                };
+                let t_build = std::time::Instant::now();
+                let verts = self.factory.opaque_verts();
+                let build_us = t_build.elapsed().as_micros() as u64;
+
+                // FURNITURE: one GPU-instanced draw per piece. Each mesh is baked to LOCAL space
+                // ONCE (cached by asset+colour) and uploaded to its own GPU buffer once by the
+                // renderer; here we only compute the per-instance model matrix (camera·model).
+                // So importing / moving / rotating furniture — even a multi-million-triangle
+                // piece — never CPU-transforms or re-uploads the mesh (that was the stutter).
+                let mvp_m = glam::Mat4::from_cols_array(&mvp);
+                const IDENT16: [f32; 16] =
+                    [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
+                // Each opaque draw also carries its WORLD model matrix (last [f32;16]) so the sun
+                // shadow pass + normal maps can transform local geometry to world.
+                let mut furn_draws: Vec<(u64, StdArc<Vec<crate::light3d::V3>>, [f32; 16], [f32; 16])> =
+                    Vec::with_capacity(self.factory.furniture.len());
+                // Textured furniture is peeled off into its own list (image-mapped pass); the
+                // rest stay flat-shaded. `tex_assets_owned` carries the pixels the pass needs.
+                let mut tex_draws_owned: Vec<(usize, u64, StdArc<Vec<crate::light3d::TexVtx>>, [f32; 16], [f32; 16])> =
+                    Vec::new();
+                // Translucent furniture (glass panes), tagged with a camera-space depth so the
+                // blended pass can be sorted back-to-front. Sorted + stripped of the depth below.
+                let mut transp_draws_owned: Vec<(f32, u64, StdArc<Vec<crate::light3d::V3A>>, [f32; 16])> =
+                    Vec::new();
+                // Translucent TEXTURED furniture (glass that shows an image), same depth tagging + model.
+                let mut tex_transp_draws_owned: Vec<(f32, usize, u64, StdArc<Vec<crate::light3d::TexVtx>>, [f32; 16], [f32; 16])> =
+                    Vec::new();
+                let mut needed_tex: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                for i in 0..self.factory.furniture.len() {
+                    let model = self.factory.furniture_model_matrix(i).unwrap_or(IDENT16);
+                    let fmvp = (mvp_m * glam::Mat4::from_cols_array(&model)).to_cols_array();
+                    // Depth (NDC z of the instance origin) for back-to-front sorting of any glass.
+                    let origin = glam::Vec3::new(model[12], model[13], model[14]);
+                    let depth = mvp_m.project_point3(origin).z;
+                    // PER-SURFACE textured piece: split into one textured group per texture used
+                    // plus a flat remainder. Only returns Some when the instance has per-face
+                    // textures (else the whole-object paths below handle it unchanged).
+                    if let Some(fac) = self.factory.furniture_faceted(i) {
+                        // `fac` is a cached Arc; the inner Vec is cloned into the GPU-mesh cache only
+                        // on a miss (first frame after a paint), never on steady frames.
+                        for (tex_idx, key, verts) in &fac.opaque {
+                            let mesh = self
+                                .furniture_tex_meshes
+                                .entry(*key)
+                                .or_insert_with(|| StdArc::new(verts.clone()))
+                                .clone();
+                            needed_tex.insert(*tex_idx);
+                            tex_draws_owned.push((*tex_idx, *key, mesh, fmvp, model));
+                        }
+                        // See-through textured faces → the blended textured pass (depth-sorted).
+                        for (tex_idx, key, verts) in &fac.translucent {
+                            let mesh = self
+                                .furniture_tex_meshes
+                                .entry(*key)
+                                .or_insert_with(|| StdArc::new(verts.clone()))
+                                .clone();
+                            needed_tex.insert(*tex_idx);
+                            tex_transp_draws_owned.push((depth, *tex_idx, *key, mesh, fmvp, model));
+                        }
+                        if let Some((key, verts)) = &fac.flat {
+                            let mesh = self
+                                .furniture_gpu_meshes
+                                .entry(*key)
+                                .or_insert_with(|| StdArc::new(verts.clone()))
+                                .clone();
+                            furn_draws.push((*key, mesh, fmvp, model));
+                        }
+                        continue;
+                    }
+                    let tex_op = self.factory.furniture_textured_mesh(i);
+                    let tex_tr = self.factory.furniture_textured_translucent_mesh(i);
+                    if tex_op.is_some() || tex_tr.is_some() {
+                        // A textured piece: opaque faces in the image pass, glass in the blended one.
+                        if let Some((tex_idx, key, verts)) = tex_op {
+                            let mesh = self
+                                .furniture_tex_meshes
+                                .entry(key)
+                                .or_insert_with(|| StdArc::new(verts))
+                                .clone();
+                            needed_tex.insert(tex_idx);
+                            tex_draws_owned.push((tex_idx, key, mesh, fmvp, model));
+                        }
+                        if let Some((tex_idx, key, verts)) = tex_tr {
+                            let mesh = self
+                                .furniture_tex_meshes
+                                .entry(key)
+                                .or_insert_with(|| StdArc::new(verts))
+                                .clone();
+                            needed_tex.insert(tex_idx);
+                            tex_transp_draws_owned.push((depth, tex_idx, key, mesh, fmvp, model));
+                        }
+                    } else {
+                        let key = self.factory.furniture_key(i);
+                        if !self.furniture_gpu_meshes.contains_key(&key) {
+                            let mesh = StdArc::new(self.factory.furniture_local_mesh(i));
+                            self.furniture_gpu_meshes.insert(key, mesh);
+                        }
+                        let mesh = self.furniture_gpu_meshes[&key].clone();
+                        furn_draws.push((key, mesh, fmvp, model));
+                        // Peel this piece's see-through triangles into the blended pass.
+                        if let Some((tkey, tverts)) = self.factory.furniture_translucent_mesh(i) {
+                            let tmesh = self
+                                .furniture_transp_meshes
+                                .entry(tkey)
+                                .or_insert_with(|| StdArc::new(tverts))
+                                .clone();
+                            transp_draws_owned.push((depth, tkey, tmesh, fmvp));
+                        }
+                    }
+                }
+                // Back-to-front for correct alpha blending between separate glass pieces.
+                transp_draws_owned.sort_by(|a, b| b.0.total_cmp(&a.0));
+                tex_transp_draws_owned.sort_by(|a, b| b.0.total_cmp(&a.0));
+                // Camera eye — for the reflection sheen AND to depth-sort translucent features.
+                let cam_pos = crate::light3d::cam_eye(
+                    self.factory.cam_yaw, self.factory.cam_pitch, self.factory.cam_dist, self.factory.cam_target,
+                );
+                // Textured FEATURE surfaces (walls/floors, CSG solids) — world-space, grouped by
+                // texture, re-uploaded each frame. Split by the texture's opacity: opaque groups
+                // draw in the normal pass; see-through ones (a tuned CSG solid) go to the blended
+                // pass, sorted back-to-front so overlapping translucent solids read correctly.
+                let mut tex_feat_owned: Vec<(usize, Vec<crate::light3d::TexVtx>)> = Vec::new();
+                let mut tex_feat_transp_owned: Vec<(usize, Vec<crate::light3d::TexVtx>)> = Vec::new();
+                for (idx, verts) in self.factory.feature_textured_meshes() {
+                    needed_tex.insert(idx);
+                    let translucent = self.factory.textures.get(idx)
+                        .map_or(false, |t| t.opacity < crate::factory::ALPHA_OPAQUE);
+                    if translucent {
+                        tex_feat_transp_owned.push((idx, verts));
+                    } else {
+                        tex_feat_owned.push((idx, verts));
+                    }
+                }
+                for (_idx, verts) in &mut tex_feat_transp_owned {
+                    let depth = |t: &[crate::light3d::TexVtx]| {
+                        let c = [(t[0].x + t[1].x + t[2].x) / 3.0, (t[0].y + t[1].y + t[2].y) / 3.0, (t[0].z + t[1].z + t[2].z) / 3.0];
+                        let d = [c[0] - cam_pos[0], c[1] - cam_pos[1], c[2] - cam_pos[2]];
+                        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+                    };
+                    let mut tris: Vec<[crate::light3d::TexVtx; 3]> =
+                        verts.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+                    tris.sort_by(|a, b| depth(b).total_cmp(&depth(a)));
+                    *verts = tris.into_iter().flatten().collect();
+                }
+                // Pixels for every texture referenced this frame (Arc → cheap clone; the
+                // renderer uploads each to GL once and caches by index).
+                let mut tex_assets_owned: Vec<(usize, StdArc<Vec<u8>>, i32, i32)> = Vec::new();
+                let mut tex_reflect_owned: Vec<(usize, f32)> = Vec::new();
+                let mut tex_proc_owned: Vec<(usize, crate::light3d::ProcParams)> = Vec::new();
+                let mut tex_pbr_owned: Vec<(usize, crate::light3d::PbrParams)> = Vec::new();
+                // PBR normal/roughness maps referenced by any needed texture must ALSO upload.
+                let pbr_maps: Vec<usize> = needed_tex
+                    .iter()
+                    .filter_map(|&i| self.factory.textures.get(i))
+                    .flat_map(|t| t.normal_map.into_iter().chain(t.rough_map))
+                    .collect();
+                for m in pbr_maps {
+                    needed_tex.insert(m);
+                }
+                for &idx in &needed_tex {
+                    if let Some(t) = self.factory.textures.get(idx) {
+                        let rgba = self
+                            .texture_rgba
+                            .entry(idx)
+                            .or_insert_with(|| StdArc::new(t.rgba.clone()))
+                            .clone();
+                        tex_assets_owned.push((idx, rgba, t.w as i32, t.h as i32));
+                        if t.reflect > 0.0 {
+                            tex_reflect_owned.push((idx, t.reflect));
+                        }
+                        // A procedural texture carries its shader params instead of an image.
+                        if let Some(def) = &t.proc {
+                            tex_proc_owned.push((idx, def.params()));
+                        }
+                        // Tangent-space normal / roughness maps (Texture Phase 2).
+                        if t.has_pbr() {
+                            tex_pbr_owned.push((idx, t.pbr_params()));
+                        }
+                    }
+                }
+                let rebuilt = match &self.factory_perf_prev {
+                    Some(p) => !StdArc::ptr_eq(p, &verts),
+                    None => true,
+                };
+                self.factory_perf_prev = Some(verts.clone());
+                // Bump the GPU scene version only when the buffer actually changed, so the
+                // renderer re-uploads it once (not every frame).
+                if rebuilt { self.factory_scene_ver = self.factory_scene_ver.wrapping_add(1); }
+
+                if self.dbg.recording {
+                    let slow_frame = frame_us >= 16_700;
+                    let throttle_ok = self
+                        .factory_perf_last_slow
+                        .map(|t| now.saturating_duration_since(t).as_millis() >= 300)
+                        .unwrap_or(true);
+                    if rebuilt || (slow_frame && throttle_ok) {
+                        if slow_frame && !rebuilt {
+                            self.factory_perf_last_slow = Some(now);
+                        }
+                        let n = verts.len();
+                        let sz = std::mem::size_of::<crate::light3d::V3>();
+                        let phase = if rebuilt { "buffer-rebuilt" } else { "slow-frame" };
+                        crate::dbg_event!(
+                            self,
+                            crate::dbg_recorder::DbgEvent::FactoryPerf {
+                                phase: phase.to_string(),
+                                frame_us: if rebuilt { 0 } else { frame_us },
+                                build_us,
+                                scene_tris: n / 3,
+                                furniture_insts: self.factory.furniture.len(),
+                                heaviest_tris: self.factory.heaviest_furniture_tris(),
+                                upload_bytes: n * sz,
+                                cache_rebuilt: rebuilt,
+                            }
+                        );
+                    }
+                }
                 let mut lines = self.factory.overlay_lines();
                 lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
                 lines.extend(self.factory.live_sketch_lines(&self.doc)); // active sketch, live
@@ -6252,6 +9008,7 @@ impl CadApp {
                 // (osnap → CARD → raw), so what you see is exactly where it lands.
                 self.factory.sync_selection_mesh();
                 let mut overlay = self.factory.shade_verts();
+                // (Furniture is drawn full-form via the GPU model-matrix pass — see `furn_draws`.)
                 // ---- §0.6 preview: the ghost + the path -----------------------
                 // "while moving it shows the path" — redrawn each frame at the
                 // CONSTRAINED cursor, so what you see is where the click lands.
@@ -6285,7 +9042,11 @@ impl CadApp {
                         ants = Some((to_s(base), to_s(cw), accent));
                     }
                 }
-                if verts.is_empty() && lines.is_empty() {
+                if verts.is_empty() && lines.is_empty() && furn_draws.is_empty()
+                    && transp_draws_owned.is_empty() && tex_transp_draws_owned.is_empty()
+                    && tex_draws_owned.is_empty() && tex_feat_owned.is_empty()
+                    && tex_feat_transp_owned.is_empty()
+                {
                     painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -6295,15 +9056,46 @@ impl CadApp {
                     );
                 } else {
                     let renderer = self.light3d_renderer.clone();
+                    // Copied out of `self` so the `move` paint closure can carry them.
+                    let scene_ver = self.factory_scene_ver;
                     painter.add(egui::Shape::Callback(egui::PaintCallback {
                         rect,
                         callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
                             let gl = gp.gl();
                             let vp = info.viewport_in_pixels();
                             let s = info.screen_size_px;
+                            // Furniture draws as (key, &local_mesh, camera·model, world model) slices.
+                            let furn: Vec<(u64, &[crate::light3d::V3], [f32; 16], [f32; 16])> =
+                                furn_draws.iter().map(|(k, m, mv, md)| (*k, m.as_slice(), *mv, *md)).collect();
+                            // Translucent furniture (already sorted back-to-front); drop the depth.
+                            let transp: Vec<(u64, &[crate::light3d::V3A], [f32; 16])> =
+                                transp_draws_owned.iter().map(|(_d, k, m, mv)| (*k, m.as_slice(), *mv)).collect();
+                            // Textured furniture + the pixels its images need.
+                            let tex_assets: Vec<(usize, i32, i32, &[u8])> = tex_assets_owned
+                                .iter()
+                                .map(|(i, r, w, h)| (*i, *w, *h, r.as_slice()))
+                                .collect();
+                            let tex_draws: Vec<(usize, u64, &[crate::light3d::TexVtx], [f32; 16], [f32; 16])> =
+                                tex_draws_owned
+                                    .iter()
+                                    .map(|(ti, k, m, mv, md)| (*ti, *k, m.as_slice(), *mv, *md))
+                                    .collect();
+                            // Translucent textured furniture (already sorted back-to-front).
+                            let tex_transp: Vec<(usize, u64, &[crate::light3d::TexVtx], [f32; 16], [f32; 16])> =
+                                tex_transp_draws_owned
+                                    .iter()
+                                    .map(|(_d, ti, k, m, mv, md)| (*ti, *k, m.as_slice(), *mv, *md))
+                                    .collect();
+                            let tex_feat: Vec<(usize, &[crate::light3d::TexVtx])> =
+                                tex_feat_owned.iter().map(|(ti, m)| (*ti, m.as_slice())).collect();
+                            let tex_feat_transp: Vec<(usize, &[crate::light3d::TexVtx])> =
+                                tex_feat_transp_owned.iter().map(|(ti, m)| (*ti, m.as_slice())).collect();
                             if let Ok(mut r) = renderer.lock() {
                                 r.render(
-                                    gl, &verts, &overlay, &lines, &mvp,
+                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver),
+                                    &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
+                                    &tex_feat_transp, cam_pos, &tex_reflect_owned, &tex_proc_owned,
+                                    &tex_pbr_owned, sun_uniform, shadow_mvp, clay, mf_highlight, true,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -6363,7 +9155,21 @@ impl CadApp {
                     self.factory_enter_sketch(f);
                 }
                 if want_finish {
-                    self.factory_exit_sketch();
+                    // In a sweep flow, "Finish" advances the flow (capture section / build);
+                    // otherwise it just closes the sketch.
+                    if self.factory.sweep_flow.is_some() {
+                        self.factory_finish_sweep_stage();
+                    } else {
+                        self.factory_exit_sketch();
+                    }
+                }
+                if let Some(i) = want_choose_view {
+                    if i == usize::MAX {
+                        self.factory.sweep_flow = None;
+                        self.factory.status = "path sweep cancelled".into();
+                    } else {
+                        self.factory_choose_sweep_view(i);
+                    }
                 }
             });
         if !open && self.factory.open {
@@ -6464,7 +9270,9 @@ impl CadApp {
                             let s = info.screen_size_px;
                             if let Ok(mut r) = renderer.lock() {
                                 r.render(
-                                    gl, &verts, &[], &[], &mvp,
+                                    gl, &verts, &[], &[], &mvp, None,
+                                    &[], &[], &[], &[], &[], &[], &[], [0.0, 0.0, 0.0], &[], &[],
+                                    &[], None, None, false, None, false,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -15886,7 +18694,2358 @@ impl CadApp {
     // Slice H — File I/O (DXF for now; .rsm in Slice I)
     // ===================================================================
 
+    /// Draw the modal load/save progress overlay: a dimmed backdrop that absorbs input and a
+    /// centred themed card with a spinner, the file name, a progress bar, and a time estimate.
+    /// Uses the app's applied Visuals (via `theme::apply`), so it matches the rest of the UI.
+    fn render_busy_overlay(&self, ctx: &egui::Context) {
+        let Some(b) = &self.busy else { return };
+        let verb = match b.kind { BusyKind::Load => "Loading", BusyKind::Save => "Saving" };
+        let elapsed = b.started.elapsed().as_secs_f32();
+        let est = (b.est_ms as f32 / 1000.0).max(0.3);
+        let frac = (elapsed / est).clamp(0.05, 0.95);
+        let screen = ctx.screen_rect();
+
+        // Dimmed backdrop — also swallows clicks so nothing behind it reacts mid-load.
+        egui::Area::new(egui::Id::new("busy_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            });
+
+        egui::Window::new("busy_overlay")
+            .order(egui::Order::Foreground)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame::window(&ctx.style()))
+            .show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(20.0));
+                    ui.add_space(6.0);
+                    ui.heading(format!("{verb}…"));
+                });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(&b.subtitle).weak());
+                ui.add_space(10.0);
+                ui.add(egui::ProgressBar::new(frac).desired_width(284.0).animate(true));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("about {:.0} second(s) — please wait", est.max(0.5).round()))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(8.0);
+            });
+        ctx.request_repaint(); // keep the spinner/bar alive while busy
+    }
+
+    /// Modal "unsaved changes" prompt shown when a close was vetoed. Save / Don't Save / Cancel.
+    fn render_close_confirm(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        // Dimmed backdrop that also swallows clicks behind the dialog.
+        egui::Area::new(egui::Id::new("close_confirm_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            });
+
+        let name = self.current_file.as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "this drawing".to_string());
+
+        egui::Window::new("close_confirm")
+            .order(egui::Order::Foreground)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame::window(&ctx.style()))
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.add_space(6.0);
+                ui.heading("Unsaved changes");
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("“{name}” has changes that aren't saved yet.")).weak());
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Save and close").strong())).clicked() {
+                        // Async save; the close happens in apply_saved once bytes are on disk.
+                        // If there's no file yet, do_save_current opens Save As.
+                        self.close_confirm = false;
+                        self.close_after_save = true;
+                        self.do_save_current();
+                    }
+                    if ui.add(egui::Button::new("Close without saving")).clicked() {
+                        self.close_confirm = false;
+                        self.pending_close = true; // authorise the close next frame
+                    }
+                    if ui.add(egui::Button::new("Cancel")).clicked() {
+                        // Stay open — nothing to do but drop the prompt.
+                        self.close_confirm = false;
+                        self.close_after_save = false;
+                    }
+                });
+                ui.add_space(6.0);
+            });
+    }
+
+    /// The ☀ Sun / daylight window — set the building's latitude/longitude, timezone, date and
+    /// time-of-day; the sun is located with Radiance's model ([`crate::solar`]) and (when enabled)
+    /// lights the whole scene. Shows the computed altitude/bearing so it can be matched in a later
+    /// Radiance/Blender render.
+    fn render_sun_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.sun_modal_open;
+        egui::Window::new("☀  Sun / daylight")
+            .id(egui::Id::new("factory_sun_modal"))
+            .collapsible(true)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let s = &mut self.factory.sun;
+                ui.checkbox(&mut s.enabled, "Light the scene by the sun")
+                    .on_hover_text("Off = the original fixed studio light (no change). On = shade every surface by the real sun direction for this place, date and time.");
+                ui.add_enabled_ui(s.enabled, |ui| {
+                    ui.checkbox(&mut s.shadows, "Cast shadows")
+                        .on_hover_text("Render a shadow-map pass from the sun so the building and furniture throw shadows. Turn off if shadows look wrong on a scene.");
+                });
+                ui.checkbox(&mut self.factory.clay_mode, "Clay mode (flat grey — light study)")
+                    .on_hover_text("Override every material to a neutral grey (glass stays transparent) so you can read light, shadow and bounce without colour — the villa build's 'light-meter'. Toggle off for full colour.");
+                ui.separator();
+
+                ui.label(egui::RichText::new("Location").small().weak());
+                // Pick a city → fills latitude / longitude / timezone (Radiance has no city DB, so
+                // this table feeds its lat/lon/meridian model). "Custom…" = hand-dialled coordinates.
+                let cur = crate::solar::city_at(s.lat_deg, s.lon_deg);
+                let sel_text = cur.map(|i| crate::solar::CITIES[i].0).unwrap_or("Custom…");
+                egui::ComboBox::from_id_salt("sun_city_picker")
+                    .selected_text(sel_text)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (i, c) in crate::solar::CITIES.iter().enumerate() {
+                            if ui.selectable_label(cur == Some(i), c.0).clicked() {
+                                s.lat_deg = c.1;
+                                s.lon_deg = c.2;
+                                s.utc_offset = c.3;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut s.north_offset_deg).speed(1.0).range(-180.0..=180.0).prefix("building faces N+ ").suffix("°"))
+                        .on_hover_text("Rotate true north off world +Y so the building can face any way. This is about ORIENTATION, not location.");
+                });
+                // Raw coordinates for anywhere not in the list (or fine-tuning) — hidden by default so
+                // the common case is just picking a city.
+                egui::CollapsingHeader::new(egui::RichText::new("Exact coordinates").small())
+                    .id_salt("sun_exact_coords")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut s.lat_deg).speed(0.1).range(-90.0..=90.0).prefix("lat ").suffix("°"))
+                                .on_hover_text("Latitude, + north");
+                            ui.add(egui::DragValue::new(&mut s.lon_deg).speed(0.1).range(-180.0..=180.0).prefix("lon ").suffix("°"))
+                                .on_hover_text("Longitude, + east");
+                        });
+                        ui.add(egui::DragValue::new(&mut s.utc_offset).speed(0.25).range(-12.0..=14.0).prefix("UTC ").suffix(" h"))
+                            .on_hover_text("Timezone offset from UTC, + east (GMT = 0, Gulf = +4, PST = −8). Add an hour for daylight saving.");
+                    });
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Date & time").small().weak());
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut s.month).range(1..=12).prefix("mo "));
+                    ui.add(egui::DragValue::new(&mut s.day).range(1..=31).prefix("day "));
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut s.hour, 0.0..=24.0).text("hour").show_value(true))
+                        .on_hover_text("Local standard clock time (drag to move the sun across the day).");
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut s.intensity, 0.2..=2.0).text("brightness").show_value(true));
+                });
+
+                // Readout — the located sun, so it can be reproduced in Radiance/Blender.
+                ui.separator();
+                let doy = crate::solar::day_of_year(s.month, s.day);
+                let p = crate::solar::sun_position(s.lat_deg, s.lon_deg, s.utc_offset, doy, s.hour, s.north_offset_deg);
+                let compass = |b: f32| {
+                    const N: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+                    N[(((b / 45.0).round() as i32).rem_euclid(8)) as usize]
+                };
+                if p.up {
+                    ui.label(egui::RichText::new(format!(
+                        "sun altitude {:.1}° · bearing {:.0}° ({}) · day {}",
+                        p.altitude_deg, p.bearing_deg, compass(p.bearing_deg), doy
+                    )).small().color(crate::theme::color::ACCENT));
+                    ui.label(egui::RichText::new(format!(
+                        "direction  x {:+.2}  y {:+.2}  z {:+.2}",
+                        p.dir.x, p.dir.y, p.dir.z
+                    )).small().weak());
+                } else {
+                    ui.label(egui::RichText::new(format!(
+                        "sun is below the horizon ({:.1}°) — night", p.altitude_deg
+                    )).small().color(egui::Color32::from_rgb(150, 160, 200)));
+                }
+                ui.label(egui::RichText::new("Sun located with the Radiance gensky model (X east · Y north · Z up).").small().weak());
+
+                ui.separator();
+                ui.label(egui::RichText::new("Offline render").small().weak());
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("▶  Export + run Radiance")
+                        .on_hover_text("Write the Radiance scene AND run the full pipeline (oconv → rpict → pfilt → ra_bmp) right now, showing the finished render in-app. Needs Radiance installed (on PATH).")
+                        .clicked()
+                    {
+                        self.run_radiance();
+                    }
+                    if ui
+                        .button("⬈  Export only…")
+                        .on_hover_text("Write a Radiance scene (.rad geometry + gensky sky matched to these settings + render script) to run yourself later.")
+                        .clicked()
+                    {
+                        self.export_radiance_scene();
+                    }
+                });
+                if !self.factory.status.is_empty() {
+                    ui.label(egui::RichText::new(&self.factory.status).small().color(crate::theme::color::ACCENT));
+                }
+            });
+        self.sun_modal_open = open;
+    }
+
+    // =====================================================================
+    // MATERIALS FACTORY — a node-based material editor (Blender-style shader
+    // graph). The graph is authored here and COMPILED onto the material's flat
+    // renderer params each frame, so the 3D Factory view updates live.
+    // =====================================================================
+
+    /// The 🎨 Materials Factory window: a material list, a node canvas (Texture → Principled BSDF →
+    /// Output), and an inspector for the selected node. Compiles the edited graph back onto the
+    /// selected material every frame — a plain colour is emitted as a live "solid" procedural, so
+    /// every edit shows in the 3D view without a GPU re-upload. See [`crate::material_graph`].
+    fn render_materials_factory(&mut self, ctx: &egui::Context) {
+        // Seed a graph for the selected material on first open.
+        if let Some(i) = self.materials.sel {
+            if i < self.factory.textures.len() {
+                if !self.materials.graphs.contains_key(&i) {
+                    let g = crate::material_graph::MaterialGraph::from_texture(&self.factory.textures[i]);
+                    self.materials.graphs.insert(i, g);
+                }
+            } else {
+                self.materials.sel = None;
+            }
+        }
+        let mut open = self.materials_open;
+        egui::Window::new("🎨  Materials Factory")
+            .id(egui::Id::new("materials_factory_window"))
+            .default_size([980.0, 600.0])
+            .min_width(560.0)
+            .resizable(true)
+            .collapsible(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::SidePanel::left("mf_materials")
+                    .resizable(true)
+                    .default_width(170.0)
+                    .show_inside(ui, |ui| self.mf_material_list(ui));
+                egui::SidePanel::right("mf_inspector")
+                    .resizable(true)
+                    .default_width(226.0)
+                    .show_inside(ui, |ui| self.mf_inspector(ui));
+                egui::CentralPanel::default().show_inside(ui, |ui| self.mf_canvas(ui));
+            });
+        self.materials_open = open;
+
+        // Compile the edited graph back onto the material (live, uniform-driven — no re-upload).
+        if let Some(i) = self.materials.sel {
+            if let Some(c) = self.materials.graphs.get(&i).map(|g| g.compile()) {
+                self.apply_compiled_material(i, &c);
+            }
+        }
+    }
+
+    /// The material list (left panel): every texture/material, plus "New material".
+    fn mf_material_list(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("Materials");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("＋ New").on_hover_text("Create a new (grey) material").clicked() {
+                    let n = self.factory.textures.len();
+                    let idx = self.factory.add_procedural_texture(
+                        format!("Material {}", n + 1),
+                        crate::factory::ProcDef::solid([0.75, 0.75, 0.75]),
+                    );
+                    self.materials.sel = Some(idx);
+                    self.materials.sel_node = None;
+                }
+            });
+        });
+        // ---- APPLY — one obvious "material → surface" flow, right here ------------------------
+        // Scope selector (synced with the 3D panel's Textures mode), a live line saying exactly
+        // what Apply will hit, and the Apply button (same routing as the ▼ Textures picker).
+        if let Some(i) = self.materials.sel {
+            if i < self.factory.textures.len() {
+                use crate::factory::FurnPaintMode as M;
+                ui.separator();
+                ui.label(egui::RichText::new("Apply to").small().weak());
+                let mut mode = self.factory.furn_paint_mode;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut mode, M::WholeObject, "Object")
+                        .on_hover_text("The whole selected furniture / solid");
+                    ui.selectable_value(&mut mode, M::Face, "Face")
+                        .on_hover_text("One flat face — click it on the model in the 3D view");
+                    ui.selectable_value(&mut mode, M::Piece, "Piece")
+                        .on_hover_text("One connected piece (part) — click it on the model");
+                });
+                if mode != self.factory.furn_paint_mode {
+                    self.factory.furn_paint_mode = mode;
+                    if mode == M::WholeObject {
+                        self.factory.furn_face_sel = None;
+                        self.factory.furn_tex_brush = None;
+                    }
+                }
+                // What will Apply hit right now?
+                let furn_name = self.factory.sel_furniture.and_then(|fi| {
+                    self.factory.furniture.get(fi).and_then(|f| self.factory.furniture_lib.get(f.asset)).map(|a| a.name.clone())
+                });
+                let face_ready = match (&self.factory.furn_face_sel, self.factory.sel_furniture) {
+                    (Some((sfi, _)), Some(fi)) => *sfi == fi,
+                    _ => false,
+                };
+                let target = match (&furn_name, mode) {
+                    (Some(n), M::WholeObject) => format!("→ {n} (whole object)"),
+                    (Some(n), _) if face_ready => format!("→ the clicked {} on {n}", if mode == M::Piece { "piece" } else { "face" }),
+                    (Some(n), _) => format!("→ click a {} on {n} in the 3D view first (or Apply to arm the brush)", if mode == M::Piece { "piece" } else { "face" }),
+                    (None, _) if !self.factory.selection.is_empty() => format!("→ {} selected solid(s)", self.factory.selection.len()),
+                    (None, _) => "→ nothing selected — click an object in the 3D view".into(),
+                };
+                ui.label(egui::RichText::new(target).small().color(crate::theme::color::ACCENT));
+                let label = if mode == M::WholeObject || face_ready { "✓  Apply material" } else { "🖌  Arm face brush" };
+                if ui
+                    .button(egui::RichText::new(label).strong())
+                    .on_hover_text("Apply this material to the target above. In Face/Piece mode with no face clicked yet, this arms the brush — every face you then click in the 3D view gets painted.")
+                    .clicked()
+                {
+                    let (name, w, h) = {
+                        let t = &self.factory.textures[i];
+                        (t.name.clone(), t.w, t.h)
+                    };
+                    self.apply_texture_index_to_selection(i, &name, w, h);
+                }
+            }
+        }
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ---- LIBRARY first (collapsed) so it's always discoverable above a long scene list.
+            egui::CollapsingHeader::new(egui::RichText::new("➕ Library — ready-made").strong())
+                .id_salt("mf_library")
+                .default_open(self.factory.textures.is_empty())
+                .show(ui, |ui| {
+                    let presets = crate::factory::material_presets();
+                    let mut cat: &str = "";
+                    let mut add: Option<crate::factory::MaterialPreset> = None;
+                    for p in &presets {
+                        if p.category != cat {
+                            cat = p.category;
+                            ui.add_space(3.0);
+                            ui.label(egui::RichText::new(cat).small().color(egui::Color32::from_rgb(150, 165, 185)));
+                        }
+                        let c = p.def.avg_color();
+                        let swatch = egui::Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8);
+                        ui.horizontal(|ui| {
+                            let (r, painter) = ui.allocate_painter(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            painter.rect_filled(r.rect.shrink(1.0), egui::Rounding::same(2.0), swatch);
+                            if ui.selectable_label(false, p.name).on_hover_text("Add to the scene's materials and open it in the editor").clicked() {
+                                add = Some(*p);
+                            }
+                        });
+                    }
+                    if let Some(p) = add {
+                        let idx = self.factory.add_preset_material(&p);
+                        self.materials.sel = Some(idx);
+                        self.materials.sel_node = None;
+                        self.factory.status = format!("material '{}' added — tune it, set Apply-to, then ✓ Apply", p.name);
+                    }
+                });
+            ui.separator();
+            let n = self.factory.textures.len();
+            if n == 0 {
+                ui.label(egui::RichText::new("No materials yet.\nAdd one from the Library above, or press ＋ New.").small().weak());
+            }
+            // Where each material is used (feature/surface paints + furniture), so the list can say
+            // "unused" — the reason a selection wouldn't highlight anything in the scene.
+            let mut uses = vec![0usize; n];
+            for &t in self.factory.feature_texture.values() {
+                if t < n { uses[t] += 1; }
+            }
+            for &t in self.factory.surface_texture.values() {
+                if t < n { uses[t] += 1; }
+            }
+            for inst in &self.factory.furniture {
+                if let Some(t) = inst.texture {
+                    if t < n { uses[t] += 1; }
+                }
+                for &t in inst.surface_texture.values() {
+                    if t < n { uses[t] += 1; }
+                }
+            }
+            for i in 0..n {
+                let name = self.factory.textures[i].name.clone();
+                let sel = self.materials.sel == Some(i);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(sel, format!("{i}·  {name}")).clicked() {
+                        self.materials.sel = Some(i);
+                        self.materials.sel_node = None;
+                    }
+                    if uses[i] == 0 {
+                        ui.label(egui::RichText::new("unused").small().color(egui::Color32::from_rgb(210, 150, 90)))
+                            .on_hover_text("Not applied to any surface — apply it via ▼ Textures (or pick a used material) to see the highlight in the 3D view.");
+                    } else if sel {
+                        ui.label(egui::RichText::new(format!("{} use{}", uses[i], if uses[i] == 1 { "" } else { "s" })).small().weak());
+                    }
+                });
+            }
+            if self.materials.sel.is_some() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("The selected material pulses cyan in the 3D view so you can see where it is.")
+                        .small()
+                        .weak(),
+                );
+            }
+
+        });
+    }
+
+    /// The node canvas (centre): draws node boxes, sockets and wires, and handles drag-to-move,
+    /// drag-a-wire-to-connect, click-a-socket-to-disconnect, and empty-drag-to-pan.
+    fn mf_canvas(&mut self, ui: &mut egui::Ui) {
+        use crate::material_graph::NodeKind;
+        use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Stroke};
+
+        let Some(i) = self.materials.sel else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("Select or create a material on the left.").weak());
+            });
+            return;
+        };
+        // Split disjoint fields of `self.materials` so the canvas needs no `self` access.
+        let mf = &mut self.materials;
+        let Some(graph) = mf.graphs.get_mut(&i) else { return; };
+        let pan = &mut mf.pan;
+        let drag_from = &mut mf.drag_from;
+        let drag_node = &mut mf.drag_node;
+        let sel_node = &mut mf.sel_node;
+
+        const NODE_W: f32 = 178.0;
+        const HEADER_H: f32 = 22.0;
+        const ROW_H: f32 = 18.0;
+        const SOCK_R: f32 = 5.0;
+
+        // Palette + view controls.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Add node:").small().weak());
+            for kind in crate::material_graph::MaterialGraph::addable() {
+                if ui.small_button(kind.title()).clicked() {
+                    let p = [40.0 - pan.x, 40.0 - pan.y + 30.0 * (graph.nodes.len() % 6) as f32];
+                    let id = graph.add(kind, p);
+                    *sel_node = Some(id);
+                }
+            }
+            ui.separator();
+            if ui.small_button("⟲ Reset view").clicked() {
+                *pan = egui::Vec2::ZERO;
+            }
+            ui.label(egui::RichText::new("drag node = move · drag from ▶ output to ◀ input = wire · click input = unwire · drag empty = pan").small().weak());
+        });
+
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
+        let origin = resp.rect.min;
+        painter.rect_filled(resp.rect, egui::Rounding::same(4.0), Color32::from_gray(26));
+
+        // ---- Layout: owned, Copy-only data so the immutable borrow of `graph` ends here ----------
+        struct Sock {
+            pos: Pos2,
+            name: &'static str,
+            col: Color32,
+        }
+        struct L {
+            id: crate::material_graph::NodeId,
+            rect: Rect,
+            title: &'static str,
+            ins: Vec<Sock>,
+            outs: Vec<Sock>,
+            swatch: Option<Color32>,
+        }
+        let to_screen = |p: [f32; 2]| origin + *pan + vec2(p[0], p[1]);
+        let mut layout: Vec<L> = Vec::with_capacity(graph.nodes.len());
+        for node in &graph.nodes {
+            let ins_d = node.kind.inputs();
+            let outs_d = node.kind.outputs();
+            let rows = ins_d.len().max(outs_d.len()).max(1);
+            let h = HEADER_H + rows as f32 * ROW_H + 6.0;
+            let rect = Rect::from_min_size(to_screen(node.pos), vec2(NODE_W, h));
+            let row_y = |k: usize| rect.top() + HEADER_H + k as f32 * ROW_H + ROW_H * 0.5;
+            let ins = ins_d.iter().enumerate().map(|(k, (nm, ty))| Sock { pos: pos2(rect.left(), row_y(k)), name: nm, col: Color32::from_rgb(ty.color()[0], ty.color()[1], ty.color()[2]) }).collect();
+            let outs = outs_d.iter().enumerate().map(|(k, (nm, ty))| Sock { pos: pos2(rect.right(), row_y(k)), name: nm, col: Color32::from_rgb(ty.color()[0], ty.color()[1], ty.color()[2]) }).collect();
+            let swatch = match &node.kind {
+                NodeKind::Rgb(c) => Some(Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8)),
+                NodeKind::Procedural(d) => {
+                    let c = d.avg_color();
+                    Some(Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8))
+                }
+                _ => None,
+            };
+            layout.push(L { id: node.id, rect, title: node.kind.title(), ins, outs, swatch });
+        }
+        let find = |id: crate::material_graph::NodeId| layout.iter().find(|l| l.id == id);
+
+        // ---- Wires (existing) ----
+        let wire = |painter: &egui::Painter, a: Pos2, b: Pos2, col: Color32| {
+            let dx = (b.x - a.x).abs().max(40.0) * 0.5;
+            let shape = egui::epaint::CubicBezierShape::from_points_stroke(
+                [a, pos2(a.x + dx, a.y), pos2(b.x - dx, b.y), b],
+                false,
+                Color32::TRANSPARENT,
+                Stroke::new(2.0, col),
+            );
+            painter.add(shape);
+        };
+        for e in &graph.edges {
+            if let (Some(sf), Some(st)) = (find(e.from), find(e.to)) {
+                if let (Some(o), Some(inp)) = (sf.outs.get(e.from_out as usize), st.ins.get(e.to_in as usize)) {
+                    wire(&painter, o.pos, inp.pos, Color32::from_gray(180));
+                }
+            }
+        }
+
+        // ---- Nodes ----
+        for l in &layout {
+            let selected = *sel_node == Some(l.id);
+            painter.rect_filled(l.rect, egui::Rounding::same(6.0), Color32::from_gray(44));
+            let header = Rect::from_min_size(l.rect.min, vec2(l.rect.width(), HEADER_H));
+            painter.rect_filled(header, egui::Rounding::same(6.0), Color32::from_rgb(60, 66, 78));
+            painter.rect_stroke(
+                l.rect,
+                egui::Rounding::same(6.0),
+                Stroke::new(if selected { 2.0 } else { 1.0 }, if selected { crate::theme::color::ACCENT } else { Color32::from_gray(80) }),
+            );
+            painter.text(header.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, l.title, FontId::proportional(12.0), Color32::from_gray(230));
+            if let Some(sw) = l.swatch {
+                let s = Rect::from_min_size(l.rect.min + vec2(8.0, HEADER_H + 4.0), vec2(NODE_W - 16.0, 12.0));
+                painter.rect_filled(s, egui::Rounding::same(2.0), sw);
+            }
+            for s in &l.ins {
+                painter.circle_filled(s.pos, SOCK_R, s.col);
+                painter.text(s.pos + vec2(9.0, 0.0), Align2::LEFT_CENTER, s.name, FontId::proportional(10.5), Color32::from_gray(200));
+            }
+            for s in &l.outs {
+                painter.circle_filled(s.pos, SOCK_R, s.col);
+                painter.text(s.pos - vec2(9.0, 0.0), Align2::RIGHT_CENTER, s.name, FontId::proportional(10.5), Color32::from_gray(200));
+            }
+        }
+
+        // ---- Interaction ----
+        let ptr = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+        let hit_out = |p: Pos2| -> Option<(crate::material_graph::NodeId, u8)> {
+            for l in &layout {
+                for (k, s) in l.outs.iter().enumerate() {
+                    if p.distance(s.pos) <= SOCK_R + 4.0 {
+                        return Some((l.id, k as u8));
+                    }
+                }
+            }
+            None
+        };
+        let hit_in = |p: Pos2| -> Option<(crate::material_graph::NodeId, u8)> {
+            for l in &layout {
+                for (k, s) in l.ins.iter().enumerate() {
+                    if p.distance(s.pos) <= SOCK_R + 4.0 {
+                        return Some((l.id, k as u8));
+                    }
+                }
+            }
+            None
+        };
+        let hit_node = |p: Pos2| -> Option<crate::material_graph::NodeId> {
+            layout.iter().rev().find(|l| l.rect.contains(p)).map(|l| l.id)
+        };
+
+        // Draw the in-progress wire.
+        if let (Some((fid, foi)), Some(p)) = (*drag_from, ptr) {
+            if let Some(from) = find(fid).and_then(|l| l.outs.get(foi as usize)) {
+                wire(&painter, from.pos, p, crate::theme::color::ACCENT);
+            }
+        }
+
+        if resp.drag_started() {
+            if let Some(p) = ptr {
+                if let Some((id, oi)) = hit_out(p) {
+                    *drag_from = Some((id, oi));
+                } else if let Some(id) = hit_node(p) {
+                    *drag_node = Some(id);
+                    *sel_node = Some(id);
+                }
+            }
+        }
+        if resp.dragged() {
+            if drag_from.is_some() {
+                // handled by the temp-wire draw above
+            } else if let Some(id) = *drag_node {
+                let d = resp.drag_delta();
+                if let Some(n) = graph.node_mut(id) {
+                    n.pos[0] += d.x;
+                    n.pos[1] += d.y;
+                }
+            } else {
+                *pan += resp.drag_delta();
+            }
+        }
+        if resp.drag_stopped() {
+            if let (Some((fid, foi)), Some(p)) = (*drag_from, ptr) {
+                if let Some((tid, tii)) = hit_in(p) {
+                    graph.connect(fid, foi, tid, tii);
+                }
+            }
+            *drag_from = None;
+            *drag_node = None;
+        }
+        if resp.clicked() {
+            if let Some(p) = ptr {
+                if let Some((tid, tii)) = hit_in(p) {
+                    graph.disconnect_input(tid, tii); // click an input socket to unwire it
+                } else if let Some(id) = hit_node(p) {
+                    *sel_node = Some(id);
+                }
+            }
+        }
+    }
+
+    /// The inspector (right panel): edit the selected node's parameters with full widgets.
+    fn mf_inspector(&mut self, ui: &mut egui::Ui) {
+        use crate::material_graph::NodeKind;
+        ui.strong("Node properties");
+        ui.separator();
+        let Some(i) = self.materials.sel else {
+            ui.label(egui::RichText::new("No material selected.").weak());
+            return;
+        };
+        let Some(nid) = self.materials.sel_node else {
+            ui.label(egui::RichText::new("Click a node on the canvas to edit it.").small().weak());
+            return;
+        };
+        let tex_names: Vec<String> = self.factory.textures.iter().enumerate().map(|(k, t)| format!("{k}: {}", t.name)).collect();
+        let n_tex = self.factory.textures.len();
+        let mut delete = false;
+        {
+            let Some(graph) = self.materials.graphs.get_mut(&i) else { return; };
+            let pid = graph.principled_id();
+            let is_output = matches!(graph.node(nid).map(|n| &n.kind), Some(NodeKind::Output));
+            if let Some(node) = graph.node_mut(nid) {
+                ui.label(egui::RichText::new(node.kind.title()).strong().color(crate::theme::color::ACCENT));
+                ui.add_space(4.0);
+                match &mut node.kind {
+                    NodeKind::Principled(p) => {
+                        ui.horizontal(|ui| {
+                            ui.label("Base Color");
+                            ui.color_edit_button_rgb(&mut p.base_color);
+                        });
+                        ui.add(egui::Slider::new(&mut p.metallic, 0.0..=1.0).text("Metallic"));
+                        ui.add(egui::Slider::new(&mut p.roughness, 0.0..=1.0).text("Roughness"));
+                        ui.add(egui::Slider::new(&mut p.ior, 1.0..=3.0).text("IOR"));
+                        ui.add(egui::Slider::new(&mut p.alpha, 0.0..=1.0).text("Alpha"));
+                        ui.horizontal(|ui| {
+                            ui.label("Emission");
+                            ui.color_edit_button_rgb(&mut p.emission);
+                        });
+                        ui.add(egui::Slider::new(&mut p.emission_strength, 0.0..=20.0).text("Emission str"));
+                        ui.label(egui::RichText::new("A wired input overrides its socket value.").small().weak());
+                    }
+                    NodeKind::Rgb(c) => {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            ui.color_edit_button_rgb(c);
+                        });
+                    }
+                    NodeKind::Value(v) => {
+                        ui.add(egui::Slider::new(v, 0.0..=1.0).text("Value"));
+                    }
+                    NodeKind::Procedural(def) => {
+                        egui::ComboBox::from_label("Pattern")
+                            .selected_text(def.pattern.label())
+                            .show_ui(ui, |ui| {
+                                for p in crate::factory::ProcPattern::ALL {
+                                    ui.selectable_value(&mut def.pattern, p, p.label());
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("A");
+                            ui.color_edit_button_rgb(&mut def.col_a);
+                            ui.label("B");
+                            ui.color_edit_button_rgb(&mut def.col_b);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Grain");
+                            for k in 0..3 {
+                                ui.add(egui::DragValue::new(&mut def.scale[k]).speed(0.5).range(0.1..=400.0));
+                            }
+                        });
+                        ui.add(egui::Slider::new(&mut def.contrast, 0.2..=4.0).text("Contrast"));
+                        ui.add(egui::Slider::new(&mut def.detail, 1.0..=8.0).text("Detail"));
+                    }
+                    NodeKind::NormalMap { tex, strength } => {
+                        let cur = match tex {
+                            Some(k) => tex_names.get(*k).cloned().unwrap_or_else(|| "(missing)".into()),
+                            None => "(none)".into(),
+                        };
+                        egui::ComboBox::from_label("Map").selected_text(cur).show_ui(ui, |ui| {
+                            ui.selectable_value(tex, None, "(none)");
+                            for k in 0..n_tex {
+                                ui.selectable_value(tex, Some(k), tex_names[k].clone());
+                            }
+                        });
+                        ui.add(egui::Slider::new(strength, 0.0..=2.0).text("Strength"));
+                    }
+                    NodeKind::ImageTex => {
+                        ui.label(egui::RichText::new("Uses this material's own bound bitmap as the base colour.").small().weak());
+                    }
+                    NodeKind::Output => {
+                        ui.label(egui::RichText::new("The material's final surface.").small().weak());
+                    }
+                }
+            }
+            ui.separator();
+            let removable = !is_output && pid != Some(nid);
+            if removable {
+                if ui.button("🗑  Delete node").clicked() {
+                    delete = true;
+                }
+            } else {
+                ui.label(egui::RichText::new("Core node — can't delete.").small().weak());
+            }
+            if delete {
+                graph.remove(nid);
+            }
+        }
+        if delete {
+            self.materials.sel_node = None;
+        }
+    }
+
+    /// Write a compiled graph result onto material `i`'s flat renderer fields. Everything here is
+    /// uniform-driven (procedural params / roughness / metallic / opacity / normal map), so the 3D
+    /// view updates the SAME frame with no GPU texture re-upload and no CSG recompute.
+    fn apply_compiled_material(&mut self, i: usize, c: &crate::material_graph::CompiledMaterial) {
+        let Some(t) = self.factory.textures.get_mut(i) else { return; };
+        t.roughness = c.roughness;
+        t.metallic = c.metallic;
+        t.ior = c.ior;
+        t.opacity = c.opacity.clamp(0.01, 1.0);
+        t.reflect = c.reflect;
+        t.normal_map = c.normal_map;
+        t.emission = c.emission;
+        t.emission_strength = c.emission_strength;
+        if c.use_image {
+            t.proc = None; // keep the material's own bound bitmap
+        } else if let Some(def) = c.proc {
+            t.proc = Some(def);
+            let col = def.avg_color();
+            t.avg = col;
+            t.w = 1;
+            t.h = 1;
+            t.rgba = vec![(col[0] * 255.0) as u8, (col[1] * 255.0) as u8, (col[2] * 255.0) as u8, 255];
+            *t.png_cache.borrow_mut() = None;
+        }
+    }
+
+    // =====================================================================
+    // ⏺ RENDER — the in-app path tracer (raytraced GI / reflections / glass),
+    // progressive like Blender's Cycles viewport. Device chosen by the user.
+    // =====================================================================
+
+    /// The ⏺ Render window: device (CPU / GPU) + resolution + samples, Start/Cancel, a live
+    /// progressive preview, and Save PNG. The scene, camera, sun and materials are gathered from
+    /// exactly what the 3D Factory view shows (same tris as the Radiance export, same resolved sun).
+    fn render_pathtrace_dialog(&mut self, ctx: &egui::Context) {
+        use crate::pathtrace::Device;
+        // Drive the GPU job: a small pass batch per UI frame keeps the app responsive while the
+        // image converges (the GPU draw is async; only readback stalls, and that's throttled below).
+        if let (Some(gpu), Some(gl)) = (&mut self.pt_gpu, self.pt_gl.clone()) {
+            if !gpu.is_done() {
+                gpu.step(&gl, 2);
+                ctx.request_repaint();
+            }
+        }
+        let mut open = self.render_modal_open;
+        egui::Window::new("⏺  Render — path tracer")
+            .id(egui::Id::new("factory_render_modal"))
+            .default_width(560.0)
+            .resizable(true)
+            .collapsible(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let running = self.pt_job.as_ref().map(|j| !j.is_done()).unwrap_or(false)
+                    || self.pt_gpu.as_ref().map(|j| !j.is_done()).unwrap_or(false);
+                ui.horizontal(|ui| {
+                    ui.label("Device");
+                    egui::ComboBox::from_id_salt("pt_device")
+                        .selected_text(match self.pt_device {
+                            Device::Cpu => "CPU (all cores)",
+                            Device::Gpu => "GPU (fragment tracer)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.pt_device, Device::Gpu, "GPU (fragment tracer)")
+                                .on_hover_text("Traces on the graphics card (GL 3.3 fragment shader) — much faster. Same image as CPU.");
+                            ui.selectable_value(&mut self.pt_device, Device::Cpu, "CPU (all cores)")
+                                .on_hover_text("Traces on every CPU core — slower, but works on any machine and any driver.");
+                        });
+                    ui.label("Size");
+                    egui::ComboBox::from_id_salt("pt_res")
+                        .selected_text(["640×480", "960×720", "1280×960", "1600×1200"][self.pt_res.min(3) as usize])
+                        .show_ui(ui, |ui| {
+                            for (k, name) in ["640×480", "960×720", "1280×960", "1600×1200"].iter().enumerate() {
+                                ui.selectable_value(&mut self.pt_res, k as u32, *name);
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut self.pt_passes, 8..=512).text("samples").logarithmic(true))
+                        .on_hover_text("Samples per pixel. The image refines progressively — more samples = less noise. You can Save at any point.");
+                });
+                ui.horizontal(|ui| {
+                    if !running {
+                        if ui.button(egui::RichText::new("▶  Start render").strong()).clicked() {
+                            self.start_pathtrace();
+                        }
+                    } else if ui.button("⏹  Cancel").clicked() {
+                        if let Some(j) = &self.pt_job {
+                            j.cancel();
+                        }
+                        if let Some(g) = &mut self.pt_gpu {
+                            g.cancel();
+                        }
+                    }
+                    // Progress: whichever backend is loaded (only one at a time).
+                    let info = self
+                        .pt_gpu
+                        .as_ref()
+                        .map(|g| (g.passes_done(), g.settings.passes, g.started.elapsed().as_secs_f32(), g.scene_tris, "GPU"))
+                        .or_else(|| self.pt_job.as_ref().map(|j| (j.passes_done(), j.settings.passes, j.started.elapsed().as_secs_f32(), j.scene_tris, "CPU")));
+                    if let Some((done, total, secs, tris, dev)) = info {
+                        ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(180.0).text(format!("{done}/{total}")));
+                        ui.label(egui::RichText::new(format!("{dev} · {secs:.1}s · {tris} tris")).small().weak());
+                        if done > 0 && ui.button("💾 Save PNG").clicked() {
+                            self.save_pathtrace_png();
+                        }
+                    }
+                });
+                // Live preview: re-upload whenever new passes have landed. GPU readback is throttled
+                // (every 4 passes) because glReadPixels stalls the pipeline.
+                let mut fresh: Option<(usize, usize, Vec<u8>)> = None;
+                if let (Some(g), Some(gl)) = (&mut self.pt_gpu, self.pt_gl.clone()) {
+                    let pass = g.passes_done();
+                    if pass != self.pt_last_pass && (pass.wrapping_sub(self.pt_last_pass) >= 4 || g.is_done()) {
+                        fresh = g.snapshot(&gl);
+                        self.pt_last_pass = pass;
+                    }
+                } else if let Some(j) = &self.pt_job {
+                    let pass = j.passes_done();
+                    if pass != self.pt_last_pass {
+                        fresh = j.snapshot_rgba();
+                        self.pt_last_pass = pass;
+                    }
+                    if !j.is_done() {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(150));
+                    }
+                }
+                if let Some((w, h, rgba)) = fresh {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+                    match &mut self.pt_preview {
+                        Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                        None => self.pt_preview = Some(ctx.load_texture("pt_preview", img, egui::TextureOptions::LINEAR)),
+                    }
+                }
+                if let Some(tex) = &self.pt_preview {
+                    let avail = ui.available_width().max(64.0);
+                    let sz = tex.size_vec2();
+                    let scale = (avail / sz.x).min(1.6);
+                    ui.image((tex.id(), sz * scale));
+                } else {
+                    ui.label(
+                        egui::RichText::new("True raytracing of the current 3D Factory scene: global illumination, reflections, soft sun shadows and real glass — with the ☀ Sun and 🎨 Materials you set. The image refines progressively.")
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+        self.render_modal_open = open;
+        // Closing the window cancels a still-running job (CPU Drop joins the worker; the GPU job's
+        // GL objects are deleted on its context).
+        if !open {
+            if self.pt_job.as_ref().map(|j| !j.is_done()).unwrap_or(false) {
+                self.pt_job = None;
+            }
+            if let Some(g) = self.pt_gpu.take() {
+                if let Some(gl) = &self.pt_gl {
+                    g.destroy(gl);
+                }
+            }
+        }
+    }
+
+    /// Gather the scene exactly as displayed and launch the chosen backend — the SAME [`Scene`],
+    /// camera, sun and materials either way (Blender's Cycles device switch, ours).
+    fn start_pathtrace(&mut self) {
+        let tris = self.factory.export_render_tris();
+        if tris.is_empty() {
+            self.factory.status = "Render: nothing in the scene".into();
+            return;
+        }
+        let scene = crate::pathtrace::Scene::build(&tris);
+        let (eye, target) = self.factory.export_camera();
+        // The resolved sun (world frame) rotated into the export frame like the geometry.
+        let (_en, dir, sun_col, sky_col, ground_col) = self.factory.sun.resolve();
+        let off = -self.factory.sun.north_offset_deg.to_radians();
+        let (c, s) = (off.cos(), off.sin());
+        let sun_dir = glam::Vec3::new(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
+        let sky = crate::pathtrace::Sky { sun_dir, sun_col, sky_col, ground_col };
+        let (w, h) = [(640, 480), (960, 720), (1280, 960), (1600, 1200)][self.pt_res.min(3) as usize];
+        let settings = crate::pathtrace::Settings { w, h, passes: self.pt_passes, max_depth: 6 };
+        let cam = crate::pathtrace::Camera { eye: glam::Vec3::from(eye), target: glam::Vec3::from(target), fov_deg: 45.0 };
+        // Clear whichever backend ran last.
+        self.pt_job = None;
+        if let Some(g) = self.pt_gpu.take() {
+            if let Some(gl) = &self.pt_gl {
+                g.destroy(gl);
+            }
+        }
+        self.pt_last_pass = 0;
+        self.pt_preview = None;
+        match (self.pt_device, self.pt_gl.clone()) {
+            (crate::pathtrace::Device::Gpu, Some(gl)) => {
+                match crate::pathtrace_gpu::GpuTracer::new(&gl, &scene.pack_gpu(), cam, sky, settings) {
+                    Ok(t) => self.pt_gpu = Some(t),
+                    Err(e) => {
+                        // Driver said no — run on the CPU instead and say so.
+                        self.factory.status = format!("GPU tracer unavailable ({e}) — rendering on CPU");
+                        self.pt_job = Some(crate::pathtrace::RenderJob::start(scene, cam, sky, settings, crate::pathtrace::Device::Cpu));
+                    }
+                }
+            }
+            _ => {
+                self.pt_job = Some(crate::pathtrace::RenderJob::start(scene, cam, sky, settings, crate::pathtrace::Device::Cpu));
+            }
+        }
+    }
+
+    /// Save the current accumulation as a PNG next to the project (or home), like the Radiance export.
+    fn save_pathtrace_png(&mut self) {
+        // GPU: the throttled preview readback is cached; CPU: snapshot the shared accumulation.
+        let shot = self
+            .pt_gpu
+            .as_ref()
+            .and_then(|g| g.last_rgba.clone())
+            .or_else(|| self.pt_job.as_ref().and_then(|j| j.snapshot_rgba()));
+        let Some((w, h, rgba)) = shot else { return };
+        let dir = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| {
+                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+                std::path::PathBuf::from(home)
+            });
+        let stem = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "scene".into());
+        let path = dir.join(format!("{stem}_render.png"));
+        match image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8) {
+            Ok(()) => {
+                self.factory.status = format!("Render saved → {}", path.display());
+                self.history.push(format!("  saved path-traced render to {}", path.display()));
+            }
+            Err(e) => self.factory.status = format!("Render save failed: {e}"),
+        }
+    }
+
+    /// Write the Radiance render bundle (scene.rad + sky.rad + render.bat/.sh + README) to a folder
+    /// next to the current file (or the user's home), matched to the ☀ Sun settings + camera.
+    /// Returns the folder on success so "Export + run" can execute the pipeline in it.
+    fn export_radiance_scene(&mut self) -> Option<std::path::PathBuf> {
+        let tris = self.factory.export_render_tris();
+        if tris.is_empty() {
+            self.factory.status = "Radiance export: nothing in the scene to export".into();
+            return None;
+        }
+        // Output folder: <current-file-stem>_radiance next to the project, else home\3dfactory_radiance.
+        let dir = match self.current_file.as_ref() {
+            Some(p) => {
+                let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "scene".into());
+                p.parent().map(|d| d.join(format!("{stem}_radiance"))).unwrap_or_else(|| std::path::PathBuf::from(format!("{stem}_radiance")))
+            }
+            None => {
+                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+                std::path::Path::new(&home).join("3dfactory_radiance")
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.factory.status = format!("Radiance export failed: {e}");
+            return None;
+        }
+        let s = &self.factory.sun;
+        let (eye, target) = self.factory.export_camera();
+        let scene = crate::radiance_export::scene_rad(&tris);
+        let sky = crate::radiance_export::sky_rad(s.lat_deg, s.lon_deg, s.utc_offset, s.month, s.day, s.hour);
+        let bat = crate::radiance_export::render_bat(eye, target);
+        let sh = crate::radiance_export::render_sh(eye, target);
+        let readme = crate::radiance_export::readme();
+        let writes = [
+            ("scene.rad", scene),
+            ("sky.rad", sky),
+            ("render.bat", bat),
+            ("render.sh", sh),
+            ("README.txt", readme),
+        ];
+        for (name, body) in writes {
+            if let Err(e) = std::fs::write(dir.join(name), body) {
+                self.factory.status = format!("Radiance export: failed writing {name}: {e}");
+                return None;
+            }
+        }
+        self.factory.status = format!("Radiance scene exported ({} triangles) → {}", tris.len(), dir.display());
+        self.history.push(format!("  exported Radiance scene ({} tris) to {}", tris.len(), dir.display()));
+        Some(dir)
+    }
+
+    /// Export the Radiance bundle AND run the pipeline (`render.bat`: oconv → rpict → pfilt →
+    /// ra_bmp) in a background thread, streaming into [`Self::rad_job`]. Needs Radiance installed
+    /// (on PATH) — a missing install surfaces in the job log, not a crash.
+    fn run_radiance(&mut self) {
+        let Some(dir) = self.export_radiance_scene() else { return };
+        let shared = StdArc::new(Mutex::new(RadState {
+            done: false,
+            ok: false,
+            log: String::new(),
+            image: None,
+            dir: dir.clone(),
+        }));
+        let sh = shared.clone();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", "render.bat"]).current_dir(&dir);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no console flash
+            }
+            let out = cmd.output();
+            let mut st = sh.lock().unwrap();
+            match out {
+                Ok(o) => {
+                    st.log = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    let bmp = dir.join("render.bmp");
+                    match image::open(&bmp) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                            st.image = Some((w, h, rgba.into_raw()));
+                            st.ok = true;
+                        }
+                        Err(_) => {
+                            st.ok = false;
+                            if st.log.trim().is_empty() {
+                                st.log = "No output — is Radiance installed and on PATH? (https://github.com/LBNL-ETA/Radiance)".into();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    st.ok = false;
+                    st.log = format!("Could not run render.bat: {e}");
+                }
+            }
+            st.done = true;
+        });
+        self.rad_job = Some(shared);
+        self.rad_started = Some(std::time::Instant::now());
+        self.rad_preview = None;
+        self.rad_loaded = false;
+    }
+
+    /// The "Radiance — offline render" window: progress while the pipeline runs, then the result
+    /// image (or the log when it failed). Shown whenever a job exists; ✕ clears it.
+    fn render_radiance_dialog(&mut self, ctx: &egui::Context) {
+        let Some(shared) = self.rad_job.clone() else { return };
+        let mut close = false;
+        egui::Window::new("☀  Radiance — offline render")
+            .id(egui::Id::new("radiance_run_modal"))
+            .default_width(560.0)
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                let st = shared.lock().unwrap();
+                if !st.done {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let secs = self.rad_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                        ui.label(format!("Running oconv → rpict → pfilt → ra_bmp…  {secs}s"));
+                    });
+                    ui.label(
+                        egui::RichText::new("Physically-accurate daylight simulation (LBNL Radiance). A few minutes is normal — rpict traces the whole scene.")
+                            .small()
+                            .weak(),
+                    );
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                } else if st.ok {
+                    // Upload the finished image once.
+                    if !self.rad_loaded {
+                        if let Some((w, h, rgba)) = &st.image {
+                            let img = egui::ColorImage::from_rgba_unmultiplied([*w, *h], rgba);
+                            self.rad_preview = Some(ctx.load_texture("radiance_result", img, egui::TextureOptions::LINEAR));
+                            self.rad_loaded = true;
+                        }
+                    }
+                    if let Some(tex) = &self.rad_preview {
+                        let avail = ui.available_width().max(64.0);
+                        let sz = tex.size_vec2();
+                        let scale = (avail / sz.x).min(1.4);
+                        ui.image((tex.id(), sz * scale));
+                    }
+                    ui.label(egui::RichText::new(format!("render.bmp → {}", st.dir.display())).small().weak());
+                } else {
+                    ui.label(egui::RichText::new("Radiance run failed").color(egui::Color32::from_rgb(230, 120, 90)));
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        ui.label(egui::RichText::new(st.log.clone()).small().monospace());
+                    });
+                    ui.label(
+                        egui::RichText::new("Install Radiance (github.com/LBNL-ETA/Radiance releases) and make sure oconv/rpict are on PATH.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        if close {
+            self.rad_job = None;
+            self.rad_preview = None;
+        }
+    }
+
+    /// The Architecture generator modal — staircase (straight / U-shape), spiral stair, or ramp.
+    /// A movable window (closable by its ✕) whose Build button generates the solid in `cad_solid`
+    /// and drops it into the scene as a placed furniture object.
+    fn render_arch_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.arch_modal_open;
+        // The modal is shared, but its identity depends on WHERE it was opened from: a door comes
+        // from ▼ Apertures, a cupboard from ▼ Furniture — so title it accordingly (a fixed `id`
+        // keeps its position/size stable across the title change).
+        let title = match self.arch_tab {
+            ArchTab::Door => "🚪  Door",
+            ArchTab::Cupboard => "🗄  Cupboard",
+            ArchTab::Kitchen => "🍳  Kitchen cabinets",
+            ArchTab::Cabin => "🚪  Cabinet unit",
+            _ => "🏛  Architecture",
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("factory_generator_modal"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(true)
+            .default_width(330.0)
+            .show(ctx, |ui| self.arch_dialog_body(ui));
+        self.arch_modal_open = open;
+    }
+
+    /// The body of the Architecture modal (split out so the `.open()` borrow and the `&mut self`
+    /// body borrow don't overlap). Tab selector + per-generator fields + live feedback + Build.
+    fn arch_dialog_body(&mut self, ui: &mut egui::Ui) {
+        use cad_solid::architecture as arch;
+
+        /// One labelled metre DragValue row.
+        fn num(ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f32, min: f32, max: f32) {
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false));
+                ui.add(egui::DragValue::new(v).speed(speed).range(min..=max).suffix(" m"));
+            });
+        }
+        fn feedback(ui: &mut egui::Ui, text: String) {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(text).small().color(crate::theme::color::ACCENT));
+        }
+        fn error(ui: &mut egui::Ui, text: String) {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("⚠ {text}")).small().color(egui::Color32::from_rgb(230, 120, 90)));
+        }
+
+        // ── tab selector ── only the ARCHITECTURE generators tab between each other. Door (▼
+        // Apertures) and Cupboard (▼ Furniture) open this same modal directly on their own screen,
+        // so they get no tab row — they aren't "architecture".
+        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin) {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.arch_tab, ArchTab::Staircase, "🪜 Staircase");
+                ui.selectable_value(&mut self.arch_tab, ArchTab::Spiral, "🌀 Spiral");
+                ui.selectable_value(&mut self.arch_tab, ArchTab::Ramp, "📐 Ramp");
+                ui.selectable_value(&mut self.arch_tab, ArchTab::Dogleg, "🧱 Dog-leg");
+                ui.selectable_value(&mut self.arch_tab, ArchTab::SpiralCsg, "🌀 Spiral (CSG)");
+                ui.selectable_value(&mut self.arch_tab, ArchTab::HelicalRamp, "🌀 Helical ramp");
+            });
+            ui.separator();
+        }
+
+        // Deferred build request (kept out of the borrow of the per-tab fields).
+        let mut build: Option<(Result<cad_solid::SolidMesh, arch::ArchError>, String)> = None;
+        let mut do_dogleg = false; // the dog-leg tab builds CSG solids, not furniture
+        let mut do_spiral_csg = false; // the spiral-CSG tab builds CSG solids, not furniture
+        let mut do_door = false; // the door tab builds a furniture mesh
+        let mut do_cupboard = false; // the cupboard tab builds a multi-material furniture mesh
+        let mut do_kitchen = false; // the kitchen tab builds a multi-material furniture mesh
+        let mut do_cabin = false; // the cabinet-unit tab builds a multi-material furniture mesh
+
+        match self.arch_tab {
+            ArchTab::Staircase => {
+                let s = &mut self.arch_stair;
+                egui::ComboBox::from_label("Layout")
+                    .selected_text(s.layout.label())
+                    .show_ui(ui, |ui| {
+                        for l in arch::StairLayout::ALL {
+                            ui.selectable_value(&mut s.layout, l, l.label());
+                        }
+                    });
+                num(ui, "Floor-to-floor height", &mut s.total_height, 0.05, 0.1, 100.0);
+                num(ui, "Stair width", &mut s.step_width, 0.05, 0.3, 20.0);
+                num(ui, "Tread going (run)", &mut s.step_depth, 0.01, 0.1, 2.0);
+                num(ui, "Target riser height", &mut s.desired_riser_height, 0.005, 0.05, 0.5);
+                num(ui, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
+                num(ui, "Riser thickness", &mut s.thickness_riser, 0.005, 0.01, 0.3);
+                ui.checkbox(&mut s.has_handrails, "Handrails (balustrade)");
+                if s.has_handrails {
+                    num(ui, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
+                }
+                ui.checkbox(&mut s.has_stringers, "Side stringers (solid slab)");
+
+                let is_u = s.layout == arch::StairLayout::UShape;
+                if is_u {
+                    ui.separator();
+                    num(ui, "Landing depth", &mut s.landing_depth, 0.05, 0.1, 20.0);
+                    if s.landing_depth < s.step_width {
+                        error(ui, format!("landing depth must be ≥ stair width ({:.2} m) to turn", s.step_width));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new("First-flight split").selectable(false));
+                        ui.add(egui::Slider::new(&mut s.split_ratio, 0.1..=0.9).show_value(false));
+                        ui.label(format!("{:.0}%", s.split_ratio * 100.0));
+                    });
+                }
+
+                let params = *s;
+                ui.separator();
+                match arch::plan_stairs(&params) {
+                    Ok(pl) => {
+                        feedback(ui, format!(
+                            "{} steps · exact riser {:.3} m · run {:.2} m",
+                            pl.num_steps, pl.riser_height, pl.total_run,
+                        ));
+                        if is_u {
+                            feedback(ui, format!(
+                                "landing at {:.2} m · flights {} + {} steps",
+                                pl.landing_height, pl.flight1_steps, pl.flight2_steps,
+                            ));
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build staircase").strong())).clicked() {
+                            let name = if is_u { "U-Stair" } else { "Staircase" };
+                            build = Some((arch::build_stairs(&params), name.to_string()));
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Spiral => {
+                let s = &mut self.arch_spiral;
+                num(ui, "Total height", &mut s.total_height, 0.05, 0.1, 100.0);
+                num(ui, "Tread length (radial)", &mut s.step_width, 0.05, 0.3, 10.0);
+                num(ui, "Inner radius", &mut s.center_radius, 0.02, 0.0, 10.0);
+                num(ui, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Steps per turn").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.steps_per_turn).speed(0.2).range(3..=64));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Total turns").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.total_turns).speed(0.05).range(0.1..=20.0));
+                });
+                ui.checkbox(&mut s.has_handrail, "Outer handrail");
+                if s.has_handrail {
+                    num(ui, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
+                }
+                let params = *s;
+                ui.separator();
+                match arch::plan_spiral(&params) {
+                    Ok(pl) => {
+                        feedback(ui, format!(
+                            "{} steps · riser {:.3} m · {:.0}° total rotation",
+                            pl.num_steps, pl.riser_height, pl.total_rotation_deg,
+                        ));
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build spiral").strong())).clicked() {
+                            build = Some((arch::build_spiral(&params), "Spiral Stair".to_string()));
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Ramp => {
+                let s = &mut self.arch_ramp;
+                num(ui, "Vertical height", &mut s.vertical_height, 0.05, 0.05, 50.0);
+                num(ui, "Horizontal length", &mut s.horizontal_length, 0.05, 0.1, 100.0);
+                num(ui, "Width", &mut s.width, 0.05, 0.2, 20.0);
+                num(ui, "Deck thickness", &mut s.thickness, 0.005, 0.02, 1.0);
+                let params = *s;
+                ui.separator();
+                feedback(ui, format!("slope {:.1}°", arch::ramp_slope_deg(&params)));
+                if ui.add(egui::Button::new(egui::RichText::new("✚  Build ramp").strong())).clicked() {
+                    build = Some((arch::build_ramp(&params), "Ramp".to_string()));
+                }
+            }
+            ArchTab::Dogleg => {
+                // A HALF-TURN stair built as EDITABLE, boolean-able CSG solids (not furniture).
+                let d = &mut self.arch_dogleg;
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Lower-flight steps").selectable(false));
+                    ui.add(egui::DragValue::new(&mut d.n_lower).speed(0.2).range(1..=100));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Upper-flight steps").selectable(false));
+                    ui.add(egui::DragValue::new(&mut d.n_upper).speed(0.2).range(1..=100));
+                });
+                num(ui, "Going (tread depth)", &mut d.going, 0.01, 0.1, 1.0);
+                num(ui, "Stair width", &mut d.width, 0.05, 0.3, 4.0);
+                num(ui, "Well (gap)", &mut d.well, 0.01, 0.0, 2.0);
+                num(ui, "Floor-to-floor rise", &mut d.total_rise, 0.05, 0.2, 12.0);
+                ui.checkbox(&mut self.arch_dogleg_treads, "Stone tread slabs");
+                let inp = self.arch_dogleg;
+                ui.separator();
+                match cad_solid::dogleg::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "{} steps ({}+{}) · riser {:.3} m · pitch {:.1}° · footprint {:.2}×{:.2} m",
+                            m.n_steps, inp.n_lower, inp.n_upper, m.riser, m.pitch_deg, m.shaft_len, m.shaft_wid,
+                        ));
+                        feedback(ui, format!(
+                            "landing at {:.2} m · top tread {:.2} m · clear width {:.2} m",
+                            m.landing_z, m.top_tread_z, m.clear_width,
+                        ));
+                        for w in warns.iter().take(2) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build editable stair").strong())).clicked() {
+                            do_dogleg = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::SpiralCsg => {
+                // A HELICAL stair built as EDITABLE, boolean-able CSG solids (not furniture).
+                let s = &mut self.arch_spiral_csg;
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Number of steps").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.n_steps).speed(0.2).range(3..=200));
+                });
+                num(ui, "Number of turns", &mut s.turns, 0.02, 0.25, 6.0);
+                num(ui, "Overall height", &mut s.total_height, 0.05, 0.2, 20.0);
+                num(ui, "Outer radius (width)", &mut s.radius, 0.02, 0.3, 4.0);
+                ui.checkbox(&mut s.clockwise, "Clockwise going up");
+                ui.checkbox(&mut s.brackets, "Support brackets");
+                ui.checkbox(&mut s.handrail, "Balustrade (rails + handrail)");
+                if s.handrail {
+                    num(ui, "Handrail height", &mut s.handrail_height, 0.02, 0.3, 1.3);
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new("Infill rails").selectable(false));
+                        ui.add(egui::DragValue::new(&mut s.n_infill).speed(0.1).range(0..=10));
+                    });
+                }
+                let inp = self.arch_spiral_csg;
+                ui.separator();
+                match cad_solid::spiral::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "{} steps · {:.2} turns · riser {:.3} m · Ø {:.2} m",
+                            m.n_steps, inp.turns, m.riser, m.overall_dia,
+                        ));
+                        feedback(ui, format!(
+                            "walk-line going {:.3} m · top tread {:.2} m · handrail top {:.2} m",
+                            m.going_walk, m.total_rise, m.handrail_top_z,
+                        ));
+                        for w in warns.iter().take(2) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build editable spiral").strong())).clicked() {
+                            do_spiral_csg = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Door => {
+                // A parametric panelled DOOR (leaf + lining + casing + hardware) placed as furniture.
+                // All sizes in metres. Same "Door classic" proportions as the drawn-aperture door.
+                let d = &mut self.arch_door;
+                ui.label(egui::RichText::new("Leaf").small().weak());
+                num(ui, "Leaf width", &mut d.door_width, 0.005, 0.4, 1.6);
+                num(ui, "Leaf height", &mut d.door_height, 0.01, 1.2, 3.2);
+                num(ui, "Leaf thickness", &mut d.door_thickness, 0.002, 0.02, 0.1);
+                ui.label(egui::RichText::new("Frame / lining").small().weak());
+                num(ui, "Wall thickness (depth)", &mut d.frame_depth, 0.005, 0.05, 0.6);
+                num(ui, "Lining reveal (face)", &mut d.frame_face_width, 0.002, 0.005, 0.1);
+                num(ui, "Stop / rebate depth", &mut d.frame_stop_depth, 0.002, 0.005, 0.05);
+                ui.label(egui::RichText::new("Casing / hardware").small().weak());
+                num(ui, "Architrave width", &mut d.arch_width, 0.005, 0.02, 0.2);
+                num(ui, "Handle height", &mut d.handle_height, 0.01, 0.6, 1.4);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Hinge side").selectable(false));
+                    ui.selectable_value(&mut d.hinge_side, 1.0, "Right");
+                    ui.selectable_value(&mut d.hinge_side, -1.0, "Left");
+                });
+                let inp = self.arch_door;
+                ui.separator();
+                match cad_solid::door::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "structural opening {:.0} × {:.0} mm — the hole to leave in the wall",
+                            m.structural_opening_w * 1000.0, m.structural_opening_h * 1000.0,
+                        ));
+                        feedback(ui, format!(
+                            "panel {:.0} × {:.0} mm · casing {:.0} × {:.0} mm · depth {:.0} mm",
+                            m.panel_w * 1000.0, m.panel_h * 1000.0, m.overall_w * 1000.0, m.overall_h * 1000.0, m.overall_depth * 1000.0,
+                        ));
+                        for w in warns.iter().skip(1).take(2) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build door").strong())).clicked() {
+                            do_door = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::HelicalRamp => {
+                // A sloped annular deck winding around a free inner edge — built as a furniture mesh.
+                use cad_solid::architecture::BalustradeEdges;
+                let r = &mut self.arch_helical;
+                num(ui, "Ramp height (rise)", &mut r.ramp_height, 0.05, 0.2, 40.0);
+                num(ui, "Inner radius", &mut r.r_inner, 0.02, 0.0, 20.0);
+                num(ui, "Outer radius", &mut r.r_outer, 0.02, 0.3, 30.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Turns").selectable(false));
+                    ui.add(egui::DragValue::new(&mut r.turns).speed(0.05).range(0.1..=20.0));
+                });
+                num(ui, "Slab thickness", &mut r.slab_thickness, 0.005, 0.02, 1.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Direction").selectable(false));
+                    ui.selectable_value(&mut r.direction, 1.0, "Anticlockwise");
+                    ui.selectable_value(&mut r.direction, -1.0, "Clockwise");
+                });
+                num(ui, "Rail height", &mut r.rail_height, 0.02, 0.3, 1.5);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Rails per edge").selectable(false));
+                    ui.add(egui::DragValue::new(&mut r.rail_count).speed(0.1).range(1..=8));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Balustrade").selectable(false));
+                    ui.selectable_value(&mut r.balustrade_edges, BalustradeEdges::Both, "Both");
+                    ui.selectable_value(&mut r.balustrade_edges, BalustradeEdges::OuterOnly, "Outer");
+                    ui.selectable_value(&mut r.balustrade_edges, BalustradeEdges::InnerOnly, "Inner");
+                });
+                ui.checkbox(&mut r.end_rails, "End rails (close each end)");
+                let inp = self.arch_helical;
+                ui.separator();
+                match cad_solid::architecture::plan_helical_ramp(&inp) {
+                    Ok((m, warns)) => {
+                        let one_in = |s: f32| if s > 0.0 { 1.0 / s } else { f32::INFINITY };
+                        feedback(ui, format!(
+                            "deck {:.2} m wide · slope 1:{:.1} mean, 1:{:.1} inner · top {:.2} m",
+                            m.deck_width, one_in(m.slope_mean), one_in(m.slope_inner), m.top_of_deck,
+                        ));
+                        feedback(ui, format!(
+                            "headroom {:.2} m · rise/turn {:.2} m · posts {}/{} (outer/inner)",
+                            m.headroom, m.rise_per_turn, m.posts_outer, m.posts_inner,
+                        ));
+                        for w in warns.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build helical ramp").strong())).clicked() {
+                            build = Some((cad_solid::architecture::build_helical_ramp(&inp), "Helical Ramp".to_string()));
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Cupboard => {
+                // A parametric CABINET: set the overall size, lay out a grid of bays × tiers, and
+                // fill each cell (door / glass / drawers / niche / panel). Counts are DERIVED from
+                // the grid, never typed (spec §B1.4). Built as a multi-material furniture mesh.
+                use cad_solid::cupboard::Cell;
+                let cup = &mut self.arch_cupboard;
+                num(ui, "Carcass width", &mut cup.width, 0.01, 0.3, 6.0);
+                num(ui, "Carcass height", &mut cup.carcass_height, 0.01, 0.3, 3.0);
+                num(ui, "Depth", &mut cup.depth, 0.005, 0.1, 1.0);
+
+                // Grid size — resize cols/rows/layout to match (new cells default to a door).
+                let (mut n_cols, mut n_rows) = (cup.cols.len(), cup.rows.len());
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Bays × tiers").selectable(false));
+                    ui.add(egui::DragValue::new(&mut n_cols).speed(0.05).range(1..=6));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut n_rows).speed(0.05).range(1..=6));
+                });
+                if n_cols != cup.cols.len() || n_rows != cup.rows.len() {
+                    cup.cols.resize(n_cols, 1.0);
+                    cup.rows.resize(n_rows, 1.0);
+                    for row in cup.layout.iter_mut() {
+                        row.resize(n_cols, Cell::Door);
+                    }
+                    cup.layout.resize(n_rows, vec![Cell::Door; n_cols]);
+                }
+
+                // The matrix: one dropdown per cell, top row first — this is the whole tool (§A1).
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Cells (top row first)").small().weak());
+                for r in 0..cup.rows.len() {
+                    ui.horizontal(|ui| {
+                        for c in 0..cup.cols.len() {
+                            let cell = &mut cup.layout[r][c];
+                            let text = match *cell {
+                                Cell::Drawers(n) => format!("Drawers×{n}"),
+                                other => other.label().to_string(),
+                            };
+                            egui::ComboBox::from_id_salt(("cup_cell", r, c))
+                                .width(74.0)
+                                .selected_text(text)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(cell, Cell::Door, "Door");
+                                    ui.selectable_value(cell, Cell::Glass, "Glass");
+                                    ui.selectable_value(cell, Cell::Niche, "Niche");
+                                    ui.selectable_value(cell, Cell::Panel, "Panel");
+                                    if ui.selectable_label(matches!(cell, Cell::Drawers(_)), "Drawers").clicked()
+                                        && !matches!(cell, Cell::Drawers(_))
+                                    {
+                                        *cell = Cell::Drawers(2);
+                                    }
+                                });
+                            if let Cell::Drawers(n) = cell {
+                                ui.add(egui::DragValue::new(n).speed(0.1).range(1..=8));
+                            }
+                        }
+                    });
+                }
+                ui.checkbox(&mut cup.handles, "Handles");
+
+                let inp = cup.clone();
+                ui.separator();
+                match cad_solid::cupboard::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "{} bays × {} tiers · {:.0} × {:.0} mm overall · aspect {:.3}",
+                            m.n_cols, m.n_rows, m.total_w * 1000.0, m.total_h * 1000.0, m.aspect,
+                        ));
+                        feedback(ui, format!(
+                            "{} doors · {} glazed · {} drawers · {} niches · {} handles",
+                            m.doors, m.glazed, m.drawers, m.niches, m.handles,
+                        ));
+                        for w in warns.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build cupboard").strong())).clicked() {
+                            do_cupboard = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Kitchen => {
+                // A parametric KITCHEN RUN: base (lower) cabinets always; wall (upper) cabinets
+                // optional via the toggle. Worktop, plinth and legs are generated automatically.
+                use cad_solid::kitchen::{BaseKind, BaseModule, KitchenShape, WallKind, WallModule};
+                let kt = &mut self.arch_kitchen;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Shape").small().weak());
+                    egui::ComboBox::from_id_salt("kt_shape").width(120.0)
+                        .selected_text(kt.shape.label())
+                        .show_ui(ui, |ui| {
+                            for s in [KitchenShape::Straight, KitchenShape::L, KitchenShape::U] {
+                                ui.selectable_value(&mut kt.shape, s, s.label());
+                            }
+                        });
+                });
+                num(ui, "Main run length", &mut kt.length, 0.02, 0.3, 12.0);
+                if matches!(kt.shape, KitchenShape::L | KitchenShape::U) {
+                    num(ui, "Return leg B length", &mut kt.length_b, 0.02, 0.3, 12.0);
+                }
+                if matches!(kt.shape, KitchenShape::U) {
+                    num(ui, "Return leg C length", &mut kt.length_c, 0.02, 0.3, 12.0);
+                }
+                if matches!(kt.shape, KitchenShape::L | KitchenShape::U) {
+                    ui.label(egui::RichText::new("return legs auto-fill to length; edit the main run below").small().weak());
+                }
+                ui.checkbox(&mut kt.include_wall, "Upper (wall) cabinets")
+                    .on_hover_text("Off = base run only (worktop, plinth, tall units stay). This is the with/without-upper option.");
+                ui.checkbox(&mut kt.handles, "Handles");
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Base cabinets (lower) — width 0 = auto").small().weak());
+                let mut rm: Option<usize> = None;
+                for i in 0..kt.base.len() {
+                    ui.horizontal(|ui| {
+                        let m = &mut kt.base[i];
+                        egui::ComboBox::from_id_salt(("kt_base", i)).width(104.0)
+                            .selected_text(m.kind.label())
+                            .show_ui(ui, |ui| {
+                                for k in [BaseKind::Door, BaseKind::Drawers, BaseKind::Void, BaseKind::Tall, BaseKind::Gap] {
+                                    ui.selectable_value(&mut m.kind, k, k.label());
+                                }
+                            });
+                        ui.add(egui::DragValue::new(&mut m.width).speed(0.01).range(0.0..=3.0).suffix(" m"));
+                        if matches!(m.kind, BaseKind::Door | BaseKind::Drawers) {
+                            ui.add(egui::DragValue::new(&mut m.count).range(1..=6))
+                                .on_hover_text(if m.kind == BaseKind::Door { "door leaves" } else { "drawers" });
+                        }
+                        if ui.small_button("🗑").clicked() { rm = Some(i); }
+                    });
+                }
+                if let Some(i) = rm { if kt.base.len() > 1 { kt.base.remove(i); } }
+                if ui.small_button("➕ base cabinet").clicked() {
+                    kt.base.push(BaseModule { kind: BaseKind::Door, width: 0.6, count: 1 });
+                }
+
+                if kt.include_wall {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Wall cabinets (upper) — Gap clears a tall unit").small().weak());
+                    let mut rmw: Option<usize> = None;
+                    for i in 0..kt.wall.len() {
+                        ui.horizontal(|ui| {
+                            let m = &mut kt.wall[i];
+                            egui::ComboBox::from_id_salt(("kt_wall", i)).width(104.0)
+                                .selected_text(m.kind.label())
+                                .show_ui(ui, |ui| {
+                                    for k in [WallKind::Door, WallKind::Open, WallKind::Gap] {
+                                        ui.selectable_value(&mut m.kind, k, k.label());
+                                    }
+                                });
+                            ui.add(egui::DragValue::new(&mut m.width).speed(0.01).range(0.0..=3.0).suffix(" m"));
+                            if matches!(m.kind, WallKind::Door | WallKind::Open) {
+                                ui.add(egui::DragValue::new(&mut m.count).range(1..=6))
+                                    .on_hover_text(if m.kind == WallKind::Door { "door leaves" } else { "shelves" });
+                            }
+                            if ui.small_button("🗑").clicked() { rmw = Some(i); }
+                        });
+                    }
+                    if let Some(i) = rmw { if kt.wall.len() > 1 { kt.wall.remove(i); } }
+                    if ui.small_button("➕ wall cabinet").clicked() {
+                        kt.wall.push(WallModule { kind: WallKind::Door, width: 0.6, count: 1 });
+                    }
+                }
+
+                let inp = kt.clone();
+                ui.separator();
+                match cad_solid::kitchen::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "{} base · {} wall cabinets · worktop {:.2} m · top {:.0} mm",
+                            m.base_modules, m.wall_modules, m.worktop_len, m.worktop_top * 1000.0,
+                        ));
+                        feedback(ui, format!(
+                            "{} doors · {} drawers · {} voids · {} tall · {} shelves · {} corners · {} legs",
+                            m.door_leaves, m.drawers, m.voids, m.talls, m.shelves, m.corners, m.legs,
+                        ));
+                        for w in warns.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build kitchen").strong())).clicked() {
+                            do_kitchen = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+            ArchTab::Cabin => {
+                // A single CLOSE-RANGE cabinet unit: overall size, a grid of cells, a grip system,
+                // panel order and banding. Full-overlay fronts tile the outline; counts are DERIVED.
+                use cad_solid::cabin::{Cell, EdgeBand, Grip, PanelOrder};
+                let cb = &mut self.arch_cabin;
+                num(ui, "Width", &mut cb.width, 0.01, 0.2, 3.0);
+                num(ui, "Height", &mut cb.height, 0.01, 0.2, 3.0);
+                num(ui, "Depth (nominal, incl. leaf)", &mut cb.depth_nominal, 0.005, 0.1, 1.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Grip").small().weak());
+                    egui::ComboBox::from_id_salt("cb_grip").width(150.0)
+                        .selected_text(cb.grip.label())
+                        .show_ui(ui, |ui| {
+                            for g in [Grip::None, Grip::JGroove, Grip::Bar, Grip::Rail] {
+                                ui.selectable_value(&mut cb.grip, g, g.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Panel order").small().weak());
+                    egui::ComboBox::from_id_salt("cb_panel").width(150.0)
+                        .selected_text(cb.panel_order.label())
+                        .show_ui(ui, |ui| {
+                            for p in [PanelOrder::SidesOutside, PanelOrder::TopBottomOutside] {
+                                ui.selectable_value(&mut cb.panel_order, p, p.label());
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Edge band").small().weak());
+                    egui::ComboBox::from_id_salt("cb_band").width(110.0)
+                        .selected_text(cb.edge_band.label())
+                        .show_ui(ui, |ui| {
+                            for b in [EdgeBand::Match, EdgeBand::Contrast] {
+                                ui.selectable_value(&mut cb.edge_band, b, b.label());
+                            }
+                        });
+                    ui.add(egui::DragValue::new(&mut cb.shelves).range(0..=6)).on_hover_text("shelves per non-drawer cell");
+                    ui.label(egui::RichText::new("shelves").small().weak());
+                });
+                ui.checkbox(&mut cb.pin_rows, "Shelf-pin rows");
+
+                // Grid size — resize cols/rows/layout together (new cells default to a single door).
+                let (mut n_cols, mut n_rows) = (cb.cols.len(), cb.rows.len());
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Columns × rows").selectable(false));
+                    ui.add(egui::DragValue::new(&mut n_cols).speed(0.05).range(1..=6));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut n_rows).speed(0.05).range(1..=6));
+                });
+                if n_cols != cb.cols.len() || n_rows != cb.rows.len() {
+                    cb.cols.resize(n_cols, 1.0);
+                    cb.rows.resize(n_rows, 1.0);
+                    for row in cb.layout.iter_mut() {
+                        row.resize(n_cols, Cell::Door(1));
+                    }
+                    cb.layout.resize(n_rows, vec![Cell::Door(1); n_cols]);
+                }
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Cells (top row first)").small().weak());
+                for r in 0..cb.rows.len() {
+                    ui.horizontal(|ui| {
+                        for c in 0..cb.cols.len() {
+                            let cell = &mut cb.layout[r][c];
+                            let text = match *cell {
+                                Cell::Door(n) => format!("Door×{n}"),
+                                Cell::Drawers(n) => format!("Drawers×{n}"),
+                                other => other.label().to_string(),
+                            };
+                            egui::ComboBox::from_id_salt(("cb_cell", r, c))
+                                .width(84.0)
+                                .selected_text(text)
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(matches!(cell, Cell::Door(_)), "Door").clicked()
+                                        && !matches!(cell, Cell::Door(_))
+                                    {
+                                        *cell = Cell::Door(1);
+                                    }
+                                    if ui.selectable_label(matches!(cell, Cell::Drawers(_)), "Drawers").clicked()
+                                        && !matches!(cell, Cell::Drawers(_))
+                                    {
+                                        *cell = Cell::Drawers(3);
+                                    }
+                                    ui.selectable_value(cell, Cell::Open, "Open");
+                                    ui.selectable_value(cell, Cell::Panel, "Panel");
+                                });
+                            match cell {
+                                Cell::Door(n) => { ui.add(egui::DragValue::new(n).speed(0.1).range(1..=3)).on_hover_text("leaves"); }
+                                Cell::Drawers(n) => { ui.add(egui::DragValue::new(n).speed(0.1).range(1..=8)).on_hover_text("drawers"); }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Open pose").small().weak());
+                    ui.add(egui::DragValue::new(&mut cb.open_deg).speed(1.0).range(0.0..=110.0).suffix("°"))
+                        .on_hover_text("swing every door leaf open by this angle (0 = shut)");
+                    ui.add(egui::DragValue::new(&mut cb.drawer_out).speed(0.005).range(0.0..=0.6).suffix(" m"))
+                        .on_hover_text("pull every drawer front out by this much");
+                });
+
+                let inp = cb.clone();
+                ui.separator();
+                match cad_solid::cabin::plan(&inp) {
+                    Ok((m, warns)) => {
+                        feedback(ui, format!(
+                            "{} × {} cells · {:.0} × {:.0} × {:.0} mm · carcass depth {:.0} mm",
+                            m.cols, m.rows, m.width * 1000.0, m.height * 1000.0, m.depth_nominal * 1000.0, m.carcass_depth * 1000.0,
+                        ));
+                        feedback(ui, format!(
+                            "{} door leaves · {} drawers · {} open · {} panels · {} shelves · {} pins",
+                            m.door_leaves, m.drawer_fronts, m.opens, m.panels, m.shelves, m.pins,
+                        ));
+                        for w in warns.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build cabinet unit").strong())).clicked() {
+                            do_cabin = true;
+                        }
+                    }
+                    Err(e) => error(ui, e.to_string()),
+                }
+            }
+        }
+
+        if let Some((result, name)) = build {
+            match result {
+                Ok(mesh) => self.arch_build_and_place(mesh, &name),
+                Err(e) => self.factory.status = format!("{name}: {e}"),
+            }
+        }
+        if do_dogleg {
+            let inp = self.arch_dogleg;
+            let with_treads = self.arch_dogleg_treads;
+            self.factory_build_dogleg(&inp, with_treads);
+        }
+        if do_spiral_csg {
+            let inp = self.arch_spiral_csg;
+            self.factory_build_spiral_csg(&inp);
+        }
+        if do_door {
+            let inp = self.arch_door;
+            self.factory_build_door(&inp);
+        }
+        if do_cupboard {
+            let inp = self.arch_cupboard.clone();
+            self.factory_build_cupboard(&inp);
+        }
+        if do_kitchen {
+            let inp = self.arch_kitchen.clone();
+            self.factory_build_kitchen(&inp);
+        }
+        if do_cabin {
+            let inp = self.arch_cabin.clone();
+            self.factory_build_cabin(&inp);
+        }
+    }
+
+    /// Build the parametric door from the dialog and drop it at the model centre as a furniture
+    /// piece (no wall cut) — the "insert by parameters" path. Each component is a selectable piece.
+    fn factory_build_door(&mut self, inp: &cad_solid::door::DoorInput) {
+        let (m, mesh) = match cad_solid::door::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Door: {e}");
+                return;
+            }
+        };
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.62, 0.50, 0.38]),
+            alpha: Vec::new(),
+        };
+        self.factory_place_furniture_mesh(obj, "Door", "built", part_ids);
+        self.factory.status = format!(
+            "Door built — structural opening {:.0} × {:.0} mm (leave this hole in the wall)",
+            m.structural_opening_w * 1000.0, m.structural_opening_h * 1000.0,
+        );
+    }
+
+    /// Build the parametric CABINET from the grid dialog and drop it at the model centre as a
+    /// furniture piece (each component selectable). Unlike a plain generated mesh this one is
+    /// MULTI-MATERIAL: glass panes and chrome pulls get their own flat swatch bound per part (same
+    /// mechanism as a glTF import), while wood parts keep the asset's base colour.
+    fn factory_build_cupboard(&mut self, inp: &cad_solid::cupboard::CupboardInput) {
+        use cad_solid::cupboard::Material;
+        let features_before = self.factory.model.features.len();
+        let (m, mesh, mats) = match cad_solid::cupboard::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Cupboard: {e}");
+                return;
+            }
+        };
+        let tris = mesh.tri_count();
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.62, 0.512, 0.348]), // oak — the wood default; glass/chrome bound below
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Cupboard".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        // One flat 1×1 swatch each for glass and chrome; wood parts stay untextured (base colour).
+        let glass_tex = self.factory.add_texture("Cupboard glass".into(), 1, 1, vec![194, 202, 205, 255]);
+        let chrome_tex = self.factory.add_texture("Cupboard chrome".into(), 1, 1, vec![196, 200, 205, 255]);
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::Glass => Some(glass_tex),
+                Material::Chrome => Some(chrome_tex),
+                Material::Wood => None,
+            })
+            .collect();
+
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at); // selects the new instance
+        // Bind each part's material to its face-groups (mirror the glTF multi-material import). The
+        // immutable asset borrow is closed before the mutable instance borrow.
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.open = true;
+        self.factory.status = format!(
+            "Cupboard built — {} doors · {} glazed · {} drawers · {} niches ({} tris)",
+            m.doors, m.glazed, m.drawers, m.niches, tris,
+        );
+        self.history.push(format!(
+            "  architecture: cupboard ({} bays × {} tiers, {} fronts, {} tris) and placed",
+            m.n_cols, m.n_rows, m.total_fronts, tris,
+        ));
+        self.factory_op_evt(
+            "cupboard", "modal",
+            format!("bays={} tiers={} fronts={} handles={} tris={}", m.n_cols, m.n_rows, m.total_fronts, m.handles, tris),
+            features_before,
+        );
+    }
+
+    /// Build the parametric KITCHEN run and drop it at the model centre as a multi-material
+    /// furniture piece. Carcass keeps the asset base colour; fronts / stone / plinth / chrome each
+    /// get a flat swatch bound per part (same mechanism as [`Self::factory_build_cupboard`]).
+    fn factory_build_kitchen(&mut self, inp: &cad_solid::kitchen::KitchenInput) {
+        use cad_solid::kitchen::Material;
+        let features_before = self.factory.model.features.len();
+        let (m, mesh, mats) = match cad_solid::kitchen::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Kitchen: {e}");
+                return;
+            }
+        };
+        let tris = mesh.tri_count();
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.76, 0.758, 0.75]), // carcass grey (the base colour); other mats bound below
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Kitchen".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        // One flat swatch per non-carcass material; carcass parts stay at the base colour.
+        let sw = |app: &mut Self, name: &str, rgb: [u8; 3]| {
+            app.factory.add_texture(name.into(), 1, 1, vec![rgb[0], rgb[1], rgb[2], 255])
+        };
+        let front = sw(self, "Kitchen front", [120, 22, 20]);
+        let stone = sw(self, "Kitchen worktop", [179, 173, 156]);
+        let edge = sw(self, "Kitchen edge", [31, 31, 32]);
+        let plinth = sw(self, "Kitchen plinth", [60, 61, 64]);
+        let metal = sw(self, "Kitchen chrome", [189, 192, 196]);
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::Carcass => None,
+                Material::Front => Some(front),
+                Material::Stone => Some(stone),
+                Material::Edge => Some(edge),
+                Material::Plinth => Some(plinth),
+                Material::Metal => Some(metal),
+            })
+            .collect();
+
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.open = true;
+        self.factory.status = format!(
+            "Kitchen built — {} base + {} wall cabinets, {} doors, {} drawers ({} tris)",
+            m.base_modules, m.wall_modules, m.door_leaves, m.drawers, tris,
+        );
+        self.history.push(format!(
+            "  architecture: kitchen run ({} base, {} wall, upper={}, {} tris) and placed",
+            m.base_modules, m.wall_modules, inp.include_wall, tris,
+        ));
+        self.factory_op_evt(
+            "kitchen", "modal",
+            format!("base={} wall={} upper={} doors={} drawers={} tris={}", m.base_modules, m.wall_modules, inp.include_wall, m.door_leaves, m.drawers, tris),
+            features_before,
+        );
+    }
+
+    /// Build the parametric handleless CABINET UNIT from the dialog and drop it at the model centre
+    /// as a MULTI-MATERIAL furniture piece: the carcass keeps the asset's white base colour; front /
+    /// edge-band-and-pins / metal parts each get their own flat swatch bound per part (same
+    /// mechanism as [`Self::factory_build_kitchen`] / a glTF import). Each component is selectable.
+    fn factory_build_cabin(&mut self, inp: &cad_solid::cabin::CabinInput) {
+        use cad_solid::cabin::Material;
+        let features_before = self.factory.model.features.len();
+        let (m, mesh, mats) = match cad_solid::cabin::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Cabinet unit: {e}");
+                return;
+            }
+        };
+        let tris = mesh.tri_count();
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.92, 0.91, 0.885]), // white carcass (the base colour); fronts/edge/metal bound below
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Cabinet unit".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        // One flat swatch per non-carcass material; carcass parts stay at the white base colour.
+        let sw = |app: &mut Self, name: &str, rgb: [u8; 3]| {
+            app.factory.add_texture(name.into(), 1, 1, vec![rgb[0], rgb[1], rgb[2], 255])
+        };
+        // Fronts get a PROCEDURAL oak veneer (evaluated in-shader from world position) so the grain
+        // runs continuously across the leaves — Blender's object-coordinate trick, ported here.
+        let front = self.factory.add_procedural_texture("Cabinet oak veneer".into(), crate::factory::ProcDef::oak());
+        let edge = sw(self, "Cabinet edge/pins", [40, 40, 42]); // dark banding + pin holes
+        let metal = sw(self, "Cabinet metal", [190, 192, 196]); // handles / hardware
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::Carcass => None,
+                Material::Front => Some(front),
+                Material::Edge => Some(edge),
+                Material::Metal => Some(metal),
+            })
+            .collect();
+
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.open = true;
+        self.factory.status = format!(
+            "Cabinet unit built — {}×{} cells, {} door leaves, {} drawers, grip {} ({} tris)",
+            m.cols, m.rows, m.door_leaves, m.drawer_fronts, inp.grip.label(), tris,
+        );
+        self.history.push(format!(
+            "  furniture: cabinet unit ({}×{} cells, {} leaves, {} drawers, {} tris) and placed",
+            m.cols, m.rows, m.door_leaves, m.drawer_fronts, tris,
+        ));
+        self.factory_op_evt(
+            "cabin", "modal",
+            format!("cols={} rows={} leaves={} drawers={} grip={} tris={}", m.cols, m.rows, m.door_leaves, m.drawer_fronts, inp.grip.label(), tris),
+            features_before,
+        );
+    }
+
+    /// Build the parametric SPIRAL (helical) stair as EDITABLE CSG solids: the pole and one-piece
+    /// sleeve are cylinders, each tread and bracket an extruded sector prism, and every balustrade
+    /// rail a run of oriented cylinder chords — all UNION'd into the model so each piece is
+    /// selectable/movable and the whole stair accepts boolean cuts like any built solid. One undo
+    /// step; selects the new solids. Mirrors [`Self::factory_build_dogleg`].
+    fn factory_build_spiral_csg(&mut self, inp: &cad_solid::spiral::SpiralInput) {
+        use cad_solid::spiral::{Role, SpiralPart};
+        let (m, parts) = match cad_solid::spiral::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Spiral stair: {e}");
+                return;
+            }
+        };
+        let features_before = self.factory.model.features.len();
+        self.snapshot_factory();
+        let colour = |role: Role| match role {
+            Role::Pole => [0.42, 0.44, 0.48],       // dark metal
+            Role::Sleeve => [0.50, 0.52, 0.55],     // metal
+            Role::Tread => [0.72, 0.62, 0.46],      // wood
+            Role::Bracket => [0.40, 0.41, 0.45],    // dark metal
+            Role::Infill => [0.55, 0.56, 0.60],     // steel rail
+            Role::Handrail => [0.62, 0.50, 0.38],   // wood handrail
+            Role::Stanchion => [0.55, 0.56, 0.60],  // steel
+        };
+        let mut ids = Vec::new();
+        for part in parts {
+            let role = part.role();
+            let id = match part {
+                SpiralPart::Cyl { cx, cy, r, z0, z1, sides, .. } => {
+                    let placement = cad_solid::Placement { u: cx, v: cy, lift: z0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+                    Some(self.factory.model.push(
+                        cad_solid::BoolOp::Union, cad_solid::Plane::default(), placement,
+                        cad_solid::Primitive::Cylinder { r, h: z1 - z0, sides },
+                    ))
+                }
+                SpiralPart::Prism { poly, z0, z1, .. } => {
+                    let pts: Vec<glam::Vec2> = poly.iter().map(|p| glam::Vec2::new(p[0], p[1])).collect();
+                    match self.factory.model.add_profile(&pts) {
+                        Ok((prof, centre, w, d)) => {
+                            let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: z0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+                            Some(self.factory.model.push(
+                                cad_solid::BoolOp::Union, cad_solid::Plane::default(), placement,
+                                cad_solid::Primitive::Extrusion { profile: prof, h: z1 - z0, w, d },
+                            ))
+                        }
+                        Err(_) => None,
+                    }
+                }
+                SpiralPart::Seg { a, b, r, sides, .. } => {
+                    // A helical-rail chord: an oriented cylinder from a→b (base circle ⟂ the chord).
+                    let (a, b) = (glam::Vec3::from(a), glam::Vec3::from(b));
+                    let dir = b - a;
+                    let len = dir.length();
+                    if len < 1e-4 {
+                        None
+                    } else {
+                        let dir = dir / len;
+                        let up = if dir.z.abs() > 0.9 { glam::Vec3::X } else { glam::Vec3::Z };
+                        let u = up.cross(dir).normalize();
+                        let v = dir.cross(u).normalize();
+                        let placement = cad_solid::Placement { u: 0.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+                        Some(self.factory.model.push(
+                            cad_solid::BoolOp::Union, cad_solid::Plane::from_basis(a, u, v), placement,
+                            cad_solid::Primitive::Cylinder { r, h: len, sides },
+                        ))
+                    }
+                }
+            };
+            if let Some(id) = id {
+                self.factory.feature_color.insert(id, colour(role));
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            self.undo_stack.pop();
+            self.factory.status = "Spiral stair produced no solids".into();
+            return;
+        }
+        self.factory.sel_furniture = None;
+        self.factory.selection = ids.clone();
+        self.factory.recompute();
+        self.factory.open = true;
+        self.factory.status = format!(
+            "Spiral stair built — {} editable solids · {:.2} turns · top tread {:.2} m (cut/union as normal)",
+            ids.len(), inp.turns, m.total_rise,
+        );
+        self.history.push(format!("  architecture: spiral stair ({} solids, {} steps)", ids.len(), m.n_steps));
+        self.factory_op_evt("spiral-stair-csg", "modal",
+            format!("solids={} steps={} turns={:.2} rise={:.2}", ids.len(), m.n_steps, inp.turns, inp.total_height), features_before);
+    }
+
+    /// Build the parametric half-turn (dog-leg) stair as EDITABLE CSG solids: each flight body is an
+    /// extruded sawtooth prism, the landing and stone treads are boxes, all UNION'd into the model —
+    /// so every piece is selectable/movable in the properties panel and the whole stair accepts
+    /// boolean cuts/unions like any built solid. One undo step; selects the new solids.
+    fn factory_build_dogleg(&mut self, inp: &cad_solid::dogleg::DoglegInput, with_treads: bool) {
+        use cad_solid::dogleg::{DoglegPart, Role};
+        let (m, parts) = match cad_solid::dogleg::build(inp, with_treads) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Dog-leg stair: {e}");
+                return;
+            }
+        };
+        let features_before = self.factory.model.features.len();
+        self.snapshot_factory();
+        let colour = |role: Role| match role {
+            Role::Tread => [0.72, 0.68, 0.60],       // stone
+            Role::Landing => [0.60, 0.60, 0.62],     // concrete
+            Role::FlightBody => [0.55, 0.55, 0.57],  // concrete
+        };
+        let mut ids = Vec::new();
+        for part in parts {
+            let role = part.role();
+            let id = match part {
+                DoglegPart::Box { min, max, .. } => {
+                    let (w, d, h) = (max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+                    let placement = cad_solid::Placement {
+                        u: (min[0] + max[0]) * 0.5,
+                        v: (min[1] + max[1]) * 0.5,
+                        lift: min[2],
+                        spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+                    };
+                    Some(self.factory.model.push(
+                        cad_solid::BoolOp::Union, cad_solid::Plane::default(), placement,
+                        cad_solid::Primitive::Box { w, d, h },
+                    ))
+                }
+                DoglegPart::Flight { profile, y0, y1, .. } => {
+                    // Sawtooth profile lives in the world X-Z plane; extrude across Y ∈ [y0, y1].
+                    let pts: Vec<glam::Vec2> = profile.iter().map(|p| glam::Vec2::new(p[0], p[1])).collect();
+                    match self.factory.model.add_profile(&pts) {
+                        Ok((prof, centre, w, d)) => {
+                            let plane = cad_solid::Plane::from_basis(glam::Vec3::new(0.0, y1, 0.0), glam::Vec3::X, glam::Vec3::Z);
+                            let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
+                            Some(self.factory.model.push(
+                                cad_solid::BoolOp::Union, plane, placement,
+                                cad_solid::Primitive::Extrusion { profile: prof, h: y1 - y0, w, d },
+                            ))
+                        }
+                        Err(_) => None,
+                    }
+                }
+            };
+            if let Some(id) = id {
+                self.factory.feature_color.insert(id, colour(role));
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            self.undo_stack.pop();
+            self.factory.status = "Dog-leg stair produced no solids".into();
+            return;
+        }
+        self.factory.sel_furniture = None;
+        self.factory.selection = ids.clone();
+        self.factory.recompute();
+        self.factory.open = true;
+        self.factory.status = format!(
+            "Dog-leg stair built — {} editable solids · top tread {:.2} m (cut/union as normal)",
+            ids.len(), m.top_tread_z,
+        );
+        self.history.push(format!("  architecture: dog-leg stair ({} solids, {} steps)", ids.len(), m.n_steps));
+        self.factory_op_evt("dogleg-stair", "modal",
+            format!("solids={} steps={} rise={:.2}", ids.len(), m.n_steps, inp.total_rise), features_before);
+    }
+
+    /// Convert a generated [`cad_solid::SolidMesh`] to furniture geometry and drop it into the
+    /// scene (snapshotting for undo) — so a generated staircase behaves like any other placed
+    /// object. Delegates the snapshot→add→place→status sequence to [`Self::factory_place_furniture_mesh`].
+    fn arch_build_and_place(&mut self, mesh: cad_solid::SolidMesh, name: &str) {
+        // Per-primitive part ids (each tread/riser/baluster) → carried onto the asset so "select a
+        // piece" picks ONE part, not the whole welded run.
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: None,        // neutral default; recolour via Textures like any furniture
+            alpha: Vec::new(),  // opaque
+        };
+        self.factory_place_furniture_mesh(obj, name, "generated", part_ids);
+    }
+
+    /// Snapshot for undo, add `mesh` to the library, and place it at the model centre — the shared
+    /// tail for BOTH the procedural generator and the bundled stair-model importer. `verb` tags the
+    /// status/history line ("generated" / "placed"). Marks `alpha_resolved` (opaque, no source to
+    /// re-derive glass from) so the load-time refresh skips it. `part_ids` (per-triangle, or empty)
+    /// tags each generated primitive as a distinct selectable piece.
+    fn factory_place_furniture_mesh(&mut self, mesh: crate::mesh_io::ObjMesh, name: &str, verb: &str, part_ids: Vec<u32>) {
+        let tris = mesh.tri_count();
+        if tris == 0 {
+            self.factory.status = format!("{name}: no geometry");
+            return;
+        }
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset(name.to_string(), mesh);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids; // one id per TRIANGLE
+            }
+        }
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        self.factory.open = true;
+        self.factory.status = format!("{name} {verb} ({tris} tris) — placed at model centre");
+        self.history.push(format!("  architecture: {name} {verb} ({tris} tris) and placed"));
+    }
+
+    /// Public entry: ARM a deferred open. The loading overlay paints for one frame, then the
+    /// actual read/parse runs on a BACKGROUND worker thread ([`load_file_worker`]) so the UI
+    /// never freezes; [`Self::apply_loaded`] installs the result back on the main thread.
     fn do_open(&mut self, path: &str) {
+        let est = self.last_load_ms.max(300);
+        self.busy = Some(BusyOp {
+            kind: BusyKind::Load,
+            path: path.to_string(),
+            subtitle: file_stem_of(path),
+            started: std::time::Instant::now(),
+            est_ms: est,
+            painted: false,
+            rx: None,
+        });
+    }
+
+    #[allow(dead_code)] // retained for reference / tests; the live path is the threaded worker.
+    fn do_open_now(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
         // Whole-open timer + a "begin" marker so the session recorder timeline starts
         // the instant the file is chosen. Every stage below is timed separately, so a
@@ -16040,8 +21199,27 @@ impl CadApp {
         self.history.push(format!("  moved {n} object(s) to layer 'SIMLUX' (now used for 3D)"));
     }
 
-    /// Write the SIMLUX sidecar (`<drawing>.simlux.json`) next to `drawing`.
-    fn write_simlux_sidecar(&mut self, drawing: &std::path::Path) {
+    /// Build the SIMLUX config from live app state, WITHOUT writing it. Pure `&self` so the
+    /// heavy `serde`/IO can then run on a worker thread against the returned owned value.
+    /// Full furniture geometry is encoded inline — used only by the (dead) synchronous save path.
+    #[allow(dead_code)]
+    fn build_simlux_config(&self) -> crate::simlux_io::SimluxConfig {
+        let mut cfg = self.build_simlux_config_common();
+        cfg.factory = self.factory.to_persist();
+        cfg
+    }
+
+    /// Config with furniture geometry LEFT OUT (empty blobs) — pair with
+    /// [`crate::factory::FactoryState::furniture_geom_flat`] so a save worker does the deflate.
+    fn build_simlux_config_lite(&self) -> crate::simlux_io::SimluxConfig {
+        let mut cfg = self.build_simlux_config_common();
+        cfg.factory = self.factory.to_persist_lite();
+        cfg
+    }
+
+    /// Everything in the SIMLUX config EXCEPT the 3D-factory block (which the two callers above
+    /// fill in with vs. without furniture geometry).
+    fn build_simlux_config_common(&self) -> crate::simlux_io::SimluxConfig {
         let mut cfg = self.light.to_config(&self.doc);
         // App-layer wall centerline linetypes, keyed by STABLE names (style → linetype).
         cfg.wall_centerline = self.wall_centerline_ltype.iter()
@@ -16051,9 +21229,15 @@ impl CadApp {
                 Some((sname, lname))
             })
             .collect();
-        // The 3D Factory model rides in the SAME sidecar — a building modelled in 3D is
-        // part of the drawing, and before this it was written nowhere at all.
-        cfg.factory = self.factory.to_persist();
+        cfg
+    }
+
+    /// Write the SIMLUX sidecar (`<drawing>.simlux.json`) next to `drawing`. Synchronous —
+    /// used only by the (dead) non-threaded save path; the live path builds the config with
+    /// [`Self::build_simlux_config`] and writes it on a worker.
+    #[allow(dead_code)]
+    fn write_simlux_sidecar(&mut self, drawing: &std::path::Path) {
+        let cfg = self.build_simlux_config();
         let solids = cfg.factory.model.features.len();
         match crate::simlux_io::save(drawing, &cfg) {
             Ok(p) => {
@@ -16070,10 +21254,32 @@ impl CadApp {
         }
     }
 
-    /// Load the SIMLUX sidecar for `drawing` (if present) onto the current doc.
+    /// Load the SIMLUX sidecar for `drawing` (if present) onto the current doc. Synchronous —
+    /// used only by the (dead) non-threaded open path; the live path parses the config on a
+    /// worker and installs it with [`Self::install_simlux_config`].
+    #[allow(dead_code)]
     fn load_simlux_sidecar(&mut self, drawing: &std::path::Path) {
         match crate::simlux_io::load(drawing) {
-            Ok(Some(cfg)) => {
+            Ok(Some(mut cfg)) => {
+                let furniture = crate::factory::FactoryState::decode_furniture_lib(
+                    std::mem::take(&mut cfg.factory.furniture_lib),
+                );
+                self.install_simlux_config(cfg, furniture);
+            }
+            Ok(None) => {}
+            Err(e) => self.history.push(format!("  ! SIMLUX load: {}", e)),
+        }
+    }
+
+    /// Install an already-parsed SIMLUX config (with its furniture library ALREADY decoded) onto
+    /// the current doc + 3D factory. Runs on the MAIN thread (recompute, fit, GL-adjacent state)
+    /// but does NOT touch furniture geometry, so it stays fast even for a huge asset.
+    fn install_simlux_config(
+        &mut self,
+        cfg: crate::simlux_io::SimluxConfig,
+        furniture: Vec<crate::factory::FurnitureAsset>,
+    ) {
+        {
                 // Resolve wall centerline linetypes by NAME → current ids (positional).
                 self.wall_centerline_ltype.clear();
                 for (sname, lname) in &cfg.wall_centerline {
@@ -16083,11 +21289,13 @@ impl CadApp {
                         self.wall_centerline_ltype.insert(sid, lid);
                     }
                 }
-                // Restore the 3D model BEFORE `apply_config` consumes `cfg`.
+                // Restore the 3D model BEFORE `apply_config` consumes `cfg`. Furniture geometry
+                // was already decoded (off-thread on the live path), so this is cheap.
                 let fac = cfg.factory.clone();
-                let had_solids = !fac.is_empty();
+                let had_solids = !fac.is_empty() || !furniture.is_empty();
                 let n_solids = fac.model.features.len();
-                let dropped = self.factory.apply_persist(fac);
+                let dropped = self.factory.apply_persist_prebuilt(fac, furniture);
+                self.refresh_aperture_transparency();
                 self.light.apply_config(cfg, &self.doc);
                 self.history.push("  SIMLUX setup loaded (sidecar)".into());
                 if had_solids {
@@ -16112,13 +21320,27 @@ impl CadApp {
                         dropped
                     ));
                 }
-            }
-            Ok(None) => {}
-            Err(e) => self.history.push(format!("  ! SIMLUX load: {}", e)),
         }
     }
 
+    /// Public entry: ARM a deferred save. The "Saving…" overlay paints for one frame, then the
+    /// serialize + sidecar-write run on a BACKGROUND worker thread ([`save_file_worker`]); the
+    /// only main-thread cost is cloning the doc + building the config in [`Self::spawn_busy_worker`].
     fn do_save(&mut self, path: &str) {
+        let est = self.last_save_ms.max(200);
+        self.busy = Some(BusyOp {
+            kind: BusyKind::Save,
+            path: path.to_string(),
+            subtitle: file_stem_of(path),
+            started: std::time::Instant::now(),
+            est_ms: est,
+            painted: false,
+            rx: None,
+        });
+    }
+
+    #[allow(dead_code)] // retained for reference; the live path is the threaded worker.
+    fn do_save_now(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
         let bytes: Vec<u8> = if lower.ends_with(".dxf") {
             cad_io::dxf::write_dxf(&self.doc).into_bytes()
@@ -16139,6 +21361,144 @@ impl CadApp {
             }
             Err(e) => self.history.push(format!("  ! save '{}': {}", path, e)),
         }
+    }
+
+    /// Spawn the background worker for the currently-armed `busy` op and stash its receiver.
+    /// Called one frame AFTER the overlay first painted, so the window is already on screen and
+    /// stays responsive while the worker reads/parses/serializes. For a save, the doc clone +
+    /// config build happen here on the main thread (fast) before the worker takes over.
+    fn spawn_busy_worker(&mut self) {
+        let Some(b) = self.busy.as_ref() else { return };
+        let kind = b.kind;
+        let path = b.path.clone();
+        let rx = match kind {
+            BusyKind::Load => {
+                let (tx, rx) = std::sync::mpsc::channel::<BusyMsg>();
+                std::thread::spawn(move || {
+                    let _ = tx.send(BusyMsg::Loaded(load_file_worker(&path)));
+                });
+                rx
+            }
+            // The modal Save and the silent autosave share one spawn helper.
+            BusyKind::Save => self.spawn_save_thread(path),
+        };
+        if let Some(b) = self.busy.as_mut() { b.rx = Some(rx); }
+    }
+
+    /// Prepare the save on the MAIN thread (a doc clone + a config with empty furniture blobs +
+    /// the raw flattened geometry — all fast memcpy) and hand it to a background worker that does
+    /// the deflate + serialize + write. Returns the result channel. Shared by the modal Save and
+    /// the silent autosave.
+    fn spawn_save_thread(&self, path: String) -> std::sync::mpsc::Receiver<BusyMsg> {
+        let (tx, rx) = std::sync::mpsc::channel::<BusyMsg>();
+        let doc = self.doc.clone();
+        let cfg = self.build_simlux_config_lite();
+        let geom = self.factory.furniture_geom_flat();
+        std::thread::spawn(move || {
+            let _ = tx.send(BusyMsg::Saved(save_file_worker(&path, doc, cfg, geom)));
+        });
+        rx
+    }
+
+    /// Install a drawing parsed by [`load_file_worker`] onto the app — the MAIN-thread half of
+    /// an open (state install, view fit, sidecar apply, GL invalidate). Mirrors the install
+    /// stages of the old synchronous `do_open_now`.
+    fn apply_loaded(&mut self, path: &str, payload: Box<LoadPayload>) {
+        let LoadPayload { doc, sidecar, furniture, read_ms, parse_ms, sidecar_ms, furn_ms } = *payload;
+        let n = doc.dobjects.len();
+        let l = doc.layers.len();
+        // Re-emit the worker's stage timings to the recorder so a slow open still pins blame.
+        self.stage_evt("read file", 0, std::time::Duration::from_millis(read_ms), "worker");
+        self.stage_evt("parse doc", n, std::time::Duration::from_millis(parse_ms), "worker");
+        // Install the parsed doc + invalidate caches.
+        self.doc = doc;
+        self.selection.clear();
+        self.selection_prev.clear();
+        self.selected = None;
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        // Frame the drawing, record where the file came from.
+        self.fit_view_to_drawing();
+        self.current_file = Some(std::path::PathBuf::from(path));
+        // Apply the SIMLUX sidecar (may rebuild the 3D model — the one recompute() we pay on open).
+        // Furniture was decoded on the worker, so this no longer blocks on a huge mesh.
+        self.stage_evt("sidecar", n, std::time::Duration::from_millis(sidecar_ms), "worker parse");
+        self.stage_evt("furniture decode", furniture.len(), std::time::Duration::from_millis(furn_ms), "worker");
+        if let Some(cfg) = sidecar {
+            self.install_simlux_config(cfg, furniture);
+        }
+        self.unsaved = false; // freshly opened → matches the file on disk
+        self.history.push(format!(
+            "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l));
+    }
+
+    /// Finalize a save completed by [`save_file_worker`] — record the file + log line.
+    fn apply_saved(&mut self, path: &str, payload: SavePayload) {
+        self.current_file = Some(std::path::PathBuf::from(path));
+        self.unsaved = false; // now matches disk
+        self.last_autosave = std::time::Instant::now(); // an explicit save resets the autosave clock
+        self.history.push(payload.note);
+        // If this save was requested to complete a close, close now that the bytes are on disk.
+        if self.close_after_save {
+            self.close_after_save = false;
+            self.pending_close = true;
+        }
+    }
+
+    /// AUTOSAVE tick — run once per frame. Silently re-saves the current file on a background
+    /// worker (no modal overlay) a few minutes after an edit, so a crash can't lose an afternoon's
+    /// work. It NEVER blocks the UI, only writes an already-saved `.dxf`/`.rsm`, and writes
+    /// atomically (see [`atomic_write`]) so an interrupted autosave can't corrupt the file. The
+    /// `unsaved` flag is cleared only if no edit happened WHILE the save ran (via `edit_seq`), so
+    /// the close-confirm guard still fires for changes the autosave didn't capture.
+    fn tick_autosave(&mut self) {
+        const AUTOSAVE_SECS: u64 = 180; // ~3 minutes after the first unsaved edit
+
+        // 1) Poll a running autosave.
+        if self.autosave_rx.is_some() {
+            use std::sync::mpsc::TryRecvError;
+            match self.autosave_rx.as_ref().unwrap().try_recv() {
+                Ok(BusyMsg::Saved(res)) => {
+                    self.autosave_rx = None;
+                    match res {
+                        Ok(p) => {
+                            // Clear `unsaved` only if nothing was edited during the save.
+                            if self.edit_seq == self.autosave_seq {
+                                self.unsaved = false;
+                            }
+                            self.history.push(format!("  ⤓ autosaved ({} bytes)", p.bytes));
+                        }
+                        Err(e) => self.history.push(format!("  ! autosave: {}", e)),
+                    }
+                }
+                Ok(_) => self.autosave_rx = None, // a stray Loaded message (never expected)
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.autosave_rx = None,
+            }
+            return; // never run two at once
+        }
+
+        // 2) Should we start one? Only for an already-saved drawing with pending edits, and not
+        //    while a modal load/save is in flight.
+        if !self.autosave_on || self.busy.is_some() || !self.unsaved {
+            return;
+        }
+        let Some(path) = self.current_file.as_ref().map(|p| p.to_string_lossy().to_string()) else {
+            return;
+        };
+        let lower = path.to_ascii_lowercase();
+        if !(lower.ends_with(".dxf") || lower.ends_with(".rsm")) {
+            return; // never autosave an untitled or non-drawing file to a surprise location
+        }
+        if self.last_autosave.elapsed().as_secs() < AUTOSAVE_SECS {
+            return;
+        }
+        // Fire a silent background save of the state as of NOW; `unsaved` stays true until it
+        // completes (so a close mid-autosave is still guarded).
+        self.autosave_seq = self.edit_seq;
+        self.autosave_rx = Some(self.spawn_save_thread(path));
+        self.last_autosave = std::time::Instant::now();
     }
 
     // ---- Groups ---------------------------------------------------------
@@ -16441,12 +21801,14 @@ impl CadApp {
                         FileDialogMode::Open =>
                             lname.ends_with(".dxf") || lname.ends_with(".rsm")
                             || lname.ends_with(".dwg"),
-                        FileDialogMode::ImportImage | FileDialogMode::ImportRaster =>
+                        FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                        | FileDialogMode::ImportTexture =>
                             ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
                                 .iter().any(|x| lname.ends_with(&format!(".{x}"))),
                         FileDialogMode::ImportObj =>
                             lname.ends_with(".obj") || lname.ends_with(".3ds")
-                            || lname.ends_with(".fbx"),
+                            || lname.ends_with(".fbx") || lname.ends_with(".glb")
+                            || lname.ends_with(".gltf"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
                     };
                     if is_dir {
@@ -16465,7 +21827,8 @@ impl CadApp {
             FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
-            FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX",
+            FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX / glTF",
+            FileDialogMode::ImportTexture => "Load texture  ·  PNG / JPG image",
             FileDialogMode::Save => "Save As",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
@@ -16549,7 +21912,7 @@ impl CadApp {
                             ui.label(match dlg.mode {
                                 FileDialogMode::Open => "Type  ",
                                 FileDialogMode::ImportImage | FileDialogMode::ImportRaster
-                                | FileDialogMode::ImportObj => "Type  ",
+                                | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Type  ",
                                 FileDialogMode::Save => "Format",
                             });
                             let before = dlg.ext.clone();
@@ -16567,8 +21930,9 @@ impl CadApp {
                                 .desired_width(260.0)
                                 .hint_text(match dlg.mode {
                                     FileDialogMode::Open => "pick a file above",
-                                    FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "pick an image above",
-                                    FileDialogMode::ImportObj => "pick an .obj, .3ds or .fbx above",
+                                    FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                                    | FileDialogMode::ImportTexture => "pick an image above",
+                                    FileDialogMode::ImportObj => "pick an .obj, .3ds, .fbx, .glb or .gltf above",
                                     FileDialogMode::Save => "drawing name",
                                 }));
                         });
@@ -16583,7 +21947,7 @@ impl CadApp {
                                 let label = match dlg.mode {
                                     FileDialogMode::Open => "Open",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
-                                    | FileDialogMode::ImportObj => "Open",
+                                    | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Open",
                                     FileDialogMode::Save => "Save",
                                 };
                                 if ui.button(label).clicked() { do_confirm = true; }
@@ -16697,6 +22061,8 @@ impl CadApp {
         if !open || do_cancel {
             self.file_dialog_dir = Some(dlg.dir);
             self.file_preview = None;   // drop cached preview doc
+            // A cancelled Save-As must not leave a pending "close after save" armed.
+            self.close_after_save = false;
             self.history.push("  file: cancelled".into());
             return;
         }
@@ -16724,6 +22090,10 @@ impl CadApp {
                 FileDialogMode::ImportObj => {
                     let path = dlg.dir.join(name);
                     self.import_furniture_obj(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportTexture => {
+                    let path = dlg.dir.join(name);
+                    self.load_texture_from_file(&path.to_string_lossy());
                 }
                 FileDialogMode::Save => {
                     // Ensure the chosen extension; if the name already ends
@@ -16755,6 +22125,8 @@ impl CadApp {
     #[track_caller]
     fn snapshot_doc(&mut self) {
         let t = std::time::Instant::now();
+        self.unsaved = true; // an edit is about to happen → drawing diverges from disk
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
@@ -16790,6 +22162,8 @@ impl CadApp {
     /// the `Document`, which does not contain the Factory model.
     #[track_caller]
     fn snapshot_factory(&mut self) {
+        self.unsaved = true; // a 3D edit is about to happen → drawing diverges from disk
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
@@ -16802,6 +22176,10 @@ impl CadApp {
             furniture: self.factory.furniture.clone(),
             feature_color: self.factory.feature_color.clone(),
             surface_color: self.factory.surface_color.clone(),
+            feature_texture: self.factory.feature_texture.clone(),
+            surface_texture: self.factory.surface_texture.clone(),
+            feature_group: self.factory.feature_group.clone(),
+            texture_xforms: self.factory.textures.iter().map(|t| (t.scale, t.offset, t.rot_deg, t.opacity, t.reflect)).collect(),
         }));
         self.redo_stack.clear();
     }
@@ -16834,6 +22212,10 @@ impl CadApp {
                 furniture: self.factory.furniture.clone(),
                 feature_color: self.factory.feature_color.clone(),
                 surface_color: self.factory.surface_color.clone(),
+                feature_texture: self.factory.feature_texture.clone(),
+                surface_texture: self.factory.surface_texture.clone(),
+                feature_group: self.factory.feature_group.clone(),
+                texture_xforms: self.factory.textures.iter().map(|t| (t.scale, t.offset, t.rot_deg, t.opacity, t.reflect)).collect(),
             }),
         }
     }
@@ -16859,6 +22241,16 @@ impl CadApp {
                 self.factory.furniture = snap.furniture;
                 self.factory.feature_color = snap.feature_color;
                 self.factory.surface_color = snap.surface_color;
+                self.factory.feature_texture = snap.feature_texture;
+                self.factory.surface_texture = snap.surface_texture;
+                self.factory.feature_group = snap.feature_group;
+                // Restore per-texture tiling/move/rotate onto the existing texture assets (their
+                // pixels are unchanged, so only the transforms roll back).
+                for (i, (s, o, r, op, rf)) in snap.texture_xforms.into_iter().enumerate() {
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.scale = s; t.offset = o; t.rot_deg = r; t.opacity = op; t.reflect = rf;
+                    }
+                }
                 // The restored furniture list may be shorter — drop a now-invalid selection.
                 if self.factory.sel_furniture.map_or(false, |i| i >= self.factory.furniture.len()) {
                     self.factory.sel_furniture = None;
@@ -25794,6 +31186,9 @@ fn paint_arc_method_icon(
 impl eframe::App for CadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
+        // The app's GL context (eframe runs the glow renderer) — the GPU path tracer draws on it.
+        self.pt_gl = _frame.gl().cloned();
+
         // ensure continuous repaint, never frozen
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
@@ -25803,6 +31198,117 @@ impl eframe::App for CadApp {
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
         // theme. Also fixes square menu corners (menu_rounding = ZERO).
         crate::theme::apply(ctx);
+
+        // ---- Auto-load the VILLA test model on startup (texture + Radiance testing) ------------
+        // One-shot, and only into a FRESH session (empty scene) so opening a project later isn't
+        // polluted. Guarded on the file existing so a moved/absent model just skips silently.
+        if !self.villa_autoloaded {
+            self.villa_autoloaded = true;
+            const VILLA: &str = r"G:\blender dev\staircase\villa model\build\villa_v1.fbx";
+            let empty = self.factory.furniture.is_empty() && self.factory.model.features.is_empty();
+            if empty && std::path::Path::new(VILLA).exists() {
+                self.import_furniture_obj(VILLA);
+                // The villa FBX is authored in CENTIMETRES (building ~845 units ≈ 8.45 m). Scale the
+                // placed instance to metres so it sits correctly in our world and the sun/shadow +
+                // Radiance export are physically sensible. Heuristic on the asset's extent so a
+                // future metres-scale replacement isn't wrongly shrunk.
+                if let Some(fi) = self.factory.sel_furniture {
+                    let big = self.factory.furniture.get(fi)
+                        .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                        .map(|a| {
+                            let e = [a.local_max[0] - a.local_min[0], a.local_max[1] - a.local_min[1], a.local_max[2] - a.local_min[2]];
+                            e[0].max(e[1]).max(e[2])
+                        })
+                        .unwrap_or(0.0);
+                    if big > 1000.0 {
+                        if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                            inst.scale = 0.01; // cm → m
+                        }
+                    }
+                }
+                self.factory.open = true;
+                self.factory.fit_all();
+                self.active_view = ActiveView::ThreeD;
+                self.factory.status = "villa test model auto-loaded (cm→m) — ☀ Sun + Textures ready to test".into();
+                self.history.push("  auto-loaded villa test model on startup".into());
+            }
+        }
+
+        // ---- Loading / saving overlay ----------------------------------------------
+        // The file work runs on a BACKGROUND worker thread so the UI thread never blocks —
+        // that is the whole point: a blocked UI thread stops pumping Windows messages and the
+        // OS stamps "(Not Responding)" on the window. The state machine over three-plus frames:
+        //   frame 1: paint the overlay (so the window is on screen before any work starts)
+        //   frame 2: spawn the worker (for a save, clone the doc + build the config first)
+        //   frame 3+: poll the worker each frame while the overlay keeps animating
+        // On completion we install the result on the main thread and self-calibrate the estimate.
+        if self.busy.is_some() {
+            self.render_busy_overlay(ctx); // always paints + request_repaint → smooth spinner
+            let (painted, spawned) = {
+                let b = self.busy.as_ref().unwrap();
+                (b.painted, b.rx.is_some())
+            };
+            if !painted {
+                self.busy.as_mut().unwrap().painted = true;
+            } else if !spawned {
+                self.spawn_busy_worker();
+            } else {
+                use std::sync::mpsc::TryRecvError;
+                let recv = self.busy.as_ref().unwrap().rx.as_ref().unwrap().try_recv();
+                match recv {
+                    Ok(msg) => {
+                        let b = self.busy.take().unwrap();
+                        let ms = b.started.elapsed().as_millis() as u64;
+                        match msg {
+                            BusyMsg::Loaded(res) => {
+                                match res {
+                                    Ok(payload) => self.apply_loaded(&b.path, payload),
+                                    Err(e) => self.history.push(format!("  ! open '{}': {}", b.path, e)),
+                                }
+                                self.last_load_ms = ms.clamp(100, 120_000);
+                            }
+                            BusyMsg::Saved(res) => {
+                                match res {
+                                    Ok(payload) => self.apply_saved(&b.path, payload),
+                                    Err(e) => self.history.push(format!("  ! save '{}': {}", b.path, e)),
+                                }
+                                self.last_save_ms = ms.clamp(100, 120_000);
+                            }
+                        }
+                    }
+                    // Worker still running — keep the overlay up and try again next frame.
+                    Err(TryRecvError::Empty) => {}
+                    // Worker thread died without sending (panic) — surface it, don't hang.
+                    Err(TryRecvError::Disconnected) => {
+                        let b = self.busy.take().unwrap();
+                        let verb = match b.kind { BusyKind::Load => "open", BusyKind::Save => "save" };
+                        self.history.push(format!("  ! {} '{}': worker failed (no result)", verb, b.path));
+                    }
+                }
+            }
+        }
+
+        // ---- Close confirmation (unsaved-changes guard) -----------------------------
+        // Intercept a window/menu close: if the drawing has unsaved edits, veto the close and
+        // ask Save / Don't Save / Cancel — so an accidental X can't discard work.
+        if self.pending_close {
+            // A prior choice authorised the close; do it now (unsaved already cleared).
+            self.pending_close = false;
+            self.unsaved = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if ctx.input(|i| i.viewport().close_requested()) {
+            if self.unsaved && self.busy.is_none() && !self.close_confirm {
+                self.close_confirm = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
+            // else: nothing unsaved (or a save is finishing) → let the close proceed.
+        }
+        if self.close_confirm {
+            self.render_close_confirm(ctx);
+        }
+
+        // Autosave: silent background re-save of the current file a few minutes after an edit.
+        self.tick_autosave();
 
         // Menu-layout recorder: arm geometry capture for THIS whole frame and
         // reset the shared buffer BEFORE any panel/menu renders. Every menu that
@@ -26160,7 +31666,10 @@ impl eframe::App for CadApp {
                 || !self.cmd.trim().is_empty()
                 || self.text_draft != TextDraftState::Off
                 || self.text_waiting_height;
-            if !editing_text {
+            // When the 3D FACTORY view is active, Ctrl+C/V belong to the 3D copy/paste
+            // (handled in render_factory_panel) — this 2D handler must NOT hijack them.
+            let three_d_active = self.factory.open && self.active_view == ActiveView::ThreeD;
+            if !editing_text && !three_d_active {
                 let (copy, paste, select_all, deselect_all) = ctx.input_mut(|i| {
                     // Key fallback in case the platform delivers raw keys.
                     let mut copy  = i.modifiers.command && i.key_pressed(egui::Key::C);
@@ -26606,6 +32115,22 @@ impl eframe::App for CadApp {
                                 self.qat_customize_open = true;
                                 self.qat_just_opened = true;
                             }
+                        }
+                        // Autosave toggle — right after the Quick Access chevron.
+                        ui.add_space(8.0);
+                        let a_on = self.autosave_on;
+                        if ui
+                            .selectable_label(a_on, egui::RichText::new(
+                                if a_on { "⤓ Autosave: on" } else { "⤓ Autosave: off" }).small())
+                            .on_hover_text(
+                                "Silently re-saves the open .dxf/.rsm a few minutes after an edit \
+                                 (atomic write — an interrupted save can't corrupt the file). Click to toggle.")
+                            .clicked()
+                        {
+                            self.autosave_on = !a_on;
+                            self.history.push(
+                                if self.autosave_on { "  autosave enabled".into() }
+                                else { "  autosave disabled".into() });
                         }
                         // Product title, far right.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -27190,6 +32715,36 @@ impl eframe::App for CadApp {
                     }
                     ui.add_space(4.0);
                     pp_cap_ui(ui, "menu: 3D Factory");
+                });
+                custom_menu(ui, "Materials", |ui| {
+                    ui.set_min_width(248.0);
+                    ui.add_space(4.0);
+                    // The Materials Factory is wired straight into the 3D Factory preview: every
+                    // node/parameter edit compiles onto the material and shows there the same frame.
+                    if ui
+                        .checkbox(&mut self.materials_open, "  🎨  Materials Factory  (node editor)")
+                        .on_hover_text("Blender-style shader graph: Texture → Principled BSDF → Output. Edits show live in the 3D Factory view.")
+                        .changed()
+                        && self.materials_open
+                    {
+                        self.factory.open = true; // the live preview lives in the 3D Factory panel
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("  Rendering").small().color(egui::Color32::from_rgb(150, 165, 185)));
+                    ui.checkbox(&mut self.render_modal_open, "  ⏺  Render  (path tracer — CPU/GPU)")
+                        .on_hover_text("Raytraced render of the 3D Factory scene: global illumination, reflections, glass. Progressive; pick CPU or GPU.");
+                    ui.checkbox(&mut self.sun_modal_open, "  ☀  Sun / daylight…")
+                        .on_hover_text("Locate the sun (city, date, time) — the light both the viewport and the renders use.");
+                    if ui
+                        .button("  ▶  Run Radiance simulation")
+                        .on_hover_text("Export the scene and run LBNL Radiance (oconv → rpict) for a physically-accurate daylight render, shown in-app when done. Needs Radiance installed.")
+                        .clicked()
+                    {
+                        self.run_radiance();
+                        ui.close_menu();
+                    }
+                    ui.add_space(4.0);
+                    pp_cap_ui(ui, "menu: Materials");
                 });
                 custom_menu(ui, "SIMLUX", |ui| {
                     ui.set_min_width(232.0);
@@ -27842,6 +33397,19 @@ impl eframe::App for CadApp {
         // 3D FACTORY viewport (docked right, like the SIMLUX 3D view).
         self.render_factory_panel(ctx);
         self.render_draw3d_dialog(ctx);
+        if self.arch_modal_open {
+            self.render_arch_dialog(ctx);
+        }
+        if self.sun_modal_open {
+            self.render_sun_dialog(ctx);
+        }
+        if self.materials_open {
+            self.render_materials_factory(ctx);
+        }
+        if self.render_modal_open || self.pt_job.is_some() || self.pt_gpu.is_some() {
+            self.render_pathtrace_dialog(ctx);
+        }
+        self.render_radiance_dialog(ctx); // shown only while a Radiance run exists
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
@@ -36087,6 +41655,52 @@ mod factory_sketch_tests {
         );
     }
 
+    /// The reported gap: editing a cutout in 2D and dragging its points must actually reshape
+    /// the opening. Cut a square hole, open it for edit, enlarge one corner, Apply — the
+    /// opening must grow. Also guards the edit-mode flag lifecycle.
+    #[test]
+    fn editing_a_cutout_and_applying_reshape_enlarges_the_opening() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        // Cut a small square opening straight through the box.
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(c, glam::Vec3::Z));
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![v(-0.3, -0.3), v(0.3, -0.3), v(0.3, 0.3), v(-0.3, 0.3)],
+            closed: true,
+            widths: Vec::new(),
+        })));
+        assert_eq!(app.factory_cut_sketch(true), 1, "one opening cut");
+        let cid0 = app.factory.cutout_ids()[0];
+        let s0 = app.factory.cutout_size(cid0).unwrap();
+
+        // Open it for 2D editing — the outline is selected so its grips show.
+        app.factory_edit_cutout(cid0);
+        assert!(app.factory.editing_cutout, "edit mode is armed");
+        assert!(app.factory.session.is_some(), "a sketch session opened");
+        assert_eq!(app.selection.len(), 1, "the editable outline is selected (grips visible)");
+
+        // Drag the +u/+v corner outward (what a user does with the grip).
+        let li = app.doc.dobjects.len() - 1;
+        if let cad_kernel::Geom::Polyline(p) = &mut app.doc.dobjects[li].geom {
+            p.vertices[2].pos = Vec2::new(p.vertices[2].pos.x + 0.6, p.vertices[2].pos.y + 0.6);
+        }
+        app.factory_apply_cutout_reshape();
+        assert!(!app.factory.editing_cutout, "edit mode cleared after Apply");
+        assert!(app.factory.session.is_none(), "sketch closed after Apply");
+
+        let cid1 = app.factory.cutout_ids()[0];
+        let s1 = app.factory.cutout_size(cid1).unwrap();
+        // X and Y are the face of a Z-through cut; enlarging a corner grows both.
+        assert!(
+            s1[0] + s1[1] > s0[0] + s0[1] + 1e-4,
+            "the reshaped opening is larger on its face: {:?} -> {:?}", s0, s1
+        );
+    }
+
     /// The active sketch renders LIVE in 3D (its geometry is in the app's live doc), and once
     /// finished it shows via `sketch_lines` — so 2D drawing and 3D stay linked.
     #[test]
@@ -36213,6 +41827,173 @@ mod factory_sketch_tests {
         });
     }
 
+    /// Arrow keys nudge the selected object for fine placement. Drives a real headless frame
+    /// with ArrowRight pressed and checks the selected furniture moved +X by the fine step.
+    #[test]
+    fn arrow_key_nudges_the_selection() {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.active_view = ActiveView::ThreeD;
+        app.factory.cam_dist = 5.0; // step = cam_dist * 0.01 = 0.05 m
+        let idx = app.factory.add_furniture_asset(
+            "nudge-me".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::new(2.0, 2.0, 0.0));
+        app.factory.select_furniture(0);
+        let x0 = app.factory.furniture[0].pos[0];
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.render_factory_panel(ctx));
+
+        let x1 = app.factory.furniture[0].pos[0];
+        assert!((x1 - x0 - 0.05).abs() < 1e-4, "ArrowRight nudges +0.05 m in X (got {})", x1 - x0);
+    }
+
+    /// The nudge step scales with zoom (`cam_dist * 0.01`): the SAME ArrowRight moves the
+    /// object farther when zoomed out and a hair when zoomed in. Drives two frames at two
+    /// camera distances and checks the resulting steps differ by the zoom ratio.
+    #[test]
+    fn arrow_nudge_step_scales_with_zoom() {
+        fn nudge_step(cam_dist: f32) -> f32 {
+            let mut app = CadApp::default();
+            app.factory.open = true;
+            app.active_view = ActiveView::ThreeD;
+            app.factory.cam_dist = cam_dist;
+            let idx = app.factory.add_furniture_asset(
+                "z".into(),
+                crate::mesh_io::ObjMesh {
+                    positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    normals: vec![[0.0, 0.0, 1.0]; 3],
+                    color: None,
+                    alpha: Vec::new(),
+                },
+            );
+            app.factory.place_furniture(idx, glam::Vec3::new(2.0, 2.0, 0.0));
+            app.factory.select_furniture(0);
+            let x0 = app.factory.furniture[0].pos[0];
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0))),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.render_factory_panel(ctx));
+            app.factory.furniture[0].pos[0] - x0
+        }
+        let near = nudge_step(5.0);   // zoomed in  → 0.05 m
+        let far = nudge_step(50.0);   // zoomed out → 0.50 m
+        assert!((near - 0.05).abs() < 1e-4, "near step {near}");
+        assert!((far - 0.50).abs() < 1e-4, "far step {far}");
+        assert!(far > near * 9.0, "far step must dwarf near step ({far} vs {near})");
+    }
+
+    /// REGRESSION (the `kbd_free=false` dump): a properties-panel DragValue keeps keyboard
+    /// focus after you touch it, and the 3D viewport isn't focusable, so that focus is never
+    /// cleared. The nudge must STILL fire (it keys off the pointer being over the viewport,
+    /// not off the keyboard being free) — the old focus-gated code blocked every arrow here.
+    #[test]
+    fn arrow_nudge_works_while_a_field_holds_focus() {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.active_view = ActiveView::ThreeD;
+        app.factory.cam_dist = 5.0; // step = cam_dist * 0.01 = 0.05 m
+        let idx = app.factory.add_furniture_asset(
+            "nudge-me".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: None,
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::new(2.0, 2.0, 0.0));
+        app.factory.select_furniture(0);
+        let x0 = app.factory.furniture[0].pos[0];
+
+        let ctx = egui::Context::default();
+        // Simulate a DragValue in the properties panel owning the keyboard this frame.
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("properties_dragvalue_focus_hog")));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.render_factory_panel(ctx));
+
+        let x1 = app.factory.furniture[0].pos[0];
+        assert!(
+            (x1 - x0 - 0.05).abs() < 1e-4,
+            "ArrowRight must nudge +0.05 m even with a field focused (got {})",
+            x1 - x0
+        );
+    }
+
+    /// The PATH-SWEEP core: `factory_build_sweep` sweeps a section (on one face) along a path
+    /// drawn on a PERPENDICULAR plane into a new Union feature; with `cut` it subtracts, and
+    /// refuses cleanly when nothing is under the path. The path is re-expressed in the section
+    /// frame, so its component along the section normal becomes the extrusion depth.
+    #[test]
+    fn path_sweep_build_extrudes_and_refuses_empty_cut() {
+        let section = vec![
+            glam::Vec2::new(0.0, 0.0), glam::Vec2::new(0.2, 0.0),
+            glam::Vec2::new(0.2, 0.2), glam::Vec2::new(0.0, 0.2), glam::Vec2::new(0.0, 0.0),
+        ];
+        let path = vec![glam::Vec2::new(0.0, 0.0), glam::Vec2::new(2.0, 0.0)];
+        // Section on the ground (normal +Z); path on a PERPENDICULAR plane (u=Z=depth, v=X).
+        let section_frame = cad_solid::Frame {
+            origin: glam::Vec3::ZERO, u: glam::Vec3::X, v: glam::Vec3::Y,
+        };
+        let path_frame = cad_solid::Frame {
+            origin: glam::Vec3::ZERO, u: glam::Vec3::Z, v: glam::Vec3::X,
+        };
+
+        // EXTRUDE → one Union sweep feature that tessellates.
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        let before = app.factory.model.features.len();
+        let made = app.factory_build_sweep(section_frame, section.clone(), path_frame, path.clone(), false, false);
+        assert_eq!(made, 1, "extrude reports one solid made");
+        assert_eq!(app.factory.model.features.len(), before + 1, "a sweep feature was added");
+        assert!(!app.factory.cached.positions.is_empty(), "the swept solid tessellates");
+
+        // CUT with nothing under the path → clean no-op, no feature added, no snapshot stranded.
+        let mut app2 = CadApp::default();
+        app2.factory.open = true;
+        let n0 = app2.factory.model.features.len();
+        let made2 = app2.factory_build_sweep(section_frame, section, path_frame, path, true, false);
+        assert_eq!(made2, 0, "path cut with no solid under the path is a no-op");
+        assert_eq!(app2.factory.model.features.len(), n0, "no feature added when there's no target");
+    }
+
     /// The reset must leave NO index-holding field populated — that is the invariant
     /// that makes a doc swap safe.
     #[test]
@@ -36294,6 +42075,143 @@ pub fn draw_select_cursor(painter: &egui::Painter, p: egui::Pos2) {
     painter.line_segment([tip, egui::pos2(tip.x + len, tip.y)], stroke);
     painter.line_segment([tip, egui::pos2(tip.x, tip.y + len)], stroke);
     painter.line_segment([tip, egui::pos2(tip.x + len * 0.75, tip.y + len * 0.75)], stroke);
+}
+
+#[cfg(test)]
+mod factory_texture_tests {
+    use super::*;
+
+    fn app_with_furniture() -> (CadApp, usize) {
+        let mut app = CadApp::default();
+        let idx = app.factory.add_furniture_asset(
+            "piece".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: Some([0.5, 0.5, 0.5]),
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::new(0.0, 0.0, 0.0)); // selects it
+        (app, idx)
+    }
+
+    /// A texture applied to furniture can be CHANGED to a different one — the reported bug. Also
+    /// covers the texture library picker's target (`apply_texture_index_to_selection`).
+    #[test]
+    fn furniture_texture_can_be_changed() {
+        let (mut app, _idx) = app_with_furniture();
+        let a = app.factory.add_texture("a".into(), 2, 2, [255u8,0,0,255].repeat(4));
+        let b = app.factory.add_texture("b".into(), 2, 2, [0u8,0,255,255].repeat(4));
+        app.apply_texture_index_to_selection(a, "a", 2, 2);
+        assert_eq!(app.factory.furniture[0].texture, Some(a), "first texture applied");
+        // Change it — this is what the library picker does.
+        app.apply_texture_index_to_selection(b, "b", 2, 2);
+        assert_eq!(app.factory.furniture[0].texture, Some(b), "texture changed to the second");
+        assert_eq!(app.factory_selected_texture(), Some(b), "picker reports the current texture");
+    }
+
+    /// Picking a COLOUR on a textured piece must clear the texture (else the colour stays masked
+    /// by the still-present texture — the "nothing happens" half of the bug).
+    #[test]
+    fn colour_replaces_a_furniture_texture() {
+        let (mut app, _idx) = app_with_furniture();
+        let a = app.factory.add_texture("a".into(), 2, 2, [255u8,0,0,255].repeat(4));
+        app.apply_texture_index_to_selection(a, "a", 2, 2);
+        assert!(app.factory.furniture[0].texture.is_some());
+        app.apply_color_to_selection([0.2, 0.7, 0.3]);
+        assert_eq!(app.factory.furniture[0].texture, None, "colour cleared the texture");
+        assert_eq!(app.factory.furniture[0].color, [0.2, 0.7, 0.3], "colour applied");
+    }
+
+    /// Same rule for a FEATURE (wall/solid): a whole-object colour clears its feature + per-face
+    /// textures so the colour is visible.
+    #[test]
+    fn colour_replaces_a_feature_texture() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let id = app.factory.model.features[0].id;
+        app.factory.sel_furniture = None;
+        app.factory.selection = vec![id];
+        let a = app.factory.add_texture("a".into(), 2, 2, [255u8,0,0,255].repeat(4));
+        app.apply_texture_index_to_selection(a, "a", 2, 2);
+        app.factory.surface_texture.insert((id, 0, 0, 1, 0), a); // a per-face texture too
+        assert!(app.factory.feature_texture.contains_key(&id));
+        app.apply_color_to_selection([0.1, 0.2, 0.3]);
+        assert!(!app.factory.feature_texture.contains_key(&id), "feature texture cleared");
+        assert!(!app.factory.surface_texture.keys().any(|k| k.0 == id), "per-face textures cleared");
+        assert_eq!(app.factory.feature_color.get(&id).copied(), Some([0.1, 0.2, 0.3]));
+    }
+
+    /// Removing a furniture texture restores the asset's own colour (not the baked tint).
+    #[test]
+    fn removing_furniture_texture_restores_asset_colour() {
+        let (mut app, _idx) = app_with_furniture();
+        let a = app.factory.add_texture("a".into(), 2, 2, [255u8,255,0,255].repeat(4));
+        app.apply_texture_index_to_selection(a, "a", 2, 2); // bakes the tint into color
+        app.remove_texture_from_selection();
+        assert_eq!(app.factory.furniture[0].texture, None);
+        assert_eq!(app.factory.furniture[0].color, [0.5, 0.5, 0.5], "back to the asset colour");
+    }
+}
+
+#[cfg(test)]
+mod autosave_tests {
+    use super::*;
+
+    /// Atomic write replaces the target and leaves no temp file behind — the property that keeps
+    /// an interrupted autosave from corrupting the drawing.
+    #[test]
+    fn atomic_write_replaces_and_cleans_up() {
+        let p = std::env::temp_dir().join(format!("rustcad_atomic_{}.bin", std::process::id()));
+        let ps = p.to_string_lossy().to_string();
+        atomic_write(&ps, b"hello").unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+        atomic_write(&ps, b"world!!").unwrap(); // replace an existing file
+        assert_eq!(std::fs::read(&p).unwrap(), b"world!!");
+        assert!(!std::path::Path::new(&format!("{ps}.savetmp")).exists(), "temp cleaned up");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Autosave stays quiet unless there's an already-saved drawing with pending edits that is
+    /// overdue — and it never blocks or writes an untitled/non-drawing file.
+    #[test]
+    fn autosave_gates_then_fires() {
+        let mut app = CadApp::default();
+        // Clean → never.
+        app.unsaved = false;
+        app.tick_autosave();
+        assert!(app.autosave_rx.is_none(), "clean → no autosave");
+        // Dirty but no file → never.
+        app.unsaved = true;
+        app.current_file = None;
+        app.tick_autosave();
+        assert!(app.autosave_rx.is_none(), "no file → no autosave");
+        // Dirty + saved file but NOT overdue → never.
+        let tmp = std::env::temp_dir().join(format!("rustcad_autosave_{}.rsm", std::process::id()));
+        app.current_file = Some(tmp.clone());
+        app.last_autosave = std::time::Instant::now();
+        app.tick_autosave();
+        assert!(app.autosave_rx.is_none(), "not overdue → no autosave");
+        // Dirty + saved + overdue → fires (skips only right after boot, when a past Instant
+        // can't be built).
+        if let Some(past) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(300)) {
+            app.last_autosave = past;
+            app.tick_autosave();
+            assert!(app.autosave_rx.is_some(), "overdue dirty drawing autosaves");
+            // Drain the worker so the write finishes, then verify it cleared `unsaved`.
+            for _ in 0..600 {
+                app.tick_autosave();
+                if app.autosave_rx.is_none() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.autosave_rx.is_none(), "autosave completed");
+            assert!(!app.unsaved, "unsaved cleared after a clean autosave");
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp.with_extension("simlux.json"));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 use csgrs::csg::CSG;
 use csgrs::mesh::Mesh;
 use csgrs::sketch::Sketch;
-use nalgebra::{Matrix4, Vector3};
+use nalgebra::{Matrix4, Point3, Vector3};
 
 use crate::{BoolOp, Feature, Model, Primitive, SolidMesh};
 
@@ -37,6 +37,21 @@ fn local_mesh(p: &Primitive, model: &Model) -> CsgMesh {
             // A stale id must not take the app down — an empty mesh is a visible
             // "nothing there", which is recoverable; a panic is not.
             None => CsgMesh::new(),
+        },
+        // Sweep the centred cross-section along the open path — csgrs keeps the section
+        // perpendicular to the path (aims sketch +Z at the tangent) and caps the ends.
+        Primitive::Sweep { profile, path, .. } => match (model.profile(profile), model.path(path)) {
+            (Some(pr), Some(pa)) if pa.pts.len() >= 2 => {
+                let pts: Vec<[f64; 2]> =
+                    pr.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
+                let path3: Vec<Point3<f64>> = pa
+                    .pts
+                    .iter()
+                    .map(|q| Point3::new(q[0] as f64, q[1] as f64, q[2] as f64))
+                    .collect();
+                Sketch::polygon(&pts, ()).sweep(&path3)
+            }
+            _ => CsgMesh::new(),
         },
         Primitive::Box { w, d, h } => {
             // csgrs cuboid is corner-anchored at the origin → recentre in u,v so it
@@ -240,6 +255,30 @@ mod tests {
         let mesh = m.eval();
         // A box = 6 quad faces = 12 triangles.
         assert_eq!(mesh.tri_count(), 12, "a plain box should tessellate to 12 tris");
+    }
+
+    /// A `Sweep` extrudes a closed cross-section along an open path — the swept solid must
+    /// have geometry and span the path length.
+    #[test]
+    fn sweep_along_a_straight_path_makes_a_solid() {
+        let mut m = Model::default();
+        let sq = [
+            glam::Vec2::new(-0.2, -0.2), glam::Vec2::new(0.2, -0.2),
+            glam::Vec2::new(0.2, 0.2), glam::Vec2::new(-0.2, 0.2),
+        ];
+        let (profile, _c, _w, _d) = m.add_profile(&sq).unwrap();
+        // A straight 5 m path along +X, on the plane (z = 0).
+        let (path, _mn, _mx) = m
+            .add_path(&[glam::Vec3::new(0.0, 0.0, 0.0), glam::Vec3::new(5.0, 0.0, 0.0)])
+            .unwrap();
+        m.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Sweep { profile, path, bmin: [-0.5, -0.5, -0.5], bmax: [5.5, 0.5, 0.5] },
+        );
+        let mesh = m.eval();
+        assert!(mesh.tri_count() > 0, "a swept solid must produce geometry");
+        let (mn, mx) = mesh.bounds().expect("swept solid has bounds");
+        assert!(mx[0] - mn[0] > 4.5, "swept bar should span the ~5 m path, got {}", mx[0] - mn[0]);
     }
 
     /// GROUP semantics: two Union features are two INDEPENDENT bodies, concatenated —
