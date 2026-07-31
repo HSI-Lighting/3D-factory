@@ -1110,6 +1110,8 @@ enum ArchTab {
     Kitchen,
     /// Parametric handleless cabinet UNIT — close-range joinery, overlay outline fronts, grips.
     Cabin,
+    /// Curved office luminaire — a lighting profile swept along a path (ring/racetrack/S-curve).
+    SweepLight,
 }
 
 /// Build the sun's light-space matrix (orthographic, framed to the scene AABB) for the shadow map.
@@ -1801,6 +1803,7 @@ pub struct CadApp {
     arch_cupboard: cad_solid::cupboard::CupboardInput,
     arch_kitchen: cad_solid::kitchen::KitchenInput,
     arch_cabin: cad_solid::cabin::CabinInput,
+    arch_sweep: cad_solid::sweeplight::SweepInput,
     /// Set when the user chose "Save and close": the async save is running, and [`Self::apply_saved`]
     /// will close the window once the bytes are on disk.
     close_after_save: bool,
@@ -3460,6 +3463,7 @@ impl Default for CadApp {
             arch_cupboard: cad_solid::cupboard::CupboardInput::default(),
             arch_kitchen: cad_solid::kitchen::KitchenInput::default(),
             arch_cabin: cad_solid::cabin::CabinInput::default(),
+            arch_sweep: cad_solid::sweeplight::SweepInput::default(),
             close_after_save: false,
             pending_close: false,
             autosave_on: true,
@@ -7422,6 +7426,15 @@ impl CadApp {
                             .clicked()
                         {
                             self.arch_tab = ArchTab::Cabin;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("💡  Curved light (sweep)…")
+                            .on_hover_text("A curved office luminaire: an extruded aluminium profile with a glowing lens face, swept along a ring, racetrack or S-curve path, hung on rods. The lens material is emissive — it glows in the ⏺ raytraced render.")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::SweepLight;
                             self.arch_modal_open = true;
                             ui.close_menu();
                         }
@@ -20112,6 +20125,7 @@ impl CadApp {
             ArchTab::Cupboard => "🗄  Cupboard",
             ArchTab::Kitchen => "🍳  Kitchen cabinets",
             ArchTab::Cabin => "🚪  Cabinet unit",
+            ArchTab::SweepLight => "💡  Curved light",
             _ => "🏛  Architecture",
         };
         egui::Window::new(title)
@@ -20148,7 +20162,7 @@ impl CadApp {
         // ── tab selector ── only the ARCHITECTURE generators tab between each other. Door (▼
         // Apertures) and Cupboard (▼ Furniture) open this same modal directly on their own screen,
         // so they get no tab row — they aren't "architecture".
-        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin) {
+        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin | ArchTab::SweepLight) {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Staircase, "🪜 Staircase");
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Spiral, "🌀 Spiral");
@@ -20168,6 +20182,7 @@ impl CadApp {
         let mut do_cupboard = false; // the cupboard tab builds a multi-material furniture mesh
         let mut do_kitchen = false; // the kitchen tab builds a multi-material furniture mesh
         let mut do_cabin = false; // the cabinet-unit tab builds a multi-material furniture mesh
+        let mut do_sweep = false; // the curved-light tab builds a multi-material furniture mesh
 
         match self.arch_tab {
             ArchTab::Staircase => {
@@ -20762,6 +20777,153 @@ impl CadApp {
                     Err(e) => error(ui, e.to_string()),
                 }
             }
+            ArchTab::SweepLight => {
+                use cad_solid::sweeplight::{PathKind, ProfileKind};
+                let s = &mut self.arch_sweep;
+                ui.label(egui::RichText::new("A lighting profile swept along a path — body, glowing lens and hanging rods. The lens is emissive in the ⏺ raytraced render.").small().weak());
+                ui.add_space(4.0);
+                // Path kind + its dimensions.
+                let cur = match s.path {
+                    PathKind::Ring { .. } => "Ring",
+                    PathKind::Racetrack { .. } => "Racetrack",
+                    PathKind::SCurve { .. } => "S-curve (open)",
+                    PathKind::Custom { .. } => "From 2D drawing",
+                };
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Path").selectable(false));
+                    egui::ComboBox::from_id_salt("sweep_path").width(150.0).selected_text(cur).show_ui(ui, |ui| {
+                        if ui.selectable_label(matches!(s.path, PathKind::Ring { .. }), "Ring").clicked() {
+                            s.path = PathKind::Ring { radius: 0.4 };
+                        }
+                        if ui.selectable_label(matches!(s.path, PathKind::Racetrack { .. }), "Racetrack").clicked() {
+                            s.path = PathKind::Racetrack { w: 1.8, d: 0.9, fillet: 0.25 };
+                        }
+                        if ui.selectable_label(matches!(s.path, PathKind::SCurve { .. }), "S-curve (open)").clicked() {
+                            s.path = PathKind::SCurve { length: 4.0, width: 0.5 };
+                        }
+                        if ui.selectable_label(matches!(s.path, PathKind::Custom { .. }), "From 2D drawing").clicked() {
+                            s.path = PathKind::Custom { pts: Vec::new(), closed: false, fillet: 0.15 };
+                        }
+                    });
+                });
+                let mut grab = false;
+                match &mut s.path {
+                    PathKind::Ring { radius } => num(ui, "Ring radius", radius, 0.01, 0.05, 5.0),
+                    PathKind::Racetrack { w, d, fillet } => {
+                        num(ui, "Length", w, 0.02, 0.3, 8.0);
+                        num(ui, "Depth", d, 0.02, 0.3, 8.0);
+                        num(ui, "Corner fillet", fillet, 0.01, 0.03, 1.0);
+                    }
+                    PathKind::SCurve { length, width } => {
+                        num(ui, "Run length", length, 0.05, 0.5, 15.0);
+                        num(ui, "Swing (±)", width, 0.02, 0.0, 3.0);
+                    }
+                    PathKind::Custom { pts, closed, fillet } => {
+                        // Draw a polyline/arc/circle/ellipse in the 2D view, select it, then grab it.
+                        ui.horizontal(|ui| {
+                            ui.add_sized([150.0, 18.0], egui::Label::new("2D curve").selectable(false));
+                            if ui
+                                .button("⤓  Use selected 2D curve")
+                                .on_hover_text("Sample the currently selected 2D entity (polyline, arc, circle, ellipse, line) as the sweep path. Draw and select it in the 2D view first. Coordinates are metres 1:1.")
+                                .clicked()
+                            {
+                                grab = true;
+                            }
+                        });
+                        if pts.is_empty() {
+                            ui.label(egui::RichText::new("  no curve loaded yet — select one in the 2D view and press the button").small().weak());
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("  {} points · {}", pts.len(), if *closed { "closed loop" } else { "open run" }))
+                                    .small()
+                                    .weak(),
+                            );
+                        }
+                        num(ui, "Corner fillet", fillet, 0.01, 0.0, 1.0);
+                    }
+                }
+                if grab {
+                    // Longest sampled outline among the selected 2D entities wins (a click often
+                    // catches construction fluff alongside the real curve).
+                    let mut got: Option<(Vec<glam::Vec2>, bool)> = None;
+                    for &di in &self.selection {
+                        let Some(d) = self.doc.dobjects.get(di) else { continue };
+                        for path in cad_solid::geom_outlines(&d.geom) {
+                            if path.len() < 2 {
+                                continue;
+                            }
+                            let len: f32 = path.windows(2).map(|w| w[0].distance(w[1])).sum();
+                            let best: f32 = got
+                                .as_ref()
+                                .map(|(g, _)| g.windows(2).map(|w| w[0].distance(w[1])).sum())
+                                .unwrap_or(0.0);
+                            if len > best {
+                                let mut p = path.clone();
+                                let closed = p.len() > 3 && p[0].distance(*p.last().unwrap()) < 1e-4;
+                                if closed {
+                                    p.pop();
+                                }
+                                got = Some((p, closed));
+                            }
+                        }
+                    }
+                    match got {
+                        Some((p, closed)) => {
+                            let n = p.len();
+                            let old_fillet = match &s.path {
+                                PathKind::Custom { fillet, .. } => *fillet,
+                                _ => 0.15,
+                            };
+                            s.path = PathKind::Custom { pts: p, closed, fillet: old_fillet };
+                            self.factory.status = format!(
+                                "2D curve loaded: {n} points ({}) — set the fillet, then Build",
+                                if closed { "closed" } else { "open" }
+                            );
+                        }
+                        None => {
+                            self.factory.status =
+                                "no usable 2D curve selected — select a polyline, arc, circle or ellipse in the 2D view first".into();
+                        }
+                    }
+                }
+                // Cross-section (md C9 control 1).
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Cross-section").selectable(false));
+                    egui::ComboBox::from_id_salt("sweep_profile").width(150.0).selected_text(s.profile.label()).show_ui(ui, |ui| {
+                        for p in ProfileKind::ALL {
+                            ui.selectable_value(&mut s.profile, p, p.label());
+                        }
+                    });
+                });
+                num(ui, "Profile width", &mut s.width, 0.002, 0.02, 0.3);
+                num(ui, "Profile height", &mut s.height, 0.002, 0.02, 0.4);
+                num(ui, "Lens size", &mut s.lens, 0.002, 0.01, 0.3);
+                // Drop (md C9 control 2) + spacing (control 3).
+                num(ui, "Drop (ceiling→top)", &mut s.drop, 0.01, 0.1, 4.0);
+                if matches!(s.path, PathKind::SCurve { .. }) {
+                    num(ui, "Drop at far end", &mut s.drop_end, 0.01, 0.1, 4.0);
+                } else {
+                    s.drop_end = s.drop;
+                }
+                num(ui, "Hanger spacing", &mut s.spacing, 0.02, 0.3, 3.0);
+
+                // Live feedback: run the builder for its metrics/validation (fast — a few k tris).
+                match cad_solid::sweeplight::build(s) {
+                    Ok((m, _, _)) => {
+                        feedback(ui, format!(
+                            "path {:.2} m · {} hangers at {:.2} m (asked {:.2}) · min radius {:.0} mm · {} tris",
+                            m.path_len, m.droppers, m.achieved_spacing, s.spacing, m.min_radius * 1000.0, m.tris,
+                        ));
+                        for w in m.warnings.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build curved light").strong())).clicked() {
+                            do_sweep = true;
+                        }
+                    }
+                    Err(e) => error(ui, e),
+                }
+            }
         }
 
         if let Some((result, name)) = build {
@@ -20790,6 +20952,10 @@ impl CadApp {
         if do_kitchen {
             let inp = self.arch_kitchen.clone();
             self.factory_build_kitchen(&inp);
+        }
+        if do_sweep {
+            let inp = self.arch_sweep.clone();
+            self.factory_build_sweeplight(&inp);
         }
         if do_cabin {
             let inp = self.arch_cabin.clone();
@@ -20989,6 +21155,81 @@ impl CadApp {
     /// as a MULTI-MATERIAL furniture piece: the carcass keeps the asset's white base colour; front /
     /// edge-band-and-pins / metal parts each get their own flat swatch bound per part (same
     /// mechanism as [`Self::factory_build_kitchen`] / a glTF import). Each component is selectable.
+    /// Build the curved luminaire as a multi-material furniture asset: dark anodised body, an
+    /// EMISSIVE warm lens (glows in the path tracers; bright in the raster), metal suspension.
+    fn factory_build_sweeplight(&mut self, inp: &cad_solid::sweeplight::SweepInput) {
+        use cad_solid::sweeplight::Material;
+        let (m, mesh, mats) = match cad_solid::sweeplight::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Curved light: {e}");
+                return;
+            }
+        };
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.13, 0.13, 0.14]), // dark anodised base (body parts stay on this)
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Curved light".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        // Lens: warm-white EMISSIVE material — the part that actually lights in the raytrace.
+        let lens = self.factory.add_texture("Light lens (emissive)".into(), 1, 1, vec![255, 236, 200, 255]);
+        if let Some(t) = self.factory.textures.get_mut(lens) {
+            t.emission = [1.0, 0.86, 0.62];
+            t.emission_strength = 6.0;
+            t.roughness = 0.35;
+        }
+        let rod = self.factory.add_texture("Light suspension".into(), 1, 1, vec![120, 122, 126, 255]);
+        if let Some(t) = self.factory.textures.get_mut(rod) {
+            t.metallic = 0.8;
+            t.roughness = 0.35;
+            t.reflect = (0.8f32 * (1.0 - 0.6 * 0.35)).clamp(0.0, 1.0);
+        }
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::Body => None, // stays on the dark base colour
+                Material::Lens => Some(lens),
+                Material::Rod => Some(rod),
+            })
+            .collect();
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.status = format!(
+            "Curved light: {:.2} m path · {} hangers at {:.2} m · {} tris — the lens glows in ⏺ Render",
+            m.path_len, m.droppers, m.achieved_spacing, m.tris,
+        );
+        self.history.push(format!("  built curved light ({:.2} m, {} hangers)", m.path_len, m.droppers));
+        self.factory.open = true;
+        self.active_view = ActiveView::ThreeD;
+    }
+
     fn factory_build_cabin(&mut self, inp: &cad_solid::cabin::CabinInput) {
         use cad_solid::cabin::Material;
         let features_before = self.factory.model.features.len();
