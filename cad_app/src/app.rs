@@ -31728,17 +31728,24 @@ impl eframe::App for CadApp {
                             e[0].max(e[1]).max(e[2])
                         })
                         .unwrap_or(0.0);
-                    if big > 1000.0 {
-                        if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                    if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                        if big > 1000.0 {
                             inst.scale = 0.01; // cm → m
                         }
+                        // The user scales this fixture up by hand on every launch, so bake it in:
+                        // `add_furniture_asset` normalises anything longer than 20 m down to a 1.5 m
+                        // asset, which leaves the villa far too small to work on. AUTOLOAD_SCALE is
+                        // that manual step, applied on top of whatever the unit heuristic decided.
+                        const AUTOLOAD_SCALE: f32 = 35.0;
+                        inst.scale *= AUTOLOAD_SCALE;
                     }
                 }
                 self.factory.open = true;
                 self.factory.fit_all();
                 self.active_view = ActiveView::ThreeD;
-                self.factory.status = "villa test model auto-loaded (cm→m) — ☀ Sun + Textures ready to test".into();
-                self.history.push("  auto-loaded villa test model on startup".into());
+                let s = self.factory.sel_furniture.and_then(|fi| self.factory.furniture.get(fi)).map(|f| f.scale).unwrap_or(1.0);
+                self.factory.status = format!("villa test model auto-loaded (scale ×{s:.3}) — ☀ Sun + Textures ready to test");
+                self.history.push(format!("  auto-loaded villa test model on startup (scale ×{s:.3})"));
             }
         }
 
