@@ -1112,6 +1112,8 @@ enum ArchTab {
     Cabin,
     /// Curved office luminaire — a lighting profile swept along a path (ring/racetrack/S-curve).
     SweepLight,
+    /// Office workstation desk — a deletable feature tree (top, screen, supports, rail, grommets).
+    Desk,
 }
 
 /// Build the sun's light-space matrix (orthographic, framed to the scene AABB) for the shadow map.
@@ -1804,6 +1806,7 @@ pub struct CadApp {
     arch_kitchen: cad_solid::kitchen::KitchenInput,
     arch_cabin: cad_solid::cabin::CabinInput,
     arch_sweep: cad_solid::sweeplight::SweepInput,
+    arch_desk: cad_solid::desk::DeskInput,
     /// Set when the user chose "Save and close": the async save is running, and [`Self::apply_saved`]
     /// will close the window once the bytes are on disk.
     close_after_save: bool,
@@ -3464,6 +3467,7 @@ impl Default for CadApp {
             arch_kitchen: cad_solid::kitchen::KitchenInput::default(),
             arch_cabin: cad_solid::cabin::CabinInput::default(),
             arch_sweep: cad_solid::sweeplight::SweepInput::default(),
+            arch_desk: cad_solid::desk::DeskInput::default(),
             close_after_save: false,
             pending_close: false,
             autosave_on: true,
@@ -7435,6 +7439,15 @@ impl CadApp {
                             .clicked()
                         {
                             self.arch_tab = ArchTab::SweepLight;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("🖥  Office desk (workstation)…")
+                            .on_hover_text("A workstation desk built as a FEATURE TREE: chamfered top, curved fabric privacy screen, splayed Λ legs, a drawer pedestal with a fingerprint lock, an under-top rail and cable ports. Every feature can be switched off — and a deleted port takes its hole with it.")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::Desk;
                             self.arch_modal_open = true;
                             ui.close_menu();
                         }
@@ -20126,6 +20139,7 @@ impl CadApp {
             ArchTab::Kitchen => "🍳  Kitchen cabinets",
             ArchTab::Cabin => "🚪  Cabinet unit",
             ArchTab::SweepLight => "💡  Curved light",
+            ArchTab::Desk => "🖥  Office desk",
             _ => "🏛  Architecture",
         };
         egui::Window::new(title)
@@ -20162,7 +20176,7 @@ impl CadApp {
         // ── tab selector ── only the ARCHITECTURE generators tab between each other. Door (▼
         // Apertures) and Cupboard (▼ Furniture) open this same modal directly on their own screen,
         // so they get no tab row — they aren't "architecture".
-        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin | ArchTab::SweepLight) {
+        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin | ArchTab::SweepLight | ArchTab::Desk) {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Staircase, "🪜 Staircase");
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Spiral, "🌀 Spiral");
@@ -20183,6 +20197,7 @@ impl CadApp {
         let mut do_kitchen = false; // the kitchen tab builds a multi-material furniture mesh
         let mut do_cabin = false; // the cabinet-unit tab builds a multi-material furniture mesh
         let mut do_sweep = false; // the curved-light tab builds a multi-material furniture mesh
+        let mut do_desk = false; // the office-desk tab builds a multi-material furniture mesh
 
         match self.arch_tab {
             ArchTab::Staircase => {
@@ -20924,6 +20939,122 @@ impl CadApp {
                     Err(e) => error(ui, e),
                 }
             }
+            ArchTab::Desk => {
+                use cad_solid::desk::{Grommet, PartPos, PedFace, Preset, Support};
+                ui.label(
+                    egui::RichText::new(
+                        "A workstation desk as a FEATURE TREE — switch any feature off and it is gone from the build (a deleted cable port takes its hole with it).",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                // Presets first: they overwrite everything, so they read as "start from".
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Start from").selectable(false));
+                    egui::ComboBox::from_id_salt("desk_preset").width(150.0).selected_text("Preset…").show_ui(ui, |ui| {
+                        for p in Preset::ALL {
+                            if ui.selectable_label(false, p.label()).clicked() {
+                                self.arch_desk = p.input();
+                            }
+                        }
+                    });
+                });
+                let d = &mut self.arch_desk;
+                num(ui, "Length", &mut d.length, 0.01, 1.0, 3.0);
+                num(ui, "Depth", &mut d.width, 0.01, 0.5, 1.4);
+                num(ui, "Surface height", &mut d.height, 0.005, 0.60, 0.90);
+
+                ui.separator();
+                ui.checkbox(&mut d.partition, "Privacy screen");
+                if d.partition {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new("Screen position").selectable(false));
+                        egui::ComboBox::from_id_salt("desk_partpos").width(150.0).selected_text(d.part_pos.label()).show_ui(ui, |ui| {
+                            for p in PartPos::ALL {
+                                ui.selectable_value(&mut d.part_pos, p, p.label());
+                            }
+                        });
+                    });
+                    num(ui, "Screen span", &mut d.part_w, 0.01, 0.3, 3.0);
+                    num(ui, "Screen height", &mut d.part_h, 0.01, 0.1, 1.0);
+                    ui.checkbox(&mut d.part_band, "Organiser band at the base");
+                }
+
+                ui.separator();
+                for (label, sup) in [("Left end", &mut d.sup_l), ("Right end", &mut d.sup_r)] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false));
+                        egui::ComboBox::from_id_salt(format!("desk_sup_{label}")).width(150.0).selected_text(sup.label()).show_ui(ui, |ui| {
+                            for s in Support::ALL {
+                                ui.selectable_value(sup, s, s.label());
+                            }
+                        });
+                    });
+                }
+                if d.sup_l == Support::Drawers || d.sup_r == Support::Drawers {
+                    num(ui, "Pedestal width", &mut d.ped_w, 0.01, 0.25, 0.8);
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new("Drawers").selectable(false));
+                        ui.add(egui::DragValue::new(&mut d.ped_n).speed(0.1).range(1..=6));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new("Fronts open on").selectable(false));
+                        egui::ComboBox::from_id_salt("desk_pedface").width(150.0).selected_text(d.ped_face.label()).show_ui(ui, |ui| {
+                            for f in PedFace::ALL {
+                                ui.selectable_value(&mut d.ped_face, f, f.label());
+                            }
+                        });
+                    });
+                }
+                ui.checkbox(&mut d.rail, "Under-top rail");
+
+                ui.separator();
+                // Cable ports — the only subtractive feature, so each row owns a hole in the top.
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Cable ports").selectable(false));
+                    if ui.button("✚").on_hover_text("Add a cable port").clicked() {
+                        d.grommets.push(Grommet::rear_at(0.0));
+                    }
+                    if ui.button("✖").on_hover_text("Remove the last cable port — its hole goes with it").clicked() {
+                        d.grommets.pop();
+                    }
+                });
+                for (i, g) in d.grommets.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
+                        ui.add(egui::DragValue::new(&mut g.x).speed(0.01).prefix("x ").suffix(" m"));
+                        ui.checkbox(&mut g.rear, "rear");
+                        if !g.rear {
+                            ui.add(egui::DragValue::new(&mut g.y).speed(0.01).prefix("y ").suffix(" m"));
+                        }
+                    });
+                }
+
+                // Live feedback: run the builder for its metrics/validation (fast — a few k tris).
+                match cad_solid::desk::build(d) {
+                    Ok((m, _, _)) => {
+                        feedback(
+                            ui,
+                            format!(
+                                "{:.0}×{:.0} mm at {:.0} mm · {} · {} tris",
+                                m.length * 1000.0,
+                                m.width * 1000.0,
+                                m.height * 1000.0,
+                                m.features.join(", "),
+                                m.tris,
+                            ),
+                        );
+                        for w in m.warnings.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build desk").strong())).clicked() {
+                            do_desk = true;
+                        }
+                    }
+                    Err(e) => error(ui, e),
+                }
+            }
         }
 
         if let Some((result, name)) = build {
@@ -20961,6 +21092,115 @@ impl CadApp {
             let inp = self.arch_cabin.clone();
             self.factory_build_cabin(&inp);
         }
+        if do_desk {
+            let inp = self.arch_desk.clone();
+            self.factory_build_desk(&inp);
+        }
+    }
+
+    /// Build the parametric office desk from the dialog and drop it at the model centre as a
+    /// furniture piece. Each feature — and each individual drawer front — is its own selectable,
+    /// paintable part; the white carcass rides the asset's base colour and everything else gets a
+    /// bound swatch. Mirrors [`Self::factory_build_cabin`].
+    fn factory_build_desk(&mut self, inp: &cad_solid::desk::DeskInput) {
+        use cad_solid::desk::Material;
+        let features_before = self.factory.model.features.len();
+        let (m, mesh, mats) = match cad_solid::desk::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Office desk: {e}");
+                return;
+            }
+        };
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.90, 0.90, 0.89]), // white laminate — the White parts stay on this
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Office desk".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        let sw = |app: &mut Self, name: &str, rgb: [u8; 3]| app.factory.add_texture(name.into(), 1, 1, vec![rgb[0], rgb[1], rgb[2], 255]);
+        // Drawer fronts get the PROCEDURAL oak veneer so the grain runs on across the stack, the
+        // same trick the cabinet unit uses.
+        let oak = self.factory.add_procedural_texture("Desk oak veneer".into(), crate::factory::ProcDef::oak());
+        let fabric = sw(self, "Desk screen fabric", [143, 146, 158]);
+        if let Some(t) = self.factory.textures.get_mut(fabric) {
+            t.roughness = 0.92; // woven — kills the specular that would make it read as plastic
+        }
+        let metal = sw(self, "Desk legs / rail", [198, 200, 204]);
+        if let Some(t) = self.factory.textures.get_mut(metal) {
+            t.metallic = 0.85;
+            t.roughness = 0.35;
+            t.reflect = (0.85f32 * (1.0 - 0.6 * 0.35)).clamp(0.0, 1.0);
+        }
+        let alu = sw(self, "Desk trim (alu)", [204, 204, 209]);
+        if let Some(t) = self.factory.textures.get_mut(alu) {
+            t.metallic = 1.0;
+            t.roughness = 0.30;
+            t.reflect = (1.0f32 * (1.0 - 0.6 * 0.30)).clamp(0.0, 1.0);
+        }
+        let dark = sw(self, "Desk dark detail", [26, 26, 28]);
+        let cap = sw(self, "Desk foot caps", [219, 219, 219]);
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::White => None,
+                Material::Oak => Some(oak),
+                Material::Fabric => Some(fabric),
+                Material::Metal => Some(metal),
+                Material::Alu => Some(alu),
+                Material::Dark => Some(dark),
+                Material::Cap => Some(cap),
+            })
+            .collect();
+
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.open = true;
+        self.active_view = ActiveView::ThreeD;
+        self.factory.status = format!(
+            "Office desk: {:.0}×{:.0} mm at {:.0} mm — {} ({} tris)",
+            m.length * 1000.0,
+            m.width * 1000.0,
+            m.height * 1000.0,
+            m.features.join(", "),
+            m.tris,
+        );
+        for w in m.warnings.iter().take(2) {
+            self.history.push(format!("  ⚠ desk: {w}"));
+        }
+        self.history.push(format!("  furniture: office desk ({}, {} tris) and placed", m.features.join(", "), m.tris));
+        self.factory_op_evt(
+            "desk",
+            "modal",
+            format!("L={:.3} W={:.3} H={:.3} features={} tris={}", m.length, m.width, m.height, m.features.len(), m.tris),
+            features_before,
+        );
     }
 
     /// Build the parametric door from the dialog and drop it at the model centre as a furniture
