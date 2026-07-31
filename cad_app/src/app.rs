@@ -1114,6 +1114,8 @@ enum ArchTab {
     SweepLight,
     /// Office workstation desk — a deletable feature tree (top, screen, supports, rail, grommets).
     Desk,
+    /// Wood-frame sofa — a run chain of straight segments joined by +90° corner units.
+    Couch,
 }
 
 /// Build the sun's light-space matrix (orthographic, framed to the scene AABB) for the shadow map.
@@ -1807,6 +1809,7 @@ pub struct CadApp {
     arch_cabin: cad_solid::cabin::CabinInput,
     arch_sweep: cad_solid::sweeplight::SweepInput,
     arch_desk: cad_solid::desk::DeskInput,
+    arch_couch: cad_solid::couch::CouchInput,
     /// Set when the user chose "Save and close": the async save is running, and [`Self::apply_saved`]
     /// will close the window once the bytes are on disk.
     close_after_save: bool,
@@ -3468,6 +3471,7 @@ impl Default for CadApp {
             arch_cabin: cad_solid::cabin::CabinInput::default(),
             arch_sweep: cad_solid::sweeplight::SweepInput::default(),
             arch_desk: cad_solid::desk::DeskInput::default(),
+            arch_couch: cad_solid::couch::CouchInput::default(),
             close_after_save: false,
             pending_close: false,
             autosave_on: true,
@@ -7439,6 +7443,15 @@ impl CadApp {
                             .clicked()
                         {
                             self.arch_tab = ArchTab::SweepLight;
+                            self.arch_modal_open = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("🛋  Sofa (straight / L / U)…")
+                            .on_hover_text("A wood-frame sofa built as a RUN CHAIN: list the straight segments and each extra one adds a +90° corner unit, so the same tool makes a two-seater, an L-sectional or a U. Arch arms, spindle back and pillowed cushions are all deletable features.")
+                            .clicked()
+                        {
+                            self.arch_tab = ArchTab::Couch;
                             self.arch_modal_open = true;
                             ui.close_menu();
                         }
@@ -20140,6 +20153,7 @@ impl CadApp {
             ArchTab::Cabin => "🚪  Cabinet unit",
             ArchTab::SweepLight => "💡  Curved light",
             ArchTab::Desk => "🖥  Office desk",
+            ArchTab::Couch => "🛋  Sofa",
             _ => "🏛  Architecture",
         };
         egui::Window::new(title)
@@ -20176,7 +20190,10 @@ impl CadApp {
         // ── tab selector ── only the ARCHITECTURE generators tab between each other. Door (▼
         // Apertures) and Cupboard (▼ Furniture) open this same modal directly on their own screen,
         // so they get no tab row — they aren't "architecture".
-        if !matches!(self.arch_tab, ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin | ArchTab::SweepLight | ArchTab::Desk) {
+        if !matches!(
+            self.arch_tab,
+            ArchTab::Door | ArchTab::Cupboard | ArchTab::Kitchen | ArchTab::Cabin | ArchTab::SweepLight | ArchTab::Desk | ArchTab::Couch
+        ) {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Staircase, "🪜 Staircase");
                 ui.selectable_value(&mut self.arch_tab, ArchTab::Spiral, "🌀 Spiral");
@@ -20198,6 +20215,7 @@ impl CadApp {
         let mut do_cabin = false; // the cabinet-unit tab builds a multi-material furniture mesh
         let mut do_sweep = false; // the curved-light tab builds a multi-material furniture mesh
         let mut do_desk = false; // the office-desk tab builds a multi-material furniture mesh
+        let mut do_couch = false; // the sofa tab builds a multi-material furniture mesh
 
         match self.arch_tab {
             ArchTab::Staircase => {
@@ -21055,6 +21073,107 @@ impl CadApp {
                     Err(e) => error(ui, e),
                 }
             }
+            ArchTab::Couch => {
+                use cad_solid::couch::{BackKind, Preset, Run};
+                ui.label(
+                    egui::RichText::new(
+                        "A sofa as a RUN CHAIN — each extra run adds a +90° corner unit, so one to three runs give you a two-seater, an L or a U. The seats always face the inside of the turn.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Start from").selectable(false));
+                    egui::ComboBox::from_id_salt("couch_preset").width(150.0).selected_text("Preset…").show_ui(ui, |ui| {
+                        for p in Preset::ALL {
+                            if ui.selectable_label(false, p.label()).clicked() {
+                                self.arch_couch = p.input();
+                            }
+                        }
+                    });
+                });
+                let c = &mut self.arch_couch;
+
+                // The chain itself: one row per run, length + cushion count (0 = auto).
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Runs (chain)").selectable(false));
+                    if ui.button("✚").on_hover_text("Add a run — each one past the first adds a corner unit").clicked() {
+                        c.runs.push(Run::new(1.350, 0));
+                    }
+                    if ui.button("✖").on_hover_text("Remove the last run").clicked() && c.runs.len() > 1 {
+                        c.runs.pop();
+                    }
+                });
+                for (i, r) in c.runs.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
+                        ui.add(egui::DragValue::new(&mut r.length).speed(0.01).range(0.4..=6.0).suffix(" m"));
+                        ui.add(
+                            egui::DragValue::new(&mut r.cushions)
+                                .speed(0.1)
+                                .range(0..=8)
+                                .custom_formatter(|n, _| if n < 0.5 { "auto".to_string() } else { format!("{n:.0}") }),
+                        )
+                        .on_hover_text("Seat cushions across this run — 0 is auto (aims at a 667 mm pitch)");
+                    });
+                }
+
+                ui.separator();
+                num(ui, "Depth", &mut c.depth, 0.01, 0.5, 1.2);
+                num(ui, "Seat height", &mut c.seat_top, 0.005, 0.25, 0.6);
+                num(ui, "Back height", &mut c.back_h, 0.005, 0.3, 1.1);
+                num(ui, "Arm height", &mut c.arm_h, 0.005, 0.2, 0.9);
+                num(ui, "Cushion thickness", &mut c.cushion_t, 0.005, 0.05, 0.35);
+
+                ui.separator();
+                ui.label(egui::RichText::new("  Features — switch any of these off").small().weak());
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Back").selectable(false));
+                    egui::ComboBox::from_id_salt("couch_back").width(150.0).selected_text(c.back.label()).show_ui(ui, |ui| {
+                        for b in BackKind::ALL {
+                            ui.selectable_value(&mut c.back, b, b.label());
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Arms").selectable(false));
+                    ui.checkbox(&mut c.arm_start, "start");
+                    ui.checkbox(&mut c.arm_end, "end");
+                })
+                .response
+                .on_hover_text("Arms only ever sit at the two FREE ends of the chain — never on an interior junction");
+                ui.checkbox(&mut c.frame, "Frame (seat boxes + corners)");
+                ui.checkbox(&mut c.seat_cushions, "Seat cushions");
+                ui.checkbox(&mut c.back_cushions, "Back cushions");
+
+                // Live feedback: run the builder for its metrics/validation (fast — a few k tris).
+                match cad_solid::couch::build(c) {
+                    Ok((m, _, _)) => {
+                        feedback(
+                            ui,
+                            format!(
+                                "{} run{} + {} corner{} · {:.2} m overall · {} seats at {:.0} mm pitch · {} tris",
+                                m.runs,
+                                if m.runs == 1 { "" } else { "s" },
+                                m.corners,
+                                if m.corners == 1 { "" } else { "s" },
+                                m.overall_len,
+                                m.seats,
+                                m.cushion_pitch * 1000.0,
+                                m.tris,
+                            ),
+                        );
+                        for w in m.warnings.iter().take(3) {
+                            ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
+                        }
+                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build sofa").strong())).clicked() {
+                            do_couch = true;
+                        }
+                    }
+                    Err(e) => error(ui, e),
+                }
+            }
         }
 
         if let Some((result, name)) = build {
@@ -21096,6 +21215,96 @@ impl CadApp {
             let inp = self.arch_desk.clone();
             self.factory_build_desk(&inp);
         }
+        if do_couch {
+            let inp = self.arch_couch.clone();
+            self.factory_build_couch(&inp);
+        }
+    }
+
+    /// Build the parametric sofa chain from the dialog and drop it at the model centre. The oak
+    /// frame, arms and spindles ride a procedural veneer; the pillows get a fabric swatch. Each
+    /// cushion, arm and frame box is its own selectable, paintable part. Mirrors
+    /// [`Self::factory_build_desk`].
+    fn factory_build_couch(&mut self, inp: &cad_solid::couch::CouchInput) {
+        use cad_solid::couch::Material;
+        let features_before = self.factory.model.features.len();
+        let (m, mesh, mats) = match cad_solid::couch::build(inp) {
+            Ok(v) => v,
+            Err(e) => {
+                self.factory.status = format!("Sofa: {e}");
+                return;
+            }
+        };
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.76, 0.69, 0.57]), // upholstery — the Fabric parts ride this
+            alpha: Vec::new(),
+        };
+        self.snapshot_factory();
+        let idx = self.factory.add_furniture_asset("Sofa".to_string(), obj);
+        if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
+            a.alpha_resolved = true;
+            if part_ids.len() == a.positions.len() / 3 {
+                a.part_ids = part_ids;
+            }
+        }
+        // The frame is one continuous piece of joinery, so the grain wants to run across the boxes —
+        // the procedural veneer is evaluated from world position and does exactly that.
+        let oak = self.factory.add_procedural_texture("Sofa oak frame".into(), crate::factory::ProcDef::oak());
+        let fabric = self.factory.add_texture("Sofa upholstery".into(), 1, 1, vec![194, 176, 145, 255]);
+        if let Some(t) = self.factory.textures.get_mut(fabric) {
+            t.roughness = 0.90; // woven — no specular hotspot on a cushion
+        }
+        let per_part_tex: Vec<Option<usize>> = mats
+            .iter()
+            .map(|mat| match mat {
+                Material::Oak => Some(oak),
+                Material::Fabric => Some(fabric),
+            })
+            .collect();
+
+        let at = self.factory.default_place_at();
+        self.factory.place_furniture(idx, at);
+        let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
+            let g = a.group_geom();
+            let ntri = a.positions.len() / 3;
+            let mut map: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..ntri {
+                let part = a.part_ids.get(t).copied().unwrap_or(0) as usize;
+                if let Some(Some(gtex)) = per_part_tex.get(part) {
+                    map.insert(g.face[t], *gtex);
+                }
+            }
+            map
+        });
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+            if let Some(inst) = self.factory.furniture.get_mut(fi) {
+                inst.surface_texture = fg_tex;
+            }
+        }
+        self.factory.open = true;
+        self.active_view = ActiveView::ThreeD;
+        self.factory.status = format!(
+            "Sofa: {} run(s) + {} corner(s), {:.2} m overall, {} seats — {} ({} tris)",
+            m.runs,
+            m.corners,
+            m.overall_len,
+            m.seats,
+            m.features.join(", "),
+            m.tris,
+        );
+        for w in m.warnings.iter().take(2) {
+            self.history.push(format!("  ⚠ sofa: {w}"));
+        }
+        self.history.push(format!("  furniture: sofa ({} runs, {} seats, {} tris) and placed", m.runs, m.seats, m.tris));
+        self.factory_op_evt(
+            "couch",
+            "modal",
+            format!("runs={} corners={} overall={:.3} seats={} tris={}", m.runs, m.corners, m.overall_len, m.seats, m.tris),
+            features_before,
+        );
     }
 
     /// Build the parametric office desk from the dialog and drop it at the model centre as a

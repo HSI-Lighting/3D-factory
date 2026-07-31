@@ -26,6 +26,7 @@ pub mod kitchen; // parametric kitchen cabinet run (base + optional wall lanes, 
 pub mod cabin; // parametric handleless cabinet UNIT (close-range joinery: overlay fronts, grips, pin rows) → SolidMesh
 pub mod sweeplight; // curved office luminaires: a lighting profile swept along a path (RMF sweep) → SolidMesh
 pub mod desk; // parametric office workstation desk as a deletable feature tree → SolidMesh
+pub mod couch; // parametric run-chain sofa (straight / L / U sectionals) → SolidMesh
 mod csg;
 pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
 pub mod draw;
