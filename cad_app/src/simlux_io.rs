@@ -161,9 +161,21 @@ pub struct ProcRec {
     pub rough: f32,
     pub contrast: f32,
     pub ramp: [f32; 2],
+    /// Phase 3 — the pattern's own SURFACE finish (roughness at its two ends) and its relief.
+    /// `#[serde(default*)]` so older sidecars load with an EQUAL pair, which the renderer reads as
+    /// "this pattern does not vary its finish, use the material's scalar roughness" — i.e. exactly
+    /// the look those projects already had.
+    #[serde(default = "half2")]
+    pub surf_rough: [f32; 2],
+    #[serde(default)]
+    pub bump: f32,
 }
 
 fn one() -> f32 { 1.0 }
+
+fn half2() -> [f32; 2] {
+    [0.5, 0.5]
+}
 
 /// A furniture mesh as persisted (triangle soup). Mirrors `factory::FurnitureAsset`.
 ///
@@ -230,6 +242,68 @@ pub struct FurnitureInstRec {
     /// surface_texture`). `#[serde(default)]` so old sidecars load as whole-object only.
     #[serde(default)]
     pub surface_texture: Vec<(u32, usize)>,
+    /// CUTS drawn on this piece's faces. The LIST is saved, never the cut geometry — the mesh is
+    /// rebuilt from the original on load, so a reopened project keeps every cut editable and
+    /// removable exactly as it was, and a later fix to the boolean improves old files too.
+    /// `#[serde(default)]` so older sidecars load with none.
+    #[serde(default)]
+    pub cuts: Vec<MeshCutRec>,
+    /// The UNCUT original when `asset` points at a derived (cut) copy. Saved so a reload reuses
+    /// that derived slot instead of minting a new one, which would otherwise leave a dead "(cut)"
+    /// entry in the library on every save/open cycle.
+    #[serde(default)]
+    pub base_asset: Option<usize>,
+}
+
+/// One cut, flattened for the sidecar. Mirrors `cad_solid::meshcut::MeshCut`; the frame is written
+/// out as its origin and two axes, plainly, so a migrated or hand-edited file stays readable.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct MeshCutRec {
+    pub profile: Vec<[f32; 2]>,
+    pub origin: [f32; 3],
+    pub u: [f32; 3],
+    pub v: [f32; 3],
+    pub depth: f32,
+    pub through: bool,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// `true` — so a cut written before `enabled` existed reads back as applied, which is what it was.
+fn yes() -> bool {
+    true
+}
+
+impl MeshCutRec {
+    pub fn of(c: &cad_solid::meshcut::MeshCut) -> Self {
+        Self {
+            profile: c.profile.clone(),
+            origin: c.frame.origin.to_array(),
+            u: c.frame.u.to_array(),
+            v: c.frame.v.to_array(),
+            depth: c.depth,
+            through: c.through,
+            enabled: c.enabled,
+            label: c.label.clone(),
+        }
+    }
+
+    pub fn to_cut(&self) -> cad_solid::meshcut::MeshCut {
+        cad_solid::meshcut::MeshCut {
+            profile: self.profile.clone(),
+            frame: cad_solid::Frame {
+                origin: glam::Vec3::from(self.origin),
+                u: glam::Vec3::from(self.u),
+                v: glam::Vec3::from(self.v),
+            },
+            depth: self.depth,
+            through: self.through,
+            enabled: self.enabled,
+            label: self.label.clone(),
+        }
+    }
 }
 
 impl FactoryDoc {

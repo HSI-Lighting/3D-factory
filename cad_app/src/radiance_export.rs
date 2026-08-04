@@ -31,12 +31,39 @@ pub struct ExportTri {
     pub ior: f32,
     /// Emission radiance (colour × strength), linear RGB.
     pub emission: [f32; 3],
+    /// CLEARCOAT strength and roughness — a thin varnish with its own smooth specular lobe over
+    /// whatever the base is doing. 0 = bare. Radiance export ignores them.
+    pub clearcoat: f32,
+    pub clearcoat_rough: f32,
+    /// SHEEN strength and the colour of the fuzz — the grazing rim fabric gets. 0 = none.
+    pub sheen: f32,
+    pub sheen_tint: [f32; 3],
+    /// Which app-side material this surface uses, so the path tracer can look up its PROCEDURAL
+    /// definition and evaluate the pattern per hit. Without it the tracer only ever saw `rgb` — the
+    /// ramp's midpoint — so an oak cabinet rendered as one flat brown while the viewport showed the
+    /// grain. An INDEX rather than the definition itself: there is one `ExportTri` per triangle and
+    /// scenes here reach millions, so a `ProcDef` per triangle is not free.
+    pub material: Option<u16>,
+    /// Per-vertex UVs, when the surface HAS a UV layer. The path tracer needs these to sample a
+    /// material's IMAGE at the hit point; without them it could only ever use the image's average
+    /// colour, which is why an offline villa render had flat roofs and flat lawn where the
+    /// viewport showed tiles and grass. Radiance export ignores them.
+    pub uv: [[f32; 2]; 3],
+    /// False when the surface carries no UV layer — the tracer then projects from world space,
+    /// exactly as the viewport shader does. Distinct from an all-zero `uv`, which is a legitimate
+    /// if degenerate mapping.
+    pub has_uv: bool,
 }
 
 impl ExportTri {
     /// A plain diffuse surface (the common case; Principled extras at their defaults).
     pub fn plain(verts: [[f32; 3]; 3], rgb: [f32; 3], roughness: f32, opacity: f32) -> Self {
-        Self { verts, rgb, roughness, opacity, metallic: 0.0, ior: 1.5, emission: [0.0; 3] }
+        Self {
+            verts, rgb, roughness, opacity,
+            metallic: 0.0, ior: 1.5, emission: [0.0; 3], material: None,
+            clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3],
+            uv: [[0.0; 2]; 3], has_uv: false,
+        }
     }
 }
 

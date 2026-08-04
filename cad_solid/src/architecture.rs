@@ -972,9 +972,15 @@ fn push_prism(m: &mut SolidMesh, profile: &[[f32; 2]], x_lo: f32, x_hi: f32) {
     let n = profile.len();
     if n < 3 { return; }
     let at = |x: f32, q: [f32; 2]| [x, q[0], q[1]];
-    // Caps (fan from vertex 0). Winding is irrelevant to shading (|n·l|).
+    // Caps (fan from vertex 0), wound OPPOSITE ways so each faces out of its own end.
+    //
+    // Winding is irrelevant to this app's shading, which uses |n·l| — but it is not irrelevant to
+    // everything. A BSP boolean classifies inside from outside using each polygon's plane, so a cap
+    // whose normal points into the solid makes a cut come out inside-out. Two identically-wound
+    // caps also leave the prism non-orientable, which is what `meshcut::closure` reports as four
+    // unmatched edges on a ramp that looks perfectly closed.
     for k in 1..n - 1 {
-        push_tri(m, at(x_lo, profile[0]), at(x_lo, profile[k]), at(x_lo, profile[k + 1]));
+        push_tri(m, at(x_lo, profile[0]), at(x_lo, profile[k + 1]), at(x_lo, profile[k]));
         push_tri(m, at(x_hi, profile[0]), at(x_hi, profile[k]), at(x_hi, profile[k + 1]));
     }
     // Side walls.

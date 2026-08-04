@@ -515,6 +515,9 @@ enum FbxVal {
     I(i64),
     F(f64),
     S(String),
+    /// A raw byte blob (`R`). This is how an FBX carries an EMBEDDED texture: `Video > Content`
+    /// holds the whole PNG/JPEG. Skipping it was why binary FBX could never show an image.
+    Raw(Vec<u8>),
     Fa(Vec<f64>),
     Ia(Vec<i32>),
     Skip,
@@ -554,6 +557,14 @@ impl FbxNode {
     }
     fn first_i32_arr(&self) -> Option<&Vec<i32>> {
         self.props.iter().find_map(|p| if let FbxVal::Ia(a) = p { Some(a) } else { None })
+    }
+    /// The first raw blob property — an embedded texture's image bytes (`Video > Content`).
+    fn first_raw(&self) -> Option<&[u8]> {
+        self.props.iter().find_map(|p| if let FbxVal::Raw(b) = p { Some(b.as_slice()) } else { None })
+    }
+    /// The string value of the first child named in `names` that carries a non-empty one.
+    fn str_child(&self, names: &[&str]) -> Option<&str> {
+        names.iter().find_map(|k| self.child(k).and_then(|c| c.str_at(0)).filter(|s| !s.is_empty()))
     }
 }
 
@@ -595,9 +606,9 @@ fn fbx_parse_node(cur: &mut FbxCursor, v75: bool) -> Option<Option<FbxNode>> {
     Some(Some(FbxNode { name, props, children }))
 }
 
-/// Read one property value, advancing the cursor. Scalars and strings are always decoded
-/// (cheap, needed for transforms); `d`/`i` arrays are decoded (verts/indices); other arrays
-/// (normals/uvs/`f`/`l`/`b`) are skipped without materialising.
+/// Read one property value, advancing the cursor. Scalars, strings and raw blobs are always
+/// decoded (cheap, and the blob is an embedded texture); `d`/`f`/`i` arrays are decoded (verts,
+/// indices, UVs, material indices); `l`/`b` arrays are skipped without materialising.
 fn fbx_value(cur: &mut FbxCursor) -> Option<FbxVal> {
     let ty = cur.u8()?;
     Some(match ty {
@@ -610,7 +621,7 @@ fn fbx_value(cur: &mut FbxCursor) -> Option<FbxVal> {
         b'S' | b'R' => {
             let n = cur.u32()? as usize;
             let b = cur.take(n)?;
-            if ty == b'S' { FbxVal::S(String::from_utf8_lossy(b).into_owned()) } else { FbxVal::Skip }
+            if ty == b'S' { FbxVal::S(String::from_utf8_lossy(b).into_owned()) } else { FbxVal::Raw(b.to_vec()) }
         }
         b'f' | b'd' | b'l' | b'i' | b'b' => {
             let len = cur.u32()? as usize;
@@ -628,6 +639,11 @@ fn fbx_value(cur: &mut FbxCursor) -> Option<FbxVal> {
             match ty {
                 b'd' if bytes.len() >= len * 8 => FbxVal::Fa(
                     bytes.chunks_exact(8).take(len).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect(),
+                ),
+                // f32 arrays widen to the same Fa. Blender writes UVs as `d`, but the Autodesk SDK
+                // (Max/Maya) writes some layers as `f` — skipping those lost their UVs entirely.
+                b'f' if bytes.len() >= len * 4 => FbxVal::Fa(
+                    bytes.chunks_exact(4).take(len).map(|c| f32::from_le_bytes(c.try_into().unwrap()) as f64).collect(),
                 ),
                 b'i' if bytes.len() >= len * 4 => FbxVal::Ia(
                     bytes.chunks_exact(4).take(len).map(|c| i32::from_le_bytes(c.try_into().unwrap())).collect(),
@@ -705,6 +721,8 @@ fn fbx_scan<'a>(
     models: &mut std::collections::HashMap<i64, (glam::DMat4, glam::DMat4)>,
     parent: &mut std::collections::HashMap<i64, i64>,
     up_axis: &mut i64,
+    // Centimetres per file unit, from `GlobalSettings > UnitScaleFactor`. Metres = unit * this / 100.
+    unit_cm: &mut f64,
 ) {
     for n in nodes {
         match n.name.as_str() {
@@ -765,9 +783,18 @@ fn fbx_scan<'a>(
             "P" if n.str_at(0) == Some("UpAxis") => {
                 if let Some(FbxVal::I(x)) = n.props.last() { *up_axis = *x; }
             }
+            // FBX measures in CENTIMETRES: `UnitScaleFactor` is how many centimetres one file unit
+            // is. Ignoring it meant every FBX imported 100x too big — invisible for furniture,
+            // which is normalised to prop size, and glaring the moment something has to sit at TRUE
+            // scale, like a door handle.
+            "P" if n.str_at(0) == Some("UnitScaleFactor") => {
+                if let Some(u) = n.last_f64() {
+                    if u > 1e-9 { *unit_cm = u; }
+                }
+            }
             _ => {}
         }
-        fbx_scan(&n.children, geoms, models, parent, up_axis);
+        fbx_scan(&n.children, geoms, models, parent, up_axis, unit_cm);
     }
 }
 
@@ -811,7 +838,8 @@ fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMes
     let mut models = std::collections::HashMap::new();
     let mut parent = std::collections::HashMap::new();
     let mut up_axis: i64 = 1; // FBX default Y-up
-    fbx_scan(root, &mut geoms, &mut models, &mut parent, &mut up_axis);
+    let mut unit_cm: f64 = 1.0; // centimetres per file unit
+    fbx_scan(root, &mut geoms, &mut models, &mut parent, &mut up_axis, &mut unit_cm);
 
     // Resolve each geometry's world transform up front (needed twice: for the shell test and to emit).
     let world_of = |gid: &Option<i64>| -> glam::DMat4 {
@@ -873,20 +901,22 @@ fn fbx_build_scene_opt(root: &[FbxNode], drop_full_depth_shell: bool) -> (ObjMes
                 wlo[0],whi[0], wlo[1],whi[1], wlo[2],whi[2],
             );
         }
-        fbx_emit_geometry(verts, indices, &world, up_axis, &mut out);
+        fbx_emit_geometry(verts, indices, &world, up_axis, unit_cm, &mut out);
     }
     (out, n_geoms, tv, ti)
 }
 
 /// Fan-triangulate one geometry, transforming each vertex by `world` and converting to Z-up.
 /// A negative `PolygonVertexIndex` is the bit-negated LAST vertex of a polygon (`real = !neg`).
-fn fbx_emit_geometry(verts: &[f64], indices: &[i32], world: &glam::DMat4, up_axis: i64, out: &mut ObjMesh) {
+/// `unit_cm` is centimetres per file unit (`UnitScaleFactor`); metres = unit * unit_cm / 100.
+fn fbx_emit_geometry(verts: &[f64], indices: &[i32], world: &glam::DMat4, up_axis: i64, unit_cm: f64, out: &mut ObjMesh) {
+    let to_m = unit_cm / 100.0;
     let vcount = verts.len() / 3;
     let pos = |i: usize| -> [f32; 3] {
         let w = world.transform_point3(glam::DVec3::new(verts[3 * i], verts[3 * i + 1], verts[3 * i + 2]));
         // Scene up-axis → app Z-up. UpAxis 1=Y (default) rotates; 2=Z is already correct.
         let v = if up_axis == 2 { w } else { glam::DVec3::new(w.x, -w.z, w.y) };
-        [v.x as f32, v.y as f32, v.z as f32]
+        [(v.x * to_m) as f32, (v.y * to_m) as f32, (v.z * to_m) as f32]
     };
     let mut poly: Vec<usize> = Vec::new();
     for &raw in indices {
@@ -953,12 +983,150 @@ fn fbx_collect_materials(
     }
 }
 
+/// Everything the textured binary-FBX path needs that [`fbx_scan`] doesn't carry: the Geometry
+/// NODES themselves (so their UV and material layers can be read), the Texture/Video image
+/// objects, and the FULL connection list.
+///
+/// The connection list matters because [`fbx_scan`] keeps only `OO` links, and a texture is bound
+/// to a material by an `OP` (object→property) link naming the property it drives —
+/// `C: "OP", texture, material, "DiffuseColor"`. Without `OP` there is no material→image edge at
+/// all, which is the second reason binary FBX never showed a texture.
+#[derive(Default)]
+struct FbxPbrScan<'a> {
+    geoms: Vec<&'a FbxNode>,
+    tex_ids: std::collections::HashSet<i64>,
+    vid_ids: std::collections::HashSet<i64>,
+    tex_file: std::collections::HashMap<i64, String>,
+    vid_file: std::collections::HashMap<i64, String>,
+    /// Video id → the embedded image bytes (borrowed from the parsed tree, never copied).
+    vid_content: std::collections::HashMap<i64, &'a [u8]>,
+    /// (kind, source id, destination id, property name) in file order — the order IS the
+    /// material-slot order for material→model links.
+    conns: Vec<(&'a str, i64, i64, Option<&'a str>)>,
+}
+
+/// FBX material properties a texture can be bound to that are NOT the base colour. Lower-case,
+/// matched as substrings against the `OP` connection's property name (`"NormalMap"`,
+/// `"Maya|specularColor"`, `"3dsMax|Parameters|bump_map"`, …).
+const NON_COLOUR_MAPS: &[&str] = &[
+    "normal", "bump", "specular", "shininess", "reflect", "displacement", "emissive",
+    "transparen", "ambient", "occlusion", "roughness", "metal", "gloss", "opacity", "vector",
+];
+
+/// The filename a Texture/Video node carries. `RelativeFilename` is tried FIRST because it is
+/// relative to the FBX itself, so it still resolves after the file leaves the machine that wrote
+/// it — the absolute `FileName` almost never does.
+fn fbx_tex_filename(n: &FbxNode) -> Option<&str> {
+    n.str_child(&["RelativeFilename", "FileName", "Filename"])
+}
+
+fn fbx_scan_pbr<'a>(nodes: &'a [FbxNode], s: &mut FbxPbrScan<'a>) {
+    for n in nodes {
+        match n.name.as_str() {
+            "Geometry" if n.child("Vertices").is_some() => s.geoms.push(n),
+            "Texture" => {
+                if let Some(id) = n.i64_at(0) {
+                    s.tex_ids.insert(id);
+                    if let Some(f) = fbx_tex_filename(n) {
+                        s.tex_file.insert(id, f.to_string());
+                    }
+                }
+            }
+            "Video" => {
+                if let Some(id) = n.i64_at(0) {
+                    s.vid_ids.insert(id);
+                    if let Some(f) = fbx_tex_filename(n) {
+                        s.vid_file.insert(id, f.to_string());
+                    }
+                    // An un-embedded Video still writes a `Content` node — an EMPTY blob. Requiring
+                    // a plausible header length keeps that from masking the on-disk file.
+                    if let Some(c) = n.child("Content").and_then(|c| c.first_raw()) {
+                        if c.len() > 16 {
+                            s.vid_content.insert(id, c);
+                        }
+                    }
+                }
+            }
+            "C" => {
+                if let (Some(k), Some(a), Some(b)) = (n.str_at(0), n.i64_at(1), n.i64_at(2)) {
+                    s.conns.push((k, a, b, n.str_at(3)));
+                }
+            }
+            _ => {}
+        }
+        fbx_scan_pbr(&n.children, s);
+    }
+}
+
+/// One geometry's UV layer: the coordinates, the index array, and the two mapping flags that say
+/// how to read them. Missing layer ⇒ empty coordinates, and the caller emits `[0,0]`.
+struct FbxUvLayer<'a> {
+    uvs: &'a [f64],
+    index: &'a [i32],
+    /// `IndexToDirect`: look the coordinate up through `index` rather than reading it in order.
+    indexed: bool,
+    /// `ByVertice`: one UV per CONTROL POINT, not per polygon-vertex.
+    by_vertex: bool,
+}
+
+fn fbx_uv_layer(g: &FbxNode) -> FbxUvLayer<'_> {
+    const NONE_F: &[f64] = &[];
+    const NONE_I: &[i32] = &[];
+    let n = match g.child("LayerElementUV") {
+        Some(n) => n,
+        None => return FbxUvLayer { uvs: NONE_F, index: NONE_I, indexed: false, by_vertex: false },
+    };
+    let mode = |k: &str| n.child(k).and_then(|c| c.str_at(0)).unwrap_or("");
+    FbxUvLayer {
+        uvs: n.child("UV").and_then(|c| c.first_f64_arr()).map(|v| v.as_slice()).unwrap_or(NONE_F),
+        index: n.child("UVIndex").and_then(|c| c.first_i32_arr()).map(|v| v.as_slice()).unwrap_or(NONE_I),
+        indexed: mode("ReferenceInformationType").contains("IndexToDirect"),
+        by_vertex: {
+            let m = mode("MappingInformationType");
+            m.contains("ByVertice") || m.contains("ByVertex")
+        },
+    }
+}
+
+/// One geometry's per-polygon material indices, and whether the whole geometry shares one
+/// material (`AllSame`). These index the OWNING MODEL's material slots, not global ids.
+fn fbx_material_layer(g: &FbxNode) -> (&[i32], bool) {
+    const NONE_I: &[i32] = &[];
+    let n = match g.child("LayerElementMaterial") {
+        Some(n) => n,
+        None => return (NONE_I, true),
+    };
+    let all_same = n
+        .child("MappingInformationType")
+        .and_then(|c| c.str_at(0))
+        .map(|m| m.contains("AllSame"))
+        .unwrap_or(false);
+    let m = n.child("Materials").and_then(|c| c.first_i32_arr()).map(|v| v.as_slice()).unwrap_or(NONE_I);
+    (m, all_same || m.len() <= 1)
+}
+
 /// Parse a BINARY FBX into geometry PLUS its per-material colours, returned through the same
-/// [`GltfPbr`] channel the multi-material glTF importer uses — so a colour-material FBX (e.g. a
-/// Blender export with flat materials, no image maps) shows each region's OWN colour and each
-/// material becomes its own selectable/paintable part. Each material's diffuse colour is emitted as
-/// a 1×1 swatch; the app binds it per face-group. Empty `GltfPbr` for ASCII / material-less files.
+/// [`GltfPbr`] channel the multi-material glTF importer uses — so each material becomes its own
+/// selectable/paintable part carrying its own appearance.
+///
+/// A material's base colour is, in order of preference: its EMBEDDED image (`Video > Content`),
+/// the image FILE it names (resolved beside the FBX, hence `base`), or a 1×1 swatch of its diffuse
+/// colour. UVs come from `LayerElementUV` and are emitted per vertex, so a textured FBX maps its
+/// image the way it was authored instead of falling back to box projection.
+///
+/// Parts are split per (geometry, material slot) via `LayerElementMaterial`, so one mesh carrying
+/// several materials — the normal case for anything modelled as a single object — no longer
+/// collapses onto whichever material happened to be connected first.
+///
+/// Empty `GltfPbr` for ASCII / material-less files.
 pub fn parse_fbx_pbr(data: &[u8]) -> (ObjMesh, GltfPbr) {
+    parse_fbx_pbr_at(data, None)
+}
+
+/// [`parse_fbx_pbr`] with the FBX's own directory, so textures stored BESIDE the file (the usual
+/// `model.fbx` + `model.fbm/` or `textures/` layout) resolve. Without it only embedded images work.
+pub fn parse_fbx_pbr_at(data: &[u8], base: Option<&std::path::Path>) -> (ObjMesh, GltfPbr) {
+    use std::collections::HashMap;
     let mut out = ObjMesh::default();
     let mut pbr = GltfPbr::default();
     if is_ascii_fbx(data) || data.len() < 27 {
@@ -969,20 +1137,52 @@ pub fn parse_fbx_pbr(data: &[u8]) -> (ObjMesh, GltfPbr) {
     let mut cur = FbxCursor { buf: data, pos: 27 };
     let root = fbx_parse_siblings(&mut cur, v75, data.len());
 
-    let mut geoms: Vec<(Option<i64>, &Vec<f64>, &Vec<i32>)> = Vec::new();
-    let mut models = std::collections::HashMap::new();
-    let mut parent = std::collections::HashMap::new();
+    // `fbx_scan` for the transform graph; `fbx_scan_pbr` for the appearance graph.
+    let mut geoms_vi: Vec<(Option<i64>, &Vec<f64>, &Vec<i32>)> = Vec::new();
+    let mut models = HashMap::new();
+    let mut parent = HashMap::new();
     let mut up_axis: i64 = 1;
-    fbx_scan(&root, &mut geoms, &mut models, &mut parent, &mut up_axis);
+    let mut unit_cm: f64 = 1.0;
+    fbx_scan(&root, &mut geoms_vi, &mut models, &mut parent, &mut up_axis, &mut unit_cm);
 
-    let mut mat_color: std::collections::HashMap<i64, [f32; 3]> = std::collections::HashMap::new();
-    let mut mat_opac: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+    let mut mat_color: HashMap<i64, [f32; 3]> = HashMap::new();
+    let mut mat_opac: HashMap<i64, f32> = HashMap::new();
     fbx_collect_materials(&root, &mut mat_color, &mut mat_opac);
-    // A Material connects OO to its Model; `parent` holds child→parent, so parent[material]=model.
-    let mut model_mat: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-    for (&child, &par) in &parent {
-        if mat_color.contains_key(&child) {
-            model_mat.entry(par).or_insert(child);
+
+    let mut sc = FbxPbrScan::default();
+    fbx_scan_pbr(&root, &mut sc);
+
+    // ---- resolve the appearance graph: model → materials → texture → video ----
+    let mut model_mats: HashMap<i64, Vec<i64>> = HashMap::new(); // ORDER = material slot order
+    let mut mat_tex: HashMap<i64, i64> = HashMap::new(); // named base-colour texture
+    let mut mat_tex_alt: HashMap<i64, i64> = HashMap::new(); // plausible fallback (see below)
+    let mut tex_video: HashMap<i64, i64> = HashMap::new();
+    for &(kind, child, par, prop) in &sc.conns {
+        if mat_color.contains_key(&child) && models.contains_key(&par) {
+            let slots = model_mats.entry(par).or_default();
+            if !slots.contains(&child) {
+                slots.push(child);
+            }
+        } else if sc.tex_ids.contains(&child) && mat_color.contains_key(&par) {
+            // An `OP` link names the material property it feeds, and that name is the only
+            // evidence of what the image IS. Binding a normal or specular map as base colour is
+            // exactly how a model ends up looking like flat lilac or tinfoil, so the non-colour
+            // properties are excluded outright — a material wearing only a normal map falls back
+            // to its diffuse colour rather than to a picture of its bumps.
+            let p = prop.unwrap_or("").to_ascii_lowercase();
+            let named_colour =
+                p.contains("diffusecolor") || p.contains("basecolor") || p.contains("base_color");
+            let not_colour = NON_COLOUR_MAPS.iter().any(|k| p.contains(k));
+            if named_colour {
+                mat_tex.entry(par).or_insert(child);
+            } else if !not_colour {
+                // Unknown property, or a plain `OO` link with no property at all: the exporter's
+                // only texture link, so it is the best base-colour candidate available.
+                let _ = kind;
+                mat_tex_alt.entry(par).or_insert(child);
+            }
+        } else if sc.vid_ids.contains(&child) && sc.tex_ids.contains(&par) {
+            tex_video.entry(par).or_insert(child);
         }
     }
 
@@ -994,42 +1194,161 @@ pub fn parse_fbx_pbr(data: &[u8]) -> (ObjMesh, GltfPbr) {
         }
     };
 
-    // One texture SLOT per distinct material (encountered in emit order), each a 1×1 colour swatch.
-    let mut slot_of: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    let mut swatches: Vec<[f32; 3]> = Vec::new();
-    for (gid, verts, indices) in &geoms {
-        let mat_id = gid.and_then(|g| parent.get(&g)).and_then(|m| model_mat.get(m)).copied();
-        let slot = match mat_id {
-            Some(mid) => *slot_of.entry(mid).or_insert_with(|| {
-                swatches.push(mat_color[&mid]);
-                swatches.len() - 1
-            }),
-            None => *slot_of.entry(-1).or_insert_with(|| {
-                swatches.push([0.72, 0.72, 0.72]);
-                swatches.len() - 1
-            }),
-        };
-        // This geometry's material opacity (1 = opaque) → per-vertex alpha, so glass panes are
-        // peeled into the see-through blended pass exactly like OBJ/glTF transparency.
-        let opac = mat_id.and_then(|m| mat_opac.get(&m)).copied().unwrap_or(1.0);
-        let world = world_of(gid);
-        let vbefore = out.positions.len();
-        fbx_emit_geometry(verts, indices, &world, up_axis, &mut out);
-        let vafter = out.positions.len();
-        for _ in (vbefore / 3)..(vafter / 3) {
-            pbr.part_ids.push(slot as u32); // one part id per triangle
+    // ---- material → texture slot, decoded once and shared ----
+    let mut img_slot: HashMap<String, usize> = HashMap::new(); // "v:<id>" embedded / "f:<name>" file
+    let mut col_slot: HashMap<[u8; 4], usize> = HashMap::new();
+    let mut mat_slot: HashMap<i64, Option<usize>> = HashMap::new();
+    let mut resolve = |mid: Option<i64>, pbr: &mut GltfPbr| -> Option<usize> {
+        let key = mid.unwrap_or(-1);
+        if let Some(&s) = mat_slot.get(&key) {
+            return s;
         }
-        for _ in vbefore..vafter {
-            out.alpha.push(opac); // one opacity per vertex (parallel to positions)
+        let mut slot: Option<usize> = None;
+        if let Some(&tid) = mid.and_then(|m| mat_tex.get(&m).or_else(|| mat_tex_alt.get(&m))) {
+            let vid = tex_video.get(&tid).copied();
+            // 1. the image packed inside the file
+            if let Some(v) = vid {
+                let k = format!("v:{v}");
+                if let Some(&s) = img_slot.get(&k) {
+                    slot = Some(s);
+                } else if let Some(bytes) = sc.vid_content.get(&v) {
+                    if let Ok(dec) = image::load_from_memory(bytes) {
+                        let rgba = dec.to_rgba8();
+                        let (w, h) = (rgba.width(), rgba.height());
+                        slot = Some(pbr.textures.len());
+                        pbr.textures.push((w, h, rgba.into_raw()));
+                        img_slot.insert(k, slot.unwrap());
+                    }
+                }
+            }
+            // 2. the image file it names, beside the FBX
+            if slot.is_none() {
+                if let Some(name) = sc.tex_file.get(&tid).or_else(|| vid.and_then(|v| sc.vid_file.get(&v))) {
+                    let k = format!("f:{name}");
+                    if let Some(&s) = img_slot.get(&k) {
+                        slot = Some(s);
+                    } else if let Some((w, h, rgba)) = fbx_load_texture(name, base) {
+                        slot = Some(pbr.textures.len());
+                        pbr.textures.push((w, h, rgba));
+                        img_slot.insert(k, slot.unwrap());
+                    }
+                }
+            }
+        }
+        // 3. no image: a 1×1 swatch of the diffuse colour, so the part still reads as itself.
+        if slot.is_none() {
+            let d = mid.and_then(|m| mat_color.get(&m)).copied().unwrap_or([0.72; 3]);
+            let rgba = [
+                (d[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (d[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (d[2].clamp(0.0, 1.0) * 255.0) as u8,
+                255,
+            ];
+            slot = Some(*col_slot.entry(rgba).or_insert_with(|| {
+                pbr.textures.push((1, 1, rgba.to_vec()));
+                pbr.textures.len() - 1
+            }));
+        }
+        mat_slot.insert(key, slot);
+        slot
+    };
+
+    // ---- emit ----
+    let mut part_of: HashMap<(usize, usize), u32> = HashMap::new(); // (geometry, material slot) → part
+    let mut had_uv = false;
+    for (gi, g) in sc.geoms.iter().enumerate() {
+        let gid = g.i64_at(0);
+        let (verts, indices) = match (
+            g.child("Vertices").and_then(|c| c.first_f64_arr()),
+            g.child("PolygonVertexIndex").and_then(|c| c.first_i32_arr()),
+        ) {
+            (Some(v), Some(i)) => (v, i),
+            _ => continue,
+        };
+        let uv = fbx_uv_layer(g);
+        had_uv |= uv.uvs.len() >= 2;
+        let (mat_poly, mat_all_same) = fbx_material_layer(g);
+        let mats: &[i64] = gid
+            .and_then(|x| parent.get(&x))
+            .and_then(|m| model_mats.get(m))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let world = world_of(&gid);
+        let vcount = verts.len() / 3;
+
+        let pos = |i: usize| -> [f32; 3] {
+            let w = world.transform_point3(glam::DVec3::new(verts[3 * i], verts[3 * i + 1], verts[3 * i + 2]));
+            // Metres = file unit x UnitScaleFactor / 100 — FBX measures in centimetres.
+            let v = if up_axis == 2 { w } else { glam::DVec3::new(w.x, -w.z, w.y) } * (unit_cm / 100.0);
+            [v.x as f32, v.y as f32, v.z as f32]
+        };
+        let uv_at = |pv: usize, vi: usize| -> [f32; 2] {
+            if uv.uvs.len() < 2 {
+                return [0.0, 0.0];
+            }
+            let di = if uv.by_vertex {
+                vi
+            } else if uv.indexed {
+                uv.index.get(pv).map(|v| *v as usize).unwrap_or(0)
+            } else {
+                pv
+            };
+            match (uv.uvs.get(di * 2), uv.uvs.get(di * 2 + 1)) {
+                (Some(u), Some(v)) => [*u as f32, *v as f32],
+                _ => [0.0, 0.0],
+            }
+        };
+
+        let mut poly: Vec<(usize, [f32; 2])> = Vec::new();
+        let mut pv = 0usize;
+        let mut poly_i = 0usize;
+        for &raw in indices {
+            let (vi, last) = if raw < 0 { ((!raw) as usize, true) } else { (raw as usize, false) };
+            if vi < vcount {
+                poly.push((vi, uv_at(pv, vi)));
+            }
+            pv += 1;
+            if !last {
+                continue;
+            }
+            // Which of the owning model's material slots this polygon wears.
+            let local = if mat_all_same {
+                mat_poly.first().copied().unwrap_or(0).max(0) as usize
+            } else {
+                mat_poly.get(poly_i).copied().unwrap_or(0).max(0) as usize
+            };
+            let mid = mats.get(local).or_else(|| mats.first()).copied();
+            let part = *part_of.entry((gi, local)).or_insert_with(|| {
+                let slot = resolve(mid, &mut pbr);
+                pbr.part_texture.push(slot);
+                (pbr.part_texture.len() - 1) as u32
+            });
+            // Material opacity (1 = opaque) → per-vertex alpha, so glass panes are peeled into the
+            // see-through blended pass exactly like OBJ/glTF transparency.
+            let opac = mid.and_then(|m| mat_opac.get(&m)).copied().unwrap_or(1.0);
+            for k in 1..poly.len().saturating_sub(1) {
+                let (a, ua) = poly[0];
+                let (b, ub) = poly[k];
+                let (c, uc) = poly[k + 1];
+                let (pa, pb, pc) = (pos(a), pos(b), pos(c));
+                let n = flat_normal(pa, pb, pc);
+                out.positions.extend_from_slice(&[pa, pb, pc]);
+                out.normals.extend_from_slice(&[n, n, n]);
+                out.alpha.extend_from_slice(&[opac; 3]);
+                pbr.uvs.extend_from_slice(&[ua, ub, uc]);
+                pbr.part_ids.push(part);
+            }
+            poly.clear();
+            poly_i += 1;
         }
     }
     // All-opaque FBX ⇒ drop the alpha array so opaque models keep the fast, byte-identical path.
     trim_alpha(&mut out);
-    pbr.textures = swatches
-        .iter()
-        .map(|c| (1u32, 1u32, vec![(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8, 255]))
-        .collect();
-    pbr.part_texture = (0..swatches.len()).map(Some).collect();
+    // No UV layer anywhere ⇒ drop the (all-zero) channel so the app box-projects instead.
+    if !had_uv {
+        pbr.uvs.clear();
+    }
+    pbr.texture = pbr.textures.first().cloned();
     (out, pbr)
 }
 
@@ -1736,6 +2055,14 @@ pub struct GltfPbr {
     pub part_texture: Vec<Option<usize>>,
     /// Back-compat: the FIRST texture (single-material fast path / older callers).
     pub texture: Option<(u32, u32, Vec<u8>)>,
+    /// Per part: the material's ROUGHNESS and METALLIC.
+    ///
+    /// These were being thrown away, and it showed. glTF carries them per material and every
+    /// import landed on the app's default 0.5 roughness instead — so a pool whose material is
+    /// roughness 0.035 (a mirror) rendered as flat cyan paint with nothing to reflect, and the
+    /// whole scene read matte. Empty when the format has no such notion (OBJ, FBX).
+    pub part_rough: Vec<f32>,
+    pub part_metal: Vec<f32>,
 }
 
 /// Accumulator threaded through the glTF node walk while building the multi-material mesh.
@@ -1746,6 +2073,8 @@ struct GltfBuild {
     had_uv: bool,
     part_ids: Vec<u32>,               // per triangle
     part_texture: Vec<Option<usize>>, // per part → slot in `textures`
+    part_rough: Vec<f32>,
+    part_metal: Vec<f32>,
     textures: Vec<(u32, u32, Vec<u8>)>,
     img_slot: std::collections::HashMap<usize, usize>, // image source index → `textures` slot
     color_slot: std::collections::HashMap<[u8; 4], usize>, // solid-colour factor → slot
@@ -1838,6 +2167,15 @@ fn gltf_emit_mesh(
         let part = build.next_part;
         build.next_part += 1;
         build.part_texture.push(slot);
+        // The surface properties beside the colour. glTF's defaults are 1.0 for both, but a
+        // fully-metal default would turn every untagged material into chrome, so an absent
+        // metallic reads as 0 — dielectric — which is what an architectural export means.
+        let m = material_idx.map(|mi| &doc["materials"][mi]);
+        let num = |p: &str, d: f32| {
+            m.and_then(|m| m.pointer(p)).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d)
+        };
+        build.part_rough.push(num("/pbrMetallicRoughness/roughnessFactor", 0.5).clamp(0.0, 1.0));
+        build.part_metal.push(num("/pbrMetallicRoughness/metallicFactor", 0.0).clamp(0.0, 1.0));
 
         let gp = |i: u32| -> glam::Vec3 {
             let k = i as usize * 3;
@@ -1979,6 +2317,8 @@ pub fn parse_gltf_ex(data: &[u8], base_dir: Option<&std::path::Path>) -> (ObjMes
     if build.part_ids.len() == out.positions.len() / 3 {
         pbr.part_ids = std::mem::take(&mut build.part_ids);
         pbr.part_texture = std::mem::take(&mut build.part_texture);
+        pbr.part_rough = std::mem::take(&mut build.part_rough);
+        pbr.part_metal = std::mem::take(&mut build.part_metal);
     }
     pbr.texture = build.textures.first().cloned(); // back-compat single-texture field
     pbr.textures = std::mem::take(&mut build.textures);
@@ -2282,8 +2622,9 @@ Connections:  {
     fn fbx_binary_reads_one_triangle_uncompressed() {
         let m = parse_fbx(&synth_fbx(false));
         assert_eq!(m.tri_count(), 1, "one polygon → one triangle");
-        // Y-up → Z-up: (0,1,0) becomes (0,0,1).
-        assert_eq!(m.positions[2], [0.0, 0.0, 1.0]);
+        // Y-up → Z-up: (0,1,0) becomes (0,0,1). The synthetic blob carries no `GlobalSettings`,
+        // so it is read as FBX.s default CENTIMETRES — 1 unit lands at 0.01 m.
+        assert_eq!(m.positions[2], [0.0, 0.0, 0.01]);
         assert_eq!(m.normals.len(), m.positions.len());
     }
 
@@ -2291,7 +2632,8 @@ Connections:  {
     fn fbx_binary_reads_one_triangle_zlib_compressed() {
         let m = parse_fbx(&synth_fbx(true));
         assert_eq!(m.tri_count(), 1, "compressed arrays inflate to the same triangle");
-        assert_eq!(m.positions[1], [1.0, 0.0, 0.0]);
+        // Centimetres, as above — no `GlobalSettings` in the synthetic blob.
+        assert_eq!(m.positions[1], [0.01, 0.0, 0.0]);
     }
 
     #[test]
@@ -2633,5 +2975,570 @@ f 1//1 2//1 3//1
         assert!((gltf_material_alpha(&doc, &mat(1)) - 0.3).abs() < 1e-6, "BLEND takes baseColorFactor.a");
         assert_eq!(gltf_material_alpha(&doc, &mat(2)), 1.0, "BLEND with no factor defaults to 1");
         assert_eq!(gltf_material_alpha(&doc, &serde_json::json!({})), 1.0, "no material ⇒ opaque");
+    }
+}
+
+#[cfg(test)]
+mod villa_import_tests {
+    /// Load the exported villa scene through the real importer and report what it costs.
+    ///
+    /// The app auto-loads this file at startup, so "does it parse" and "how long does it take" are
+    /// startup-blocking questions. Ignored because it depends on a 119 MB file outside the repo.
+    ///
+    /// `cargo test --release -p cad_app --bin simlux villa_scene_imports -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the exported villa scene; run explicitly"]
+    fn villa_scene_imports() {
+        const P: &str = r"G:\blender dev\staircase\villa scene\villa_scene.glb";
+        let path = std::path::Path::new(P);
+        assert!(path.exists(), "{P} missing — run build/export_factory.py");
+        let t0 = std::time::Instant::now();
+        let bytes = std::fs::read(path).expect("read");
+        let read_ms = t0.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let (mesh, pbr) = super::parse_gltf_ex(&bytes, path.parent());
+        let parse_ms = t1.elapsed().as_millis();
+
+        let tris = mesh.positions.len() / 3;
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in &mesh.positions {
+            for k in 0..3 {
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        let tex_px: usize = pbr.textures.iter().map(|(w, h, _)| *w as usize * *h as usize).sum();
+        println!("file      : {:.1} MB, read {read_ms} ms", bytes.len() as f64 / 1e6);
+        println!("parse     : {parse_ms} ms");
+        println!("triangles : {tris}");
+        println!("uvs       : {} (verts {})", pbr.uvs.len(), mesh.positions.len());
+        println!("parts     : {} distinct", pbr.part_texture.len());
+        println!("textures  : {} images, {:.1} Mpx, {:.0} MB RGBA",
+                 pbr.textures.len(), tex_px as f64 / 1e6, tex_px as f64 * 4.0 / 1e6);
+        println!("bounds    : {mn:?} .. {mx:?}");
+        println!("size      : {:?} m", [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]);
+
+        assert!(tris > 1_500_000, "expected the full scene, got {tris} triangles");
+        assert_eq!(pbr.uvs.len(), mesh.positions.len(), "every vertex must carry a UV");
+        assert_eq!(pbr.part_ids.len(), tris, "one part id per triangle");
+        // Authored in metres at real-world size — the autoload depends on this.
+        let longest = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]);
+        assert!((80.0..95.0).contains(&longest), "expected an ~86 m site, got {longest} m");
+        assert!(mx[2] - mn[2] > 8.0 && mx[2] - mn[2] < 14.0, "expected a ~10.6 m tall scene");
+    }
+}
+
+#[cfg(test)]
+mod import_scale_tests {
+    use crate::factory::FactoryState;
+    use crate::mesh_io::ObjMesh;
+
+    /// A cuboid mesh `sx × sy × sz` metres, as two triangles per face is unnecessary — one
+    /// degenerate-free triangle spanning the box's extremes is enough to exercise the bounds path.
+    fn box_mesh(sx: f32, sy: f32, sz: f32) -> ObjMesh {
+        let mut m = ObjMesh::default();
+        m.positions = vec![[0.0, 0.0, 0.0], [sx, sy, 0.0], [sx, sy, sz]];
+        m.normals = vec![[0.0, 0.0, 1.0]; 3];
+        m
+    }
+
+    /// The autoload's whole correctness rests on this: `add_furniture_asset` shrinks a big import
+    /// toward 1.5 m, and `import_scale` must record exactly enough to undo it. Getting it wrong is
+    /// how the previous autoload ended up carrying a hand-tuned `×35` that was right for one file
+    /// and wrong for any other.
+    #[test]
+    fn import_scale_undoes_the_normalisation_exactly() {
+        let mut st = FactoryState::default();
+        // An 86 m site — the villa scene. Normalised down, so the factor must be < 1.
+        let a = st.add_furniture_asset("villa".into(), box_mesh(86.0, 74.0, 10.6));
+        let asset = &st.furniture_lib[a];
+        assert!(asset.import_scale < 1.0, "a big model is shrunk: {}", asset.import_scale);
+        let longest = |a: &crate::factory::FurnitureAsset| {
+            let e = [a.local_max[0] - a.local_min[0], a.local_max[1] - a.local_min[1], a.local_max[2] - a.local_min[2]];
+            e[0].max(e[1]).max(e[2])
+        };
+        assert!((longest(asset) - 1.5).abs() < 1e-3, "normalised to 1.5 m, got {}", longest(asset));
+        // Undoing it must restore the real 86 m.
+        let world = longest(asset) / asset.import_scale;
+        assert!((world - 86.0).abs() < 0.01, "1/import_scale must restore real size, got {world}");
+
+        // A normal-sized piece is left alone, and undoing is then a no-op.
+        let b = st.add_furniture_asset("chair".into(), box_mesh(0.6, 0.6, 0.9));
+        assert_eq!(st.furniture_lib[b].import_scale, 1.0, "an in-range model is not rescaled");
+        assert!((longest(&st.furniture_lib[b]) - 0.9).abs() < 1e-4);
+
+        // …and a millimetre export is scaled UP, so the factor exceeds 1.
+        let c = st.add_furniture_asset("tiny".into(), box_mesh(0.02, 0.01, 0.03));
+        assert!(st.furniture_lib[c].import_scale > 1.0, "a sub-50 mm model is grown");
+        assert!((longest(&st.furniture_lib[c]) - 1.5).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
+mod gltf_material_dump {
+    /// Dump every material in a GLB: whether it carries a base-colour IMAGE or only a flat factor.
+    /// `cargo test --release -p cad_app --bin simlux dump_gltf_materials -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic"]
+    fn dump_gltf_materials() {
+        let p = std::env::var("GLB").unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
+        let bytes = std::fs::read(&p).expect("read glb");
+        let (json, _) = super::glb_split(&bytes).expect("glb");
+        let doc: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let mats = doc["materials"].as_array().cloned().unwrap_or_default();
+        println!("{} materials, {} textures, {} images",
+            mats.len(),
+            doc["textures"].as_array().map(|a| a.len()).unwrap_or(0),
+            doc["images"].as_array().map(|a| a.len()).unwrap_or(0));
+        let mut with_img = 0;
+        for (i, m) in mats.iter().enumerate() {
+            let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let ti = m.pointer("/pbrMetallicRoughness/baseColorTexture/index").and_then(|v| v.as_u64());
+            let f = m.pointer("/pbrMetallicRoughness/baseColorFactor")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_f64()).map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(","))
+                .unwrap_or_else(|| "1,1,1,1 (default)".into());
+            let nrm = m.pointer("/normalTexture/index").is_some();
+            let mr = m.pointer("/pbrMetallicRoughness/metallicRoughnessTexture/index").is_some();
+            let img = ti.and_then(|t| doc["textures"][t as usize].get("source").and_then(|v| v.as_u64()))
+                .and_then(|s| doc["images"][s as usize].get("name").and_then(|v| v.as_str()).map(|x| x.to_string()));
+            if img.is_some() { with_img += 1; }
+            println!("{i:>3}  {name:<34} base={:<28} factor=[{f}] {}{}",
+                img.unwrap_or_else(|| "— NO IMAGE —".into()),
+                if nrm { "+nrm" } else { "" }, if mr { "+mr" } else { "" });
+        }
+        println!("\n{with_img}/{} materials carry a base-colour image", mats.len());
+    }
+}
+
+#[cfg(test)]
+mod villa_perf_tests {
+    /// Time every stage the app runs when the villa scene loads and then draws.
+    ///
+    /// "Laggy and unusable" is a symptom with several candidate causes; this separates them so the
+    /// fix lands on the one that actually costs the time rather than the one that looks expensive.
+    ///
+    /// `cargo test --release -p cad_app --bin simlux villa_pipeline_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "profiling; needs the exported villa scene"]
+    fn villa_pipeline_timing() {
+        use std::time::Instant;
+        const P: &str = r"G:\blender dev\staircase\villa scene\villa_scene.glb";
+        if !std::path::Path::new(P).exists() {
+            eprintln!("{P} missing — skipping");
+            return;
+        }
+        let bytes = std::fs::read(P).unwrap();
+        let t = Instant::now();
+        let (mesh, pbr) = super::parse_gltf_ex(&bytes, std::path::Path::new(P).parent());
+        println!("parse_gltf_ex        {:>8.0} ms   ({} tris)", t.elapsed().as_secs_f64() * 1e3, mesh.positions.len() / 3);
+
+        let mut st = crate::factory::FactoryState::default();
+        let t = Instant::now();
+        let idx = st.add_furniture_asset("villa".into(), mesh);
+        println!("add_furniture_asset  {:>8.0} ms", t.elapsed().as_secs_f64() * 1e3);
+
+        // The app attaches the glTF UVs + part ids after adding the asset.
+        let t = Instant::now();
+        {
+            let a = &mut st.furniture_lib[idx];
+            a.uvs = pbr.uvs.clone();
+            a.part_ids = pbr.part_ids.clone();
+        }
+        println!("attach uvs+parts     {:>8.0} ms", t.elapsed().as_secs_f64() * 1e3);
+
+        // THE suspect: a coplanar flood fill + weld over every triangle, run lazily on first draw.
+        let t = Instant::now();
+        let g = st.furniture_lib[idx].group_geom();
+        let el = t.elapsed().as_secs_f64() * 1e3;
+        let nface = g.face.iter().max().map(|m| m + 1).unwrap_or(0);
+        let nbody = g.body.iter().max().map(|m| m + 1).unwrap_or(0);
+        println!("group_geom           {:>8.0} ms   ({nface} faces, {nbody} bodies)  <-- once, on first draw", el);
+
+        let t = Instant::now();
+        let _ = st.furniture_lib[idx].group_geom();
+        println!("group_geom (cached)  {:>8.3} ms", t.elapsed().as_secs_f64() * 1e3);
+
+        let t = Instant::now();
+        let n = st.furniture_lib[idx].is_translucent();
+        println!("is_translucent       {:>8.0} ms   ({n})", t.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
+#[cfg(test)]
+mod heavy_group_tests {
+    use crate::factory::{FactoryState, COPLANAR_TRI_LIMIT};
+    use crate::mesh_io::ObjMesh;
+
+    /// `n` disjoint triangles — enough geometry to cross the heavy-mesh threshold without needing
+    /// a real model.
+    fn soup(n: usize) -> ObjMesh {
+        let mut m = ObjMesh::default();
+        m.positions.reserve(n * 3);
+        for i in 0..n {
+            let x = i as f32 * 0.01;
+            m.positions.push([x, 0.0, 0.0]);
+            m.positions.push([x + 0.005, 0.0, 0.0]);
+            m.positions.push([x, 0.005, 0.0]);
+        }
+        m.normals = vec![[0.0, 0.0, 1.0]; n * 3];
+        m
+    }
+
+    /// A heavy import must NOT run the coplanar flood fill. It used to, on the UI thread, at first
+    /// draw: 3.7 s in release for the villa scene and far worse in a debug build — which is what
+    /// "unresponsive after loading" was. The parts it falls back to are also the better grouping at
+    /// that size (25 materials, versus 407,858 coplanar regions nobody can select individually).
+    #[test]
+    fn a_heavy_import_groups_by_material_part_not_by_coplanar_region() {
+        let n = COPLANAR_TRI_LIMIT + 1000;
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("heavy".into(), soup(n));
+        // Three source materials, as a real import would carry.
+        st.furniture_lib[idx].part_ids = (0..n).map(|i| (i % 3) as u32).collect();
+
+        let t = std::time::Instant::now();
+        let g = st.furniture_lib[idx].group_geom();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+
+        assert_eq!(g.face.len(), n, "one group id per triangle");
+        let faces: std::collections::BTreeSet<u32> = g.face.iter().copied().collect();
+        assert_eq!(faces.len(), 3, "the material parts ARE the faces on a heavy mesh: {faces:?}");
+        assert_eq!(g.body, g.face, "and the bodies match them");
+        // A generous ceiling: the flood fill on this many triangles takes hundreds of ms even in
+        // release, so anything near it means the shortcut stopped working.
+        assert!(ms < 200.0, "heavy grouping must be near-free, took {ms:.0} ms");
+
+        // A mesh with no part ids at all degrades to ONE group rather than to a long wait.
+        let idx2 = st.add_furniture_asset("heavy_bare".into(), soup(n));
+        let g2 = st.furniture_lib[idx2].group_geom();
+        assert!(g2.face.iter().all(|&f| f == 0), "no parts ⇒ a single whole-object group");
+
+        // …and a SMALL mesh still gets the real coplanar grouping, which is what makes
+        // click-a-face texturing work on ordinary furniture.
+        let mut st3 = FactoryState::default();
+        let small = st3.add_furniture_asset("small".into(), soup(64));
+        let g3 = st3.furniture_lib[small].group_geom();
+        let f3: std::collections::BTreeSet<u32> = g3.face.iter().copied().collect();
+        assert!(f3.len() > 1, "a small mesh keeps per-face grouping ({} groups)", f3.len());
+    }
+}
+
+#[cfg(test)]
+mod gltf_texture_content {
+    /// The average colour of every base-colour image the villa exports, so a "texture is present"
+    /// claim can be checked against "the texture is not white". The roof and the lawn both shipped
+    /// as present-but-white before the exporter learned to pick the albedo and bake procedurals.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn dump_texture_average_colours() {
+        let p = std::env::var("GLB").unwrap_or_else(|_| r"G:\blender dev\staircase\villa scene\villa_scene.glb".into());
+        let bytes = std::fs::read(&p).expect("read glb");
+        let (_m, pbr) = super::parse_gltf_ex(&bytes, std::path::Path::new(&p).parent());
+        println!("{} textures, {} parts", pbr.textures.len(), pbr.part_texture.len());
+        for (i, (w, h, rgba)) in pbr.textures.iter().enumerate() {
+            let mut s = [0u64; 3];
+            let n = (rgba.len() / 4).max(1);
+            for px in rgba.chunks_exact(4) {
+                for k in 0..3 {
+                    s[k] += px[k] as u64;
+                }
+            }
+            let avg = [s[0] / n as u64, s[1] / n as u64, s[2] / n as u64];
+            let white = avg.iter().all(|&c| c > 235);
+            println!("  tex {i:>2}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}) {}",
+                avg[0], avg[1], avg[2], if white { "<-- ESSENTIALLY WHITE" } else { "" });
+        }
+    }
+}
+
+/// Binary FBX carrying real textures. The fixtures are a cube whose sides wear a four-quadrant
+/// image and whose top wears a plain red material — two materials on ONE mesh, so the reader has
+/// to honour `LayerElementMaterial` rather than assume one material per geometry. Built by
+/// `assets/test/fbx/make_fbx_fixtures.py` (there was no textured FBX on the machine to test with).
+#[cfg(test)]
+mod fbx_textures {
+    const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/test/fbx");
+
+    fn load(name: &str) -> (super::ObjMesh, super::GltfPbr) {
+        let p = std::path::Path::new(DIR).join(name);
+        let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("fixture {}: {e}", p.display()));
+        super::parse_fbx_pbr_at(&bytes, p.parent())
+    }
+
+    /// The distinct opaque colours in an RGBA image, rounded hard so JPEG-ish drift can't matter.
+    fn palette(rgba: &[u8]) -> std::collections::BTreeSet<[u8; 3]> {
+        rgba.chunks_exact(4)
+            .map(|p| [p[0] & 0xE0, p[1] & 0xE0, p[2] & 0xE0])
+            .collect()
+    }
+
+    /// The headline claim: an FBX with an image inside it now imports WEARING that image.
+    #[test]
+    fn an_embedded_texture_is_read_out_of_the_fbx_itself() {
+        let (mesh, pbr) = load("tex_cube_embedded.fbx");
+        assert_eq!(mesh.tri_count(), 12, "a cube is 12 triangles");
+        let images: Vec<_> = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).collect();
+        assert_eq!(images.len(), 1, "one real image, got textures {:?}",
+            pbr.textures.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>());
+        let (w, h, rgba) = images[0];
+        assert_eq!((*w, *h), (64, 64));
+        // The four quadrant colours must all survive — a wrong decode gives grey or one colour.
+        let pal = palette(rgba);
+        for want in [[0xE0, 0, 0], [0, 0xE0, 0], [0, 0, 0xE0], [0xE0, 0xE0, 0]] {
+            assert!(pal.contains(&want), "quadrant {want:?} missing from {pal:?}");
+        }
+    }
+
+    /// The same model with the texture left on disk beside it must import identically — that is
+    /// the far more common layout (`model.fbx` + a `textures/` folder).
+    #[test]
+    fn a_texture_file_beside_the_fbx_resolves_the_same_way() {
+        let (_, emb) = load("tex_cube_embedded.fbx");
+        let (_, ext) = load("tex_cube_external.fbx");
+        let img = |p: &super::GltfPbr| p.textures.iter().find(|(w, h, _)| *w > 1 || *h > 1).cloned();
+        let (a, b) = (img(&emb).expect("embedded image"), img(&ext).expect("external image"));
+        assert_eq!((a.0, a.1), (b.0, b.1), "same image dimensions either way");
+        assert_eq!(palette(&a.2), palette(&b.2), "same pixels either way");
+    }
+
+    /// Two materials on one mesh: the reader must split the mesh by per-polygon material index.
+    /// Before this, whichever material connected first won and the whole cube wore one appearance.
+    #[test]
+    fn one_mesh_with_two_materials_splits_into_two_parts() {
+        let (mesh, pbr) = load("tex_cube_embedded.fbx");
+        assert_eq!(pbr.part_ids.len(), mesh.tri_count(), "one part id per triangle");
+        let parts: std::collections::BTreeSet<u32> = pbr.part_ids.iter().copied().collect();
+        assert_eq!(parts.len(), 2, "textured sides and the red top are separate parts");
+
+        // The red top is exactly one quad = 2 triangles; the textured sides are the other 10.
+        let mut count = std::collections::BTreeMap::new();
+        for p in &pbr.part_ids {
+            *count.entry(*p).or_insert(0usize) += 1;
+        }
+        let mut sizes: Vec<usize> = count.values().copied().collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![2, 10], "the +Z face is the two-triangle part");
+
+        // …and they must point at DIFFERENT appearances: one image, one red swatch.
+        let of = |p: u32| pbr.part_texture[p as usize].map(|s| &pbr.textures[s]);
+        let big = count.iter().max_by_key(|(_, n)| **n).map(|(p, _)| *p).unwrap();
+        let small = count.iter().min_by_key(|(_, n)| **n).map(|(p, _)| *p).unwrap();
+        let (bw, bh, _) = of(big).expect("sides have an appearance");
+        assert!(*bw > 1 && *bh > 1, "the sides wear the image");
+        let (sw, sh, srgba) = of(small).expect("top has an appearance");
+        assert_eq!((*sw, *sh), (1, 1), "the top has no image, just its colour");
+        assert!(srgba[0] > 150 && srgba[1] < 80 && srgba[2] < 80, "the top is red, got {srgba:?}");
+    }
+
+    /// Two images on one material — the quadrant colour map and a normal map. The reader must
+    /// choose by what each image FEEDS (`OP … "DiffuseColor"`), not by which it meets first.
+    /// Getting this wrong is not hypothetical: the villa roof rendered WHITE because a curvature
+    /// mask was picked as its colour.
+    #[test]
+    fn a_normal_map_is_not_mistaken_for_the_base_colour() {
+        let (_, pbr) = load("tex_cube_normalmap.fbx");
+        let sides = pbr
+            .part_ids
+            .iter()
+            .copied()
+            .max_by_key(|p| pbr.part_ids.iter().filter(|q| *q == p).count())
+            .expect("parts");
+        let (w, h, rgba) = pbr.part_texture[sides as usize]
+            .map(|s| &pbr.textures[s])
+            .expect("the sides have an appearance");
+        assert_eq!((*w, *h), (64, 64), "the 64² colour map, not the 32² normal map");
+        // A normal map is flat lilac everywhere; the colour map has four saturated quadrants.
+        let pal = palette(rgba);
+        assert!(pal.contains(&[0xE0, 0, 0]), "expected the colour map's red, got {pal:?}");
+    }
+
+    /// The discriminating half of the case above: a material wearing ONLY a normal map. There is
+    /// no colour image to prefer, so the reader must fall back to the material's diffuse colour —
+    /// binding the normal map would paint the cube flat lilac, a picture of its own bumps.
+    #[test]
+    fn a_material_with_only_a_normal_map_falls_back_to_its_colour() {
+        let (_, pbr) = load("tex_cube_normalonly.fbx");
+        let images: Vec<_> = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).collect();
+        assert!(images.is_empty(), "no image should be bound, got {:?}",
+            images.iter().map(|(w, h, _)| (*w, *h)).collect::<Vec<_>>());
+        // The sides must carry the material's own blue, not the normal map's lilac.
+        let sides = pbr
+            .part_ids
+            .iter()
+            .copied()
+            .max_by_key(|p| pbr.part_ids.iter().filter(|q| *q == p).count())
+            .expect("parts");
+        let (_, _, rgba) = pbr.part_texture[sides as usize]
+            .map(|s| &pbr.textures[s])
+            .expect("the sides have an appearance");
+        assert!(rgba[2] > rgba[0] + 60, "expected the material's blue, got {rgba:?}");
+    }
+
+    /// UVs are the other half of "textures work" — an image with no UVs is box-projected, which
+    /// looks nothing like what was authored. Cube-projected faces span the full 0..1 square.
+    #[test]
+    fn uvs_come_through_per_vertex_and_span_the_map() {
+        let (mesh, pbr) = load("tex_cube_embedded.fbx");
+        assert_eq!(pbr.uvs.len(), mesh.positions.len(), "one UV per emitted vertex");
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for uv in &pbr.uvs {
+            for k in 0..2 {
+                lo[k] = lo[k].min(uv[k]);
+                hi[k] = hi[k].max(uv[k]);
+            }
+        }
+        assert!(lo[0] <= 0.01 && lo[1] <= 0.01, "UVs start at the map origin, got {lo:?}");
+        assert!(hi[0] >= 0.99 && hi[1] >= 0.99, "UVs reach the far corner, got {hi:?}");
+        // Not all one value — a collapsed UV set would pass the span test on a lucky pair.
+        let distinct: std::collections::BTreeSet<[u32; 2]> =
+            pbr.uvs.iter().map(|t| [t[0].to_bits(), t[1].to_bits()]).collect();
+        assert!(distinct.len() >= 4, "expected varied UVs, got {} distinct", distinct.len());
+    }
+
+    /// A geometry-only regression guard: the appearance work must not disturb the mesh. The cube
+    /// must come back cubic and centred.
+    ///
+    /// It comes back at 2 m, not 200: FBX measures in CENTIMETRES and the reader now applies
+    /// `GlobalSettings > UnitScaleFactor` — metres = unit x factor / 100. Before that every FBX
+    /// imported 100x too big, which furniture normalisation hid and a door handle exposed the
+    /// moment it had to sit at TRUE scale.
+    #[test]
+    fn the_textured_reader_still_places_geometry_correctly() {
+        let (mesh, _) = load("tex_cube_embedded.fbx");
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &mesh.positions {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        for k in 0..3 {
+            assert!((hi[k] - lo[k] - 2.0).abs() < 1e-4, "axis {k} spans {} m, want 2", hi[k] - lo[k]);
+            assert!((hi[k] + lo[k]).abs() < 1e-4, "axis {k} is off centre");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fbx_survey {
+    /// Dump the node tree of a binary FBX — the ground truth a reader has to be written against.
+    /// Run with: cargo test -p cad_app dump_binary_fbx_tree -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic"]
+    fn dump_binary_fbx_tree() {
+        // Override with SIMLUX_FBX=<path> to dump any other file.
+        let path = std::env::var("SIMLUX_FBX").unwrap_or_else(|_| {
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../assets/test/fbx/tex_cube_embedded.fbx").into()
+        });
+        let data = std::fs::read(&path).expect("fixture");
+        let v75 = u32::from_le_bytes([data[23], data[24], data[25], data[26]]) >= 7500;
+        let mut cur = super::FbxCursor { buf: &data, pos: 27 };
+        let root = super::fbx_parse_siblings(&mut cur, v75, data.len());
+        fn walk(ns: &[super::FbxNode], d: usize) {
+            for n in ns {
+                let p: Vec<String> = n.props.iter().map(|v| match v {
+                    super::FbxVal::I(x) => format!("I({x})"),
+                    super::FbxVal::F(x) => format!("F({x:.3})"),
+                    super::FbxVal::S(s) => format!("S({:?})", &s[..s.len().min(60)]),
+                    super::FbxVal::Fa(a) => format!("d[{}]", a.len()),
+                    super::FbxVal::Ia(a) => format!("i[{}]", a.len()),
+                    super::FbxVal::Raw(b) => format!("raw[{}]", b.len()),
+                    super::FbxVal::Skip => "SKIP".into(),
+                }).collect();
+                println!("{:indent$}{} {}", "", n.name, p.join(" "), indent = d * 2);
+                if d < 5 { walk(&n.children, d + 1); }
+            }
+        }
+        walk(&root, 0);
+    }
+
+    /// The real-world check on the binary-FBX texture reader: point `SIMLUX_FBX` at any textured
+    /// FBX and see what comes back — parts, UVs, and the average colour of every image bound, so a
+    /// map that decoded to white/grey (the failure that made the villa roof white in glTF) is
+    /// visible rather than merely absent.
+    ///   SIMLUX_FBX=<file> cargo test -p cad_app --release report_fbx_textures -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic"]
+    fn report_fbx_textures() {
+        let path = match std::env::var("SIMLUX_FBX") {
+            Ok(p) => p,
+            Err(_) => {
+                println!("set SIMLUX_FBX=<path to a textured .fbx>");
+                return;
+            }
+        };
+        let p = std::path::Path::new(&path);
+        let bytes = std::fs::read(p).expect("readable fbx");
+        let t = std::time::Instant::now();
+        let (mesh, pbr) = super::parse_fbx_pbr_at(&bytes, p.parent());
+        let ms = t.elapsed().as_millis();
+        println!("{}  {:.1} MB, parsed in {ms} ms", p.display(), bytes.len() as f64 / 1e6);
+        println!("  triangles {}   parts {}   uvs {}",
+            mesh.tri_count(), pbr.part_texture.len(), pbr.uvs.len());
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &mesh.positions {
+            for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); }
+        }
+        println!("  bounds    {:?} .. {:?}  size {:?}", lo, hi,
+            [hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]]);
+        let mut images = 0;
+        for (i, (w, h, rgba)) in pbr.textures.iter().enumerate() {
+            let n = (rgba.len() / 4).max(1) as u64;
+            let mut s = [0u64; 3];
+            for px in rgba.chunks_exact(4) {
+                for k in 0..3 {
+                    s[k] += px[k] as u64;
+                }
+            }
+            let avg = [s[0] / n, s[1] / n, s[2] / n];
+            if *w > 1 || *h > 1 {
+                images += 1;
+                println!("  tex {i:>3}  {w:>5}x{h:<5} avg=({:>3},{:>3},{:>3}){}",
+                    avg[0], avg[1], avg[2],
+                    if avg.iter().all(|&c| c > 235) { "   <-- ESSENTIALLY WHITE" } else { "" });
+            }
+        }
+        println!("  images {images} of {} appearances", pbr.textures.len());
+    }
+
+    /// What does a BINARY FBX actually contain? The importer currently gives these files a 1×1
+    /// colour swatch per material and no UVs at all, so "textures don't work on FBX" needs to be
+    /// grounded in what is in the files before anything is written to read it.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn survey_binary_fbx_contents() {
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for d in ["assets/cc0/furniture", "assets/apertures"] {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                paths.extend(rd.flatten().map(|e| e.path()).filter(|p| {
+                    p.extension().map(|e| e.eq_ignore_ascii_case("fbx")).unwrap_or(false)
+                }));
+            }
+        }
+        for extra in [r"G:\blender dev\staircase\villa model\build\villa_v1.fbx",
+                      r"G:\blender dev\staircase\cabinet\build\kitchen_v1.fbx"] {
+            let p = std::path::PathBuf::from(extra);
+            if p.exists() { paths.push(p); }
+        }
+        for p in paths {
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let ascii = super::is_ascii_fbx(&bytes);
+            let (mesh, pbr) = if ascii {
+                super::parse_fbx_ascii(&bytes, p.parent())
+            } else {
+                super::parse_fbx_pbr_at(&bytes, p.parent())
+            };
+            let real_imgs = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).count();
+            println!("{:<44} {:<7} {:>8} tris  uv={:<5} parts={:<4} tex={} (real images {})",
+                p.file_name().unwrap().to_string_lossy(),
+                if ascii { "ascii" } else { "binary" },
+                mesh.positions.len() / 3,
+                !pbr.uvs.is_empty(),
+                pbr.part_texture.len(),
+                pbr.textures.len(),
+                real_imgs);
+        }
     }
 }

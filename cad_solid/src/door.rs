@@ -25,8 +25,12 @@ pub struct DoorInput {
     pub frame_depth: f32,
     /// How far the stop projects into the opening (the rebate).
     pub frame_stop_depth: f32,
-    /// Architrave (casing) face width.
+    /// Architrave (casing) face width — the SIDE legs, measured across the board.
     pub arch_width: f32,
+    /// Architrave HEAD face width — the depth of the band over the opening, read as its "height"
+    /// on elevation. Usually equal to [`Self::arch_width`], but a deeper head is a common
+    /// (and deliberate) joinery choice, so it is its own number.
+    pub arch_head_width: f32,
     /// Architrave projection proud of the wall face.
     pub arch_thickness: f32,
     pub stile_width: f32,
@@ -40,6 +44,10 @@ pub struct DoorInput {
     pub hinge_side: f32,
     pub lever_length: f32,
     pub lever_standoff: f32,
+    /// Draw the door's OWN rose + lever. False when a handle from the library is being welded on
+    /// instead — otherwise the leaf carries two sets of hardware at the same spindle, which is what
+    /// happened before this flag existed.
+    pub builtin_hardware: bool,
 }
 
 impl Default for DoorInput {
@@ -54,6 +62,7 @@ impl Default for DoorInput {
             frame_depth: 0.11223,
             frame_stop_depth: 0.0129,
             arch_width: 0.08098,
+            arch_head_width: 0.08098, // the measured door's head matches its legs
             arch_thickness: 0.01715,
             stile_width: 0.10707,
             rail_width: 0.10723,
@@ -65,6 +74,7 @@ impl Default for DoorInput {
             hinge_side: 1.0,
             lever_length: 0.14331,
             lever_standoff: 0.02179,
+            builtin_hardware: true,
         }
     }
 }
@@ -131,6 +141,13 @@ pub fn plan(inp: &DoorInput) -> Result<(DoorMetrics, Vec<String>), ArchError> {
     if inp.handle_backset + inp.lever_length >= inp.door_width {
         return Err(ArchError::NonPositive("lever overruns the leaf (handle_backset + lever_length ≥ door_width)"));
     }
+    if inp.arch_width <= 0.0 || inp.arch_head_width <= 0.0 || inp.arch_thickness <= 0.0 {
+        return Err(ArchError::NonPositive("architrave size"));
+    }
+    // The handle must sit ON the leaf, not above its head or below its bottom rail.
+    if inp.handle_height <= inp.door_gap_bottom || inp.handle_height >= inp.door_gap_bottom + inp.door_height {
+        return Err(ArchError::NonPositive("handle height is off the leaf"));
+    }
 
     let rebate_opening_w = inp.door_width;
     let rebate_opening_h = inp.door_height + inp.door_gap_bottom;
@@ -142,7 +159,7 @@ pub fn plan(inp: &DoorInput) -> Result<(DoorMetrics, Vec<String>), ArchError> {
         structural_opening_w: rebate_opening_w + 2.0 * inp.frame_face_width,
         structural_opening_h: rebate_opening_h + inp.frame_face_width,
         overall_w: rebate_opening_w + 2.0 * inp.arch_width,
-        overall_h: rebate_opening_h + inp.arch_width,
+        overall_h: rebate_opening_h + inp.arch_head_width,
         overall_depth: inp.frame_depth + 2.0 * inp.arch_thickness,
         panel_w,
         panel_h,
@@ -242,7 +259,9 @@ pub fn build(inp: &DoorInput) -> Result<(DoorMetrics, SolidMesh), ArchError> {
     //    two casings differ in width (spec §B6.3). Each is a three-bar frame (no bottom casing). ──
     let mut casing = |mesh: &mut SolidMesh, part: Part, inner_w: f32, inner_h: f32, y: [f32; 2]| {
         let ox = inner_w / 2.0 + inp.arch_width;
-        let oz = inner_h + inp.arch_width;
+        // The head band is its own depth — a deeper head over equal legs is deliberate joinery,
+        // not a mistake, so it does not follow `arch_width`.
+        let oz = inner_h + inp.arch_head_width;
         push_box(mesh, part, [-ox, -inner_w / 2.0 + OVERLAP], y, [0.0, oz]); // left
         push_box(mesh, part, [inner_w / 2.0 - OVERLAP, ox], y, [0.0, oz]); // right
         push_box(mesh, part, [-ox, ox], y, [inner_h - OVERLAP, oz]); // head
@@ -261,16 +280,20 @@ pub fn build(inp: &DoorInput) -> Result<(DoorMetrics, SolidMesh), ArchError> {
     }
 
     // ── HANDLE: rose + lever on the OTHER edge, the lever pointing INWARD toward the hinges. ──
-    let lever_dir = if inp.hinge_side >= 0.0 { 1.0 } else { -1.0 }; // toward the hinge side
-    let handle_edge = -hinge_x; // opposite the hinges
-    let hx = handle_edge + lever_dir * inp.handle_backset; // lever centre, backset in from the leading edge
-    let hz = inp.handle_height;
-    push_box(&mut mesh, Part::Handle, [hx - 0.0266, hx + 0.0266], [0.0, 0.0066], [hz - 0.0266, hz + 0.0266]); // front rose
-    push_box(&mut mesh, Part::Handle, [hx - 0.0266, hx + 0.0266], [-dt - 0.0066, -dt], [hz - 0.0266, hz + 0.0266]); // back rose
-    let bar_x = [hx, hx + lever_dir * inp.lever_length]; // toward the hinge side
-    let so = inp.lever_standoff;
-    push_box(&mut mesh, Part::Handle, bar_x, [so - 0.014, so + 0.014], [hz - 0.014, hz + 0.014]); // front lever
-    push_box(&mut mesh, Part::Handle, bar_x, [-dt - so - 0.014, -dt - so + 0.014], [hz - 0.014, hz + 0.014]); // back lever
+    // Skipped when a library handle is being welded on at the same spindle — two levers on one
+    // leaf is worse than none, because it reads as a modelling error rather than a missing part.
+    if inp.builtin_hardware {
+        let lever_dir = if inp.hinge_side >= 0.0 { 1.0 } else { -1.0 }; // toward the hinge side
+        let handle_edge = -hinge_x; // opposite the hinges
+        let hx = handle_edge + lever_dir * inp.handle_backset; // lever centre, backset in from the leading edge
+        let hz = inp.handle_height;
+        push_box(&mut mesh, Part::Handle, [hx - 0.0266, hx + 0.0266], [0.0, 0.0066], [hz - 0.0266, hz + 0.0266]); // front rose
+        push_box(&mut mesh, Part::Handle, [hx - 0.0266, hx + 0.0266], [-dt - 0.0066, -dt], [hz - 0.0266, hz + 0.0266]); // back rose
+        let bar_x = [hx, hx + lever_dir * inp.lever_length]; // toward the hinge side
+        let so = inp.lever_standoff;
+        push_box(&mut mesh, Part::Handle, bar_x, [so - 0.014, so + 0.014], [hz - 0.014, hz + 0.014]); // front lever
+        push_box(&mut mesh, Part::Handle, bar_x, [-dt - so - 0.014, -dt - so + 0.014], [hz - 0.014, hz + 0.014]); // back lever
+    }
 
     Ok((m, mesh))
 }
@@ -345,11 +368,80 @@ mod tests {
         }
     }
 
+    /// The head architrave is its OWN depth: raising it must raise the overall height and the
+    /// mesh's top, and must NOT touch the width (which the legs own).
+    #[test]
+    fn the_architrave_head_is_independent_of_its_legs() {
+        let base = DoorInput::default();
+        let (m0, mesh0) = build(&base).unwrap();
+        let tall = DoorInput { arch_head_width: base.arch_width + 0.120, ..base };
+        let (m1, mesh1) = build(&tall).unwrap();
+        assert!((m1.overall_h - m0.overall_h - 0.120).abs() < 1e-5, "head raises overall height");
+        assert!((m1.overall_w - m0.overall_w).abs() < 1e-6, "head leaves the width alone");
+        let top = |m: &SolidMesh| m.bounds().unwrap().1[2];
+        assert!((top(&mesh1) - top(&mesh0) - 0.120).abs() < 1e-4, "the built mesh really is taller");
+
+        // …and the legs still own the width, without moving the head band's own depth.
+        let wide = DoorInput { arch_width: base.arch_width + 0.050, ..base };
+        let (m2, _) = build(&wide).unwrap();
+        assert!((m2.overall_w - m0.overall_w - 0.100).abs() < 1e-5, "legs widen both sides");
+        assert!((m2.overall_h - m0.overall_h).abs() < 1e-6, "legs leave the head alone");
+    }
+
+    /// The whole point of `builtin_hardware`: with a library handle welded on, the door must not
+    /// also draw its own lever at the same spindle.
+    #[test]
+    fn the_builtin_lever_can_be_dropped_for_a_library_handle() {
+        let with = DoorInput::default();
+        let (_m, a) = build(&with).unwrap();
+        assert!(a.face_ids.contains(&(Part::Handle as u32)), "default door carries its own lever");
+
+        let without = DoorInput { builtin_hardware: false, ..with };
+        let (_m, b) = build(&without).unwrap();
+        assert!(!b.face_ids.contains(&(Part::Handle as u32)), "no hardware triangles remain");
+        // Nothing ELSE may vanish with it — this must remove the lever, not the door.
+        for want in [Part::Leaf, Part::Panel, Part::Lining, Part::Stop, Part::ArchFront, Part::ArchBack, Part::Hinge] {
+            assert!(b.face_ids.contains(&(want as u32)), "{want:?} survives");
+        }
+        assert!(b.tri_count() < a.tri_count(), "and it is strictly less geometry");
+    }
+
+    /// The UI offers 50–150 mm backset and 750–1300 mm handle height (the user-facing ranges).
+    /// Every corner of that box must build — a slider that can reach an error is a broken slider.
+    #[test]
+    fn every_offered_handle_position_builds() {
+        for backset in [0.050_f32, 0.100, 0.150] {
+            for height in [0.750_f32, 1.050, 1.300] {
+                for side in [1.0_f32, -1.0] {
+                    let inp = DoorInput {
+                        handle_backset: backset,
+                        handle_height: height,
+                        hinge_side: side,
+                        ..Default::default()
+                    };
+                    let (_m, mesh) = build(&inp).expect("backset {backset} height {height}");
+                    // The lever must still land on the leaf, at the height asked for.
+                    let mut zs: Vec<f32> = Vec::new();
+                    for (t, &id) in mesh.face_ids.iter().enumerate() {
+                        if id == Part::Handle as u32 {
+                            for k in 0..3 { zs.push(mesh.positions[t * 3 + k][2]); }
+                        }
+                    }
+                    let zc = (zs.iter().cloned().fold(f32::MAX, f32::min)
+                        + zs.iter().cloned().fold(f32::MIN, f32::max)) / 2.0;
+                    assert!((zc - height).abs() < 0.03, "handle centred at {height} m, got {zc}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn rejects_bad_inputs() {
         assert!(plan(&DoorInput { door_thickness: 0.2, ..Default::default() }).is_err(), "leaf thicker than wall");
         assert!(plan(&DoorInput { frame_stop_depth: 0.5, ..Default::default() }).is_err(), "stop closes opening");
         assert!(plan(&DoorInput { lever_length: 1.0, ..Default::default() }).is_err(), "lever overruns leaf");
         assert!(plan(&DoorInput { door_width: 0.0, ..Default::default() }).is_err());
+        assert!(plan(&DoorInput { arch_head_width: 0.0, ..Default::default() }).is_err(), "no head casing");
+        assert!(plan(&DoorInput { handle_height: 3.0, ..Default::default() }).is_err(), "handle above the leaf");
     }
 }

@@ -105,13 +105,57 @@ pub struct SunEnv {
     /// Cast shadows from the sun (shadow-map pass). Independent of `enabled` lighting so it can be
     /// turned off if the shadow map misbehaves on a given scene.
     pub shadows: bool,
+    /// Atmospheric turbidity for the analytic sky (see [`crate::env`]). ~2 = crisp alpine air,
+    /// ~6 = hazy summer city, 10+ = fog. Drives both the sky's colour and its gradient.
+    pub turbidity: f32,
+    /// Draw the sky itself behind the model instead of the flat studio backdrop.
+    pub sky_backdrop: bool,
+    /// Ambient occlusion — the contact shading that keeps sky lighting from reading flat.
+    pub ao: crate::env::AoSettings,
+    /// One bounce of coloured light between visible surfaces. Off by default — see
+    /// [`crate::env::GiSettings`] for why this one is opt-in when the others are not.
+    pub gi: crate::env::GiSettings,
+    /// Strength of environment reflections, 0..1. What a glossy surface picks up from the sky.
+    pub reflections: f32,
+    /// Angular DIAMETER of the sun's disc, degrees — how soft its shadows are. The real sun is
+    /// 0.53°; raising it stands in for haze or an overcast sky, which spread the source out. Only
+    /// visible while the still-frame refinement is running (it is integrated over the samples).
+    pub sun_angle_deg: f32,
+    /// How many CASCADES the shadow map is split into. More means sharper shadows near the camera
+    /// (each cascade covers less ground with the same 2048 texels) at the cost of one extra depth
+    /// pass over the scene each. 1 = the single whole-scene map.
+    pub shadow_cascades: u32,
+    /// The air between the camera and the model — see [`crate::env::FogSettings`].
+    pub fog: crate::env::FogSettings,
 }
 
 impl Default for SunEnv {
     fn default() -> Self {
         // London, midsummer noon — a pleasant high sun; OFF by default so nothing changes until
         // the user opts in.
-        Self { enabled: false, lat_deg: 51.5, lon_deg: -0.13, utc_offset: 1.0, month: 6, day: 21, hour: 13.0, north_offset_deg: 0.0, intensity: 1.0, shadows: true }
+        Self {
+            enabled: false,
+            lat_deg: 51.5,
+            lon_deg: -0.13,
+            utc_offset: 1.0,
+            month: 6,
+            day: 21,
+            hour: 13.0,
+            north_offset_deg: 0.0,
+            intensity: 1.0,
+            shadows: true,
+            turbidity: crate::env::DEFAULT_TURBIDITY,
+            sky_backdrop: true,
+            ao: crate::env::AoSettings::default(),
+            gi: crate::env::GiSettings::default(),
+            reflections: 1.0,
+            sun_angle_deg: crate::env::SUN_ANGLE_DEG,
+            // Three: the point at which a villa-sized site gets centimetre texels close to the
+            // camera, and one more would cost a whole extra depth pass to sharpen ground that is
+            // already too far away to look at.
+            shadow_cascades: 3,
+            fog: crate::env::FogSettings::default(),
+        }
     }
 }
 
@@ -120,11 +164,50 @@ impl SunEnv {
     fn hash_into(&self, h: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         self.enabled.hash(h);
-        for x in [self.lat_deg, self.lon_deg, self.utc_offset, self.hour, self.north_offset_deg, self.intensity] {
+        for x in [self.lat_deg, self.lon_deg, self.utc_offset, self.hour, self.north_offset_deg, self.intensity, self.turbidity] {
             x.to_bits().hash(h);
         }
         self.month.hash(h);
         self.day.hash(h);
+    }
+
+    /// Resolve the whole environment for one frame: the sun as a **direct** light, and the analytic
+    /// sky as everything else — diffuse ambient (via its SH projection) and glossy reflections.
+    ///
+    /// The sky is calibrated against [`Self::resolve`]'s old two-colour ambient, so this changes how
+    /// light is *distributed* over the dome without changing how much of it there is. That keeps the
+    /// daylight calibration that was matched to Blender intact. Returns
+    /// `(enabled, sun direction, sun radiance, environment)`.
+    pub fn resolve_env(&self) -> (bool, Vec3, [f32; 3], crate::env::EnvRender) {
+        let (enabled, dir, sun, sky_col, ground_col) = self.resolve();
+        let mut sky = crate::env::Sky::new(dir, self.turbidity);
+        sky.calibrate(sky_col, ground_col, sun);
+        let sh = if enabled && sky.valid {
+            sky.sh9()
+        } else {
+            // No sun (night, or daylight switched off): fall back to the flat ambient rather than a
+            // model whose normalisation has collapsed. Encoded as the l=0 term alone, which IS a
+            // uniform environment — `sh_ambient` then returns `sky_col` for every normal.
+            let mut sh = [[0.0f32; 3]; 9];
+            for c in 0..3 {
+                sh[0][c] = sky_col[c] * std::f32::consts::PI / 0.886_227;
+            }
+            sh
+        };
+        let env = crate::env::EnvRender {
+            sky: if enabled { Some(sky) } else { None },
+            sh,
+            ao: self.ao,
+            gi: self.gi,
+            backdrop: if enabled && self.sky_backdrop { crate::env::Backdrop::Sky } else { crate::env::Backdrop::Studio },
+            reflections: self.reflections,
+            // Filled in by the caller that owns the loaded map — `SunEnv` describes the SUN, and an
+            // HDRI belongs to the scene, not to a date and a latitude.
+            hdri: None,
+            sun_angle_deg: self.sun_angle_deg.max(0.0),
+            fog: self.fog,
+        };
+        (enabled, dir, sun, env)
     }
 
     /// Resolve the current settings to a directional light: the sun direction (via [`crate::solar`])
@@ -140,8 +223,15 @@ impl SunEnv {
         // yellow). These are HDR radiances — values exceed 1 on purpose; the shaders + CPU shade
         // tone-map (1 − e⁻ˣ) so highlights roll off to a photographic bright-day look instead of
         // clipping to flat white.
-        let w = smoothstep(0.06, 0.35, f); // whiten quickly once the sun clears the horizon
-        let warm = [1.0, lerp(0.42, 0.97, w), lerp(0.16, 0.92, w)];
+        // Whiten SLOWLY. This used to reach white by ~20° of altitude, so every daytime sun was a
+        // neutral white light — and a white sun against a near-white sky ambient leaves an image
+        // with no warm/cool separation at all, which is a large part of why our renders read as
+        // flat where a reference render reads as sunlight. Calibrated against the villa scene's
+        // own Blender sun, which is (1.0, 0.745, 0.48) at 34° of altitude; this ramp gives
+        // (1.0, 0.75, 0.55) there, and still lands only slightly warm at noon — a midday sun is
+        // about 5500 K, not 6500 K.
+        let w = smoothstep(0.05, 0.90, f);
+        let warm = [1.0, lerp(0.42, 0.93, w), lerp(0.12, 0.86, w)];
         let direct = self.intensity * (0.35 + 2.0 * f); // strong at noon
         let sun = [warm[0] * direct, warm[1] * direct, warm[2] * direct];
         // HEMISPHERIC ambient — the biggest thing missing before. Real daylight is not a flat fill:
@@ -164,26 +254,29 @@ impl SunEnv {
 struct SunLightRaw {
     enabled: bool,
     dir: Vec3,
-    sun: [f32; 3],    // warm direct term (already intensity-scaled)
-    sky: [f32; 3],    // cool ambient fill from ABOVE
-    ground: [f32; 3], // warm ground bounce from BELOW (fake GI); hemispheric-blended by normal.z
+    sun: [f32; 3], // direct term (already intensity-scaled), calibrated as irradiance/π
+    /// The SKY's irradiance as 9 spherical-harmonic coefficients (see [`crate::env`]). This
+    /// replaced a pair of colours lerped by `normal.z`: the ambient a surface receives now depends
+    /// on where in the sky the light actually is, so two walls facing different ways differ.
+    sh: [[f32; 3]; 9],
 }
 
 impl Default for SunLightRaw {
     fn default() -> Self {
-        Self { enabled: false, dir: Vec3::new(0.35, 0.25, 0.9).normalize(), sun: [1.0, 0.96, 0.88], sky: [0.32, 0.34, 0.40], ground: [0.20, 0.19, 0.17] }
+        Self { enabled: false, dir: Vec3::new(0.35, 0.25, 0.9).normalize(), sun: [1.0, 0.96, 0.88], sh: [[0.0; 3]; 9] }
     }
 }
 
 thread_local! {
     /// The active sun light for shading on THIS (render) thread. Buffer building is single-threaded
     /// on the main thread, so a thread-local is both correct and lock-free per vertex.
-    static SUN: std::cell::Cell<SunLightRaw> = const { std::cell::Cell::new(SunLightRaw { enabled: false, dir: Vec3::new(0.0, 0.0, 1.0), sun: [1.0, 0.96, 0.88], sky: [0.32, 0.34, 0.40], ground: [0.20, 0.19, 0.17] }) };
+    static SUN: std::cell::Cell<SunLightRaw> = const { std::cell::Cell::new(SunLightRaw { enabled: false, dir: Vec3::new(0.0, 0.0, 1.0), sun: [1.0, 0.96, 0.88], sh: [[0.0; 3]; 9] }) };
 }
 
-/// Push the resolved sun light (call before building any shaded buffers). `dir` points TO the sun.
-pub fn set_sun_light(enabled: bool, dir: Vec3, sun: [f32; 3], sky: [f32; 3], ground: [f32; 3]) {
-    SUN.with(|c| c.set(SunLightRaw { enabled, dir: dir.normalize_or_zero(), sun, sky, ground }));
+/// Push the resolved sun light (call before building any shaded buffers). `dir` points TO the sun,
+/// `sh` is the sky's irradiance projection from [`crate::env::Sky::sh9`].
+pub fn set_sun_light(enabled: bool, dir: Vec3, sun: [f32; 3], sh: [[f32; 3]; 9]) {
+    SUN.with(|c| c.set(SunLightRaw { enabled, dir: dir.normalize_or_zero(), sun, sh }));
 }
 
 fn sun_light() -> SunLightRaw {
@@ -220,89 +313,172 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Exposure tone-map (1 − e⁻ˣ) — compresses the HDR daylight radiances into 0..1 so bright sun
-/// highlights roll off smoothly (photographic) instead of clipping to flat white, while lifting the
-/// shadow side into visible daylight. Must MATCH the shader's `tonemap()` (light3d TEX_FS) so the
-/// CPU-baked flat geometry and the in-shader textured surfaces read identically. Applied only on the
-/// sun-lit path; the fixed studio light (sun off) keeps its original LDR look.
-fn tonemap(c: [f32; 3]) -> [f32; 3] {
-    [1.0 - (-c[0]).exp(), 1.0 - (-c[1]).exp(), 1.0 - (-c[2]).exp()]
+/// One baked vertex colour: **scene-referred linear light**, plus the fraction of it that arrived
+/// as ambient.
+///
+/// Both halves are new. The colour used to be display-referred — the material's sRGB bytes times a
+/// shading factor, squashed by `1 − e⁻ˣ`. Once Phase 1 moved the view transform to the composite,
+/// that made two tone-maps in series on every flat-shaded surface, which is exactly the mistake
+/// Phase 1 removed from the *textured* path. Now the light stays linear all the way to the
+/// composite, and the display transform runs once. The ambient fraction is what lets screen-space
+/// occlusion darken only the part of the light that a crease actually blocks.
+/// Shading modes the fragment shader reproduces. Carried per vertex so it can tell a lit surface
+/// from a UI swatch, and a wall from a piece of furniture.
+pub const SHADE_UI: f32 = 0.0;
+pub const SHADE_SCENE: f32 = 1.0;
+pub const SHADE_FURNITURE: f32 = 2.0;
+
+#[derive(Clone, Copy, Debug)]
+struct Baked {
+    /// The lit colour. Still computed on the CPU, but no longer what reaches the GPU: it is the
+    /// TWIN the fragment shader's lighting is tested against, and what the CPU-side consumers
+    /// (the translucent `V3A` pass, the tests) read.
+    col: [f32; 3],
+    amb: f32,
+    /// What the vertex buffer actually carries now — the surface's own colour and normal, with the
+    /// lighting applied per FRAGMENT instead of baked in here.
+    ///
+    /// Baking meant a vertex buffer that had to be rebuilt whenever the light moved (the hour
+    /// slider re-baking 1.86 M vertices was exactly this), and it made any per-frame variation in
+    /// the lighting — jittered soft shadows, accumulation — impossible by construction. It also
+    /// blocks instancing: one mesh drawn at twenty places cannot carry twenty bakes.
+    albedo: [f32; 3],
+    n: Vec3,
+    mode: f32,
 }
 
-/// Hemispheric ambient at a surface with normal `n`: the cool sky (from above) blended toward the
-/// warm ground bounce (from below) by the normal's up-component — up-facing → full sky, undersides →
-/// ground bounce, verticals → the midpoint. This fakes the sky-dome + ground-bounce GI that makes
-/// Blender's render read as convincing daylight instead of a flat, dim fill. Must match the shader.
-fn hemi_ambient(s: &SunLightRaw, n: Vec3) -> [f32; 3] {
-    let up = (0.5 + 0.5 * n.z).clamp(0.0, 1.0);
-    [
-        lerp(s.ground[0], s.sky[0], up),
-        lerp(s.ground[1], s.sky[1], up),
-        lerp(s.ground[2], s.sky[2], up),
-    ]
+impl Baked {
+    /// Split `ambient + direct` into a colour and the ambient's share of it, measured on luminance
+    /// (a per-channel share would tint the occluded parts).
+    fn split(ambient: [f32; 3], direct: [f32; 3]) -> Self {
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let col = [ambient[0] + direct[0], ambient[1] + direct[1], ambient[2] + direct[2]];
+        let total = lum(col);
+        Self {
+            col,
+            amb: if total > 1e-6 { (lum(ambient) / total).clamp(0.0, 1.0) } else { 1.0 },
+            albedo: [0.0; 3],
+            n: Vec3::ZERO,
+            mode: SHADE_UI,
+        }
+    }
+
+    /// Attach what the shader needs: the surface's authored colour, its normal, and which
+    /// lighting response to use.
+    fn surface(mut self, albedo: [f32; 3], n: Vec3, mode: f32) -> Self {
+        self.albedo = albedo;
+        self.n = n;
+        self.mode = mode;
+        self
+    }
+}
+
+/// The sky's irradiance at a surface with normal `n`, divided by π — a direct multiplier on albedo.
+/// This is the real integral of the [`crate::env`] sky over the hemisphere, so an underside sees the
+/// ground, a north wall sees the dim half of the dome, and a surface facing the sun's side of the
+/// sky sees the aureole. The two-colour `mix(ground, sky, n.z)` fill it replaced could express none
+/// of that. Must match the shader's `sh_ambient`.
+fn sky_ambient(s: &SunLightRaw, n: Vec3) -> [f32; 3] {
+    crate::env::sh_ambient(&s.sh, n)
 }
 
 /// Fixed key light, matching `light3d`'s shading so the two 3D views look alike. When the sun is
-/// enabled this instead lights by the real sun direction (warm direct + hemispheric sky/ground fill),
-/// so the lit and shadowed sides read as daylight and rotate as the sun moves.
-fn shade(base: [f32; 3], n: Vec3) -> [f32; 3] {
+/// enabled this instead lights by the real sun direction plus the sky's own irradiance, so the lit
+/// and shadowed sides read as daylight and rotate as the sun moves.
+fn shade(base: [f32; 3], n: Vec3) -> Baked {
     let base = if clay_on() { CLAY_GREY } else { base };
+    // The AUTHORED colour, kept for the vertex buffer — the shader decodes sRGB itself, exactly as
+    // the `SRGB8_ALPHA8` upload does for image textures.
+    let authored = base;
+    let tag = |b: Baked| b.surface(authored, n, SHADE_SCENE);
+    // Authored colours are sRGB; light is linear. Decode ONCE, here — this is the CPU twin of the
+    // `SRGB8_ALPHA8` upload that decodes image textures for free.
+    let base = crate::color::srgb_to_linear3(base);
     let s = sun_light();
     if !s.enabled {
+        // The studio key: a constant 0.35 fill plus a 0.65 directional term. The shader reproduces
+        // exactly this split for textured surfaces (see `STUDIO_DIR` in TEX_FS).
         let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
-        let k = 0.35 + 0.65 * n.dot(dir).abs();
-        return [base[0] * k, base[1] * k, base[2] * k];
+        let k = 0.65 * n.dot(dir).abs();
+        return tag(Baked::split(
+            [base[0] * 0.35, base[1] * 0.35, base[2] * 0.35],
+            [base[0] * k, base[1] * k, base[2] * k],
+        ));
     }
-    let a = hemi_ambient(&s, n);
+    let a = sky_ambient(&s, n);
     let lit = n.dot(s.dir).max(0.0);
-    tonemap([
-        base[0] * (a[0] + s.sun[0] * lit),
-        base[1] * (a[1] + s.sun[1] * lit),
-        base[2] * (a[2] + s.sun[2] * lit),
-    ])
+    tag(Baked::split(
+        [base[0] * a[0], base[1] * a[1], base[2] * a[2]],
+        [base[0] * s.sun[0] * lit, base[1] * s.sun[1] * lit, base[2] * s.sun[2] * lit],
+    ))
 }
 
 /// Brighter shading for imported furniture — a higher ambient floor (0.6) so meshes read
 /// clearly instead of coming out murky-dark, which is how many imports looked.
-fn shade_furniture(base: [f32; 3], n: Vec3) -> [f32; 3] {
+fn shade_furniture(base: [f32; 3], n: Vec3) -> Baked {
     let base = if clay_on() { CLAY_GREY } else { base };
+    let authored = base;
+    let tag = |b: Baked| b.surface(authored, n, SHADE_FURNITURE);
+    let base = crate::color::srgb_to_linear3(base);
     let s = sun_light();
     if !s.enabled {
         let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
-        let k = 0.6 + 0.4 * n.dot(dir).abs();
-        return [(base[0] * k).min(1.0), (base[1] * k).min(1.0), (base[2] * k).min(1.0)];
+        let k = 0.4 * n.dot(dir).abs();
+        return tag(Baked::split(
+            [base[0] * 0.6, base[1] * 0.6, base[2] * 0.6],
+            [base[0] * k, base[1] * k, base[2] * k],
+        ));
     }
     // A touch more fill than the scene so furniture never reads murky.
-    let a = hemi_ambient(&s, n);
+    let a = sky_ambient(&s, n);
     let lit = n.dot(s.dir).max(0.0);
-    let amb = 0.05;
-    tonemap([
-        base[0] * (a[0] + amb + s.sun[0] * lit),
-        base[1] * (a[1] + amb + s.sun[1] * lit),
-        base[2] * (a[2] + amb + s.sun[2] * lit),
-    ])
+    let extra = 0.05;
+    tag(Baked::split(
+        [base[0] * (a[0] + extra), base[1] * (a[1] + extra), base[2] * (a[2] + extra)],
+        [base[0] * s.sun[0] * lit, base[1] * s.sun[1] * lit, base[2] * s.sun[2] * lit],
+    ))
 }
 
 /// Scalar lighting for TEXTURED surfaces — the `TexVtx.s` that multiplies the sampled image/procedural
 /// colour. Sun-aware when enabled (the luminance of the directional response), else the fixed studio
 /// scalar. `furniture` selects the brighter ambient floor. Keeps textured/procedural surfaces (e.g.
 /// the cabin's oak) responding to the sun alongside flat-coloured ones.
+///
+/// Linear, and no tone-map: like [`shade`], this feeds a buffer the composite grades once.
 fn shade_scalar(n: Vec3, furniture: bool) -> f32 {
     let s = sun_light();
     if !s.enabled {
         let dir = Vec3::new(0.35, 0.25, 0.9).normalize();
         return if furniture { 0.6 + 0.4 * n.dot(dir).abs() } else { 0.35 + 0.65 * n.dot(dir).abs() };
     }
-    let lum = |c: [f32; 3]| 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     let lit = n.dot(s.dir).max(0.0);
     let amb = if furniture { 0.05 } else { 0.0 };
-    // Tone-map the scalar so it matches the colour paths' 1 − e⁻ˣ rolloff (this path lights the
-    // textured pieces only when the sun is OFF in-shader; kept consistent for the faceted remainder).
-    1.0 - (-(lum(hemi_ambient(&s, n)) + amb + lum(s.sun) * lit)).exp()
+    lum(sky_ambient(&s, n)) + amb + lum(s.sun) * lit
 }
 
-fn v(p: Vec3, c: [f32; 3]) -> V3 {
-    V3 { x: p.x, y: p.y, z: p.z, r: c[0], g: c[1], b: c[2] }
+fn v(p: Vec3, b: Baked) -> V3 {
+    // The ALBEDO and the normal, not the lit colour — the fragment shader lights it. A UI swatch
+    // has `mode = SHADE_UI` and a zero normal, and the shader passes its colour through untouched.
+    V3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        r: b.albedo[0],
+        g: b.albedo[1],
+        b: b.albedo[2],
+        nx: b.n.x,
+        ny: b.n.y,
+        nz: b.n.z,
+        mode: b.mode,
+    }
+}
+
+/// A UI colour for the overlay / line passes — a swatch, not a lit surface. It stays in **authored
+/// sRGB** (those passes set `u_linearize = 1` and decode it in the shader) and carries no ambient
+/// share, because a selection tint is not something ambient occlusion has any business dimming.
+fn ui(c: [f32; 3]) -> Baked {
+    Baked { col: c, amb: 0.0, albedo: c, n: Vec3::ZERO, mode: SHADE_UI }
 }
 
 /// Whether the triangle whose first vertex is `base` is see-through — any of its three
@@ -346,8 +522,8 @@ fn corners_of(mn: Vec3, mx: Vec3) -> [Vec3; 8] {
 }
 
 fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
-    out.push(v(a, c));
-    out.push(v(b, c));
+    out.push(v(a, ui(c)));
+    out.push(v(b, ui(c)));
 }
 
 /// The 12 edges of an AABB.
@@ -374,6 +550,25 @@ struct RenderCache {
     ready: bool,
     verts: std::sync::Arc<Vec<V3>>,
 }
+
+/// The cached outline of a targeted face/piece, in the asset's LOCAL space.
+struct FaceOutline {
+    inst: usize,
+    /// Which asset, and how many triangles it had — a re-import or a rebuild under the same
+    /// instance must not leave the outline tracing geometry that no longer exists.
+    asset: usize,
+    tris: usize,
+    groups: Vec<u32>,
+    /// Boundary edges only — see [`FactoryState::furniture_face_highlight_segments`].
+    edges: Vec<[Vec3; 2]>,
+    /// True when the boundary hit [`MAX_OUTLINE_EDGES`] and was cut short.
+    truncated: bool,
+}
+
+/// A hard ceiling on the outline, so a highlight can never again cost more than a few milliseconds
+/// a frame no matter what is selected. A real coplanar face boundary is hundreds of edges; this is
+/// two orders of magnitude above that, and exists only so the worst case stays bounded.
+const MAX_OUTLINE_EDGES: usize = 20_000;
 
 /// 3D Factory state — the model + its view. Lives on `CadApp` as one field.
 pub struct FactoryState {
@@ -511,10 +706,14 @@ pub struct FactoryState {
     /// library is stored in the project file so furniture can be reused later.
     pub furniture_lib: Vec<FurnitureAsset>,
     pub furniture: Vec<FurnitureInst>,
-    /// The selected furniture instance, if any. Mutually exclusive with the CSG feature
-    /// selection — selecting furniture clears the feature selection and vice versa, so the
-    /// gizmo and properties panel always act on exactly one thing.
-    pub sel_furniture: Option<usize>,
+    /// The selected furniture instances, in pick order. Mutually exclusive with the CSG feature
+    /// selection — selecting furniture clears the feature selection and vice versa.
+    ///
+    /// The FIRST entry is the PRIMARY: the one whose properties the panel edits and whose
+    /// parameters the editors read. Operations that are meaningful on a set — move, rotate,
+    /// delete, recolour — act on all of them; operations that need one set of numbers act on the
+    /// primary. Use [`Self::sel_furn_one`] where a multi-selection should not be edited at all.
+    pub sel_furniture: Vec<usize>,
 
     /// Guided PATH-SWEEP pick, if one is running (see [`SweepPick`]). While `Some`, a click in
     /// the 3D view designates the cross-section then the path instead of selecting.
@@ -531,6 +730,25 @@ pub struct FactoryState {
     faceted_cache: std::cell::RefCell<
         std::collections::HashMap<usize, (u64, std::sync::Arc<FacetedFurniture>)>,
     >,
+    /// A loaded HDR environment, and everything derived from it. `None` ⇒ the analytic sky.
+    ///
+    /// The derived parts are kept beside the map because they are expensive: the SH projection and
+    /// the GGX prefilter run once when the file is loaded, never per frame. `env_version` changes
+    /// whenever the map does, which is how the renderer tells "same environment" from "new one"
+    /// without comparing megabytes of pixels.
+    pub env_map: Option<std::sync::Arc<crate::env_map::EnvMap>>,
+    pub env_chain: Vec<crate::env_map::EnvMip>,
+    pub env_sh: [[f32; 3]; 9],
+    /// Multiplies the environment's radiance; 1.0 = as photographed.
+    pub env_strength: f32,
+    /// Yaw about Z, degrees — turn the world without moving the model.
+    pub env_rot_deg: f32,
+    pub env_version: u64,
+
+    /// Memo of the targeted face/piece OUTLINE, in the asset's LOCAL space — see
+    /// [`Self::furniture_face_highlight_segments`], which explains why this exists. Local, so the
+    /// pose is applied per frame and dragging the object never rebuilds it.
+    face_outline: std::cell::RefCell<Option<FaceOutline>>,
     /// Bumped on every [`Self::recompute`]; lets the render cache notice a geometry change
     /// without hashing the (large) triangle buffer.
     pub geom_version: u64,
@@ -539,6 +757,17 @@ pub struct FactoryState {
     /// When changed, the render caches re-bake so shading follows the sun (see [`Self::opaque_sig`]
     /// and [`Self::furniture_key`], which fold it in).
     pub sun: SunEnv,
+
+    /// COLOUR MANAGEMENT — how scene-referred linear light becomes pixels (Blender's Color
+    /// Management panel). Purely a display decision: it never touches the geometry or the render
+    /// caches, so changing it costs one frame and nothing re-bakes.
+    pub color: crate::color::ColorPipeline,
+
+    /// TEMPORAL ACCUMULATION — how many sub-pixel-jittered samples a STILL frame is refined over
+    /// before the viewport settles. 0 or 1 = off (one sample, exactly as before). It costs that
+    /// many ordinary frames after every change and nothing at all once converged: the renderer
+    /// then re-presents the finished buffer instead of redrawing the scene.
+    pub taa_samples: u32,
 
     /// CLAY mode — flatten every material to neutral grey (glass keeps transparency) for a
     /// light-only study. Folded into the render-cache signatures so toggling re-bakes.
@@ -857,7 +1086,7 @@ impl GizmoHandle {
 
 /// In-progress rotation-ring drag. Captured on grab so the whole gesture is one undo step
 /// and the rotation is measured relative to where you first grabbed the ring.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RotDrag {
     pub handle: GizmoHandle,
     /// Unit rotation axis in WORLD space (a world axis for furniture; a plane-local axis for
@@ -871,6 +1100,13 @@ pub struct RotDrag {
     /// For a feature, which placement angle (0=pitch,1=roll,2=spin) this ring drives.
     pub feat_axis: usize,
     pub is_furniture: bool,
+    /// Every selected furniture instance as it stood when the grab began: `(index, pos, rot°)`.
+    ///
+    /// Captured up front, and every frame of the drag is computed from THESE rather than from the
+    /// live values. Applying an incremental delta each frame would accumulate float error over a
+    /// long drag and, worse, drift the pieces apart from each other — a row of chairs would come
+    /// out of one rotation no longer a row.
+    pub start_furn: Vec<(usize, [f32; 3], [f32; 3])>,
 }
 
 /// One projected arm of the gizmo.
@@ -1018,6 +1254,12 @@ pub struct FurnitureAsset {
     /// a heavy piece was selected: the gizmo + highlight both asked for the AABB each frame).
     pub local_min: [f32; 3],
     pub local_max: [f32; 3],
+    /// The factor [`FactoryState::add_furniture_asset`] applied to normalise the import (1.0 when
+    /// it was left alone). A file whose longest side exceeds 20 m is shrunk toward a 1.5 m asset,
+    /// which is right for a chair exported in millimetres and wrong for a building exported at
+    /// real-world size. Recording it means a caller who KNOWS the file is already in metres can
+    /// undo it exactly — `inst.scale = 1.0 / import_scale` — instead of guessing a multiplier.
+    pub import_scale: f32,
     /// Per-vertex UVs (parallel to `positions`) from a glTF import. EMPTY when the source had
     /// no texture coords — then a textured instance falls back to box-projection UVs.
     pub uvs: Vec<[f32; 2]>,
@@ -1086,6 +1328,13 @@ pub struct FacetedFurniture {
 /// Above this triangle count a furniture asset gets a decimated display proxy.
 pub const LOD_TRI_THRESHOLD: usize = 200_000;
 
+/// Above this triangle count, [`FurnitureAsset::group_geom`] stops running the coplanar flood fill
+/// and uses the import's material PARTS as the face grouping instead. The flood fill is O(n) with a
+/// large constant — 3.7 s in release for 1.86 M triangles, and it runs on the UI thread the first
+/// time anything draws. See the note in `group_geom` for why parts are the better answer at that
+/// size, not merely the cheaper one.
+pub const COPLANAR_TRI_LIMIT: usize = 250_000;
+
 /// At/above this opacity a vertex is treated as fully opaque (drawn in the solid pass). Below
 /// it, the triangle is peeled into the blended transparent pass.
 pub const ALPHA_OPAQUE: f32 = 0.996;
@@ -1106,7 +1355,7 @@ impl FurnitureAsset {
             mn = [0.0; 3];
             mx = [0.0; 3];
         }
-        Self { name, positions, normals, color, local_min: mn, local_max: mx, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new() }
+        Self { name, positions, normals, color, local_min: mn, local_max: mx, import_scale: 1.0, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new() }
     }
 
     /// The per-triangle face/body grouping, built once and cached. Used for per-surface texturing.
@@ -1125,8 +1374,32 @@ impl FurnitureAsset {
             return g.clone();
         }
         let ntri = self.positions.len() / 3;
-        let (face_coplanar, welded_body) = cad_solid::surface_groups(&self.positions);
         let has_parts = self.part_ids.len() == ntri;
+
+        // HEAVY IMPORTS SKIP THE FLOOD FILL. `surface_groups` welds every vertex and grows coplanar
+        // regions across the whole mesh; on the villa scene (1.86 M triangles) it takes **3.7
+        // seconds in release** and far longer in a debug build — on the UI thread, at first draw,
+        // which is exactly the "the app is unresponsive after loading" symptom.
+        //
+        // What it buys is click-a-face texturing. On a mesh this size it produced 407,858 coplanar
+        // regions, which is not a granularity anyone can work at anyway. A whole imported scene
+        // already arrives with PART ids — one per source material — and that is the level a user
+        // actually paints at: "the roof", "the walls". So for a heavy mesh the parts ARE the faces,
+        // and the wait disappears entirely.
+        if ntri > COPLANAR_TRI_LIMIT {
+            let g = std::sync::Arc::new(if has_parts {
+                FurnGroups { face: self.part_ids.clone(), body: self.part_ids.clone() }
+            } else {
+                // No parts either (a raw OBJ soup): one group. Per-face painting degrades to
+                // whole-object painting, which is honest — better than a ten-second freeze for a
+                // grouping nobody can use.
+                FurnGroups { face: vec![0; ntri], body: vec![0; ntri] }
+            });
+            *self.groups.borrow_mut() = Some(g.clone());
+            return g;
+        }
+
+        let (face_coplanar, welded_body) = cad_solid::surface_groups(&self.positions);
         let body = if has_parts { self.part_ids.clone() } else { welded_body };
         let face = if has_parts {
             // Split every coplanar region at part boundaries so a face stays within one primitive.
@@ -1288,6 +1561,42 @@ pub struct FurnitureInst {
     /// triangle's group it overrides `texture` (the whole-object texture) for that surface — so
     /// one object can carry different textures on different faces/pieces. Empty ⇒ whole-object only.
     pub surface_texture: std::collections::HashMap<u32, usize>,
+
+    /// CUTS drawn on this piece's faces — holes, rebates, service openings. See
+    /// [`FactoryState::rebuild_cut_asset`] for how they become geometry.
+    ///
+    /// The list is the truth and the geometry is derived from it: every rebuild replays the whole
+    /// list against the UNTOUCHED original, so a cut can be switched off, deleted or re-ordered and
+    /// the piece returns to exactly what it was. Frames are stored in the asset's own LOCAL space,
+    /// so moving or rotating the piece carries its holes with it.
+    pub cuts: Vec<cad_solid::meshcut::MeshCut>,
+    /// The uncut original in [`FactoryState::furniture_lib`] when `asset` points at a derived
+    /// (cut) copy. `None` ⇒ `asset` IS the original and there is nothing to fall back to.
+    pub base_asset: Option<usize>,
+}
+
+impl Default for FurnitureInst {
+    fn default() -> Self {
+        Self {
+            asset: 0,
+            pos: [0.0; 3],
+            scale: 1.0,
+            fit: None,
+            rot: [0.0; 3],
+            color: [0.8, 0.8, 0.8],
+            texture: None,
+            surface_texture: std::collections::HashMap::new(),
+            cuts: Vec::new(),
+            base_asset: None,
+        }
+    }
+}
+
+impl FurnitureInst {
+    /// The library entry this instance's cuts are computed FROM — the uncut original.
+    pub fn source_asset(&self) -> usize {
+        self.base_asset.unwrap_or(self.asset)
+    }
 }
 
 /// One copied 3D object held in the paste buffer — a furniture instance or a CSG feature
@@ -1376,6 +1685,13 @@ pub struct ProcDef {
     pub rough: f32,
     pub contrast: f32,
     pub ramp: [f32; 2],
+    /// SURFACE roughness at the two ends of the same pattern — not to be confused with `rough`
+    /// above, which is the fBm's amplitude falloff. Dark grain rougher than light, mortar rougher
+    /// than tile: a real surface changes its gloss wherever it changes its colour, and reading both
+    /// off one field is what stops a procedural looking like a photo printed on plastic.
+    pub surf_rough: [f32; 2],
+    /// Relief from that same field, as a bump. 0 = flat.
+    pub bump: f32,
 }
 
 impl ProcDef {
@@ -1391,13 +1707,17 @@ impl ProcDef {
             rough: 0.62,
             contrast: 1.4,
             ramp: [0.40, 0.62],
+            // Open-pored oak: the dark early-wood is noticeably duller than the pale late-wood,
+            // and the pores are a real depression a raking light finds.
+            surf_rough: [0.72, 0.48],
+            bump: 0.35,
         }
     }
     /// A SOLID colour as a (degenerate) procedural: both ramp stops the same, so any pattern renders
     /// a flat colour. This lets the Materials Factory drive a plain base colour through the LIVE
     /// per-frame procedural uniforms (no GPU texture re-upload), so colour edits show instantly.
     pub fn solid(c: [f32; 3]) -> Self {
-        Self { pattern: ProcPattern::Noise, col_a: c, col_b: c, scale: [1.0, 1.0, 1.0], detail: 1.0, rough: 0.5, contrast: 1.0, ramp: [0.0, 1.0] }
+        Self { pattern: ProcPattern::Noise, col_a: c, col_b: c, scale: [1.0, 1.0, 1.0], detail: 1.0, rough: 0.5, contrast: 1.0, ramp: [0.0, 1.0], surf_rough: [0.5, 0.5], bump: 0.0 }
     }
     /// Whether this is a solid colour (both ramp stops equal) — the inverse of [`Self::solid`], so the
     /// node editor can show it as an RGB node rather than a pattern.
@@ -1423,7 +1743,17 @@ impl ProcDef {
             rough: self.rough,
             contrast: self.contrast,
             ramp: self.ramp,
+            rough_lo: self.surf_rough[0],
+            rough_hi: self.surf_rough[1],
+            bump: self.bump,
         }
+    }
+
+    /// True when this pattern varies its own surface finish (rather than being a uniform gloss).
+    /// The renderer only lets the pattern drive roughness when there is no roughness MAP, so this
+    /// is what decides whether the material's scalar roughness is the one that matters.
+    pub fn varies_roughness(&self) -> bool {
+        (self.surf_rough[0] - self.surf_rough[1]).abs() > 1e-3
     }
 }
 
@@ -1453,56 +1783,89 @@ impl MaterialPreset {
 /// The built-in material library, grouped by category (order = display order). Everything here is
 /// expressible in the live renderer AND the path tracers: procedural/solid base colour + metallic /
 /// roughness / IOR / opacity / emission.
+/// The built-in material library.
+///
+/// Rebuilt in Phase 3 on **measured** numbers rather than eyeballed ones. Three things changed:
+///
+/// 1. **Albedos come from measured reflectance.** A "white" wall is not 0.88 — architectural white
+///    paint measures around 0.75–0.80 diffuse reflectance, and fresh concrete about 0.35, not the
+///    0.5 it was given. Too-bright albedos are why a bounced-light render goes milky: every bounce
+///    multiplies the error. Values here are sRGB-encoded (what the colour picker shows); the
+///    renderer decodes them.
+/// 2. **Metals use their real spectral F0.** Copper is (0.95, 0.64, 0.54) and gold (1.00, 0.77,
+///    0.34) at normal incidence — not a guess at "orange" and "yellow". A metal's base colour IS
+///    its F0 once `metallic = 1`, so this is a physical constant, not a taste decision.
+/// 3. **Roughness varies with the pattern.** Every procedural now carries a `surf_rough` range read
+///    off the same field as its colour, plus a bump. This is the single biggest change: it is why
+///    oak now catches light along the grain instead of glinting like a uniform sheet of plastic.
+///
+/// Everything is still expressible in BOTH renderers: procedural/solid base colour + metallic /
+/// roughness / IOR / opacity / emission.
 pub fn material_presets() -> Vec<MaterialPreset> {
     use ProcPattern::*;
-    let pat = |pattern, col_a, col_b, scale, detail, rough, contrast, ramp| ProcDef { pattern, col_a, col_b, scale, detail, rough, contrast, ramp };
+    #[allow(clippy::too_many_arguments)]
+    let pat = |pattern, col_a, col_b, scale: [f32; 3], detail, rough, contrast, ramp, surf_rough, bump| ProcDef {
+        pattern, col_a, col_b, scale, detail, rough, contrast, ramp, surf_rough, bump,
+    };
     let mut v: Vec<MaterialPreset> = Vec::new();
     let mut p = |m: MaterialPreset| v.push(m);
 
-    // ---- Wood ----
-    p(MaterialPreset { roughness: 0.62, ..MaterialPreset::flat("Wood", "Oak", ProcDef::oak()) });
-    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Wood", "Walnut", pat(Wood, [0.14, 0.09, 0.05], [0.36, 0.23, 0.13], [42.0, 10.0, 2.0], 7.0, 0.62, 1.5, [0.38, 0.62])) });
-    p(MaterialPreset { roughness: 0.65, ..MaterialPreset::flat("Wood", "Pine", pat(Wood, [0.55, 0.42, 0.26], [0.79, 0.66, 0.45], [36.0, 9.0, 2.0], 6.0, 0.6, 1.3, [0.4, 0.62])) });
-    p(MaterialPreset { metallic: 0.22, roughness: 0.28, ..MaterialPreset::flat("Wood", "Varnished oak", ProcDef::oak()) });
-    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Wood", "Wenge (dark)", pat(Wood, [0.07, 0.05, 0.04], [0.2, 0.14, 0.1], [48.0, 12.0, 2.2], 7.0, 0.6, 1.6, [0.38, 0.6])) });
+    // ---- Wood ---- (open-pored species: dark early-wood duller and lower than pale late-wood)
+    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Wood", "Oak", ProcDef::oak()) });
+    p(MaterialPreset { roughness: 0.58, ..MaterialPreset::flat("Wood", "Walnut", pat(Wood, [0.14, 0.09, 0.05], [0.36, 0.23, 0.13], [42.0, 10.0, 2.0], 7.0, 0.62, 1.5, [0.38, 0.62], [0.68, 0.44], 0.30)) });
+    p(MaterialPreset { roughness: 0.62, ..MaterialPreset::flat("Wood", "Pine", pat(Wood, [0.52, 0.40, 0.25], [0.74, 0.62, 0.42], [36.0, 9.0, 2.0], 6.0, 0.6, 1.3, [0.4, 0.62], [0.70, 0.52], 0.22)) });
+    // Varnish is a clear dielectric layer over the timber: the grain still shows, the FINISH does
+    // not vary with it, and it is not remotely metallic (the old preset used metallic 0.22 to fake
+    // a sheen, which tinted the specular with the wood's own colour — the classic wrong-metal look).
+    p(MaterialPreset { roughness: 0.14, ior: 1.52, ..MaterialPreset::flat("Wood", "Varnished oak", ProcDef { surf_rough: [0.14, 0.12], bump: 0.10, ..ProcDef::oak() }) });
+    p(MaterialPreset { roughness: 0.52, ..MaterialPreset::flat("Wood", "Wenge (dark)", pat(Wood, [0.06, 0.045, 0.035], [0.18, 0.13, 0.09], [48.0, 12.0, 2.2], 7.0, 0.6, 1.6, [0.38, 0.6], [0.62, 0.40], 0.40)) });
 
     // ---- Stone & masonry ----
-    p(MaterialPreset { roughness: 0.22, ..MaterialPreset::flat("Stone", "White marble", pat(Marble, [0.92, 0.92, 0.9], [0.55, 0.56, 0.58], [3.0, 3.0, 3.0], 6.0, 0.55, 1.6, [0.35, 0.65])) });
-    p(MaterialPreset { roughness: 0.25, ..MaterialPreset::flat("Stone", "Black marble", pat(Marble, [0.06, 0.06, 0.07], [0.34, 0.34, 0.36], [3.0, 3.0, 3.0], 6.0, 0.55, 1.7, [0.35, 0.65])) });
-    p(MaterialPreset { roughness: 0.92, ..MaterialPreset::flat("Stone", "Concrete", pat(Noise, [0.57, 0.56, 0.54], [0.44, 0.435, 0.42], [8.0, 8.0, 8.0], 7.0, 0.6, 1.1, [0.3, 0.7])) });
-    p(MaterialPreset { roughness: 0.6, ..MaterialPreset::flat("Stone", "Granite", pat(Noise, [0.34, 0.33, 0.32], [0.18, 0.17, 0.17], [60.0, 60.0, 60.0], 8.0, 0.7, 1.8, [0.35, 0.65])) });
-    p(MaterialPreset { roughness: 0.95, ..MaterialPreset::flat("Stone", "Sandstone", pat(Noise, [0.76, 0.68, 0.54], [0.6, 0.52, 0.4], [14.0, 14.0, 14.0], 6.0, 0.55, 1.2, [0.3, 0.7])) });
+    // Polished marble is glossy where the calcite is and slightly duller along the veins.
+    p(MaterialPreset { roughness: 0.13, ..MaterialPreset::flat("Stone", "White marble", pat(Marble, [0.88, 0.88, 0.86], [0.55, 0.56, 0.58], [3.0, 3.0, 3.0], 6.0, 0.55, 1.6, [0.35, 0.65], [0.10, 0.20], 0.05)) });
+    p(MaterialPreset { roughness: 0.14, ..MaterialPreset::flat("Stone", "Black marble", pat(Marble, [0.05, 0.05, 0.06], [0.30, 0.30, 0.32], [3.0, 3.0, 3.0], 6.0, 0.55, 1.7, [0.35, 0.65], [0.11, 0.22], 0.05)) });
+    // Concrete: ~0.35 reflectance, not 0.5. It is also genuinely rough at a millimetre scale.
+    p(MaterialPreset { roughness: 0.88, ..MaterialPreset::flat("Stone", "Concrete", pat(Noise, [0.40, 0.395, 0.385], [0.30, 0.30, 0.29], [8.0, 8.0, 8.0], 7.0, 0.6, 1.1, [0.3, 0.7], [0.94, 0.80], 0.45)) });
+    p(MaterialPreset { roughness: 0.45, ..MaterialPreset::flat("Stone", "Granite", pat(Noise, [0.32, 0.31, 0.30], [0.16, 0.155, 0.15], [60.0, 60.0, 60.0], 8.0, 0.7, 1.8, [0.35, 0.65], [0.30, 0.55], 0.25)) });
+    p(MaterialPreset { roughness: 0.9, ..MaterialPreset::flat("Stone", "Sandstone", pat(Noise, [0.68, 0.60, 0.47], [0.54, 0.47, 0.36], [14.0, 14.0, 14.0], 6.0, 0.55, 1.2, [0.3, 0.7], [0.95, 0.82], 0.55)) });
 
-    // ---- Metal ----
-    p(MaterialPreset { metallic: 1.0, roughness: 0.05, ..MaterialPreset::flat("Metal", "Chrome", ProcDef::solid([0.9, 0.91, 0.92])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.3, ..MaterialPreset::flat("Metal", "Stainless steel", ProcDef::solid([0.7, 0.71, 0.73])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.42, ..MaterialPreset::flat("Metal", "Brushed aluminium", pat(Wood, [0.62, 0.63, 0.65], [0.78, 0.79, 0.81], [160.0, 6.0, 2.0], 5.0, 0.55, 1.2, [0.35, 0.65])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.25, ..MaterialPreset::flat("Metal", "Copper", ProcDef::solid([0.9, 0.55, 0.42])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.2, ..MaterialPreset::flat("Metal", "Gold", ProcDef::solid([1.0, 0.78, 0.34])) });
-    p(MaterialPreset { metallic: 1.0, roughness: 0.45, ..MaterialPreset::flat("Metal", "Black steel", ProcDef::solid([0.11, 0.11, 0.12])) });
+    // ---- Metal ---- (base colour = the measured F0 at normal incidence, sRGB-encoded)
+    p(MaterialPreset { metallic: 1.0, roughness: 0.04, ..MaterialPreset::flat("Metal", "Chrome", ProcDef::solid([0.95, 0.96, 0.97])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.28, ..MaterialPreset::flat("Metal", "Stainless steel", ProcDef::solid([0.77, 0.78, 0.78])) });
+    // Brushed metal: an anisotropic streak that varies the FINISH, not the colour — which is what
+    // brushing physically is. Hence a near-flat colour ramp and a wide roughness range.
+    p(MaterialPreset { metallic: 1.0, roughness: 0.35, ..MaterialPreset::flat("Metal", "Brushed aluminium", pat(Wood, [0.89, 0.90, 0.91], [0.93, 0.94, 0.94], [220.0, 4.0, 2.0], 5.0, 0.55, 1.2, [0.3, 0.7], [0.46, 0.24], 0.05)) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.22, ..MaterialPreset::flat("Metal", "Copper", ProcDef::solid([0.95, 0.64, 0.54])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.18, ..MaterialPreset::flat("Metal", "Gold", ProcDef::solid([1.00, 0.77, 0.34])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.45, ..MaterialPreset::flat("Metal", "Black steel", ProcDef::solid([0.16, 0.16, 0.17])) });
+    p(MaterialPreset { metallic: 1.0, roughness: 0.12, ..MaterialPreset::flat("Metal", "Brass", ProcDef::solid([0.91, 0.79, 0.49])) });
 
-    // ---- Glass ----
-    p(MaterialPreset { roughness: 0.05, ior: 1.52, opacity: 0.08, ..MaterialPreset::flat("Glass", "Clear glass", ProcDef::solid([0.85, 0.9, 0.92])) });
-    p(MaterialPreset { roughness: 0.5, ior: 1.52, opacity: 0.42, ..MaterialPreset::flat("Glass", "Frosted glass", ProcDef::solid([0.88, 0.9, 0.92])) });
-    p(MaterialPreset { roughness: 0.08, ior: 1.52, opacity: 0.22, ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24])) });
-    p(MaterialPreset { roughness: 0.06, ior: 1.52, opacity: 0.16, ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85])) });
+    // ---- Glass ---- (IOR 1.52 = soda-lime, which every architectural pane is)
+    p(MaterialPreset { roughness: 0.02, ior: 1.52, opacity: 0.06, ..MaterialPreset::flat("Glass", "Clear glass", ProcDef::solid([0.93, 0.96, 0.95])) });
+    p(MaterialPreset { roughness: 0.45, ior: 1.52, opacity: 0.42, ..MaterialPreset::flat("Glass", "Frosted glass", ProcDef::solid([0.92, 0.94, 0.94])) });
+    p(MaterialPreset { roughness: 0.05, ior: 1.52, opacity: 0.22, ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24])) });
+    p(MaterialPreset { roughness: 0.04, ior: 1.52, opacity: 0.16, ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85])) });
 
-    // ---- Paint & plaster ----
-    p(MaterialPreset { roughness: 0.7, ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.88, 0.87, 0.86])) });
-    p(MaterialPreset { metallic: 0.12, roughness: 0.28, ..MaterialPreset::flat("Paint", "Satin white", ProcDef::solid([0.88, 0.87, 0.86])) });
-    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Paint", "Anthracite", ProcDef::solid([0.06, 0.065, 0.07])) });
-    p(MaterialPreset { roughness: 0.85, ..MaterialPreset::flat("Paint", "Warm plaster", pat(Noise, [0.85, 0.81, 0.73], [0.78, 0.74, 0.66], [10.0, 10.0, 10.0], 5.0, 0.5, 1.0, [0.3, 0.7])) });
-    p(MaterialPreset { metallic: 0.75, roughness: 0.25, ..MaterialPreset::flat("Paint", "Car paint red", ProcDef::solid([0.58, 0.05, 0.08])) });
+    // ---- Paint & plaster ---- (architectural white measures ~0.78, not ~0.9)
+    p(MaterialPreset { roughness: 0.75, ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.80, 0.79, 0.78])) });
+    // Satin is a dielectric clearcoat. Metallic 0.12 (the old value) makes the highlight take the
+    // paint's colour, which is what a metal does and a painted wall does not.
+    p(MaterialPreset { roughness: 0.22, ior: 1.5, ..MaterialPreset::flat("Paint", "Satin white", ProcDef::solid([0.80, 0.79, 0.78])) });
+    p(MaterialPreset { roughness: 0.55, ..MaterialPreset::flat("Paint", "Anthracite", ProcDef::solid([0.09, 0.095, 0.10])) });
+    p(MaterialPreset { roughness: 0.82, ..MaterialPreset::flat("Paint", "Warm plaster", pat(Noise, [0.79, 0.75, 0.68], [0.72, 0.68, 0.61], [10.0, 10.0, 10.0], 5.0, 0.5, 1.0, [0.3, 0.7], [0.88, 0.76], 0.30)) });
+    // Car paint IS a metallic-flake basecoat under a clearcoat, so this one keeps its metallic.
+    p(MaterialPreset { metallic: 0.7, roughness: 0.12, ..MaterialPreset::flat("Paint", "Car paint red", ProcDef::solid([0.58, 0.05, 0.08])) });
 
-    // ---- Fabric ----
-    p(MaterialPreset { roughness: 1.0, ..MaterialPreset::flat("Fabric", "Grey fabric", pat(Noise, [0.5, 0.5, 0.52], [0.42, 0.42, 0.44], [90.0, 90.0, 90.0], 6.0, 0.6, 1.1, [0.3, 0.7])) });
-    p(MaterialPreset { roughness: 1.0, ..MaterialPreset::flat("Fabric", "Beige carpet", pat(Noise, [0.62, 0.56, 0.46], [0.5, 0.45, 0.36], [70.0, 70.0, 70.0], 7.0, 0.6, 1.1, [0.3, 0.7])) });
+    // ---- Fabric ---- (fully rough, with weave-scale relief)
+    p(MaterialPreset { roughness: 0.95, ..MaterialPreset::flat("Fabric", "Grey fabric", pat(Noise, [0.44, 0.44, 0.46], [0.36, 0.36, 0.38], [90.0, 90.0, 90.0], 6.0, 0.6, 1.1, [0.3, 0.7], [1.0, 0.88], 0.6)) });
+    p(MaterialPreset { roughness: 0.98, ..MaterialPreset::flat("Fabric", "Beige carpet", pat(Noise, [0.56, 0.50, 0.41], [0.45, 0.40, 0.32], [70.0, 70.0, 70.0], 7.0, 0.6, 1.1, [0.3, 0.7], [1.0, 0.92], 0.9)) });
 
     // ---- Floor ----
-    p(MaterialPreset { roughness: 0.3, ..MaterialPreset::flat("Floor", "Checker tiles", pat(Checker, [0.85, 0.85, 0.84], [0.12, 0.12, 0.13], [2.0, 2.0, 2.0], 1.0, 0.5, 1.0, [0.0, 1.0])) });
-    p(MaterialPreset { roughness: 0.35, ..MaterialPreset::flat("Floor", "Terrazzo", pat(Noise, [0.82, 0.8, 0.76], [0.45, 0.44, 0.42], [90.0, 90.0, 90.0], 8.0, 0.75, 2.2, [0.42, 0.58])) });
+    // Tiles: glossy face, matte grout — the roughness range does the grout, no second map needed.
+    p(MaterialPreset { roughness: 0.16, ..MaterialPreset::flat("Floor", "Checker tiles", pat(Checker, [0.78, 0.78, 0.77], [0.10, 0.10, 0.11], [2.0, 2.0, 2.0], 1.0, 0.5, 1.0, [0.0, 1.0], [0.14, 0.20], 0.06)) });
+    p(MaterialPreset { roughness: 0.24, ..MaterialPreset::flat("Floor", "Terrazzo", pat(Noise, [0.74, 0.72, 0.69], [0.40, 0.39, 0.37], [90.0, 90.0, 90.0], 8.0, 0.75, 2.2, [0.42, 0.58], [0.20, 0.30], 0.10)) });
 
-    // ---- Emission ----
+    // ---- Emission ---- (strength in the same scene-referred units the sun uses)
     p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.85, 0.6], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED warm", ProcDef::solid([1.0, 0.88, 0.7])) });
     p(MaterialPreset { roughness: 0.4, emission: [0.85, 0.9, 1.0], emission_strength: 5.0, ..MaterialPreset::flat("Emission", "LED cool", ProcDef::solid([0.88, 0.92, 1.0])) });
     p(MaterialPreset { roughness: 0.4, emission: [1.0, 0.08, 0.08], emission_strength: 8.0, ..MaterialPreset::flat("Emission", "Neon red", ProcDef::solid([1.0, 0.25, 0.25])) });
@@ -1564,6 +1927,17 @@ pub struct TextureAsset {
     /// 1 = matte). All `None`/default → an ordinary albedo texture (unchanged).
     pub normal_map: Option<usize>,
     pub rough_map: Option<usize>,
+    /// Phase 3 — the rest of a downloaded PBR texture set. [`load_texture_set`] fills all four from
+    /// one folder by reading the filenames.
+    pub metal_map: Option<usize>,
+    pub ao_map: Option<usize>,
+    /// Map this material in WORLD space at `tiles_per_m` instead of through the mesh's UVs. On for
+    /// architecture, which is extruded from a 2D plan and has no UVs worth the name; off for
+    /// imported furniture, which usually does.
+    pub triplanar: bool,
+    /// How many times the image repeats per metre of surface. This is what gives a texture a
+    /// physical SIZE: 2.0 means a 0.5 m tile, whatever the geometry it lands on.
+    pub tiles_per_m: f32,
     pub roughness: f32,
     /// Principled BSDF parameters authored in the Materials Factory node editor. `metallic` drives the
     /// raster glossy sheen; all four are read by the path tracer. Defaults (0, 1.5, black, 0) reproduce
@@ -1572,6 +1946,17 @@ pub struct TextureAsset {
     pub ior: f32,
     pub emission: [f32; 3],
     pub emission_strength: f32,
+    /// CLEARCOAT — a thin varnish with its own smooth specular lobe, reflecting about the
+    /// GEOMETRIC normal so it stays glassy over a grain or a bump map. This is the difference
+    /// between oiled timber and lacquered timber, and it is not expressible by roughness alone:
+    /// one surface is rough and one is smooth AT THE SAME TIME.
+    pub clearcoat: f32,
+    pub clearcoat_rough: f32,
+    /// SHEEN — the pale grazing-angle rim of fabric. 0 = none.
+    pub sheen: f32,
+    /// The colour of the fuzz, usually near-white even on a dark cloth — which is most of why
+    /// black velvet reads as velvet rather than as black plastic.
+    pub sheen_tint: [f32; 3],
 }
 
 impl TextureAsset {
@@ -1596,7 +1981,7 @@ impl TextureAsset {
         } else {
             [0.8, 0.8, 0.82]
         };
-        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 0.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, roughness: 0.5, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0 }
+        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 0.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, metal_map: None, ao_map: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0, clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
     }
 
     /// Build a PROCEDURAL texture from a [`ProcDef`]. Carries a 1×1 fallback swatch (the ramp
@@ -1619,11 +2004,19 @@ impl TextureAsset {
             proc: Some(def),
             normal_map: None,
             rough_map: None,
+            metal_map: None,
+            ao_map: None,
+            triplanar: false,
+            tiles_per_m: 1.0,
             roughness: 0.5,
             metallic: 0.0,
             ior: 1.5,
             emission: [0.0, 0.0, 0.0],
             emission_strength: 0.0,
+            clearcoat: 0.0,
+            clearcoat_rough: 0.1,
+            sheen: 0.0,
+            sheen_tint: [1.0; 3],
         }
     }
 
@@ -1642,17 +2035,48 @@ impl TextureAsset {
         ]
     }
 
-    /// The renderer's PBR-map bundle (normal/roughness map indices + scalar roughness).
+    /// The renderer's Principled bundle — normal/roughness map indices plus the scalars the raster
+    /// shader needs. `metallic`/`ior` used to stop at the path tracer, so a metal authored in the
+    /// Materials Factory rendered as grey plastic in the viewport; they ride along now.
     pub fn pbr_params(&self) -> crate::light3d::PbrParams {
         crate::light3d::PbrParams {
             normal_idx: self.normal_map,
             rough_idx: self.rough_map,
+            metal_idx: self.metal_map,
+            ao_idx: self.ao_map,
+            triplanar: self.triplanar,
+            tiles_per_m: self.tiles_per_m,
             roughness: self.roughness,
+            metallic: self.metallic,
+            ior: self.ior,
+            // Pre-multiplied by strength and decoded to linear here, so the shader can simply add
+            // it. An emissive material glowed only in the path tracer before this.
+            emission: {
+                let e = crate::color::srgb_to_linear3(self.emission);
+                let k = self.emission_strength;
+                [e[0] * k, e[1] * k, e[2] * k]
+            },
+            clearcoat: self.clearcoat,
+            clearcoat_rough: self.clearcoat_rough,
+            sheen: self.sheen,
+            // Decoded here, like every other authored colour: the shader adds it to linear light.
+            sheen_tint: crate::color::srgb_to_linear3(self.sheen_tint),
         }
     }
-    /// Whether any PBR map / non-default roughness is set (so the app only ships PBR params when used).
+    /// Whether anything here differs from the plain-dielectric default (so the app only ships PBR
+    /// params when they would change the picture).
     pub fn has_pbr(&self) -> bool {
-        self.normal_map.is_some() || self.rough_map.is_some() || (self.roughness - 0.5).abs() > 1e-3
+        self.normal_map.is_some()
+            || self.rough_map.is_some()
+            || self.metal_map.is_some()
+            || self.ao_map.is_some()
+            || self.triplanar
+            || (self.roughness - 0.5).abs() > 1e-3
+            || self.metallic > 1e-3
+            || (self.ior - 1.5).abs() > 1e-3
+            || self.emission_strength > 1e-3
+            || self.clearcoat > 1e-3
+            || self.sheen > 1e-3
     }
 
     /// PNG+base64 for the sidecar, computed once and cached (the pixels are immutable).
@@ -1746,6 +2170,11 @@ pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAss
             rough: p.rough,
             contrast: p.contrast,
             ramp: p.ramp,
+            // Phase 3 fields. A sidecar written before them loads as a UNIFORM finish, i.e. the
+            // material renders exactly as it did — the serde defaults are 0, and 0/0 means "use the
+            // material's scalar roughness", which is what it used to do.
+            surf_rough: p.surf_rough,
+            bump: p.bump,
         });
     }
     a.normal_map = r.normal_map;
@@ -2074,12 +2503,24 @@ impl Default for FactoryState {
             marquee: None,
             furniture_lib: Vec::new(),
             furniture: Vec::new(),
-            sel_furniture: None,
+            sel_furniture: Vec::new(),
             sweep_flow: None,
             render_cache: std::cell::RefCell::new(RenderCache::default()),
+            env_map: None,
+            env_chain: Vec::new(),
+            env_sh: [[0.0; 3]; 9],
+            env_strength: 1.0,
+            env_rot_deg: 0.0,
+            env_version: 0,
+            face_outline: std::cell::RefCell::new(None),
             faceted_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             geom_version: 0,
             sun: SunEnv::default(),
+            color: crate::color::ColorPipeline::default(),
+            // 16 samples: about a quarter of a second at 60 fps, and past the point where more
+            // samples are visible on geometry edges. High enough to matter, short enough that the
+            // refinement is over before you have finished letting go of the mouse.
+            taa_samples: 16,
             clay_mode: false,
             feature_color: std::collections::HashMap::new(),
             surface_color: std::collections::HashMap::new(),
@@ -2326,11 +2767,13 @@ impl FactoryState {
             }
             mn[0].is_finite().then_some((mn, mx))
         };
+        let mut import_scale = 1.0f32;
         if let Some((mn, mx)) = bounds {
             let size = [(mx[0] - mn[0]), (mx[1] - mn[1]), (mx[2] - mn[2])];
             let longest = size[0].max(size[1]).max(size[2]).max(1e-4);
             // Scale toward ~1.5 m only for wildly off sizes (cm/mm exports, or giant units).
             let k = if longest > 20.0 || longest < 0.05 { 1.5 / longest } else { 1.0 };
+            import_scale = k;
             for p in &mut positions {
                 p[0] = (p[0] - (mn[0] + mx[0]) * 0.5) * k; // centre X
                 p[1] = (p[1] - (mn[1] + mx[1]) * 0.5) * k; // centre Y
@@ -2338,6 +2781,7 @@ impl FactoryState {
             }
         }
         let mut fa = FurnitureAsset::new(name, positions, normals, asset_color);
+        fa.import_scale = import_scale;
         fa.alpha = alpha;
         self.furniture_lib.push(fa);
         self.furniture_lib.len() - 1
@@ -2357,7 +2801,9 @@ impl FactoryState {
     /// Copy the current 3D selection (a furniture instance OR a single CSG feature) into the
     /// paste buffer, with its colour/texture. Returns true if something was captured.
     pub fn copy_selection(&mut self) -> bool {
-        if let Some(fi) = self.sel_furniture {
+        // The PRIMARY only: the paste buffer holds one object, and copying a multi-selection would
+        // have to silently pick one of them anyway.
+        if let Some(fi) = self.sel_furn_primary() {
             if let Some(inst) = self.furniture.get(fi).cloned() {
                 self.clip = Some(FactoryClip::Furniture(inst));
                 return true;
@@ -2456,7 +2902,7 @@ impl FactoryState {
                 };
                 for (n, d, c) in surface_colors { self.surface_color.insert(rekey(n, d), c); }
                 for (n, d, t) in surface_textures { self.surface_texture.insert(rekey(n, d), t); }
-                self.sel_furniture = None;
+                self.sel_furniture.clear();
                 self.selection = vec![id];
                 self.dirty = true;
                 Some(true)
@@ -2493,6 +2939,7 @@ impl FactoryState {
             color,
             texture: None,
             surface_texture: std::collections::HashMap::new(),
+            ..Default::default()
         });
         self.select_furniture(self.furniture.len() - 1);
     }
@@ -2544,6 +2991,7 @@ impl FactoryState {
             color,
             texture: None,
             surface_texture: std::collections::HashMap::new(),
+            ..Default::default()
         });
         let i = self.furniture.len() - 1;
         self.select_furniture(i);
@@ -2576,6 +3024,7 @@ impl FactoryState {
             color,
             texture: None,
             surface_texture: std::collections::HashMap::new(),
+            ..Default::default()
         });
         let i = self.furniture.len() - 1;
         self.select_furniture(i);
@@ -2816,20 +3265,57 @@ impl FactoryState {
         })
     }
 
-    /// Select a furniture instance — clears the CSG feature selection (they are mutually
-    /// exclusive, so exactly one thing is edited).
+    /// Select a furniture instance, replacing any previous furniture selection — and clearing the
+    /// CSG feature selection (the two are mutually exclusive, so one kind of thing is edited).
     pub fn select_furniture(&mut self, i: usize) {
         if i < self.furniture.len() {
-            self.sel_furniture = Some(i);
+            self.sel_furniture.clear();
+            self.sel_furniture.push(i);
             self.selection.clear();
             self.sel_key.clear();
+        }
+    }
+
+    /// ADD a furniture instance to the selection, or drop it if it was already in — Shift-click.
+    ///
+    /// Toggling rather than only adding is what makes a shift-click reversible: overshoot by one
+    /// piece and you take it back the same way you added it, instead of starting the whole
+    /// selection again.
+    pub fn toggle_furniture(&mut self, i: usize) {
+        if i >= self.furniture.len() {
+            return;
+        }
+        match self.sel_furniture.iter().position(|&s| s == i) {
+            Some(at) => {
+                self.sel_furniture.remove(at);
+            }
+            None => self.sel_furniture.push(i),
+        }
+        self.selection.clear();
+        self.sel_key.clear();
+    }
+
+    /// The PRIMARY selected furniture — the one whose properties the panel edits.
+    pub fn sel_furn_primary(&self) -> Option<usize> {
+        self.sel_furniture.first().copied()
+    }
+
+    /// The selected furniture only when there is EXACTLY one.
+    ///
+    /// For editors that write a single set of numbers back (dimensions, a parameter dialog): with
+    /// several pieces selected there is no one set to show, and writing the primary's numbers to
+    /// all of them would silently resize things the user never looked at.
+    pub fn sel_furn_one(&self) -> Option<usize> {
+        match self.sel_furniture.as_slice() {
+            [i] => Some(*i),
+            _ => None,
         }
     }
 
     /// True when anything is selected — a feature OR a furniture instance. The gizmo and
     /// properties panel key off this.
     pub fn has_any_selection(&self) -> bool {
-        !self.selection.is_empty() || self.sel_furniture.is_some()
+        !self.selection.is_empty() || !self.sel_furniture.is_empty()
     }
 
     // ===================================================================
@@ -2913,12 +3399,16 @@ impl FactoryState {
     /// World AABB of the current selection — a furniture instance if one is selected,
     /// otherwise every selected feature. Drives the gizmo size and centre.
     pub fn selection_aabb(&self) -> Option<(Vec3, Vec3)> {
-        if let Some(i) = self.sel_furniture {
-            return self.furniture_aabb(i);
-        }
         let mut mn = Vec3::splat(f32::INFINITY);
         let mut mx = Vec3::splat(f32::NEG_INFINITY);
         let mut any = false;
+        for &i in &self.sel_furniture {
+            if let Some((a, b)) = self.furniture_aabb(i) {
+                mn = mn.min(a);
+                mx = mx.max(b);
+                any = true;
+            }
+        }
         for &id in &self.selection {
             if let Some(f) = self.model.features.iter().find(|f| f.id == id) {
                 let (a, b) = f.world_aabb();
@@ -2948,14 +3438,21 @@ impl FactoryState {
         (mn.x.is_finite()).then_some((mn, mx))
     }
 
-    /// Select every feature whose projected centre falls inside a screen rectangle —
-    /// rubber-band box-select. `additive` keeps the existing selection (Shift-drag).
+    /// Select everything whose projected centre falls inside a screen rectangle — rubber-band
+    /// box-select over BOTH the CSG features and the placed furniture. `additive` keeps the
+    /// existing selection (Shift-drag).
     ///
     /// Centre-in-box is the intuitive rule for a box-select: an object counts as picked
     /// when its middle is inside the band, so a small overlap at the edge doesn't grab it.
+    ///
+    /// Features and furniture are normally mutually exclusive — but not here. A band dragged
+    /// across a room is a statement about a REGION, and a user who draws one round a corner of the
+    /// villa means the walls and the chairs standing in it. Silently dropping one kind would be
+    /// the surprise; the delete and move paths handle both, so nothing downstream is confused by
+    /// it. Returns `(features, furniture)` counts.
     pub fn select_in_marquee(
         &mut self, band: egui::Rect, viewport: egui::Rect, mvp: &[f32; 16], additive: bool,
-    ) {
+    ) -> (usize, usize) {
         let mut hits = Vec::new();
         for f in &self.model.features {
             let (mn, mx) = f.world_aabb();
@@ -2965,15 +3462,50 @@ impl FactoryState {
                 }
             }
         }
+        let mut furn_hits = Vec::new();
+        for i in 0..self.furniture.len() {
+            if let Some((mn, mx)) = self.furniture_aabb(i) {
+                if let Some(s) = world_to_screen((mn + mx) * 0.5, viewport, mvp) {
+                    if band.contains(s) {
+                        furn_hits.push(i);
+                    }
+                }
+            }
+        }
         if !additive {
             self.selection.clear();
+            self.sel_furniture.clear();
         }
         for id in hits {
             if !self.selection.contains(&id) {
                 self.selection.push(id);
             }
         }
+        for i in furn_hits {
+            if !self.sel_furniture.contains(&i) {
+                self.sel_furniture.push(i);
+            }
+        }
         self.sel_key.clear();
+        (self.selection.len(), self.sel_furniture.len())
+    }
+
+    /// Delete every selected furniture instance, highest index first.
+    ///
+    /// Descending order is not a detail: `Vec::remove` shifts everything after it down, so
+    /// removing 2 then 5 deletes the wrong piece. Returns how many went.
+    pub fn erase_selected_furniture(&mut self) -> usize {
+        let mut idx = self.sel_furniture.clone();
+        idx.sort_unstable();
+        idx.dedup();
+        let n = idx.len();
+        for i in idx.into_iter().rev() {
+            if i < self.furniture.len() {
+                self.furniture.remove(i);
+            }
+        }
+        self.sel_furniture.clear();
+        n
     }
 
     /// Move the current selection by a world delta — the selected furniture instance, or
@@ -2982,13 +3514,17 @@ impl FactoryState {
         if delta.length_squared() < 1e-12 {
             return;
         }
-        if let Some(i) = self.sel_furniture {
-            if let Some(inst) = self.furniture.get_mut(i) {
-                inst.pos[0] += delta.x;
-                inst.pos[1] += delta.y;
-                inst.pos[2] += delta.z;
+        if !self.sel_furniture.is_empty() {
+            for &i in &self.sel_furniture {
+                if let Some(inst) = self.furniture.get_mut(i) {
+                    inst.pos[0] += delta.x;
+                    inst.pos[1] += delta.y;
+                    inst.pos[2] += delta.z;
+                }
             }
-            return; // furniture is not part of the CSG model — nothing to re-eval
+            if self.selection.is_empty() {
+                return; // furniture is not part of the CSG model — nothing to re-eval
+            }
         }
         for &id in &self.selection.clone() {
             if let Some(f) = self.model.get_mut(id) {
@@ -3005,9 +3541,11 @@ impl FactoryState {
         if (k - 1.0).abs() < 1e-4 {
             return;
         }
-        if let Some(i) = self.sel_furniture {
-            if let Some(inst) = self.furniture.get_mut(i) {
-                inst.scale = (inst.scale * k).clamp(0.001, 1000.0);
+        if !self.sel_furniture.is_empty() {
+            for &i in &self.sel_furniture {
+                if let Some(inst) = self.furniture.get_mut(i) {
+                    inst.scale = (inst.scale * k).clamp(0.001, 1000.0);
+                }
             }
             return;
         }
@@ -3305,10 +3843,211 @@ impl FactoryState {
         ti
     }
 
-    /// Screen-space edge segments outlining the currently-targeted furniture face/piece
-    /// (`furn_face_sel`) — so the user can SEE which surface a texture will land on. Every triangle
-    /// in the selected face-groups is projected (posed by the instance model matrix) and its three
-    /// edges emitted. Empty when nothing is targeted.
+    /// Load an HDR environment (or drop the current one), doing all the expensive derivation once.
+    ///
+    /// The SH projection and the GGX prefilter both run here, at load, and never again — a frame
+    /// must never wait on them. Returns a one-line summary for the status bar, including a warning
+    /// when the file has no dynamic range in it, because an IBL lit by an 8-bit JPEG looks broken in
+    /// a way that is very hard to attribute to the file.
+    pub fn set_env_map(&mut self, map: Option<crate::env_map::EnvMap>) -> String {
+        match map {
+            None => {
+                self.env_map = None;
+                self.env_chain.clear();
+                self.env_sh = [[0.0; 3]; 9];
+                self.env_version = self.env_version.wrapping_add(1);
+                self.dirty = true;
+                "environment cleared — back to the analytic sky".into()
+            }
+            Some(m) => {
+                let hdr = m.is_hdr();
+                let peak = m.peak();
+                let (w, h) = (m.w, m.h);
+                let name = m.name.clone();
+                self.env_sh = m.sh9();
+                self.env_chain = m.prefilter();
+                self.env_map = Some(std::sync::Arc::new(m));
+                self.env_version = self.env_version.wrapping_add(1);
+                self.dirty = true;
+                if hdr {
+                    format!("environment '{name}' loaded — {w}×{h}, peak {peak:.0}")
+                } else {
+                    format!(
+                        "environment '{name}' loaded — {w}×{h}, but it peaks at {peak:.2}: \
+                         a low-dynamic-range image has no sun in it and will light the scene flatly"
+                    )
+                }
+            }
+        }
+    }
+
+    /// The scene's environment for one frame: the sun's own resolution, with a loaded HDRI
+    /// overriding the analytic sky's ambient and backdrop.
+    ///
+    /// The HDRI wins on the DIFFUSE term by replacing `sh` — the same nine coefficients the sky
+    /// would have supplied, so nothing downstream needs to know which produced them. The sun stays
+    /// whatever the Sun dialog says: an HDRI's own sun cannot cast a shadow (it is pixels, not a
+    /// direction), so a daylight study keeps its directional light and gets the image's ambient.
+    pub fn scene_env(&self) -> (bool, Vec3, [f32; 3], crate::env::EnvRender) {
+        let (en, dir, sun_col, mut env) = self.sun.resolve_env();
+        if self.env_map.is_some() {
+            env.sh = self.env_sh;
+            env.hdri = Some(crate::env::HdriUse {
+                strength: self.env_strength.max(0.0),
+                rot: self.env_rot_deg.to_radians(),
+            });
+            env.backdrop = crate::env::Backdrop::Sky;
+        }
+        (en, dir, sun_col, env)
+    }
+
+    /// Rebuild instance `fi`'s geometry from its UNCUT original plus its whole cut list.
+    ///
+    /// This is what makes the cuts editable. Nothing is ever baked: the source of truth is the
+    /// list, and every change — adding, disabling, deleting, editing a depth — replays the lot
+    /// against untouched geometry. Delete every cut and the piece is bit-for-bit what it was.
+    ///
+    /// The cut result lands in a DERIVED library asset the instance points at, rather than in some
+    /// parallel per-instance mesh. That is deliberate: every consumer in the app — the render
+    /// buffers, ray-picking, face grouping, LOD, per-surface texturing — already reads a
+    /// `FurnitureAsset`, and they all keep working unchanged. Only this function knows a cut
+    /// happened.
+    ///
+    /// Cutting one piece never touches its neighbours: a derived asset belongs to one instance, so
+    /// three doors placed from the same library entry stay independent.
+    pub fn rebuild_cut_asset(&mut self, fi: usize) -> Result<(), cad_solid::meshcut::CutError> {
+        let Some(inst) = self.furniture.get(fi) else { return Ok(()) };
+        let src = inst.source_asset();
+        let Some(base) = self.furniture_lib.get(src) else { return Ok(()) };
+        let cuts = inst.cuts.clone();
+
+        // Nothing enabled → go back to the original outright, and drop the derived copy.
+        let out = cad_solid::meshcut::apply(&base.positions, &base.normals, &base.part_ids, &cuts)?;
+        let Some(mesh) = out else {
+            if let Some(inst) = self.furniture.get_mut(fi) {
+                inst.asset = src;
+                inst.base_asset = None;
+            }
+            self.dirty = true;
+            return Ok(());
+        };
+
+        // Per-part MATERIALS have to be carried across, and they cannot be carried by face-group
+        // id: those are renumbered whenever the triangles change, so the ids the instance has bound
+        // would land on different surfaces after a cut. Part ids are stable through the boolean
+        // (that is why they go through it), so the binding is remapped part-wise: read what each
+        // part is wearing now, then re-bind by part on the new geometry.
+        let part_tex: std::collections::HashMap<u32, usize> = {
+            let g = base.group_geom();
+            let mut m = std::collections::HashMap::new();
+            for t in 0..base.positions.len() / 3 {
+                let part = base.part_ids.get(t).copied().unwrap_or(0);
+                if let Some(&tex) = inst.surface_texture.get(&g.face[t]) {
+                    m.entry(part).or_insert(tex);
+                }
+            }
+            m
+        };
+
+        let name = format!("{} (cut)", base.name);
+        let color = base.color;
+        let import_scale = base.import_scale;
+        let part_ids = mesh.face_ids;
+
+        // Built DIRECTLY, never through `add_furniture_asset`. That routine RECENTRES an asset on
+        // its own bounds and rescales a wildly-sized import toward prop size — right for an import,
+        // wrong here. A cut changes the bounds, so recentring would shift the piece the first time
+        // it was cut; and since a later rebuild goes through the in-place path, it would shift back
+        // on the second edit. A derived asset is already in its original's units and its original's
+        // frame, and has to stay in both.
+        let mut asset = FurnitureAsset::new(name, mesh.positions, mesh.normals, color);
+        asset.import_scale = import_scale;
+        asset.alpha_resolved = true;
+        if part_ids.len() == asset.positions.len() / 3 {
+            asset.part_ids = part_ids;
+        }
+
+        // Reuse the derived slot when there is one, so repeated edits do not grow the library.
+        let existing = self.furniture[fi].base_asset.map(|_| self.furniture[fi].asset);
+        let derived = match existing {
+            Some(d) if d != src && d < self.furniture_lib.len() => {
+                self.furniture_lib[d] = asset;
+                d
+            }
+            _ => {
+                self.furniture_lib.push(asset);
+                self.furniture_lib.len() - 1
+            }
+        };
+
+        // Re-bind materials by part on the new face groups.
+        let rebound = self.furniture_lib.get(derived).map(|a| {
+            let g = a.group_geom();
+            let mut m: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for t in 0..a.positions.len() / 3 {
+                let part = a.part_ids.get(t).copied().unwrap_or(0);
+                if let Some(&tex) = part_tex.get(&part) {
+                    m.insert(g.face[t], tex);
+                }
+            }
+            m
+        });
+        if let Some(inst) = self.furniture.get_mut(fi) {
+            inst.base_asset = Some(src);
+            inst.asset = derived;
+            if let Some(m) = rebound {
+                inst.surface_texture = m;
+            }
+        }
+        self.dirty = true;
+        self.face_outline.borrow_mut().take();
+        Ok(())
+    }
+
+    /// Overwrite an existing library asset's geometry in place, keeping its index valid.
+    fn replace_furniture_asset(
+        &mut self, idx: usize, name: String, mesh: crate::mesh_io::ObjMesh, import_scale: f32,
+    ) {
+        let Some(a) = self.furniture_lib.get_mut(idx) else { return };
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for p in &mesh.positions {
+            for i in 0..3 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+        a.name = name;
+        a.positions = mesh.positions;
+        a.normals = mesh.normals;
+        a.uvs.clear(); // the boolean does not carry UVs; per-part materials do the work instead
+        a.alpha.clear();
+        a.part_ids.clear();
+        a.local_min = lo;
+        a.local_max = hi;
+        a.import_scale = import_scale;
+        *a.groups.borrow_mut() = None;
+        *a.lod.borrow_mut() = None;
+    }
+
+    /// Screen-space segments outlining the currently-targeted furniture face/piece
+    /// (`furn_face_sel`) — so the user can SEE which surface a texture will land on. Empty when
+    /// nothing is targeted.
+    ///
+    /// This used to walk every triangle in the asset each frame and emit all THREE edges of every
+    /// selected one. On the villa (2.01 M triangles, a 15,296-triangle face) that was a 2 M-element
+    /// scan producing **45,888 line segments per frame**, each of which egui tessellates into a
+    /// quad — measured at 250–436 ms a frame, for as long as anything stayed selected. Selecting
+    /// something made the app unusable, and deselecting fixed it.
+    ///
+    /// Both halves of that were wrong, and both fixes are here:
+    ///
+    /// - **Outline, not wireframe.** A face group is a surface; its three-edges-per-triangle form
+    ///   is its whole triangulation, which is a dense mesh of lines nobody wants to look at. What
+    ///   reads as "this face is selected" is the BOUNDARY — the edges used by exactly one selected
+    ///   triangle. For that same villa face it is a few hundred segments instead of 45,888.
+    /// - **Cached in LOCAL space.** The boundary depends on the selection, not on the camera or
+    ///   the pose, so it is built once and then only transformed and projected. Orbiting the
+    ///   camera and dragging the object both stay free.
     pub fn furniture_face_highlight_segments(
         &self, rect: egui::Rect, mvp: &[f32; 16],
     ) -> Vec<[egui::Pos2; 2]> {
@@ -3319,29 +4058,103 @@ impl FactoryState {
         if asset.needs_lod() {
             return out;
         }
-        let fg = asset.group_geom();
-        let want: std::collections::HashSet<u32> = groups.iter().copied().collect();
+
+        // Rebuild only when the SELECTION changed — not when the camera moved.
+        {
+            let tris = asset.positions.len() / 3;
+            let stale = self.face_outline.borrow().as_ref().is_none_or(|c| {
+                c.inst != *fi || c.asset != inst.asset || c.tris != tris || c.groups != *groups
+            });
+            if stale {
+                *self.face_outline.borrow_mut() =
+                    Some(Self::build_face_outline(asset, *fi, inst.asset, groups));
+            }
+        }
+        let cache = self.face_outline.borrow();
+        let Some(c) = cache.as_ref() else { return out };
+
         let model = glam::Mat4::from_cols_array(&self.furniture_model_matrix(*fi).unwrap_or([
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ]));
+        out.reserve(c.edges.len());
+        for e in &c.edges {
+            let a = world_to_screen(model.transform_point3(e[0]), rect, mvp);
+            let b = world_to_screen(model.transform_point3(e[1]), rect, mvp);
+            if let (Some(a), Some(b)) = (a, b) {
+                out.push([a, b]);
+            }
+        }
+        out
+    }
+
+    /// True when the last outline was cut short at [`MAX_OUTLINE_EDGES`] — the caller says so
+    /// rather than quietly drawing a partial highlight, because a highlight that stops halfway
+    /// round a face reads as a hole in the face.
+    pub fn face_highlight_truncated(&self) -> bool {
+        self.face_outline.borrow().as_ref().is_some_and(|c| c.truncated)
+    }
+
+    /// The boundary of the selected face-groups, in the asset's local space.
+    ///
+    /// Edges are welded by QUANTIZED position rather than by vertex index: this is triangle soup,
+    /// so the two triangles sharing an edge carry two separate copies of its endpoints, and an
+    /// index-based match would find no shared edges at all and hand back the wireframe it was
+    /// meant to replace.
+    fn build_face_outline(
+        asset: &FurnitureAsset, inst: usize, asset_idx: usize, groups: &[u32],
+    ) -> FaceOutline {
+        use std::collections::hash_map::Entry;
+        let fg = asset.group_geom();
+        let want: std::collections::HashSet<u32> = groups.iter().copied().collect();
+        // 0.1 mm — far below anything a user can see, far above f32 noise on a metre-scale model.
+        let key = |p: [f32; 3]| {
+            [
+                (p[0] * 10_000.0).round() as i64,
+                (p[1] * 10_000.0).round() as i64,
+                (p[2] * 10_000.0).round() as i64,
+            ]
+        };
+        let mut edges: std::collections::HashMap<([i64; 3], [i64; 3]), ([Vec3; 2], u32)> =
+            std::collections::HashMap::new();
         for t in 0..fg.face.len() {
             if !want.contains(&fg.face[t]) {
                 continue;
             }
             let base = t * 3;
-            let s: Vec<Option<egui::Pos2>> = (0..3)
-                .map(|k| {
-                    let wp = model.transform_point3(Vec3::from(asset.positions[base + k]));
-                    world_to_screen(wp, rect, mvp)
-                })
-                .collect();
             for e in 0..3 {
-                if let (Some(a), Some(b)) = (s[e], s[(e + 1) % 3]) {
-                    out.push([a, b]);
+                let (p, q) = (asset.positions[base + e], asset.positions[base + (e + 1) % 3]);
+                let (kp, kq) = (key(p), key(q));
+                // Order-independent, so the same edge from the neighbouring triangle (which winds
+                // it the other way) lands on the same key.
+                let k = if kp <= kq { (kp, kq) } else { (kq, kp) };
+                match edges.entry(k) {
+                    Entry::Occupied(mut o) => o.get_mut().1 += 1,
+                    Entry::Vacant(v) => {
+                        v.insert(([Vec3::from(p), Vec3::from(q)], 1));
+                    }
                 }
             }
         }
-        out
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for (seg, n) in edges.into_values() {
+            if n != 1 {
+                continue; // interior: shared by two selected triangles
+            }
+            if out.len() >= MAX_OUTLINE_EDGES {
+                truncated = true;
+                break;
+            }
+            out.push(seg);
+        }
+        FaceOutline {
+            inst,
+            asset: asset_idx,
+            tris: asset.positions.len() / 3,
+            groups: groups.to_vec(),
+            edges: out,
+            truncated,
+        }
     }
 
     /// Set a feature's world origin directly — the Position fields in the properties
@@ -3467,7 +4280,7 @@ impl FactoryState {
     fn rot_target(&self) -> Option<(Vec3, [Vec3; 3], bool)> {
         let (mn, mx) = self.selection_aabb()?;
         let center = (mn + mx) * 0.5;
-        if self.sel_furniture.is_some() {
+        if !self.sel_furniture.is_empty() {
             return Some((center, [Vec3::X, Vec3::Y, Vec3::Z], true));
         }
         let id = self.selected_single()?;
@@ -3543,14 +4356,22 @@ impl FactoryState {
         let Some(ai) = handle.ring_axis() else { return false };
         let axis = axes[ai];
         let Some(r0) = self.ray_to_ring_vec(cursor, center, axis, rect, mvp) else { return false };
+        let start_furn: Vec<(usize, [f32; 3], [f32; 3])> = if is_furniture {
+            self.sel_furniture
+                .iter()
+                .filter_map(|&fi| self.furniture.get(fi).map(|f| (fi, f.pos, f.rot)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let start_rot = if is_furniture {
-            self.sel_furniture.and_then(|fi| self.furniture.get(fi)).map(|f| f.rot).unwrap_or([0.0; 3])
+            start_furn.first().map(|&(_, _, r)| r).unwrap_or([0.0; 3])
         } else {
             self.selected_single().and_then(|id| self.feature_rotation(id)).unwrap_or([0.0; 3])
         };
         self.rot_drag = Some(RotDrag {
             handle, axis, center, r0, start_rot,
-            feat_axis: ai, is_furniture,
+            feat_axis: ai, is_furniture, start_furn,
         });
         true
     }
@@ -3559,18 +4380,26 @@ impl FactoryState {
     /// world-axis quaternion (kept as Euler for the numeric fields); a feature adds the swept
     /// angle to the ring's plane-local placement angle.
     pub fn rot_update(&mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) {
-        let Some(d) = self.rot_drag else { return };
+        let Some(d) = self.rot_drag.clone() else { return };
         let Some(r1) = self.ray_to_ring_vec(cursor, d.center, d.axis, rect, mvp) else { return };
         // Signed angle r0→r1 about the axis (radians).
         let angle = d.r0.cross(r1).dot(d.axis).atan2(d.r0.dot(r1));
         if d.is_furniture {
-            if let Some(inst) = self.sel_furniture.and_then(|fi| self.furniture.get_mut(fi)) {
+            let spin = glam::Quat::from_axis_angle(d.axis, angle);
+            for &(fi, start_pos, start_rot) in &d.start_furn {
+                let Some(inst) = self.furniture.get_mut(fi) else { continue };
+                // ORBIT about the selection centre as well as spinning in place. With one piece
+                // selected the centre IS the piece and this term vanishes; with several, turning
+                // the group has to move them round each other or it is not a group rotation at
+                // all — the pieces would each pirouette on the spot and the arrangement break up.
+                let p = Vec3::from(start_pos);
+                let moved = d.center + spin * (p - d.center);
+                inst.pos = [moved.x, moved.y, moved.z];
                 let q_start = glam::Quat::from_euler(
                     glam::EulerRot::XYZ,
-                    d.start_rot[0].to_radians(), d.start_rot[1].to_radians(), d.start_rot[2].to_radians(),
+                    start_rot[0].to_radians(), start_rot[1].to_radians(), start_rot[2].to_radians(),
                 );
-                let q = glam::Quat::from_axis_angle(d.axis, angle) * q_start;
-                let (x, y, z) = q.to_euler(glam::EulerRot::XYZ);
+                let (x, y, z) = (spin * q_start).to_euler(glam::EulerRot::XYZ);
                 inst.rot = [x.to_degrees(), y.to_degrees(), z.to_degrees()];
             }
         } else if let Some(id) = self.selected_single() {
@@ -3880,7 +4709,7 @@ impl FactoryState {
     /// selection is already drawn, and the old highlight would linger.
     pub fn clear_selection(&mut self) {
         self.selection.clear();
-        self.sel_furniture = None;
+        self.sel_furniture.clear();
         self.sel_key.clear();
     }
 
@@ -3971,6 +4800,8 @@ impl FactoryState {
                     texture: f.texture,
                     fit: f.fit,
                     surface_texture: f.surface_texture.iter().map(|(&g, &t)| (g, t)).collect(),
+                    cuts: f.cuts.iter().map(crate::simlux_io::MeshCutRec::of).collect(),
+                    base_asset: f.base_asset,
                 })
                 .collect(),
             feature_colors: self.feature_color.iter().map(|(&k, &v)| (k, v)).collect(),
@@ -4001,6 +4832,8 @@ impl FactoryState {
                         rough: p.rough,
                         contrast: p.contrast,
                         ramp: p.ramp,
+                        surf_rough: p.surf_rough,
+                        bump: p.bump,
                     }),
                     normal_map: t.normal_map,
                     rough_map: t.rough_map,
@@ -4156,6 +4989,9 @@ impl FactoryState {
                     .filter(|(_, t)| *t < ntex)
                     .map(|(g, t)| (*g, *t))
                     .collect(),
+                cuts: f.cuts.iter().map(|c| c.to_cut()).collect(),
+                base_asset: f.base_asset.filter(|&b| b < nlib),
+                ..Default::default()
             })
             .collect();
         self.feature_color = d.feature_colors.into_iter().collect();
@@ -4182,6 +5018,15 @@ impl FactoryState {
             .filter(|&(id, _)| have.contains(&id))
             .collect();
         self.next_group_id = self.feature_group.values().copied().max().unwrap_or(0) + 1;
+        // CUTS are stored as a list, not as geometry, so a loaded piece has to be re-cut before it
+        // matches what was saved. Replaying them here (rather than trusting the saved mesh) is what
+        // keeps them editable across a reload — and means a later fix to the boolean improves old
+        // projects instead of leaving them frozen with their old result baked in.
+        for fi in 0..self.furniture.len() {
+            if self.furniture[fi].cuts.iter().any(|c| c.enabled) {
+                let _ = self.rebuild_cut_asset(fi);
+            }
+        }
         // Ids are safe to carry across: `Model::push` mints `max(id) + 1`, so restored
         // ids are never reused. Selection, though, indexed the OLD model — drop it.
         self.clear_selection();
@@ -4456,7 +5301,7 @@ impl FactoryState {
     /// Select an opening — ALL sibling cuts — so it highlights and its Position/Dimensions load
     /// into the panel, and a 3D move/nudge moves every body's hole together (not just one).
     pub fn select_cutout(&mut self, id: u32) {
-        self.sel_furniture = None;
+        self.sel_furniture.clear();
         self.selection = self.cutout_siblings(id);
     }
 
@@ -4652,6 +5497,48 @@ impl FactoryState {
     /// roughness / opacity resolved from its per-surface or whole-object texture, else its colour.
     /// Geometry is rotated by `−north_offset` about Z so the model's north lines up with gensky's
     /// (true) north — so the exported `gensky` sun matches the viewport.
+    /// The PROCEDURAL definition of every material, indexed by texture id — the table
+    /// [`crate::radiance_export::ExportTri::material`] points into. Built alongside
+    /// [`Self::export_render_tris`] so the path tracer can evaluate the same pattern the viewport
+    /// evaluates in its shader, instead of being handed one averaged colour per surface.
+    pub fn export_proc_table(&self) -> Vec<Option<ProcDef>> {
+        if self.clay_mode {
+            return Vec::new(); // a light study is deliberately material-free
+        }
+        self.textures.iter().map(|t| t.proc).collect()
+    }
+
+    /// The IMAGES the path tracer should sample, plus the material→image index parallel to
+    /// [`Self::export_proc_table`]. A material with a procedural, or with only a 1×1 colour
+    /// swatch, contributes nothing: the swatch IS the flat albedo the tracer already had, and
+    /// paying for a texture fetch to read one texel back is pure cost.
+    ///
+    /// The pixel data is cloned once here, at the start of a render. For the villa that is ~62 MB
+    /// copied once per render start — worth measuring if it ever shows up, but it is not per frame
+    /// and not per sample.
+    pub fn export_texture_table(&self) -> (Vec<crate::pathtrace::TexImage>, Vec<Option<u32>>) {
+        if self.clay_mode {
+            return (Vec::new(), Vec::new());
+        }
+        let mut pool = Vec::new();
+        let mut index = Vec::with_capacity(self.textures.len());
+        for t in &self.textures {
+            if t.proc.is_some() || (t.w <= 1 && t.h <= 1) || t.rgba.len() < 4 {
+                index.push(None);
+                continue;
+            }
+            index.push(Some(pool.len() as u32));
+            pool.push(crate::pathtrace::TexImage {
+                w: t.w,
+                h: t.h,
+                rgba: std::sync::Arc::new(t.rgba.clone()),
+                triplanar: t.triplanar,
+                tiles_per_m: t.tiles_per_m,
+            });
+        }
+        (pool, index)
+    }
+
     pub fn export_render_tris(&self) -> Vec<crate::radiance_export::ExportTri> {
         const DEF: [f32; 3] = [0.72, 0.72, 0.72];
         let clay = self.clay_mode; // flat grey for a light study (glass keeps its transparency)
@@ -4660,19 +5547,42 @@ impl FactoryState {
         let rot = |p: [f32; 3]| [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]];
         let mut out = Vec::new();
 
-        // Principled extras (metallic / IOR / emission) for a texture index — read by the path
-        // tracer; zeroed under clay so a light study stays matte and unlit-by-materials.
-        let extras = |ti: Option<usize>| -> (f32, f32, [f32; 3]) {
+        // Principled extras for a texture index — read by the path tracer; zeroed under clay so a
+        // light study stays matte and unlit-by-materials.
+        #[derive(Clone, Copy)]
+        struct Extras {
+            metallic: f32,
+            ior: f32,
+            emission: [f32; 3],
+            clearcoat: f32,
+            clearcoat_rough: f32,
+            sheen: f32,
+            sheen_tint: [f32; 3],
+        }
+        const BARE: Extras = Extras {
+            metallic: 0.0, ior: 1.5, emission: [0.0; 3],
+            clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3],
+        };
+        let extras = |ti: Option<usize>| -> Extras {
             if clay {
-                return (0.0, 1.5, [0.0; 3]);
+                return BARE;
             }
             match ti.and_then(|t| self.textures.get(t)) {
                 Some(t) => {
                     let e = t.emission;
                     let s = t.emission_strength;
-                    (t.metallic, t.ior, [e[0] * s, e[1] * s, e[2] * s])
+                    Extras {
+                        metallic: t.metallic,
+                        ior: t.ior,
+                        emission: [e[0] * s, e[1] * s, e[2] * s],
+                        clearcoat: t.clearcoat,
+                        clearcoat_rough: t.clearcoat_rough,
+                        sheen: t.sheen,
+                        // Linear, like every other colour crossing into the tracer.
+                        sheen_tint: crate::color::srgb_to_linear3(t.sheen_tint),
+                    }
                 }
-                None => (0.0, 1.5, [0.0; 3]),
+                None => BARE,
             }
         };
 
@@ -4688,15 +5598,24 @@ impl FactoryState {
                 (col, 0.5, 1.0)
             };
             let rgb = if clay { CLAY_GREY } else { rgb };
-            let (metallic, ior, emission) = extras(tex);
+            let x = extras(tex);
             out.push(crate::radiance_export::ExportTri {
                 verts: [rot(tri[0]), rot(tri[1]), rot(tri[2])],
                 rgb,
                 roughness: rough,
                 opacity: op,
-                metallic,
-                ior,
-                emission,
+                metallic: x.metallic,
+                ior: x.ior,
+                emission: x.emission,
+                clearcoat: x.clearcoat,
+                clearcoat_rough: x.clearcoat_rough,
+                sheen: x.sheen,
+                sheen_tint: x.sheen_tint,
+                material: if clay { None } else { tex.and_then(|t| u16::try_from(t).ok()) },
+                // CSG faces carry no UV layer — the viewport projects their textures from world
+                // space, and the tracer is told to do the same rather than invent a mapping.
+                uv: [[0.0; 2]; 3],
+                has_uv: false,
             });
         }
 
@@ -4712,7 +5631,7 @@ impl FactoryState {
                 let eff = inst.surface_texture.get(&fg).copied().or(inst.texture);
                 let (rgb, rough, op) = eff.map(|ti| self.export_tex_rep(ti)).unwrap_or((inst.color, 0.5, 1.0));
                 let rgb = if clay { CLAY_GREY } else { rgb };
-                let (metallic, ior, emission) = extras(eff);
+                let x = extras(eff);
                 // Imported glass (per-vertex alpha, e.g. the villa panes) has no texture — carry the
                 // mesh's own translucency so the tracer refracts it too.
                 let op = if eff.is_none() && tri_is_translucent(asset, t * 3) {
@@ -4726,7 +5645,24 @@ impl FactoryState {
                     let w = m.transform_point3(Vec3::new(p[0], p[1], p[2]));
                     *v = rot([w.x, w.y, w.z]);
                 }
-                out.push(crate::radiance_export::ExportTri { verts: vs, rgb, roughness: rough, opacity: op, metallic, ior, emission });
+                // An imported mesh's OWN UVs, when it has them. This is what lets the tracer put
+                // roof tiles on the roof instead of the tiles' average brown.
+                let mut uv = [[0.0f32; 2]; 3];
+                let has_uv = asset.uvs.len() >= t * 3 + 3;
+                if has_uv {
+                    for (k, slot) in uv.iter_mut().enumerate() {
+                        *slot = asset.uvs[t * 3 + k];
+                    }
+                }
+                out.push(crate::radiance_export::ExportTri {
+                    verts: vs, rgb, roughness: rough, opacity: op,
+                    metallic: x.metallic, ior: x.ior, emission: x.emission,
+                    clearcoat: x.clearcoat, clearcoat_rough: x.clearcoat_rough,
+                    sheen: x.sheen, sheen_tint: x.sheen_tint,
+                    material: if clay { None } else { eff.and_then(|t| u16::try_from(t).ok()) },
+                    uv,
+                    has_uv,
+                });
             }
         }
         out
@@ -4914,13 +5850,13 @@ impl FactoryState {
             return Vec::new(); // once the base is picked the GHOST is the feedback
         }
         let c = [0.0, 0.75, 0.95];
-        self.sel_mesh.positions.iter().map(|p| v(Vec3::from(*p), c)).collect()
+        self.sel_mesh.positions.iter().map(|p| v(Vec3::from(*p), ui(c))).collect()
     }
 
     /// GHOST — the selected solids under the op's LIVE transform, at the constrained
     /// cursor (spec §0.6: "while moving it shows the path").
     fn ghost_verts(&self, c: [f32; 3], xf: impl Fn(Vec3) -> Vec3) -> Vec<V3> {
-        self.sel_mesh.positions.iter().map(|p| v(xf(Vec3::from(*p)), c)).collect()
+        self.sel_mesh.positions.iter().map(|p| v(xf(Vec3::from(*p)), ui(c))).collect()
     }
 
     /// The live ghost for the running op. Colours per §0.6: Move accent(255,200,100) ·
@@ -5172,7 +6108,7 @@ impl FactoryState {
                 let c = shade_furniture(inst.color, Vec3::from(n));
                 out.push(crate::light3d::V3A {
                     x: p[0], y: p[1], z: p[2],
-                    r: c[0], g: c[1], b: c[2],
+                    r: c.col[0], g: c.col[1], b: c.col[2],
                     a: asset.vertex_alpha(k),
                 });
             }
@@ -5337,7 +6273,16 @@ impl FactoryState {
                 tex.opacity.to_bits().hash(&mut sig);
             }
         }
-        self.sun.hash_into(&mut sig); // sun change → re-shade the flat remainder of a faceted piece
+        // The baked `TexVtx.s` scalar is only READ by the shader in studio mode — when daylight is
+        // on, the textured shader computes its own lighting from the sun and the sky's SH ambient
+        // and ignores it entirely (see `u_sun_on` in light3d's TEX_FS). So only the sun's ON/OFF
+        // state can change this buffer's contents; hashing the whole `SunEnv` meant every nudge of
+        // the hour slider re-baked every textured vertex in the scene, which on the villa is 1.86 M
+        // triangles rebuilt per frame while dragging.
+        self.sun.enabled.hash(&mut sig);
+        if !self.sun.enabled {
+            self.sun.hash_into(&mut sig); // studio mode: the baked scalar is what lights the piece
+        }
         self.clay_mode.hash(&mut sig); // clay toggle → re-bake
         let sig = sig.finish();
         if let Some((cached_sig, arc)) = self.faceted_cache.borrow().get(&i) {
@@ -5565,7 +6510,12 @@ impl FactoryState {
         self.hide_ceilings.hash(&mut h);
         self.cutaway.hash(&mut h);
         self.cutaway_z.to_bits().hash(&mut h);
-        self.sun.hash_into(&mut h); // sun change → re-shade the scene
+        // The sun is DELIBERATELY not hashed. The buffer now carries albedo and normals, and the
+        // fragment shader applies the light — so moving the sun changes no vertex. Re-baking here
+        // was the hour slider rebuilding 1.86 M vertices on every nudge, and the whole point of
+        // moving the lighting into the shader is that this cannot happen any more. Only the
+        // sun's ENABLED state matters, because it selects the studio response.
+        self.sun.enabled.hash(&mut h);
         self.clay_mode.hash(&mut h); // clay toggle → re-bake grey/coloured
         // Colour maps: combine per-entry hashes order-independently (XOR/add) so a recolour
         // of an existing key changes the signature even though the map length is unchanged.
@@ -5645,8 +6595,8 @@ impl FactoryState {
                 aabb_lines(&mut out, mn, mx, [0.0, 0.9, 1.0]);
             }
         }
-        // Highlight a selected furniture instance the same way.
-        if let Some(i) = self.sel_furniture {
+        // Highlight every selected furniture instance the same way.
+        for &i in &self.sel_furniture {
             if let Some((mn, mx)) = self.furniture_aabb(i) {
                 aabb_lines(&mut out, mn, mx, [1.0, 0.75, 0.2]);
             }
@@ -5716,16 +6666,141 @@ impl FactoryState {
     pub fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Frame> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, Vec3, Vec3)> = None;
+        let mut consider = |t: f32, a: Vec3, b: Vec3, c: Vec3| {
+            if best.map_or(true, |(bt, _, _)| t < bt) {
+                let n = (b - a).cross(c - a).normalize_or_zero();
+                best = Some((t, orig + dir * t, n));
+            }
+        };
         for tri in self.cached.positions.chunks_exact(3) {
             let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
             if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
-                if best.map_or(true, |(bt, _, _)| t < bt) {
-                    let n = (b - a).cross(c - a).normalize_or_zero();
-                    best = Some((t, orig + dir * t, n));
+                consider(t, a, b, c);
+            }
+        }
+        // FURNITURE FACES TOO. Faces used to come from the evaluated CSG mesh alone, so a face on a
+        // door, a cupboard, a staircase or an aperture could not be picked at all — and since
+        // sketch-on-face is how a cut is aimed, none of those could be cut either. They are all
+        // furniture instances, so testing them here opens the feature to all three at once.
+        for (i, inst) in self.furniture.iter().enumerate() {
+            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            match self.furniture_aabb(i) {
+                Some((mn, mx)) if cad_solid::ray_aabb(orig, dir, mn, mx).is_some() => {}
+                _ => continue,
+            }
+            // The FULL mesh, never the decimated LOD: a cut must be aimed at the surface that will
+            // actually be cut, and a decimated proxy is a different surface.
+            for tri in asset.positions.chunks_exact(3) {
+                let a = self.furniture_point(inst, tri[0]);
+                let b = self.furniture_point(inst, tri[1]);
+                let c = self.furniture_point(inst, tri[2]);
+                if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                    consider(t, a, b, c);
                 }
             }
         }
         best.map(|(_, p, n)| Frame::from_point_normal(p, n))
+    }
+
+    /// Which furniture instance a sketch frame is sitting ON, if any.
+    ///
+    /// Resolved from the frame's own origin rather than remembered from the pick. A sketch can be
+    /// started, left, re-entered and finished much later; a stashed instance index would go stale
+    /// the moment anything else was deleted, and aiming a cut at the wrong object is worse than
+    /// finding none. The origin is a point the pick placed exactly on a surface, so asking which
+    /// surface it lies on gives the same answer however much later it is asked.
+    pub fn furniture_at_face(&self, frame: &Frame) -> Option<usize> {
+        let (o, n) = (frame.origin, frame.normal());
+        let mut best: Option<(f32, usize)> = None;
+        for (i, inst) in self.furniture.iter().enumerate() {
+            let Some(asset) = self.furniture_lib.get(inst.asset) else { continue };
+            match self.furniture_aabb(i) {
+                // 5 mm of slack: the origin came OFF this surface, it is not a guess.
+                Some((mn, mx))
+                    if o.cmpge(mn - Vec3::splat(0.005)).all()
+                        && o.cmple(mx + Vec3::splat(0.005)).all() => {}
+                _ => continue,
+            }
+            for tri in asset.positions.chunks_exact(3) {
+                let a = self.furniture_point(inst, tri[0]);
+                let b = self.furniture_point(inst, tri[1]);
+                let c = self.furniture_point(inst, tri[2]);
+                let tn = (b - a).cross(c - a).normalize_or_zero();
+                // Same plane AND the same way up: the two skins of a panel are a millimetre apart,
+                // and only the one the user actually picked should claim the sketch.
+                if tn.dot(n) < 0.99 {
+                    continue;
+                }
+                let d = (o - a).dot(tn).abs();
+                if d < 1e-3 && best.map_or(true, |(bd, _)| d < bd) {
+                    best = Some((d, i));
+                }
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Pull a WORLD-space frame back into instance `fi`'s own local space, where a cut is stored.
+    ///
+    /// A cut belongs to the object, not to the room: store the frame in world space and the hole
+    /// stays behind the moment the piece is dragged or spun. The instance matrix can carry a
+    /// non-uniform `fit` (apertures stretch to fill their opening), so the frame is rebuilt from
+    /// the transformed normal rather than assuming the axes came through square.
+    pub fn frame_to_local(&self, fi: usize, f: &Frame) -> Option<Frame> {
+        let inv = Mat4::from_cols_array(&self.furniture_model_matrix(fi)?).inverse();
+        let o = inv.transform_point3(f.origin);
+        let n = inv.transform_point3(f.origin + f.normal()) - o;
+        Some(Frame::from_point_normal(o, n.normalize_or_zero()))
+    }
+
+    /// Record a cut on instance `fi` and rebuild its geometry. The profile arrives in the WORLD
+    /// frame the user drew on; both are converted to the asset's local space here, once.
+    pub fn add_furniture_cut(
+        &mut self,
+        fi: usize,
+        world: &Frame,
+        loops: &[Vec<Vec2>],
+        through: bool,
+        depth: f32,
+    ) -> Result<usize, cad_solid::meshcut::CutError> {
+        let Some(local) = self.frame_to_local(fi, world) else { return Ok(0) };
+        // Scale: the instance may be scaled, so a metre drawn on screen is not a metre in the
+        // asset's own units. Measure it off the transform rather than assuming 1.
+        let k = {
+            let m = Mat4::from_cols_array(&self.furniture_model_matrix(fi).unwrap_or_default());
+            let s = m.transform_vector3(local.u).length();
+            if s > 1e-6 { 1.0 / s } else { 1.0 }
+        };
+        let before = self.furniture[fi].cuts.len();
+        for pts in loops {
+            let profile: Vec<[f32; 2]> = pts
+                .iter()
+                .map(|p| {
+                    let w = world.from_uv(*p);
+                    let uv = local.to_uv(
+                        Mat4::from_cols_array(&self.furniture_model_matrix(fi).unwrap_or_default())
+                            .inverse()
+                            .transform_point3(w),
+                    );
+                    [uv.x, uv.y]
+                })
+                .collect();
+            let label = format!("Cut {}", self.furniture[fi].cuts.len() + 1);
+            self.furniture[fi].cuts.push(if through {
+                cad_solid::meshcut::MeshCut::through(local, profile, label)
+            } else {
+                cad_solid::meshcut::MeshCut::pocket(local, profile, depth * k, label)
+            });
+        }
+        // Rebuild, and put the list back exactly as it was if the mesh refuses — a failed cut must
+        // leave no trace in the list, or the piece is stuck refusing forever.
+        match self.rebuild_cut_asset(fi) {
+            Ok(()) => Ok(self.furniture[fi].cuts.len() - before),
+            Err(e) => {
+                self.furniture[fi].cuts.truncate(before);
+                Err(e)
+            }
+        }
     }
 
     /// Unproject `cursor` onto the active construction plane (XY at z=0) — the 3D
@@ -6288,7 +7363,7 @@ mod furniture_and_color_tests {
         assert!(!st.selection.is_empty());
         let idx = st.add_furniture_asset("x".into(), tetra());
         st.place_furniture(idx, Vec3::ZERO);   // selects the furniture
-        assert_eq!(st.sel_furniture, Some(0));
+        assert_eq!(st.sel_furniture, vec![0]);
         assert!(st.selection.is_empty(), "selecting furniture clears the feature selection");
     }
 
@@ -6489,6 +7564,12 @@ mod gizmo_and_props_tests {
         st.fit();
         st
     }
+    /// The smallest thing that can be a furniture asset — four faces, no degenerate triangles.
+    fn tetra() -> crate::mesh_io::ObjMesh {
+        crate::mesh_io::parse_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n",
+        )
+    }
 
     /// The selection centre is the AABB centre — the gizmo hangs off it.
     #[test]
@@ -6614,6 +7695,114 @@ mod gizmo_and_props_tests {
         st.select_in_marquee(band, rect(), &mvp, false);
         assert!(st.selection.contains(&a), "A is inside the band");
         assert!(!st.selection.contains(&b), "B is outside it");
+    }
+
+    /// A band dragged across the view must pick up FURNITURE as well as solids.
+    ///
+    /// A marquee is a statement about a region: someone who draws one round a corner of the villa
+    /// means the walls AND the chairs standing in it. Selecting only one kind is the surprise.
+    #[test]
+    fn the_marquee_takes_furniture_too() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        st.place_furniture(idx, Vec3::new(40.0, 0.0, 0.0)); // far outside any sane band
+        st.clear_selection();
+        st.fit();
+        let mvp = view(&st);
+
+        let near = st.furniture_aabb(0).map(|(a, b)| (a + b) * 0.5).unwrap();
+        let s = crate::factory::world_to_screen(near, rect(), &mvp).unwrap();
+        let band = egui::Rect::from_center_size(s, egui::vec2(60.0, 60.0));
+        let (feat, furn) = st.select_in_marquee(band, rect(), &mvp, false);
+        assert_eq!((feat, furn), (0, 1), "one piece of furniture, no solids");
+        assert_eq!(st.sel_furniture, vec![0]);
+    }
+
+    /// Shift-click adds a second piece — and clicking it again takes it back out.
+    ///
+    /// Toggling rather than only adding is what makes the gesture reversible: overshoot by one and
+    /// you undo it the same way you did it, instead of starting the selection over.
+    #[test]
+    fn shift_click_toggles_a_piece_in_and_out() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.place_furniture(idx, Vec3::new(2.0, 0.0, 0.0));
+        st.select_furniture(0);
+        st.toggle_furniture(1);
+        assert_eq!(st.sel_furniture, vec![0, 1], "both are selected");
+        st.toggle_furniture(1);
+        assert_eq!(st.sel_furniture, vec![0], "…and the second one came back out");
+        assert_eq!(st.sel_furn_primary(), Some(0), "the primary is unchanged throughout");
+    }
+
+    /// Deleting several pieces must delete the ones that were selected.
+    ///
+    /// `Vec::remove` shifts everything after it down, so erasing ascending indices removes the
+    /// wrong objects — 0 then 2 takes out the first and the fourth. This is the whole reason
+    /// `erase_selected_furniture` walks the list backwards.
+    #[test]
+    fn erasing_several_pieces_removes_the_right_ones() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        for x in 0..4 {
+            st.place_furniture(idx, Vec3::new(x as f32, 0.0, 0.0));
+        }
+        st.sel_furniture = vec![0, 2];
+        assert_eq!(st.erase_selected_furniture(), 2);
+        assert_eq!(st.furniture.len(), 2);
+        let xs: Vec<f32> = st.furniture.iter().map(|f| f.pos[0]).collect();
+        assert_eq!(xs, vec![1.0, 3.0], "the pieces at x=0 and x=2 went, not their neighbours");
+        assert!(st.sel_furniture.is_empty(), "nothing is left selected");
+    }
+
+    /// Moving a multi-selection moves every piece by the same delta, keeping the arrangement.
+    #[test]
+    fn moving_several_pieces_keeps_them_in_formation() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.place_furniture(idx, Vec3::new(2.0, 0.0, 0.0));
+        st.sel_furniture = vec![0, 1];
+        st.selection.clear();
+        st.move_selection(Vec3::new(1.0, 5.0, 0.0));
+        assert!((st.furniture[0].pos[0] - 1.0).abs() < 1e-4);
+        assert!((st.furniture[1].pos[0] - 3.0).abs() < 1e-4);
+        assert!((st.furniture[1].pos[1] - 5.0).abs() < 1e-4);
+    }
+
+    /// The selection bounds must cover EVERY selected piece, not just the first — the gizmo hangs
+    /// off this, and anchored to one chair of a selected row it would sit off to one side.
+    #[test]
+    fn the_bounds_of_a_multi_selection_cover_all_of_it() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.place_furniture(idx, Vec3::new(10.0, 0.0, 0.0));
+        st.sel_furniture = vec![0, 1];
+        st.selection.clear();
+        let (mn, mx) = st.selection_aabb().expect("a multi-selection has bounds");
+        assert!(mn.x <= 0.01 && mx.x >= 9.99, "bounds {mn:?}..{mx:?} miss a piece");
+        let c = st.selection_center().unwrap();
+        assert!((c.x - 5.0).abs() < 0.5, "the centre sits between them, not on one");
+    }
+
+    /// An editor that writes one set of numbers must refuse a multi-selection outright.
+    ///
+    /// With several pieces selected there is no single set of dimensions to show, and writing the
+    /// primary's numbers to all of them would silently resize things nobody looked at.
+    #[test]
+    fn a_single_object_editor_sees_nothing_when_several_are_selected() {
+        let mut st = FactoryState::default();
+        let idx = st.add_furniture_asset("chair".into(), tetra());
+        st.place_furniture(idx, Vec3::ZERO);
+        st.place_furniture(idx, Vec3::new(2.0, 0.0, 0.0));
+        st.select_furniture(1);
+        assert_eq!(st.sel_furn_one(), Some(1), "one selected — the editor opens");
+        st.toggle_furniture(0);
+        assert_eq!(st.sel_furn_one(), None, "two selected — the editor stands down");
+        assert_eq!(st.sel_furn_primary(), Some(1), "…but the primary is still known");
     }
 
     /// Empty selection: no gizmo, nothing to pick.
@@ -7691,7 +8880,7 @@ mod aperture_tests {
     /// scale_vec resolves uniform vs non-uniform correctly, and `scale` multiplies on top.
     #[test]
     fn scale_vec_resolves_uniform_and_fit() {
-        let mut inst = FurnitureInst { asset: 0, pos: [0.0;3], scale: 2.0, fit: None, rot: [0.0;3], color: [0.8;3], texture: None, surface_texture: std::collections::HashMap::new() };
+        let mut inst = FurnitureInst { asset: 0, pos: [0.0;3], scale: 2.0, fit: None, rot: [0.0;3], color: [0.8;3], texture: None, surface_texture: std::collections::HashMap::new(), ..Default::default() };
         assert_eq!(inst.scale_vec(), Vec3::splat(2.0), "uniform");
         inst.scale = 1.0;
         inst.fit = Some([1.2, 3.0, 1.05]);
@@ -7894,7 +9083,7 @@ mod clipboard_tests {
         assert_eq!(st.furniture.len(), 2, "one clone added");
         let copy = st.furniture[1].pos;
         assert!((copy[0] - orig[0] - 0.3).abs() < 1e-4 && (copy[1] - orig[1] - 0.3).abs() < 1e-4, "offset by 0.3 m");
-        assert_eq!(st.sel_furniture, Some(1), "the copy is selected");
+        assert_eq!(st.sel_furniture, vec![1], "the copy is selected");
     }
 
     /// Ctrl+C / Ctrl+V on a CSG feature: clones it (new id), carries the colour, offsets it.
@@ -7950,7 +9139,7 @@ mod clipboard_tests {
         assert_eq!(st.paste_clipboard(), Some(false), "furniture paste (not a feature)");
         assert_eq!(st.furniture.len(), 2, "one clone added");
         assert_eq!(st.furniture[1].fit, fit0, "the copy keeps the stretched fit");
-        assert_eq!(st.sel_furniture, Some(1), "the copy is selected");
+        assert_eq!(st.sel_furniture, vec![1], "the copy is selected");
     }
 
     /// An EXTRUDED solid (the "As furniture" extrude → a Union Extrusion feature) copy/pastes as a
@@ -7968,7 +9157,7 @@ mod clipboard_tests {
         st.feature_color.insert(id, [0.6, 0.62, 0.70]);
         st.recompute();
         let n = st.model.features.len();
-        st.sel_furniture = None;
+        st.sel_furniture.clear();
         st.selection = vec![id];
 
         assert!(st.copy_selection(), "extruded solid copied");
@@ -8115,7 +9304,7 @@ mod extrude_property_tests {
         let paint = [0.9, 0.15, 0.15];
         st.surface_color.insert(key, paint);
         st.selection = vec![id];
-        st.sel_furniture = None;
+        st.sel_furniture.clear();
 
         assert!(st.copy_selection(), "feature copied");
         assert_eq!(st.paste_clipboard(), Some(true));
@@ -8551,24 +9740,58 @@ mod texture_tests {
         assert_eq!(st2.feature_texture.get(&id).copied(), Some(0), "assignment restored");
     }
 
+    /// A UNIFORM environment of radiance `l` as SH coefficients — only the `l = 0` band is
+    /// non-zero, and `sh_ambient` then returns `l` for every normal. Handy for tests that want a
+    /// controlled ambient rather than a real sky.
+    fn flat_sh(l: f32) -> [[f32; 3]; 9] {
+        let mut sh = [[0.0f32; 3]; 9];
+        for c in 0..3 {
+            sh[0][c] = l * std::f32::consts::PI / 0.886_227;
+        }
+        sh
+    }
+
     /// The sun light drives the CPU shading: enabling it makes a surface facing the sun brighter
     /// than one facing away, and disabling it restores the fixed two-sided studio key light.
     #[test]
     fn sun_light_drives_directional_shading() {
         use glam::Vec3;
         // Disabled → the fixed two-sided key light (front and back shade equally under |n·dir|).
-        set_sun_light(false, Vec3::new(0.0, 0.0, 1.0), [1.0, 1.0, 1.0], [0.3, 0.3, 0.3], [0.2, 0.2, 0.2]);
+        set_sun_light(false, Vec3::new(0.0, 0.0, 1.0), [1.0, 1.0, 1.0], flat_sh(0.3));
         let up = shade([1.0, 1.0, 1.0], Vec3::Z);
         let down = shade([1.0, 1.0, 1.0], -Vec3::Z);
-        assert!((up[0] - down[0]).abs() < 1e-6, "studio light is two-sided");
+        assert!((up.col[0] - down.col[0]).abs() < 1e-6, "studio light is two-sided");
 
         // Enabled, sun straight up → an up-facing surface is lit, a down-facing one gets only ambient.
-        set_sun_light(true, Vec3::new(0.0, 0.0, 1.0), [1.0, 0.95, 0.85], [0.2, 0.22, 0.28], [0.1, 0.1, 0.1]);
+        set_sun_light(true, Vec3::new(0.0, 0.0, 1.0), [1.0, 0.95, 0.85], flat_sh(0.25));
         let lit = shade([1.0, 1.0, 1.0], Vec3::Z);
         let shadow = shade([1.0, 1.0, 1.0], -Vec3::Z);
-        assert!(lit[0] > shadow[0] + 0.3, "sun-facing brighter than shadow side: {lit:?} vs {shadow:?}");
+        assert!(lit.col[0] > shadow.col[0] + 0.3, "sun-facing brighter than shadow side: {lit:?} vs {shadow:?}");
         // Reset so other tests see the default.
-        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], [0.32, 0.34, 0.40], [0.2, 0.19, 0.17]);
+        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], flat_sh(0.32));
+    }
+
+    /// The ambient SHARE is what ambient occlusion is allowed to darken, so it has to track where
+    /// the light actually came from: everything on a face turned away from the sun, and only a
+    /// minority on one facing it. Getting this backwards would darken sunlit creases and leave
+    /// shadowed ones bright — plausible-looking, and exactly wrong.
+    #[test]
+    fn the_ambient_share_tracks_where_the_light_came_from() {
+        use glam::Vec3;
+        set_sun_light(true, Vec3::Z, [2.0, 2.0, 2.0], flat_sh(0.3));
+        let lit = shade([0.8; 3], Vec3::Z);
+        let away = shade([0.8; 3], -Vec3::Z);
+        assert!(away.amb > 0.99, "a surface facing away from the sun is lit purely by the sky: {away:?}");
+        assert!(lit.amb < 0.2, "a surface facing a 2.0 sun against a 0.3 sky is mostly direct: {lit:?}");
+        // The split must be lossless: ambient + direct is the colour, whatever the share.
+        assert!(lit.col[0] > away.col[0], "the sunlit face is still the brighter one");
+        // Studio mode: the fixed key is 0.35 fill + 0.65 directional, so a face square to it is
+        // 0.35/1.0 ambient and one edge-on is all ambient.
+        set_sun_light(false, Vec3::Z, [1.0; 3], flat_sh(0.0));
+        let d = Vec3::new(0.35, 0.25, 0.9).normalize();
+        assert!((shade([0.8; 3], d).amb - 0.35).abs() < 0.02, "{:?}", shade([0.8; 3], d));
+        let edge = d.cross(Vec3::Z).normalize();
+        assert!(shade([0.8; 3], edge).amb > 0.99, "edge-on to the key light is pure fill");
     }
 
     /// Clay mode overrides the shaded base colour to neutral grey (same for any input colour),
@@ -8576,14 +9799,34 @@ mod texture_tests {
     #[test]
     fn clay_mode_flattens_the_shade() {
         use glam::Vec3;
-        set_sun_light(false, Vec3::Z, [1.0; 3], [0.3; 3], [0.2; 3]);
+        set_sun_light(false, Vec3::Z, [1.0; 3], flat_sh(0.3));
         set_clay(true);
         let red = shade([0.9, 0.1, 0.1], Vec3::Z);
         let blue = shade([0.1, 0.1, 0.9], Vec3::Z);
-        assert!((red[0] - blue[0]).abs() < 1e-6 && (red[2] - blue[2]).abs() < 1e-6, "clay greys any colour the same");
+        assert!((red.col[0] - blue.col[0]).abs() < 1e-6 && (red.col[2] - blue.col[2]).abs() < 1e-6, "clay greys any colour the same");
         set_clay(false);
         let red2 = shade([0.9, 0.1, 0.1], Vec3::Z);
-        assert!(red2[0] > red2[2] + 0.2, "colour restored when clay off");
+        assert!(red2.col[0] > red2.col[2] + 0.2, "colour restored when clay off");
+    }
+
+    /// The baked colour must be **scene-referred linear** and must NOT be tone-mapped: Phase 1
+    /// moved the display transform to the composite, so a `1 − e⁻ˣ` here would be the second one in
+    /// series. The tell is that the output stays proportional to the light instead of saturating.
+    #[test]
+    fn the_flat_path_stays_linear_and_untonemapped() {
+        use glam::Vec3;
+        // White albedo, sun straight up, no sky: the colour IS the sun radiance.
+        set_sun_light(true, Vec3::Z, [1.0; 3], flat_sh(0.0));
+        let a = shade([1.0; 3], Vec3::Z).col[0];
+        set_sun_light(true, Vec3::Z, [4.0; 3], flat_sh(0.0));
+        let b = shade([1.0; 3], Vec3::Z).col[0];
+        assert!(b > 3.0, "4x the light must give ~4x the value, not a saturated one: {a} -> {b}");
+        assert!((b / a - 4.0).abs() < 0.01, "and exactly 4x: {a} -> {b}");
+        // Albedo is decoded from sRGB, so a 0.5 swatch contributes its LINEAR 0.214.
+        set_sun_light(true, Vec3::Z, [1.0; 3], flat_sh(0.0));
+        let half = shade([0.5; 3], Vec3::Z).col[0];
+        assert!((half - crate::color::srgb_to_linear(0.5)).abs() < 1e-4, "albedo must be decoded: {half}");
+        set_sun_light(false, Vec3::new(0.35, 0.25, 0.9), [1.0, 0.96, 0.88], flat_sh(0.32));
     }
 
     /// [`SunEnv::resolve`] returns a normalized daytime sun direction and a dimmer light at night.
@@ -8962,6 +10205,209 @@ mod zoom_tests {
     }
 }
 
+/// Cutting a furniture piece: the app-level half of `cad_solid::meshcut`, where a cut becomes an
+/// EDITABLE property of an instance rather than a one-off boolean.
+#[cfg(test)]
+mod furniture_cuts {
+    use super::*;
+
+    /// A real parametric door, placed. Everything here is a generated piece, which is the scope
+    /// cutting is offered for.
+    fn placed_door() -> (FactoryState, usize) {
+        let mut st = FactoryState::default();
+        let (_m, mesh) = cad_solid::door::build(&cad_solid::door::DoorInput::default()).unwrap();
+        let part_ids = mesh.face_ids.clone();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.62, 0.50, 0.38]),
+            alpha: Vec::new(),
+        };
+        let a = st.add_furniture_asset("Door".into(), obj);
+        if let Some(asset) = st.furniture_lib.get_mut(a) {
+            asset.part_ids = part_ids;
+        }
+        st.place_furniture(a, Vec3::ZERO);
+        (st, 0)
+    }
+
+    /// A 150 mm square on the piece's front-most +Y face, built the way a face PICK builds one:
+    /// from a real triangle's centroid and its real normal. Inventing a plausible-looking frame
+    /// instead would test the cut against a surface that is not quite there.
+    fn slot(st: &FactoryState, fi: usize) -> (Frame, Vec<Vec<Vec2>>) {
+        let inst = &st.furniture[fi];
+        let asset = &st.furniture_lib[inst.asset];
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for tri in asset.positions.chunks_exact(3) {
+            let a = st.furniture_point(inst, tri[0]);
+            let b = st.furniture_point(inst, tri[1]);
+            let c = st.furniture_point(inst, tri[2]);
+            let n = (b - a).cross(c - a).normalize_or_zero();
+            if n.dot(Vec3::Y) < 0.99 {
+                continue; // want a face looking along +Y
+            }
+            let mid = (a + b + c) / 3.0;
+            // The FRONT-most such face, so the cut starts outside the piece.
+            if best.map_or(true, |(y, _, _)| mid.y > y) {
+                best = Some((mid.y, mid, n));
+            }
+        }
+        let (_, p, n) = best.expect("the piece has a +Y face");
+        let r = 0.02;
+        (
+            Frame::from_point_normal(p, n),
+            vec![vec![Vec2::new(-r, -r), Vec2::new(r, -r), Vec2::new(r, r), Vec2::new(-r, r)]],
+        )
+    }
+
+    fn tris(st: &FactoryState, fi: usize) -> usize {
+        st.furniture_lib[st.furniture[fi].asset].positions.len() / 3
+    }
+
+    /// THE round trip that makes the list editable: cut, and the piece changes; disable, and it is
+    /// byte-for-byte what it was; re-enable, and the cut is back. Nothing is ever baked.
+    #[test]
+    fn a_cut_can_be_switched_off_and_the_piece_returns_exactly() {
+        let (mut st, fi) = placed_door();
+        let original: Vec<[f32; 3]> = st.furniture_lib[st.furniture[fi].asset].positions.clone();
+        let (frame, loops) = slot(&st, fi);
+
+        let made = st.add_furniture_cut(fi, &frame, &loops, true, 0.0).expect("the door cuts");
+        assert_eq!(made, 1, "one loop, one cut");
+        assert_eq!(st.furniture[fi].cuts.len(), 1);
+        assert!(st.furniture[fi].base_asset.is_some(), "the instance now points at a derived copy");
+        assert_ne!(tris(&st, fi), original.len() / 3, "the geometry changed");
+
+        st.furniture[fi].cuts[0].enabled = false;
+        st.rebuild_cut_asset(fi).unwrap();
+        assert_eq!(st.furniture[fi].base_asset, None, "back to the original asset itself");
+        assert_eq!(
+            st.furniture_lib[st.furniture[fi].asset].positions, original,
+            "and to the original geometry, exactly"
+        );
+
+        st.furniture[fi].cuts[0].enabled = true;
+        st.rebuild_cut_asset(fi).unwrap();
+        assert_ne!(st.furniture_lib[st.furniture[fi].asset].positions, original, "the cut is back");
+    }
+
+    /// Cutting one piece must not touch another placed from the same library entry. Three doors,
+    /// one cut: the other two are untouched.
+    #[test]
+    fn cutting_one_instance_leaves_its_siblings_alone() {
+        let (mut st, fi) = placed_door();
+        let a = st.furniture[fi].asset;
+        st.place_furniture(a, Vec3::new(2.0, 0.0, 0.0));
+        st.place_furniture(a, Vec3::new(4.0, 0.0, 0.0));
+        let before = tris(&st, 1);
+
+        let (frame, loops) = slot(&st, fi);
+        st.add_furniture_cut(fi, &frame, &loops, true, 0.0).unwrap();
+
+        assert_ne!(tris(&st, 0), before, "the one that was cut changed");
+        assert_eq!(tris(&st, 1), before, "its sibling did not");
+        assert_eq!(tris(&st, 2), before, "nor did the third");
+        assert!(st.furniture[1].cuts.is_empty() && st.furniture[2].cuts.is_empty());
+    }
+
+    /// Per-part materials must survive the boolean. Face-group ids are renumbered by a cut, so a
+    /// binding kept by group id would land on the wrong surfaces; it is carried part-wise instead.
+    #[test]
+    fn per_part_materials_survive_a_cut() {
+        let (mut st, fi) = placed_door();
+        let tex = st.add_texture("glass".into(), 1, 1, vec![200, 210, 205, 255]);
+        // Bind that texture to every face group belonging to the door's PANEL.
+        let panel = cad_solid::door::Part::Panel as u32;
+        let bound: std::collections::HashMap<u32, usize> = {
+            let a = &st.furniture_lib[st.furniture[fi].asset];
+            let g = a.group_geom();
+            (0..a.positions.len() / 3)
+                .filter(|&t| a.part_ids[t] == panel)
+                .map(|t| (g.face[t], tex))
+                .collect()
+        };
+        assert!(!bound.is_empty(), "the panel has face groups to bind");
+        st.furniture[fi].surface_texture = bound;
+
+        let (frame, loops) = slot(&st, fi);
+        st.add_furniture_cut(fi, &frame, &loops, true, 0.0).unwrap();
+
+        // After the cut, every group still wearing the texture must belong to the PANEL, and the
+        // panel must still be wearing it somewhere.
+        let a = &st.furniture_lib[st.furniture[fi].asset];
+        let g = a.group_geom();
+        let mut on_panel = 0;
+        for t in 0..a.positions.len() / 3 {
+            if st.furniture[fi].surface_texture.get(&g.face[t]) == Some(&tex) {
+                assert_eq!(a.part_ids[t], panel, "the texture stayed on the panel");
+                on_panel += 1;
+            }
+        }
+        assert!(on_panel > 0, "…and is still on it after the cut");
+    }
+
+    /// An imported (open) mesh is refused, the piece is untouched, and — the part that matters for
+    /// an editable list — NO cut is left behind. A recorded cut that always fails would leave the
+    /// piece permanently unable to rebuild.
+    #[test]
+    fn a_refused_cut_leaves_no_trace() {
+        let mut st = FactoryState::default();
+        // An open shell: a box with one triangle removed, as an "import".
+        let (_m, mesh) = cad_solid::door::build(&cad_solid::door::DoorInput::default()).unwrap();
+        let obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions[3..].to_vec(),
+            normals: mesh.normals[3..].to_vec(),
+            color: None,
+            alpha: Vec::new(),
+        };
+        let a = st.add_furniture_asset("Imported".into(), obj);
+        st.place_furniture(a, Vec3::ZERO);
+        let before = st.furniture_lib[a].positions.clone();
+
+        let (frame, loops) = slot(&st, 0);
+        let err = st.add_furniture_cut(0, &frame, &loops, true, 0.0).unwrap_err();
+        assert!(matches!(err, cad_solid::meshcut::CutError::NotClosed { .. }), "{err}");
+        assert!(st.furniture[0].cuts.is_empty(), "the failed cut was not recorded");
+        assert_eq!(st.furniture[0].asset, a, "the piece still points at its own asset");
+        assert_eq!(st.furniture_lib[a].positions, before, "and is geometrically untouched");
+    }
+
+    /// Cuts are stored in the piece's OWN space, so moving and spinning it carries its holes along.
+    /// Stored in world space they would stay behind the instant it was dragged.
+    #[test]
+    fn a_cut_travels_with_the_piece() {
+        let (mut st, fi) = placed_door();
+        let (frame, loops) = slot(&st, fi);
+        st.add_furniture_cut(fi, &frame, &loops, true, 0.0).unwrap();
+        let cut_tris = tris(&st, fi);
+
+        // Move and rotate, then rebuild: the geometry must be identical, because the cut is local.
+        st.furniture[fi].pos = [5.0, -3.0, 0.0];
+        st.furniture[fi].rot = [0.0, 0.0, 37.0];
+        let before = st.furniture_lib[st.furniture[fi].asset].positions.clone();
+        st.rebuild_cut_asset(fi).unwrap();
+        assert_eq!(tris(&st, fi), cut_tris, "the same cut, after moving");
+        assert_eq!(
+            st.furniture_lib[st.furniture[fi].asset].positions, before,
+            "local geometry is unchanged by the pose"
+        );
+    }
+
+    /// A face on a furniture piece must be pickable at all — the gap that used to make this whole
+    /// feature unreachable, since sketch-on-face is how a cut is aimed.
+    #[test]
+    fn a_furniture_face_can_be_picked_and_resolved_back_to_its_piece() {
+        let (mut st, fi) = placed_door();
+        st.recompute();
+        let (frame, _) = slot(&st, fi);
+        assert_eq!(st.furniture_at_face(&frame), Some(fi), "the frame resolves to its piece");
+
+        // A frame floating in space belongs to nothing.
+        let nowhere = Frame::from_point_normal(Vec3::new(9.0, 9.0, 9.0), Vec3::Z);
+        assert_eq!(st.furniture_at_face(&nowhere), None);
+    }
+}
+
 #[cfg(test)]
 mod place_tests {
     use super::*;
@@ -8983,5 +10429,316 @@ mod place_tests {
         let pl2 = st.model.features[1].placement;
         assert!((pl2.u - 5.0).abs() < 1e-4 && (pl2.v + 5.0).abs() < 1e-4,
                 "cylinder centre sits at the click");
+    }
+}
+
+/// The face-selection highlight, which once made the whole app unusable for as long as anything
+/// was selected: it walked all 2.01 M triangles of the villa each frame and handed egui 45,888 line
+/// segments to tessellate, at 250–436 ms a frame. These tests pin BOTH halves of the fix.
+#[cfg(test)]
+mod face_highlight {
+    use super::*;
+
+    /// An `n × n` grid of quads in the z = 0 plane, spanning [-0.5, 0.5]², as triangle soup.
+    /// One flat surface, so the coplanar grouping must see exactly one face.
+    fn flat_grid(n: usize) -> crate::mesh_io::ObjMesh {
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let step = 1.0 / n as f32;
+        for j in 0..n {
+            for i in 0..n {
+                let (x0, y0) = (-0.5 + i as f32 * step, -0.5 + j as f32 * step);
+                let (x1, y1) = (x0 + step, y0 + step);
+                for tri in [
+                    [[x0, y0, 0.0], [x1, y0, 0.0], [x1, y1, 0.0]],
+                    [[x0, y0, 0.0], [x1, y1, 0.0], [x0, y1, 0.0]],
+                ] {
+                    for v in tri {
+                        positions.push(v);
+                        normals.push([0.0, 0.0, 1.0]);
+                    }
+                }
+            }
+        }
+        crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() }
+    }
+
+    fn one_selected_grid(n: usize) -> FactoryState {
+        let mut st = FactoryState::default();
+        let a = st.add_furniture_asset("grid".into(), flat_grid(n));
+        st.place_furniture(a, Vec3::ZERO);
+        // Every triangle is coplanar and connected, so the whole grid is one face group.
+        let groups: Vec<u32> = {
+            let fg = st.furniture_lib[a].group_geom();
+            let mut g: Vec<u32> = fg.face.iter().copied().collect();
+            g.sort_unstable();
+            g.dedup();
+            g
+        };
+        assert_eq!(groups.len(), 1, "a flat grid is ONE coplanar face");
+        st.furn_face_sel = Some((0, groups));
+        st
+    }
+
+    fn segs(st: &FactoryState) -> Vec<[egui::Pos2; 2]> {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        // Identity MVP: the grid lives in [-0.5, 0.5]², well inside the NDC cube.
+        let mvp = Mat4::IDENTITY.to_cols_array();
+        st.furniture_face_highlight_segments(rect, &mvp)
+    }
+
+    /// THE regression. The highlight must cost the face's BOUNDARY, not its triangulation — so
+    /// the segment count tracks the perimeter and barely moves when the mesh gets 4× denser.
+    #[test]
+    fn the_highlight_outlines_the_face_instead_of_wireframing_it() {
+        // 40 × 40 quads = 3,200 triangles; the old code emitted 3 segments for every one of them.
+        let st = one_selected_grid(40);
+        let n = segs(&st).len();
+        assert_eq!(n, 160, "the perimeter of a 40×40 grid is 4 × 40 edges, got {n}");
+        assert!(n * 20 < 3_200 * 3, "…which is a fraction of the 9,600-segment wireframe");
+
+        // Quadrupling the triangles must only DOUBLE the outline (perimeter, not area). This is
+        // the property that makes a 2 M-triangle mesh affordable.
+        let dense = one_selected_grid(80);
+        assert_eq!(segs(&dense).len(), 320, "6,400 more triangles cost 160 more segments");
+    }
+
+    /// The cache must survive a camera move — that was the other half of the cost, since the
+    /// outline depends on the selection and the pose, never on where you are looking from.
+    #[test]
+    fn moving_the_camera_does_not_rebuild_the_outline() {
+        let st = one_selected_grid(40);
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let a = st.furniture_face_highlight_segments(rect, &Mat4::IDENTITY.to_cols_array());
+        let ptr = st.face_outline.borrow().as_ref().map(|c| c.edges.as_ptr() as usize);
+
+        // A different view: same outline, different pixels, same allocation.
+        let spun = Mat4::from_rotation_z(0.6) * Mat4::from_scale(Vec3::splat(0.8));
+        let b = st.furniture_face_highlight_segments(rect, &spun.to_cols_array());
+        assert_eq!(
+            ptr,
+            st.face_outline.borrow().as_ref().map(|c| c.edges.as_ptr() as usize),
+            "the cached edges were not rebuilt"
+        );
+        assert_eq!(a.len(), b.len(), "the same edges are projected");
+        assert!(a.iter().zip(&b).any(|(p, q)| p[0] != q[0]), "…to different places on screen");
+    }
+
+    /// Changing the selection MUST rebuild it — a cache that never invalidates is a bug that
+    /// shows the previous face highlighted.
+    #[test]
+    fn changing_the_selection_rebuilds_the_outline() {
+        let mut st = one_selected_grid(40);
+        assert_eq!(segs(&st).len(), 160);
+        st.furn_face_sel = Some((0, vec![999]));
+        assert_eq!(segs(&st).len(), 0, "a group that selects nothing outlines nothing");
+        assert!(!st.face_highlight_truncated());
+    }
+
+    /// Nothing targeted, nothing drawn.
+    #[test]
+    fn no_selection_means_no_segments() {
+        let mut st = one_selected_grid(20);
+        st.furn_face_sel = None;
+        assert!(segs(&st).is_empty());
+    }
+}
+
+/// The lighting moved out of the vertex bake and into the fragment shader. `shade` /
+/// `shade_furniture` survive as the CPU TWIN — the thing the GLSL has to agree with — so these
+/// tests are what stop the two drifting apart.
+#[cfg(test)]
+mod shader_twin {
+    use super::*;
+
+    /// Moving the sun must no longer invalidate the vertex buffer. This was the hour slider
+    /// rebuilding 1.86 M vertices on every nudge; with the lighting in the shader, no vertex
+    /// changes, and the cache must know that.
+    #[test]
+    fn moving_the_sun_does_not_rebuild_the_vertex_buffer() {
+        let mut st = FactoryState::default();
+        st.sun.enabled = true;
+        st.sun.hour = 9.0;
+        let a = st.opaque_sig();
+        st.sun.hour = 17.0;
+        st.sun.north_offset_deg = 40.0;
+        st.sun.intensity = 1.6;
+        assert_eq!(a, st.opaque_sig(), "a sun move must not invalidate the buffer");
+        // …but switching daylight OFF selects the studio response, which the shader branches on.
+        st.sun.enabled = false;
+        assert_ne!(a, st.opaque_sig(), "toggling daylight must still invalidate");
+    }
+
+    /// Whatever else changes, a vertex must carry the surface's OWN colour and its normal. If the
+    /// bake ever creeps back in, per-frame lighting and instancing both quietly become impossible
+    /// again, and nothing else would notice.
+    #[test]
+    fn a_vertex_carries_albedo_and_normal_not_a_lit_colour() {
+        set_sun_light(false, Vec3::Z, [1.0; 3], [[0.0; 3]; 9]);
+        let n = Vec3::new(0.0, 0.0, 1.0);
+        let red = [0.8, 0.1, 0.1];
+        let vert = v(Vec3::ZERO, shade(red, n));
+        assert!((vert.r - red[0]).abs() < 1e-6, "the vertex carries the authored colour, got {}", vert.r);
+        assert!((vert.g - red[1]).abs() < 1e-6 && (vert.b - red[2]).abs() < 1e-6);
+        assert!((vert.nz - 1.0).abs() < 1e-6, "and its normal, got ({},{},{})", vert.nx, vert.ny, vert.nz);
+        assert_eq!(vert.mode, SHADE_SCENE);
+        assert_eq!(v(Vec3::ZERO, shade_furniture(red, n)).mode, SHADE_FURNITURE);
+        // A UI swatch is not a surface: zero normal, and the shader passes it through unlit.
+        let sw = v(Vec3::ZERO, ui(red));
+        assert_eq!(sw.mode, SHADE_UI);
+        assert_eq!((sw.nx, sw.ny, sw.nz), (0.0, 0.0, 0.0));
+    }
+
+    /// A thin card seen from behind must still be lit. Foliage is one sheet of triangles, so half
+    /// of every tree faces away from its authored normal; without this the villa's trees rendered
+    /// black. The CPU twin has no viewer and cannot express it, so the check is on the shader
+    /// source — and the tests below therefore cover the front-facing case only.
+    #[test]
+    fn the_flat_path_lights_both_sides_of_a_surface() {
+        let src = crate::light3d::scene_fs_for_test();
+        assert!(
+            src.contains("if (!gl_FrontFacing) N = -N;"),
+            "the flat path must face its normal to the viewer, as the textured path and the tracer do"
+        );
+    }
+
+    /// The moved lighting must be the SAME lighting. This recomputes what the fragment shader does
+    /// — from the shader's own source constants where it can — and checks it against the CPU twin
+    /// for both modes, sun on and sun off. Front-facing normals only: see the two-sided test above.
+    #[test]
+    fn the_shader_lighting_matches_the_cpu_twin() {
+        let src = crate::light3d::scene_fs_for_test();
+        // The studio constants are written into the shader; read them back rather than trust that
+        // the two copies were typed the same.
+        for want in ["float fill = furniture ? 0.6 : 0.35;", "(furniture ? 0.4 : 0.65) * abs(dot(N, normalize(STUDIO_DIR)))"] {
+            assert!(src.contains(want), "shader no longer contains `{want}`");
+        }
+        assert!(src.contains("vec3(0.35, 0.25, 0.9)"), "STUDIO_DIR changed in the shader");
+        assert!(src.contains("float extra = furniture ? 0.05 : 0.0;"), "the furniture ambient floor changed");
+
+        // The shader's own arithmetic, in Rust.
+        let shader = |albedo: [f32; 3], n: Vec3, furniture: bool, sun: Option<&SunLightRaw>| -> ([f32; 3], [f32; 3]) {
+            let a = crate::color::srgb_to_linear3(albedo);
+            match sun {
+                Some(s) => {
+                    let extra = if furniture { 0.05 } else { 0.0 };
+                    let sh = crate::env::sh_ambient(&s.sh, n);
+                    let lit = n.dot(s.dir).max(0.0);
+                    (
+                        [a[0] * (sh[0] + extra), a[1] * (sh[1] + extra), a[2] * (sh[2] + extra)],
+                        [a[0] * s.sun[0] * lit, a[1] * s.sun[1] * lit, a[2] * s.sun[2] * lit],
+                    )
+                }
+                None => {
+                    let fill = if furniture { 0.6 } else { 0.35 };
+                    let k = (if furniture { 0.4 } else { 0.65 })
+                        * n.dot(Vec3::new(0.35, 0.25, 0.9).normalize()).abs();
+                    ([a[0] * fill, a[1] * fill, a[2] * fill], [a[0] * k, a[1] * k, a[2] * k])
+                }
+            }
+        };
+
+        let normals = [Vec3::Z, Vec3::X, Vec3::new(0.3, -0.6, 0.74).normalize(), -Vec3::Z];
+        let colours = [[0.8, 0.1, 0.1], [0.2, 0.5, 0.9], [0.72; 3]];
+        // A sky with real directional variation, so an SH mistake cannot hide behind a flat dome.
+        let sky = crate::env::Sky::new(Vec3::new(0.4, 0.3, 0.86).normalize(), crate::env::DEFAULT_TURBIDITY);
+        let lit_sun = SunLightRaw {
+            enabled: true,
+            dir: Vec3::new(0.4, 0.3, 0.86).normalize(),
+            sun: [2.2, 2.0, 1.7],
+            sh: sky.sh9(),
+        };
+        for sun_on in [false, true] {
+            if sun_on {
+                set_sun_light(true, lit_sun.dir, lit_sun.sun, lit_sun.sh);
+            } else {
+                set_sun_light(false, Vec3::Z, [1.0; 3], [[0.0; 3]; 9]);
+            }
+            for &n in &normals {
+                for &c in &colours {
+                    for furniture in [false, true] {
+                        let cpu = if furniture { shade_furniture(c, n) } else { shade(c, n) };
+                        let (amb, dir) = shader(c, n, furniture, sun_on.then_some(&lit_sun));
+                        // The twin splits into ambient + direct; the CPU packs the same two into a
+                        // colour and the ambient's share of it. Recombine and compare.
+                        for k in 0..3 {
+                            let total = amb[k] + dir[k];
+                            assert!(
+                                (total - cpu.col[k]).abs() < 1e-5,
+                                "sun={sun_on} furn={furniture} n={n:?} c={c:?} channel {k}: shader {total} vs cpu {}",
+                                cpu.col[k]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        set_sun_light(false, Vec3::Z, [1.0; 3], [[0.0; 3]; 9]);
+    }
+}
+
+/// The daylight the renders are judged against. Every number here was READ OUT of the villa
+/// scene's own Blender file (`probe_look.py`), not chosen: sun energy 8.0, colour
+/// (1.0, 0.745, 0.48), angular size 2.2°, at 34° of altitude; world a gradient sky from
+/// (1.25, 1.19, 1.08) at the horizon to (0.75, 0.89, 1.08) at the zenith.
+#[cfg(test)]
+mod daylight_match {
+    use super::*;
+
+    /// Set the sun to a given ALTITUDE by searching the hour, so a claim about "a 34° sun" is
+    /// about geometry rather than about a time of day at some latitude.
+    fn sun_at_altitude(alt_deg: f32) -> SunEnv {
+        let mut best = (f32::MAX, 12.0f32);
+        let mut e = SunEnv { enabled: true, lat_deg: 15.3, lon_deg: 74.0, utc_offset: 5.5, month: 1, day: 15, ..Default::default() };
+        for i in 0..(24 * 12) {
+            e.hour = i as f32 / 12.0;
+            let (_, dir, _, _, _) = e.resolve();
+            let a = dir.z.clamp(-1.0, 1.0).asin().to_degrees();
+            let d = (a - alt_deg).abs();
+            if d < best.0 {
+                best = (d, e.hour);
+            }
+        }
+        e.hour = best.1;
+        e
+    }
+
+    /// A low sun must be VISIBLY AMBER. It used to reach neutral white by ~20° of altitude, and a
+    /// white sun lighting a scene under a near-white sky ambient is most of why our renders read
+    /// flat: there is no warm/cool separation anywhere in the image.
+    #[test]
+    fn a_low_sun_is_warm_the_way_the_reference_render_is() {
+        let e = sun_at_altitude(34.0);
+        let (_, dir, sun, _, _) = e.resolve();
+        let alt = dir.z.asin().to_degrees();
+        assert!((alt - 34.0).abs() < 3.0, "test set up a {alt:.1}° sun, wanted 34°");
+        // Blender's own sun for this scene is (1.0, 0.745, 0.48): a red:blue ratio of 2.08.
+        let ratio = sun[0] / sun[2];
+        assert!(ratio > 1.5, "a 34° sun should be amber (R/B {ratio:.2}, Blender's is 2.08)");
+        let g = sun[1] / sun[0];
+        assert!((0.65..0.85).contains(&g), "green should sit near Blender's 0.745, got {g:.3}");
+    }
+
+    /// …but noon must NOT be orange. Warming a low sun is only right if the ramp still resolves
+    /// to near-neutral overhead, otherwise every render turns into a sunset.
+    #[test]
+    fn a_high_sun_is_close_to_neutral() {
+        let e = sun_at_altitude(80.0);
+        let (_, _, sun, _, _) = e.resolve();
+        let ratio = sun[0] / sun[2];
+        assert!((1.0..1.35).contains(&ratio), "an overhead sun should be near-neutral, R/B {ratio:.2}");
+    }
+
+    /// The direct-to-ambient BALANCE was already right, and must stay right — it is the one part
+    /// of the lighting that already matched. Blender: direct irradiance 8.0 x (1, .745, .48)
+    /// against a sky dome averaging ~1.03, so roughly 1.8 : 1 in favour of the sun. Ours is
+    /// carried as irradiance/pi, so the comparison is `sun` against `sky` directly.
+    #[test]
+    fn direct_and_ambient_stay_in_the_ratio_the_reference_uses() {
+        let e = sun_at_altitude(60.0);
+        let (_, _, sun, sky, _) = e.resolve();
+        let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let r = lum(sun) / lum(sky);
+        assert!((1.2..3.0).contains(&r), "direct:ambient is {r:.2}:1, reference is ~1.8:1");
     }
 }

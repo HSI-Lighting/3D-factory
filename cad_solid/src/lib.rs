@@ -28,6 +28,7 @@ pub mod sweeplight; // curved office luminaires: a lighting profile swept along 
 pub mod desk; // parametric office workstation desk as a deletable feature tree → SolidMesh
 pub mod couch; // parametric run-chain sofa (straight / L / U sectionals) → SolidMesh
 mod csg;
+pub mod meshcut; // subtract a drawn prism from a finished MESH (furniture / architecture / apertures)
 pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
 pub mod draw;
 pub mod modify;
@@ -742,7 +743,7 @@ pub fn surface_groups(positions: &[[f32; 3]]) -> (Vec<u32>, Vec<u32>) {
 /// A free (arbitrary) construction plane: an orthonormal `(u, v)` frame at an
 /// `origin` in world space. Unlike [`Plane`] (locked to XY/XZ/YZ), a `Frame` sits
 /// on any picked surface — the basis for **sketch-on-face**.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frame {
     pub origin: Vec3,
     pub u: Vec3,

@@ -1,22 +1,35 @@
 mod aci_picker;
 mod app;
+mod color; // colour management — sRGB decode/encode + the display view transform (AgX &c.)
 mod command;
 mod dbg_recorder;
 mod dock;
+mod door_mat; // what the parametric door is made of — one palette, preview + build read it
+mod env_map; // HDR image-based lighting — a real environment instead of the analytic sky
+mod env; // environment lighting — the analytic sky, its SH ambient, and the AO settings
 mod factory;   // 3D Factory — cad_solid wired into the app
 mod gpu;
+mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
 mod light;
 mod light3d;
 mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
 mod mesh_io;      // OBJ furniture import
+mod mesh_preview; // CPU preview of a parametric build, shown before it is inserted
 mod param_editor;
+mod matball;   // CPU material-ball preview — the same BRDF and sky the viewport uses
 mod pathtrace; // in-app progressive path tracer — shared core + CPU backend
+mod proc_tex;  // Rust twin of the shader's procedural evaluation (path tracer + preview read it)
 mod pathtrace_gpu; // GPU backend: the same tracer in a GL 3.3 fragment shader
 mod radiance_export; // offline Radiance render export (.rad geometry + gensky sky)
+#[cfg(test)]
+mod render_probe; // headless villa render → PNG, so a change to the LOOK can be judged by looking
+#[cfg(test)]
+mod report_figs; // renders the Phase 2–4 report's figures from the code they document
 mod settings;
 mod simlux_io;
 mod solar;      // Radiance-based sun position for daylight rendering
+mod texture_set; // PBR texture-set folders: filename → map slot, and the loader that follows it
 mod theme;
 mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).

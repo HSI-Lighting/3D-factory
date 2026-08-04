@@ -4,6 +4,110 @@
 use eframe::egui;
 use crate::dock::DockHost;   // brings `.show()` into scope for the dock host
 
+/// The Goan villa scene, exported from the Blender dev build by
+/// `villa scene/build/export_factory.py`: architecture, hard landscape, the procedural frangipani
+/// and the scattered grass, merged into three meshes across 25 material parts. ~2.0 M triangles —
+/// the full Blender scene is 89.7 M, of which 98% is imported planting no real-time viewport can
+/// hold. Authored in **metres at real-world size** (86 × 74 × 10.6 m), so it imports 1:1.
+const VILLA_SCENE: &str = r"G:\blender dev\staircase\villa scene\villa_scene.glb";
+
+/// Which handle a parametric door will actually wear. Resolved ONCE per build, because two
+/// decisions hang off it that must not disagree: whether to weld the library mesh on, and whether
+/// the door draws its own lever. Deciding them separately is how a leaf ends up with two levers at
+/// the same spindle, or with none at all.
+enum HandleChoice {
+    /// No library, or nothing chosen — the door wears its own built-in rose and lever.
+    Builtin,
+    /// One was chosen but does not fit this leaf. Falls back to the built-in lever and SAYS SO;
+    /// hardware that silently fails to appear reads as a bug in the door.
+    Refused(String),
+    /// Weld this one on, and drop the built-in lever.
+    Use(Box<crate::handles::Handle>, crate::handles::DoorFit),
+}
+
+/// The door preview window's state.
+///
+/// TWO caches, not one, because the two costs are an order of magnitude apart: rebuilding the mesh
+/// re-reads and re-parses the handle's FBX, while re-rendering only re-shades pixels. Orbiting must
+/// pay the second and never the first.
+#[derive(Default)]
+struct DoorPreview {
+    open: bool,
+    view: crate::mesh_preview::View,
+    zoom: f32,
+    /// Parameters + handle the cached MESH was built from.
+    geom_sig: u64,
+    mesh: Option<(crate::mesh_io::ObjMesh, Vec<u32>)>,
+    /// What the door reports about itself, and any note about a refused handle.
+    caption: String,
+    /// Everything the picture depends on EXCEPT its quality.
+    img_sig: u64,
+    /// The supersampling the cached image was rendered at — 0 = nothing cached. Draft first,
+    /// refined on the next idle frame; see `door_preview_window`.
+    tex_ss: usize,
+    tex: Option<egui::TextureHandle>,
+}
+
+/// Hash anything the preview's picture depends on. Floats go in by bit pattern — the point is
+/// "did this change", not "is this close to that".
+fn preview_hash(parts: &[f32], text: &[&str]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for v in parts {
+        v.to_bits().hash(&mut h);
+    }
+    for s in text {
+        s.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// How a door's triangle should look, by its `Part` id: joinery follows the chosen materials,
+/// ironmongery follows the handle finish. Both the preview and the built object resolve through
+/// this one function, so a door cannot preview in walnut and insert in oak.
+fn door_part_look(
+    mats: &crate::door_mat::DoorMaterials,
+    finish: &str,
+    part: u32,
+) -> crate::mesh_preview::PartLook {
+    match mats.for_part(part) {
+        Some(m) => m.look(),
+        // Hinges, the door's own lever, and every part a welded handle brought with it.
+        None => finish_look(finish),
+    }
+}
+
+/// A handle finish as a surface. Names come from the manifest (`satin_nickel`, `matt_black`, …);
+/// matching on a KEYWORD rather than the exact string means a new finish in a future manifest
+/// looks approximately right instead of defaulting to nothing.
+fn finish_look(name: &str) -> crate::mesh_preview::PartLook {
+    use crate::mesh_preview::PartLook;
+    let n = name.to_ascii_lowercase();
+    let m = |albedo: [f32; 3], roughness: f32| PartLook {
+        albedo,
+        roughness,
+        metallic: 1.0,
+        ..Default::default()
+    };
+    let d = |albedo: [f32; 3], roughness: f32| PartLook { albedo, roughness, ..Default::default() };
+    if n.contains("black") || n.contains("anthracite") {
+        // Powder coat is a dielectric, not a metal — as metal it renders as a dark mirror.
+        d([0.020, 0.020, 0.022], 0.42)
+    } else if n.contains("white") {
+        d([0.80, 0.80, 0.79], 0.40)
+    } else if n.contains("brass") || n.contains("gold") {
+        m([0.62, 0.48, 0.21], if n.contains("polish") { 0.12 } else { 0.30 })
+    } else if n.contains("bronze") || n.contains("copper") {
+        m([0.44, 0.28, 0.20], 0.34)
+    } else if n.contains("chrome") {
+        m([0.56, 0.57, 0.58], 0.06)
+    } else if n.contains("steel") || n.contains("stainless") {
+        m([0.52, 0.52, 0.52], 0.22)
+    } else {
+        m([0.52, 0.51, 0.49], 0.28) // satin nickel — the library default
+    }
+}
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -1123,13 +1227,106 @@ enum ArchTab {
 fn sun_light_matrix(mn: glam::Vec3, mx: glam::Vec3, dir: glam::Vec3) -> [f32; 16] {
     let center = (mn + mx) * 0.5;
     let radius = ((mx - mn) * 0.5).length().max(0.5);
+    sun_cascade_matrix(center, radius, dir, 0)
+}
+
+/// One cascade's light matrix: an orthographic box around the sphere `(center, radius)`, looking
+/// along the sun.
+///
+/// `map_size` > 0 snaps the box to whole shadow texels. That snapping is not a refinement — without
+/// it the map slides continuously as the camera moves and every shadow edge in the scene crawls
+/// with a life of its own, which is far more distracting than a slightly coarser shadow.
+fn sun_cascade_matrix(center: glam::Vec3, radius: f32, dir: glam::Vec3, map_size: i32) -> [f32; 16] {
     let d = dir.normalize_or_zero();
+    if d == glam::Vec3::ZERO {
+        return [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    }
     let up = if d.z.abs() > 0.95 { glam::Vec3::Y } else { glam::Vec3::Z };
+    let r = radius * 1.1;
+    let center = if map_size > 0 {
+        // Snap in LIGHT space, where a texel is axis-aligned, then come back.
+        let rot = glam::Mat4::look_at_rh(glam::Vec3::ZERO, -d, up);
+        let mut lc = rot.transform_point3(center);
+        let unit = 2.0 * r / map_size as f32;
+        lc.x = (lc.x / unit).floor() * unit;
+        lc.y = (lc.y / unit).floor() * unit;
+        rot.inverse().transform_point3(lc)
+    } else {
+        center
+    };
     let eye = center + d * (radius * 2.0);
     let view = glam::Mat4::look_at_rh(eye, center, up);
-    let r = radius * 1.1;
     let proj = glam::Mat4::orthographic_rh_gl(-r, r, -r, r, radius * 0.1, radius * 3.9);
     (proj * view).to_cols_array()
+}
+
+/// Split the view frustum into shadow cascades, TIGHTEST FIRST.
+///
+/// The near ground gets its own small map and the distance gets the coarse one, which is where the
+/// resolution belongs: one map over a whole site spends nearly all of itself on ground nobody is
+/// looking at, and a window mullion's shadow comes out two texels wide.
+///
+/// Slices are cut with the standard practical scheme — part logarithmic (which is what texel
+/// density actually wants, since a perspective camera's world-per-pixel grows linearly with
+/// distance) and part uniform (which keeps the first slice from collapsing to nothing near the
+/// camera). The far end is clamped to the scene, because there is no point giving a cascade to
+/// empty air past the last building.
+fn sun_cascades(
+    mvp: &[f32; 16], eye: glam::Vec3, scene: (glam::Vec3, glam::Vec3), dir: glam::Vec3,
+    n: usize, map_size: i32,
+) -> Vec<[f32; 16]> {
+    let inv = glam::Mat4::from_cols_array(mvp).inverse();
+    if !inv.is_finite() {
+        return Vec::new();
+    }
+    // The frustum's eight corners, in world space.
+    let corner = |x: f32, y: f32, z: f32| -> glam::Vec3 {
+        let p = inv * glam::Vec4::new(x, y, z, 1.0);
+        if p.w.abs() < 1e-9 { glam::Vec3::ZERO } else { p.truncate() / p.w }
+    };
+    let quad = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    let near: Vec<glam::Vec3> = quad.iter().map(|&(x, y)| corner(x, y, -1.0)).collect();
+    let far: Vec<glam::Vec3> = quad.iter().map(|&(x, y)| corner(x, y, 1.0)).collect();
+    if near.iter().chain(&far).any(|p| !p.is_finite()) {
+        return Vec::new();
+    }
+    let depth = (far[0] - near[0]).length();
+    if depth < 1e-3 {
+        return Vec::new();
+    }
+    let d_near = (near[0] - eye).length();
+    // Nothing past the far side of the model can cast a shadow anyone will see, so that is where
+    // the cascades stop — otherwise an adaptive far plane out at 10 km would hand the last cascade
+    // to empty sky and waste a third of the shadow budget.
+    let (mn, mx) = scene;
+    let scene_c = (mn + mx) * 0.5;
+    let scene_r = ((mx - mn) * 0.5).length().max(0.5);
+    let d_far = ((eye - scene_c).length() + scene_r).clamp(d_near + 1.0, d_near + depth);
+
+    let n = n.clamp(1, 8);
+    let mut out = Vec::with_capacity(n);
+    let mut t0 = 0.0f32;
+    for i in 1..=n {
+        let p = i as f32 / n as f32;
+        let log = d_near * (d_far / d_near.max(1e-3)).powf(p);
+        let uni = d_near + (d_far - d_near) * p;
+        let d = 0.75 * log + 0.25 * uni;
+        let t1 = ((d - d_near) / depth).clamp(0.0, 1.0);
+        // The slice's own eight corners, then the sphere around them. A SPHERE rather than a box:
+        // it is invariant to the camera's rotation, so turning on the spot does not change the
+        // cascade's size — and a size that changed with heading would make every shadow in the
+        // scene pulse as the user orbited.
+        let mut pts = [glam::Vec3::ZERO; 8];
+        for k in 0..4 {
+            pts[k] = near[k].lerp(far[k], t0);
+            pts[k + 4] = near[k].lerp(far[k], t1);
+        }
+        let c = pts.iter().fold(glam::Vec3::ZERO, |a, &p| a + p) / 8.0;
+        let r = pts.iter().fold(0.0f32, |m, &p| m.max((p - c).length())).max(0.5);
+        out.push(sun_cascade_matrix(c, r, dir, map_size));
+        t0 = t1;
+    }
+    out
 }
 
 pub struct CadApp {
@@ -1793,7 +1990,16 @@ pub struct CadApp {
     pt_device: crate::pathtrace::Device,
     pt_res: u32,
     pt_passes: u32,
-    /// One-shot: on the first frame, auto-load the villa test model (for texture + Radiance testing).
+    /// Run the à-trous denoiser on the CPU tracer's preview and saved PNG.
+    pt_denoise: bool,
+    /// Which material a pending folder pick is loading a PBR texture set into (the folder dialog is
+    /// modal and asynchronous, so the target has to outlive the click that started it).
+    texset_target: Option<usize>,
+    /// True while the file picker was opened by ▼ FBC scene import rather than ▼ Furniture — the
+    /// two share one dialog but place their result very differently.
+    scene_import_pending: bool,
+    /// One-shot: on the first frame, auto-load the villa test model (opt-in — see the autoload
+    /// site for why it is no longer on by default).
     villa_autoloaded: bool,
     arch_tab: ArchTab,
     arch_stair: cad_solid::architecture::StairParams,
@@ -1803,6 +2009,18 @@ pub struct CadApp {
     arch_dogleg_treads: bool,
     arch_spiral_csg: cad_solid::spiral::SpiralInput,
     arch_door: cad_solid::door::DoorInput,
+    /// The swappable door-handle library, loaded once on first use, plus the decoded preview tiles
+    /// and the chosen handle/finish. Empty when the asset folder is not on this machine.
+    handle_lib: Option<crate::handles::HandleLibrary>,
+    handle_tex: std::collections::HashMap<String, egui::TextureHandle>,
+    handle_sel: String,
+    handle_finish: String,
+    /// Whether the Handles dialog is open (opened from the Door panel).
+    handle_dialog: bool,
+    /// The "look at it before you insert it" window for the parametric door.
+    door_preview: DoorPreview,
+    /// What the parametric door is made of, per component.
+    door_mats: crate::door_mat::DoorMaterials,
     arch_helical: cad_solid::architecture::HelicalRampParams,
     arch_cupboard: cad_solid::cupboard::CupboardInput,
     arch_kitchen: cad_solid::kitchen::KitchenInput,
@@ -2660,7 +2878,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture, PickFolder }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture, PickFolder, ImportHdri }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -3231,6 +3449,11 @@ pub struct MaterialsFactoryState {
     pub drag_node: Option<crate::material_graph::NodeId>,
     /// The node selected on the canvas (its properties show in the inspector).
     pub sel_node: Option<crate::material_graph::NodeId>,
+    /// The rendered **material ball**, cached against a signature of the material it shows. It is a
+    /// CPU render ([`crate::matball`]) of a few thousand pixels, which is cheap once and far too
+    /// expensive every frame — hence the signature rather than a dirty flag, since a material is
+    /// edited by writing its fields from a dozen different places.
+    pub ball: Option<(u64, egui::TextureHandle)>,
 }
 
 /// State of a background Radiance run (`render.bat`: oconv → rpict → pfilt → ra_bmp), shared
@@ -3456,6 +3679,9 @@ impl Default for CadApp {
             pt_device: crate::pathtrace::Device::Gpu, // falls back to CPU if the driver refuses
             pt_res: 1,
             pt_passes: 64,
+            pt_denoise: true,
+            texset_target: None,
+            scene_import_pending: false,
             villa_autoloaded: false,
             arch_tab: ArchTab::Staircase,
             arch_stair: cad_solid::architecture::StairParams::default(),
@@ -3465,6 +3691,13 @@ impl Default for CadApp {
             arch_dogleg_treads: true,
             arch_spiral_csg: cad_solid::spiral::SpiralInput::default(),
             arch_door: cad_solid::door::DoorInput::default(),
+            handle_lib: None,
+            handle_tex: std::collections::HashMap::new(),
+            handle_sel: String::new(),
+            handle_finish: String::new(),
+            handle_dialog: false,
+            door_preview: DoorPreview { zoom: 1.0, ..DoorPreview::default() },
+            door_mats: crate::door_mat::DoorMaterials::default(),
             arch_helical: cad_solid::architecture::HelicalRampParams::default(),
             arch_cupboard: cad_solid::cupboard::CupboardInput::default(),
             arch_kitchen: cad_solid::kitchen::KitchenInput::default(),
@@ -4162,7 +4395,7 @@ impl CadApp {
     fn factory_texture_section(&mut self, ui: &mut egui::Ui) {
         // PER-SURFACE apply mode — shown whenever a FURNITURE object is selected, so the user can
         // choose Whole object / Face / Piece BEFORE picking a texture from the Textures menu.
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             use crate::factory::FurnPaintMode as M;
             ui.add_space(2.0);
             ui.label(egui::RichText::new("Apply texture to").small().weak());
@@ -4212,6 +4445,8 @@ impl CadApp {
             }
         }
 
+        self.factory_cuts_panel(ui);
+
         // Inline texture picker — apply or CHANGE a texture RIGHT HERE on the object (not only via
         // the ▼ Textures menu). Colour and texture are the same surface property, so they sit
         // together: pick a colour swatch above, or a texture here.
@@ -4256,7 +4491,7 @@ impl CadApp {
         // WHAT are we tuning? A selected face/piece has its OWN material (so opacity/reflection/
         // tiling land on JUST that piece); otherwise the whole object / feature. `face_sel` is the
         // active per-face selection on the selected furniture (in Face/Piece mode).
-        let face_sel: Option<(usize, Vec<u32>)> = if let Some(fi) = self.factory.sel_furniture {
+        let face_sel: Option<(usize, Vec<u32>)> = if let Some(fi) = self.factory.sel_furn_primary() {
             if self.factory.furn_paint_mode != crate::factory::FurnPaintMode::WholeObject {
                 self.factory.furn_face_sel.clone().filter(|(f, _)| *f == fi)
             } else {
@@ -4267,7 +4502,7 @@ impl CadApp {
         };
         // Selected CSG feature-solid(s) — e.g. individual treads of a boolean stair. Each gets its
         // own material on tune (copy-on-write), so opacity/reflection land on JUST those solids.
-        let feat_sel: Option<Vec<u32>> = if self.factory.sel_furniture.is_none() && !self.factory.selection.is_empty() {
+        let feat_sel: Option<Vec<u32>> = if self.factory.sel_furniture.is_empty() && !self.factory.selection.is_empty() {
             Some(self.factory.selection.clone())
         } else {
             None
@@ -4279,7 +4514,7 @@ impl CadApp {
             self.factory
                 .face_material(fi, groups)
                 .or_else(|| self.factory.furniture.get(fi).and_then(|f| f.texture))
-        } else if let Some(fi) = self.factory.sel_furniture {
+        } else if let Some(fi) = self.factory.sel_furn_primary() {
             self.factory.furniture.get(fi).and_then(|f| f.texture)
         } else if let Some(ref ids) = feat_sel {
             ids.iter().find_map(|id| self.factory.feature_texture.get(id).copied())
@@ -4330,7 +4565,7 @@ impl CadApp {
 
     #[allow(dead_code)]
     fn factory_adjust_legacy(&mut self, ui: &mut egui::Ui, face_sel: Option<(usize, Vec<u32>)>, feat_sel: Option<Vec<u32>>, tex_idx: Option<usize>) {
-        let furniture = self.factory.sel_furniture.is_some();
+        let furniture = !self.factory.sel_furniture.is_empty();
         // Is the surface a PROCEDURAL material? Its pattern/colours/grain are edited below; the
         // image-only tiling/move/rotate controls are hidden (it's world-space, not UV-mapped).
         let proc_def: Option<crate::factory::ProcDef> = tex_idx.and_then(|ti| self.factory.textures.get(ti)).and_then(|t| t.proc);
@@ -4540,7 +4775,7 @@ impl CadApp {
     /// step; a feature move needs a re-eval so its triangles rejoin the flat batch.
     fn remove_texture_from_selection(&mut self) {
         self.snapshot_factory();
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             // Drop the baked-in tint back to the asset's own colour, else the piece stays
             // stuck at the texture's average colour after removal.
             let asset_col = self.factory.furniture.get(fi)
@@ -4801,6 +5036,132 @@ impl CadApp {
         }
     }
 
+    /// **▼ FBC scene import** — bring a whole Blender scene in, rather than a single prop.
+    ///
+    /// A scene differs from furniture in two ways that the ordinary import gets wrong:
+    ///
+    /// - **Scale.** `add_furniture_asset` shrinks anything longer than 20 m toward a 1.5 m asset,
+    ///   which is right for a chair exported in millimetres and wrong for a building exported at
+    ///   real size. A scene is placed at 1:1 by undoing that exactly (`1 / import_scale`).
+    /// - **Placement.** A prop is dropped at the cursor; a scene belongs at the world origin, in
+    ///   the coordinates it was authored in, so its sun position and its plan still line up.
+    fn factory_scene_import_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("  From Blender").small().weak());
+        if ui
+            .button("⭳  Import scene (.glb / .gltf / .fbx)…")
+            .on_hover_text(
+                "Place a whole exported scene at 1:1 in world coordinates, keeping every material as \
+                 its own paintable part. Export from Blender with File ▸ Export ▸ glTF 2.0 (.glb), \
+                 +Y up, and materials set to Export.",
+            )
+            .clicked()
+        {
+            self.scene_import_pending = true;
+            let dir = std::path::Path::new(r"G:\blender dev\staircase");
+            if dir.is_dir() {
+                self.file_dialog_dir = Some(dir.to_path_buf());
+            }
+            self.open_file_dialog(FileDialogMode::ImportObj, ".glb");
+            ui.close_menu();
+        }
+        if ui
+            .button("🏠  Reload the villa scene")
+            .on_hover_text(
+                "Re-import the Goan villa test scene from the Blender build.\n\
+                 134 MB, 2.01 M triangles — a few seconds. No longer loaded at startup;\n\
+                 set SIMLUX_VILLA=1 to bring that back.",
+            )
+            .clicked()
+        {
+            self.scene_import_pending = true;
+            self.import_scene_file(VILLA_SCENE);
+            ui.close_menu();
+        }
+        ui.separator();
+        // What a glTF can and cannot carry, stated where someone is about to rely on it — this is
+        // the exact thing that made the first villa import render white.
+        ui.label(egui::RichText::new("  glTF carries a Principled BSDF whose Base Color is\n  ONE image or a flat colour. A procedural, or an\n  image reached through mix nodes, exports as a\n  flat colour — usually white. Bake those first.").small().weak());
+        ui.separator();
+        ui.label(egui::RichText::new("  In this project").small().weak());
+        let scenes: Vec<(usize, String, usize)> = self
+            .factory
+            .furniture_lib
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.positions.len() / 3 > 50_000)
+            .map(|(i, a)| (i, a.name.clone(), a.positions.len() / 3))
+            .collect();
+        if scenes.is_empty() {
+            ui.label(egui::RichText::new("  (no scenes imported yet)").small().weak());
+        } else {
+            for (i, name, tris) in scenes {
+                let parts = self.factory.furniture_lib[i].part_ids.iter().collect::<std::collections::BTreeSet<_>>().len();
+                ui.label(egui::RichText::new(format!("  {name} — {tris} tris, {parts} materials")).small());
+            }
+        }
+    }
+
+    /// Import `path` as a SCENE: 1:1 world scale, at the origin, materials as parts.
+    fn import_scene_file(&mut self, path: &str) {
+        if !std::path::Path::new(path).exists() {
+            self.factory.status = format!("Scene import: {path} not found");
+            return;
+        }
+        let before = self.factory.furniture.len();
+        self.import_furniture_obj(path);
+        if self.factory.furniture.len() == before {
+            return; // the importer already reported why
+        }
+        let Some(fi) = self.factory.sel_furn_primary() else { return };
+        let k = self
+            .factory
+            .furniture
+            .get(fi)
+            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+            .map(|a| a.import_scale)
+            .unwrap_or(1.0);
+        let (tris, parts) = self
+            .factory
+            .furniture
+            .get(fi)
+            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+            .map(|a| (a.positions.len() / 3, a.part_ids.iter().collect::<std::collections::BTreeSet<_>>().len()))
+            .unwrap_or((0, 0));
+        if let Some(inst) = self.factory.furniture.get_mut(fi) {
+            inst.scale = if k > 1e-6 { 1.0 / k } else { 1.0 };
+            // A scene is authored about its own origin — dropping it at the cursor would put the
+            // building somewhere the plan and the sun no longer agree with.
+            inst.pos = [0.0, 0.0, 0.0];
+            inst.rot = [0.0, 0.0, 0.0];
+        }
+        // SWITCH THE DAYLIGHT ON. A scene arrives from Blender having been lit there; left in the
+        // app's default studio mode it renders with no sun, no sky and no shadows — a flat grey
+        // background, uniform white walls and no cast shadow anywhere. That is not a small
+        // difference in quality, it is a different image, and it is why an imported scene looked
+        // nothing like the render it came from. Only ever turned ON, and only when the user has
+        // not already set it up, so it cannot overwrite a chosen sun.
+        let lit = if !self.factory.sun.enabled {
+            self.factory.sun.enabled = true;
+            self.factory.sun.shadows = true;
+            self.factory.sun.sky_backdrop = true;
+            // Grade it the way the scene was graded where it came from: Blender's reference render
+            // uses AgX with the "Punchy" look at -0.2 EV. Plain AgX leaves an architectural render
+            // pale and desaturated — measured on the villa, this takes mean saturation from 0.13
+            // to 0.22. Only applied alongside the daylight, so it never overrides a chosen grade.
+            self.factory.color.punchy = 1.0;
+            self.factory.color.exposure = -0.2;
+            ", daylight on, AgX Punchy"
+        } else {
+            ""
+        };
+        self.factory.open = true;
+        self.factory.fit_all();
+        self.active_view = ActiveView::ThreeD;
+        self.factory.status =
+            format!("scene imported — {tris} triangles, {parts} materials, 1:1 world scale{lit}");
+        self.history.push(format!("  imported scene {path} ({tris} tris, {parts} materials)"));
+    }
+
     fn factory_textures_menu(&mut self, ui: &mut egui::Ui) {
         // Paint mode: click individual faces instead of colouring the whole object.
         let mut paint = self.factory.paint_surface_mode;
@@ -4927,7 +5288,7 @@ impl CadApp {
 
     /// The texture index currently on the selection (furniture instance or single feature), if any.
     fn factory_selected_texture(&self) -> Option<usize> {
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             self.factory.furniture.get(fi).and_then(|f| f.texture)
         } else if self.factory.paint_surface_mode {
             self.factory.surface_tex_brush
@@ -5009,7 +5370,7 @@ impl CadApp {
         // PER-SURFACE FURNITURE (Face/Piece mode). Two orders:
         //  • the user already clicked a face (furn_face_sel set) → apply the texture to it NOW;
         //  • otherwise ARM the brush so the next face click textures it.
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             if self.factory.furn_paint_mode != crate::factory::FurnPaintMode::WholeObject {
                 let what = if self.factory.furn_paint_mode == crate::factory::FurnPaintMode::Piece { "piece" } else { "face" };
                 let sel = self.factory.furn_face_sel.clone();
@@ -5053,7 +5414,7 @@ impl CadApp {
         }
         let tint = self.factory.textures.get(idx).map(|t| t.avg).unwrap_or([0.8, 0.8, 0.82]);
         self.snapshot_factory();
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.texture = Some(idx);
                 inst.color = tint;
@@ -5072,7 +5433,7 @@ impl CadApp {
     /// Apply a colour to whatever is selected — a CSG feature (building/wall/…) or, if no
     /// feature is selected, the most recently placed furniture. One undo step.
     fn apply_color_to_selection(&mut self, c: [f32; 3]) {
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             // PER-FACE COLOUR: in Face/Piece mode a colour lands on the clicked face/piece (as a
             // 1×1 solid texture), NOT the whole object — matching how per-face TEXTURE works. This
             // is the fix for "I selected a face and the colour changed the whole object".
@@ -5174,14 +5535,15 @@ impl CadApp {
                         gltf_pbr = Some(pbr);
                         m
                     } else {
-                        // BINARY FBX. Read geometry AND each material's diffuse colour, flowing the
-                        // colours through the same per-part channel glTF uses so a flat-material
-                        // model (e.g. the villa) shows its own colours per region instead of one
-                        // uniform grey — and each material becomes a selectable/paintable part.
-                        let (m, pbr) = crate::mesh_io::parse_fbx_pbr(&bytes);
+                        // BINARY FBX. Read geometry, UVs, and each material's IMAGE — embedded in
+                        // the file, or the file it names beside it — falling back to its diffuse
+                        // colour, flowing them through the same per-part channel glTF uses so each
+                        // material is a selectable/paintable part wearing its own texture.
+                        let (m, pbr) = crate::mesh_io::parse_fbx_pbr_at(&bytes, base);
+                        let images = pbr.textures.iter().filter(|(w, h, _)| *w > 1 || *h > 1).count();
                         fbx_note = format!(
-                            " fbx_binary=true fbx_tris={} fbx_mats={}",
-                            m.tri_count(), pbr.textures.len(),
+                            " fbx_binary=true fbx_tris={} fbx_mats={} fbx_images={} fbx_uv={}",
+                            m.tri_count(), pbr.textures.len(), images, !pbr.uvs.is_empty(),
                         );
                         if m.tri_count() == 0 {
                             // Fall back to the geometry-only reader for the richer diagnostic.
@@ -5261,6 +5623,21 @@ impl CadApp {
                 .map(|(i, (tw, th, rgba))| self.factory.add_texture(format!("{name} mat{i}"), *tw, *th, rgba.clone()))
                 .collect();
             per_part_tex = pbr.part_texture.iter().map(|slot| slot.and_then(|s| globals.get(s).copied())).collect();
+            // Carry the material's SURFACE properties, not just its colour. Without these every
+            // import sat at the app's default 0.5 roughness: a pool authored at 0.035 — a mirror —
+            // rendered as flat cyan paint with nothing to reflect, and the whole scene read matte.
+            for (part, slot) in pbr.part_texture.iter().enumerate() {
+                let (Some(s), Some(g)) = (slot, slot.and_then(|s| globals.get(s).copied())) else { continue };
+                let _ = s;
+                if let Some(t) = self.factory.textures.get_mut(g) {
+                    if let Some(r) = pbr.part_rough.get(part) {
+                        t.roughness = r.clamp(0.0, 1.0);
+                    }
+                    if let Some(m) = pbr.part_metal.get(part) {
+                        t.metallic = m.clamp(0.0, 1.0);
+                    }
+                }
+            }
             gltf_tex_note = format!(" gltf_mats={} parts={}", globals.len(), per_part_tex.len());
         }
         // Drop it at the MODEL's centre, not world origin. Imported drawings live at their
@@ -5272,7 +5649,7 @@ impl CadApp {
         // texture of the PART (glTF primitive) it belongs to, so each material shows on its own
         // area (real UVs map the image). A single-material model → every face-group → the one tex.
         if !per_part_tex.is_empty() {
-            if let Some(fi) = self.factory.sel_furniture {
+            if let Some(fi) = self.factory.sel_furn_primary() {
                 let asset_idx = self.factory.furniture.get(fi).map(|f| f.asset);
                 if let Some(ai) = asset_idx {
                     if let Some(a) = self.factory.furniture_lib.get(ai) {
@@ -5376,24 +5753,590 @@ impl CadApp {
         Some(idx)
     }
 
+    /// The handle library folder. Ships beside the Blender assets; absent on a bare checkout, in
+    /// Load the handle library once, on first need. A bare checkout has no asset folder, and the
+    /// picker says so rather than pretending the library is empty.
+    fn handle_lib_ensure(&mut self) {
+        if self.handle_lib.is_none() {
+            if let Ok(l) = crate::handles::HandleLibrary::load(Self::handle_lib_dir()) {
+                if self.handle_sel.is_empty() {
+                    self.handle_sel = l.handles.first().map(|h| h.id.clone()).unwrap_or_default();
+                }
+                self.handle_lib = Some(l);
+            }
+        }
+    }
+
+    /// The Handles dialog: preview tiles for the whole library, opened from the Door panel's
+    /// Handle row. Drawn at the top level so it floats over the panel instead of reflowing it.
+    fn handle_dialog_window(&mut self, ctx: &egui::Context) {
+        if !self.handle_dialog {
+            return;
+        }
+        let door = self.arch_door;
+        let mut open = true;
+        egui::Window::new("Handles")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                self.handle_lib_ensure();
+                if self.handle_lib.is_none() {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "handle library not found at {}",
+                            Self::handle_lib_dir().display()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    return;
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "for a {:.0} × {:.0} mm leaf at {:.0} mm backset",
+                        door.door_width * 1000.0,
+                        door.door_height * 1000.0,
+                        door.handle_backset * 1000.0
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+                self.handle_picker(ui, &door);
+                ui.separator();
+                if ui.button("Done").clicked() {
+                    self.handle_dialog = false;
+                }
+            });
+        if !open {
+            self.handle_dialog = false;
+        }
+    }
+
+    /// The DOOR PREVIEW: what you are about to insert, before you insert it.
+    ///
+    /// Not a screenshot of the viewport — the point is to decide *without* putting a door in the
+    /// model first, then hunting it down and undoing it. It renders the very mesh
+    /// [`Self::door_mesh`] hands to the builder, welded handle and all, so agreeing with the
+    /// picture and agreeing with the result are the same act.
+    ///
+    /// Returns true when the user asked to build from in here.
+    fn door_preview_window(&mut self, ctx: &egui::Context) -> bool {
+        if !self.door_preview.open {
+            return false;
+        }
+        let inp = self.arch_door;
+        let mut open = true;
+        let mut build = false;
+
+        // ── The mesh: rebuilt only when the door or its handle actually changed ──────────────
+        let geom_sig = preview_hash(
+            &[
+                inp.door_width, inp.door_height, inp.door_thickness, inp.frame_depth,
+                inp.frame_face_width, inp.frame_stop_depth, inp.arch_width, inp.arch_head_width,
+                inp.arch_thickness, inp.handle_backset, inp.handle_height, inp.hinge_side,
+                inp.stile_width, inp.rail_width, inp.panel_mould_width,
+            ],
+            &[&self.handle_sel, &self.handle_finish],
+        );
+        if self.door_preview.geom_sig != geom_sig || self.door_preview.mesh.is_none() {
+            self.door_preview.geom_sig = geom_sig;
+            match self.door_mesh(&inp) {
+                Ok((m, obj, ids, note)) => {
+                    self.door_preview.caption = format!(
+                        "structural opening {:.0} × {:.0} mm · casing {:.0} × {:.0} mm · depth {:.0} mm{}",
+                        m.structural_opening_w * 1000.0, m.structural_opening_h * 1000.0,
+                        m.overall_w * 1000.0, m.overall_h * 1000.0, m.overall_depth * 1000.0,
+                        note,
+                    );
+                    self.door_preview.mesh = Some((obj, ids));
+                }
+                Err(e) => {
+                    self.door_preview.caption = format!("⚠ {e}");
+                    self.door_preview.mesh = None;
+                }
+            }
+            self.door_preview.tex_ss = 0; // force a re-render of the picture too
+        }
+
+        egui::Window::new("Door preview")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                const VIEW: usize = 460;
+
+                // SIX FIXED VIEWS. See `mesh_preview::View` for why this is not a free orbit.
+                ui.horizontal(|ui| {
+                    for v in crate::mesh_preview::View::ALL {
+                        ui.selectable_value(&mut self.door_preview.view, v, v.label());
+                    }
+                });
+                ui.add_space(2.0);
+
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(VIEW as f32, VIEW as f32),
+                    egui::Sense::click_and_drag(),
+                );
+
+                // ZOOM: scroll on the image, or drag it vertically. Both land on the same number,
+                // so there is one thing to reason about.
+                let mut zoom = self.door_preview.zoom;
+                if resp.hovered() {
+                    let scroll = ui.ctx().input(|i| i.raw_scroll_delta.y);
+                    if scroll.abs() > 0.5 {
+                        zoom *= 1.0 + scroll * 0.0018;
+                    }
+                }
+                if resp.dragged() {
+                    zoom *= 1.0 - resp.drag_delta().y * 0.004;
+                }
+                self.door_preview.zoom = zoom.clamp(0.4, 6.0);
+
+                // Everything the picture depends on EXCEPT how finely it is sampled. Materials
+                // belong here, not in the geometry signature: changing oak to walnut must
+                // re-shade, never re-parse the handle's FBX.
+                let o = self.door_preview.view.orbit(self.door_preview.zoom);
+                let img_sig = preview_hash(
+                    &[o.yaw, o.pitch, o.zoom],
+                    &[&self.handle_finish],
+                ) ^ self.door_preview.geom_sig
+                    ^ self.door_mats.key().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+                // PROGRESSIVE, in two levels. A change draws a DRAFT immediately — half
+                // resolution, one sample, no procedural relief, which is sixteen times less
+                // shading — and asks for one more frame. If nothing has changed by then, the same
+                // image is rendered properly. Nobody should wait on the expensive version to find
+                // out they turned the wrong knob, and the draft is upscaled by the same bilinear
+                // filter the final image is drawn through, so it reads as soft rather than broken.
+                let changed = self.door_preview.img_sig != img_sig;
+                let level = if changed { 1 } else { 2 };
+                if changed || self.door_preview.tex_ss < level || self.door_preview.tex.is_none() {
+                    self.door_preview.img_sig = img_sig;
+                    self.door_preview.tex_ss = level;
+                    if level < 2 {
+                        ui.ctx().request_repaint(); // come back and refine it
+                    }
+                    let (size, ss) = if level < 2 { (VIEW / 2, 1) } else { (VIEW, 2) };
+                    // Joinery follows the chosen materials, ironmongery the handle finish — the
+                    // same resolution the built door uses, so the two cannot disagree.
+                    let mats = self.door_mats;
+                    let finish = self.handle_finish.clone();
+                    let look = move |id: u32| door_part_look(&mats, &finish, id);
+                    let px = match &self.door_preview.mesh {
+                        Some((obj, ids)) => crate::mesh_preview::render(
+                            &obj.positions, &obj.normals, ids, &look, o, size, ss, self.factory.color,
+                        ),
+                        None => crate::mesh_preview::render(
+                            &[], &[], &[], &look, o, size, ss, self.factory.color,
+                        ),
+                    };
+                    let tex = ui.ctx().load_texture(
+                        "door_preview",
+                        egui::ColorImage::from_rgba_unmultiplied([size, size], &px),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.door_preview.tex = Some(tex);
+                }
+                if let Some(t) = &self.door_preview.tex {
+                    ui.painter().image(
+                        t.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                resp.on_hover_text("scroll or drag up/down to zoom");
+
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Zoom").small().weak());
+                    ui.add(
+                        egui::Slider::new(&mut self.door_preview.zoom, 0.4..=6.0)
+                            .logarithmic(true)
+                            .show_value(false),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", self.door_preview.zoom * 100.0))
+                            .small()
+                            .weak(),
+                    );
+                    if ui.small_button("Fit").clicked() {
+                        self.door_preview.zoom = 1.0;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(&self.door_preview.caption)
+                        .small()
+                        .color(crate::theme::color::ACCENT),
+                );
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let can = self.door_preview.mesh.is_some();
+                    if ui
+                        .add_enabled(can, egui::Button::new(egui::RichText::new("✚  Build door").strong()))
+                        .clicked()
+                    {
+                        build = true;
+                    }
+                    if ui.button("Handles…").clicked() {
+                        self.handle_dialog = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.door_preview.open = false;
+                    }
+                });
+            });
+        if !open {
+            self.door_preview.open = false;
+        }
+        if build {
+            self.door_preview.open = false;
+        }
+        build
+    }
+
+    /// Append the chosen handle's geometry to a door mesh, both faces, in the door's own frame.
+    /// Returns a note for the status line (empty when nothing was welded).
+    ///
+    /// One object, not three. The handle is part of the door: erase, move or copy the door and the
+    /// hardware goes with it, because it IS the door. Its parts still get their own `part_ids`, so
+    /// "select a piece" and per-part recolouring keep working on the lever and the rose.
+    ///
+    /// The two traps from HANDLES_BUILD.md are in `mount_matrix`: the X coefficient is `hand` on
+    /// BOTH faces (the mirror is through the leaf's mid-plane, so it reverses Y and leaves X
+    /// alone), and `det M < 0` on exactly one face — where lettering is reflected about `x = 0`
+    /// first, so a glyph changes column and the mount's mirror carries it back.
+    fn factory_weld_handle(
+        &mut self,
+        choice: &HandleChoice,
+        obj: &mut crate::mesh_io::ObjMesh,
+        part_ids: &mut Vec<u32>,
+    ) -> String {
+        let (h, fit) = match choice {
+            HandleChoice::Builtin => return String::new(),
+            HandleChoice::Refused(why) => return format!(" ({why})"),
+            HandleChoice::Use(h, fit) => (h, *fit),
+        };
+        let Some(lib) = self.handle_lib.clone() else { return String::new() };
+
+        let path = lib.mesh_path(h);
+        let Ok(bytes) = std::fs::read(&path) else {
+            self.history.push(format!("  ! handle mesh unreadable: {}", path.display()));
+            return String::new();
+        };
+        let (hm, hp) = crate::mesh_io::parse_fbx_pbr_at(&bytes, path.parent());
+        if hm.tri_count() == 0 {
+            self.history.push(format!("  ! handle mesh empty: {}", path.display()));
+            return String::new();
+        }
+
+        crate::handles::weld_onto(
+            &fit,
+            &hm.positions, &hm.normals, &hp.part_ids,
+            &mut obj.positions, &mut obj.normals, part_ids,
+        );
+        self.history.push(format!("  handle '{}' welded into the door, both faces", h.id));
+        format!(" with {}", h.name)
+    }
+
+    /// Decide, ONCE, which handle a door wears — and hand back the door input that matches, with
+    /// its own lever switched off when a library handle is going on instead.
+    ///
+    /// Both the preview and the build go through here, which is the point: what the user is shown
+    /// and what gets inserted cannot disagree about the hardware.
+    fn door_resolved(
+        &mut self,
+        inp: &cad_solid::door::DoorInput,
+    ) -> (cad_solid::door::DoorInput, HandleChoice) {
+        self.handle_lib_ensure();
+        let choice = match self.handle_lib.as_ref().and_then(|l| l.get(&self.handle_sel)).cloned() {
+            None => HandleChoice::Builtin,
+            Some(h) => {
+                let fit = crate::handles::DoorFit {
+                    door_width_mm: inp.door_width * 1000.0,
+                    door_height_mm: inp.door_height * 1000.0,
+                    leaf_thickness_mm: inp.door_thickness * 1000.0,
+                    handle_backset_mm: inp.handle_backset * 1000.0,
+                    handle_height_mm: inp.handle_height * 1000.0,
+                    hinge_side: inp.hinge_side,
+                };
+                let f = crate::handles::fitness(&h, &fit);
+                if f.ok() {
+                    HandleChoice::Use(Box::new(h), fit)
+                } else {
+                    HandleChoice::Refused(format!("no {} — {}", h.name, f.summary()))
+                }
+            }
+        };
+        // A refused handle falls BACK to the built-in lever: better a plain door than a bare hole
+        // where the hardware should be.
+        let builtin = !matches!(choice, HandleChoice::Use(..));
+        (cad_solid::door::DoorInput { builtin_hardware: builtin, ..*inp }, choice)
+    }
+
+    /// Bind the chosen materials to a placed door, per component.
+    ///
+    /// The door arrives as ONE mesh whose triangles carry `Part` ids, so the materials go on the
+    /// same way a glTF's per-primitive materials do: part id → face group → texture index, stored
+    /// on the instance. Nothing is duplicated and nothing is re-meshed — a glazed panel is the
+    /// same geometry with a see-through material bound to it.
+    fn door_bind_materials(&mut self, fi: usize) {
+        use crate::door_mat::Slot;
+        // One texture per DISTINCT material, reused by name — see `DoorMaterial::install`.
+        let mut by_part: HashMap<u32, usize> = HashMap::new();
+        for slot in Slot::ALL {
+            let ti = self.door_mats.get(slot).install(&mut self.factory);
+            for &p in slot.parts() {
+                by_part.insert(p, ti);
+            }
+        }
+        // Ironmongery — hinges, the door's own lever, and every part a welded handle contributed —
+        // takes the handle FINISH, so the whole door is materialled and nothing falls back to the
+        // asset's base colour.
+        let hw = self.door_hardware_texture();
+        let Some(inst) = self.factory.furniture.get(fi) else { return };
+        let map = self.factory.furniture_lib.get(inst.asset).map(|a| {
+            let g = a.group_geom();
+            let mut m: HashMap<u32, usize> = HashMap::new();
+            for t in 0..a.positions.len() / 3 {
+                let part = a.part_ids.get(t).copied().unwrap_or(0);
+                let ti = by_part.get(&part).copied().or_else(|| {
+                    (part >= crate::door_mat::FIRST_HARDWARE_PART).then_some(hw)
+                });
+                if let Some(ti) = ti {
+                    m.insert(g.face[t], ti);
+                }
+            }
+            m
+        });
+        if let (Some(m), Some(inst)) = (map, self.factory.furniture.get_mut(fi)) {
+            inst.surface_texture = m;
+        }
+    }
+
+    /// A swatch of the current handle finish, reused by name. Shares [`finish_look`] with the
+    /// preview so the ironmongery is the same colour in both.
+    fn door_hardware_texture(&mut self) -> usize {
+        let name = format!(
+            "Door — hardware ({})",
+            if self.handle_finish.is_empty() { "satin nickel" } else { &self.handle_finish }
+        );
+        if let Some(i) = self.factory.textures.iter().position(|t| t.name == name) {
+            return i;
+        }
+        let look = finish_look(&self.handle_finish);
+        // `finish_look` is authored in LINEAR reflectance; a swatch stores sRGB bytes.
+        let px = |c: f32| (crate::color::linear_to_srgb(c) * 255.0).round().clamp(0.0, 255.0) as u8;
+        let rgb = [px(look.albedo[0]), px(look.albedo[1]), px(look.albedo[2])];
+        let i = self.factory.add_texture(name, 1, 1, vec![rgb[0], rgb[1], rgb[2], 255]);
+        if let Some(t) = self.factory.textures.get_mut(i) {
+            t.metallic = look.metallic;
+            t.roughness = look.roughness;
+            // A polished lever really does mirror the room; a matt-black one does not.
+            t.reflect = (look.metallic * (1.0 - 0.6 * look.roughness)).clamp(0.0, 1.0);
+        }
+        i
+    }
+
+    /// The finished door — leaf, lining, casing and whichever handle it wears — as one mesh.
+    /// Shared by the preview and the build so they cannot drift apart.
+    fn door_mesh(
+        &mut self,
+        inp: &cad_solid::door::DoorInput,
+    ) -> Result<(cad_solid::door::DoorMetrics, crate::mesh_io::ObjMesh, Vec<u32>, String), String> {
+        let (resolved, choice) = self.door_resolved(inp);
+        let (m, mesh) = cad_solid::door::build(&resolved).map_err(|e| e.to_string())?;
+        let mut part_ids = mesh.face_ids.clone();
+        let mut obj = crate::mesh_io::ObjMesh {
+            positions: mesh.positions,
+            normals: mesh.normals,
+            color: Some([0.62, 0.50, 0.38]), // wood; recolour a piece via Textures
+            alpha: Vec::new(),
+        };
+        // WELD THE HANDLE INTO THE LEAF. A door and its hardware are one thing: you erase it, move
+        // it or copy it as a unit, and a handle left as its own instance is something the user has
+        // to chase around separately — and can delete by accident, leaving a door with a hole where
+        // its lever was. `mount_matrix` already works in the door's OWN frame, which is the frame
+        // this mesh is built in, so the handle's vertices transform straight in with no parenting
+        // and no second instance.
+        let note = self.factory_weld_handle(&choice, &mut obj, &mut part_ids);
+        Ok((m, obj, part_ids, note))
+    }
+
+    /// The handle library folder. Ships beside the Blender assets; absent on a bare checkout, in
+    /// which case the picker says so rather than pretending the library is empty.
+    fn handle_lib_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(r"G:\blender dev\staircase\door handles_\assets\handles")
+    }
+
+    /// Decode a handle's preview PNG into an egui texture, once. The tiles are 640 square with an
+    /// alpha channel — rendered against nothing, so they sit on any panel background in either
+    /// theme.
+    fn handle_preview(&mut self, ctx: &egui::Context, id: &str, path: &std::path::Path) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.handle_tex.get(id) {
+            return Some(t.clone());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let tex = ctx.load_texture(
+            format!("handle_{id}"),
+            egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        self.handle_tex.insert(id.to_string(), tex.clone());
+        Some(tex)
+    }
+
+    /// The handle picker (HANDLES_BUILD.md section B5).
+    ///
+    /// Tiles are drawn at HONEST RELATIVE SCALE: the smart lock's plate is seven times the height
+    /// of the round rose, and a picker that normalises every tile to the same box misleads exactly
+    /// the user who has to fit one to a door. A handle that fails validation is GREYED OUT with the
+    /// reason on hover, never hidden — someone who picked the smart lock and cannot see why it
+    /// vanished will assume the library is broken.
+    fn handle_picker(&mut self, ui: &mut egui::Ui, door: &cad_solid::door::DoorInput) {
+        if self.handle_lib.is_none() {
+            match crate::handles::HandleLibrary::load(Self::handle_lib_dir()) {
+                Ok(l) => self.handle_lib = Some(l),
+                Err(e) => {
+                    ui.label(egui::RichText::new(format!("handle library unavailable — {e}")).small().weak());
+                    return;
+                }
+            }
+        }
+        let Some(lib) = self.handle_lib.clone() else { return };
+        let fit = crate::handles::DoorFit {
+            door_width_mm: door.door_width * 1000.0,
+            door_height_mm: door.door_height * 1000.0,
+            leaf_thickness_mm: door.door_thickness * 1000.0,
+            handle_backset_mm: door.handle_backset * 1000.0,
+            handle_height_mm: door.handle_height * 1000.0,
+            hinge_side: door.hinge_side,
+        };
+        if self.handle_sel.is_empty() {
+            self.handle_sel = lib.handles.first().map(|h| h.id.clone()).unwrap_or_default();
+        }
+
+        ui.label(egui::RichText::new("Handle").small().weak());
+        // The tallest plate sets the scale for every tile, so their sizes stay comparable.
+        let tallest = lib
+            .handles
+            .iter()
+            .map(|h| h.bbox_mm.max[1] - h.bbox_mm.min[1])
+            .fold(1.0f32, f32::max);
+        const TILE: f32 = 78.0;
+
+        let mut styles: Vec<String> = lib.handles.iter().map(|h| h.style.clone()).collect();
+        styles.dedup();
+        let ctx = ui.ctx().clone();
+        let mut picked: Option<String> = None;
+        for style in styles {
+            ui.label(egui::RichText::new(&style).small().weak());
+            ui.horizontal_wrapped(|ui| {
+                for h in lib.handles.iter().filter(|h| h.style == style) {
+                    let f = crate::handles::fitness(h, &fit);
+                    let usable = f.ok();
+                    let tex = self.handle_preview(&ctx, &h.id, &lib.preview_path(h));
+                    let selected = self.handle_sel == h.id;
+                    ui.vertical(|ui| {
+                        ui.set_width(TILE);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            egui::vec2(TILE, TILE),
+                            egui::Sense::click(),
+                        );
+                        if selected {
+                            ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(38, 74, 102));
+                        }
+                        if let Some(t) = &tex {
+                            // Honest scale: each tile is drawn at its true height relative to the
+                            // tallest handle in the library, floored so a rose is still visible.
+                            let hmm = h.bbox_mm.max[1] - h.bbox_mm.min[1];
+                            let art = TILE * (hmm / tallest).clamp(0.3, 1.0);
+                            let r = egui::Rect::from_center_size(rect.center(), egui::vec2(art, art));
+                            let tint = if usable {
+                                egui::Color32::WHITE
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55)
+                            };
+                            ui.painter().image(
+                                t.id(),
+                                r,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                tint,
+                            );
+                        }
+                        let label = egui::RichText::new(&h.name).small();
+                        ui.label(if usable { label } else { label.weak() });
+                        // The two numbers that decide whether a handle fits a doorway at all.
+                        ui.label(
+                            egui::RichText::new(format!("{:.0} out · {:.0} reach", h.projection_mm, h.lever_reach_mm))
+                                .small()
+                                .weak(),
+                        );
+                        let tip = if usable {
+                            if f.warnings.is_empty() {
+                                format!("{}\n{} mount · min backset {:.0} mm", h.name, h.mount, h.min_backset_mm)
+                            } else {
+                                format!("{}\n⚠ {}", h.name, f.summary())
+                            }
+                        } else {
+                            format!("{} — unavailable\n{}", h.name, f.summary())
+                        };
+                        if resp.clicked() && usable {
+                            picked = Some(h.id.clone());
+                        }
+                        resp.on_hover_text(tip);
+                    });
+                }
+            });
+        }
+        if let Some(id) = picked {
+            // Changing the handle must not rebuild the door — this swaps which handle is mounted.
+            self.handle_sel = id;
+        }
+
+        // Finish is a SECOND, independent control, preserved across handle changes where the new
+        // handle offers the same one.
+        if let Some(h) = lib.get(&self.handle_sel) {
+            if self.handle_finish.is_empty() || !h.finishes.contains(&self.handle_finish) {
+                self.handle_finish = h.default_finish.clone();
+            }
+            if !h.finishes.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Finish").selectable(false));
+                    egui::ComboBox::from_id_salt("handle_finish")
+                        .selected_text(self.handle_finish.replace('_', " "))
+                        .show_ui(ui, |ui| {
+                            for fin in &h.finishes {
+                                ui.selectable_value(&mut self.handle_finish, fin.clone(), fin.replace('_', " "));
+                            }
+                        });
+                });
+            }
+            for w in &crate::handles::fitness(h, &fit).warnings {
+                ui.label(egui::RichText::new(format!("  ⚠ {}", w.message)).small().weak());
+            }
+        }
+    }
+
     /// Build the parametric door as a furniture ASSET (no placement) and return its library index.
     /// Each structural component (leaf / lining / casing / hardware) is tagged via `part_ids`, so
     /// "select a piece" picks one part and it can be recoloured on its own. Shared by the default
     /// aperture door, the fitted (drawn) door, and the parameters dialog.
     fn factory_add_door_asset(&mut self, inp: &cad_solid::door::DoorInput, name: &str) -> Option<usize> {
-        let (_m, mesh) = match cad_solid::door::build(inp) {
+        // Through `door_mesh`, so a door DRAWN on a wall wears the same handle as one built from
+        // the dialog. Two routes to the same object should not produce two different objects.
+        let (_m, obj, part_ids, _note) = match self.door_mesh(inp) {
             Ok(v) => v,
             Err(e) => {
                 self.factory.status = format!("Door: {e}");
                 return None;
             }
-        };
-        let part_ids = mesh.face_ids.clone();
-        let obj = crate::mesh_io::ObjMesh {
-            positions: mesh.positions,
-            normals: mesh.normals,
-            color: Some([0.62, 0.50, 0.38]), // wood; recolour a piece via Textures
-            alpha: Vec::new(),
         };
         let idx = self.factory.add_furniture_asset(name.to_string(), obj);
         if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
@@ -5569,7 +6512,10 @@ impl CadApp {
             if let Some(asset) = self.factory_add_door_asset(&inp, "Door") {
                 // The door's structural-opening centre, mid-wall, lands on the opening centre.
                 let anchor = glam::Vec3::new(0.0, -thick * 0.5, height * 0.5);
-                self.factory.place_aperture_native(asset, center_mid, u_h, anchor);
+                if let Some(fi) = self.factory.place_aperture_native(asset, center_mid, u_h, anchor) {
+                    // A door drawn on a wall wears the same materials as one built from the panel.
+                    self.door_bind_materials(fi);
+                }
             }
         } else {
             let Some(asset) = self.factory_ensure_aperture_asset(kind) else { return };
@@ -5636,7 +6582,7 @@ impl CadApp {
         ui.separator();
 
         // A selected FURNITURE instance: position, scale, rotation, colour, delete.
-        if let Some(fi) = self.factory.sel_furniture {
+        if let Some(fi) = self.factory.sel_furn_primary() {
             if let Some(inst) = self.factory.furniture.get(fi).cloned() {
                 let name = self
                     .factory
@@ -5875,26 +6821,32 @@ impl CadApp {
 
     /// Delete the current 3D selection — one undo step, then re-evaluate. Shared by the
     /// panel button and the Delete key.
+    /// Both kinds go in ONE undo step. A marquee can pick up walls and furniture together, and
+    /// splitting that into two steps would mean the user has to press undo twice to put back what
+    /// one Delete took away — with the drawing in a half-restored state in between.
     fn factory_delete_selection(&mut self) {
-        // A selected furniture instance deletes on its own — it is not a CSG feature.
-        if let Some(fi) = self.factory.sel_furniture {
-            if fi < self.factory.furniture.len() {
-                self.snapshot_factory();
-                self.factory.furniture.remove(fi);
-                self.factory.sel_furniture = None;
-                self.history.push("  furniture deleted".into());
-            }
+        let furn = self.factory.sel_furniture.len();
+        let feat = self.factory.selection.len();
+        if furn == 0 && feat == 0 {
             return;
         }
-        if self.factory.selection.is_empty() {
-            return;
-        }
-        let n = self.factory.selection.len();
         self.snapshot_factory();
-        self.factory.erase_selection();
-        self.factory.recompute();
-        self.history.push(format!("  3D Factory: {n} object(s) deleted"));
-        self.factory_note(format!("{n} deleted"));
+        // Furniture first: it is not part of the CSG model, so it needs no re-evaluation and
+        // removing it cannot disturb the feature ids about to be erased.
+        if furn > 0 {
+            self.factory.erase_selected_furniture();
+        }
+        if feat > 0 {
+            self.factory.erase_selection();
+            self.factory.recompute();
+        }
+        let what = match (feat, furn) {
+            (0, n) => format!("{n} furniture"),
+            (n, 0) => format!("{n} object(s)"),
+            (a, b) => format!("{a} object(s) + {b} furniture"),
+        };
+        self.history.push(format!("  3D Factory: {what} deleted"));
+        self.factory_note(format!("{what} deleted"));
     }
 
     /// The best closed outline in the current 2D selection, for a slab boundary.
@@ -6457,7 +7409,7 @@ impl CadApp {
         // Always SELECT the new solid (and clear any furniture selection) so it can be moved,
         // recoloured, or Deleted straight away — otherwise the just-made piece felt stuck.
         if let Some(id) = last {
-            self.factory.sel_furniture = None;
+            self.factory.sel_furniture.clear();
             self.factory.selection = vec![id];
         }
         self.factory.recompute();
@@ -6479,6 +7431,154 @@ impl CadApp {
         made
     }
 
+    /// The CUTS list for the selected piece — what makes a cut editable rather than final.
+    ///
+    /// Every row is a hole that can be switched off, re-depthed or deleted, and each change replays
+    /// the whole list against the untouched original. Switching them all off gives back exactly the
+    /// piece that was there before anything was cut, which is the property the list exists for.
+    fn factory_cuts_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(fi) = self.factory.sel_furn_primary() else { return };
+        let n = self.factory.furniture.get(fi).map_or(0, |f| f.cuts.len());
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("Cuts").small().weak());
+        if n == 0 {
+            ui.label(
+                egui::RichText::new(
+                    "  right-click a face → Draw on this face, draw a shape, then Cut",
+                )
+                .small()
+                .weak(),
+            );
+            return;
+        }
+
+        let mut rebuild = false;
+        let mut remove: Option<usize> = None;
+        for i in 0..n {
+            let Some(cut) = self.factory.furniture[fi].cuts.get(i).cloned() else { continue };
+            ui.horizontal(|ui| {
+                let mut on = cut.enabled;
+                if ui.checkbox(&mut on, "").on_hover_text("apply this cut").changed() {
+                    self.factory.furniture[fi].cuts[i].enabled = on;
+                    rebuild = true;
+                }
+                ui.add_sized(
+                    [86.0, 18.0],
+                    egui::Label::new(egui::RichText::new(&cut.label).small()).selectable(false),
+                );
+                let mut through = cut.through;
+                if ui
+                    .selectable_label(through, "through")
+                    .on_hover_text("punch all the way out the far side")
+                    .clicked()
+                {
+                    through = !through;
+                    self.factory.furniture[fi].cuts[i].through = through;
+                    rebuild = true;
+                }
+                if !through {
+                    let mut d = cut.depth;
+                    if ui
+                        .add(egui::DragValue::new(&mut d).speed(0.002).range(0.001..=2.0).suffix(" m"))
+                        .changed()
+                    {
+                        self.factory.furniture[fi].cuts[i].depth = d;
+                        rebuild = true;
+                    }
+                }
+                if ui
+                    .small_button(egui::RichText::new("✕").color(egui::Color32::from_rgb(230, 170, 170)))
+                    .on_hover_text("delete this cut — the piece returns to what it was")
+                    .clicked()
+                {
+                    remove = Some(i);
+                }
+            });
+        }
+
+        if let Some(i) = remove {
+            self.snapshot_factory();
+            self.factory.furniture[fi].cuts.remove(i);
+            rebuild = true;
+        } else if rebuild {
+            self.snapshot_factory();
+        }
+        if rebuild {
+            match self.factory.rebuild_cut_asset(fi) {
+                Ok(()) => {
+                    self.factory.recompute();
+                    let live = self.factory.furniture[fi].cuts.iter().filter(|c| c.enabled).count();
+                    self.factory.status = match live {
+                        0 => "no cuts applied — the piece is back to its original".into(),
+                        k => format!("{k} cut(s) applied"),
+                    };
+                }
+                Err(e) => self.factory.status = format!("cut: {e}"),
+            }
+        }
+    }
+
+    /// Cut the drawn shapes into a FURNITURE piece — the mesh half of [`Self::factory_cut_sketch`].
+    ///
+    /// The cut is recorded on the instance and its geometry rebuilt from the original; nothing is
+    /// baked, so it can be switched off or deleted afterwards from the Cuts list in the properties
+    /// panel. A refusal (an imported mesh, an open shell) leaves the piece untouched and says which
+    /// measurement it failed on, rather than producing a mangled body that looks like a bug.
+    fn factory_cut_furniture(
+        &mut self,
+        fi: usize,
+        frame: cad_solid::Frame,
+        loops: &[Vec<glam::Vec2>],
+        through: bool,
+        fin_idx: Option<usize>,
+        source: &str,
+    ) -> usize {
+        let features_before = self.factory.model.features.len();
+        let depth = self.factory.element_height.max(0.005);
+        self.snapshot_factory();
+        let name = self
+            .factory
+            .furniture_lib
+            .get(self.factory.furniture[fi].source_asset())
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| "piece".into());
+
+        match self.factory.add_furniture_cut(fi, &frame, loops, through, depth) {
+            Ok(0) => {
+                self.undo_stack.pop();
+                self.factory.status = "shapes could not be cut (degenerate / self-crossing)".into();
+                0
+            }
+            Ok(made) => {
+                self.factory_consume_sketch(fin_idx, false);
+                self.factory.select_furniture(fi);
+                self.factory.recompute();
+                let what = if through { "opening(s) cut through" } else { "recess(es) cut into" };
+                self.factory.status = format!(
+                    "{made} {what} {name} — edit or remove them under Cuts in the panel"
+                );
+                self.history.push(format!("  furniture cut: {made} on '{name}' (through={through})"));
+                self.factory_op_evt(
+                    if through { "furniture-cut-through" } else { "furniture-recess" },
+                    source,
+                    format!(
+                        "inst=#{fi} through={through} depth={depth:.3} loops={} cuts_now={}",
+                        loops.len(),
+                        self.factory.furniture[fi].cuts.len()
+                    ),
+                    features_before,
+                );
+                made
+            }
+            Err(e) => {
+                self.undo_stack.pop();
+                self.factory.status = format!("{name}: {e}");
+                self.history.push(format!("  ! furniture cut refused on '{name}': {e}"));
+                0
+            }
+        }
+    }
+
     /// CUT the shapes drawn on the current face into the solid that face belongs to. With
     /// `through`, the cut punches all the way through (a window/door); otherwise it stops at
     /// `element_height` depth (a recess / niche / blind pocket). The cut is a Difference
@@ -6493,6 +7593,17 @@ impl CadApp {
         let source = if is_sel { "2d-selection" }
             else if fin_idx.is_some() { "finished-sketch" }
             else { "active-face-sketch" };
+
+        // FURNITURE FIRST. Doors, cupboards, kitchens, stairs, ramps and apertures are all mesh
+        // INSTANCES, not CSG features, so the Difference feature built below can never reach them.
+        // If the shape was drawn on one of their faces, this is a mesh cut instead — same command,
+        // same gesture, different machinery underneath.
+        if !is_sel {
+            if let Some(fi) = self.factory.furniture_at_face(&frame) {
+                return self.factory_cut_furniture(fi, frame, &loops, through, fin_idx, source);
+            }
+        }
+
         let features_before = self.factory.model.features.len();
         let n_loops = loops.len();
         // The solid to cut: the SMALLEST Union feature whose box contains a point UNDER the
@@ -6730,7 +7841,7 @@ impl CadApp {
             None => {
                 let colour = if furniture { [0.60, 0.62, 0.70] } else { [0.72, 0.66, 0.52] };
                 self.factory.feature_color.insert(id, colour);
-                self.factory.sel_furniture = None;
+                self.factory.sel_furniture.clear();
                 self.factory.selection = vec![id];
             }
         }
@@ -7486,6 +8597,12 @@ impl CadApp {
                     .response
                     .on_hover_text("Import furniture (.obj/.3ds/.fbx), place it, or extrude/sweep a drawn shape into furniture");
 
+                    ui.menu_button("▼ FBC scene import", |ui| {
+                        self.factory_scene_import_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("Import a whole scene exported from Blender (.glb / .gltf / .fbx) at its real-world size, with its materials and textures");
+
                     ui.menu_button("▼ Textures", |ui| {
                         self.factory_textures_menu(ui);
                     })
@@ -7797,7 +8914,7 @@ impl CadApp {
                         self.snapshot_factory();
                         self.factory.move_selection(delta);
                         // Furniture is not in the CSG model; a feature move needs a re-eval.
-                        if self.factory.sel_furniture.is_none() {
+                        if self.factory.sel_furniture.is_empty() {
                             self.factory.recompute();
                         }
                         self.factory.status = format!(
@@ -8095,10 +9212,14 @@ impl CadApp {
                             // SELECTED furniture's body, treat it as a free (ground-plane)
                             // move — dragging the object itself should move it, not marquee.
                             let mut h = self.factory.pick_gizmo(pos, rect, &mvp);
+                            // Dragging from ANY member of the selection moves the whole set —
+                            // grabbing one chair of a selected row and having only that chair
+                            // follow would silently break the arrangement you just made.
                             if h.is_none()
-                                && self.factory.sel_furniture.is_some()
-                                && self.factory.pick_furniture(pos, rect, &mvp)
-                                    == self.factory.sel_furniture
+                                && self
+                                    .factory
+                                    .pick_furniture(pos, rect, &mvp)
+                                    .is_some_and(|i| self.factory.sel_furniture.contains(&i))
                             {
                                 h = Some(crate::factory::GizmoHandle::Free);
                             }
@@ -8137,7 +9258,7 @@ impl CadApp {
                                                 self.factory.move_selection(dir * (along * wpp));
                                                 // Furniture isn't in the CSG model — skip the
                                                 // (expensive) re-eval when moving it.
-                                                if self.factory.sel_furniture.is_none() {
+                                                if self.factory.sel_furniture.is_empty() {
                                                     self.factory.recompute();
                                                 }
                                             }
@@ -8159,7 +9280,7 @@ impl CadApp {
                                                 + glam::Vec3::new(now.x - grab.x, now.y - grab.y, 0.0);
                                             self.factory
                                                 .move_selection(glam::Vec3::new(want.x - cur.x, want.y - cur.y, 0.0));
-                                            if self.factory.sel_furniture.is_none() {
+                                            if self.factory.sel_furniture.is_empty() {
                                                 self.factory.recompute();
                                             }
                                         }
@@ -8195,7 +9316,7 @@ impl CadApp {
                         if resp.dragged_by(egui::PointerButton::Primary) {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 self.factory.rot_update(pos, rect, &mvp);
-                                if self.factory.sel_furniture.is_none() {
+                                if self.factory.sel_furniture.is_empty() {
                                     self.factory.recompute();
                                 }
                             }
@@ -8246,11 +9367,14 @@ impl CadApp {
                                 let band = egui::Rect::from_two_pos(a, b);
                                 if band.width() > 3.0 || band.height() > 3.0 {
                                     let add = ui.input(|i| i.modifiers.shift);
-                                    self.factory.select_in_marquee(band, rect, &mvp, add);
-                                    self.factory_note(format!(
-                                        "3D marquee → {} selected",
-                                        self.factory.selection.len()
-                                    ));
+                                    let (feat, furn) =
+                                        self.factory.select_in_marquee(band, rect, &mvp, add);
+                                    self.factory_note(match (feat, furn) {
+                                        (0, 0) => "3D marquee → nothing inside".into(),
+                                        (n, 0) => format!("3D marquee → {n} solid(s)"),
+                                        (0, n) => format!("3D marquee → {n} furniture"),
+                                        (a, b) => format!("3D marquee → {a} solid(s) + {b} furniture"),
+                                    });
                                 }
                             }
                         }
@@ -8426,7 +9550,7 @@ impl CadApp {
                         )).with_clip_rect(rect);
                         let hover = resp.hover_pos();
                         for ring in &rv.rings {
-                            let hot = self.factory.rot_drag.map(|d| d.handle) == Some(ring.handle)
+                            let hot = self.factory.rot_drag.as_ref().map(|d| d.handle) == Some(ring.handle)
                                 || hover.is_some_and(|h| ring.pts.windows(2)
                                     .any(|s| crate::factory::seg_dist(h, s[0], s[1]) <= 8.0));
                             let w = if hot { 3.5 } else { 2.0 };
@@ -8451,6 +9575,17 @@ impl CadApp {
                         )).with_clip_rect(rect);
                         for s in &segs {
                             fg.line_segment(*s, egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 220, 255)));
+                        }
+                        // A highlight that stops halfway round a face reads as a hole in the
+                        // face, so say it was cut short rather than let the picture lie.
+                        if self.factory.face_highlight_truncated() {
+                            fg.text(
+                                rect.left_bottom() + egui::vec2(8.0, -8.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                "outline clipped — selection is very large",
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::from_rgb(80, 220, 255),
+                            );
                         }
                     }
                 }
@@ -8541,17 +9676,18 @@ impl CadApp {
                 // A click that MISSES the selected object falls through to normal selection.
                 // `furn_handled` suppresses the normal selection/paint branches when we consumed it.
                 let mut furn_handled = false;
-                if self.factory.sel_furniture.is_some()
+                // Face painting acts on the PRIMARY: a face belongs to one object.
+                let furn_primary = self.factory.sel_furn_primary();
+                if furn_primary.is_some()
                     && resp.clicked()
                     && !return_after_click
                 {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let fi = self.factory.sel_furniture.unwrap();
+                    if let (Some(pos), Some(fi)) = (resp.interact_pointer_pos(), furn_primary) {
                         let piece = self.factory.furn_paint_mode == crate::factory::FurnPaintMode::Piece;
                         let hit = self.factory.furniture_face_at(fi, pos, rect, &mvp, piece);
                         // Diagnostic: which face/piece the click resolved to (or why it missed).
                         if self.dbg.recording {
-                            let asset_tris = self.factory.sel_furniture
+                            let asset_tris = self.factory.sel_furn_primary()
                                 .and_then(|i| self.factory.furniture.get(i))
                                 .and_then(|inst| self.factory.furniture_lib.get(inst.asset))
                                 .map(|a| a.positions.len() / 3)
@@ -8711,7 +9847,7 @@ impl CadApp {
                         // Helper: select a feature id, honouring shift-add. Picking a grouped
                         // feature selects the WHOLE group so it behaves as one entity.
                         let mut select_feature = |app: &mut Self, id: u32| {
-                            app.factory.sel_furniture = None;
+                            app.factory.sel_furniture.clear();
                             if add {
                                 if !app.factory.selection.contains(&id) { app.factory.selection.push(id); }
                             } else {
@@ -8719,20 +9855,29 @@ impl CadApp {
                             }
                             app.factory.expand_selection_to_groups();
                         };
+                        // Shift-click a piece of furniture to ADD it to the selection (or take it
+                        // back out), the same gesture that already extends a feature selection.
+                        let mut select_furn = |app: &mut Self, i: usize| {
+                            if add {
+                                app.factory.toggle_furniture(i);
+                            } else {
+                                app.factory.select_furniture(i);
+                            }
+                        };
 
                         if let (true, Some((ai, _))) = (ap_wins, ap) {
-                            self.factory.select_furniture(ai);
+                            select_furn(self, ai);
                         } else {
                             match (fur, feat) {
                                 (Some((fi, ft)), Some((id, gt))) => {
                                     // 2 cm tolerance so furniture flush against a wall still wins.
                                     if ft <= gt + 0.02 {
-                                        self.factory.select_furniture(fi);
+                                        select_furn(self, fi);
                                     } else {
                                         select_feature(self, id);
                                     }
                                 }
-                                (Some((fi, _)), None) => self.factory.select_furniture(fi),
+                                (Some((fi, _)), None) => select_furn(self, fi),
                                 (None, Some((id, _))) => select_feature(self, id),
                                 (None, None) => {
                                     // No solid/furniture hit — try a 2D plan shape on the ground,
@@ -8862,10 +10007,19 @@ impl CadApp {
                 // Push the resolved sun light to the (thread-local) shader BEFORE any shaded buffer
                 // is built this frame, so the scene + furniture bake under the current daylight.
                 // Also derive the per-frame sun uniforms + shadow-map matrix passed to render().
-                let (sun_en, sun_dir, sun_col, sky_col, ground_col) = self.factory.sun.resolve();
-                crate::factory::set_sun_light(sun_en, sun_dir, sun_col, sky_col, ground_col);
+                let (sun_en, sun_dir, sun_col, env_render) = self.factory.scene_env();
+                // Cloned out of the borrow so the paint callback (which owns nothing of `self`) can
+                // hand the prefiltered chain to the renderer. Only ~10 MB, and only while an HDRI
+                // is loaded; the version means it is uploaded once, not once a frame.
+                let env_chain = self.factory.env_chain.clone();
+                let env_source = self.factory.env_map.clone(); // Arc — the 4K pixels are not copied
+                let env_version = self.factory.env_version;
+                crate::factory::set_sun_light(sun_en, sun_dir, sun_col, env_render.sh);
                 crate::factory::set_clay(self.factory.clay_mode);
                 let clay = self.factory.clay_mode;
+                // Display transform for this frame (exposure + view transform + sRGB encode). The
+                // 3D Factory renders scene-referred linear light, so it always wants a real one.
+                let color_pipeline = self.factory.color;
                 // Materials Factory selection → pulse-highlight that material's surfaces in the
                 // scene, so the user sees WHERE it is while tuning it. Only while the editor is open.
                 let mf_highlight: Option<(usize, f32)> = if self.materials_open {
@@ -8876,14 +10030,32 @@ impl CadApp {
                 } else {
                     None
                 };
-                let sun_uniform: Option<([f32; 3], [f32; 3], [f32; 3], [f32; 3])> =
-                    if sun_en { Some(([sun_dir.x, sun_dir.y, sun_dir.z], sun_col, sky_col, ground_col)) } else { None };
+                // Only the DIRECT sun travels here now; the ambient half is the sky in `env_render`.
+                let sun_uniform: Option<([f32; 3], [f32; 3])> =
+                    if sun_en { Some(([sun_dir.x, sun_dir.y, sun_dir.z], sun_col)) } else { None };
                 // Shadows only while the sun is meaningfully above the horizon (a near-horizon sun
                 // makes an enormous, useless frustum). Framed to the whole drawn scene.
-                let shadow_mvp: Option<[f32; 16]> = if sun_en && self.factory.sun.shadows && sun_dir.z > 0.05 {
-                    self.factory.render_bounds().map(|(mn, mx)| sun_light_matrix(mn, mx, sun_dir))
+                let shadow_mvp: Vec<[f32; 16]> = if sun_en && self.factory.sun.shadows && sun_dir.z > 0.05 {
+                    match self.factory.render_bounds() {
+                        Some(b) => {
+                            let eye = crate::light3d::cam_eye(
+                                self.factory.cam_yaw, self.factory.cam_pitch,
+                                self.factory.cam_dist, self.factory.cam_target,
+                            );
+                            let c = sun_cascades(
+                                &mvp, eye.into(), b, sun_dir,
+                                self.factory.sun.shadow_cascades as usize,
+                                crate::light3d::SHADOW_MAP_SIZE,
+                            );
+                            // A degenerate camera (an un-invertible matrix mid-resize) leaves the
+                            // cascade fit with nothing to work from. Fall back to the single
+                            // whole-scene map rather than dropping shadows for that frame.
+                            if c.is_empty() { vec![sun_light_matrix(b.0, b.1, sun_dir)] } else { c }
+                        }
+                        None => Vec::new(),
+                    }
                 } else {
-                    None
+                    Vec::new()
                 };
                 let t_build = std::time::Instant::now();
                 let verts = self.factory.opaque_verts();
@@ -9075,7 +10247,14 @@ impl CadApp {
                 if rebuilt { self.factory_scene_ver = self.factory_scene_ver.wrapping_add(1); }
 
                 if self.dbg.recording {
-                    let slow_frame = frame_us >= 16_700;
+                    // ABOVE vsync, not at it. 16.7 ms IS 60 Hz, so a threshold there flags every
+                    // single frame on a vsync-locked display and the warning stops meaning
+                    // anything — which is exactly what it did: whole sessions of ⚠ SLOW describing
+                    // a renderer that was keeping perfect time. A frame only cost something when it
+                    // MISSED a refresh, and a missed refresh lands near 33 ms; 20 ms leaves room
+                    // for ordinary jitter while still catching the first real stumble.
+                    const SLOW_FRAME_US: u64 = 20_000;
+                    let slow_frame = frame_us >= SLOW_FRAME_US;
                     let throttle_ok = self
                         .factory_perf_last_slow
                         .map(|t| now.saturating_duration_since(t).as_millis() >= 300)
@@ -9086,11 +10265,29 @@ impl CadApp {
                         }
                         let n = verts.len();
                         let sz = std::mem::size_of::<crate::light3d::V3>();
-                        let phase = if rebuilt { "buffer-rebuilt" } else { "slow-frame" };
+                        // Any program the driver refused rides along in the phase string. A failed
+                        // shader takes its feature out of the picture silently — the user sees
+                        // "part of the render is wrong" and has no stderr to look at, so the one
+                        // report they DO know how to produce has to carry it.
+                        // …and so does the frame's GEOMETRY: the viewport, the buffers it drew
+                        // into and their sizes. A viewport that disagrees with its framebuffer, or
+                        // an accumulation buffer left at a stale size, both surface as "part of the
+                        // picture is wrong" with nothing to point at from a screenshot.
+                        let (bad, geom) = self
+                            .light3d_renderer
+                            .lock()
+                            .ok()
+                            .map(|r| (r.shader_failures().join(","), r.last_geom().to_string()))
+                            .unwrap_or_default();
+                        let phase = match (rebuilt, bad.is_empty()) {
+                            (_, false) => format!("SHADERS-FAILED[{bad}] {geom}"),
+                            (true, _) => format!("buffer-rebuilt {geom}"),
+                            _ => format!("slow-frame {geom}"),
+                        };
                         crate::dbg_event!(
                             self,
                             crate::dbg_recorder::DbgEvent::FactoryPerf {
-                                phase: phase.to_string(),
+                                phase,
                                 frame_us: if rebuilt { 0 } else { frame_us },
                                 build_us,
                                 scene_tris: n / 3,
@@ -9168,6 +10365,13 @@ impl CadApp {
                     let renderer = self.light3d_renderer.clone();
                     // Copied out of `self` so the `move` paint closure can carry them.
                     let scene_ver = self.factory_scene_ver;
+                    let taa_samples = self.factory.taa_samples;
+                    // Keep asking for frames while the picture is still being refined. Read from
+                    // LAST frame's renderer state — the paint callback runs after this — which is
+                    // harmless: at worst it costs one extra repaint at the end of a convergence.
+                    if renderer.lock().map(|r| r.taa_converging()).unwrap_or(false) {
+                        ctx.request_repaint();
+                    }
                     painter.add(egui::Shape::Callback(egui::PaintCallback {
                         rect,
                         callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
@@ -9201,11 +10405,22 @@ impl CadApp {
                             let tex_feat_transp: Vec<(usize, &[crate::light3d::TexVtx])> =
                                 tex_feat_transp_owned.iter().map(|(ti, m)| (*ti, m.as_slice())).collect();
                             if let Ok(mut r) = renderer.lock() {
+                                // The HDR environment. The version check inside makes this a no-op
+                                // on every frame but the one where the environment actually changed.
+                                r.set_environment(
+                                    gl,
+                                    env_source.as_deref().map(|src| crate::light3d::EnvUpload {
+                                        chain: &env_chain,
+                                        source: src,
+                                        version: env_version,
+                                    }),
+                                );
+                                r.set_taa(gl, taa_samples);
                                 r.render(
                                     gl, &verts, &overlay, &lines, &mvp, Some(scene_ver),
                                     &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
                                     &tex_feat_transp, cam_pos, &tex_reflect_owned, &tex_proc_owned,
-                                    &tex_pbr_owned, sun_uniform, shadow_mvp, clay, mf_highlight, true,
+                                    &tex_pbr_owned, sun_uniform, &shadow_mvp, clay, mf_highlight, color_pipeline, env_render, true,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -9379,10 +10594,21 @@ impl CadApp {
                             let vp = info.viewport_in_pixels();
                             let s = info.screen_size_px;
                             if let Ok(mut r) = renderer.lock() {
+                                // The lux view NEVER accumulates: it shares the renderer with the
+                                // factory, and averaging jittered samples of a false-colour scale
+                                // would blur the reading it exists to report.
+                                r.set_taa(gl, 0);
                                 r.render(
                                     gl, &verts, &[], &[], &mvp, None,
                                     &[], &[], &[], &[], &[], &[], &[], [0.0, 0.0, 0.0], &[], &[],
-                                    &[], None, None, false, None, false,
+                                    &[], None, &[], false, None,
+                                    // The lux heatmap's vertex colours ARE the false-colour scale —
+                                    // re-grading them would misreport illuminance, so: no transform.
+                                    crate::color::ColorPipeline::passthrough(),
+                                    // …and no environment either: the SIMLUX view is a measurement,
+                                    // not a picture. Sky light or occlusion would change what it says.
+                                    crate::env::EnvRender::none(),
+                                    false,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -18915,6 +20141,14 @@ impl CadApp {
     /// Radiance/Blender render.
     fn render_sun_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.sun_modal_open;
+        // The environment's own controls are edited as LOCALS and written back after the window
+        // closes. Inside, `self.factory.sun` is held as `&mut`, and a closure captures all of
+        // `self` with it — so touching another factory field in there would not borrow-check.
+        let mut env_strength = self.factory.env_strength;
+        let mut env_rot = self.factory.env_rot_deg;
+        let env_name = self.factory.env_map.as_ref().map(|m| m.name.clone());
+        let env_size = self.factory.env_map.as_ref().map(|m| (m.w, m.h));
+        let mut want_env: Option<bool> = None; // Some(true) = pick a file, Some(false) = clear
         egui::Window::new("☀  Sun / daylight")
             .id(egui::Id::new("factory_sun_modal"))
             .collapsible(true)
@@ -18927,9 +20161,260 @@ impl CadApp {
                 ui.add_enabled_ui(s.enabled, |ui| {
                     ui.checkbox(&mut s.shadows, "Cast shadows")
                         .on_hover_text("Render a shadow-map pass from the sun so the building and furniture throw shadows. Turn off if shadows look wrong on a scene.");
+                    ui.add_enabled_ui(s.shadows, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add_sized([110.0, 18.0], egui::Label::new("Detail steps").selectable(false));
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut s.shadow_cascades,
+                                    1..=crate::light3d::MAX_CASCADES as u32,
+                                )
+                                .show_value(true),
+                            )
+                            .on_hover_text(
+                                "How many shadow maps to split the view across. One map over a \
+                                 whole site spends nearly all of itself on ground nobody is \
+                                 looking at, so a window mullion's shadow comes out as mush; \
+                                 splitting gives the near ground its own tight map. Each step \
+                                 costs one more pass over the scene — drop to 1 on a slow machine \
+                                 or a small model.",
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_sized([110.0, 18.0], egui::Label::new("Sun disc").selectable(false));
+                            ui.add(
+                                egui::Slider::new(&mut s.sun_angle_deg, 0.0..=8.0)
+                                    .suffix("°")
+                                    .show_value(true),
+                            )
+                            .on_hover_text(
+                                "How WIDE the sun is in the sky — 0.53° is the real thing. This is \
+                                 what makes a shadow crisp under a table leg and soft under a roof \
+                                 eave, because the penumbra widens with the distance the shadow \
+                                 travels. Raise it to stand in for haze or overcast. Integrated \
+                                 over the still-frame refinement, so it needs 'Refine still frame' \
+                                 above 1 to show at all; 0 gives the razor edge of a point source.",
+                            );
+                        });
+                    });
                 });
+                // ── Atmosphere ─────────────────────────────────────────────────────────────────
+                // Distance in a render reads almost entirely from how much contrast the air takes
+                // out of things. Without it a wall 200 m off is as saturated as one at 2 m, and
+                // the whole scene reads as a model on a table rather than as a place.
+                let f = &mut self.factory.sun.fog;
+                ui.checkbox(&mut f.enabled, "Atmospheric haze")
+                    .on_hover_text("Fade distant geometry into the air. Height-based, so haze pools low and thins with altitude — the way it actually behaves over a site.");
+                ui.add_enabled_ui(f.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Density").selectable(false));
+                        ui.add(
+                            egui::Slider::new(&mut f.density, 0.0..=0.02)
+                                .logarithmic(true)
+                                .custom_formatter(|v, _| {
+                                    // Metres to half extinction reads far better than "per metre".
+                                    if v <= 1e-6 { "off".into() } else { format!("{:.0} m", 0.693 / v) }
+                                })
+                                .show_value(true),
+                        )
+                        .on_hover_text("Shown as the distance at which HALF the light is gone. Small numbers = thick air.");
+                        let mut c = [
+                            f.color[0].powf(1.0 / 2.2),
+                            f.color[1].powf(1.0 / 2.2),
+                            f.color[2].powf(1.0 / 2.2),
+                        ];
+                        if ui.color_edit_button_rgb(&mut c).on_hover_text(
+                            "What distance fades TOWARDS — the light the air itself scatters at you. \
+                             Match it to the sky or the horizon; too dark and the haze reads as smoke.",
+                        ).changed() {
+                            f.color = [c[0].powf(2.2), c[1].powf(2.2), c[2].powf(2.2)];
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Thins above").selectable(false));
+                        ui.add(egui::DragValue::new(&mut f.base_z).speed(0.5).suffix(" m"))
+                            .on_hover_text("The height the density above is measured at — usually ground level.");
+                        ui.add(
+                            egui::Slider::new(&mut f.falloff, 0.0..=0.2)
+                                .custom_formatter(|v, _| {
+                                    if v <= 1e-6 { "never".into() } else { format!("½ per {:.0} m", 0.693 / v) }
+                                })
+                                .show_value(true),
+                        )
+                        .on_hover_text("How fast the air thins with height. 'never' is uniform fog at every altitude — which is what makes most fog look like a filter rather than weather.");
+                    });
+                });
+                ui.separator();
                 ui.checkbox(&mut self.factory.clay_mode, "Clay mode (flat grey — light study)")
                     .on_hover_text("Override every material to a neutral grey (glass stays transparent) so you can read light, shadow and bounce without colour — the villa build's 'light-meter'. Toggle off for full colour.");
+                ui.separator();
+
+                // ── Colour management ──────────────────────────────────────────────────────────
+                // The viewport renders scene-referred LINEAR light; this is how it becomes pixels.
+                // Same three controls Blender puts in Render Properties → Color Management, and the
+                // path tracers read them too, so ⏺ Render matches what the viewport shows.
+                ui.label(egui::RichText::new("Colour management").small().weak());
+                let c = &mut self.factory.color;
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new("View transform").selectable(false));
+                    egui::ComboBox::from_id_salt("view_transform").width(180.0).selected_text(c.view.label()).show_ui(ui, |ui| {
+                        for v in crate::color::ViewTransform::ALL {
+                            ui.selectable_value(&mut c.view, v, v.label());
+                        }
+                    });
+                })
+                .response
+                .on_hover_text(
+                    "How bright light is mapped to the screen. AgX (Blender's default) rolls highlights off through a \
+                     desaturating film curve instead of clipping them to flat white. Standard clips at 1.0. Raw shows the \
+                     raw linear buffer — diagnostic only.",
+                );
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new("Exposure").selectable(false));
+                    ui.add(egui::DragValue::new(&mut c.exposure).speed(0.05).range(-8.0..=8.0).suffix(" EV"))
+                        .on_hover_text("Stops. +1 EV is exactly twice the light — the photographic control, not a brightness fudge.");
+                    ui.add_sized([44.0, 18.0], egui::Label::new("Look").selectable(false));
+                    ui.add(egui::DragValue::new(&mut c.look).speed(0.02).range(-1.0..=1.0))
+                        .on_hover_text("Extra saturation applied inside the view transform. 0 = neutral.");
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new("Bloom").selectable(false));
+                    ui.add(egui::Slider::new(&mut c.bloom, 0.0..=0.5).show_value(true))
+                        .on_hover_text(
+                            "Light spilling around anything brighter than the threshold — what makes a \
+                             luminaire read as a source instead of a pale rectangle. Added to \
+                             scene-referred light BEFORE the view transform, so it glows rather than \
+                             washing out. 0 turns it off entirely.",
+                        );
+                    ui.add_sized([44.0, 18.0], egui::Label::new("above").selectable(false));
+                    ui.add(egui::DragValue::new(&mut c.bloom_threshold).speed(0.05).range(0.05..=8.0))
+                        .on_hover_text(
+                            "Where the spill starts, in scene-referred light. 1.0 is about 'brighter \
+                             than a white surface in full light', so only real sources and specular \
+                             highlights bloom. Lower it to make more of the scene glow.",
+                        );
+                });
+                if ui.small_button("Reset colour").clicked() {
+                    *c = crate::color::ColorPipeline::default();
+                }
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new("Refine still frame").selectable(false));
+                    ui.add(egui::Slider::new(&mut self.factory.taa_samples, 0..=64).show_value(true))
+                        .on_hover_text(
+                            "Samples averaged while nothing is moving. Each is the same frame drawn \
+                             with a sub-pixel camera shift, so edges resolve past what one raster \
+                             sample can reach. Costs that many frames after every change — and \
+                             nothing once settled, because the finished image is simply re-shown \
+                             instead of the scene being redrawn. 0 or 1 turns it off.",
+                        );
+                });
+                ui.separator();
+
+                // ── Environment ────────────────────────────────────────────────────────────────
+                // Where the light that ISN'T the sun comes from. The sky is an analytic Preetham
+                // dome (see `crate::env`): it is drawn behind the model, integrated into the
+                // ambient every surface receives, and reflected by anything glossy — one model,
+                // three jobs, so the backdrop and the lighting can never disagree.
+                let s = &mut self.factory.sun;
+                ui.label(egui::RichText::new("Environment").small().weak());
+                ui.add_enabled_ui(s.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Turbidity").selectable(false));
+                        ui.add(egui::Slider::new(&mut s.turbidity, 1.8..=10.0).show_value(true))
+                            .on_hover_text(
+                                "How much haze is in the air. ~2 is crisp alpine light with a deep blue zenith and a hard \
+                                 sun; ~6 is a hazy summer city, whiter and softer; 10 is fog. It changes the sky's colour \
+                                 AND its gradient, so it changes the ambient on every surface, not just the backdrop.",
+                            );
+                    });
+                    ui.checkbox(&mut s.sky_backdrop, "Draw the sky behind the model")
+                        .on_hover_text("Show the sky itself instead of the flat studio backdrop — so what lights the scene is what you can see.");
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Reflections").selectable(false));
+                        ui.add(egui::Slider::new(&mut s.reflections, 0.0..=1.0).show_value(true))
+                            .on_hover_text("How strongly glossy surfaces mirror the sky. This is what gives a metal something to be a metal about.");
+                    });
+                });
+                // ── HDR ENVIRONMENT ───────────────────────────────────────────────────────
+                // A photograph of a real place, doing the lighting. It replaces the analytic sky's
+                // ambient and backdrop; the SUN above stays, because an image cannot cast a shadow
+                // (it is pixels, not a direction) and a daylight study still needs one.
+                ui.separator();
+                ui.label(egui::RichText::new("Environment (HDRI)").small().weak());
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("🖼  Load HDRI…")
+                        .on_hover_text(
+                            "An .hdr or .exr environment — Poly Haven and friends. It lights every \
+                             surface and gives glossy ones something real to reflect.",
+                        )
+                        .clicked()
+                    {
+                        want_env = Some(true);
+                    }
+                    match (&env_name, env_size) {
+                        (Some(n), Some((w, h))) => {
+                            ui.label(egui::RichText::new(format!("{n}  ({w}×{h})")).small());
+                            if ui.small_button("✕").on_hover_text("back to the analytic sky").clicked() {
+                                want_env = Some(false);
+                            }
+                        }
+                        _ => {
+                            ui.label(egui::RichText::new("none — analytic sky").small().weak());
+                        }
+                    }
+                });
+                if env_name.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Strength").selectable(false));
+                        ui.add(egui::Slider::new(&mut env_strength, 0.0..=4.0).show_value(true))
+                            .on_hover_text("Multiplies the environment's light. 1.0 is as photographed.");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new("Rotation").selectable(false));
+                        ui.add(egui::Slider::new(&mut env_rot, -180.0..=180.0).suffix("°").show_value(true))
+                            .on_hover_text("Turn the world around the model — aim the sky's bright side where you want it.");
+                    });
+                }
+                ui.checkbox(&mut s.ao.enabled, "Ambient occlusion (contact shading)")
+                    .on_hover_text(
+                        "Darken the ambient light where geometry blocks the sky — under furniture, in corners, along a \
+                         wall-to-floor junction. It scales ONLY the ambient term, so a crease in direct sunlight is not \
+                         greyed out. Without it, sky lighting reads flatter, not rounder.",
+                    );
+                ui.add_enabled_ui(s.ao.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut s.ao.radius).speed(0.02).range(0.05..=3.0).prefix("radius ").suffix(" m"))
+                            .on_hover_text("How far a crease reaches, in metres. 0.5 m suits rooms and furniture; raise it for large exteriors.");
+                        ui.add(egui::DragValue::new(&mut s.ao.strength).speed(0.02).range(0.0..=2.0).prefix("strength "))
+                            .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
+                    });
+                });
+                ui.checkbox(&mut s.gi.enabled, "Bounced light (colour bleed)")
+                    .on_hover_text(
+                        "One bounce of coloured light between surfaces — a red rug tinting the sofa \
+                         above it, a white wall throwing daylight onto the ceiling. Without it the \
+                         only indirect light is the sky, which is the same in every direction and \
+                         knows nothing about the room, so objects read as composited in rather \
+                         than standing in the space.\n\n\
+                         OFF by default because it can only gather from surfaces the camera can \
+                         already see: pan a bounce source off screen and its contribution fades. \
+                         That is a fair trade for a viewport and a poor one for a measurement — \
+                         ⏺ Render computes the real thing.",
+                    );
+                ui.add_enabled_ui(s.gi.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut s.gi.radius).speed(0.05).range(0.1..=8.0).prefix("radius ").suffix(" m"))
+                            .on_hover_text("How far a bounce reaches. 1.5 m suits rooms; raise it for large interiors.");
+                        ui.add(egui::DragValue::new(&mut s.gi.strength).speed(0.02).range(0.0..=2.0).prefix("strength "))
+                            .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
+                    });
+                    ui.label(
+                        egui::RichText::new("Noisy until the still-frame refinement settles.")
+                            .small()
+                            .weak(),
+                    );
+                });
                 ui.separator();
 
                 ui.label(egui::RichText::new("Location").small().weak());
@@ -19038,6 +20523,28 @@ impl CadApp {
                     ui.label(egui::RichText::new(&self.factory.status).small().color(crate::theme::color::ACCENT));
                 }
             });
+        // Write the environment locals back, and act on a load/clear.
+        if (env_strength - self.factory.env_strength).abs() > 1e-6
+            || (env_rot - self.factory.env_rot_deg).abs() > 1e-6
+        {
+            self.factory.env_strength = env_strength;
+            self.factory.env_rot_deg = env_rot;
+            self.factory.dirty = true;
+        }
+        match want_env {
+            Some(true) => {
+                let dir = std::path::Path::new(r"G:\blender dev\hdri");
+                if dir.is_dir() {
+                    self.file_dialog_dir = Some(dir.to_path_buf());
+                }
+                self.open_file_dialog(FileDialogMode::ImportHdri, ".hdr");
+            }
+            Some(false) => {
+                let msg = self.factory.set_env_map(None);
+                self.factory.status = msg;
+            }
+            None => {}
+        }
         self.sun_modal_open = open;
     }
 
@@ -19148,10 +20655,10 @@ impl CadApp {
                     }
                 }
                 // What will Apply hit right now?
-                let furn_name = self.factory.sel_furniture.and_then(|fi| {
+                let furn_name = self.factory.sel_furn_primary().and_then(|fi| {
                     self.factory.furniture.get(fi).and_then(|f| self.factory.furniture_lib.get(f.asset)).map(|a| a.name.clone())
                 });
-                let face_ready = match (&self.factory.furn_face_sel, self.factory.sel_furniture) {
+                let face_ready = match (&self.factory.furn_face_sel, self.factory.sel_furn_primary()) {
                     (Some((sfi, _)), Some(fi)) => *sfi == fi,
                     _ => false,
                 };
@@ -19467,12 +20974,15 @@ impl CadApp {
     /// The inspector (right panel): edit the selected node's parameters with full widgets.
     fn mf_inspector(&mut self, ui: &mut egui::Ui) {
         use crate::material_graph::NodeKind;
-        ui.strong("Node properties");
-        ui.separator();
         let Some(i) = self.materials.sel else {
+            ui.strong("Node properties");
+            ui.separator();
             ui.label(egui::RichText::new("No material selected.").weak());
             return;
         };
+        self.mf_material_ball(ui, i);
+        ui.strong("Node properties");
+        ui.separator();
         // No node picked → default to the Principled BSDF, so the properties area always shows the
         // material's main parameters (colour, metallic, roughness, Alpha/opacity, emission…).
         let nid = match self.materials.sel_node {
@@ -19533,6 +21043,40 @@ impl CadApp {
                                     ui.selectable_value(&mut t.rough_map, Some(k), tex_names[k].clone());
                                 }
                             });
+                        }
+                        // CLEARCOAT + SHEEN. Written straight onto the material asset, like the
+                        // roughness map above: they are surface properties rather than shading
+                        // graph values, and neither has an input worth wiring.
+                        if let Some(t) = self.factory.textures.get_mut(i) {
+                            ui.separator();
+                            ui.add(egui::Slider::new(&mut t.clearcoat, 0.0..=1.0).text("Clearcoat"))
+                                .on_hover_text(
+                                    "A thin varnish over the material, with its own smooth \
+                                     reflection. It reflects about the surface's real shape rather \
+                                     than its bump, so a lacquered board still shows its grain but \
+                                     mirrors a window as one clean shape — which is the difference \
+                                     between oiled and lacquered timber, and is not something \
+                                     roughness alone can say.",
+                                );
+                            if t.clearcoat > 0.0 {
+                                ui.add(egui::Slider::new(&mut t.clearcoat_rough, 0.01..=1.0).text("Coat rough"))
+                                    .on_hover_text("How polished the varnish itself is. Low = a hard glint; high = a satin sheen.");
+                            }
+                            ui.add(egui::Slider::new(&mut t.sheen, 0.0..=1.0).text("Sheen"))
+                                .on_hover_text(
+                                    "The pale rim fabric gets where you look along it, from light \
+                                     scattering through the fuzz standing off its surface. Without \
+                                     it velvet, felt and heavy curtains all render as matte plastic.",
+                                );
+                            if t.sheen > 0.0 {
+                                ui.horizontal(|ui| {
+                                    ui.label("Sheen tint");
+                                    ui.color_edit_button_rgb(&mut t.sheen_tint).on_hover_text(
+                                        "The colour of the fuzz — usually near-white even on a dark \
+                                         cloth, which is most of why black velvet reads as velvet.",
+                                    );
+                                });
+                            }
                         }
                         ui.label(egui::RichText::new("A wired input overrides its socket value. Alpha = surface opacity.").small().weak());
                     }
@@ -19614,6 +21158,163 @@ impl CadApp {
         }
     }
 
+    /// The **material ball** at the top of the inspector: a sphere of the selected material under a
+    /// fixed studio sky.
+    ///
+    /// A flat swatch cannot show what a material now is. Roughness, metallic, IOR, the grain's own
+    /// relief and what the sky puts back into a glossy surface are only legible on a curved surface
+    /// with an environment behind it — which is why every tool with materials shows a sphere.
+    /// Rendered on the CPU by [`crate::matball`] using the SAME BRDF and sky as the viewport, so if
+    /// the two ever disagree, something in between is wrong.
+    fn mf_material_ball(&mut self, ui: &mut egui::Ui, i: usize) {
+        let Some(t) = self.factory.textures.get(i) else { return };
+        // Signature of everything the render depends on. Materials are written from a dozen places
+        // (the node graph compiles onto them every frame), so a dirty flag would not survive.
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            i.hash(&mut h);
+            for f in [t.roughness, t.metallic, t.ior, t.opacity, t.emission_strength] {
+                f.to_bits().hash(&mut h);
+            }
+            for c in t.avg.iter().chain(t.emission.iter()) {
+                c.to_bits().hash(&mut h);
+            }
+            if let Some(p) = &t.proc {
+                (p.pattern as u8).hash(&mut h);
+                for f in p.col_a.iter().chain(p.col_b.iter()).chain(p.scale.iter()).chain(p.ramp.iter()).chain(p.surf_rough.iter()) {
+                    f.to_bits().hash(&mut h);
+                }
+                for f in [p.detail, p.rough, p.contrast, p.bump] {
+                    f.to_bits().hash(&mut h);
+                }
+            }
+            h.finish()
+        };
+        if self.materials.ball.as_ref().map(|(s, _)| *s) != Some(sig) {
+            const N: usize = 128;
+            let (sky, sh, sun) = crate::matball::preview_sky();
+            let prev = crate::matball::Preview::from_texture(t);
+            let rgba = crate::matball::render(&prev, &sky, &sh, sun, self.factory.color, N);
+            let img = egui::ColorImage::from_rgba_unmultiplied([N, N], &rgba);
+            let handle = ui.ctx().load_texture(format!("matball_{i}"), img, egui::TextureOptions::LINEAR);
+            self.materials.ball = Some((sig, handle));
+        }
+        if let Some((_, h)) = &self.materials.ball {
+            let side = ui.available_width().min(150.0);
+            ui.vertical_centered(|ui| {
+                ui.image((h.id(), egui::vec2(side, side)));
+            });
+        }
+        if ui
+            .button("📂  Load PBR texture set…")
+            .on_hover_text(
+                "Point at a folder of maps from ambientCG / Poly Haven / Quixel and they are sorted by filename: \
+                 base colour, normal (GL or DirectX), roughness or glossiness, metallic, occlusion. A single pasted \
+                 image can only ever be albedo, which is why an imported brick used to read as wallpaper.",
+            )
+            .clicked()
+        {
+            self.mf_pick_texture_set(i);
+        }
+        ui.separator();
+    }
+
+    /// Import a folder of PBR maps as one material — the workflow every free texture library is
+    /// built around (see [`crate::texture_set`]). Base colour becomes the material; the normal,
+    /// roughness, metallic and occlusion maps are added as hidden textures and bound to it.
+    fn mf_pick_texture_set(&mut self, i: usize) {
+        self.texset_target = Some(i);
+        self.open_file_dialog(FileDialogMode::PickFolder, "");
+    }
+
+    /// Apply a chosen folder to material `i` — the second half of [`Self::mf_pick_texture_set`],
+    /// run when the folder dialog closes.
+    fn mf_load_texture_set(&mut self, i: usize, dir: std::path::PathBuf) {
+        let maps = match crate::texture_set::load_folder(&dir) {
+            Ok(m) => m,
+            Err(e) => {
+                self.factory.status = format!("Texture set: {e}");
+                return;
+            }
+        };
+        use crate::texture_set::MapKind;
+        let set_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("Texture set").to_string();
+        let mut bound: Vec<&'static str> = Vec::new();
+        for m in maps {
+            let idx = {
+                let mut a = crate::factory::TextureAsset::new(format!("{set_name} · {}", m.kind.label()), m.w, m.h, m.rgba);
+                // A world-space default: these sets are photographs of real surfaces at a real
+                // size, and the geometry they land on here usually has no UVs at all.
+                a.triplanar = true;
+                a.tiles_per_m = 1.0;
+                self.factory.textures.push(a);
+                self.factory.textures.len() - 1
+            };
+            match m.kind {
+                MapKind::BaseColor => {
+                    // The base colour REPLACES the selected material's pixels, so the material the
+                    // user already assigned to surfaces keeps its identity and its assignments.
+                    let (w, h, rgba, avg) = {
+                        let s = &self.factory.textures[idx];
+                        (s.w, s.h, s.rgba.clone(), s.avg)
+                    };
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.w = w;
+                        t.h = h;
+                        t.rgba = rgba;
+                        t.avg = avg;
+                        t.proc = None; // a real bitmap now drives the colour
+                        t.triplanar = true;
+                        t.tiles_per_m = 1.0;
+                        *t.png_cache.borrow_mut() = None;
+                    }
+                    self.factory.textures.pop(); // the staging copy is no longer needed
+                    bound.push("base colour");
+                }
+                MapKind::Normal => {
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.normal_map = Some(idx);
+                    }
+                    bound.push("normal");
+                }
+                MapKind::Roughness => {
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.rough_map = Some(idx);
+                    }
+                    bound.push("roughness");
+                }
+                MapKind::Metallic => {
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.metal_map = Some(idx);
+                        t.metallic = 1.0; // the map SCALES this, so it must not start at zero
+                    }
+                    bound.push("metallic");
+                }
+                MapKind::AmbientOcclusion => {
+                    if let Some(t) = self.factory.textures.get_mut(i) {
+                        t.ao_map = Some(idx);
+                    }
+                    bound.push("occlusion");
+                }
+                // Height and opacity are recognised so they are not mistaken for something else,
+                // but nothing consumes them yet; drop the staged texture rather than leak it.
+                _ => {
+                    self.factory.textures.pop();
+                }
+            }
+        }
+        if let Some(t) = self.factory.textures.get_mut(i) {
+            t.name = set_name.clone();
+        }
+        self.materials.graphs.remove(&i); // re-seed the node graph from the new material
+        self.factory.status = if bound.is_empty() {
+            format!("Texture set '{set_name}': nothing usable found")
+        } else {
+            format!("Texture set '{set_name}' → {}", bound.join(", "))
+        };
+    }
+
     /// Procedural-pattern editor (pattern / ramp colours / grain / contrast / detail) — shared by
     /// the Procedural node arm and the inline Base-Color source section.
     fn mf_edit_procedural(ui: &mut egui::Ui, def: &mut crate::factory::ProcDef) {
@@ -19638,13 +21339,44 @@ impl CadApp {
         });
         ui.add(egui::Slider::new(&mut def.contrast, 0.2..=4.0).text("Contrast"));
         ui.add(egui::Slider::new(&mut def.detail, 1.0..=8.0).text("Detail"));
+        // ── the pattern's own SURFACE, not just its colour ──
+        // A real material changes its finish wherever it changes its colour: oak's dark grain is
+        // duller and lower than the pale wood beside it, mortar is rougher than the tile. Reading
+        // both off one field is what stops a procedural reading as a picture printed on plastic.
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Surface").small().weak());
+        ui.horizontal(|ui| {
+            ui.label("Rough A→B");
+            ui.add(egui::DragValue::new(&mut def.surf_rough[0]).speed(0.01).range(0.02..=1.0));
+            ui.add(egui::DragValue::new(&mut def.surf_rough[1]).speed(0.01).range(0.02..=1.0));
+            if ui.small_button("=").on_hover_text("Uniform finish — use the material's own Roughness instead").clicked() {
+                def.surf_rough = [0.5, 0.5];
+            }
+        })
+        .response
+        .on_hover_text(
+            "Roughness at the two ends of the pattern. Set them EQUAL and the material's own Roughness takes over; \
+             set them apart and the finish follows the grain.",
+        );
+        ui.add(egui::Slider::new(&mut def.bump, 0.0..=1.5).text("Relief"))
+            .on_hover_text("Treat the pattern as a height field and tilt the shading normal by its slope, so the grain catches light instead of only tinting it.");
     }
 
     /// Image placement editor (tiling / move / rotate) — direct material properties (not
     /// graph-compiled), shared by the ImageTex node arm and the inline source section.
     fn mf_edit_placement(ui: &mut egui::Ui, t: &mut crate::factory::TextureAsset) {
+        // WORLD-SPACE mapping. Architecture here is CSG extruded from a 2D plan and carries no
+        // meaningful UVs at all, so "one image per face" is the only thing UV mapping can do with
+        // it — which is why an imported brick texture used to read as wallpaper. Projecting in
+        // world space at a real tiles-per-metre gives the texture a physical SIZE instead.
+        ui.checkbox(&mut t.triplanar, "World-space (triplanar)")
+            .on_hover_text("Project the image on the three world axes and blend by the surface normal, at a fixed size in metres — instead of using the mesh's UVs. The right choice for walls, floors and anything built from a plan.");
+        if t.triplanar {
+            ui.add(egui::DragValue::new(&mut t.tiles_per_m).speed(0.02).range(0.02..=64.0).prefix("tiles/m "))
+                .on_hover_text("How many times the image repeats per metre. 2.0 = a 0.5 m tile, on any surface it lands on.");
+        }
         ui.add(egui::DragValue::new(&mut t.scale).speed(0.05).range(0.05..=200.0).prefix("tiling "))
-            .on_hover_text("Tiles per metre (features) / repeats across the piece (furniture)");
+            .on_hover_text("UV tiling: tiles per metre (features) / repeats across the piece (furniture). Ignored in world-space mode.");
         ui.horizontal(|ui| {
             ui.label("move");
             ui.add(egui::DragValue::new(&mut t.offset[0]).speed(0.01).prefix("u "));
@@ -19737,6 +21469,13 @@ impl CadApp {
                 ui.horizontal(|ui| {
                     ui.add(egui::Slider::new(&mut self.pt_passes, 8..=512).text("samples").logarithmic(true))
                         .on_hover_text("Samples per pixel. The image refines progressively — more samples = less noise. You can Save at any point.");
+                    if ui.checkbox(&mut self.pt_denoise, "denoise").on_hover_text(
+                        "Edge-aware à-trous filter, guided by the first hit's albedo, normal and depth — so it removes \
+                         noise from the LIGHT without smearing texture or rounding off silhouettes. It backs off \
+                         automatically as the render converges. CPU renders only.",
+                    ).changed() {
+                        self.pt_last_pass = u32::MAX; // force the preview to rebuild
+                    }
                 });
                 ui.horizontal(|ui| {
                     if !running {
@@ -19777,7 +21516,7 @@ impl CadApp {
                 } else if let Some(j) = &self.pt_job {
                     let pass = j.passes_done();
                     if pass != self.pt_last_pass {
-                        fresh = j.snapshot_rgba();
+                        fresh = j.snapshot_rgba_opt(self.pt_denoise);
                         self.pt_last_pass = pass;
                     }
                     if !j.is_done() {
@@ -19827,16 +21566,25 @@ impl CadApp {
             self.factory.status = "Render: nothing in the scene".into();
             return;
         }
-        let scene = crate::pathtrace::Scene::build(&tris);
         let (eye, target) = self.factory.export_camera();
         // The resolved sun (world frame) rotated into the export frame like the geometry.
-        let (_en, dir, sun_col, sky_col, ground_col) = self.factory.sun.resolve();
+        let (_en, dir, sun_col, env_render) = self.factory.scene_env();
         let off = -self.factory.sun.north_offset_deg.to_radians();
         let (c, s) = (off.cos(), off.sin());
         let sun_dir = glam::Vec3::new(dir.x * c - dir.y * s, dir.x * s + dir.y * c, dir.z);
-        let sky = crate::pathtrace::Sky { sun_dir, sun_col, sky_col, ground_col };
+        // The scene carries the material table AND the north rotation, so procedurals are evaluated
+        // in the model's own world space — the frame the viewport shades them in.
+        let (tex_pool, tex_of) = self.factory.export_texture_table();
+        let scene = crate::pathtrace::Scene::build_full(
+            &tris, &self.factory.export_proc_table(), off, tex_pool, &tex_of,
+        );
+        // The offline render is lit by whatever the viewport is lit by — the SAME `EnvMap`, shared
+        // by Arc rather than copied, so ⏺ Render is a preview of the scene and not of a different
+        // sky that happens to resemble it.
+        let sky = crate::pathtrace::Sky::from_env(sun_dir, sun_col, &env_render)
+            .with_env(self.factory.env_map.clone());
         let (w, h) = [(640, 480), (960, 720), (1280, 960), (1600, 1200)][self.pt_res.min(3) as usize];
-        let settings = crate::pathtrace::Settings { w, h, passes: self.pt_passes, max_depth: 6 };
+        let settings = crate::pathtrace::Settings { w, h, passes: self.pt_passes, max_depth: 6, color: self.factory.color };
         let cam = crate::pathtrace::Camera { eye: glam::Vec3::from(eye), target: glam::Vec3::from(target), fov_deg: 45.0 };
         // Clear whichever backend ran last.
         self.pt_job = None;
@@ -19849,7 +21597,7 @@ impl CadApp {
         self.pt_preview = None;
         match (self.pt_device, self.pt_gl.clone()) {
             (crate::pathtrace::Device::Gpu, Some(gl)) => {
-                match crate::pathtrace_gpu::GpuTracer::new(&gl, &scene.pack_gpu(), cam, sky, settings) {
+                match crate::pathtrace_gpu::GpuTracer::new(&gl, &scene.pack_gpu(), cam, sky.clone(), settings) {
                     Ok(t) => self.pt_gpu = Some(t),
                     Err(e) => {
                         // Driver said no — run on the CPU instead and say so.
@@ -19871,7 +21619,7 @@ impl CadApp {
             .pt_gpu
             .as_ref()
             .and_then(|g| g.last_rgba.clone())
-            .or_else(|| self.pt_job.as_ref().and_then(|j| j.snapshot_rgba()));
+            .or_else(|| self.pt_job.as_ref().and_then(|j| j.snapshot_rgba_opt(self.pt_denoise)));
         let Some((w, h, rgba)) = shot else { return };
         let dir = self
             .current_file
@@ -20178,6 +21926,16 @@ impl CadApp {
                 ui.add(egui::DragValue::new(v).speed(speed).range(min..=max).suffix(" m"));
             });
         }
+        /// The same row, with the one sentence that says what the number is measured FROM. Ranges
+        /// alone don't stop someone entering a backset from the wrong edge.
+        fn num_tip(ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f32, min: f32, max: f32, tip: &str) {
+            ui.horizontal(|ui| {
+                ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false))
+                    .on_hover_text(tip);
+                ui.add(egui::DragValue::new(v).speed(speed).range(min..=max).suffix(" m"))
+                    .on_hover_text(tip);
+            });
+        }
         fn feedback(ui: &mut egui::Ui, text: String) {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(text).small().color(crate::theme::color::ACCENT));
@@ -20413,15 +22171,86 @@ impl CadApp {
                 num(ui, "Wall thickness (depth)", &mut d.frame_depth, 0.005, 0.05, 0.6);
                 num(ui, "Lining reveal (face)", &mut d.frame_face_width, 0.002, 0.005, 0.1);
                 num(ui, "Stop / rebate depth", &mut d.frame_stop_depth, 0.002, 0.005, 0.05);
-                ui.label(egui::RichText::new("Casing / hardware").small().weak());
-                num(ui, "Architrave width", &mut d.arch_width, 0.005, 0.02, 0.2);
-                num(ui, "Handle height", &mut d.handle_height, 0.01, 0.6, 1.4);
+                ui.label(egui::RichText::new("Architrave (casing)").small().weak());
+                // Legs and head are separate boards. A deeper head over equal legs is a deliberate
+                // joinery choice, so it gets its own number rather than following the legs.
+                num(ui, "Side width", &mut d.arch_width, 0.005, 0.02, 0.30);
+                num(ui, "Head height", &mut d.arch_head_width, 0.005, 0.02, 0.40);
+                num(ui, "Projection", &mut d.arch_thickness, 0.001, 0.004, 0.06);
+                if ui
+                    .small_button("= match head to sides")
+                    .on_hover_text("the measured 'Door classic' has both at 81 mm")
+                    .clicked()
+                {
+                    d.arch_head_width = d.arch_width;
+                }
+                ui.label(egui::RichText::new("Hardware").small().weak());
+                // The two numbers that decide where the lever actually lands, at the ranges asked
+                // for. Backset is measured from the leaf's LEADING edge (the one away from the
+                // hinges) — that is where a lock's backset is measured from on site.
+                num_tip(
+                    ui, "Handle backset", &mut d.handle_backset, 0.002, 0.050, 0.150,
+                    "50–150 mm. Spindle centre in from the leaf's LEADING edge — the one away from\n\
+                     the hinges, and the edge a lock's backset is measured from on site.",
+                );
+                num_tip(
+                    ui, "Handle height", &mut d.handle_height, 0.005, 0.750, 1.300,
+                    "750–1300 mm above the FINISHED FLOOR, which is how handle heights are\n\
+                     specified and set out. The leaf's own bottom sits ~2 mm above that.",
+                );
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Hinge side").selectable(false));
                     ui.selectable_value(&mut d.hinge_side, 1.0, "Right");
                     ui.selectable_value(&mut d.hinge_side, -1.0, "Left");
                 });
                 let inp = self.arch_door;
+                // ── MATERIALS, per component ────────────────────────────────────────────────
+                // A door is not one material: the glazed door is timber everywhere except one
+                // panel, which is the case this exists for. Ironmongery is absent on purpose —
+                // it follows the handle FINISH below, and offering it twice in two vocabularies
+                // would only let the two disagree.
+                ui.label(egui::RichText::new("Materials").small().weak());
+                for slot in crate::door_mat::Slot::ALL {
+                    let mut cur = self.door_mats.get(slot);
+                    ui.horizontal(|ui| {
+                        ui.add_sized([150.0, 18.0], egui::Label::new(slot.label()).selectable(false));
+                        egui::ComboBox::from_id_salt(("door_mat", slot.label()))
+                            .selected_text(cur.label())
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for m in crate::door_mat::DoorMaterial::ALL {
+                                    ui.selectable_value(&mut cur, m, m.label());
+                                }
+                            });
+                    });
+                    self.door_mats.set(slot, cur);
+                }
+                if self.door_mats.has_glass() {
+                    ui.label(
+                        egui::RichText::new(
+                            "  glazed — the panel keeps its raised field, so it reads as thick glass",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                ui.separator();
+                // HANDLE — a row in Casing / hardware that opens the picker dialog. The dialog
+                // itself is drawn at the top level (see `handle_dialog_window`) so it floats over
+                // the panel rather than reflowing it.
+                self.handle_lib_ensure();
+                let cur = self
+                    .handle_lib
+                    .as_ref()
+                    .and_then(|l| l.get(&self.handle_sel))
+                    .map(|h| h.name.clone())
+                    .unwrap_or_else(|| "none".into());
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Handle").selectable(false));
+                    if ui.button(format!("🔧  {cur}")).on_hover_text("choose a handle").clicked() {
+                        self.handle_dialog = true;
+                    }
+                });
                 ui.separator();
                 match cad_solid::door::plan(&inp) {
                     Ok((m, warns)) => {
@@ -20436,9 +22265,19 @@ impl CadApp {
                         for w in warns.iter().skip(1).take(2) {
                             ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
                         }
-                        if ui.add(egui::Button::new(egui::RichText::new("✚  Build door").strong())).clicked() {
-                            do_door = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::Button::new(egui::RichText::new("✚  Build door").strong())).clicked() {
+                                do_door = true;
+                            }
+                            // Look at it before it is in the model — see `door_preview_window`.
+                            if ui
+                                .button("👁  Preview")
+                                .on_hover_text("see the door, with its handle, before inserting it")
+                                .clicked()
+                            {
+                                self.door_preview.open = true;
+                            }
+                        });
                     }
                     Err(e) => error(ui, e.to_string()),
                 }
@@ -21279,7 +23118,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21385,7 +23224,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21415,23 +23254,20 @@ impl CadApp {
     /// Build the parametric door from the dialog and drop it at the model centre as a furniture
     /// piece (no wall cut) — the "insert by parameters" path. Each component is a selectable piece.
     fn factory_build_door(&mut self, inp: &cad_solid::door::DoorInput) {
-        let (m, mesh) = match cad_solid::door::build(inp) {
+        let (m, obj, part_ids, handle_note) = match self.door_mesh(inp) {
             Ok(v) => v,
             Err(e) => {
                 self.factory.status = format!("Door: {e}");
                 return;
             }
         };
-        let part_ids = mesh.face_ids.clone();
-        let obj = crate::mesh_io::ObjMesh {
-            positions: mesh.positions,
-            normals: mesh.normals,
-            color: Some([0.62, 0.50, 0.38]),
-            alpha: Vec::new(),
-        };
         self.factory_place_furniture_mesh(obj, "Door", "built", part_ids);
+        if let Some(fi) = self.factory.sel_furn_primary() {
+            self.door_bind_materials(fi);
+        }
+        let glazed = if self.door_mats.has_glass() { " · glazed" } else { "" };
         self.factory.status = format!(
-            "Door built — structural opening {:.0} × {:.0} mm (leave this hole in the wall)",
+            "Door built{handle_note}{glazed} — structural opening {:.0} × {:.0} mm (leave this hole in the wall)",
             m.structural_opening_w * 1000.0, m.structural_opening_h * 1000.0,
         );
     }
@@ -21494,7 +23330,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21579,7 +23415,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21665,7 +23501,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21738,7 +23574,7 @@ impl CadApp {
             }
             map
         });
-        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furniture, fg_tex) {
+        if let (Some(fi), Some(fg_tex)) = (self.factory.sel_furn_primary(), fg_tex) {
             if let Some(inst) = self.factory.furniture.get_mut(fi) {
                 inst.surface_texture = fg_tex;
             }
@@ -21838,7 +23674,7 @@ impl CadApp {
             self.factory.status = "Spiral stair produced no solids".into();
             return;
         }
-        self.factory.sel_furniture = None;
+        self.factory.sel_furniture.clear();
         self.factory.selection = ids.clone();
         self.factory.recompute();
         self.factory.open = true;
@@ -21914,7 +23750,7 @@ impl CadApp {
             self.factory.status = "Dog-leg stair produced no solids".into();
             return;
         }
-        self.factory.sel_furniture = None;
+        self.factory.sel_furniture.clear();
         self.factory.selection = ids.clone();
         self.factory.recompute();
         self.factory.open = true;
@@ -22746,6 +24582,10 @@ impl CadApp {
                         | FileDialogMode::ImportTexture =>
                             ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
                                 .iter().any(|x| lname.ends_with(&format!(".{x}"))),
+                        // HDR environments. `.hdr` is Radiance RGBE, `.exr` OpenEXR - the two
+                        // formats HDRI libraries actually ship.
+                        FileDialogMode::ImportHdri =>
+                            ["hdr", "exr"].iter().any(|x| lname.ends_with(&format!(".{x}"))),
                         FileDialogMode::ImportObj =>
                             lname.ends_with(".obj") || lname.ends_with(".3ds")
                             || lname.ends_with(".fbx") || lname.ends_with(".glb")
@@ -22771,6 +24611,7 @@ impl CadApp {
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
             FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX / glTF",
             FileDialogMode::ImportTexture => "Load texture  ·  PNG / JPG image",
+            FileDialogMode::ImportHdri => "Load environment  ·  HDR / EXR",
             FileDialogMode::Save => "Save As",
             FileDialogMode::PickFolder => "Choose output folder  ·  Radiance render",
         };
@@ -22857,6 +24698,7 @@ impl CadApp {
                                     FileDialogMode::Open => "Type  ",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
                                     | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Type  ",
+                                    FileDialogMode::ImportHdri => "Type  ",
                                     FileDialogMode::Save => "Format",
                                     FileDialogMode::PickFolder => unreachable!(),
                                 });
@@ -22879,6 +24721,7 @@ impl CadApp {
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
                                     | FileDialogMode::ImportTexture => "pick an image above",
                                     FileDialogMode::ImportObj => "pick an .obj, .3ds, .fbx, .glb or .gltf above",
+                                    FileDialogMode::ImportHdri => "pick an .hdr or .exr above",
                                     FileDialogMode::Save => "drawing name",
                                     FileDialogMode::PickFolder => "optional — new subfolder to create here",
                                 }));
@@ -22894,7 +24737,8 @@ impl CadApp {
                                 let label = match dlg.mode {
                                     FileDialogMode::Open => "Open",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
-                                    | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Open",
+                                    | FileDialogMode::ImportObj | FileDialogMode::ImportTexture
+                                    | FileDialogMode::ImportHdri => "Open",
                                     FileDialogMode::Save => "Save",
                                     FileDialogMode::PickFolder => "Use this folder",
                                 };
@@ -23037,11 +24881,35 @@ impl CadApp {
                 }
                 FileDialogMode::ImportObj => {
                     let path = dlg.dir.join(name);
-                    self.import_furniture_obj(&path.to_string_lossy());
+                    // The same picker serves ▼ Furniture and ▼ FBC scene import; the flag says
+                    // which asked, and a scene is placed 1:1 at the origin rather than normalised
+                    // to a 1.5 m prop at the cursor.
+                    if std::mem::take(&mut self.scene_import_pending) {
+                        self.import_scene_file(&path.to_string_lossy());
+                    } else {
+                        self.import_furniture_obj(&path.to_string_lossy());
+                    }
                 }
                 FileDialogMode::ImportTexture => {
                     let path = dlg.dir.join(name);
                     self.load_texture_from_file(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportHdri => {
+                    // Loading does the SH projection and the GGX prefilter, once. Both are
+                    // seconds-scale on a 4K map, so the busy overlay is what the user sees.
+                    let path = dlg.dir.join(name);
+                    match crate::env_map::EnvMap::load(&path) {
+                        Ok(m) => {
+                            let msg = self.factory.set_env_map(Some(m));
+                            self.history.push(format!("  {msg}"));
+                            self.factory.status = msg;
+                            self.factory.open = true;
+                        }
+                        Err(e) => {
+                            self.factory.status = format!("environment: {e}");
+                            self.history.push(format!("  ! environment: {e}"));
+                        }
+                    }
                 }
                 FileDialogMode::Save => {
                     // Ensure the chosen extension; if the name already ends
@@ -23058,7 +24926,10 @@ impl CadApp {
                 FileDialogMode::PickFolder => {
                     // The Radiance output folder: the browsed dir, or a new subfolder in it.
                     let dir = if name.is_empty() { dlg.dir.clone() } else { dlg.dir.join(name) };
-                    if self.rad_run_after_pick {
+                    // …or a PBR texture-set folder, if that is what asked for the picker.
+                    if let Some(i) = self.texset_target.take() {
+                        self.mf_load_texture_set(i, dir);
+                    } else if self.rad_run_after_pick {
                         self.run_radiance_in(dir);
                     } else {
                         self.export_radiance_scene_to(&dir);
@@ -23208,10 +25079,11 @@ impl CadApp {
                         t.scale = s; t.offset = o; t.rot_deg = r; t.opacity = op; t.reflect = rf;
                     }
                 }
-                // The restored furniture list may be shorter — drop a now-invalid selection.
-                if self.factory.sel_furniture.map_or(false, |i| i >= self.factory.furniture.len()) {
-                    self.factory.sel_furniture = None;
-                }
+                // The restored furniture list may be shorter — drop any now-invalid index. Kept
+                // per-entry rather than all-or-nothing so an undo that removes one piece does not
+                // also silently deselect the others.
+                let live = self.factory.furniture.len();
+                self.factory.sel_furniture.retain(|&i| i < live);
                 // The restored ids are not the ones that were selected.
                 self.factory.clear_selection();
                 // An in-flight modify would keep operating on features that no longer
@@ -32146,8 +34018,17 @@ impl eframe::App for CadApp {
         // The app's GL context (eframe runs the glow renderer) — the GPU path tracer draws on it.
         self.pt_gl = _frame.gl().cloned();
 
-        // ensure continuous repaint, never frozen
-        ctx.request_repaint();
+        // Wake regularly, but do NOT spin. This used to be an unconditional `request_repaint()`,
+        // which pinned the app at full framerate forever: a 2 M-triangle scene re-rendered 60 times
+        // a second whether or not anything had changed, holding a CPU core and the GPU busy the
+        // whole time the window was open. That is felt as the whole machine being slow, and the
+        // recorder shows it as every frame logged at ~17 ms and flagged SLOW from startup.
+        //
+        // egui repaints immediately on any input by itself, and everything that genuinely animates
+        // — a drag, the path tracer, a hatch build, the progress spinner — already asks for its own
+        // repaint at its own site. So a 5 Hz heartbeat keeps the "never frozen" guarantee while
+        // letting an idle viewport cost nothing.
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
 
@@ -32156,45 +34037,25 @@ impl eframe::App for CadApp {
         // theme. Also fixes square menu corners (menu_rounding = ZERO).
         crate::theme::apply(ctx);
 
-        // ---- Auto-load the VILLA test model on startup (texture + Radiance testing) ------------
+        // ---- Auto-load the VILLA test model on startup — OPT-IN ---------------------------------
+        // The villa is a 134 MB glTF at 2.01 M triangles: measured 715 ms to parse in release and
+        // **6.5 s in debug**, and that is only the parse — the same first frame then builds and
+        // uploads ~240 MB of vertex buffers for it. Doing that before the window has drawn anything
+        // is exactly the "why does the app take so long to open now?" the autoload caused. It is a
+        // RENDERING TEST FIXTURE, not something a user opening the app wants, so it now needs
+        // `SIMLUX_VILLA=1`. ▼ FBC scene import → "🏠 Reload the villa scene" loads it on demand,
+        // with the busy overlay up, which is the honest way to spend six seconds.
+        //
         // One-shot, and only into a FRESH session (empty scene) so opening a project later isn't
-        // polluted. Guarded on the file existing so a moved/absent model just skips silently.
+        // polluted. A moved or absent model just skips silently.
         if !self.villa_autoloaded {
             self.villa_autoloaded = true;
-            const VILLA: &str = r"G:\blender dev\staircase\villa model\build\villa_v1.fbx";
+            let want = std::env::var("SIMLUX_VILLA").map(|v| v != "0").unwrap_or(false);
             let empty = self.factory.furniture.is_empty() && self.factory.model.features.is_empty();
-            if empty && std::path::Path::new(VILLA).exists() {
-                self.import_furniture_obj(VILLA);
-                // The villa FBX is authored in CENTIMETRES (building ~845 units ≈ 8.45 m). Scale the
-                // placed instance to metres so it sits correctly in our world and the sun/shadow +
-                // Radiance export are physically sensible. Heuristic on the asset's extent so a
-                // future metres-scale replacement isn't wrongly shrunk.
-                if let Some(fi) = self.factory.sel_furniture {
-                    let big = self.factory.furniture.get(fi)
-                        .and_then(|f| self.factory.furniture_lib.get(f.asset))
-                        .map(|a| {
-                            let e = [a.local_max[0] - a.local_min[0], a.local_max[1] - a.local_min[1], a.local_max[2] - a.local_min[2]];
-                            e[0].max(e[1]).max(e[2])
-                        })
-                        .unwrap_or(0.0);
-                    if let Some(inst) = self.factory.furniture.get_mut(fi) {
-                        if big > 1000.0 {
-                            inst.scale = 0.01; // cm → m
-                        }
-                        // The user scales this fixture up by hand on every launch, so bake it in:
-                        // `add_furniture_asset` normalises anything longer than 20 m down to a 1.5 m
-                        // asset, which leaves the villa far too small to work on. AUTOLOAD_SCALE is
-                        // that manual step, applied on top of whatever the unit heuristic decided.
-                        const AUTOLOAD_SCALE: f32 = 35.0;
-                        inst.scale *= AUTOLOAD_SCALE;
-                    }
-                }
-                self.factory.open = true;
-                self.factory.fit_all();
-                self.active_view = ActiveView::ThreeD;
-                let s = self.factory.sel_furniture.and_then(|fi| self.factory.furniture.get(fi)).map(|f| f.scale).unwrap_or(1.0);
-                self.factory.status = format!("villa test model auto-loaded (scale ×{s:.3}) — ☀ Sun + Textures ready to test");
-                self.history.push(format!("  auto-loaded villa test model on startup (scale ×{s:.3})"));
+            if want && empty {
+                // Exactly the path ▼ FBC scene import runs, so the autoload and a manual import
+                // cannot drift apart in how they scale or place a scene.
+                self.import_scene_file(VILLA_SCENE);
             }
         }
 
@@ -34366,6 +36227,14 @@ impl eframe::App for CadApp {
         }
         if self.sun_modal_open {
             self.render_sun_dialog(ctx);
+        }
+        self.handle_dialog_window(ctx);
+        // Both are top-level windows so they float over the Architecture panel instead of
+        // reflowing it, and so the preview and the handle picker can be open together — changing
+        // a handle with the preview up is the whole point of having both.
+        if self.door_preview_window(ctx) {
+            let inp = self.arch_door;
+            self.factory_build_door(&inp);
         }
         if self.materials_open {
             self.render_materials_factory(ctx);
@@ -43096,7 +44965,7 @@ mod factory_texture_tests {
         app.factory.add_box();
         app.factory.recompute();
         let id = app.factory.model.features[0].id;
-        app.factory.sel_furniture = None;
+        app.factory.sel_furniture.clear();
         app.factory.selection = vec![id];
         let a = app.factory.add_texture("a".into(), 2, 2, [255u8,0,0,255].repeat(4));
         app.apply_texture_index_to_selection(a, "a", 2, 2);
@@ -44005,6 +45874,127 @@ mod cmd_timing_tests {
         for (raw, us) in &cmds {
             assert!(us.is_some(), "`{raw}` was left unstamped — a nested call stole its slot");
         }
+    }
+}
+
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use glam::{Mat4, Vec3};
+
+    /// A camera looking across a villa-sized site, and the bounds of that site.
+    fn setup() -> ([f32; 16], Vec3, (Vec3, Vec3), Vec3) {
+        let eye = Vec3::new(0.0, -40.0, 12.0);
+        let proj = Mat4::perspective_rh_gl(0.9, 16.0 / 9.0, 0.1, 500.0);
+        let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Z);
+        let bounds = (Vec3::new(-50.0, -50.0, 0.0), Vec3::new(50.0, 50.0, 12.0));
+        (( proj * view).to_cols_array(), eye, bounds, Vec3::new(0.3, 0.4, 0.87).normalize())
+    }
+
+    /// How much WORLD a single shadow texel covers, in metres — the number the whole feature is
+    /// about. Recovered from the matrix rather than from the fit, so it measures what the shader
+    /// will actually sample.
+    fn metres_per_texel(m: &[f32; 16], map_size: i32) -> f32 {
+        let inv = Mat4::from_cols_array(m).inverse();
+        // Two light-space points one NDC unit apart map to half the map's width in world.
+        let a = inv.project_point3(Vec3::new(-1.0, 0.0, 0.0));
+        let b = inv.project_point3(Vec3::new(1.0, 0.0, 0.0));
+        (b - a).length() / map_size as f32
+    }
+
+    /// The near cascade must be sharper than the far one. That is the entire point: one map over
+    /// a whole site spends nearly all of its texels on ground nobody is looking at.
+    #[test]
+    fn the_near_cascade_is_sharper_than_the_far_one() {
+        let (mvp, eye, bounds, sun) = setup();
+        let c = sun_cascades(&mvp, eye, bounds, sun, 3, crate::light3d::SHADOW_MAP_SIZE);
+        assert_eq!(c.len(), 3, "three cascades were asked for");
+        let m: Vec<f32> = c.iter().map(|x| metres_per_texel(x, crate::light3d::SHADOW_MAP_SIZE)).collect();
+        assert!(m[0] < m[1] && m[1] < m[2], "cascades are not ordered tightest-first: {m:?}");
+        // …and the first must be a real improvement on the single whole-scene map it replaces.
+        let one = sun_light_matrix(bounds.0, bounds.1, sun);
+        let whole = metres_per_texel(&one, crate::light3d::SHADOW_MAP_SIZE);
+        assert!(
+            m[0] < whole * 0.35,
+            "the near cascade is {:.1} mm/texel against the single map's {:.1} mm — barely worth the pass",
+            m[0] * 1000.0,
+            whole * 1000.0
+        );
+    }
+
+    /// Asking for ONE cascade must still work, and must cover the scene.
+    ///
+    /// This is the fallback for a slow machine, and a "1" that quietly shadowed nothing would be
+    /// worse than no setting at all.
+    #[test]
+    fn a_single_cascade_still_covers_the_view() {
+        let (mvp, eye, bounds, sun) = setup();
+        let c = sun_cascades(&mvp, eye, bounds, sun, 1, crate::light3d::SHADOW_MAP_SIZE);
+        assert_eq!(c.len(), 1);
+        // A point in the middle of the site must land inside the map.
+        let p = Mat4::from_cols_array(&c[0]) * Vec3::new(0.0, 0.0, 1.0).extend(1.0);
+        let n = p.truncate() / p.w;
+        assert!(
+            n.x.abs() <= 1.0 && n.y.abs() <= 1.0 && n.z.abs() <= 1.0,
+            "the scene centre fell outside its own shadow map at {n:?}"
+        );
+    }
+
+    /// Turning the camera on the spot must not change the cascades' SIZE.
+    ///
+    /// The slices are bounded by spheres for exactly this reason. A box fitted to the slice
+    /// corners changes shape as the camera rotates, so every shadow in the scene would pulse while
+    /// the user orbited — far more distracting than a slightly larger map.
+    #[test]
+    fn orbiting_does_not_resize_the_cascades() {
+        let eye = Vec3::new(0.0, -40.0, 12.0);
+        let bounds = (Vec3::new(-50.0, -50.0, 0.0), Vec3::new(50.0, 50.0, 12.0));
+        let sun = Vec3::new(0.3, 0.4, 0.87).normalize();
+        let proj = Mat4::perspective_rh_gl(0.9, 16.0 / 9.0, 0.1, 500.0);
+        let size = |target: Vec3| {
+            let mvp = (proj * Mat4::look_at_rh(eye, target, Vec3::Z)).to_cols_array();
+            let c = sun_cascades(&mvp, eye, bounds, sun, 3, crate::light3d::SHADOW_MAP_SIZE);
+            metres_per_texel(&c[0], crate::light3d::SHADOW_MAP_SIZE)
+        };
+        let a = size(Vec3::ZERO);
+        let b = size(Vec3::new(30.0, 10.0, 0.0));
+        assert!(
+            (a - b).abs() < a * 0.02,
+            "the near cascade went from {a:.4} to {b:.4} m/texel just by turning the camera"
+        );
+    }
+
+    /// The fit must SNAP to whole texels, or the map slides continuously and every shadow edge in
+    /// the scene crawls as the camera moves — which reads as the renderer being unstable.
+    #[test]
+    fn the_cascades_snap_to_their_own_texel_grid() {
+        let sun = Vec3::new(0.3, 0.4, 0.87).normalize();
+        let map = 2048;
+        let r = 20.0f32;
+        let unit = 2.0 * (r * 1.1) / map as f32; // one texel, in world metres
+        // Where a FIXED world point lands in the map, measured in texels. This is the thing that
+        // must not move: if it slides, the depth stored for that point changes every frame and the
+        // shadow's edge crawls. (Not matrix equality — the light-space round trip is a rotation
+        // and back, so the numbers wobble in the last decimal no matter how well it snaps.)
+        let probe = Vec3::new(5.0, 3.0, 1.0);
+        let texel_x = |m: &[f32; 16]| {
+            let c = Mat4::from_cols_array(m) * probe.extend(1.0);
+            let n = c.truncate() / c.w;
+            n.x * 0.5 * map as f32
+        };
+        let a = sun_cascade_matrix(Vec3::new(5.0, 3.0, 1.0), r, sun, map);
+        let b = sun_cascade_matrix(Vec3::new(5.0 + unit * 0.05, 3.0, 1.0), r, sun, map);
+        assert!(
+            (texel_x(&a) - texel_x(&b)).abs() < 0.05,
+            "a twentieth-of-a-texel nudge slid the map by {:.3} texels",
+            (texel_x(&a) - texel_x(&b)).abs()
+        );
+        // …and a nudge of several whole texels DOES move it, or the snapping is really a freeze.
+        let c = sun_cascade_matrix(Vec3::new(5.0 + unit * 40.0, 3.0, 1.0), r, sun, map);
+        assert!(
+            (texel_x(&a) - texel_x(&c)).abs() > 1.0,
+            "the map never moves at all — the fit is stuck rather than snapped"
+        );
     }
 }
 

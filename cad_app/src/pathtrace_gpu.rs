@@ -28,7 +28,9 @@ const FS: &str = r#"
     #version 330 core
     out vec4 frag;
 
-    uniform sampler2D u_tris;   // 5 texels/tri: [p0|rough][e1|metal][e2|opacity][albedo|0][emission|0]
+    // TRI_TEXELS texels/tri: [p0|rough][e1|metal][e2|opacity][albedo|sheen_tint][emission|sheen]
+    //                        [coat, coat_rough, 0, 0] — see `pathtrace::Scene::pack_gpu`.
+    uniform sampler2D u_tris;
     uniform sampler2D u_nodes;  // 2 texels/node: [mn|right_or_start][mx|count]
     uniform sampler2D u_order;  // 1 texel/entry: [tri_index|0|0|0]
     uniform vec3 u_eye;
@@ -44,6 +46,14 @@ const FS: &str = r#"
     uniform vec3 u_ground_col;
     uniform uint u_pass;
 
+    // The HDR environment, when one is loaded — the same equirectangular map the viewport draws,
+    // read through the same formula (ENV_UV_GLSL comes straight out of `crate::env`).
+    uniform sampler2D u_env;
+    uniform int u_env_on;
+    uniform float u_env_rot;
+    uniform float u_env_strength;
+    ENV_UV_GLSL
+
     // ---- RNG (pcg-ish) ----
     uint g_state;
     float rnd() {
@@ -54,6 +64,13 @@ const FS: &str = r#"
     }
 
     vec4 fetchT(sampler2D t, int i) { return texelFetch(t, ivec2(i & 2047, i >> 11), 0); }
+
+    // The inverse of `pathtrace::pack_rgb8` — three 8-bit channels out of one float.
+    vec3 unpack_rgb8(float p) {
+        float r = floor(p / 65536.0);
+        float g = floor((p - r * 65536.0) / 256.0);
+        return vec3(r, g, p - r * 65536.0 - g * 256.0) / 255.0;
+    }
 
     // ---- ray/tri + ray/box ----
     float rayTri(vec3 ro, vec3 rd, vec3 p0, vec3 e1, vec3 e2) {
@@ -97,7 +114,7 @@ const FS: &str = r#"
                 int start = int(n0.w);
                 for (int k = start; k < start + count; k++) {
                     int ti = int(fetchT(u_order, k).x);
-                    int b = ti * 5;
+                    int b = ti * TRI_TEXELS;
                     float t = rayTri(ro, rd, fetchT(u_tris, b).xyz, fetchT(u_tris, b + 1).xyz, fetchT(u_tris, b + 2).xyz);
                     if (t > 0.0 && t < tmax) { tmax = t; best = ti; }
                 }
@@ -117,7 +134,7 @@ const FS: &str = r#"
             float t;
             int ti = intersect(ro, rd, t);
             if (ti < 0) return tr;
-            int b = ti * 5;
+            int b = ti * TRI_TEXELS;
             float opacity = fetchT(u_tris, b + 2).w;
             if (opacity >= 0.99) return vec3(0.0);
             vec3 alb = fetchT(u_tris, b + 3).xyz;
@@ -139,6 +156,11 @@ const FS: &str = r#"
     }
 
     vec3 skyRadiance(vec3 dir, bool primary) {
+        // An HDR environment answers for the whole sphere, and it answers the SAME whether the ray
+        // is primary or not: its sun is a bright patch of image, not a delta light sampled
+        // separately, so there is nothing here that could be counted twice. Word for word the rule
+        // the CPU tracer follows in `pathtrace::sky_radiance`.
+        if (u_env_on == 1) return texture(u_env, env_uv(dir)).rgb * u_env_strength;
         float up = clamp(0.5 + 0.5 * dir.z, 0.0, 1.0);
         vec3 c = mix(u_ground_col, u_sky_col, up);
         if (primary) {
@@ -156,12 +178,17 @@ const FS: &str = r#"
             float t;
             int ti = intersect(ro, rd, t);
             if (ti < 0) { radiance += through * skyRadiance(rd, primary); break; }
-            int b = ti * 5;
+            int b = ti * TRI_TEXELS;
             vec4 t0 = fetchT(u_tris, b);
             vec4 t1 = fetchT(u_tris, b + 1);
             vec4 t2 = fetchT(u_tris, b + 2);
-            vec3 albedo = fetchT(u_tris, b + 3).xyz;
-            vec3 emission = fetchT(u_tris, b + 4).xyz;
+            vec4 t3 = fetchT(u_tris, b + 3);
+            vec4 t4 = fetchT(u_tris, b + 4);
+            vec4 t5 = fetchT(u_tris, b + 5);
+            vec3 albedo = t3.xyz;
+            vec3 emission = t4.xyz;
+            vec3 sheen_tint = unpack_rgb8(t3.w);
+            float sheen = t4.w, coat = t5.x, coat_rough = max(t5.y, 0.01);
             float rough = t0.w, metal = t1.w, opacity = t2.w;
             vec3 hit = ro + rd * t;
             vec3 n = normalize(cross(t1.xyz, t2.xyz));
@@ -183,11 +210,44 @@ const FS: &str = r#"
                 continue;
             }
 
+            // The coat takes its cut before the material underneath sees anything — the same
+            // attenuation the viewport and the CPU tracer apply, so a lacquered surface gains a
+            // reflection and loses a little of what is under it rather than simply getting brighter.
+            vec3 vdir = -rd;
+            float nov = max(dot(n, vdir), 1e-4);
+            if (coat > 0.0) albedo *= (1.0 - coat * (0.04 + 0.96 * pow(1.0 - nov, 5.0)));
+
             float ndl = dot(n, u_sun_dir);
             if (ndl > 0.0) {
                 vec3 jd = normalize(u_sun_dir + cosineDir(u_sun_dir) * 0.012);
                 vec3 tr = transmission(hit + n * 1e-3, jd);
                 radiance += through * albedo * u_sun_col * ndl * tr;
+                vec3 hv = normalize(u_sun_dir + vdir);
+                float fh = pow(clamp(1.0 - max(dot(vdir, hv), 0.0), 0.0, 1.0), 5.0);
+                // SHEEN: the grazing rim, as an extra lobe on the sun.
+                if (sheen > 0.0) radiance += through * sheen_tint * (sheen * fh * ndl) * u_sun_col * tr;
+                // CLEARCOAT: a tight glint about the geometric normal. Approximated with a power
+                // lobe rather than GGX — this backend's base BSDF is already the simpler model, and
+                // matching its idiom keeps the two halves of the shader consistent with each other.
+                if (coat > 0.0) {
+                    float e = 2.0 / max(coat_rough * coat_rough, 1e-3);
+                    float spec = pow(max(dot(n, hv), 0.0), e) * (e + 2.0) / 8.0;
+                    float fc = (0.04 + 0.96 * fh) * coat;
+                    radiance += through * vec3(spec * fc * ndl) * u_sun_col * tr;
+                }
+            }
+
+            // A coated surface reflects the ROOM as well as the sun, and the room only reaches a
+            // tracer through bounce rays — so the coat gets its own share of them.
+            if (coat > 0.0 && rnd() < coat * 0.5) {
+                vec3 mirror = normalize(reflect(rd, n));
+                rd = normalize(mix(mirror, cosineDir(mirror), coat_rough * coat_rough));
+                if (dot(rd, n) <= 0.0) rd = mirror;
+                // Divided by the probability of having come here, so the estimator stays unbiased.
+                through *= (0.04 + 0.96 * pow(1.0 - nov, 5.0)) * coat / (coat * 0.5);
+                ro = hit + n * 1e-3;
+                primary = false;
+                continue;
             }
 
             if (rnd() < metal) {
@@ -233,6 +293,8 @@ pub struct GpuTracer {
     tris_tex: glow::Texture,
     nodes_tex: glow::Texture,
     order_tex: glow::Texture,
+    /// The HDR environment, when the scene has one. `None` ⇒ the two-colour hemisphere.
+    env_tex: Option<glow::Texture>,
     pub settings: Settings,
     pub scene_tris: usize,
     pub started: std::time::Instant,
@@ -272,6 +334,52 @@ unsafe fn upload_stream(gl: &glow::Context, data: &[f32]) -> Result<glow::Textur
     Ok(tex)
 }
 
+/// The widest equirect the tracer will upload. A downloaded 8K panorama is 8192 × 4096, which is
+/// 400 MB of float in flight before the driver has converted anything — for a background that no
+/// render resolution can resolve. 4K is already more than a 1920-wide render can show across a
+/// 60° field of view. Box-downsampling below this keeps the sun's total energy (see
+/// [`crate::env_map::EnvMap::resized`]), so the shadows do not change when the map is shrunk.
+const ENV_MAX_W: usize = 4096;
+
+/// Upload the environment as one RGB16F equirect, or `None` when there is no map.
+///
+/// A failure here returns `None` rather than aborting the render: the tracer falls back to the
+/// two-colour hemisphere, which is what it did before this existed. Losing the backdrop is a far
+/// better outcome than losing the render.
+unsafe fn upload_env(gl: &glow::Context, map: Option<&crate::env_map::EnvMap>) -> Option<glow::Texture> {
+    let map = map?;
+    let scaled;
+    let src = if map.w > ENV_MAX_W {
+        let h = (map.h * ENV_MAX_W / map.w.max(1)).max(1);
+        scaled = map.resized(ENV_MAX_W, h);
+        &scaled
+    } else {
+        map
+    };
+    let flat: Vec<f32> = src.px.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let bytes = std::slice::from_raw_parts(flat.as_ptr() as *const u8, flat.len() * 4);
+    let tex = gl.create_texture().ok()?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    // RGB16F, not RGB8: this is scene-referred radiance and its sun is thousands of times brighter
+    // than its sky. Eight bits would clip that to white and the render would lose the light.
+    gl.tex_image_2d(
+        glow::TEXTURE_2D, 0, glow::RGB16F as i32, src.w as i32, src.h as i32, 0,
+        glow::RGB, glow::FLOAT, glow::PixelUnpackData::Slice(Some(bytes)),
+    );
+    // REPEAT across longitude (the map is continuous where its left edge meets its right) and
+    // CLAMP down latitude (it is not continuous over the poles) — as the viewport binds it.
+    for (p, v) in [
+        (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+        (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+        (glow::TEXTURE_WRAP_S, glow::REPEAT),
+        (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+    ] {
+        gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+    }
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Some(tex)
+}
+
 impl GpuTracer {
     /// Compile the tracer, upload the scene, create the accumulation FBO.
     pub fn new(gl: &glow::Context, pack: &GpuPack, cam: Camera, sky: Sky, settings: Settings) -> Result<Self, String> {
@@ -279,7 +387,10 @@ impl GpuTracer {
             // Program.
             let program = gl.create_program()?;
             let mut compiled = Vec::new();
-            for (ty, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, FS)] {
+            let fs = FS
+                .replace("ENV_UV_GLSL", crate::env::ENV_UV_GLSL)
+                .replace("TRI_TEXELS", &crate::pathtrace::TRI_TEXELS.to_string());
+            for (ty, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, fs.as_str())] {
                 let sh = gl.create_shader(ty)?;
                 gl.shader_source(sh, src);
                 gl.compile_shader(sh);
@@ -308,6 +419,7 @@ impl GpuTracer {
             let tris_tex = upload_stream(gl, &pack.tris)?;
             let nodes_tex = upload_stream(gl, &pack.nodes)?;
             let order_tex = upload_stream(gl, &pack.order)?;
+            let env_tex = upload_env(gl, sky.env.as_deref());
 
             // Accumulation FBO (RGBA32F).
             let accum = gl.create_texture()?;
@@ -338,6 +450,7 @@ impl GpuTracer {
                 tris_tex,
                 nodes_tex,
                 order_tex,
+                env_tex,
                 settings,
                 scene_tris: pack.tri_count,
                 started: std::time::Instant::now(),
@@ -404,6 +517,21 @@ impl GpuTracer {
             set3("u_sun_col", self.sky.sun_col);
             set3("u_sky_col", self.sky.sky_col);
             set3("u_ground_col", self.sky.ground_col);
+            // The environment on unit 3, and the switch that tells the shader to believe it.
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, self.env_tex);
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_env") {
+                gl.uniform_1_i32(Some(&loc), 3);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_env_on") {
+                gl.uniform_1_i32(Some(&loc), self.env_tex.is_some() as i32);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_env_rot") {
+                gl.uniform_1_f32(Some(&loc), self.sky.env_rot);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_env_strength") {
+                gl.uniform_1_f32(Some(&loc), self.sky.env_strength);
+            }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_half") {
                 gl.uniform_1_f32(Some(&loc), (self.cam.fov_deg.to_radians() * 0.5).tan());
             }
@@ -451,10 +579,13 @@ impl GpuTracer {
             for x in 0..w {
                 let s = (src_row * w + x) * 16;
                 let d = (y * w + x) * 4;
+                let mut lin = [0.0f32; 3];
                 for c in 0..3 {
                     let f = f32::from_ne_bytes([bytes[s + c * 4], bytes[s + c * 4 + 1], bytes[s + c * 4 + 2], bytes[s + c * 4 + 3]]);
-                    out[d + c] = tonemap8(f * inv);
+                    lin[c] = f * inv;
                 }
+                let rgb = tonemap8(self.settings.color, lin);
+                out[d..d + 3].copy_from_slice(&rgb);
                 out[d + 3] = 255;
             }
         }
@@ -472,6 +603,88 @@ impl GpuTracer {
             gl.delete_texture(self.tris_tex);
             gl.delete_texture(self.nodes_tex);
             gl.delete_texture(self.order_tex);
+            if let Some(t) = self.env_tex {
+                gl.delete_texture(t);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tracer must read the environment through the SAME lookup the viewport uses.
+    ///
+    /// There is no GL context in a unit test, so this checks the one thing that actually goes
+    /// wrong: two transcriptions of an equirect lookup drifting apart. It is substituted from
+    /// `crate::env`, not copied — this asserts the substitution really happens, because a
+    /// misspelled token would leave the literal word in the source and fail to compile only on a
+    /// machine with a GPU.
+    #[test]
+    fn the_tracer_and_the_viewport_read_the_environment_the_same_way() {
+        assert!(FS.contains("ENV_UV_GLSL"), "the tracer includes the shared lookup by token");
+        let fs = FS.replace("ENV_UV_GLSL", crate::env::ENV_UV_GLSL);
+        assert!(!fs.contains("ENV_UV_GLSL"), "…and the token is fully substituted");
+        assert!(fs.contains("vec2 env_uv(vec3 d)"), "…leaving a real env_uv behind");
+        assert!(fs.contains("uniform float u_env_rot;"), "…with the rotation it reads in scope");
+        // The viewport's copy has to stay word for word the same as the shared one, or the render
+        // and the view disagree about which way round the world is.
+        let shared = crate::env::ENV_UV_GLSL.trim();
+        assert!(
+            crate::env::SKY_GLSL.contains(shared),
+            "SKY_GLSL's env_uv has drifted from ENV_UV_GLSL"
+        );
+    }
+
+    /// An HDR environment must answer for every ray, primary or not — the same rule the CPU
+    /// tracer follows. Its sun is a bright patch of image, not a delta light sampled separately,
+    /// so branching on `primary` here would darken every indirect bounce for no reason.
+    #[test]
+    fn the_environment_answers_the_same_for_every_ray() {
+        let body = FS.split("vec3 skyRadiance").nth(1).expect("skyRadiance exists");
+        let env_line = body.find("u_env_on == 1").expect("the environment short-circuit");
+        let primary = body.find("if (primary)").expect("the analytic sun disc");
+        assert!(env_line < primary, "the environment must answer before the primary-only branch");
+    }
+
+    /// A huge panorama must be shrunk rather than uploaded whole. An 8K map is 400 MB of float in
+    /// flight for a background no render resolution can resolve.
+    /// The shader's stride and the packer's layout must be ONE number.
+    ///
+    /// They are on opposite sides of a string substitution, so a mismatch does not fail to
+    /// compile — it silently reads each triangle's material out of the next triangle's texels, and
+    /// the render comes back with every surface wearing its neighbour's material.
+    #[test]
+    fn the_shader_strides_by_the_packed_texel_count() {
+        assert!(FS.contains("ti * TRI_TEXELS"), "the shader strides by the shared constant");
+        let fs = FS.replace("TRI_TEXELS", &crate::pathtrace::TRI_TEXELS.to_string());
+        assert!(!fs.contains("TRI_TEXELS"), "…and every occurrence is substituted");
+        // The highest texel the shader reads must exist in the packed stride.
+        let last = (0..16)
+            .filter(|i| fs.contains(&format!("fetchT(u_tris, b + {i})")))
+            .max()
+            .expect("the shader fetches material texels");
+        assert!(
+            last + 1 <= crate::pathtrace::TRI_TEXELS,
+            "the shader reads texel {last} but only {} are packed per triangle",
+            crate::pathtrace::TRI_TEXELS
+        );
+    }
+
+    /// The clearcoat must dim what is under it before adding its own reflection, in every backend.
+    #[test]
+    fn the_gpu_clearcoat_pays_for_itself() {
+        let coat = FS.find("albedo *= (1.0 - coat").expect("the base is attenuated");
+        let glint = FS.find("radiance += through * vec3(spec * fc").expect("the coat's own glint");
+        assert!(coat < glint, "the coat dims itself instead of the base");
+        assert!(FS.contains("unpack_rgb8(t3.w)"), "the sheen tint is unpacked from its float");
+    }
+
+    #[test]
+    fn an_oversized_panorama_is_capped() {
+        assert!(ENV_MAX_W <= 4096, "the upload cap has grown past what a render can show");
+        let big = crate::env_map::EnvMap::from_fn(64, 32, "small", |_| [1.0; 3]);
+        assert!(big.w <= ENV_MAX_W, "a small map is left alone");
     }
 }
