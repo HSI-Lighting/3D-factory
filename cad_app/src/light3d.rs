@@ -1262,12 +1262,22 @@ const SSGI_FS: &str = r#"
             float dist = length(to);
             if (dist < 1e-3 || dist > u_radius) continue;
             to /= dist;
-            float cos_r = dot(N, to);
-            if (cos_r <= 0.0) continue;                        // behind the receiver
-            float cos_e = max(-dot(normal_at(su, Q), to), 0.0);
-            if (cos_e <= 0.0) continue;                        // the far side of a wall
-            gi += radiance_at(su) * (cos_r * cos_e * (1.0 - dist / u_radius));
+            // Both of these are REJECTIONS, not weights.
+            //
+            // The directions above are drawn cosine-weighted (cos = sqrt(1-a)), so the receiver's
+            // cosine and the 1/pi of the diffuse BRDF are already carried by the sampling: the
+            // estimator of outgoing radiance is simply albedo times the MEAN of what those
+            // directions saw. Multiplying by the cosine again applies it twice, which is what made
+            // the whole effect four-odd times too dark to see.
+            if (dot(N, to) <= 0.0) continue;                    // behind the receiver
+            if (-dot(normal_at(su, Q), to) <= 0.0) continue;    // the far side of a wall
+            // A window, not an attenuation: full strength out to most of the radius, then a fade
+            // so a surface does not pop as it crosses the boundary.
+            gi += radiance_at(su) * smoothstep(1.0, 0.65, dist / u_radius);
         }
+        // The mean over ALL directions, including the ones that found nothing — a direction that
+        // escaped saw the sky, and the sky is already lighting this surface through its spherical
+        // harmonics. Counting it here as well would be double-counting.
         frag = vec4(alb * gi * (u_strength / 8.0), 1.0);
     }
 "#;
@@ -4841,7 +4851,10 @@ mod taa_tests {
     #[test]
     fn the_emitter_must_face_the_receiver() {
         assert!(SSGI_FS.contains("normal_at(su, Q)"), "the emitter's normal is reconstructed");
-        assert!(SSGI_FS.contains("if (cos_e <= 0.0) continue;"), "…and a back-facing emitter is dropped");
+        assert!(
+            SSGI_FS.contains("if (-dot(normal_at(su, Q), to) <= 0.0) continue;"),
+            "…and a back-facing emitter is dropped"
+        );
         // The reconstruction must NOT use screen derivatives: the point is fetched from a texture,
         // so its derivative across the quad describes nothing.
         let f = SSGI_FS.find("vec3 normal_at(").expect("the reconstruction");
@@ -4849,6 +4862,34 @@ mod taa_tests {
         assert!(!body.contains("dFdx"), "the emitter normal is taken from a texture-fetched value");
         // The sky is not a bounce card either — it is already lighting the scene through its SH.
         assert!(SSGI_FS.contains(">= 0.99999) continue;"), "the sky is gathered from");
+    }
+
+    /// The receiver's cosine must be applied ONCE.
+    ///
+    /// The gather draws directions cosine-weighted (`cos = sqrt(1 - a)`), so the receiver's cosine
+    /// and the diffuse BRDF's 1/π are already carried by the sampling — the estimator is albedo
+    /// times the plain MEAN of what those directions saw. Multiplying by `dot(N, to)` as well
+    /// applies it twice, and the two together average about a third, which is enough to make the
+    /// whole effect invisible at a strength of 1. It is the kind of mistake that reads as "the
+    /// slider is too weak" rather than as a bug, so it is worth pinning.
+    #[test]
+    fn the_receiver_cosine_is_not_applied_twice() {
+        // Cosine-weighted sampling, which is what carries the cosine.
+        assert!(SSGI_FS.contains("ct = sqrt(1.0 - a)"), "the directions are not cosine-weighted");
+        // The accumulation line must not re-apply it.
+        let acc = SSGI_FS
+            .lines()
+            .find(|l| l.contains("gi +="))
+            .expect("the accumulation");
+        assert!(
+            !acc.contains("cos_r") && !acc.contains("dot(N, to)"),
+            "the receiver cosine is applied a second time when accumulating: {acc}"
+        );
+        // …and the emitter test must be a rejection too, not a weight.
+        assert!(
+            !acc.contains("cos_e") && !acc.contains("normal_at"),
+            "the emitter cosine is used as a weight rather than a rejection: {acc}"
+        );
     }
 
     /// The gather's jitter must vary with the accumulation sample, or the refinement converges to

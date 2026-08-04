@@ -20406,8 +20406,13 @@ impl CadApp {
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut s.gi.radius).speed(0.05).range(0.1..=8.0).prefix("radius ").suffix(" m"))
                             .on_hover_text("How far a bounce reaches. 1.5 m suits rooms; raise it for large interiors.");
-                        ui.add(egui::DragValue::new(&mut s.gi.strength).speed(0.02).range(0.0..=2.0).prefix("strength "))
-                            .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
+                        ui.add(egui::DragValue::new(&mut s.gi.strength).speed(0.05).range(0.0..=4.0).prefix("strength "))
+                            .on_hover_text(
+                                "1.0 is the geometric estimate — one bounce, at the brightness one \
+                                 bounce actually has. Screen-space GI only ever sees part of the \
+                                 room, so pushing past 1 is a reasonable way to stand in for the \
+                                 bounces it cannot reach.",
+                            );
                     });
                     ui.label(
                         egui::RichText::new("Noisy until the still-frame refinement settles.")

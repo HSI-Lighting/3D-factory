@@ -353,7 +353,8 @@ pub struct GiSettings {
     pub enabled: bool,
     /// How far a bounce reaches, in metres.
     pub radius: f32,
-    /// 0..2. 1 is the geometric estimate; above that is artistic licence.
+    /// 0..4. 1 is the geometric estimate — one bounce at the brightness one bounce has. Above that
+    /// stands in for the bounces a screen-space gather cannot reach, which is most of them.
     pub strength: f32,
 }
 
