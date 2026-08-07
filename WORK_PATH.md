@@ -462,6 +462,29 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
   at 3000 units on a mm plan) and `the_plan_projection_round_trips_in_millimetres`
   (`w2s_m`/`s2w_m` are inverses).
 
+## 23. DXF `$INSUNITS` — imported plans now arrive at the right scale (Phase 2)
+
+- **Root cause:** `read_dxf` matched HEADER to `skip_to_endsec` along with everything else it
+  didn't handle, so `$INSUNITS` — the file's own statement of what a drawing unit means — was
+  discarded on **every** import. A millimetre plan arrived indistinguishable from a metre one,
+  which is why you had to know to type `units mm`.
+- **Built:** `read_header` walks the `9 / $VARNAME` + value pairs and sets `doc.units` from
+  `$INSUNITS` via `insunits_to_metres` (in/ft/mm/cm/m/yd/dm). Marked **`Declared`** — the FILE
+  said so, not the user. `$INSUNITS = 0` is *unitless*, an explicit absence of a claim, so it
+  deliberately leaves the unit `Assumed` rather than reading as metres. Exotic codes
+  (angstroms, parsecs, survey feet) are left out on purpose: guessing beats nothing only if the
+  guess is right.
+- **Export is the careful half:** `write_header` now emits `$INSUNITS`, but writes **0
+  (unitless) when `source == Assumed`**. Otherwise autosave would silently stamp "this drawing
+  is metres" onto every .dxf the user has open, converting a default nobody chose into a
+  positive claim other software would then trust.
+- **Nothing is rescaled on import** — the declaration only changes how the 3D side reads the
+  drawing from here on. The open log says so explicitly, because a scale that changes without
+  being asked for is the exact silence this whole problem came from.
+- **Verified:** 931 tests, incl. mm read from the header, `$INSUNITS = 0` staying Assumed, a
+  header-less file still loading unchanged, an assumed unit exporting as unitless, and a
+  declared unit surviving write → read for all five common units.
+
 ## Open / not yet done
 
 - **Transform gizmos — Phase 2 (scale + extrude by drag):** uniform corner handle +
@@ -475,12 +498,7 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
 - **2D furniture blocks in 3D:** the plan's DXF furniture symbols are 2D-only; showing
   them in 3D (extrude footprints, or block→mesh mapping) is a separate feature — not
   started, awaiting a decision on approach.
-- **Units Phases 2–3** (Phase 1 done, see §21 — these are what remain):
-  - **DXF `$INSUNITS` on import.** `cad_io/src/dxf.rs` still skips the HEADER section
-    wholesale, so an mm plan arrives untagged and you must type `units mm` yourself. Honour
-    it only when the Factory is empty, so it can never contradict existing 3D work. On
-    *export*, only assert a unit when `source != Assumed` (else write 0 / unitless) —
-    otherwise a merely-assumed metre drawing gets stamped as a positive claim.
+- **Units Phase 3** (Phases 1–2 done, see §21–23 — this is what remains):
   - **Explicit "rescale the existing 3D model" action** for a project built before its unit
     was declared. Must NOT run at load time (a load must never mutate geometry), and must
     re-derive `surface_key` — the per-face colour/texture keys quantise a WORLD plane offset,

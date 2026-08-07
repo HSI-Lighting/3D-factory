@@ -24432,6 +24432,15 @@ impl CadApp {
         self.unsaved = false; // freshly opened → matches the file on disk
         self.history.push(format!(
             "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l));
+        // Say so when the FILE declared its unit. Nothing was rescaled — the declaration only
+        // changes how the 3D side reads the drawing from here on — but a scale that changed
+        // without the user asking is exactly the kind of silence this whole problem came from.
+        if self.doc.units.source == cad_kernel::UnitSource::Declared {
+            self.history.push(format!(
+                "  units: the file declares 1 drawing unit = {} — 3D builds use it from now on \
+                 (nothing existing was rescaled; `units` to change)",
+                self.doc.units.label()));
+        }
     }
 
     /// Finalize a save completed by [`save_file_worker`] — record the file + log line.

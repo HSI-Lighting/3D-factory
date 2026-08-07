@@ -35,6 +35,11 @@ pub fn read_dxf(text: &str) -> Result<Document, String> {
             let (c2, name) = pairs[i + 1];
             if c2 == 2 {
                 match name {
+                    // HEADER carries $INSUNITS — the file's own statement of what one
+                    // drawing unit means. Skipping it (which this reader did) is why an
+                    // architectural plan in millimetres arrived indistinguishable from one
+                    // in metres, and so came into the 3D side 1000x too large.
+                    "HEADER"   => i = read_header(&pairs, i + 2, &mut doc),
                     "TABLES"   => i = read_tables(&pairs, i + 2, &mut doc),
                     // BLOCKS precedes ENTITIES in the file, so block defs land
                     // in the table before any INSERT in ENTITIES resolves them.
@@ -74,6 +79,53 @@ fn parse_pairs(text: &str) -> Result<Vec<(i32, &str)>, String> {
         out.push((code, value_line.trim()));
     }
     Ok(out)
+}
+
+/// Metres in one drawing unit for an AutoCAD `$INSUNITS` code, or `None` when the file
+/// declares nothing usable.
+///
+/// 0 is "unitless" — an explicit *absence* of a claim, not a unit, so it must NOT be taken as
+/// metres. The exotic codes (angstroms, parsecs, survey feet…) are deliberately left out: a
+/// drawing that really is in parsecs is not a drawing this app can help with, and guessing
+/// would be worse than leaving it `Assumed`.
+fn insunits_to_metres(code: i32) -> Option<f64> {
+    Some(match code {
+        1  => 0.0254,      // inches
+        2  => 0.3048,      // feet
+        4  => 0.001,       // millimetres  ← the architectural default
+        5  => 0.01,        // centimetres
+        6  => 1.0,         // metres
+        10 => 0.9144,      // yards
+        14 => 0.1,         // decimetres
+        _  => return None, // 0 = unitless, and everything exotic
+    })
+}
+
+/// HEADER section: pick out `$INSUNITS` and record it on the document.
+///
+/// Shape is `9 / $VARNAME` followed by the value pair, so this walks to the named variable and
+/// reads whatever pair comes next. Unknown variables are skipped, exactly as before.
+fn read_header(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
+    let mut i = start;
+    while i < pairs.len() {
+        let (code, value) = pairs[i];
+        if code == 0 && value == "ENDSEC" {
+            return i + 1;
+        }
+        if code == 9 && value == "$INSUNITS" && i + 1 < pairs.len() {
+            if let Ok(n) = pairs[i + 1].1.parse::<i32>() {
+                if let Some(k) = insunits_to_metres(n) {
+                    // DECLARED, not User: the FILE said so. The distinction matters because
+                    // an assumed unit must never be written back out as a positive claim.
+                    doc.units = cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::Declared);
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    i
 }
 
 fn skip_to_endsec(pairs: &[(i32, &str)], start: usize) -> usize {
@@ -537,7 +589,7 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DO
 /// correctly in LibreCAD and AutoCAD.
 pub fn write_dxf(doc: &Document) -> String {
     let mut s = String::with_capacity(64 * 1024);
-    write_header(&mut s);
+    write_header(&mut s, doc);
     write_tables(&mut s, doc);
     write_entities(&mut s, doc);
     s.push_str("0\nEOF\n");
@@ -554,11 +606,33 @@ fn pair_i(s: &mut String, code: i32, v: i32) {
     s.push_str(&format!("{}\n{}\n", code, v));
 }
 
-fn write_header(s: &mut String) {
+fn write_header(s: &mut String, doc: &Document) {
     pair(s, 0, "SECTION");
     pair(s, 2, "HEADER");
     pair(s, 9, "$ACADVER"); pair(s, 1, "AC1015");   // AutoCAD 2000 ASCII level
+    // $INSUNITS — but ONLY a unit somebody actually stated. A drawing whose unit was merely
+    // ASSUMED (every file made before units existed) writes 0 = unitless, which is what this
+    // writer effectively emitted before by omitting the variable entirely. Stamping such a
+    // file "6 = metres" would turn a default nobody chose into a positive claim, and autosave
+    // would do it silently to every .dxf the user has open.
+    let code = match doc.units.source {
+        cad_kernel::UnitSource::Assumed => 0,
+        _ => metres_to_insunits(doc.units.metres_per_unit),
+    };
+    pair(s, 9, "$INSUNITS"); pair_i(s, 70, code);
     pair(s, 0, "ENDSEC");
+}
+
+/// Inverse of [`insunits_to_metres`]; 0 (unitless) when the scale is not a standard unit,
+/// since inventing a nearest match would misstate the drawing.
+fn metres_to_insunits(m: f64) -> i32 {
+    const NEAR: f64 = 1e-9;
+    for (code, metres) in [(1, 0.0254), (2, 0.3048), (4, 0.001), (5, 0.01), (6, 1.0), (10, 0.9144), (14, 0.1)] {
+        if (m - metres).abs() < NEAR {
+            return code;
+        }
+    }
+    0
 }
 
 fn write_tables(s: &mut String, doc: &Document) {
@@ -804,6 +878,63 @@ mod tests {
     fn round_trip(doc: &Document) -> Document {
         let text = write_dxf(doc);
         read_dxf(&text).expect("round-trip parse")
+    }
+
+    /// The headline fix: an architectural plan that says it is in millimetres now arrives
+    /// saying so, instead of arriving indistinguishable from a metre drawing.
+    #[test]
+    fn insunits_millimetres_is_read_from_the_header() {
+        let text = "0\nSECTION\n2\nHEADER\n9\n$ACADVER\n1\nAC1015\n9\n$INSUNITS\n70\n4\n0\nENDSEC\n\
+                    0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(text).expect("parse");
+        assert_eq!(doc.units.metres_per_unit, 0.001);
+        assert_eq!(doc.units.source, cad_kernel::UnitSource::Declared);
+    }
+
+    /// `$INSUNITS = 0` is "unitless" — an explicit absence of a claim. Reading it as metres
+    /// would silently promote a non-statement into a statement.
+    #[test]
+    fn insunits_zero_leaves_the_unit_assumed() {
+        let text = "0\nSECTION\n2\nHEADER\n9\n$INSUNITS\n70\n0\n0\nENDSEC\n\
+                    0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(text).expect("parse");
+        assert_eq!(doc.units.source, cad_kernel::UnitSource::Assumed);
+        assert_eq!(doc.units.metres_per_unit, 1.0);
+    }
+
+    /// A file with no HEADER at all (and every file written before units existed) must still
+    /// load, unchanged, as 1 unit = 1 metre / Assumed.
+    #[test]
+    fn a_header_less_file_still_loads_as_assumed() {
+        let text = "0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n";
+        let doc = read_dxf(text).expect("parse");
+        assert_eq!(doc.units.source, cad_kernel::UnitSource::Assumed);
+        assert_eq!(doc.units.metres_per_unit, 1.0);
+    }
+
+    /// Export must not turn a default nobody chose into a positive claim — otherwise autosave
+    /// silently stamps "this drawing is metres" on every .dxf the user has open.
+    #[test]
+    fn an_assumed_unit_is_exported_as_unitless() {
+        let doc = Document::default();
+        assert_eq!(doc.units.source, cad_kernel::UnitSource::Assumed);
+        let text = write_dxf(&doc);
+        assert!(text.contains("$INSUNITS"), "the variable is written");
+        assert_eq!(round_trip(&doc).units.source, cad_kernel::UnitSource::Assumed);
+    }
+
+    /// A unit somebody DID state survives a full write → read cycle.
+    #[test]
+    fn a_declared_unit_survives_export_and_reimport() {
+        for (metres, _name) in [(0.001, "mm"), (0.01, "cm"), (1.0, "m"), (0.0254, "in"), (0.3048, "ft")] {
+            let mut doc = Document::default();
+            doc.units = cad_kernel::DocUnits::new(metres, cad_kernel::UnitSource::User);
+            let back = round_trip(&doc);
+            assert_eq!(back.units.metres_per_unit, metres, "{metres} m/unit round-trips");
+            // It comes back DECLARED (the file said so) rather than User — the app cannot
+            // know a file's unit was originally typed by a person.
+            assert_eq!(back.units.source, cad_kernel::UnitSource::Declared);
+        }
     }
 
     #[test]
