@@ -7012,7 +7012,8 @@ impl FactoryState {
             let active = self.session.as_ref().is_some_and(|s| s.idx == i);
             let c = if active { [1.0, 0.62, 0.12] } else { [0.55, 0.62, 0.72] };
             for d in &sk.doc.dobjects {
-                for poly in cad_solid::geom_outlines(&d.geom) {
+                // By the SKETCH's own unit — `from_uv` lifts (u,v) into world METRES.
+                for poly in cad_solid::geom_outlines_scaled(&d.geom, sk.doc.units.metres_per_unit) {
                     for w in poly.windows(2) {
                         seg(
                             &mut out,
@@ -7043,7 +7044,8 @@ impl FactoryState {
         let Some(sk) = self.model.sketches.get(session.idx) else { return out };
         let c = [1.0, 0.62, 0.12]; // hot — the sketch you are drawing right now
         for d in &doc.dobjects {
-            for poly in cad_solid::geom_outlines(&d.geom) {
+            // By the live sketch document's own unit — `from_uv` lifts into world METRES.
+            for poly in cad_solid::geom_outlines_scaled(&d.geom, doc.units.metres_per_unit) {
                 for w in poly.windows(2) {
                     seg(
                         &mut out,

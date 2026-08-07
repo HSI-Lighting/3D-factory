@@ -3925,8 +3925,10 @@ impl CadApp {
                 let color = crate::light::lux_color((v / maxv) as f32);
                 let x0 = plane.origin.x + col as f32 * dx;
                 let y0 = plane.origin.y + row as f32 * dy;
-                let p0 = self.w2s(Vec2::new(x0 as f64, y0 as f64), rect);
-                let p1 = self.w2s(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
+                // The calc plane is METRES (cad_light's contract; its bounds come from
+                // `extrude::bbox`, which scales by the document's unit).
+                let p0 = self.w2s_m(Vec2::new(x0 as f64, y0 as f64), rect);
+                let p1 = self.w2s_m(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
                 clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0, color);
             }
         }
@@ -3941,7 +3943,8 @@ impl CadApp {
         let gold = egui::Color32::from_rgb(255, 214, 90);
         let dark = egui::Color32::from_rgb(70, 48, 0);
         for l in &self.light.luminaires {
-            let p = self.w2s(Vec2::new(l.position.x as f64, l.position.y as f64), rect);
+            // Luminaire positions are METRES (cad_light `Vertex`).
+            let p = self.w2s_m(Vec2::new(l.position.x as f64, l.position.y as f64), rect);
             clip.circle_filled(p, 5.0, gold);
             clip.circle_stroke(p, 8.0, egui::Stroke::new(1.5, dark));
             clip.line_segment([egui::pos2(p.x - 9.0, p.y), egui::pos2(p.x + 9.0, p.y)], egui::Stroke::new(1.0, gold));
@@ -6582,7 +6585,10 @@ impl CadApp {
             .with_clip_rect(rect);
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 175, 225, 160));
         for d in &self.doc.dobjects {
-            for path in cad_solid::geom_outlines(&d.geom) {
+            // METRES: this projects into the 3D view's world space, so it must be scaled the
+            // same way the build tools scale it — otherwise a millimetre plan draws its
+            // reference kilometres away from the model it is meant to sit under.
+            for path in self.outlines_m(&d.geom) {
                 for w in path.windows(2) {
                     let a = crate::factory::world_to_screen(glam::Vec3::new(w[0].x, w[0].y, 0.0), rect, mvp);
                     let b = crate::factory::world_to_screen(glam::Vec3::new(w[1].x, w[1].y, 0.0), rect, mvp);
@@ -22889,7 +22895,9 @@ impl CadApp {
                     let mut got: Option<(Vec<glam::Vec2>, bool)> = None;
                     for &di in &self.selection {
                         let Some(d) = self.doc.dobjects.get(di) else { continue };
-                        for path in cad_solid::geom_outlines(&d.geom) {
+                        // METRES: this curve becomes a sweep PATH the generator builds in
+                        // world space, so it is a 2D→3D crossing like any other.
+                        for path in cad_solid::geom_outlines_scaled(&d.geom, self.doc.units.metres_per_unit) {
                             if path.len() < 2 {
                                 continue;
                             }
@@ -30267,12 +30275,35 @@ impl CadApp {
         )
     }
 
+    /// Project a WORLD (metre) XY point onto the 2D canvas.
+    ///
+    /// `w2s` maps DRAWING UNITS to screen, but everything the Factory and the lux engine hold
+    /// is metres. Anything painting 3D data onto the plan must come through here, or it draws
+    /// at the wrong scale the moment a drawing declares a unit — on a millimetre plan a
+    /// metre-space overlay lands 1000x too small, clustered near the origin.
+    ///
+    /// Uses the ACTIVE document's unit, matching `w2s`: with a face sketch open the canvas IS
+    /// the sketch (metre-space, k = 1), where this is the identity — which is correct.
+    fn w2s_m(&self, world_m: Vec2, rect: egui::Rect) -> egui::Pos2 {
+        let u = self.doc.units;
+        self.w2s(Vec2::new(u.from_metres(world_m.x), u.from_metres(world_m.y)), rect)
+    }
+
     fn s2w(&self, s: egui::Pos2, rect: egui::Rect) -> Vec2 {
         let c = rect.center();
         Vec2::new(
             ((s.x - c.x) / self.scale - self.world_offset.x) as f64,
             (-(s.y - c.y) / self.scale - self.world_offset.y) as f64,
         )
+    }
+
+    /// Inverse of [`Self::w2s_m`]: a canvas click back to WORLD metres. For click-placement of
+    /// anything the 3D side or the lux engine owns.
+    #[allow(dead_code)]
+    fn s2w_m(&self, s: egui::Pos2, rect: egui::Rect) -> Vec2 {
+        let d = self.s2w(s, rect);
+        let u = self.doc.units;
+        Vec2::new(u.to_metres(d.x), u.to_metres(d.y))
     }
 
     /// Live PLINE prompt — reflects current Line/Arc sub-mode + vertex
@@ -43794,8 +43825,11 @@ impl CadApp {
         let stroke =
             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 175, 225, 150));
         for [a, b] in &self.factory.sketch_ref {
-            let pa = self.w2s(Vec2::new(a.x as f64, a.y as f64), rect);
-            let pb = self.w2s(Vec2::new(b.x as f64, b.y as f64), rect);
+            // The edges come off the SOLID, so they are metres; the canvas is the sketch's own
+            // document. Those coincide today (a sketch is metre-space, k = 1) and `w2s_m` is
+            // the identity there — but going through it keeps the two independent.
+            let pa = self.w2s_m(Vec2::new(a.x as f64, a.y as f64), rect);
+            let pb = self.w2s_m(Vec2::new(b.x as f64, b.y as f64), rect);
             painter.line_segment([pa, pb], stroke);
         }
     }
@@ -43815,12 +43849,16 @@ impl CadApp {
                 continue; // the active sketch is the live canvas — don't double-draw it
             }
             for d in &sk.doc.dobjects {
-                for path in cad_solid::geom_outlines(&d.geom) {
+                // By the SKETCH's own unit (metre-space, so k = 1 today) — `from_uv` below
+                // expects the sketch's (u,v) already in metres.
+                for path in cad_solid::geom_outlines_scaled(&d.geom, sk.doc.units.metres_per_unit) {
                     for w in path.windows(2) {
+                        // `from_uv` lifts to WORLD metres, so the projection back onto the
+                        // plan must divide by the drawing's unit.
                         let a = sk.frame.from_uv(glam::Vec2::new(w[0].x, w[0].y));
                         let b = sk.frame.from_uv(glam::Vec2::new(w[1].x, w[1].y));
-                        let pa = self.w2s(Vec2::new(a.x as f64, a.y as f64), rect);
-                        let pb = self.w2s(Vec2::new(b.x as f64, b.y as f64), rect);
+                        let pa = self.w2s_m(Vec2::new(a.x as f64, a.y as f64), rect);
+                        let pb = self.w2s_m(Vec2::new(b.x as f64, b.y as f64), rect);
                         painter.line_segment([pa, pb], stroke);
                     }
                 }
@@ -43858,9 +43896,11 @@ impl CadApp {
             if hull.len() < 2 {
                 continue;
             }
+            // Furniture is posed in WORLD metres, so the footprint divides by the drawing's
+            // unit on the way onto the plan.
             for i in 0..hull.len() {
-                let a = self.w2s(hull[i], rect);
-                let b = self.w2s(hull[(i + 1) % hull.len()], rect);
+                let a = self.w2s_m(hull[i], rect);
+                let b = self.w2s_m(hull[(i + 1) % hull.len()], rect);
                 clip.line_segment([a, b], stroke);
             }
         }
@@ -44788,6 +44828,45 @@ mod factory_sketch_tests {
             (promoted_m - app.factory.wall_thickness).abs() < 1e-4,
             "drawn wall {promoted_m} m must match the imported-centerline fallback {} m",
             app.factory.wall_thickness,
+        );
+    }
+
+    /// The reverse direction: a WORLD point painted on the plan must land where the drawing
+    /// says it is. Without this, declaring millimetres fixes promotion but makes every 3D
+    /// overlay (factory sketches, furniture outlines, lux, luminaires) paint 1000x too small.
+    #[test]
+    fn world_metres_project_onto_the_plan_at_the_drawings_scale() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+
+        // A metre drawing: 3 m in the world is 3 units on the canvas.
+        let mut app = CadApp::default();
+        let metres = app.w2s_m(Vec2::new(3.0, 0.0), rect);
+        assert_eq!(metres, app.w2s(Vec2::new(3.0, 0.0), rect), "k = 1 is the identity");
+
+        // A millimetre drawing: the same 3 m must land at 3000 drawing units.
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        let mm = app.w2s_m(Vec2::new(3.0, 0.0), rect);
+        assert_eq!(
+            mm,
+            app.w2s(Vec2::new(3000.0, 0.0), rect),
+            "3 m must paint at 3000 units on a millimetre plan",
+        );
+    }
+
+    /// `w2s_m` and `s2w_m` must be inverses, so a click placing 3D content lands where the
+    /// overlay drew it.
+    #[test]
+    fn the_plan_projection_round_trips_in_millimetres() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        let world = Vec2::new(12.5, -4.25);
+        let back = app.s2w_m(app.w2s_m(world, rect), rect);
+        assert!(
+            (back.x - world.x).abs() < 1e-3 && (back.y - world.y).abs() < 1e-3,
+            "expected {world:?} back, got {back:?}",
         );
     }
 

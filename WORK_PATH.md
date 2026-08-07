@@ -440,6 +440,28 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
 - **Verified:** 924 tests across the workspace, incl. `a_millimetre_plan_promotes_to_metres`
   (3000 mm → ~3 m) and `without_a_unit_the_numbers_are_still_taken_as_metres` (zero-delta).
 
+## 22. Units — the reverse direction (3D→2D), completing Phase 1
+
+- **Symptom (would have been):** after §21, declaring `units mm` fixed promotion but broke every
+  overlay that paints 3D data onto the plan — they'd draw 1000× too small, clustered near the
+  origin. Caught before it shipped; the default (no unit) was never affected.
+- **Built:** `w2s_m` / `s2w_m` — the metre-aware pair beside `w2s`/`s2w`. `w2s` maps DRAWING
+  UNITS to screen, but the Factory and lux engine hold METRES, so anything crossing back must
+  divide by the drawing's unit. Applied to all five painters: `paint_lux_overlay`,
+  `paint_luminaires_2d`, `draw_factory_sketch_reference`, `draw_factory_sketches_2d`,
+  `draw_furniture_outlines_2d`.
+- **Two more 2D→3D crossings found while sweeping** (§21 missed them):
+  - `paint_plan_underlay` flattened doc units and projected them into the **3D view's** world
+    space — a mm plan would draw its reference kilometres from the model it sits under.
+  - the sweeplight "grab a 2D curve as the path" branch fed doc units straight into a
+    generator that builds in metres.
+- **Swept clean:** `grep cad_solid::geom_outlines(` over `cad_app/src` now returns nothing —
+  every call site goes through `geom_outlines_scaled` with an explicit unit. Sketch-space sites
+  scale by the SKETCH document's own unit (k = 1 today), so the two spaces stay independent.
+- **Verified:** 926 tests. `world_metres_project_onto_the_plan_at_the_drawings_scale` (3 m paints
+  at 3000 units on a mm plan) and `the_plan_projection_round_trips_in_millimetres`
+  (`w2s_m`/`s2w_m` are inverses).
+
 ## Open / not yet done
 
 - **Transform gizmos — Phase 2 (scale + extrude by drag):** uniform corner handle +
@@ -459,11 +481,6 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
     it only when the Factory is empty, so it can never contradict existing 3D work. On
     *export*, only assert a unit when `source != Assumed` (else write 0 / unitless) —
     otherwise a merely-assumed metre drawing gets stamped as a positive claim.
-  - **The reverse 3D→2D direction is NOT converted.** `draw_factory_sketches_2d`,
-    `draw_furniture_outlines_2d` (§19), the sketch reference, and the lux/luminaire overlays
-    all write metres into the plan canvas. Harmless at k = 1, but the moment a drawing is
-    tagged `units mm` those overlays paint 1000× too small. **Setting a unit currently fixes
-    promotion and breaks the plan overlays** — close this before the feature is advertised.
   - **Explicit "rescale the existing 3D model" action** for a project built before its unit
     was declared. Must NOT run at load time (a load must never mutate geometry), and must
     re-derive `surface_key` — the per-face colour/texture keys quantise a WORLD plane offset,
