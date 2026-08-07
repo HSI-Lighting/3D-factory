@@ -142,6 +142,10 @@ pub struct PbrParams {
     pub triplanar: bool,
     pub tiles_per_m: f32,
     pub roughness: f32,
+    /// This material is a MEDIUM light travels through, not a surface with holes in it — see
+    /// `TextureAsset::transmission`. Only a medium is a volume, and only a volume's back faces may
+    /// be dropped.
+    pub transmission: f32,
     pub metallic: f32,
     /// Dielectric index of refraction — sets the specular F0 (1.5 ⇒ the usual 0.04).
     pub ior: f32,
@@ -164,7 +168,7 @@ pub struct PbrParams {
 
 impl Default for PbrParams {
     fn default() -> Self {
-        Self { normal_idx: None, rough_idx: None, metal_idx: None, ao_idx: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, metallic: 0.0, ior: 1.5, emission: [0.0; 3], clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
+        Self { normal_idx: None, rough_idx: None, metal_idx: None, ao_idx: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, transmission: 0.0, metallic: 0.0, ior: 1.5, emission: [0.0; 3], clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
     }
 }
 
@@ -443,14 +447,20 @@ const SCENE_FS: &str = r#"
         if (!gl_FrontFacing) N = -N;
         bool furniture = v_mode > 1.5;
         vec3 ambient, direct;
-        if (u_sky_on == 1) {
+        // An HDRI lights the scene whether or not the analytic SUN is on — the same decision as in
+        // the textured shader. Gating this on the sun meant a loaded environment lit nothing.
+        bool ibl = (u_sky_on == 1 || u_env_on == 1);
+        if (ibl) {
             // Furniture keeps a slightly higher ambient floor so an imported mesh never reads
             // murky — the 0.05 in `shade_furniture`.
             float extra = furniture ? 0.05 : 0.0;
             ambient = albedo * (sh_ambient(N) + vec3(extra));
-            float lit = max(dot(N, u_sky_sun), 0.0);
-            float sh = (u_shadow_on == 1) ? shadow_lit(v_wpos) : 1.0;
-            direct = albedo * u_sky_sun_col * (lit * sh);
+            direct = vec3(0.0);
+            if (u_sky_on == 1) {
+                float lit = max(dot(N, u_sky_sun), 0.0);
+                float sh = (u_shadow_on == 1) ? shadow_lit(v_wpos) : 1.0;
+                direct = albedo * u_sky_sun_col * (lit * sh);
+            }
         } else {
             // Studio: a constant fill plus a two-sided directional term, exactly as the CPU built
             // it. Furniture uses 0.6 / 0.4 where the scene uses 0.35 / 0.65.
@@ -479,6 +489,23 @@ const TRANSP_VS: &str = r#"
     void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); v_col = a_col; v_a = a_a; }
 "#;
 
+// A copy of the OPAQUE scene, composed the way the composite composes it, taken just before the
+// transparent pass so glass has something to refract. A shader cannot read the buffer it is
+// writing to, so this is the only way a pane can bend what is behind it.
+const SCENE_COPY_FS: &str = r#"
+    #version 330 core
+    in vec2 v_uv;
+    out vec4 frag;
+    uniform sampler2D u_lit;
+    uniform sampler2D u_amb;
+    void main() {
+        // No ambient occlusion here: the AO pass runs after ALL geometry, so it does not exist
+        // yet. What is lost is a slight over-brightening of creases seen THROUGH glass, which is
+        // not worth reordering the frame for.
+        frag = vec4(texture(u_lit, v_uv).rgb + texture(u_amb, v_uv).rgb, 1.0);
+    }
+"#;
+
 const TRANSP_FS: &str = r#"
     #version 330 core
     in vec3 v_col;
@@ -487,9 +514,52 @@ const TRANSP_FS: &str = r#"
     layout(location=1) out vec4 amb_out;
     ALBEDO_OUT_GLSL
     uniform int u_linearize;
+    // REFRACTION. `u_scene` is the opaque scene as it stood before this pass began.
+    uniform sampler2D u_scene;
+    uniform mat4  u_scene_vp;      // the WORLD→clip matrix, not this draw's camera·model
+    uniform mat4  u_scene_inv_vp;
+    uniform vec3  u_refr_cam;
+    uniform vec2  u_refr_vp;       // viewport size in pixels
+    uniform float u_refr_ior;
+    uniform float u_refr_thick;    // how much glass the ray crosses, metres
+    uniform int   u_refr_on;
     SRGB_GLSL
     void main() {
-        frag = vec4(u_linearize == 1 ? srgb_to_lin(v_col) : v_col, v_a);
+        vec3 tint = u_linearize == 1 ? srgb_to_lin(v_col) : v_col;
+        if (u_refr_on == 1) {
+            // The pane's own world position, reconstructed from this fragment's depth. The
+            // transparent pass is drawn with camera·model, so inverting THAT would land in model
+            // space — the scene's own inverse view-projection is passed in separately for exactly
+            // this reason.
+            vec2 uv = gl_FragCoord.xy / u_refr_vp;
+            vec4 h = u_scene_inv_vp * vec4(uv * 2.0 - 1.0, gl_FragCoord.z * 2.0 - 1.0, 1.0);
+            vec3 P = h.xyz / h.w;
+            // The pane's normal from screen-space derivatives of that position. Glass is flat, so
+            // this is exact — and it means no per-vertex normal has to be threaded through a
+            // vertex format that never carried one.
+            vec3 N = normalize(cross(dFdx(P), dFdy(P)));
+            vec3 V = normalize(P - u_refr_cam);
+            if (dot(N, V) > 0.0) N = -N;
+            // Where the ray comes out after crossing `u_refr_thick` of glass, projected back to
+            // the screen. Sampling THERE is what bends the view.
+            vec3 Rf = refract(V, N, 1.0 / max(u_refr_ior, 1.0));
+            vec4 c1 = u_scene_vp * vec4(P + Rf * u_refr_thick, 1.0);
+            vec2 uv1 = (c1.w > 0.0) ? (c1.xy / c1.w * 0.5 + 0.5) : uv;
+            // Total internal reflection returns a zero vector; fall back to the straight view so
+            // the pane goes clear rather than black.
+            if (dot(Rf, Rf) < 1e-6) uv1 = uv;
+            vec3 behind = texture(u_scene, clamp(uv1, vec2(0.001), vec2(0.999))).rgb;
+            // Fresnel: glass seen edge-on reflects rather than transmits, which is most of what
+            // makes a window read as glass at all.
+            float f = 0.04 + 0.96 * pow(1.0 - max(dot(N, -V), 0.0), 5.0);
+            // Written OPAQUE. The refracted background has already been fetched and composed here,
+            // so blending it again would mix in the UNBENT pixel underneath and halve the effect.
+            frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);
+            amb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            alb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        frag = vec4(tint, v_a);
         // Glass contributes no occludable ambient of its own, but it must still blend against the
         // ambient buffer — writing (0,0,0,alpha) attenuates what is behind it by the same factor
         // the colour buffer uses, so a pane does not leave an un-dimmed ghost in the AO term.
@@ -546,6 +616,21 @@ const TEX_FS: &str = r#"
     // WORLD-SPACE (triplanar) mapping and its texel density, for geometry with no useful UVs.
     uniform int   u_triplanar;
     uniform float u_tpm;       // tiles per metre
+    // TRANSMISSION — light that travels THROUGH the material (glTF's KHR_materials_transmission),
+    // which is a different thing from alpha coverage and cannot be expressed by the blender. Needs
+    // a copy of the opaque scene taken before any glass was drawn.
+    uniform int       u_tr_on;
+    uniform sampler2D u_tr_scene;     // unit 6 — 5 is the AO map
+    uniform mat4      u_tr_scene_vp;  // world → clip for the SCENE, to re-project the bent ray
+    uniform vec2      u_tr_vp;        // viewport pixels, for gl_FragCoord → uv
+    uniform float     u_tr_ior;
+    uniform float     u_tr_thick;     // apparent thickness the ray is displaced through
+    // Is this material a MEDIUM (water, solid glass) rather than a surface with holes? Only a
+    // medium is a VOLUME, and only a volume's back faces may be dropped.
+    uniform float     u_transmission;
+    // …and the SCENE reflected in this surface, marched through the same copy. Declared after the
+    // two uniforms above because it reads both.
+    SSR_GLSL
     // Daylight (sun) — when u_sun_on, light this surface by the real sun instead of the baked shade.
     uniform int   u_sun_on;
     uniform vec3  u_sun_dir;   // TO the sun
@@ -678,6 +763,25 @@ const TEX_FS: &str = r#"
         return mix(sky_with_sun(R), sh_ambient(R), clamp(rough * 1.4, 0.0, 1.0));
     }
 
+    // The environment reflection for this surface, with the SCENE substituted wherever the trace
+    // can see it.
+    //
+    // ONE place, because the studio branch needs exactly the same substitution as the daylight one
+    // and a second copy would drift from this the first time either was touched — which is how SSR
+    // shipped working only under a sky and doing nothing at all in studio mode, the very case with
+    // no environment to reflect and therefore the most to gain.
+    vec3 with_ssr(vec3 sky_spec, vec3 Rd, float rgh, vec3 w) {
+        // A single mirror ray is only the right answer for a smooth surface. On a rough one the
+        // reflection is a wide lobe that one ray cannot stand in for, and forcing it paints a
+        // sharp, noisy picture of the room onto a matte wall.
+        if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;
+        vec4 hit = ssr_trace(v_wpos, Rd, u_cam);
+        // A `mix`, never an add: what the trace found REPLACES the sky it would otherwise have
+        // shown along that same ray. Adding would double-count and make the effect pop in and out
+        // wherever the trace lost confidence.
+        return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));
+    }
+
     // The fixed studio key light, when there is no daylight. Kept in one place because the shader
     // has to reproduce the CPU's `0.35 + 0.65·|n·d|` split to know which part of the baked shade is
     // ambient — that share, and only that share, is what ambient occlusion may darken.
@@ -686,6 +790,32 @@ const TEX_FS: &str = r#"
     // Output alpha = the vertex opacity × the image's own alpha channel. Opaque draws run with
     // blending OFF, so this alpha is simply ignored there; only the blended textured pass uses it.
     void main() {
+        // A MEDIUM's surface that lies ON an opaque one is the container, not a thing to look
+        // through.
+        //
+        // Modelled water is a closed box sitting inside a pool liner, so five of its six faces are
+        // exactly coplanar with the tiles. Drawing them put two coincident surfaces into a
+        // per-pixel z-fight — and because the transmission branch below composes an OPAQUE result,
+        // whichever won overwrote the other, so the fight read as triangular wedges crawling over
+        // the water as the camera moved.
+        //
+        // The test is DISTANCE IN FRONT of whatever is already there, deliberately not
+        // `gl_FrontFacing`: facing depends on winding surviving an exporter, an axis conversion and
+        // an instance matrix, and if any of those flips it this discards the surface you can see
+        // instead of the one you cannot. "Is there opaque geometry within 2 cm of this fragment"
+        // depends on nothing but the depth buffer.
+        //
+        // Gated on TRANSMISSION, never on alpha: an alpha-cutout leaf card is see-through too, and
+        // it is a single sheet lying flat on nothing.
+        if (u_transmission > 0.0 && u_tr_on == 1) {
+            vec2 suv = gl_FragCoord.xy / u_tr_vp;
+            float sd = texture(u_ssr_depth, suv).r;
+            // Compared in METRES. The depth buffer is nonlinear, so a fixed epsilon in its own
+            // units is millimetres up close and metres out at the far plane.
+            if (sd < 0.99999 &&
+                distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;
+        }
+
         // Geometric normal from screen-space derivatives (no per-vertex normal needed), faced to
         // the viewer so two-sided surfaces light correctly.
         vec3 Ng = normalize(cross(dFdx(v_wpos), dFdy(v_wpos)));
@@ -766,23 +896,46 @@ const TEX_FS: &str = r#"
         vec3  Lrad;     // its radiance
         float shf;      // shadow factor
         vec3  amb_irr;  // irradiance the ambient term is built from (already occluded by any AO map)
-        if (u_sun_on == 1) {
-            // Real daylight. `u_sun_col` is calibrated as irradiance/π (which is why the specular
-            // carries the π back), and the ambient is now the sky's own irradiance projected onto
-            // spherical harmonics — a north wall and a south wall genuinely differ, which the old
-            // two-colour `mix(ground, sky, n.z)` fill could not express.
+        // The SPECULAR share of `direct`, accumulated alongside it. Transmission needs the two
+        // apart: light that passed through the material never scattered off it, so the diffuse
+        // must fall away as transmission rises — but a reflection of the sky is still a reflection
+        // of the sky, and dimming it in step with transmission is what makes rendered glass look
+        // like tinted plastic.
+        vec3  spec = vec3(0.0);
+        // Is there an ENVIRONMENT to be lit by — an analytic sky, a loaded HDRI, or both?
+        //
+        // Deliberately NOT the same question as "is the sun switched on". An HDR environment is a
+        // light source in its own right, and gating its irradiance on the analytic sun meant that
+        // loading a sky lit nothing: the backdrop showed a real place while every surface kept the
+        // fixed studio lamp. The two are independent, and the shader has to treat them so.
+        bool ibl = (u_sky_on == 1 || u_env_on == 1);
+        if (ibl) {
+            // `u_sun_col` is calibrated as irradiance/π (which is why the specular carries the π
+            // back), and the ambient is the environment's own irradiance projected onto spherical
+            // harmonics — a north wall and a south wall genuinely differ, which the old two-colour
+            // `mix(ground, sky, n.z)` fill could not express.
             float sh = (u_shadow_on == 1) ? shadow_lit(v_wpos) : 1.0;
-            float NoL = max(dot(N, u_sun_dir), 0.0);
             ambient = diff * sh_ambient(N) * ao_map;
-            direct = diff * (u_sun_col * NoL * sh);
-            vec3 H = normalize(u_sun_dir + V);
-            vec3 F = f_schlick(f0, max(dot(V, H), 0.0));
-            direct += F * (d_ggx(max(dot(N, H), 0.0), a) * v_smith(NoV, NoL, a) * NoL * sh * PI) * u_sun_col;
+            direct = vec3(0.0);
+            Ldir = normalize(STUDIO_DIR); Lrad = vec3(0.0); shf = sh;
+            // The DIRECT sun is a separate question from where the ambient came from. With an
+            // HDRI and no analytic sun there is simply no directional term — the environment lights
+            // the scene on its own, which is what image-based lighting is for.
+            if (u_sun_on == 1) {
+                float NoL = max(dot(N, u_sun_dir), 0.0);
+                direct = diff * (u_sun_col * NoL * sh);
+                vec3 H = normalize(u_sun_dir + V);
+                vec3 F = f_schlick(f0, max(dot(V, H), 0.0));
+                vec3 sun_spec = F * (d_ggx(max(dot(N, H), 0.0), a) * v_smith(NoV, NoL, a) * NoL * sh * PI) * u_sun_col;
+                direct += sun_spec; spec += sun_spec;
+                Ldir = u_sun_dir; Lrad = u_sun_col;
+            }
             // Environment specular — the sky itself, reflected. This is what gives a metal
             // something to be a metal ABOUT; before it there was nothing to mirror and a chrome
             // surface rendered as grey plastic no matter what the material said.
-            direct += env_sample(R, rough) * env_w;
-            Ldir = u_sun_dir; Lrad = u_sun_col; shf = sh;
+            // …and where the SCENE is in the way of that sky, reflect the scene instead.
+            vec3 env_spec = with_ssr(env_sample(R, rough) * env_w, R, rough, env_w);
+            direct += env_spec; spec += env_spec;
             amb_irr = sh_ambient(N) * ao_map;
         } else {
             // Studio mode (no daylight): the baked scalar stands in for irradiance. Split it the
@@ -792,7 +945,10 @@ const TEX_FS: &str = r#"
             float ambf = 0.35 / (0.35 + 0.65 * k);
             ambient = diff * v_shade * ambf * ao_map;
             direct = diff * v_shade * (1.0 - ambf);
-            direct += vec3(v_shade) * env_w;
+            // Studio mode has no environment at all, so the SCENE is the only thing there is to
+            // reflect — the case with the most to gain, and the one SSR was silently skipping.
+            vec3 env_spec = with_ssr(vec3(v_shade) * env_w, R, rough, env_w);
+            direct += env_spec; spec += env_spec;
             Ldir = normalize(STUDIO_DIR); Lrad = vec3(v_shade * (1.0 - ambf)); shf = 1.0;
             amb_irr = vec3(v_shade * ambf * ao_map);
         }
@@ -816,10 +972,12 @@ const TEX_FS: &str = r#"
             float NcL = max(dot(Ng, Ldir), 0.0);
             vec3  Hc  = normalize(Ldir + V);
             float Fc  = (0.04 + 0.96 * pow(1.0 - max(dot(V, Hc), 0.0), 5.0)) * u_coat;
-            direct += vec3(d_ggx(max(dot(Ng, Hc), 0.0), ca) * v_smith(NcV, NcL, ca) * NcL * shf * PI * Fc) * Lrad;
+            vec3 coat_key = vec3(d_ggx(max(dot(Ng, Hc), 0.0), ca) * v_smith(NcV, NcL, ca) * NcL * shf * PI * Fc) * Lrad;
+            direct += coat_key; spec += coat_key;
             vec2 cab = env_brdf(u_coat_rough, NcV);
-            direct += env_sample(reflect(-V, Ng), u_coat_rough)
-                    * ((0.04 * cab.x + cab.y) * u_coat * clamp(u_reflect, 0.0, 1.0));
+            vec3 coat_env = env_sample(reflect(-V, Ng), u_coat_rough)
+                          * ((0.04 * cab.x + cab.y) * u_coat * clamp(u_reflect, 0.0, 1.0));
+            direct += coat_env; spec += coat_env;
         }
         if (u_sheen > 0.0) {
             // Disney's retroreflective term — a Fresnel-shaped rim peaking where the half vector
@@ -827,7 +985,8 @@ const TEX_FS: &str = r#"
             vec3  Hs   = normalize(Ldir + V);
             float FH   = pow(clamp(1.0 - max(dot(V, Hs), 0.0), 0.0, 1.0), 5.0);
             float NoLs = max(dot(N, Ldir), 0.0);
-            direct += u_sheen_tint * (u_sheen * FH * NoLs * shf) * Lrad;
+            vec3 sheen_key = u_sheen_tint * (u_sheen * FH * NoLs * shf) * Lrad;
+            direct += sheen_key; spec += sheen_key;
             // …and the same rim under sky light alone. Without this a velvet curtain in a
             // north-facing room — the one place anybody would put one — would be the single
             // situation where the effect disappeared.
@@ -846,6 +1005,40 @@ const TEX_FS: &str = r#"
         // NOTE: no tone-map here. Every pass writes scene-referred LINEAR light into an RGBA16F
         // target; exposure and the view transform happen once, at the composite (see color.rs).
         float alpha = t.a * v_a;
+
+        // ---- TRANSMISSION ------------------------------------------------
+        // Alpha blending composes `src·α + dst·(1−α)`, which says the surface COVERS part of the
+        // pixel and leaves the rest a hole. That is right for a wire mesh and wrong for water:
+        // the background arrives at full strength and undyed, so 45%-transmissive water over pale
+        // pool tiles came out pale, with its own teal diluted to nothing rather than tinting what
+        // was beneath it. Light going THROUGH a medium is FILTERED by it — `behind × albedo` —
+        // and that is the whole difference between water and a hole in the ground.
+        //
+        // Composed here, so the draw writes alpha 1 and the blender leaves the result alone.
+        if (u_tr_on == 1 && alpha < 0.999) {
+            float transmit = 1.0 - alpha;
+            vec2 suv = gl_FragCoord.xy / u_tr_vp;
+            // Bend the view ray at the surface and re-project it — the textured path knows its own
+            // world position and shaded normal, so unlike the flat glass pass nothing has to be
+            // reconstructed from the depth buffer.
+            vec2 uv1 = suv;
+            vec3 Rf = refract(-V, N, 1.0 / max(u_tr_ior, 1.0));
+            if (dot(Rf, Rf) > 1e-6 && u_tr_thick > 0.0) {
+                vec4 c1 = u_tr_scene_vp * vec4(v_wpos + Rf * u_tr_thick, 1.0);
+                if (c1.w > 0.0) uv1 = c1.xy / c1.w * 0.5 + 0.5;
+            }
+            vec3 behind = texture(u_tr_scene, clamp(uv1, vec2(0.001), vec2(0.999))).rgb;
+            // Everything that is NOT a mirror reflection scatters off the surface, so it fades as
+            // transmission rises; the reflection itself does not.
+            vec3 body = max(direct - spec, vec3(0.0)) + ambient;
+            frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);
+            // The scene copy already carries the ambient behind this surface, so contributing it
+            // again here would double-count it; and glass is a poor GI bouncer.
+            amb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            alb_out = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+
         frag = vec4(direct, alpha);
         amb_out = vec4(ambient, alpha);
         // The DIFFUSE albedo — what this surface would bounce. `diff` already has the metallic
@@ -1083,6 +1276,144 @@ fn fog_glsl() -> String {
 /// fail to compile — it fills the albedo buffer with whatever the tile memory held, and GI bounces
 /// garbage off it.
 const ALBEDO_OUT_GLSL: &str = "layout(location=2) out vec4 alb_out;";
+
+/// SCREEN-SPACE REFLECTIONS, as a function the textured shader calls in place of its sky lookup.
+///
+/// The environment lobe can only ever return what an environment map holds, and a sky map holds
+/// sky. A pool cannot reflect the trees standing beside it out of one, however good the map — the
+/// trees are simply not in it. This marches the reflected ray through the depth of the scene as it
+/// stood before any glass was drawn, and returns what it actually struck.
+///
+/// The confidence in `.a` is the important part. It is 0 whenever the march cannot answer — the ray
+/// left the frame, ran out of length, or found only sky — and the caller then keeps the environment
+/// reflection it already had. So this only ever REPLACES the sky where real geometry is in the way,
+/// which means there is nothing to double-count and nothing to fade in and out as the camera moves.
+///
+/// Shares `u_tr_scene` / `u_tr_scene_vp` with transmission: the same copy of the same scene, and
+/// two copies of a 134 MB scene's framebuffer is not a saving worth making.
+const SSR_GLSL: &str = r#"
+    uniform int       u_ssr_on;
+    uniform sampler2D u_ssr_depth;   // unit 7 — depth of the opaque scene, copied beside its colour
+    uniform mat4      u_ssr_inv_vp;
+    uniform float     u_ssr_dist;    // how far a ray may travel, metres
+    uniform float     u_ssr_thick;   // how far behind a surface still counts as hitting it
+    uniform int       u_ssr_frame;   // accumulation frame, for the per-frame jitter
+
+    vec3 ssr_world(vec2 uv, float d) {
+        vec4 p = u_ssr_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+        return p.xyz / p.w;
+    }
+
+    vec4 ssr_trace(vec3 P, vec3 R, vec3 cam) {
+        vec4 c0 = u_tr_scene_vp * vec4(P, 1.0);
+        vec4 c1 = u_tr_scene_vp * vec4(P + R * u_ssr_dist, 1.0);
+        if (c0.w <= 1e-5) return vec4(0.0);
+        // A ray whose far end passes behind the camera still has a useful stretch in front of it,
+        // so clip it to the near plane instead of abandoning the whole trace.
+        if (c1.w <= 1e-5) c1 = mix(c0, c1, (c0.w - 1e-4) / (c0.w - c1.w));
+
+        vec2 uv0 = c0.xy / c0.w * 0.5 + 0.5;
+        vec2 uv1 = c1.xy / c1.w * 0.5 + 0.5;
+
+        // CLIP THE SEGMENT TO THE VIEWPORT before choosing a step count.
+        //
+        // A reflected ray almost always leaves the frame long before it reaches its full length —
+        // off a pool the villa is ten metres away and the ray is forty, so most of it is sky above
+        // the top of the screen. Sizing the march over the WHOLE segment spends nearly every
+        // sample out there where nothing can be found: with the ray covering 5000 px and only the
+        // first 300 on screen, 96 steps put six of them anywhere useful, and the march simply
+        // stepped over the building. Clipping first spends all 96 on the part that exists.
+        vec2 d = uv1 - uv0;
+        float tmax = 1.0;
+        if (abs(d.x) > 1e-6) tmax = min(tmax, max((0.0 - uv0.x) / d.x, (1.0 - uv0.x) / d.x));
+        if (abs(d.y) > 1e-6) tmax = min(tmax, max((0.0 - uv0.y) / d.y, (1.0 - uv0.y) / d.y));
+        tmax = clamp(tmax, 0.0, 1.0);
+        if (tmax <= 1e-4) return vec4(0.0);
+
+        // STEP IN SCREEN SPACE, not along the world ray.
+        //
+        // This is the whole difference between a clean reflection and one crawling with triangular
+        // bands that slide as the camera turns. A step of fixed WORLD length covers a large span of
+        // pixels near the camera and a fraction of one far away, so the depth buffer gets sampled
+        // at a density that changes across the image AND with the view — every gap between samples
+        // is a place the march can step straight over a surface, and the pattern of those gaps
+        // moves whenever anything moves. Marching a fixed number of PIXELS instead samples it
+        // evenly, and what the trace finds stops depending on where you happen to be standing.
+        float px = length(d * tmax * u_tr_vp);
+        if (px < 1.0) return vec4(0.0);
+        int steps = int(clamp(px / 3.0, 12.0, 96.0));
+
+        // NDC z interpolates LINEARLY across the screen, so the ray's depth at each pixel is a
+        // plain mix() of the endpoints — perspective-correct, and it never leaves the depth
+        // buffer's own space.
+        //
+        // Why it is linear, since it looks like it should not be: a perspective projection gives
+        // `z_ndc = -a - b/z_eye` and `1/w = -1/z_eye`, so z_ndc is AFFINE in 1/w; and 1/w is the
+        // textbook screen-linear quantity. Affine-in-linear is linear. (Orthographic is trivially
+        // linear — w is 1 everywhere.)
+        //
+        // This used to divide by an interpolated 1/w as well, on the reflex that screen-space
+        // interpolation always needs that correction. It does when you are recovering a 3D
+        // attribute from `attribute/w`; z_ndc is already the divided quantity, so dividing again
+        // yielded z_CLIP — tens to thousands, not 0..1. Every first step then compared as "behind
+        // the scene" and reported a hit at the fragment itself, whose reconstructed world position
+        // was nonsense, so the thickness test below threw it away. The trace has therefore never
+        // returned a single hit: the reflections that were visible were the sky, and only the sky.
+        float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;
+
+        // Offset the first sample by a per-pixel, per-frame fraction of a step. Whatever banding
+        // survives then falls somewhere different on every pixel and every frame, so it reads as
+        // faint noise rather than as a moving pattern — and the still-frame accumulation, which
+        // averages over exactly this frame index, resolves it away completely.
+        float jit = fract(sin(dot(gl_FragCoord.xy + vec2(float(u_ssr_frame) * 13.0),
+                                 vec2(12.9898, 78.233))) * 43758.5453);
+
+        float prev = 0.0, hit_s = -1.0;
+        for (int i = 1; i <= 96; i++) {
+            if (i > steps) break;
+            float s = tmax * (float(i) - jit) / float(steps);
+            vec2 uv = mix(uv0, uv1, s);
+            if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
+            float sd = texture(u_ssr_depth, uv).r;
+            if (sd >= 0.99999) { prev = s; continue; }     // sky here: nothing to hit, keep going
+            float rd = mix(zn0, zn1, s) * 0.5 + 0.5;
+            if (rd > sd) { hit_s = s; break; }             // the ray has passed behind that surface
+            prev = s;
+        }
+        if (hit_s < 0.0) return vec4(0.0);
+
+        // Bisect between the last miss and the hit, in the same screen parameter. Without this the
+        // contact lands wherever the step happened to fall and the reflection detaches from the
+        // object casting it by up to one step.
+        float lo = prev, hi = hit_s;
+        for (int k = 0; k < 6; k++) {
+            float mid = 0.5 * (lo + hi);
+            vec2 uvm = mix(uv0, uv1, mid);
+            float sdm = texture(u_ssr_depth, uvm).r;
+            float rdm = mix(zn0, zn1, mid) * 0.5 + 0.5;
+            if (sdm < 0.99999 && rdm > sdm) hi = mid; else lo = mid;
+        }
+
+        vec2 huv = mix(uv0, uv1, hi);
+        float hsd = texture(u_ssr_depth, huv).r;
+        if (hsd >= 0.99999) return vec4(0.0);
+        // THICKNESS, in metres. The depth buffer holds one surface per pixel and no thickness, so
+        // "the ray went behind it" has to be qualified by how far behind: a ray sliding along under
+        // a distant wall passes behind it for its whole length and would otherwise register a hit
+        // anywhere along that stretch, smearing the wall across the reflection.
+        vec3 S = ssr_world(huv, hsd);
+        vec3 Q = ssr_world(huv, mix(zn0, zn1, hi) * 0.5 + 0.5);
+        if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);
+
+        // Fade at the frame edge and as the ray runs out. What lies off-screen is precisely what
+        // this cannot know, so a reflection must thin out there rather than stop at a hard line —
+        // an abrupt edge is the most recognisable screen-space artefact there is.
+        vec2 e = min(huv, vec2(1.0) - huv);
+        float edge = smoothstep(0.0, 0.12, min(e.x, e.y));
+        float reach = 1.0 - smoothstep(0.75, 1.0, hi);
+        return vec4(texture(u_tr_scene, huv).rgb, edge * reach);
+    }
+"#;
 
 // The SKY as the backdrop. Drawn first, over the whole viewport, with depth testing off — the
 // geometry then paints over it. The ray is reconstructed from the inverse view-projection, so it is
@@ -1450,6 +1781,7 @@ impl SkyUniforms {
 /// differently would be testing nothing.
 fn assemble_tex_fs() -> String {
     TEX_FS
+        .replace("SSR_GLSL", SSR_GLSL)
         .replace("ALBEDO_OUT_GLSL", ALBEDO_OUT_GLSL)
         .replace("SHADOW_GLSL", &shadow_glsl())
         .replace("SRGB_GLSL", crate::color::SRGB_GLSL)
@@ -1684,6 +2016,30 @@ pub struct Scene3dRenderer {
     // keyed like `furn_bufs` but holding only the translucent triangles of an asset.
     transp_prog: Option<glow::Program>,
     u_transp_mvp: Option<glow::UniformLocation>,
+    // Refraction uniforms on the transparent program — see [`RefractSettings`].
+    u_transp_scene: Option<glow::UniformLocation>,
+    u_transp_scene_vp: Option<glow::UniformLocation>,
+    /// TRANSMISSION in the TEXTURED program — the same scene copy the flat glass pass refracts,
+    /// but composed as a filter rather than as coverage (see the shader).
+    u_tex_tr_on: Option<glow::UniformLocation>,
+    u_tex_tr_scene: Option<glow::UniformLocation>,
+    u_tex_tr_scene_vp: Option<glow::UniformLocation>,
+    u_tex_tr_vp: Option<glow::UniformLocation>,
+    u_tex_tr_ior: Option<glow::UniformLocation>,
+    u_tex_tr_thick: Option<glow::UniformLocation>,
+    /// SCREEN-SPACE REFLECTIONS in the textured program (shares the scene copy above).
+    u_tex_ssr_on: Option<glow::UniformLocation>,
+    u_tex_ssr_depth: Option<glow::UniformLocation>,
+    u_tex_ssr_inv_vp: Option<glow::UniformLocation>,
+    u_tex_ssr_dist: Option<glow::UniformLocation>,
+    u_tex_ssr_thick: Option<glow::UniformLocation>,
+    u_tex_ssr_frame: Option<glow::UniformLocation>,
+    u_transp_inv_vp: Option<glow::UniformLocation>,
+    u_transp_cam: Option<glow::UniformLocation>,
+    u_transp_refr_vp: Option<glow::UniformLocation>,
+    u_transp_ior: Option<glow::UniformLocation>,
+    u_transp_thick: Option<glow::UniformLocation>,
+    u_transp_refr_on: Option<glow::UniformLocation>,
     transp_bufs: std::collections::HashMap<u64, (glow::VertexArray, glow::Buffer, i32)>,
     // TEXTURED pass: its own program (pos+uv+shade), per-mesh GPU buffers keyed like
     // `furn_bufs`, and a cache of uploaded GL images keyed by the app-side texture index.
@@ -1774,6 +2130,7 @@ pub struct Scene3dRenderer {
     u_tex_rough_hi: Option<glow::UniformLocation>,
     u_tex_bump: Option<glow::UniformLocation>,
     u_tex_rough_base: Option<glow::UniformLocation>,
+    u_tex_transmission: Option<glow::UniformLocation>,
     u_tex_coat: Option<glow::UniformLocation>,
     u_tex_coat_rough: Option<glow::UniformLocation>,
     u_tex_sheen: Option<glow::UniformLocation>,
@@ -1847,6 +2204,15 @@ pub struct Scene3dRenderer {
     ssgi_fbo: [Option<glow::Framebuffer>; 2],
     ssgi_tex: [Option<glow::Texture>; 2],
     ssgi_size: (i32, i32),
+    /// REFRACTION: the opaque scene as it stood before the transparent pass, so glass has
+    /// something to bend. A shader cannot read the buffer it is writing to.
+    scene_copy_prog: Option<glow::Program>,
+    refr_fbo: Option<glow::Framebuffer>,
+    refr_tex: Option<glow::Texture>,
+    /// The opaque scene's DEPTH, blitted beside its colour so screen-space reflections can march
+    /// it without sampling the buffer the transparent pass is drawing into.
+    refr_depth: Option<glow::Texture>,
+    refr_size: (i32, i32),
     ao_fbo: [Option<glow::Framebuffer>; 2],
     ao_tex: [Option<glow::Texture>; 2],
     fbo: Option<glow::Framebuffer>,
@@ -1893,6 +2259,26 @@ impl Default for Scene3dRenderer {
             furn_bufs: std::collections::HashMap::new(),
             transp_prog: None,
             u_transp_mvp: None,
+            u_transp_scene: None,
+            u_transp_scene_vp: None,
+            u_tex_tr_on: None,
+            u_tex_tr_scene: None,
+            u_tex_tr_scene_vp: None,
+            u_tex_tr_vp: None,
+            u_tex_tr_ior: None,
+            u_tex_tr_thick: None,
+            u_tex_ssr_on: None,
+            u_tex_ssr_depth: None,
+            u_tex_ssr_inv_vp: None,
+            u_tex_ssr_dist: None,
+            u_tex_ssr_thick: None,
+            u_tex_ssr_frame: None,
+            u_transp_inv_vp: None,
+            u_transp_cam: None,
+            u_transp_refr_vp: None,
+            u_transp_ior: None,
+            u_transp_thick: None,
+            u_transp_refr_on: None,
             transp_bufs: std::collections::HashMap::new(),
             tex_prog: None,
             u_tex_mvp: None,
@@ -1950,6 +2336,7 @@ impl Default for Scene3dRenderer {
             u_tex_rough_hi: None,
             u_tex_bump: None,
             u_tex_rough_base: None,
+            u_tex_transmission: None,
             u_tex_coat: None,
             u_tex_coat_rough: None,
             u_tex_sheen: None,
@@ -2011,6 +2398,11 @@ impl Default for Scene3dRenderer {
             ssgi_fbo: [None, None],
             ssgi_tex: [None, None],
             ssgi_size: (0, 0),
+            scene_copy_prog: None,
+            refr_fbo: None,
+            refr_tex: None,
+            refr_depth: None,
+            refr_size: (0, 0),
             ao_fbo: [None, None],
             ao_tex: [None, None],
             fbo: None,
@@ -2713,6 +3105,14 @@ impl Scene3dRenderer {
             if let Some(transp_prog) = compile(gl, "transparent", TRANSP_VS, &transp_fs) {
                 self.u_transp_mvp = gl.get_uniform_location(transp_prog, "u_mvp");
                 self.u_transp_linearize = gl.get_uniform_location(transp_prog, "u_linearize");
+                self.u_transp_scene = gl.get_uniform_location(transp_prog, "u_scene");
+                self.u_transp_scene_vp = gl.get_uniform_location(transp_prog, "u_scene_vp");
+                self.u_transp_inv_vp = gl.get_uniform_location(transp_prog, "u_scene_inv_vp");
+                self.u_transp_cam = gl.get_uniform_location(transp_prog, "u_refr_cam");
+                self.u_transp_refr_vp = gl.get_uniform_location(transp_prog, "u_refr_vp");
+                self.u_transp_ior = gl.get_uniform_location(transp_prog, "u_refr_ior");
+                self.u_transp_thick = gl.get_uniform_location(transp_prog, "u_refr_thick");
+                self.u_transp_refr_on = gl.get_uniform_location(transp_prog, "u_refr_on");
                 self.transp_prog = Some(transp_prog);
             }
 
@@ -2722,6 +3122,18 @@ impl Scene3dRenderer {
                 self.u_tex_mvp = gl.get_uniform_location(tex_prog, "u_mvp");
                 self.u_tex_img = gl.get_uniform_location(tex_prog, "u_img");
                 self.u_tex_cam = gl.get_uniform_location(tex_prog, "u_cam");
+                self.u_tex_tr_on = gl.get_uniform_location(tex_prog, "u_tr_on");
+                self.u_tex_tr_scene = gl.get_uniform_location(tex_prog, "u_tr_scene");
+                self.u_tex_tr_scene_vp = gl.get_uniform_location(tex_prog, "u_tr_scene_vp");
+                self.u_tex_tr_vp = gl.get_uniform_location(tex_prog, "u_tr_vp");
+                self.u_tex_tr_ior = gl.get_uniform_location(tex_prog, "u_tr_ior");
+                self.u_tex_tr_thick = gl.get_uniform_location(tex_prog, "u_tr_thick");
+                self.u_tex_ssr_on = gl.get_uniform_location(tex_prog, "u_ssr_on");
+                self.u_tex_ssr_depth = gl.get_uniform_location(tex_prog, "u_ssr_depth");
+                self.u_tex_ssr_inv_vp = gl.get_uniform_location(tex_prog, "u_ssr_inv_vp");
+                self.u_tex_ssr_dist = gl.get_uniform_location(tex_prog, "u_ssr_dist");
+                self.u_tex_ssr_thick = gl.get_uniform_location(tex_prog, "u_ssr_thick");
+                self.u_tex_ssr_frame = gl.get_uniform_location(tex_prog, "u_ssr_frame");
                 self.u_tex_reflect = gl.get_uniform_location(tex_prog, "u_reflect");
                 self.u_tex_proc = gl.get_uniform_location(tex_prog, "u_proc");
                 self.u_tex_col_a = gl.get_uniform_location(tex_prog, "u_col_a");
@@ -2753,6 +3165,7 @@ impl Scene3dRenderer {
                 self.u_tex_rough_hi = gl.get_uniform_location(tex_prog, "u_rough_hi");
                 self.u_tex_bump = gl.get_uniform_location(tex_prog, "u_bump");
                 self.u_tex_rough_base = gl.get_uniform_location(tex_prog, "u_rough_base");
+                self.u_tex_transmission = gl.get_uniform_location(tex_prog, "u_transmission");
                 self.u_tex_coat = gl.get_uniform_location(tex_prog, "u_coat");
                 self.u_tex_coat_rough = gl.get_uniform_location(tex_prog, "u_coat_rough");
                 self.u_tex_sheen = gl.get_uniform_location(tex_prog, "u_sheen");
@@ -2841,6 +3254,7 @@ impl Scene3dRenderer {
             }
             self.ssgi_prog = compile(gl, "ssgi", BLIT_VS, SSGI_FS);
             self.blur_rgb_prog = compile(gl, "rgb blur", BLIT_VS, BLUR_RGB_FS);
+            self.scene_copy_prog = compile(gl, "scene copy", BLIT_VS, SCENE_COPY_FS);
 
             let bvbo = gl.create_buffer().unwrap();
             let bvao = gl.create_vertex_array().unwrap();
@@ -2877,6 +3291,7 @@ impl Scene3dRenderer {
                 ("taa-resolve", self.taa_prog.is_none()),
                 ("ssgi", self.ssgi_prog.is_none()),
                 ("rgb-blur", self.blur_rgb_prog.is_none()),
+                ("scene-copy", self.scene_copy_prog.is_none()),
             ]
             .into_iter()
             .filter_map(|(n, failed)| failed.then_some(n))
@@ -3024,6 +3439,123 @@ impl Scene3dRenderer {
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
         gl.bind_vertex_array(None);
         gl.bind_texture(glow::TEXTURE_2D, None);
+        true
+    }
+
+    /// Snapshot the opaque scene into `refr_tex` so the transparent pass has something to refract.
+    ///
+    /// Returns false when it could not run, in which case glass falls back to plain blending —
+    /// which is what it did before refraction existed, so nothing looks broken.
+    unsafe fn scene_copy(&mut self, gl: &glow::Context, w: i32, h: i32) -> bool {
+        if self.refr_tex.is_none() || self.refr_size != (w, h) {
+            if let Some(t) = self.refr_tex.take() {
+                gl.delete_texture(t);
+            }
+            let Ok(t) = gl.create_texture() else { return false };
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            // RGBA16F, like everything else here: this is scene-referred light, and what shows
+            // through a window is routinely the brightest thing in the frame.
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA16F as i32, w, h, 0,
+                glow::RGBA, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+            );
+            for (p, v) in [
+                (glow::TEXTURE_MIN_FILTER, glow::LINEAR),
+                (glow::TEXTURE_MAG_FILTER, glow::LINEAR),
+                // CLAMP: a ray refracted past the edge of the frame reads the border pixel rather
+                // than wrapping round to the opposite side of the room.
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+            }
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            if self.refr_fbo.is_none() {
+                self.refr_fbo = gl.create_framebuffer().ok();
+            }
+            self.refr_tex = Some(t);
+            self.refr_size = (w, h);
+            // A copy of the DEPTH beside the colour, for screen-space reflections to march.
+            //
+            // Not the scene's own depth texture: that one is still attached to the framebuffer the
+            // transparent pass is drawing into, and sampling a texture you are simultaneously
+            // rendering with is undefined even when the writes are masked off. A blit costs one
+            // pass and removes the question.
+            if let Some(d) = self.refr_depth.take() {
+                gl.delete_texture(d);
+            }
+            if let Ok(d) = gl.create_texture() {
+                gl.bind_texture(glow::TEXTURE_2D, Some(d));
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D, 0, glow::DEPTH_COMPONENT24 as i32, w, h, 0,
+                    glow::DEPTH_COMPONENT, glow::FLOAT, glow::PixelUnpackData::Slice(None),
+                );
+                for (p, v) in [
+                    // NEAREST: interpolating depth across a silhouette invents surfaces that are
+                    // not there, and a ray would hit one of them.
+                    (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                    (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                ] {
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, p, v as i32);
+                }
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                self.refr_depth = Some(d);
+            }
+        }
+        let (Some(prog), Some(fbo), Some(tex), Some(vao), Some(vbo), Some(lit), Some(amb)) = (
+            self.scene_copy_prog, self.refr_fbo, self.refr_tex, self.blit_vao, self.blit_vbo,
+            self.color, self.ambient,
+        ) else {
+            return false;
+        };
+        const FULL: [f32; 24] = [
+            -1.0, -1.0, 0.0, 0.0,  1.0, -1.0, 1.0, 0.0,  1.0, 1.0, 1.0, 1.0,
+            -1.0, -1.0, 0.0, 0.0,  1.0, 1.0, 1.0, 1.0,  -1.0, 1.0, 0.0, 1.0,
+        ];
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.framebuffer_texture_2d(
+            glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0,
+        );
+        gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+        gl.viewport(0, 0, w, h);
+        gl.disable(glow::DEPTH_TEST);
+        gl.disable(glow::BLEND);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&FULL), glow::DYNAMIC_DRAW);
+        gl.bind_vertex_array(Some(vao));
+        gl.use_program(Some(prog));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(lit));
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(amb));
+        for (n, v) in [("u_lit", 0), ("u_amb", 1)] {
+            if let Some(l) = gl.get_uniform_location(prog, n) {
+                gl.uniform_1_i32(Some(&l), v);
+            }
+        }
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.active_texture(glow::TEXTURE0);
+        gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        // …and the depth alongside it, so reflected rays have a scene to march through.
+        if let Some(d) = self.refr_depth {
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::TEXTURE_2D, Some(d), 0,
+            );
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, self.fbo);
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo));
+            gl.blit_framebuffer(
+                0, 0, w, h, 0, 0, w, h, glow::DEPTH_BUFFER_BIT, glow::NEAREST,
+            );
+        }
+        // Back to the scene, with depth on — the transparent pass draws next.
+        gl.bind_framebuffer(glow::FRAMEBUFFER, self.fbo);
+        gl.viewport(0, 0, w, h);
+        gl.enable(glow::DEPTH_TEST);
         true
     }
 
@@ -3392,6 +3924,7 @@ impl Scene3dRenderer {
         if let Some(loc) = &self.u_tex_triplanar { gl.uniform_1_i32(Some(loc), pbr.triplanar as i32); }
         if let Some(loc) = &self.u_tex_tpm { gl.uniform_1_f32(Some(loc), pbr.tiles_per_m.max(1e-3)); }
         if let Some(loc) = &self.u_tex_rough_base { gl.uniform_1_f32(Some(loc), pbr.roughness); }
+        if let Some(loc) = &self.u_tex_transmission { gl.uniform_1_f32(Some(loc), pbr.transmission.clamp(0.0, 1.0)); }
         if let Some(loc) = &self.u_tex_metallic { gl.uniform_1_f32(Some(loc), pbr.metallic.clamp(0.0, 1.0)); }
         if let Some(loc) = &self.u_tex_ior { gl.uniform_1_f32(Some(loc), pbr.ior.clamp(1.0, 3.0)); }
         if let Some(loc) = &self.u_tex_coat { gl.uniform_1_f32(Some(loc), pbr.clearcoat.clamp(0.0, 1.0)); }
@@ -3981,7 +4514,11 @@ impl Scene3dRenderer {
             // Same opaque state. Upload any referenced textures once, then draw each textured
             // mesh from its persistent buffer with the bound image + camera·model matrix.
             // Per-texture reflection / procedural / PBR-map lookups (defaults when absent).
-            let reflect_of = |idx: usize| tex_reflect.iter().find(|(i, _)| *i == idx).map(|(_, r)| *r).unwrap_or(0.0);
+            // A texture the caller said nothing about reflects its surroundings by the physically
+            // correct amount — the shader's `f0`/split-sum already decides how much that is. The
+            // old 0.0 fallback made "no opinion" mean "matte", which is not a neutral default: it
+            // switched the environment lobe off for every imported material in the scene.
+            let reflect_of = |idx: usize| tex_reflect.iter().find(|(i, _)| *i == idx).map(|(_, r)| *r).unwrap_or(1.0);
             let proc_of = |idx: usize| tex_proc.iter().find(|(i, _)| *i == idx).map(|(_, p)| *p).unwrap_or_default();
             let pbr_of = |idx: usize| tex_pbr.iter().find(|(i, _)| *i == idx).map(|(_, p)| *p).unwrap_or_default();
             let hl_of = |idx: usize| highlight.map(|(h, _)| h == idx).unwrap_or(false);
@@ -3995,6 +4532,15 @@ impl Scene3dRenderer {
                     if data_maps.contains(&idx) {
                         let _ = self.ensure_texture(gl, idx, w, h, rgba, false);
                     }
+                }
+                // Nothing in the OPAQUE textured pass transmits — and this program is shared with
+                // the blended pass below, where the flag is turned back on.
+                if let Some(prog) = self.tex_prog {
+                    gl.use_program(Some(prog));
+                    if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }
+                    // Nor can the opaque pass REFLECT the scene: the copy it would march does not
+                    // exist yet — this pass is what fills it.
+                    if let Some(l) = &self.u_tex_ssr_on { gl.uniform_1_i32(Some(l), 0); }
                 }
                 // Furniture (persistent per-key buffers + model matrix).
                 for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_draws {
@@ -4016,14 +4562,90 @@ impl Scene3dRenderer {
             // faces all show through instead of the nearest one occluding the rest. The caller
             // hands `transp` back-to-front, which is the ordering blending needs.
             if !transp.is_empty() || !tex_transp.is_empty() || !tex_feat_transp.is_empty() {
+                // A copy of the opaque scene, taken BEFORE any glass is drawn — a shader cannot
+                // read the buffer it is writing to. Both see-through paths need it: the flat one
+                // to REFRACT, the textured one to FILTER what is behind it by the material's own
+                // colour instead of letting the blender mix it in undyed.
+                let scene_copied = self.scene_copy(gl, vp_w, vp_h);
+                let refract = env.refract.enabled && !transp.is_empty() && scene_copied;
+                if let Some(prog) = self.transp_prog {
+                    gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_transp_refr_on {
+                        gl.uniform_1_i32(Some(loc), refract as i32);
+                    }
+                    if refract {
+                        // Unit 5: clear of the albedo/normal/roughness maps the textured pass binds
+                        // below, which shares this framebuffer state.
+                        gl.active_texture(glow::TEXTURE5);
+                        gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
+                        gl.active_texture(glow::TEXTURE0);
+                        let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+                        if let Some(l) = &self.u_transp_scene { gl.uniform_1_i32(Some(l), 5); }
+                        if let Some(l) = &self.u_transp_scene_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
+                        if let Some(l) = &self.u_transp_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
+                        if let Some(l) = &self.u_transp_cam { gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]); }
+                        if let Some(l) = &self.u_transp_refr_vp { gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32); }
+                        if let Some(l) = &self.u_transp_ior { gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0)); }
+                        if let Some(l) = &self.u_transp_thick { gl.uniform_1_f32(Some(l), env.refract.thickness.max(0.0)); }
+                    }
+                }
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
                 gl.depth_mask(false);
                 for &(key, verts, ref tmvp) in transp {
                     self.draw_transp(gl, key, verts, tmvp);
                 }
+                if refract {
+                    gl.active_texture(glow::TEXTURE5);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                    gl.active_texture(glow::TEXTURE0);
+                }
                 // Textured glass (image shows through). Drawn after the flat glass; the images
                 // were uploaded in the textured pass above.
+                //
+                // Unit 6 for the scene copy: 5 is the AO map in this program (the flat glass pass
+                // above can use 5 only because it binds no maps at all).
+                if scene_copied {
+                    if let Some(prog) = self.tex_prog {
+                        gl.use_program(Some(prog));
+                        gl.active_texture(glow::TEXTURE6);
+                        gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
+                        gl.active_texture(glow::TEXTURE0);
+                        if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }
+                        if let Some(l) = &self.u_tex_tr_scene { gl.uniform_1_i32(Some(l), 6); }
+                        if let Some(l) = &self.u_tex_tr_scene_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
+                        if let Some(l) = &self.u_tex_tr_vp { gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32); }
+                        if let Some(l) = &self.u_tex_tr_ior { gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0)); }
+                        // The Refraction toggle controls the BEND only. Transmission itself is not
+                        // an effect to be switched off — it is what the material says it is, and
+                        // turning it off would put the pool back to being a lid.
+                        let thick = if env.refract.enabled { env.refract.thickness.max(0.0) } else { 0.0 };
+                        if let Some(l) = &self.u_tex_tr_thick { gl.uniform_1_f32(Some(l), thick); }
+                        // The scene's DEPTH on unit 7, beside its colour on 6. Bound whenever the
+                        // copy exists and NOT only when reflections are on: the medium/container
+                        // test above reads it too, and gating it on an unrelated toggle would put
+                        // the pool's z-fight back the moment someone unticked reflections.
+                        let have_depth = self.refr_depth.is_some();
+                        if have_depth {
+                            gl.active_texture(glow::TEXTURE7);
+                            gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);
+                            gl.active_texture(glow::TEXTURE0);
+                            let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+                            if let Some(l) = &self.u_tex_ssr_depth { gl.uniform_1_i32(Some(l), 7); }
+                            if let Some(l) = &self.u_tex_ssr_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
+                        }
+                        // SCREEN-SPACE REFLECTIONS proper.
+                        let ssr = env.ssr.enabled && have_depth;
+                        if let Some(l) = &self.u_tex_ssr_on { gl.uniform_1_i32(Some(l), ssr as i32); }
+                        if ssr {
+                            if let Some(l) = &self.u_tex_ssr_dist { gl.uniform_1_f32(Some(l), env.ssr.distance.max(0.1)); }
+                            if let Some(l) = &self.u_tex_ssr_thick { gl.uniform_1_f32(Some(l), env.ssr.thickness.max(0.01)); }
+                            // The SAME counter the still-frame accumulation averages over, so the
+                            // march's jitter decorrelates across exactly the frames being summed.
+                            if let Some(l) = &self.u_tex_ssr_frame { gl.uniform_1_i32(Some(l), self.taa_n as i32); }
+                        }
+                    }
+                }
                 for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
                         self.draw_textured(gl, mesh_key, verts, tmvp, model, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
@@ -4034,6 +4656,13 @@ impl Scene3dRenderer {
                     if let Some(img) = self.tex_images.get(&(tex_idx, true)).copied() {
                         self.draw_textured_dyn(gl, verts, mvp, img, cam_pos, reflect_of(tex_idx), proc_of(tex_idx), pbr_of(tex_idx), hl_of(tex_idx));
                     }
+                }
+                if scene_copied {
+                    for u in [glow::TEXTURE6, glow::TEXTURE7] {
+                        gl.active_texture(u);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                    }
+                    gl.active_texture(glow::TEXTURE0);
                 }
                 gl.depth_mask(true);
                 gl.disable(glow::BLEND);
@@ -4826,6 +5455,289 @@ mod taa_tests {
         );
     }
 
+    /// Refraction needs a world position and a normal, and the transparent vertex format carries
+    /// NEITHER — so it takes both from the depth buffer instead.
+    ///
+    /// The pane's position is reconstructed from this fragment's own `gl_FragCoord.z` using the
+    /// SCENE's inverse view-projection, which has to be passed in separately: the transparent pass
+    /// is drawn with camera·model, so inverting the matrix it was drawn with would land in model
+    /// space, not world. The normal is then the screen-space derivative of that position — exact
+    /// for flat glass, and it means no per-vertex normal has to be threaded through a format that
+    /// never had one.
+    #[test]
+    fn refraction_takes_position_and_normal_from_the_depth_buffer() {
+        assert!(TRANSP_FS.contains("u_scene_inv_vp * vec4(uv * 2.0 - 1.0, gl_FragCoord.z"),
+            "the pane's world position is not reconstructed from its own depth");
+        assert!(TRANSP_FS.contains("normalize(cross(dFdx(P), dFdy(P)))"),
+            "the pane's normal is not taken from the reconstructed position");
+        // The SCENE matrix, not the draw's own: `u_mvp` is camera·model here.
+        assert!(TRANSP_FS.contains("u_scene_vp"), "there is no world-space projection to re-project with");
+        assert!(!TRANSP_FS.contains("inverse(u_mvp)"), "inverting the draw matrix lands in model space");
+    }
+
+    /// A refracting pane must be written OPAQUE.
+    ///
+    /// It has already fetched and composed the refracted background itself. Letting the blender
+    /// mix that against the framebuffer would fold in the UNBENT pixel sitting underneath, which
+    /// halves the displacement and leaves a ghost of the straight-through image.
+    #[test]
+    fn a_refracting_pane_replaces_rather_than_blends() {
+        let f = TRANSP_FS.find("if (u_refr_on == 1)").expect("the refraction branch");
+        let branch = &TRANSP_FS[f..TRANSP_FS[f..].find("        frag = vec4(tint, v_a);").unwrap() + f];
+        assert!(branch.contains("frag = vec4(mix(behind * tint, tint, max(v_a, f)), 1.0);"),
+            "the refracted pane does not write opaque alpha");
+        assert!(branch.contains("return;"), "…and does not leave before the blended path");
+        // Total internal reflection returns a zero vector; the pane must go clear, not black.
+        assert!(branch.contains("if (dot(Rf, Rf) < 1e-6) uv1 = uv;"), "total internal reflection is unhandled");
+    }
+
+    /// The scene copy must be taken BEFORE any glass is drawn, or a pane refracts itself.
+    #[test]
+    fn the_scene_copy_precedes_the_transparent_pass() {
+        let src = include_str!("light3d.rs");
+        let copy = src.find("let scene_copied = self.scene_copy(gl, vp_w, vp_h);").expect("the copy call");
+        let draw = src.find("self.draw_transp(gl, key, verts, tmvp)").expect("the flat glass draw");
+        let tex = src.find("for &(tex_idx, mesh_key, verts, ref tmvp, ref model) in tex_transp").expect("the textured glass draw");
+        assert!(copy < draw, "the scene is copied after the flat glass has already been drawn into it");
+        assert!(copy < tex, "…or after the TEXTURED glass has");
+    }
+
+    /// Transmission must FILTER what is behind the surface, not uncover it.
+    ///
+    /// Alpha blending composes `src·α + dst·(1−α)`: the surface covers part of the pixel and the
+    /// rest is a hole. That is right for a wire mesh and wrong for water — it lets the background
+    /// through at full strength and undyed, so 45%-transmissive water over pale pool tiles came
+    /// out pale, its own teal diluted away instead of tinting what lay beneath it.
+    #[test]
+    fn transmission_tints_the_background_rather_than_uncovering_it() {
+        let src = assemble_tex_fs();
+        let br = src.find("if (u_tr_on == 1 && alpha < 0.999)").expect("the transmission branch");
+        let end = src[br..].find("return;").expect("its early out") + br;
+        let branch = &src[br..end];
+        assert!(branch.contains("behind * albedo * transmit"),
+            "what comes through must be filtered by the material's own colour");
+        assert!(branch.contains("frag = vec4(spec + body * alpha + behind * albedo * transmit, 1.0);"),
+            "…and the whole result composed here, at alpha 1, so the blender cannot re-mix it");
+        // The reflection is NOT part of what fades away as the surface transmits more.
+        assert!(branch.contains("vec3 body = max(direct - spec, vec3(0.0)) + ambient;"),
+            "the specular has to be separated out before the diffuse is scaled by transmission");
+        assert!(branch.contains("amb_out = vec4(0.0, 0.0, 0.0, 1.0);"),
+            "the scene copy already carries the ambient behind this surface — adding it twice would double it");
+    }
+
+    /// A MEDIUM's surface lying ON an opaque one is the container, and must not be drawn.
+    ///
+    /// Modelled water is a closed box in a pool liner — measured on the villa, five of its six
+    /// faces are exactly coplanar with the tiles. Drawing them put two coincident surfaces into a
+    /// per-pixel z-fight, and because the transmission branch composes an OPAQUE result, whichever
+    /// won overwrote the other: triangular wedges crawling over the water as the camera moved.
+    ///
+    /// Two things this must NOT be keyed on. Not `gl_FrontFacing` — facing depends on winding
+    /// surviving an exporter, an axis conversion and an instance matrix, and if any of those flips
+    /// it the discard takes the surface you can see instead of the one you cannot (which is exactly
+    /// what happened: the pool lost its water and showed bare liner). And not alpha — an
+    /// alpha-cutout leaf card is see-through too, and it is a single sheet lying on nothing.
+    #[test]
+    fn a_medium_lying_on_its_container_is_not_drawn() {
+        let src = assemble_tex_fs();
+        let at = src.find("if (u_transmission > 0.0 && u_tr_on == 1)").expect("the contact test");
+        let block = &src[at..at + 500];
+        assert!(block.contains("distance(ssr_world(suv, sd), u_cam) - distance(v_wpos, u_cam) < 0.02) discard;"),
+            "the test is distance in front of what is already there, in metres");
+        assert!(block.contains("sd < 0.99999"), "sky behind the surface is not a container");
+        assert!(!block.contains("gl_FrontFacing"), "and it must not depend on winding");
+        assert!(!block.contains("v_a"), "…nor on coverage");
+        // Before any shading work — everything after it would be wasted on a discarded fragment.
+        let shade = src.find("vec3 Ng = normalize(cross(dFdx(v_wpos)").expect("the shading");
+        assert!(at < shade, "discard first");
+    }
+
+    /// The depth copy is bound whenever it exists, not only when reflections are switched on.
+    ///
+    /// The medium/container test reads the same texture. Gating the bind on the SSR toggle would
+    /// put the pool's z-fight straight back the moment anyone unticked reflections — an unrelated
+    /// setting silently breaking the water.
+    #[test]
+    fn the_depth_copy_is_bound_independently_of_the_reflection_toggle() {
+        let src = include_str!("light3d.rs");
+        let bind = src.find("let have_depth = self.refr_depth.is_some();").expect("the bind gate");
+        let ssr = src.find("let ssr = env.ssr.enabled && have_depth;").expect("the SSR gate");
+        assert!(bind < ssr, "the depth is bound before, and independently of, the SSR decision");
+        let between = &src[bind..ssr];
+        assert!(between.contains("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);"),
+            "…and the bind itself is not inside the SSR branch");
+    }
+
+    /// SSR must REPLACE the sky reflection where it finds geometry, never add to it.
+    ///
+    /// Adding would double-count: the environment lobe has already contributed a sky reflection
+    /// for that ray, and a surface reflecting both the tree and the sky the tree is standing in
+    /// front of is brighter than either. It would also make the effect pop in and out — every
+    /// pixel where the trace lost confidence would visibly drop a whole reflection.
+    #[test]
+    fn ssr_replaces_the_sky_reflection_rather_than_adding_to_it() {
+        let src = assemble_tex_fs();
+        let at = src.find("vec3 with_ssr(").expect("the substitution");
+        let body = &src[at..at + 900];
+        assert!(body.contains("return mix(sky_spec, hit.rgb * w, hit.a * (1.0 - smoothstep(0.15, 0.35, rgh)));"),
+            "the trace's confidence blends the two; it never sums them");
+        assert!(body.contains("if (u_ssr_on != 1 || rgh >= 0.35) return sky_spec;"),
+            "a rough surface keeps the sky — one ray cannot stand in for a wide lobe");
+        // BOTH lighting branches must route through it. Shipping it in the daylight branch only
+        // meant studio mode — which has no environment to reflect at all — silently got nothing.
+        assert!(src.contains("with_ssr(env_sample(R, rough) * env_w, R, rough, env_w)"),
+            "the daylight branch substitutes the scene for the sky");
+        assert!(src.contains("with_ssr(vec3(v_shade) * env_w, R, rough, env_w)"),
+            "…and so does studio mode");
+    }
+
+    /// The march must be sized over the part of the ray that is ON SCREEN.
+    ///
+    /// A reflected ray leaves the frame long before it runs out: off a pool the villa is ten metres
+    /// away and the ray is forty, so most of it is sky above the top of the screen. Sizing the
+    /// march over the whole segment put nearly every sample out there — six of ninety-six anywhere
+    /// useful — and the trace stepped clean over the building it was supposed to reflect.
+    #[test]
+    fn the_march_is_sized_over_the_visible_part_of_the_ray() {
+        assert!(SSR_GLSL.contains("if (abs(d.x) > 1e-6) tmax = min(tmax, max((0.0 - uv0.x) / d.x, (1.0 - uv0.x) / d.x));"),
+            "the segment is clipped to the viewport");
+        assert!(SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "…and the step count comes from the CLIPPED length, not the whole ray");
+        assert!(SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "…so every step lands inside the frame");
+        assert!(SSR_GLSL.contains("if (tmax <= 1e-4) return vec4(0.0);"),
+            "a ray that leaves immediately has nothing to find");
+    }
+
+    /// A miss must cost nothing. Every early-out in the trace returns zero confidence so the
+    /// caller silently keeps the sky, which is what makes the edge of the effect invisible.
+    #[test]
+    fn a_lost_reflection_ray_falls_back_to_the_sky() {
+        assert!(SSR_GLSL.contains("if (hit_s < 0.0) return vec4(0.0);"), "a ray that hit nothing");
+        assert!(SSR_GLSL.contains("float edge = smoothstep(0.0, 0.12, min(e.x, e.y));"),
+            "…and one that hit near the frame edge fades out rather than stopping dead");
+        assert!(SSR_GLSL.contains("float reach = 1.0 - smoothstep(0.75, 1.0, hi);"),
+            "…as does one that ran to the end of its reach");
+        assert!(SSR_GLSL.contains("if (sd >= 0.99999) { prev = s; continue; }"),
+            "sky along the ray is not a hit — the march carries on past it");
+        assert!(SSR_GLSL.contains("if (distance(Q, cam) - distance(S, cam) > u_ssr_thick) return vec4(0.0);"),
+            "…and a ray that merely slid behind a distant surface has not hit it either");
+    }
+
+    /// The march has to step in SCREEN space, not along the world ray.
+    ///
+    /// This is what produced the triangular bands that slid about as the camera turned. A step of
+    /// fixed world length covers a wide span of pixels near the camera and a fraction of one far
+    /// away, so the depth buffer is sampled at a density that varies across the image and with the
+    /// view — and every gap between samples is a surface the march can step straight over. Fixing
+    /// the step in PIXELS makes what the trace finds independent of where the camera is standing.
+    #[test]
+    fn the_march_steps_in_pixels_not_in_metres() {
+        assert!(SSR_GLSL.contains("float px = length(d * tmax * u_tr_vp);"),
+            "the ray's length is measured on screen");
+        assert!(SSR_GLSL.contains("int steps = int(clamp(px / 3.0, 12.0, 96.0));"),
+            "…and the step count comes from that, so each step is a few pixels wherever it is");
+        // Perspective-correct depth: 1/w and z/w are what interpolate linearly across the screen.
+        assert!(SSR_GLSL.contains("float zn0 = c0.z / c0.w, zn1 = c1.z / c1.w;"), "NDC z at both ends");
+        assert!(SSR_GLSL.contains("float rd = mix(zn0, zn1, s) * 0.5 + 0.5;"),
+            "…so the ray's depth at each pixel is a mix, not a fresh projection");
+        // The correction that must NOT be here. z_ndc is already `z_clip/w`; dividing it by an
+        // interpolated 1/w a second time yields z_CLIP — tens to thousands rather than 0..1 — so
+        // the very first step compared as "behind the scene", reported a hit at the fragment
+        // itself, and the thickness test then discarded it. The trace never returned a hit at all.
+        assert!(!SSR_GLSL.contains("/ mix(iw"), "z_ndc is already divided by w; dividing again gives z_clip");
+        assert!(!SSR_GLSL.contains("P + R * t"), "no world-space stepping survives");
+    }
+
+    /// Residual banding must be broken up per pixel AND per frame.
+    ///
+    /// Per-pixel alone would freeze one dither pattern into the image and the still-frame
+    /// accumulation would average sixteen copies of the same artefact. Varying with the frame the
+    /// accumulator is summing over is what lets it resolve away to nothing.
+    #[test]
+    fn the_march_is_jittered_by_the_accumulation_frame() {
+        assert!(SSR_GLSL.contains("uniform int       u_ssr_frame;"), "the trace knows the frame");
+        let j = SSR_GLSL.find("float jit =").expect("the jitter");
+        assert!(SSR_GLSL[j..j + 200].contains("u_ssr_frame"), "…and the jitter varies with it");
+        assert!(SSR_GLSL.contains("float s = tmax * (float(i) - jit) / float(steps);"),
+            "the jitter offsets the sample position, not the result");
+        let src = include_str!("light3d.rs");
+        assert!(src.contains("gl.uniform_1_i32(Some(l), self.taa_n as i32); }"),
+            "and it is fed the SAME counter the accumulation averages over");
+    }
+
+    /// The march has to read a COPY of the depth, not the buffer being drawn into.
+    ///
+    /// Sampling a texture that is attached to the current framebuffer is undefined in GL even when
+    /// writes to it are masked off, and the transparent pass draws with the scene's own depth
+    /// attached for testing. A blit costs one pass and removes the question.
+    #[test]
+    fn ssr_marches_a_copy_of_the_depth_not_the_live_buffer() {
+        let src = include_str!("light3d.rs");
+        assert!(SSR_GLSL.contains("uniform sampler2D u_ssr_depth;"), "its own depth sampler");
+        assert!(src.contains("glow::DEPTH_BUFFER_BIT, glow::NEAREST,"), "the depth is blitted aside");
+        let blit = src.find("glow::DEPTH_BUFFER_BIT").expect("the blit");
+        let bind = src.find("gl.bind_texture(glow::TEXTURE_2D, self.refr_depth);").expect("the bind");
+        assert!(blit < bind, "the copy has to exist before the pass that reads it");
+    }
+
+    /// The OPAQUE textured pass shares its program with the blended one, so the transmission flag
+    /// has to be switched off for it — otherwise every solid surface would try to read the scene
+    /// copy (which at that point in the frame does not even exist yet).
+    #[test]
+    fn the_opaque_textured_pass_does_not_transmit() {
+        let src = include_str!("light3d.rs");
+        let off = src.find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 0); }")
+            .expect("the opaque pass clears the flag");
+        let on = src.find("if let Some(l) = &self.u_tex_tr_on { gl.uniform_1_i32(Some(l), 1); }")
+            .expect("the blended pass sets it");
+        assert!(off < on, "the flag must be cleared BEFORE the opaque draws and set only after them");
+    }
+
+    /// A loaded ENVIRONMENT must light the scene whether or not the analytic sun is switched on.
+    ///
+    /// Two independent lights, and the shader has to treat them so. Gating the environment's
+    /// irradiance on the sun meant loading an HDRI lit nothing: the backdrop showed a real place
+    /// while every surface kept the fixed studio lamp — a light that does not move with the sun
+    /// controls, casts no shadow, and is two-sided, so no face ever reads as turned away.
+    #[test]
+    fn an_environment_lights_the_scene_without_the_sun() {
+        for (name, src) in [("scene", assemble_scene_fs()), ("textured", assemble_tex_fs())] {
+            assert!(
+                src.contains("bool ibl = (u_sky_on == 1 || u_env_on == 1);"),
+                "{name}: environment lighting is not independent of the sun"
+            );
+            let ibl = src.find("if (ibl) {").expect("the environment branch");
+            let studio = src[ibl..].find("} else {").expect("the studio fallback") + ibl;
+            let branch = &src[ibl..studio];
+            assert!(
+                branch.contains("sh_ambient(N)"),
+                "{name}: the environment branch does not use the environment's own irradiance"
+            );
+            // The DIRECT sun must be NESTED inside it, not the other way round.
+            assert!(
+                branch.contains("if (u_sun_on == 1)") || branch.contains("if (u_sky_on == 1)"),
+                "{name}: the sun is not nested inside the environment branch"
+            );
+        }
+    }
+
+    /// The studio lamp is the NO-ENVIRONMENT fallback, and it is two-sided on purpose — which is
+    /// exactly why it must not be reached when an environment exists. It has also never been
+    /// derived from the camera, and must not start being: a light that follows the viewer cannot
+    /// produce an accurate render.
+    #[test]
+    fn the_studio_lamp_is_only_the_no_environment_fallback() {
+        let src = assemble_tex_fs();
+        let studio = src.find("abs(dot(N, normalize(STUDIO_DIR)))").expect("the studio key light");
+        let ibl = src.find("bool ibl =").expect("the environment test");
+        assert!(ibl < studio, "the studio lamp is chosen before anyone asks about the environment");
+        assert!(
+            src.contains("const vec3 STUDIO_DIR = vec3(0.35, 0.25, 0.9);"),
+            "the studio direction is no longer a fixed world-space constant"
+        );
+    }
+
     /// Bounced light must be coloured by what it LANDS on, not just by what it left.
     ///
     /// This is the whole reason the albedo G-buffer exists. Every other buffer holds light already
@@ -5262,9 +6174,14 @@ mod tests {
     #[test]
     fn shader_helpers_are_defined_before_use() {
         for (name, src) in assembled() {
-            for func in ["srgb_to_lin", "shadow_lit", "apply_view", "d_ggx", "v_smith", "f_schlick", "sh_ambient", "sky_radiance", "env_sample", "world_at"] {
+            for func in ["srgb_to_lin", "shadow_lit", "apply_view", "d_ggx", "v_smith", "f_schlick", "sh_ambient", "sky_radiance", "env_sample", "world_at", "ssr_world", "ssr_trace"] {
                 let def = src.find(&format!("{func}(")).filter(|_| src.contains(&format!(" {func}(")));
-                let Some(def_at) = src.find(&format!("vec3 {func}(")).or(src.find(&format!("float {func}("))) else {
+                // Every return type the helpers actually use — `vec3`/`float` alone missed
+                // `ssr_trace`, which returns a vec4 (rgb + confidence) and so read as undefined.
+                let def_at = ["vec2", "vec3", "vec4", "float", "bool"]
+                    .iter()
+                    .find_map(|ty| src.find(&format!("{ty} {func}(")));
+                let Some(def_at) = def_at else {
                     // Not used by this shader at all is fine; used-but-undefined is not.
                     assert!(!src.contains(&format!("{func}(")), "{name}: calls `{func}` but never defines it");
                     continue;
@@ -5337,8 +6254,12 @@ mod tests {
         // The attenuation must come BEFORE the coat's own lobes, or it would dim the very
         // reflection it is adding instead of the material underneath.
         let loss = coat.find("direct *= (1.0 - loss)").expect("the base is attenuated");
-        let add = coat.find("direct += vec3(d_ggx").expect("the coat's sun lobe");
+        let add = coat.find("vec3 coat_key = vec3(d_ggx").expect("the coat's sun lobe");
         assert!(loss < add, "the coat dims itself instead of the base");
+        // Both coat lobes are SPECULAR, so both must join `spec` — transmission scales the
+        // diffuse away and a lacquered surface still mirrors the room at any transmission.
+        assert!(coat.contains("direct += coat_key; spec += coat_key;"), "the coat's key lobe is specular");
+        assert!(coat.contains("direct += coat_env; spec += coat_env;"), "…and so is its environment lobe");
         assert!(coat.contains("ambient *= (1.0 - loss)"), "the ambient pays too, not just the direct");
     }
 

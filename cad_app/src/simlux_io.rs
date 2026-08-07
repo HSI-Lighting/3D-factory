@@ -110,11 +110,14 @@ pub struct TextureRec {
     pub offset: [f32; 2],
     #[serde(default)]
     pub rot_deg: f32,
-    /// Surface OPACITY (1.0 = opaque) and REFLECTION (0.0 = matte). `#[serde(default*)]` so older
-    /// sidecars load as opaque + matte.
+    /// Surface OPACITY (1.0 = opaque) and REFLECTION (1.0 = the full physical amount).
+    /// `#[serde(default = "one")]` on both, so a sidecar predating either field loads as an
+    /// ordinary opaque surface that reflects its surroundings — which is what a material with
+    /// nothing said about it should do. (`decode_texture_rec` also reads a stored 0 as 1.0, for
+    /// the sidecars written while 0 was still the default.)
     #[serde(default = "one")]
     pub opacity: f32,
-    #[serde(default)]
+    #[serde(default = "one")]
     pub reflect: f32,
     /// PNG-encoded pixels, base64. Decoded back to RGBA8 on load. For a procedural texture this is
     /// just a 1×1 fallback swatch; the real definition lives in `proc`.
@@ -140,6 +143,15 @@ pub struct TextureRec {
     pub emission: [f32; 3],
     #[serde(default)]
     pub emission_strength: f32,
+    /// This material is a MEDIUM light travels through (water, a glass block) rather than a surface
+    /// with holes. `#[serde(default)]` = 0, which is what every material predating it was.
+    ///
+    /// Persisted because it is not derivable from anything else here: opacity says HOW MUCH light
+    /// gets past, and this says whether what gets past is filtered by the material on its way. A
+    /// water material that reloaded without it would come back as tinted glazing over the pool
+    /// floor instead of water in a pool.
+    #[serde(default)]
+    pub transmission: f32,
 }
 
 fn half() -> f32 {

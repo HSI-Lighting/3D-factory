@@ -4625,7 +4625,7 @@ impl CadApp {
         }
         let is_proc = proc_def.is_some();
         // Seed the slider values from the display texture, or sensible defaults for an untextured
-        // piece (opacity 100 = opaque, reflect 1 = matte).
+        // piece (opacity 100 = opaque, reflect 100 = reflects its surroundings properly).
         let (mut scale, mut off, mut rot, mut opacity_pct, mut reflect_pct) =
             match tex_idx.and_then(|ti| self.factory.textures.get(ti)) {
                 Some(t) => (
@@ -4633,7 +4633,7 @@ impl CadApp {
                     (t.opacity * 100.0).round().clamp(1.0, 100.0),
                     (t.reflect * 100.0).round().clamp(1.0, 100.0),
                 ),
-                None => (1.0, [0.0, 0.0], 0.0, 100.0, 1.0),
+                None => (1.0, [0.0, 0.0], 0.0, 100.0, 100.0),
             };
         if !is_proc {
         ui.horizontal(|ui| {
@@ -4679,13 +4679,17 @@ impl CadApp {
             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
             if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].opacity = (opacity_pct / 100.0).clamp(0.01, 1.0); } }
         });
-        // REFLECTION: 1 = matte, 100 = mirror-like glossy sheen (view-dependent highlight).
+        // REFLECTION: 100 (the default) = the physically correct amount for this material's
+        // roughness and IOR; below that is an artistic knock-down, not a physical statement.
+        // The mapping is `pct/100`, NOT `(pct-1)/99`: a stored 0 has to keep meaning "written
+        // before reflections worked" so `decode_texture_rec` can migrate it, and the old mapping
+        // let a user author exactly 0 at 1%.
         ui.horizontal(|ui| {
             ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("reflect").small().weak()))
-                .on_hover_text("Surface reflection: 1 = no reflection (matte), 100 = maximum glossy sheen.");
+                .on_hover_text("How much of the surface's true reflection to keep: 100 = physically correct, lower = artificially dulled. Use ROUGHNESS to make something matte.");
             let r = ui.add(egui::Slider::new(&mut reflect_pct, 1.0..=100.0).show_value(true));
             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
-            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].reflect = ((reflect_pct - 1.0) / 99.0).clamp(0.0, 1.0); } }
+            if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].reflect = (reflect_pct / 100.0).clamp(0.01, 1.0); } }
         });
 
         // ── Surface (PBR maps) — a tangent-space NORMAL map + ROUGHNESS, lit by the sun (Texture
@@ -5626,9 +5630,18 @@ impl CadApp {
             // Carry the material's SURFACE properties, not just its colour. Without these every
             // import sat at the app's default 0.5 roughness: a pool authored at 0.035 — a mirror —
             // rendered as flat cyan paint with nothing to reflect, and the whole scene read matte.
+            // …and its MAPS. `globals` already holds every image the model referenced — base
+            // colours and maps alike — so a map is just another index into it.
+            let map_of = |v: &Vec<Option<usize>>, part: usize| -> Option<usize> {
+                v.get(part).copied().flatten().and_then(|s| globals.get(s).copied())
+            };
             for (part, slot) in pbr.part_texture.iter().enumerate() {
                 let (Some(s), Some(g)) = (slot, slot.and_then(|s| globals.get(s).copied())) else { continue };
                 let _ = s;
+                let nrm = map_of(&pbr.part_normal, part);
+                let rgh = map_of(&pbr.part_rough_map, part);
+                let mtl = map_of(&pbr.part_metal_map, part);
+                let ao = map_of(&pbr.part_ao_map, part);
                 if let Some(t) = self.factory.textures.get_mut(g) {
                     if let Some(r) = pbr.part_rough.get(part) {
                         t.roughness = r.clamp(0.0, 1.0);
@@ -5636,6 +5649,20 @@ impl CadApp {
                     if let Some(m) = pbr.part_metal.get(part) {
                         t.metallic = m.clamp(0.0, 1.0);
                     }
+                    // A MEDIUM, as opposed to a surface with holes — the difference decides whether
+                    // this is a volume whose back faces must be dropped. See `TextureAsset`.
+                    if let Some(x) = pbr.part_transmission.get(part) {
+                        t.transmission = x.clamp(0.0, 1.0);
+                    }
+                    // A map WINS over the scalar in the shader, so only overwrite when there is
+                    // one — a second part sharing this base image must not clear the first's maps.
+                    if nrm.is_some() { t.normal_map = nrm; }
+                    if rgh.is_some() { t.rough_map = rgh; }
+                    if mtl.is_some() { t.metal_map = mtl; }
+                    if ao.is_some() { t.ao_map = ao; }
+                    // These models carry real UVs, so the maps must be sampled through them and
+                    // not world-projected — triplanar would slide a normal map across the wall.
+                    t.triplanar = false;
                 }
             }
             gltf_tex_note = format!(" gltf_mats={} parts={}", globals.len(), per_part_tex.len());
@@ -6136,8 +6163,8 @@ impl CadApp {
         if let Some(t) = self.factory.textures.get_mut(i) {
             t.metallic = look.metallic;
             t.roughness = look.roughness;
-            // A polished lever really does mirror the room; a matt-black one does not.
-            t.reflect = (look.metallic * (1.0 - 0.6 * look.roughness)).clamp(0.0, 1.0);
+            // A polished lever mirrors the room and a matt-black one does not — but that is what
+            // ROUGHNESS says, and the shader already reads it. `reflect` stays at its 1.0 default.
         }
         i
     }
@@ -9918,6 +9945,9 @@ impl CadApp {
                 let mut want_sketch: Option<cad_solid::Frame> = None;
                 let mut want_finish = false;
                 let mut want_choose_view: Option<usize> = None;
+                // Square the view up to a face. Deferred like the others — the menu closure cannot
+                // borrow `self` mutably while `pending` is read from it.
+                let mut want_face_on: Option<cad_solid::Frame> = None;
 
                 // PATH-SWEEP "which view?" overlay — shown after the cross-section is finished.
                 // Offers the two perpendicular planes for drawing the path (path defines where
@@ -9962,6 +9992,23 @@ impl CadApp {
                                 .small()
                                 .weak(),
                             );
+                            // Square the view up FIRST — listed above "draw" because on a face at
+                            // an angle it is the difference between drafting and guessing.
+                            if ui
+                                .button("⊾  Look square-on at this face")
+                                .on_hover_text(
+                                    "Orbit until you are looking straight at this face, and switch \
+                                     to parallel projection.\n\n\
+                                     On a face turned away from you, a pixel of mouse movement is \
+                                     a long way across the face, so nothing drawn on it can be \
+                                     placed accurately. Square-on, a millimetre on screen is a \
+                                     millimetre on the face — everywhere on it.",
+                                )
+                                .clicked()
+                            {
+                                want_face_on = Some(f);
+                                ui.close_menu();
+                            }
                             if ui
                                 .button("✎  Draw on this face")
                                 .on_hover_text("Sketch here with the FULL 2D toolset")
@@ -10207,11 +10254,16 @@ impl CadApp {
                 let mut tex_reflect_owned: Vec<(usize, f32)> = Vec::new();
                 let mut tex_proc_owned: Vec<(usize, crate::light3d::ProcParams)> = Vec::new();
                 let mut tex_pbr_owned: Vec<(usize, crate::light3d::PbrParams)> = Vec::new();
-                // PBR normal/roughness maps referenced by any needed texture must ALSO upload.
+                // Every PBR map referenced by a needed texture must ALSO upload — all FOUR of them.
+                // Normal and roughness alone was enough while maps only ever came from a texture
+                // set the user assembled by hand; a glTF import binds metallic and occlusion too,
+                // and a map whose image never reaches the GPU is a sampler reading black.
                 let pbr_maps: Vec<usize> = needed_tex
                     .iter()
                     .filter_map(|&i| self.factory.textures.get(i))
-                    .flat_map(|t| t.normal_map.into_iter().chain(t.rough_map))
+                    .flat_map(|t| {
+                        t.normal_map.into_iter().chain(t.rough_map).chain(t.metal_map).chain(t.ao_map)
+                    })
                     .collect();
                 for m in pbr_maps {
                     needed_tex.insert(m);
@@ -10224,9 +10276,12 @@ impl CadApp {
                             .or_insert_with(|| StdArc::new(t.rgba.clone()))
                             .clone();
                         tex_assets_owned.push((idx, rgba, t.w as i32, t.h as i32));
-                        if t.reflect > 0.0 {
-                            tex_reflect_owned.push((idx, t.reflect));
-                        }
+                        // Every texture, not just the ones above some threshold. `reflect` is now
+                        // "how much of the physical reflection to keep", 1.0 by default, so a
+                        // `> 0.0` filter would have silently dropped nothing — but a material
+                        // turned DOWN to matte has to reach the renderer just as much as one
+                        // turned up, and the old gate would have skipped exactly those.
+                        tex_reflect_owned.push((idx, t.reflect));
                         // A procedural texture carries its shader params instead of an image.
                         if let Some(def) = &t.proc {
                             tex_proc_owned.push((idx, def.params()));
@@ -10476,6 +10531,18 @@ impl CadApp {
                     ui.ctx().request_repaint();
                 }
                 // applied outside the context-menu closure (it can't borrow self mutably)
+                if let Some(f) = want_face_on {
+                    // `pick_face` anchors the frame at the point the ray hit, so this centres on
+                    // the spot you right-clicked rather than on the face's centroid — which is what
+                    // you want on a long wall, where the centroid may be off screen entirely.
+                    self.factory.look_at_frame(&f, f.origin);
+                    let n = f.normal();
+                    self.factory.status = format!(
+                        "looking square-on at the face ({:.2}, {:.2}, {:.2}) — parallel projection",
+                        n.x, n.y, n.z
+                    );
+                    ui.ctx().request_repaint();
+                }
                 if let Some(f) = want_sketch {
                     self.factory_enter_sketch(f);
                 }
@@ -20420,6 +20487,56 @@ impl CadApp {
                             .weak(),
                     );
                 });
+                ui.checkbox(&mut s.refract.enabled, "Refraction (glass bends what is behind it)")
+                    .on_hover_text(
+                        "Blended glass shows you the wall behind it, dimmed and tinted, but sitting \
+                         exactly where it would be with no glass there at all. Real glass MOVES it. \
+                         That displacement is most of what tells you a surface is glass rather than \
+                         a tinted hole.\n\n\
+                         Screen-space, so it can only bend what is already on screen — a ray sent \
+                         toward something outside the frame lands on the nearest edge pixel. \
+                         Unnoticeable on a pane set in a wall; visible on a thick lens filling the \
+                         view.",
+                    );
+                ui.add_enabled_ui(s.refract.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut s.refract.ior).speed(0.01).range(1.0..=2.5).prefix("IOR "))
+                            .on_hover_text("Window glass is 1.52, water 1.33, acrylic 1.49. 1.0 is no bend at all.");
+                        ui.add(egui::DragValue::new(&mut s.refract.thickness).speed(0.005).range(0.0..=0.5).prefix("thickness ").suffix(" m"))
+                            .on_hover_text(
+                                "How far the displacement reaches. The pass has one surface to work \
+                                 with rather than a front and a back, so this stands in for the \
+                                 glass a ray crosses instead of measuring the pane.",
+                            );
+                    });
+                });
+                ui.checkbox(&mut s.ssr.enabled, "Reflect the scene (not just the sky)")
+                    .on_hover_text(
+                        "An environment map holds sky, so a reflection taken from one shows sky. A \
+                         pool cannot reflect the trees standing beside it out of a sky map, however \
+                         good the map — the trees are not in it. This marches the reflected ray \
+                         through the scene and returns what it really hits.\n\n\
+                         Screen-space: it can only reflect what is already drawn. A tree just \
+                         outside the frame, or hidden behind the building from the reflection's \
+                         point of view, is not there to be found, so the reflection fades back to \
+                         the sky at the edges rather than ending on a hard line.\n\n\
+                         Smooth surfaces only — water, glass, polished stone. A rough surface \
+                         reflects a wide lobe that a single ray cannot stand in for.",
+                    );
+                ui.add_enabled_ui(s.ssr.enabled, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut s.ssr.distance).speed(1.0).range(1.0..=200.0).prefix("reach ").suffix(" m"))
+                            .on_hover_text("How far a reflected ray may travel. Longer spans a whole site and costs proportionally more steps.");
+                        ui.add(egui::DragValue::new(&mut s.ssr.thickness).speed(0.05).range(0.05..=5.0).prefix("thickness ").suffix(" m"))
+                            .on_hover_text(
+                                "How far behind a surface a ray may pass and still count as hitting \
+                                 it. The depth buffer records one surface per pixel with no \
+                                 thickness, so this stands in for it: too small and rays tunnel \
+                                 through walls, too large and everything smears a reflection of \
+                                 whatever is in front of it.",
+                            );
+                    });
+                });
                 ui.separator();
 
                 ui.label(egui::RichText::new("Location").small().weak());
@@ -23192,13 +23309,11 @@ impl CadApp {
         if let Some(t) = self.factory.textures.get_mut(metal) {
             t.metallic = 0.85;
             t.roughness = 0.35;
-            t.reflect = (0.85f32 * (1.0 - 0.6 * 0.35)).clamp(0.0, 1.0);
         }
         let alu = sw(self, "Desk trim (alu)", [204, 204, 209]);
         if let Some(t) = self.factory.textures.get_mut(alu) {
             t.metallic = 1.0;
             t.roughness = 0.30;
-            t.reflect = (1.0f32 * (1.0 - 0.6 * 0.30)).clamp(0.0, 1.0);
         }
         let dark = sw(self, "Desk dark detail", [26, 26, 28]);
         let cap = sw(self, "Desk foot caps", [219, 219, 219]);
@@ -23482,7 +23597,6 @@ impl CadApp {
         if let Some(t) = self.factory.textures.get_mut(rod) {
             t.metallic = 0.8;
             t.roughness = 0.35;
-            t.reflect = (0.8f32 * (1.0 - 0.6 * 0.35)).clamp(0.0, 1.0);
         }
         let per_part_tex: Vec<Option<usize>> = mats
             .iter()

@@ -169,7 +169,9 @@ pub struct CompiledMaterial {
     pub metallic: f32,
     pub ior: f32,
     pub opacity: f32,
-    /// View-dependent glossy sheen for the raster shader — derived from metallic (0 = matte).
+    /// How much of the physically correct environment reflection the raster shader keeps. 1.0 —
+    /// all of it — for everything a graph compiles; metallic reaches the specular through `f0`,
+    /// not through here.
     pub reflect: f32,
     /// `Some` ⇒ the base colour is driven by a procedural (a real pattern, OR a degenerate SOLID
     /// colour — see [`ProcDef::solid`] — so plain colours update live through the shader uniforms).
@@ -324,8 +326,11 @@ impl MaterialGraph {
             _ => None,
         };
 
-        // Metallic drives the raster's glossy sheen; sharper when smoother.
-        let reflect = (metallic * (1.0 - 0.6 * roughness)).clamp(0.0, 1.0);
+        // Every material reflects its surroundings by the physically correct amount — the shader
+        // works that out from `f0` (which carries metallic) and the split-sum BRDF. Deriving a
+        // separate `metallic × (1 − 0.6·roughness)` gate here is what left every dielectric a node
+        // graph could author — water, glass, polished stone — with no reflection whatsoever.
+        let reflect = 1.0;
 
         CompiledMaterial {
             base_color,
@@ -437,11 +442,28 @@ mod tests {
         assert!((c.roughness - 0.2).abs() < 1e-6);
         assert!((c.metallic - 1.0).abs() < 1e-6);
         assert!((c.opacity - 0.5).abs() < 1e-6);
-        assert!(c.reflect > 0.0, "metallic drives the glossy sheen");
+        assert_eq!(c.reflect, 1.0, "the environment lobe is kept in full; f0 carries metallic");
         // A plain Principled colour compiles to a SOLID procedural (so it updates live).
         assert!(!c.use_image, "no bitmap");
         assert!(c.proc.map(|p| p.is_solid()).unwrap_or(false), "flat colour → solid proc");
         assert_eq!(c.base_color, p.base_color);
+    }
+
+    /// The bug this file carried: a DIELECTRIC compiled to `reflect = 0`, because the old mapping
+    /// was `metallic × (1 − 0.6·roughness)` and every non-metal has `metallic = 0`. Water at
+    /// roughness 0.035 is a mirror; it must not compile to "matte".
+    #[test]
+    fn a_polished_dielectric_still_reflects() {
+        let mut g = MaterialGraph { nodes: Vec::new(), edges: Vec::new(), next_id: 0 };
+        let out = g.add(NodeKind::Output, [0.0, 0.0]);
+        let mut p = Principled::default();
+        p.roughness = 0.035; // pool water
+        p.metallic = 0.0;    // …and it is not a metal
+        let bsdf = g.add(NodeKind::Principled(p), [0.0, 0.0]);
+        g.connect(bsdf, 0, out, 0);
+        let c = g.compile();
+        assert_eq!(c.metallic, 0.0, "still a dielectric");
+        assert_eq!(c.reflect, 1.0, "and it reflects the environment in full");
     }
 
     #[test]

@@ -2063,6 +2063,39 @@ pub struct GltfPbr {
     /// whole scene read matte. Empty when the format has no such notion (OBJ, FBX).
     pub part_rough: Vec<f32>,
     pub part_metal: Vec<f32>,
+    /// Per part: the material's MAPS — tangent-space normal, plus the roughness / metallic /
+    /// occlusion channels of its `metallicRoughnessTexture` and `occlusionTexture`, each already
+    /// split into its own single-channel image. Indices into [`Self::textures`], like
+    /// `part_texture`, and `None` where the material has no such map.
+    ///
+    /// The scalars above were read and the maps were not, and that is not the same material: the
+    /// villa's stucco, painted wood, roof tiles, granite paving and pool tiles each carry a normal
+    /// map AND a packed metallic-roughness map, so all five imported perfectly flat with one
+    /// uniform finish across the whole surface.
+    pub part_normal: Vec<Option<usize>>,
+    pub part_rough_map: Vec<Option<usize>>,
+    pub part_metal_map: Vec<Option<usize>>,
+    pub part_ao_map: Vec<Option<usize>>,
+    /// Per part: `KHR_materials_transmission`, 0 for everything else. See [`gltf_transmission`] —
+    /// this is what tells the renderer a surface is a MEDIUM rather than a mesh with holes, and so
+    /// which surfaces are volumes whose back faces must not be drawn.
+    pub part_transmission: Vec<f32>,
+}
+
+/// Which channel of a glTF image an app-side map wants.
+///
+/// glTF packs occlusion in R, roughness in G and metallic in B of ONE image, while the shader reads
+/// `.r` through a dedicated sampler per map. So a packed source is split here, at import, into one
+/// single-channel image each. The alternative — a channel selector threaded through the texture
+/// asset, the uploader and three uniforms — carries a fact the importer already knows all the way
+/// to the GPU for no gain.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Chan {
+    /// Keep all three channels — a tangent-space normal map.
+    Rgb,
+    R,
+    G,
+    B,
 }
 
 /// Accumulator threaded through the glTF node walk while building the multi-material mesh.
@@ -2075,8 +2108,16 @@ struct GltfBuild {
     part_texture: Vec<Option<usize>>, // per part → slot in `textures`
     part_rough: Vec<f32>,
     part_metal: Vec<f32>,
+    part_normal: Vec<Option<usize>>,
+    part_rough_map: Vec<Option<usize>>,
+    part_metal_map: Vec<Option<usize>>,
+    part_ao_map: Vec<Option<usize>>,
+    part_transmission: Vec<f32>,
     textures: Vec<(u32, u32, Vec<u8>)>,
     img_slot: std::collections::HashMap<usize, usize>, // image source index → `textures` slot
+    /// `(image source, channel)` → slot, for the maps. Keyed on the channel too because one packed
+    /// metallic-roughness image legitimately becomes two different app textures.
+    aux_slot: std::collections::HashMap<(usize, Chan), usize>,
     color_slot: std::collections::HashMap<[u8; 4], usize>, // solid-colour factor → slot
     next_part: u32,
 }
@@ -2111,8 +2152,24 @@ impl GltfBuild {
             .and_then(|m| m.pointer("/pbrMetallicRoughness/baseColorFactor"))
             .and_then(|v| v.as_array());
         if let Some(f) = factor {
-            let to8 = |i: usize| (f.get(i).and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 1.0) * 255.0).round() as u8;
-            let rgba = [to8(0), to8(1), to8(2), to8(3)];
+            // `baseColorFactor` is LINEAR — glTF is a linear-light format — but a swatch is a
+            // texture, and every texture in this app is sRGB-encoded bytes that the uploader hands
+            // to GL as `SRGB8_ALPHA8` for the sampler to decode. Writing the linear number straight
+            // into the byte makes the sampler decode something that was never encoded, and the
+            // material lands far darker than it was authored: the villa's pool water, authored
+            // (0.055, 0.30, 0.34), arrived as (0.004, 0.065, 0.095) — a thirteenth of its red — so
+            // it had almost no colour of its own left, and once it reflected the sky at all it
+            // read as pale grey rather than as water.
+            //
+            // ALPHA is coverage, not colour: it is linear on both sides and must not be encoded.
+            let chan = |i: usize| f.get(i).and_then(|v| v.as_f64()).unwrap_or(1.0).clamp(0.0, 1.0) as f32;
+            let to8 = |v: f32| (v * 255.0).round() as u8;
+            let rgba = [
+                to8(crate::color::linear_to_srgb(chan(0))),
+                to8(crate::color::linear_to_srgb(chan(1))),
+                to8(crate::color::linear_to_srgb(chan(2))),
+                to8(chan(3)),
+            ];
             if let Some(&slot) = self.color_slot.get(&rgba) {
                 return Some(slot);
             }
@@ -2122,6 +2179,65 @@ impl GltfBuild {
             return Some(slot);
         }
         None
+    }
+
+    /// Load the image behind a `textures[]` entry as a MAP, taking `chan` from it, and return its
+    /// `textures` slot. Deduped on `(image source, channel)`.
+    fn map_slot(
+        &mut self, doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
+        tex_idx: usize, chan: Chan,
+    ) -> Option<usize> {
+        let src = doc["textures"][tex_idx].get("source").and_then(|v| v.as_u64())? as usize;
+        if let Some(&slot) = self.aux_slot.get(&(src, chan)) {
+            return Some(slot);
+        }
+        let (w, h, mut rgba) = gltf_image_at(doc, bufs, base_dir, src)?;
+        if chan != Chan::Rgb {
+            // Broadcast the wanted channel across RGB — the shader samples `.r`, and keeping the
+            // other two would leave a roughness map looking like a colour picture in the library.
+            let k = match chan {
+                Chan::R => 0,
+                Chan::G => 1,
+                Chan::B => 2,
+                Chan::Rgb => unreachable!(),
+            };
+            for px in rgba.chunks_exact_mut(4) {
+                let v = px[k];
+                px[0] = v;
+                px[1] = v;
+                px[2] = v;
+                px[3] = 255;
+            }
+        }
+        let slot = self.textures.len();
+        self.textures.push((w, h, rgba));
+        self.aux_slot.insert((src, chan), slot);
+        Some(slot)
+    }
+
+    /// Record every map this material carries, in lockstep with `part_texture`. Called ONCE per
+    /// part, so all four vectors stay parallel whether or not the material has any maps at all.
+    fn push_material_maps(
+        &mut self, doc: &serde_json::Value, bufs: &[Vec<u8>], base_dir: Option<&std::path::Path>,
+        material_idx: Option<usize>,
+    ) {
+        let tex_at = |p: &str| -> Option<usize> {
+            material_idx
+                .and_then(|mi| doc["materials"][mi].pointer(p))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+        let nrm = tex_at("/normalTexture/index");
+        let mr = tex_at("/pbrMetallicRoughness/metallicRoughnessTexture/index");
+        let ao = tex_at("/occlusionTexture/index");
+        let n = nrm.and_then(|t| self.map_slot(doc, bufs, base_dir, t, Chan::Rgb));
+        let r = mr.and_then(|t| self.map_slot(doc, bufs, base_dir, t, Chan::G));
+        let m = mr.and_then(|t| self.map_slot(doc, bufs, base_dir, t, Chan::B));
+        let o = ao.and_then(|t| self.map_slot(doc, bufs, base_dir, t, Chan::R));
+        self.part_normal.push(n);
+        self.part_rough_map.push(r);
+        self.part_metal_map.push(m);
+        self.part_ao_map.push(o);
     }
 }
 
@@ -2176,6 +2292,10 @@ fn gltf_emit_mesh(
         };
         build.part_rough.push(num("/pbrMetallicRoughness/roughnessFactor", 0.5).clamp(0.0, 1.0));
         build.part_metal.push(num("/pbrMetallicRoughness/metallicFactor", 0.0).clamp(0.0, 1.0));
+        // …and the MAPS beside those scalars, pushed here so all the per-part vectors advance
+        // together even for a material that has none.
+        build.push_material_maps(doc, bufs, base_dir, material_idx);
+        build.part_transmission.push(gltf_transmission(doc, material_idx));
 
         let gp = |i: u32| -> glam::Vec3 {
             let k = i as usize * 3;
@@ -2191,8 +2311,9 @@ fn gltf_emit_mesh(
         };
         // glTF is Y-up; the app is Z-up → (x, y, z) → (x, -z, y).
         let z_up = |v: glam::Vec3| [v.x, -v.z, v.y];
-        // Material opacity: only `alphaMode:BLEND` is treated as see-through (OPAQUE/MASK stay
-        // solid — we don't do per-texel cutout yet), taking its `baseColorFactor` alpha.
+        // Material opacity: `alphaMode:BLEND` coverage OR `KHR_materials_transmission`, whichever
+        // lets more light through (MASK stays solid — no per-texel cutout yet). See
+        // `gltf_material_alpha`.
         let mat_alpha = gltf_material_alpha(doc, prim);
         for t in indices.chunks_exact(3) {
             let (a, b, c) = (gp(t[0]), gp(t[1]), gp(t[2]));
@@ -2269,18 +2390,53 @@ fn gltf_image_bytes(img: &serde_json::Value, base_dir: Option<&std::path::Path>)
     base_dir.map(|d| d.join(&dec)).and_then(|p| std::fs::read(p).ok())
 }
 
-/// A glTF primitive's opacity in `0..=1`. Only `alphaMode:BLEND` is see-through — it takes the
-/// material's `baseColorFactor` alpha (default 1). `OPAQUE` (the default) and `MASK` return 1.0.
+/// A glTF primitive's opacity in `0..=1`.
+///
+/// TWO independent ways a glTF says "you can see through this", and the file needs both read:
+///
+///   * `alphaMode:BLEND` — thin coverage, the alpha of `baseColorFactor`. `OPAQUE` (the default)
+///     and `MASK` are solid.
+///   * **`KHR_materials_transmission`** — real refractive transmission, which is what a physically
+///     based authoring tool writes for water, glass and anything else light passes THROUGH rather
+///     than around. A transmissive material stays `alphaMode:OPAQUE` by design (the spec is
+///     explicit that transmission is not coverage), so reading only `alphaMode` misses it
+///     completely — which is how the villa's pool, authored at 0.45 transmission, imported as a
+///     solid teal lid with the tiles beneath it invisible.
+///
+/// Whichever admits more light wins, so a material using both is not double-counted.
 fn gltf_material_alpha(doc: &serde_json::Value, prim: &serde_json::Value) -> f32 {
     let Some(mi) = prim.get("material").and_then(|v| v.as_u64()) else { return 1.0 };
     let m = &doc["materials"][mi as usize];
-    if m.get("alphaMode").and_then(|v| v.as_str()) != Some("BLEND") {
-        return 1.0;
-    }
-    m.pointer("/pbrMetallicRoughness/baseColorFactor/3")
-        .and_then(|v| v.as_f64())
-        .map(|a| (a as f32).clamp(0.0, 1.0))
-        .unwrap_or(1.0)
+    let blend = if m.get("alphaMode").and_then(|v| v.as_str()) == Some("BLEND") {
+        m.pointer("/pbrMetallicRoughness/baseColorFactor/3")
+            .and_then(|v| v.as_f64())
+            .map(|a| (a as f32).clamp(0.0, 1.0))
+            .unwrap_or(1.0)
+    } else {
+        1.0
+    };
+    blend.min(1.0 - gltf_transmission(doc, prim.get("material").and_then(|v| v.as_u64()).map(|m| m as usize)))
+}
+
+/// A material's `KHR_materials_transmission` factor, 0 when it has none.
+///
+/// Kept apart from the coverage alpha above because the two are NOT the same physical thing, and
+/// collapsing them cost a day: coverage says "this mesh has holes in it", transmission says "this
+/// is a MEDIUM light travels through". A leaf card is the first; water is the second. Only the
+/// second is a volume — with an entry face and an exit face — and only the second may therefore
+/// have its back faces dropped. Cull a leaf card's back face and the tree disappears when you walk
+/// round it.
+fn gltf_transmission(doc: &serde_json::Value, material_idx: Option<usize>) -> f32 {
+    // The extension's own default is 0 (opaque) when the object is present but the factor absent.
+    material_idx
+        .and_then(|mi| doc["materials"][mi].pointer("/extensions/KHR_materials_transmission"))
+        .map(|t| {
+            t.get("transmissionFactor")
+                .and_then(|v| v.as_f64())
+                .map(|v| (v as f32).clamp(0.0, 1.0))
+                .unwrap_or(0.0)
+        })
+        .unwrap_or(0.0)
 }
 
 /// Parse a glTF into geometry (Z-up flat soup) PLUS its PBR extras — per-vertex UVs, per-primitive
@@ -2319,6 +2475,11 @@ pub fn parse_gltf_ex(data: &[u8], base_dir: Option<&std::path::Path>) -> (ObjMes
         pbr.part_texture = std::mem::take(&mut build.part_texture);
         pbr.part_rough = std::mem::take(&mut build.part_rough);
         pbr.part_metal = std::mem::take(&mut build.part_metal);
+        pbr.part_normal = std::mem::take(&mut build.part_normal);
+        pbr.part_rough_map = std::mem::take(&mut build.part_rough_map);
+        pbr.part_metal_map = std::mem::take(&mut build.part_metal_map);
+        pbr.part_ao_map = std::mem::take(&mut build.part_ao_map);
+        pbr.part_transmission = std::mem::take(&mut build.part_transmission);
     }
     pbr.texture = build.textures.first().cloned(); // back-compat single-texture field
     pbr.textures = std::mem::take(&mut build.textures);
@@ -2787,6 +2948,135 @@ f 1//1 2//1 3//1
         assert_eq!(m.positions[2], [0.0, 0.0, 1.0]);
     }
 
+    /// Wrap a JSON doc + BIN chunk into a GLB container.
+    fn glb_of(json: String, mut bin: Vec<u8>) -> Vec<u8> {
+        let mut jb = json.into_bytes();
+        while jb.len() % 4 != 0 { jb.push(b' '); }
+        while bin.len() % 4 != 0 { bin.push(0); }
+        let total = 12 + 8 + jb.len() + 8 + bin.len();
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(jb.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x4E4F_534Au32.to_le_bytes()); // "JSON"
+        glb.extend_from_slice(&jb);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x004E_4942u32.to_le_bytes()); // "BIN\0"
+        glb.extend_from_slice(&bin);
+        glb
+    }
+
+    /// One triangle wearing a material with a normal map, a PACKED metallic-roughness map and
+    /// `KHR_materials_transmission` — i.e. the shape of every textured material in the villa.
+    ///
+    /// The packed map is the point: glTF puts occlusion/roughness/metallic in R/G/B of ONE image
+    /// and the shader reads `.r` per sampler, so importing it whole would feed the roughness
+    /// sampler a picture whose red channel is the AMBIENT OCCLUSION.
+    #[test]
+    fn gltf_splits_the_packed_metallic_roughness_map() {
+        // A 2×1 image with distinguishable channels: px0 = (10, 20, 30), px1 = (40, 50, 60).
+        let img = image::RgbaImage::from_raw(2, 1, vec![10, 20, 30, 255, 40, 50, 60, 255]).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let png = png.into_inner();
+
+        let pos: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut bin = Vec::new();
+        for f in pos { bin.extend_from_slice(&f.to_le_bytes()); }
+        for i in [0u16, 1, 2] { bin.extend_from_slice(&i.to_le_bytes()); }
+        while bin.len() % 4 != 0 { bin.push(0); }
+        let png_off = bin.len();
+        bin.extend_from_slice(&png);
+
+        let json = format!(r#"{{
+            "asset":{{"version":"2.0"}},
+            "scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+            "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
+            "materials":[{{
+                "pbrMetallicRoughness":{{
+                    "baseColorFactor":[0.055,0.3,0.34,1],
+                    "roughnessFactor":0.035,"metallicFactor":0.0,
+                    "metallicRoughnessTexture":{{"index":0}}}},
+                "normalTexture":{{"index":0}},
+                "occlusionTexture":{{"index":0}},
+                "extensions":{{"KHR_materials_transmission":{{"transmissionFactor":0.45}}}}}}],
+            "textures":[{{"source":0}}],
+            "images":[{{"bufferView":2,"mimeType":"image/png"}}],
+            "buffers":[{{"byteLength":{}}}],
+            "bufferViews":[
+                {{"buffer":0,"byteOffset":0,"byteLength":36}},
+                {{"buffer":0,"byteOffset":36,"byteLength":6}},
+                {{"buffer":0,"byteOffset":{},"byteLength":{}}}],
+            "accessors":[
+                {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
+                {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}]
+        }}"#, bin.len(), png_off, png.len());
+
+        let (mesh, pbr) = parse_gltf_ex(&glb_of(json, bin), None);
+        assert_eq!(mesh.tri_count(), 1);
+
+        // The scalar still arrives…
+        assert!((pbr.part_rough[0] - 0.035).abs() < 1e-6, "roughnessFactor survives");
+        // …and so do the maps, each as its OWN slot — one image became four textures.
+        let (n, r, m, o) = (pbr.part_normal[0], pbr.part_rough_map[0],
+                            pbr.part_metal_map[0], pbr.part_ao_map[0]);
+        for (name, s) in [("normal", n), ("roughness", r), ("metallic", m), ("occlusion", o)] {
+            assert!(s.is_some(), "the {name} map must be imported");
+        }
+        assert_eq!([n, r, m, o].iter().flatten().collect::<std::collections::HashSet<_>>().len(), 4,
+            "four distinct channels ⇒ four distinct slots, not one image reused four times");
+
+        // The normal map keeps all three channels; the others are their own channel broadcast.
+        let px = |slot: Option<usize>| pbr.textures[slot.unwrap()].2.clone();
+        assert_eq!(&px(n)[0..3], &[10, 20, 30], "a normal map is not a single channel");
+        assert_eq!(&px(r)[0..3], &[20, 20, 20], "roughness comes from GREEN");
+        assert_eq!(&px(m)[0..3], &[30, 30, 30], "metallic comes from BLUE");
+        assert_eq!(&px(o)[0..3], &[10, 10, 10], "occlusion comes from RED");
+        assert_eq!(&px(r)[4..7], &[50, 50, 50], "…for every texel, not just the first");
+
+        // Transmission 0.45 ⇒ 55% opaque, even though alphaMode is (correctly) absent/OPAQUE.
+        assert!((mesh.alpha[0] - 0.55).abs() < 1e-6,
+            "KHR_materials_transmission must make the surface see-through");
+    }
+
+    /// A flat `baseColorFactor` has to survive the round trip through the swatch and back out of
+    /// the sRGB sampler as the SAME linear colour it was authored as.
+    ///
+    /// It did not. The factor is linear and was written straight into a byte, which the GPU then
+    /// decoded as though it had been sRGB-encoded — so every flat-colour glTF material imported
+    /// dark, dark colours worst of all. The pool water's red channel came out at a thirteenth of
+    /// what Blender had.
+    #[test]
+    fn gltf_flat_base_colour_survives_the_srgb_round_trip() {
+        let pos: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let mut bin = Vec::new();
+        for f in pos { bin.extend_from_slice(&f.to_le_bytes()); }
+        for i in [0u16, 1, 2] { bin.extend_from_slice(&i.to_le_bytes()); }
+        let json = format!(r#"{{
+            "asset":{{"version":"2.0"}},
+            "scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+            "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
+            "materials":[{{"pbrMetallicRoughness":{{"baseColorFactor":[0.055,0.3,0.34,1.0]}}}}],
+            "buffers":[{{"byteLength":{}}}],
+            "bufferViews":[
+                {{"buffer":0,"byteOffset":0,"byteLength":36}},
+                {{"buffer":0,"byteOffset":36,"byteLength":6}}],
+            "accessors":[
+                {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}},
+                {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}}]
+        }}"#, bin.len());
+        let (_m, pbr) = parse_gltf_ex(&glb_of(json, bin), None);
+        let px = &pbr.textures[pbr.part_texture[0].expect("a swatch")].2;
+        // Decode the swatch the way the GPU's SRGB8_ALPHA8 sampler does.
+        let back: Vec<f32> = px[0..3].iter().map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0)).collect();
+        for (got, want) in back.iter().zip([0.055f32, 0.30, 0.34]) {
+            assert!((got - want).abs() < 0.01,
+                "authored {want}, the shader would see {got} — {:?} vs the linear factor", back);
+        }
+        assert_eq!(px[3], 255, "alpha is coverage, not colour — never sRGB-encoded");
+    }
+
     /// Garbage bytes → empty mesh, no panic (fail-soft on untrusted files).
     #[test]
     fn gltf_rejects_garbage() {
@@ -2976,10 +3266,157 @@ f 1//1 2//1 3//1
         assert_eq!(gltf_material_alpha(&doc, &mat(2)), 1.0, "BLEND with no factor defaults to 1");
         assert_eq!(gltf_material_alpha(&doc, &serde_json::json!({})), 1.0, "no material ⇒ opaque");
     }
+
+    /// `KHR_materials_transmission` is the OTHER way a glTF says see-through, and the one a
+    /// physically based exporter actually uses for water and glass. A transmissive material is
+    /// `alphaMode:OPAQUE` by design — transmission is not coverage — so reading alphaMode alone
+    /// left the villa's pool a solid lid.
+    #[test]
+    fn gltf_transmission_is_see_through_despite_opaque_alpha_mode() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"materials":[
+                {"alphaMode":"OPAQUE","extensions":{"KHR_materials_transmission":{"transmissionFactor":0.45}}},
+                {"alphaMode":"OPAQUE","extensions":{"KHR_materials_transmission":{}}},
+                {"alphaMode":"BLEND","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,0.8]},
+                 "extensions":{"KHR_materials_transmission":{"transmissionFactor":0.9}}},
+                {"alphaMode":"OPAQUE","extensions":{"KHR_materials_specular":{"specularFactor":0.85}}}
+            ]}"#,
+        ).unwrap();
+        let mat = |i: u64| serde_json::json!({ "material": i });
+        assert!((gltf_material_alpha(&doc, &mat(0)) - 0.55).abs() < 1e-6, "0.45 transmitted ⇒ 0.55 opaque");
+        assert_eq!(gltf_material_alpha(&doc, &mat(1)), 1.0, "the extension's own default is 0 transmission");
+        assert!((gltf_material_alpha(&doc, &mat(2)) - 0.1).abs() < 1e-6,
+            "coverage and transmission together ⇒ whichever passes MORE light, not the product");
+        assert_eq!(gltf_material_alpha(&doc, &mat(3)), 1.0,
+            "a different KHR extension must not be mistaken for transmission");
+    }
+
+    /// Transmission has to reach the renderer as ITSELF, not folded into the coverage alpha.
+    ///
+    /// Both make a surface see-through and only one makes it a VOLUME. Water is a closed box whose
+    /// faces are coplanar with the pool liner, so its back faces must be dropped; a leaf card is a
+    /// single sheet and dropping its back face deletes the tree from behind. One number cannot say
+    /// which of those a material is, and while it was one number the water z-fought.
+    #[test]
+    fn transmission_is_carried_apart_from_coverage() {
+        let doc: serde_json::Value = serde_json::from_str(
+            r#"{"materials":[
+                {"alphaMode":"OPAQUE","extensions":{"KHR_materials_transmission":{"transmissionFactor":0.45}}},
+                {"alphaMode":"BLEND","pbrMetallicRoughness":{"baseColorFactor":[1,1,1,0.4]}}
+            ]}"#,
+        ).unwrap();
+        let mat = |i: u64| serde_json::json!({ "material": i });
+        // The pool: a medium.
+        assert!((gltf_transmission(&doc, Some(0)) - 0.45).abs() < 1e-6);
+        assert!((gltf_material_alpha(&doc, &mat(0)) - 0.55).abs() < 1e-6);
+        // A leaf card: just as see-through, and not a medium at all.
+        assert_eq!(gltf_transmission(&doc, Some(1)), 0.0, "coverage is not transmission");
+        assert!((gltf_material_alpha(&doc, &mat(1)) - 0.4).abs() < 1e-6, "…but it is still see-through");
+        assert_eq!(gltf_transmission(&doc, None), 0.0, "no material ⇒ not a medium");
+    }
 }
 
 #[cfg(test)]
 mod villa_import_tests {
+    /// What SURFACE the villa's materials actually arrive with — the maps and the transmission,
+    /// not just the geometry. Every claim here is about the real exported file.
+    ///
+    /// `cargo test --release -p cad_app --bin simlux villa_surfaces -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the exported villa scene; run explicitly"]
+    fn villa_surfaces_arrive_intact() {
+        const P: &str = r"G:\blender dev\staircase\villa scene\villa_scene.glb";
+        let path = std::path::Path::new(P);
+        assert!(path.exists(), "{P} missing — run build/export_factory.py");
+        let bytes = std::fs::read(path).expect("read");
+        let (mesh, pbr) = super::parse_gltf_ex(&bytes, path.parent());
+
+        let nparts = pbr.part_texture.len();
+        let mapped = (0..nparts).filter(|&i| pbr.part_normal[i].is_some()).count();
+        let rough_mapped = (0..nparts).filter(|&i| pbr.part_rough_map[i].is_some()).count();
+        println!("{nparts} parts, {} textures, {mapped} with a normal map, {rough_mapped} with a roughness map",
+            pbr.textures.len());
+
+        // The five textured surfaces (stucco, painted wood, roof tiles, granite paving, pool
+        // tiles) each carry a normal map AND a packed metallic-roughness map. Before this they
+        // imported with the base colour alone and rendered dead flat.
+        assert!(mapped >= 5, "expected at least the five mapped surfaces, got {mapped}");
+        assert!(rough_mapped >= 5, "…each of which also carries roughness, got {rough_mapped}");
+
+        // The pool: authored roughness 0.035 (a mirror) and transmission 0.45.
+        let water = (0..nparts)
+            .find(|&i| (pbr.part_rough[i] - 0.035).abs() < 1e-4)
+            .expect("the pool_water part, by its unmistakable roughness");
+        println!("pool_water: part {water}, rough {:.3}, metal {:.3}", pbr.part_rough[water], pbr.part_metal[water]);
+        // …and the colour the SHADER will see: the swatch decoded the way an sRGB sampler decodes it.
+        let sw = &pbr.textures[pbr.part_texture[water].expect("water swatch")].2;
+        let lin: Vec<f32> = sw[0..3].iter().map(|&b| crate::color::srgb_to_linear(b as f32 / 255.0)).collect();
+        println!("pool_water albedo: bytes {:?} → linear {:.3?} (authored 0.055, 0.300, 0.340)", &sw[0..4], lin);
+        for (got, want) in lin.iter().zip([0.055f32, 0.30, 0.34]) {
+            assert!((got - want).abs() < 0.01, "the water must keep its own colour: {lin:.3?}");
+        }
+        assert_eq!(pbr.part_metal[water], 0.0, "water is a dielectric — the case that used to reflect nothing");
+
+        // …and it must reach the mesh see-through, which only the transmission extension says.
+        let clear = mesh.alpha.iter().filter(|&&a| (a - 0.55).abs() < 1e-4).count();
+        assert!(clear > 0, "the pool surface must import at 55% opacity (0.45 transmitted)");
+        println!("{clear} vertices at 0.55 opacity — the water reads as water");
+    }
+
+    /// What SHAPE is the pool water, and does any of it sit on the same plane as the pool liner?
+    ///
+    /// Coincident faces z-fight, and z-fighting between two triangulated quads is exactly the
+    /// shifting triangular wedge pattern that appeared on the water — so this is worth knowing as
+    /// a fact rather than as a theory about the renderer.
+    ///
+    /// `cargo test --release -p cad_app --bin simlux villa_water_geometry -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the exported villa scene; run explicitly"]
+    fn villa_water_geometry() {
+        const P: &str = r"G:\blender dev\staircase\villa scene\villa_scene.glb";
+        let path = std::path::Path::new(P);
+        assert!(path.exists(), "{P} missing");
+        let bytes = std::fs::read(path).expect("read");
+        let (mesh, pbr) = super::parse_gltf_ex(&bytes, path.parent());
+
+        // Group each part's triangles by the PLANE they lie in (normal, offset), quantised.
+        let mut planes: std::collections::HashMap<(usize, [i64; 4]), usize> = Default::default();
+        for (t, part) in pbr.part_ids.iter().enumerate() {
+            let p: Vec<glam::Vec3> = (0..3).map(|k| glam::Vec3::from(mesh.positions[t * 3 + k])).collect();
+            let n = (p[1] - p[0]).cross(p[2] - p[0]);
+            if n.length_squared() < 1e-12 {
+                continue;
+            }
+            let n = n.normalize();
+            let d = n.dot(p[0]);
+            let q = |v: f32| (v * 1000.0).round() as i64;
+            *planes.entry((*part as usize, [q(n.x), q(n.y), q(n.z), q(d)])).or_default() += 1;
+        }
+
+        let water = (0..pbr.part_rough.len()).find(|&i| (pbr.part_rough[i] - 0.035).abs() < 1e-4).unwrap();
+        let mut mine: Vec<_> = planes.iter().filter(|((p, _), _)| *p == water).collect();
+        mine.sort_by_key(|((_, k), _)| *k);
+        println!("pool_water is part {water}: {} distinct planes", mine.len());
+        for ((_, k), n) in &mine {
+            println!("   normal ({:.2},{:.2},{:.2})  offset {:.3} m   {n} triangles",
+                k[0] as f32 / 1000.0, k[1] as f32 / 1000.0, k[2] as f32 / 1000.0, k[3] as f32 / 1000.0);
+        }
+
+        // Does any OTHER part share one of those planes?
+        let mut clashes = 0;
+        for ((_, k), _) in &mine {
+            for ((op, ok), on) in &planes {
+                // Same plane, opposite-facing counts too — a lid and a floor meet nose to nose.
+                let flipped = [-ok[0], -ok[1], -ok[2], -ok[3]];
+                if *op != water && (ok == k || flipped == *k) {
+                    println!("   !! part {op} shares that plane ({on} triangles) — these z-fight");
+                    clashes += 1;
+                }
+            }
+        }
+        println!("\n{clashes} coincident-plane clashes against the water");
+    }
+
     /// Load the exported villa scene through the real importer and report what it costs.
     ///
     /// The app auto-loads this file at startup, so "does it parse" and "how long does it take" are

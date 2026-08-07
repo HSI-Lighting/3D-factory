@@ -60,9 +60,18 @@ pub fn load_scene(path: &str) -> Option<FactoryState> {
         .collect();
     let per_part: Vec<Option<usize>> =
         pbr.part_texture.iter().map(|s| s.and_then(|s| globals.get(s).copied())).collect();
-    // The material's surface properties, exactly as the app import applies them.
+    // The material's surface properties, exactly as the app import applies them — scalars AND
+    // maps. Letting the maps diverge here would quietly cost this probe its whole purpose: it
+    // would go on rendering the flat version of a scene the app renders with relief.
+    let map_of = |v: &Vec<Option<usize>>, part: usize| -> Option<usize> {
+        v.get(part).copied().flatten().and_then(|s| globals.get(s).copied())
+    };
     for (part, g) in per_part.iter().enumerate() {
         let Some(g) = g else { continue };
+        let nrm = map_of(&pbr.part_normal, part);
+        let rgh = map_of(&pbr.part_rough_map, part);
+        let mtl = map_of(&pbr.part_metal_map, part);
+        let ao = map_of(&pbr.part_ao_map, part);
         if let Some(t) = st.textures.get_mut(*g) {
             if let Some(r) = pbr.part_rough.get(part) {
                 t.roughness = r.clamp(0.0, 1.0);
@@ -70,6 +79,11 @@ pub fn load_scene(path: &str) -> Option<FactoryState> {
             if let Some(m) = pbr.part_metal.get(part) {
                 t.metallic = m.clamp(0.0, 1.0);
             }
+            if nrm.is_some() { t.normal_map = nrm; }
+            if rgh.is_some() { t.rough_map = rgh; }
+            if mtl.is_some() { t.metal_map = mtl; }
+            if ao.is_some() { t.ao_map = ao; }
+            t.triplanar = false;
         }
     }
 

@@ -366,6 +366,61 @@ impl Default for GiSettings {
     }
 }
 
+/// REFRACTION through glass — bending what is behind a pane instead of merely tinting it.
+///
+/// The viewport's glass blends: you see the wall behind it, dimmed and coloured, but sitting
+/// exactly where it would be with no glass there at all. Real glass MOVES it. That displacement is
+/// most of what tells you a surface is glass rather than a tinted hole, and it is the difference
+/// between a window that reads as a window and one that reads as a gap in the wall.
+///
+/// Screen-space, so it can only bend what is already on screen: a ray refracted toward something
+/// outside the frame lands on the nearest edge pixel instead. Unnoticeable on a pane set in a
+/// wall, visible on a thick lens filling the view.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefractSettings {
+    pub enabled: bool,
+    /// Index of refraction. 1.0 = no bend at all; window glass is about 1.52, water 1.33.
+    pub ior: f32,
+    /// How much glass the ray crosses, metres. A screen-space stand-in for real thickness — the
+    /// pass has one surface to work with, not a front and a back — so it is the knob that says how
+    /// far the displacement reaches rather than a measurement of the pane.
+    pub thickness: f32,
+}
+
+impl Default for RefractSettings {
+    fn default() -> Self {
+        // On, and gentle. Window glass at 1.52 with a few centimetres of apparent thickness gives
+        // the slight, correct-looking offset a real pane has, without turning a flat window into a
+        // funhouse mirror.
+        Self { enabled: true, ior: 1.52, thickness: 0.04 }
+    }
+}
+
+/// SCREEN-SPACE REFLECTIONS — the scene reflected in a glossy surface, as opposed to the sky.
+///
+/// The environment lobe can only ever return what an environment map holds, which is sky and
+/// nothing else. A pool cannot reflect the trees standing beside it from a sky map, however good
+/// the map is, because the trees are not in it. This marches the reflected ray through the depth
+/// buffer of what has already been drawn and returns what it actually hits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SsrSettings {
+    pub enabled: bool,
+    /// How far a reflected ray may travel, metres. Longer reaches across a whole courtyard and
+    /// costs proportionally more steps; the default spans a garden.
+    pub distance: f32,
+    /// How deep behind a surface a ray may pass and still count as having hit it, metres. The
+    /// depth buffer records one surface per pixel with no thickness, so this is what stands in for
+    /// it: too small and rays tunnel straight through walls, too large and everything casts a
+    /// smeared reflection of whatever happens to be in front of it.
+    pub thickness: f32,
+}
+
+impl Default for SsrSettings {
+    fn default() -> Self {
+        Self { enabled: true, distance: 40.0, thickness: 0.5 }
+    }
+}
+
 /// What the sky should be drawn as behind the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Backdrop {
@@ -387,6 +442,10 @@ pub struct EnvRender {
     pub ao: AoSettings,
     /// One bounce of coloured light between visible surfaces — see [`GiSettings`].
     pub gi: GiSettings,
+    /// Glass that BENDS what is behind it — see [`RefractSettings`].
+    pub refract: RefractSettings,
+    /// The SCENE reflected in glossy surfaces, as opposed to the sky — see [`SsrSettings`].
+    pub ssr: SsrSettings,
     pub backdrop: Backdrop,
     /// Strength of environment reflections, 0..1 — the old "reflection" slider's new home.
     pub reflections: f32,
@@ -498,7 +557,7 @@ pub const ENV_UV_GLSL: &str = r#"
 
 impl Default for EnvRender {
     fn default() -> Self {
-        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings::default(), gi: GiSettings::default(), backdrop: Backdrop::Studio, reflections: 1.0, hdri: None, sun_angle_deg: SUN_ANGLE_DEG, fog: FogSettings::default() }
+        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings::default(), gi: GiSettings::default(), refract: RefractSettings::default(), ssr: SsrSettings::default(), backdrop: Backdrop::Studio, reflections: 1.0, hdri: None, sun_angle_deg: SUN_ANGLE_DEG, fog: FogSettings::default() }
     }
 }
 
@@ -507,7 +566,7 @@ impl EnvRender {
     pub fn none() -> Self {
         // GI off too: the lux view is a MEASUREMENT, and a term whose value depends on where the
         // camera is standing has no business anywhere near a false-colour illuminance scale.
-        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings { enabled: false, ..Default::default() }, gi: GiSettings { enabled: false, ..Default::default() }, backdrop: Backdrop::Studio, reflections: 0.0, hdri: None, sun_angle_deg: 0.0, fog: FogSettings { enabled: false, ..FogSettings::default() } }
+        Self { sky: None, sh: [[0.0; 3]; 9], ao: AoSettings { enabled: false, ..Default::default() }, gi: GiSettings { enabled: false, ..Default::default() }, refract: RefractSettings { enabled: false, ..Default::default() }, ssr: SsrSettings { enabled: false, ..Default::default() }, backdrop: Backdrop::Studio, reflections: 0.0, hdri: None, sun_angle_deg: 0.0, fog: FogSettings { enabled: false, ..FogSettings::default() } }
     }
 }
 

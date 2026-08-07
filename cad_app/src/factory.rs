@@ -115,6 +115,9 @@ pub struct SunEnv {
     /// One bounce of coloured light between visible surfaces. Off by default — see
     /// [`crate::env::GiSettings`] for why this one is opt-in when the others are not.
     pub gi: crate::env::GiSettings,
+    /// Glass that BENDS what is behind it rather than only tinting it.
+    pub refract: crate::env::RefractSettings,
+    pub ssr: crate::env::SsrSettings,
     /// Strength of environment reflections, 0..1. What a glossy surface picks up from the sky.
     pub reflections: f32,
     /// Angular DIAMETER of the sun's disc, degrees — how soft its shadows are. The real sun is
@@ -148,6 +151,8 @@ impl Default for SunEnv {
             sky_backdrop: true,
             ao: crate::env::AoSettings::default(),
             gi: crate::env::GiSettings::default(),
+            refract: crate::env::RefractSettings::default(),
+            ssr: crate::env::SsrSettings::default(),
             reflections: 1.0,
             sun_angle_deg: crate::env::SUN_ANGLE_DEG,
             // Three: the point at which a villa-sized site gets centimetre texels close to the
@@ -199,6 +204,8 @@ impl SunEnv {
             sh,
             ao: self.ao,
             gi: self.gi,
+            refract: self.refract,
+            ssr: self.ssr,
             backdrop: if enabled && self.sky_backdrop { crate::env::Backdrop::Sky } else { crate::env::Backdrop::Studio },
             reflections: self.reflections,
             // Filled in by the caller that owns the loaded map — `SunEnv` describes the SUN, and an
@@ -1770,13 +1777,21 @@ pub struct MaterialPreset {
     pub roughness: f32,
     pub ior: f32,
     pub opacity: f32,
+    /// This material is a MEDIUM light travels THROUGH — water, a solid glass block — rather than a
+    /// surface with holes in it. See [`TextureAsset::transmission`]: it is what tells the renderer
+    /// the surface belongs to a volume, so what is behind it gets FILTERED by the material's colour
+    /// instead of merely uncovered, and so the volume's back faces are not drawn.
+    ///
+    /// 0 for almost everything, including the Glass presets: an architectural pane is modelled as a
+    /// thin sheet, and coverage is the honest description of it. A body of water is not.
+    pub transmission: f32,
     pub emission: [f32; 3],
     pub emission_strength: f32,
 }
 
 impl MaterialPreset {
     const fn flat(category: &'static str, name: &'static str, def: ProcDef) -> Self {
-        Self { category, name, def, metallic: 0.0, roughness: 0.6, ior: 1.5, opacity: 1.0, emission: [0.0; 3], emission_strength: 0.0 }
+        Self { category, name, def, metallic: 0.0, roughness: 0.6, ior: 1.5, opacity: 1.0, transmission: 0.0, emission: [0.0; 3], emission_strength: 0.0 }
     }
 }
 
@@ -1846,6 +1861,27 @@ pub fn material_presets() -> Vec<MaterialPreset> {
     p(MaterialPreset { roughness: 0.05, ior: 1.52, opacity: 0.22, ..MaterialPreset::flat("Glass", "Bronze glass", ProcDef::solid([0.45, 0.34, 0.24])) });
     p(MaterialPreset { roughness: 0.04, ior: 1.52, opacity: 0.16, ..MaterialPreset::flat("Glass", "Blue glass", ProcDef::solid([0.6, 0.75, 0.85])) });
 
+    // ---- Water ---- a MEDIUM, which is what separates these from the Glass presets above.
+    //
+    // `transmission` is the whole point. It tells the renderer this surface belongs to a volume, so
+    // what lies behind gets FILTERED by the water's own colour rather than merely uncovered (the
+    // difference between water and a hole in the ground), the reflection is not dimmed in step with
+    // the transparency, and the faces of the volume that lie ON its container are not drawn — the
+    // last of which is what stops a modelled pool z-fighting with its liner.
+    //
+    // Apply to ANY surface. Nothing here is specific to a pool: a fountain basin, a canal, a wet
+    // road, a puddle drawn as a flat face all want the same material.
+    //
+    // IOR 1.333 is water at 20 °C. Roughness is the ONLY difference between the three: still water
+    // is a mirror, and roughening it is what turns the reflection into a suggestion of one.
+    p(MaterialPreset { roughness: 0.02, ior: 1.333, opacity: 0.55, transmission: 0.45,
+        ..MaterialPreset::flat("Water", "Water (still)", ProcDef::solid([0.055, 0.30, 0.34])) });
+    p(MaterialPreset { roughness: 0.12, ior: 1.333, opacity: 0.60, transmission: 0.40,
+        ..MaterialPreset::flat("Water", "Water (rippled)", ProcDef::solid([0.055, 0.30, 0.34])) });
+    // Deeper, greener and far less see-through — a lake or a canal rather than a swimming pool.
+    p(MaterialPreset { roughness: 0.06, ior: 1.333, opacity: 0.82, transmission: 0.18,
+        ..MaterialPreset::flat("Water", "Water (deep)", ProcDef::solid([0.018, 0.085, 0.075])) });
+
     // ---- Paint & plaster ---- (architectural white measures ~0.78, not ~0.9)
     p(MaterialPreset { roughness: 0.75, ..MaterialPreset::flat("Paint", "Matte white", ProcDef::solid([0.80, 0.79, 0.78])) });
     // Satin is a dielectric clearcoat. Metallic 0.12 (the old value) makes the highlight take the
@@ -1883,10 +1919,15 @@ impl FactoryState {
         t.roughness = p.roughness;
         t.ior = p.ior;
         t.opacity = p.opacity.clamp(0.01, 1.0);
+        // A MEDIUM, not a surface with holes — see `TextureAsset::transmission`. Without this the
+        // Water presets would import as ordinary alpha-blended paint: what lies beneath would show
+        // through undyed rather than tinted, the reflection would be dimmed in proportion to the
+        // transparency, and a modelled body of water would z-fight with whatever it sits in.
+        t.transmission = p.transmission.clamp(0.0, 1.0);
         t.emission = p.emission;
         t.emission_strength = p.emission_strength;
-        // Metallic drives the raster's glossy sheen (same mapping as the node compiler).
-        t.reflect = (p.metallic * (1.0 - 0.6 * p.roughness)).clamp(0.0, 1.0);
+        // `reflect` stays at its 1.0 default: metallic already reaches the specular through `f0`,
+        // and multiplying by it again here is what left every dielectric preset matte.
         idx
     }
 }
@@ -1912,8 +1953,16 @@ pub struct TextureAsset {
     /// Surface OPACITY, `0.01..=1.0` (UI 1..100). 1.0 = fully opaque (the default); below it the
     /// surface is drawn see-through in the blended pass (multiplies the per-vertex alpha).
     pub opacity: f32,
-    /// Surface REFLECTION, `0.0..=1.0` (UI 1..100). 0 = matte (default); higher adds a
-    /// view-dependent glossy sheen in the textured shader (a fresnel highlight, not a true mirror).
+    /// Surface REFLECTION, `0.01..=1.0` (UI 1..100) — how much of the PHYSICALLY CORRECT
+    /// environment reflection this surface keeps. **1.0 (all of it) is the default.**
+    ///
+    /// It used to default to 0 and be computed as `metallic × (1 − 0.6·roughness)`, which meant
+    /// every dielectric — water, glass, polished stone, varnished timber — had `metallic = 0` and
+    /// so reflected nothing at all. That is backwards: water reflects ~2% head-on and ~100% at
+    /// grazing incidence, and that Fresnel ramp is most of what makes water read as water. The
+    /// shader already computes the right amount (`f0·ab.x + ab.y`, with `f0` carrying metallic),
+    /// so gating it on metallic a second time both double-counted metals and zeroed everything
+    /// else. This is now purely an artistic dial for dropping BELOW physical.
     pub reflect: f32,
     /// Cached PNG+base64 encoding for the sidecar. `rgba` never changes after creation, so the
     /// (expensive) encode is computed once on the first save and reused — otherwise EVERY save
@@ -1939,6 +1988,16 @@ pub struct TextureAsset {
     /// physical SIZE: 2.0 means a 0.5 m tile, whatever the geometry it lands on.
     pub tiles_per_m: f32,
     pub roughness: f32,
+    /// TRANSMISSION — this material is a MEDIUM light travels through (water, solid glass), not a
+    /// surface with holes in it. 0 = not a medium, which is everything else.
+    ///
+    /// The distinction is not pedantry, it is what tells the renderer the surface belongs to a
+    /// VOLUME with an entry face and an exit face. Modelled water is a closed box sitting in a pool
+    /// liner, so five of its six faces are exactly coplanar with the tiles — drawing those back
+    /// faces put two coincident surfaces in a per-pixel z-fight that read as triangular wedges
+    /// crawling over the water. Coverage transparency must NOT be treated this way: cull a leaf
+    /// card's back face and the tree vanishes when you walk round it.
+    pub transmission: f32,
     /// Principled BSDF parameters authored in the Materials Factory node editor. `metallic` drives the
     /// raster glossy sheen; all four are read by the path tracer. Defaults (0, 1.5, black, 0) reproduce
     /// the previous plastic look, so existing materials are unchanged until edited.
@@ -1981,7 +2040,7 @@ impl TextureAsset {
         } else {
             [0.8, 0.8, 0.82]
         };
-        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 0.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, metal_map: None, ao_map: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0, clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
+        Self { name, w, h, rgba, avg, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0, opacity: 1.0, reflect: 1.0, png_cache: std::cell::RefCell::new(None), proc: None, normal_map: None, rough_map: None, metal_map: None, ao_map: None, triplanar: false, tiles_per_m: 1.0, roughness: 0.5, transmission: 0.0, metallic: 0.0, ior: 1.5, emission: [0.0, 0.0, 0.0], emission_strength: 0.0, clearcoat: 0.0, clearcoat_rough: 0.1, sheen: 0.0, sheen_tint: [1.0; 3] }
     }
 
     /// Build a PROCEDURAL texture from a [`ProcDef`]. Carries a 1×1 fallback swatch (the ramp
@@ -1999,7 +2058,7 @@ impl TextureAsset {
             offset: [0.0, 0.0],
             rot_deg: 0.0,
             opacity: 1.0,
-            reflect: 0.0,
+            reflect: 1.0,
             png_cache: std::cell::RefCell::new(None),
             proc: Some(def),
             normal_map: None,
@@ -2009,6 +2068,7 @@ impl TextureAsset {
             triplanar: false,
             tiles_per_m: 1.0,
             roughness: 0.5,
+            transmission: 0.0,
             metallic: 0.0,
             ior: 1.5,
             emission: [0.0, 0.0, 0.0],
@@ -2047,6 +2107,7 @@ impl TextureAsset {
             triplanar: self.triplanar,
             tiles_per_m: self.tiles_per_m,
             roughness: self.roughness,
+            transmission: self.transmission,
             metallic: self.metallic,
             ior: self.ior,
             // Pre-multiplied by strength and decoded to linear here, so the shader can simply add
@@ -2072,6 +2133,7 @@ impl TextureAsset {
             || self.ao_map.is_some()
             || self.triplanar
             || (self.roughness - 0.5).abs() > 1e-3
+            || self.transmission > 1e-3
             || self.metallic > 1e-3
             || (self.ior - 1.5).abs() > 1e-3
             || self.emission_strength > 1e-3
@@ -2156,7 +2218,11 @@ pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAss
     a.offset = r.offset;
     a.rot_deg = r.rot_deg;
     a.opacity = if r.opacity > 0.0 { r.opacity.clamp(0.01, 1.0) } else { 1.0 };
-    a.reflect = r.reflect.clamp(0.0, 1.0);
+    // A stored 0 is an OLD sidecar's "matte", written when 0 was the default and nothing but a
+    // metal ever got anything else. Read it as physical, or every project saved before this would
+    // reload with its reflections switched off. The UI can no longer author 0 (it floors at 0.01),
+    // so 0 unambiguously means "from before", not "the user asked for none".
+    a.reflect = if r.reflect <= 0.0 { 1.0 } else { r.reflect.clamp(0.01, 1.0) };
     // The sidecar ALREADY holds this texture's PNG — reuse it as the cache so a re-save of a
     // loaded project doesn't re-encode every image (that was the save-time lag spike).
     *a.png_cache.borrow_mut() = Some(r.png_b64.clone());
@@ -2184,6 +2250,7 @@ pub fn decode_texture_rec(r: &crate::simlux_io::TextureRec) -> Option<TextureAss
     a.ior = if r.ior > 0.0 { r.ior.clamp(1.0, 4.0) } else { 1.5 };
     a.emission = r.emission;
     a.emission_strength = r.emission_strength.max(0.0);
+    a.transmission = r.transmission.clamp(0.0, 1.0);
     Some(a)
 }
 
@@ -4842,6 +4909,7 @@ impl FactoryState {
                     ior: t.ior,
                     emission: t.emission,
                     emission_strength: t.emission_strength,
+                    transmission: t.transmission,
                 })
                 .collect(),
             feature_textures: self.feature_texture.iter().map(|(&k, &v)| (k, v)).collect(),
@@ -5751,6 +5819,46 @@ impl FactoryState {
         self.cam_yaw = yaw;
         self.cam_pitch = pitch;
         self.ortho = true; // standard views are orthographic (true CAD Top/Front/…)
+    }
+
+    /// Orbit the camera SQUARE-ON to a plane, centred on `at`.
+    ///
+    /// This is the prerequisite for drawing on a face rather than a convenience. On a face turned
+    /// steeply away from the viewer, one pixel of cursor movement is metres of movement across the
+    /// plane and the screen-ray/plane intersection goes ill-conditioned as the two approach
+    /// parallel — so no amount of snapping makes an angled face workable. Squaring the view up is
+    /// what makes it workable, and it costs one camera move.
+    ///
+    /// Unlike [`Self::set_view`] this MOVES the target. Putting that face in front of you is the
+    /// entire point of the action, and leaving the target where it was would swing the face off
+    /// screen instead. `cam_dist` is kept, so it reframes without also re-zooming.
+    pub fn look_at_frame(&mut self, frame: &Frame, at: Vec3) {
+        let n = frame.normal();
+        if n.length_squared() < 1e-9 {
+            return; // degenerate frame — nothing to square up to
+        }
+        let mut n = n.normalize();
+        // Face the side the camera is ALREADY on. `pick_face` returns an OUTWARD normal, but
+        // "outward" is a property of the solid and not of where you happen to be standing: taking
+        // it on trust swings the camera through the wall and leaves you inside the building looking
+        // at the back of the face you picked.
+        let eye = Vec3::from(crate::light3d::cam_eye(
+            self.cam_yaw, self.cam_pitch, self.cam_dist, self.cam_target,
+        ));
+        if n.dot(eye - at) < 0.0 {
+            n = -n;
+        }
+        // The orbit camera puts the eye at `target + (cos p·cos y, cos p·sin y, sin p)·dist`, so
+        // yaw and pitch have to encode the direction TO the eye — which is exactly `n` now.
+        self.cam_pitch = n.z.clamp(-1.0, 1.0).asin();
+        self.cam_yaw = n.y.atan2(n.x);
+        self.cam_target = at.to_array();
+        // ORTHOGRAPHIC — and not merely for CAD convention. Under perspective a plane's
+        // pixels-per-metre varies across it, so a snap tolerance in pixels and a distance drawn in
+        // metres mean different things at the two ends of the same wall. A parallel projection
+        // makes that scale constant, which is what lets the 2D drafting tools behave on a face
+        // exactly as they behave on the ground.
+        self.ortho = true;
     }
 
     /// Dolly the camera by a factor: `<1` zooms in (closer), `>1` zooms out. The same
@@ -10740,5 +10848,215 @@ mod daylight_match {
         let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let r = lum(sun) / lum(sky);
         assert!((1.2..3.0).contains(&r), "direct:ambient is {r:.2}:1, reference is ~1.8:1");
+    }
+}
+
+#[cfg(test)]
+mod reflection_defaults {
+    use super::*;
+
+    /// A material nobody has said anything about reflects its surroundings by the physically
+    /// correct amount. The old default of 0 meant "matte", and since the only code that ever set
+    /// `reflect` was `metallic × (1 − 0.6·roughness)`, EVERY dielectric in every imported scene —
+    /// water, glass, polished stone, varnished timber — kept it. The environment lobe was
+    /// computed correctly and then multiplied by zero.
+    #[test]
+    fn a_new_material_reflects_its_surroundings() {
+        let t = TextureAsset::new("swatch".into(), 1, 1, vec![128, 128, 128, 255]);
+        assert_eq!(t.reflect, 1.0, "a plain swatch is not matte by fiat");
+        assert_eq!(t.metallic, 0.0, "…and it is a dielectric, which is exactly the case that broke");
+
+        let p = TextureAsset::procedural("wood".into(), ProcDef::oak());
+        assert_eq!(p.reflect, 1.0, "a procedural material too");
+    }
+
+    /// Roughness is how a surface is made matte — not by switching its reflection off. A mirror
+    /// and a chalk wall differ in `roughness`, and both keep `reflect` at 1.
+    #[test]
+    fn roughness_not_reflect_is_what_makes_something_matte() {
+        let mut water = TextureAsset::new("pool_water".into(), 1, 1, vec![14, 77, 87, 255]);
+        water.roughness = 0.035;
+        let mut chalk = TextureAsset::new("stucco".into(), 1, 1, vec![230, 228, 220, 255]);
+        chalk.roughness = 0.95;
+        assert_eq!((water.reflect, chalk.reflect), (1.0, 1.0));
+        assert!(water.roughness < chalk.roughness, "the difference lives in roughness alone");
+    }
+
+    /// Sidecars written while 0 was the default must not reload with their reflections switched
+    /// off. The UI floors at 0.01, so a stored 0 can only have come from before.
+    #[test]
+    fn an_old_sidecars_zero_reflect_migrates_to_physical() {
+        let png = TextureAsset::new("t".into(), 1, 1, vec![200, 200, 200, 255]).encoded_png();
+        let rec = |reflect: f32| crate::simlux_io::TextureRec {
+            name: "t".into(), w: 1, h: 1, scale: 1.0, offset: [0.0, 0.0], rot_deg: 0.0,
+            opacity: 1.0, reflect, png_b64: png.clone(), ..Default::default()
+        };
+        assert_eq!(decode_texture_rec(&rec(0.0)).unwrap().reflect, 1.0, "0 = written before this worked");
+        // …but a deliberate knock-down is still honoured.
+        let dulled = decode_texture_rec(&rec(0.25)).unwrap().reflect;
+        assert!((dulled - 0.25).abs() < 1e-6, "an authored value survives the round trip");
+    }
+}
+
+#[cfg(test)]
+mod face_on_view {
+    use super::*;
+
+    fn cam(st: &FactoryState) -> Vec3 {
+        Vec3::from(crate::light3d::cam_eye(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target))
+    }
+
+    /// Square-on means the camera sits along the face's normal, looking straight back down it.
+    #[test]
+    fn the_camera_ends_up_on_the_face_normal() {
+        for n in [
+            Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y, Vec3::Z, -Vec3::Z,
+            Vec3::new(1.0, 1.0, 0.0).normalize(),
+            Vec3::new(-0.3, 0.7, 0.65).normalize(),
+        ] {
+            let at = Vec3::new(3.0, -4.0, 2.0);
+            let frame = Frame::from_point_normal(at, n);
+            let mut st = FactoryState::default();
+            // Put the EYE well over on the side the face points at, so the side-flip has nothing
+            // to do and this test is only about the ANGLE. Target far out along `n` with a short
+            // dist: wherever the default yaw/pitch happens to point, the eye lands on the +n side.
+            // (Setting only the TARGET is not enough — the eye sits `dist` away from it in some
+            // unrelated direction, which is what made the first version of this test wrong.)
+            st.cam_target = (at + n * 100.0).to_array();
+            st.cam_dist = 1.0;
+            assert!((cam(&st) - at).dot(n) > 0.0, "test setup: the eye must start on the +n side");
+            st.look_at_frame(&frame, at);
+
+            let to_eye = (cam(&st) - at).normalize();
+            assert!(to_eye.dot(n) > 0.9999, "n={n:?} put the eye at {to_eye:?}");
+            assert!((Vec3::from(st.cam_target) - at).length() < 1e-4, "the face is centred");
+            assert!(st.ortho, "parallel projection — the scale across the face must be constant");
+        }
+    }
+
+    /// The camera must not swing THROUGH the wall.
+    ///
+    /// `pick_face` hands back an outward normal, but outward is a property of the solid and not of
+    /// where you are standing. Following it blindly on a face whose outward side faces away puts
+    /// the camera inside the building, looking at the back of what you just picked.
+    #[test]
+    fn it_stays_on_the_side_the_camera_was_already_on() {
+        let at = Vec3::ZERO;
+        let frame = Frame::from_point_normal(at, Vec3::X); // "outward" is +X
+        let mut st = FactoryState::default();
+        st.cam_target = [-8.0, 0.0, 0.0]; // …but we are standing at −X
+        st.cam_dist = 10.0;
+        st.look_at_frame(&frame, at);
+        assert!(cam(&st).x < 0.0, "the camera crossed the face instead of squaring up to it");
+    }
+
+    /// Distance is preserved: this reframes, it does not also re-zoom.
+    #[test]
+    fn the_zoom_is_left_alone() {
+        let mut st = FactoryState::default();
+        st.cam_dist = 37.5;
+        let f = Frame::from_point_normal(Vec3::new(1.0, 2.0, 3.0), Vec3::Y);
+        st.look_at_frame(&f, Vec3::new(1.0, 2.0, 3.0));
+        assert!((st.cam_dist - 37.5).abs() < 1e-6);
+    }
+
+    /// A horizontal face asks for a straight-down view — the pitch the orbit drag itself clamps
+    /// away from. `mvp` flips its up-vector past ±0.999 rad exactly so this case stays stable, and
+    /// `set_view` already relies on it for Top/Bottom, so it must NOT be clamped here.
+    #[test]
+    fn a_floor_gives_a_true_plan_view() {
+        let mut st = FactoryState::default();
+        let f = Frame::from_point_normal(Vec3::ZERO, Vec3::Z);
+        st.cam_target = [0.0, 0.0, 5.0];
+        st.look_at_frame(&f, Vec3::ZERO);
+        assert!((st.cam_pitch - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "pitch {} is not straight down", st.cam_pitch);
+        let m = crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, 1.5, st.ortho);
+        assert!(m.iter().all(|v| v.is_finite()), "the look-at degeneracy produced a NaN matrix");
+    }
+
+    /// A degenerate frame leaves the camera exactly where it was rather than producing NaNs.
+    #[test]
+    fn a_degenerate_face_is_ignored() {
+        let mut st = FactoryState::default();
+        let (y, p) = (st.cam_yaw, st.cam_pitch);
+        let f = Frame { origin: Vec3::ZERO, u: Vec3::X, v: Vec3::X }; // u × v = 0
+        st.look_at_frame(&f, Vec3::ZERO);
+        assert_eq!((st.cam_yaw, st.cam_pitch), (y, p));
+    }
+}
+
+#[cfg(test)]
+mod water_material {
+    use super::*;
+
+    fn preset(name: &str) -> MaterialPreset {
+        *material_presets().iter().find(|p| p.name == name).expect("preset in the library")
+    }
+
+    /// The library has water, and it is a MEDIUM — which is the property everything else hangs off.
+    ///
+    /// Nothing here is specific to the villa's pool. A fountain basin, a canal, a wet road or a
+    /// puddle drawn as one flat face all take the same material and get the same treatment.
+    #[test]
+    fn water_is_in_the_library_and_transmits() {
+        let waters: Vec<_> = material_presets().into_iter().filter(|p| p.category == "Water").collect();
+        assert!(waters.len() >= 3, "still / rippled / deep");
+        for p in &waters {
+            assert!(p.transmission > 0.0, "{}: water is a medium, not coverage", p.name);
+            assert!(p.opacity < 1.0, "{}: and it is see-through", p.name);
+            assert!((p.ior - 1.333).abs() < 1e-3, "{}: water is IOR 1.333", p.name);
+            assert_eq!(p.metallic, 0.0, "{}: water is a dielectric", p.name);
+        }
+        // Roughness is the ONLY thing separating them — still water is a mirror.
+        let still = preset("Water (still)");
+        let rippled = preset("Water (rippled)");
+        assert!(still.roughness < rippled.roughness);
+        assert!(still.roughness < 0.35,
+            "still water must stay under the SSR roughness gate or it cannot reflect the scene");
+    }
+
+    /// GLASS is deliberately NOT transmissive. An architectural pane is modelled as a thin sheet
+    /// and coverage is the honest description of it; treating it as a volume would drop the back
+    /// face of every window. The distinction is the whole reason the two are separate fields.
+    #[test]
+    fn glass_is_coverage_and_water_is_a_medium() {
+        for p in material_presets().iter().filter(|p| p.category == "Glass") {
+            assert_eq!(p.transmission, 0.0, "{} is a sheet, not a volume", p.name);
+            assert!(p.opacity < 1.0, "{} is still see-through", p.name);
+        }
+    }
+
+    /// Adding it to a scene has to carry transmission all the way to the shader's uniforms —
+    /// otherwise the preset is just tinted paint with a nice name.
+    #[test]
+    fn adding_water_reaches_the_shader() {
+        let mut st = FactoryState::default();
+        let i = st.add_preset_material(&preset("Water (still)"));
+        let t = &st.textures[i];
+        assert!(t.transmission > 0.0, "the material carries it");
+        assert!(t.opacity < ALPHA_OPAQUE, "…so the surface routes to the blended pass");
+        assert!(t.has_pbr(), "…and its PBR params are shipped to the renderer at all");
+        assert!(t.pbr_params().transmission > 0.0, "…including the transmission the shader reads");
+        assert_eq!(t.reflect, 1.0, "and it reflects its surroundings by the physical amount");
+    }
+
+    /// It has to survive a save and reload. `opacity` says how much light gets past; this says
+    /// whether what gets past is FILTERED on the way. A water material that came back without it
+    /// would reload as tinted glazing lying over the pool floor.
+    #[test]
+    fn transmission_survives_the_sidecar() {
+        let mut st = FactoryState::default();
+        let i = st.add_preset_material(&preset("Water (still)"));
+        let src = &st.textures[i];
+        let rec = crate::simlux_io::TextureRec {
+            name: src.name.clone(), w: src.w, h: src.h, scale: src.scale, offset: src.offset,
+            rot_deg: src.rot_deg, opacity: src.opacity, reflect: src.reflect,
+            png_b64: src.encoded_png(), roughness: src.roughness, metallic: src.metallic,
+            ior: src.ior, transmission: src.transmission, ..Default::default()
+        };
+        let back = decode_texture_rec(&rec).expect("round trip");
+        assert!((back.transmission - src.transmission).abs() < 1e-6,
+            "reloaded as {} instead of {}", back.transmission, src.transmission);
     }
 }

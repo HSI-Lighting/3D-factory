@@ -192,8 +192,10 @@ impl DoorMaterial {
         if let Some(t) = st.textures.get_mut(i) {
             t.roughness = roughness;
             t.opacity = opacity;
-            // Glass is smooth enough to carry a real reflection; timber and paint are not mirrors.
-            t.reflect = if self.is_glass() { 0.55 } else { 0.0 };
+            // `reflect` stays at 1.0 for both. Glass carries a strong reflection and painted
+            // timber a weak one because of their ROUGHNESS, which is set just above — knocking
+            // the whole environment lobe down to 0 on the joinery was not a second way of saying
+            // "matte", it was the reason a varnished door never showed the room.
             t.avg = srgb;
         }
         i
