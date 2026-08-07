@@ -4138,11 +4138,12 @@ impl CadApp {
             let Some(g) = self.doc.dobjects.get(i).map(|d| &d.geom) else { continue };
             match g {
                 Geom::Wall(w) => {
-                    let t = w.thickness as f32;
+                    let t = self.dlen_m(w.thickness);
+                    let k = self.doc_k();
                     let fp: Vec<glam::Vec2> = w
                         .centerline_polyline(16)
                         .iter()
-                        .map(|p| glam::Vec2::new(p.x as f32, p.y as f32))
+                        .map(|p| glam::Vec2::new((p.x * k) as f32, (p.y * k) as f32))
                         .collect();
                     if fp.len() >= 2 {
                         footprints.push((fp, t));
@@ -4151,7 +4152,7 @@ impl CadApp {
                     }
                 }
                 other if is_promotable_to_wall(other) => {
-                    let paths = cad_solid::geom_outlines(other);
+                    let paths = self.outlines_m(other);
                     let mut any = false;
                     for p in paths.into_iter().filter(|p| p.len() >= 2) {
                         footprints.push((p, fallback_t));
@@ -6900,6 +6901,7 @@ impl CadApp {
                 best = Some((a, path));
             }
         };
+        let k = self.doc_k();
         for &i in &self.selection {
             let Some(g) = self.doc.dobjects.get(i).map(|d| &d.geom) else { continue };
             match g {
@@ -6907,12 +6909,12 @@ impl CadApp {
                     let fp: Vec<glam::Vec2> = w
                         .centerline_polyline(16)
                         .iter()
-                        .map(|p| glam::Vec2::new(p.x as f32, p.y as f32))
+                        .map(|p| glam::Vec2::new((p.x * k) as f32, (p.y * k) as f32))
                         .collect();
                     consider(fp);
                 }
                 other => {
-                    for path in cad_solid::geom_outlines(other) {
+                    for path in self.outlines_m(other) {
                         consider(path);
                     }
                 }
@@ -7120,10 +7122,15 @@ impl CadApp {
 
     /// Closed loops in a document, in its (u,v). Only closed shapes (circles, closed
     /// polylines, rectangles) can become a solid; open lines are ignored.
+    /// Output is in METRES, scaled by the document's OWN unit — which is what makes this work
+    /// for both callers: a face sketch is its own Document (metre-space, k = 1) while the plan
+    /// may be millimetres. The `1e-3` closure test is likewise a real 1 mm once scaled, instead
+    /// of a metre-shaped epsilon judging drawing units.
     fn closed_loops_of(doc: &cad_kernel::Document) -> Vec<Vec<glam::Vec2>> {
         let mut out = Vec::new();
+        let k = doc.units.metres_per_unit;
         for d in &doc.dobjects {
-            for path in cad_solid::geom_outlines(&d.geom) {
+            for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
                 if path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3 {
                     out.push(path);
                 }
@@ -7138,12 +7145,15 @@ impl CadApp {
     fn factory_pick_ground_dobject(
         &self, pos: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
     ) -> Option<usize> {
+        // `cursor_on_plane` returns a WORLD (metre) point, so the plan outlines it is compared
+        // against must be metres too — otherwise the `0.3` nearest-line tolerance below is
+        // metres judging drawing units, and picking a line from the 3D view never fires.
         let w = self.factory.cursor_on_plane(pos, rect, mvp)?;
         let p = glam::Vec2::new(w.x, w.y);
         let mut best_inside: Option<(f32, usize)> = None;
         let mut best_near: Option<(f32, usize)> = None;
         for (i, d) in self.doc.dobjects.iter().enumerate() {
-            for path in cad_solid::geom_outlines(&d.geom) {
+            for path in self.outlines_m(&d.geom) {
                 let closed = path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3;
                 if closed {
                     // even–odd point-in-polygon
@@ -7193,7 +7203,7 @@ impl CadApp {
         let mut out = Vec::new();
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
-                for path in cad_solid::geom_outlines(&d.geom) {
+                for path in self.outlines_m(&d.geom) {
                     if path.len() >= 4 && (path[0] - path[path.len() - 1]).length() < 1e-3 {
                         out.push(path);
                     }
@@ -7242,8 +7252,11 @@ impl CadApp {
     /// First usable polyline in a document, in its (u,v). Used to read the path a user drew
     /// (open or closed) — the sweep only needs the point sequence.
     fn first_polyline_of(doc: &cad_kernel::Document) -> Option<Vec<glam::Vec2>> {
+        // Metres, by the document's own unit — same contract as `closed_loops_of`, since a
+        // sweep pairs this path with a section that came from there.
+        let k = doc.units.metres_per_unit;
         for d in &doc.dobjects {
-            for pl in cad_solid::geom_outlines(&d.geom) {
+            for pl in cad_solid::geom_outlines_scaled(&d.geom, k) {
                 if pl.len() >= 2 { return Some(pl); }
             }
         }
@@ -12811,6 +12824,37 @@ impl CadApp {
                 let _ = self.env.save();
                 self.history.push(format!(
                     "  CARD {}", if self.env.CrdEnb { "on" } else { "off" }));
+            }
+            Ok(Command::Units(set_opt)) => {
+                // UNITS — declare what one drawing unit means. This NEVER moves geometry: the
+                // numbers in the drawing are untouched, only their interpretation at the 2D→3D
+                // boundaries changes. So it is safe to set, safe to set back, and a mistake
+                // costs nothing but a re-promote.
+                match set_opt {
+                    None => {
+                        let u = self.doc.units;
+                        let how = match u.source {
+                            cad_kernel::UnitSource::Assumed  => "assumed (never set)",
+                            cad_kernel::UnitSource::Declared => "declared by the file",
+                            cad_kernel::UnitSource::User     => "set by you",
+                        };
+                        self.history.push(format!(
+                            "  UNITS: 1 drawing unit = {} ({}) — {}",
+                            u.label(), u.metres_per_unit, how));
+                        self.history.push(
+                            "  set with: units mm | cm | m | in | ft   (affects 3D scale only)".into());
+                    }
+                    Some(k) => {
+                        self.snapshot_doc();
+                        let was = self.doc.units;
+                        self.doc.units =
+                            cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::User);
+                        self.history.push(format!(
+                            "  UNITS: 1 drawing unit = {} (was {}) — existing 3D solids are NOT \
+                             rescaled; re-promote to rebuild them at the new scale",
+                            self.doc.units.label(), was.label()));
+                    }
+                }
             }
             Ok(Command::Explode) => {
                 // Select-first like erase: empty basket queues the op.
@@ -24228,6 +24272,31 @@ impl CadApp {
     /// Public entry: ARM a deferred save. The "Saving…" overlay paints for one frame, then the
     /// serialize + sidecar-write run on a BACKGROUND worker thread ([`save_file_worker`]); the
     /// only main-thread cost is cloning the doc + building the config in [`Self::spawn_busy_worker`].
+    /// Metres per drawing unit for the ACTIVE document — the factor every 2D→3D boundary
+    /// multiplies by.
+    ///
+    /// Reads `self.doc`, not `plan_doc()`, and that is deliberate: a face sketch is its own
+    /// Document with its own unit, and geometry drawn in a sketch is lifted through the
+    /// sketch's frame, not the plan's. Defaults to 1.0 (`Assumed`) so nothing moves until a
+    /// drawing's unit is actually set.
+    #[inline]
+    fn doc_k(&self) -> f64 {
+        self.doc.units.metres_per_unit
+    }
+
+    /// A drawing-unit length → metres, for the 3D side.
+    #[inline]
+    fn dlen_m(&self, v: f64) -> f32 {
+        (v * self.doc_k()) as f32
+    }
+
+    /// Flatten a geom straight into METRES. The 2D→3D flattening entry point: prefer this over
+    /// `cad_solid::geom_outlines` anywhere the result feeds the Factory.
+    #[inline]
+    fn outlines_m(&self, g: &Geom) -> Vec<Vec<glam::Vec2>> {
+        cad_solid::geom_outlines_scaled(g, self.doc_k())
+    }
+
     /// The user's DRAWING document — never the face-sketch that temporarily owns `self.doc`.
     ///
     /// `factory_enter_sketch` swaps the app's document for the sketch's (that swap is the whole
@@ -30682,7 +30751,12 @@ impl CadApp {
                 // the corner wherever endpoints coincide.
                 let start = self.pending[0];
                 let end   = self.pending[1];
-                let thk = self.env.WlThk;
+                // `WlThk` is an honest METRE value (settings.rs documents it as "0.20 (200mm)"),
+                // but a Wall's `thickness` is a DRAWING-UNIT length. Convert on the way in, so
+                // `dlen_m` converts it back to 0.2 m at promotion whatever the document's unit
+                // is — and so the two arms of the promotion match (a drawn wall and an imported
+                // centerline must not come out 1000x apart).
+                let thk = self.doc.units.from_metres(self.env.WlThk);
                 if (end - start).len() < EPS || thk <= 1e-9 {
                     // Degenerate click (no motion / bad thickness): drop the
                     // duplicate point but keep the chain anchored.
@@ -40013,8 +40087,11 @@ impl eframe::App for CadApp {
                             // commit. Build a temporary Geom::Wall and
                             // walk its side-line accessors so the
                             // preview matches what apply will draw.
+                            // Same metre→doc-unit conversion as the commit path (Tool::Wall),
+                            // so the dashed preview is the width the wall will actually get.
                             let ghost = cad_kernel::Wall {
-                                start: *a, end: cw, thickness: self.env.WlThk,
+                                start: *a, end: cw,
+                                thickness: self.doc.units.from_metres(self.env.WlThk),
                                 style: self.current_wall_style, bulge: 0.0,
                             };
                             if let Some(l) = ghost.left_line() {
@@ -44651,6 +44728,66 @@ mod factory_sketch_tests {
             cad_io::rsm::write_rsm(saved),
             plan_bytes,
             "autosaving mid-sketch leaves the .rsm byte-identical",
+        );
+    }
+
+    /// The whole point of the unit tag: a plan drawn in MILLIMETRES must promote to a wall of
+    /// the right size in metres, instead of a 3-kilometre one.
+    #[test]
+    fn a_millimetre_plan_promotes_to_metres() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        // A 3 m wall, drawn the way an architectural plan draws it: 3000 units.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(3000.0, 0.0),
+        })));
+        app.selection = vec![app.doc.dobjects.len() - 1];
+        let (promoted, _) = app.make_3d_wall_from_selection();
+        assert_eq!(promoted, 1, "the line promoted");
+        let (mn, mx) = app.factory.features_aabb().expect("the wall has bounds");
+        let span = mx.x - mn.x;
+        assert!(
+            (span - 3.0).abs() < 0.05,
+            "a 3000 mm wall must be ~3 m long in the 3D world, got {span}",
+        );
+    }
+
+    /// Zero-delta: the same drawing with NO unit set behaves exactly as it always did — the
+    /// numbers are taken as metres. This is what keeps every existing file unchanged.
+    #[test]
+    fn without_a_unit_the_numbers_are_still_taken_as_metres() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Assumed);
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(3.0, 0.0),
+        })));
+        app.selection = vec![app.doc.dobjects.len() - 1];
+        assert_eq!(app.make_3d_wall_from_selection().0, 1);
+        let (mn, mx) = app.factory.features_aabb().expect("bounds");
+        assert!((mx.x - mn.x - 3.0).abs() < 0.05, "unchanged behaviour at k = 1");
+    }
+
+    /// A wall DRAWN at the default thickness and an imported centerline promoted with the
+    /// fallback must come out the SAME thickness. `WlThk` is a metre constant stored as a
+    /// doc-unit length, so without converting at the authoring site the two diverge by 1000x.
+    #[test]
+    fn drawn_and_imported_walls_agree_on_thickness_in_millimetres() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        // What the Wall tool stores for the current default thickness.
+        let stored = app.doc.units.from_metres(app.env.WlThk);
+        // What promotion turns that back into.
+        let promoted_m = app.dlen_m(stored);
+        assert!(
+            (promoted_m - app.factory.wall_thickness).abs() < 1e-4,
+            "drawn wall {promoted_m} m must match the imported-centerline fallback {} m",
+            app.factory.wall_thickness,
         );
     }
 

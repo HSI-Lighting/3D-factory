@@ -794,25 +794,42 @@ impl Sketch {
 /// Flatten a kernel geom into uv-space polyline paths (each inner `Vec` is one
 /// path; closed shapes include the wrap point). Reuses the kernel's own geometry
 /// (arc/ellipse samplers + DXF bulge). Point returns a small cross (two paths).
+///
+/// Output is in DRAWING UNITS — the caller decides what those mean. Use
+/// [`geom_outlines_scaled`] to flatten straight into metres for the 3D side.
 pub fn geom_outlines(g: &cad_kernel::Geom) -> Vec<Vec<Vec2>> {
+    geom_outlines_scaled(g, 1.0)
+}
+
+/// Flatten as [`geom_outlines`], but multiply every coordinate by `k` (metres per drawing
+/// unit) on the way out.
+///
+/// The multiply happens in **f64, before the f32 cast**, and that ordering is the point of
+/// this function rather than scaling the returned `Vec2`s. An architectural plan sits at
+/// coordinates like X = 3_619_000 mm; in f32 the spacing there is ~0.25, so a plan flattened
+/// first and scaled afterwards would already have lost a quarter-millimetre of precision per
+/// point. Scaling first yields 3619.0 m held to ~0.0002 m.
+pub fn geom_outlines_scaled(g: &cad_kernel::Geom, k: f64) -> Vec<Vec<Vec2>> {
     use cad_kernel::Geom as G;
     match g {
-        G::Line(l) => vec![vec![gvec(l.a), gvec(l.b)]],
-        G::Circle(c) => vec![circle_path(c.center, c.radius, 64)],
-        G::Arc(a) => vec![arc_path(a.center, a.radius, a.start_angle, a.sweep_angle, 48)],
+        G::Line(l) => vec![vec![gvec(l.a, k), gvec(l.b, k)]],
+        G::Circle(c) => vec![circle_path(c.center, c.radius, 64, k)],
+        G::Arc(a) => vec![arc_path(a.center, a.radius, a.start_angle, a.sweep_angle, 48, k)],
         G::Ellipse(e) => {
             let n = 72;
-            vec![(0..=n).map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64))).collect()]
+            vec![(0..=n).map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64), k)).collect()]
         }
         G::EllipseArc(ea) => {
             let n = 48;
             vec![(0..=n)
-                .map(|i| gvec(ea.ellipse.point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64)))
+                .map(|i| gvec(ea.ellipse.point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64), k))
                 .collect()]
         }
-        G::Polyline(p) => vec![polyline_path(p)],
+        G::Polyline(p) => vec![polyline_path(p, k)],
         G::Point(pt) => {
-            let c = gvec(pt.location);
+            let c = gvec(pt.location, k);
+            // The cross is a MARKER, so its size belongs to the output space, not the drawing's
+            // — it is not multiplied by `k`. Unchanged at k = 1; a sane 15 cm at k = 0.001.
             let s = 0.15;
             vec![
                 vec![c - Vec2::new(s, 0.0), c + Vec2::new(s, 0.0)],
@@ -824,30 +841,30 @@ pub fn geom_outlines(g: &cad_kernel::Geom) -> Vec<Vec<Vec2>> {
 }
 
 #[inline]
-fn gvec(p: KVec2) -> Vec2 {
-    Vec2::new(p.x as f32, p.y as f32)
+fn gvec(p: KVec2, k: f64) -> Vec2 {
+    Vec2::new((p.x * k) as f32, (p.y * k) as f32)
 }
 
-fn circle_path(c: KVec2, r: f64, n: usize) -> Vec<Vec2> {
+fn circle_path(c: KVec2, r: f64, n: usize, k: f64) -> Vec<Vec2> {
     (0..=n)
         .map(|i| {
             let t = std::f64::consts::TAU * i as f64 / n as f64;
-            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()), k)
         })
         .collect()
 }
 
-fn arc_path(c: KVec2, r: f64, start: f64, sweep: f64, n: usize) -> Vec<Vec2> {
+fn arc_path(c: KVec2, r: f64, start: f64, sweep: f64, n: usize, k: f64) -> Vec<Vec2> {
     (0..=n)
         .map(|i| {
             let t = start + sweep * i as f64 / n as f64;
-            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()), k)
         })
         .collect()
 }
 
 /// Flatten a (possibly bulged / closed) polyline into a single uv path.
-fn polyline_path(p: &cad_kernel::Polyline) -> Vec<Vec2> {
+fn polyline_path(p: &cad_kernel::Polyline, k: f64) -> Vec<Vec2> {
     let n = p.vertices.len();
     if n == 0 {
         return Vec::new();
@@ -858,18 +875,18 @@ fn polyline_path(p: &cad_kernel::Polyline) -> Vec<Vec2> {
         let a = p.vertices[i];
         let b = p.vertices[(i + 1) % n];
         if a.bulge.abs() < 1e-9 {
-            path.push(gvec(a.pos));
+            path.push(gvec(a.pos, k));
         } else if let Some((c, r, sa, sw)) = cad_kernel::bulge_arc(a.pos, b.pos, a.bulge) {
             let steps = 16;
-            for k in 0..steps {
-                let t = sa + sw * k as f64 / steps as f64;
-                path.push(gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin())));
+            for j in 0..steps {
+                let t = sa + sw * j as f64 / steps as f64;
+                path.push(gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()), k));
             }
         } else {
-            path.push(gvec(a.pos));
+            path.push(gvec(a.pos, k));
         }
     }
-    path.push(gvec(p.vertices[if p.closed { 0 } else { n - 1 }].pos));
+    path.push(gvec(p.vertices[if p.closed { 0 } else { n - 1 }].pos, k));
     path
 }
 

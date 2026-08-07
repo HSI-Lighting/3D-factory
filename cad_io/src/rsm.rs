@@ -72,16 +72,31 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 //     HSI windows-ui branch shipped this as "v4"; renumbered to v7 here because
 //     our v4/v5/v6 were already taken by raster / mirror_x / scale_y. The width
 //     reader is therefore gated on ver >= 7 so v4..v6 files (no widths) load.
-const VERSION: u16  = 7;
+// v8: + document UNITS (metres per drawing unit + how it was learned).
+//     WRITTEN ON DEMAND — see `version_for`. A drawing whose unit was never set
+//     still writes as v7, so the overwhelming majority of files stay readable by
+//     older builds. Only once a unit is actually DECLARED does the file become v8,
+//     and then an older build REFUSES it (the `ver > VERSION` check below) instead
+//     of loading it, silently dropping the unit, and writing back a v7 file whose
+//     geometry no longer matches its (now lost) scale. Refusing is recoverable;
+//     silent stripping is not.
+const VERSION: u16  = 8;
+
+/// The lowest version that can represent `doc` — so adding units costs nothing to
+/// every drawing that does not use them.
+fn version_for(doc: &Document) -> u16 {
+    if doc.units.source == cad_kernel::UnitSource::Assumed { 7 } else { 8 }
+}
 
 // =============================================================================
 //   WRITER
 // =============================================================================
 
 pub fn write_rsm(doc: &Document) -> Vec<u8> {
+    let ver = version_for(doc);
     let mut w = Vec::with_capacity(1024 + doc.dobjects.len() * 64);
     w.extend_from_slice(&MAGIC);
-    write_u16(&mut w, VERSION);
+    write_u16(&mut w, ver);
     write_u16(&mut w, 0);
 
     write_linetype_table(&mut w, &doc.linetypes);
@@ -95,8 +110,24 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_dim_style_table(&mut w, &doc.dim_styles);
     write_wall_style_table(&mut w, &doc.wall_styles);
     write_raster_images(&mut w, &doc.raster_images);          // v4
+    if ver >= 8 {
+        write_units(&mut w, &doc.units);                       // v8
+    }
 
     w
+}
+
+/// v8 — the document's unit. `source` is stored too: it is the difference between
+/// "the user said this drawing is millimetres" and "nobody ever said", and only the
+/// former may be acted on.
+fn write_units(w: &mut Vec<u8>, u: &cad_kernel::DocUnits) {
+    write_f64(w, u.metres_per_unit);
+    let tag: u8 = match u.source {
+        cad_kernel::UnitSource::Assumed => 0,
+        cad_kernel::UnitSource::Declared => 1,
+        cad_kernel::UnitSource::User => 2,
+    };
+    w.push(tag);
 }
 
 /// v4 — embedded raster underlays. Per image: name, placement (insert + world
@@ -617,10 +648,24 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     };
     // v4 — embedded raster underlays. Older files have no section.
     let raster_images = if ver >= 4 { read_raster_images(&mut r)? } else { Vec::new() };
+    // v8 — document unit. Every older file predates the concept, so it gets the default
+    // (1 unit = 1 metre, ASSUMED). That is the zero-delta path: every 2D→3D boundary then
+    // multiplies by 1.0 and the drawing behaves exactly as it did before units existed.
+    let units = if ver >= 8 { read_units(&mut r)? } else { cad_kernel::DocUnits::default() };
     Ok(Document {
         dobjects, layers, linetypes, pens, truecolors,
-        text_styles, dim_styles, wall_styles, blocks, raster_images,
+        text_styles, dim_styles, wall_styles, blocks, raster_images, units,
     })
+}
+
+fn read_units(r: &mut R) -> Result<cad_kernel::DocUnits, String> {
+    let metres_per_unit = r.f64()?;
+    let source = match r.u8()? {
+        1 => cad_kernel::UnitSource::Declared,
+        2 => cad_kernel::UnitSource::User,
+        _ => cad_kernel::UnitSource::Assumed,
+    };
+    Ok(cad_kernel::DocUnits { metres_per_unit, source })
 }
 
 /// v4 — embedded raster underlays (mirror of `write_raster_images`).
@@ -966,6 +1011,43 @@ mod tests {
     fn round_trip(doc: &Document) -> Document {
         let bytes = write_rsm(doc);
         read_rsm(&bytes).expect("rsm round-trip")
+    }
+
+    /// A drawing that never set a unit must still be written as v7 — so every build that
+    /// predates units keeps opening it. This is what makes adding units cost nothing.
+    #[test]
+    fn a_drawing_with_no_unit_still_writes_as_v7() {
+        let doc = Document::default();
+        assert_eq!(doc.units.source, cad_kernel::UnitSource::Assumed);
+        let bytes = write_rsm(&doc);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 7, "unchanged drawings stay v7");
+    }
+
+    /// Once a unit is DECLARED the file becomes v8, so an older build refuses it outright
+    /// rather than loading it, dropping the unit, and writing back a v7 file whose geometry
+    /// silently no longer matches its scale.
+    #[test]
+    fn declaring_a_unit_bumps_to_v8_and_round_trips() {
+        let mut doc = Document::default();
+        doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::User);
+        let bytes = write_rsm(&doc);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 8, "a declared unit is v8");
+        let back = read_rsm(&bytes).expect("v8 round-trip");
+        assert_eq!(back.units.metres_per_unit, 0.001);
+        assert_eq!(back.units.source, cad_kernel::UnitSource::User);
+    }
+
+    /// The zero-delta guarantee: a file written before units existed loads with the default
+    /// (1 unit = 1 metre, ASSUMED), so every 2D→3D boundary multiplies by 1.0 and the drawing
+    /// behaves exactly as it did.
+    #[test]
+    fn a_pre_units_file_loads_as_one_metre_per_unit_assumed() {
+        let mut doc = Document::default();
+        doc.push(DObject::new(Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(3000.0, 0.0) })));
+        let bytes = write_rsm(&doc); // v7 — no units section at all
+        let back = read_rsm(&bytes).expect("v7 read");
+        assert_eq!(back.units.metres_per_unit, 1.0);
+        assert_eq!(back.units.source, cad_kernel::UnitSource::Assumed);
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub use layer::{Layer, LayerId, LayerTable};
 pub use style::Style;
 pub use pen::{Pen, PenTable};
 pub use dobject::{next_handle, DObject, Handle};
-pub use document::{Document, RasterImage};
+pub use document::{DocUnits, Document, RasterImage, UnitSource};
 pub use intersect::intersect;
 pub use parser::{parse, Command, ToolKind};
 pub use construct::{

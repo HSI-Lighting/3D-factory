@@ -11,20 +11,24 @@ const WALL: MaterialId = 1;
 const CEILING: MaterialId = 2;
 const CURVE_SEGMENTS: usize = 48;
 
-fn vtx(p: Vec2, z: f32) -> Vertex {
-    Vertex::new(p.x as f32, p.y as f32, z)
+/// `k` = metres per drawing unit. The engine's world is METRES (see `types::Vertex`), but the
+/// document's X/Y are drawing units while `z`/`height` already arrive in metres — so without
+/// this scale a wall quad pairs millimetre X/Y with a metre Z in the same vertex, and the
+/// inverse-square law in `calc` is evaluated on nonsense.
+fn vtx(p: Vec2, z: f32, k: f64) -> Vertex {
+    Vertex::new((p.x * k) as f32, (p.y * k) as f32, z)
 }
 
-fn surface(a: Vec2, b: Vec2, height: f32, material: MaterialId) -> Mesh {
+fn surface(a: Vec2, b: Vec2, height: f32, material: MaterialId, k: f64) -> Mesh {
     Mesh {
-        vertices: vec![vtx(a, 0.0), vtx(b, 0.0), vtx(b, height), vtx(a, height)],
+        vertices: vec![vtx(a, 0.0, k), vtx(b, 0.0, k), vtx(b, height, k), vtx(a, height, k)],
         triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
         material,
     }
 }
 
-fn cap(poly: &[Vec2], z: f32, material: MaterialId, out: &mut Vec<Mesh>) {
-    let p2: Vec<[f32; 2]> = poly.iter().map(|v| [v.x as f32, v.y as f32]).collect();
+fn cap(poly: &[Vec2], z: f32, material: MaterialId, out: &mut Vec<Mesh>, k: f64) {
+    let p2: Vec<[f32; 2]> = poly.iter().map(|v| [(v.x * k) as f32, (v.y * k) as f32]).collect();
     let tris = triangulate(&p2);
     if tris.is_empty() {
         return;
@@ -36,14 +40,14 @@ fn cap(poly: &[Vec2], z: f32, material: MaterialId, out: &mut Vec<Mesh>) {
     });
 }
 
-fn extrude_path(pts: &[Vec2], closed: bool, height: f32, out: &mut Vec<Mesh>) {
+fn extrude_path(pts: &[Vec2], closed: bool, height: f32, out: &mut Vec<Mesh>, k: f64) {
     for w in pts.windows(2) {
-        out.push(surface(w[0], w[1], height, WALL));
+        out.push(surface(w[0], w[1], height, WALL, k));
     }
     if closed && pts.len() >= 3 {
-        out.push(surface(pts[pts.len() - 1], pts[0], height, WALL));
-        cap(pts, 0.0, FLOOR, out);
-        cap(pts, height, CEILING, out);
+        out.push(surface(pts[pts.len() - 1], pts[0], height, WALL, k));
+        cap(pts, 0.0, FLOOR, out, k);
+        cap(pts, height, CEILING, out, k);
     }
 }
 
@@ -69,16 +73,16 @@ fn arc_pts(a: &KArc) -> Vec<Vec2> {
 /// Extrude ONE geometry to surfaces at `height` (closed paths also get
 /// floor + ceiling). Shared by `extrude` (whole doc) and `extrude_handles`
 /// (SIMLUX per-layer room build), so both stay in lock-step.
-fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>) {
+fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>, k: f64) {
     match geom {
-        Geom::Line(l) => extrude_path(&[l.a, l.b], false, height, out),
-        Geom::Wall(w) => extrude_path(&[w.start, w.end], false, height, out),
+        Geom::Line(l) => extrude_path(&[l.a, l.b], false, height, out, k),
+        Geom::Wall(w) => extrude_path(&[w.start, w.end], false, height, out, k),
         Geom::Polyline(p) => {
             let v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
-            extrude_path(&v, p.closed, height, out);
+            extrude_path(&v, p.closed, height, out, k);
         }
-        Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, out),
-        Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out),
+        Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, out, k),
+        Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out, k),
         _ => {}
     }
 }
@@ -86,8 +90,9 @@ fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>) {
 /// Extrude every drafted entity to surfaces (closed paths also get floor + ceiling).
 pub fn extrude(doc: &Document, height: f32) -> Vec<Mesh> {
     let mut out = Vec::new();
+    let k = doc.units.metres_per_unit;
     for d in &doc.dobjects {
-        extrude_geom(&d.geom, height, &mut out);
+        extrude_geom(&d.geom, height, &mut out, k);
     }
     out
 }
@@ -97,24 +102,27 @@ pub fn extrude(doc: &Document, height: f32) -> Vec<Mesh> {
 /// Handles that no longer exist in `doc` are silently skipped.
 pub fn extrude_handles(doc: &Document, handles: &[u64], height: f32) -> Vec<Mesh> {
     let mut out = Vec::new();
+    let k = doc.units.metres_per_unit;
     for &h in handles {
         if let Some(d) = doc.find_by_handle(h) {
-            extrude_geom(&d.geom, height, &mut out);
+            extrude_geom(&d.geom, height, &mut out, k);
         }
     }
     out
 }
 
-/// Bounding box of all drafted geometry (x-min, y-min, x-max, y-max).
+/// Bounding box of all drafted geometry (x-min, y-min, x-max, y-max), in METRES — it sizes the
+/// calc plane, which the engine treats as metres.
 pub fn bbox(doc: &Document) -> Option<(f32, f32, f32, f32)> {
     let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut any = false;
+    let k = doc.units.metres_per_unit;
     let mut add = |v: Vec2| {
         any = true;
-        mnx = mnx.min(v.x as f32);
-        mny = mny.min(v.y as f32);
-        mxx = mxx.max(v.x as f32);
-        mxy = mxy.max(v.y as f32);
+        mnx = mnx.min((v.x * k) as f32);
+        mny = mny.min((v.y * k) as f32);
+        mxx = mxx.max((v.x * k) as f32);
+        mxy = mxy.max((v.y * k) as f32);
     };
     for d in &doc.dobjects {
         match &d.geom {

@@ -33,6 +33,85 @@ pub struct RasterImage {
     pub world_h: f64,
 }
 
+/// How a document's unit was arrived at. The distinction matters more than the number:
+/// an ASSUMED unit is a fallback nobody chose, and the app must never write it out as a
+/// positive assertion (e.g. into a DXF `$INSUNITS`) or act on it destructively.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UnitSource {
+    /// Nobody said. Every drawing made before units existed lands here.
+    #[default]
+    Assumed,
+    /// The file declared it (e.g. DXF `$INSUNITS`, or an RSM unit record).
+    Declared,
+    /// The user set it explicitly (the UNITS command).
+    User,
+}
+
+/// The real-world size of one drawing unit.
+///
+/// The 2D side draws in whatever the user likes — architectural plans here are millimetres,
+/// so a 3 m wall is drawn 3000 long. The 3D Factory, the renderer, the parametric generators
+/// and the lux engine are all METRES. This type is what lets the two meet: it is the single
+/// declaration of what a drawing's numbers mean, so the handful of 2D↔3D boundaries can
+/// convert instead of guessing.
+///
+/// `metres_per_unit` is deliberately the stored direction (multiply doc → metres), because
+/// that is the direction the boundaries actually need.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct DocUnits {
+    /// Metres in one drawing unit. 1.0 = the drawing is already metres; 0.001 = millimetres.
+    pub metres_per_unit: f64,
+    pub source: UnitSource,
+}
+
+impl Default for DocUnits {
+    /// **1 unit = 1 metre, assumed.** This is the zero-delta default: every drawing that
+    /// existed before units did behaves EXACTLY as it did, because every boundary multiplies
+    /// by 1.0. Nothing is rescaled by loading a file — only an explicit user action changes a
+    /// drawing's unit.
+    fn default() -> Self {
+        Self { metres_per_unit: 1.0, source: UnitSource::Assumed }
+    }
+}
+
+impl DocUnits {
+    pub const MM: f64 = 0.001;
+    pub const CM: f64 = 0.01;
+    pub const M: f64 = 1.0;
+    pub const INCH: f64 = 0.0254;
+    pub const FOOT: f64 = 0.3048;
+
+    pub fn new(metres_per_unit: f64, source: UnitSource) -> Self {
+        Self { metres_per_unit, source }
+    }
+
+    /// Drawing units → metres. The direction every 2D→3D boundary needs.
+    #[inline]
+    pub fn to_metres(&self, v: f64) -> f64 {
+        v * self.metres_per_unit
+    }
+
+    /// Metres → drawing units. The direction every 3D→2D boundary needs, and the one that
+    /// keeps a metre-shaped default (a 0.2 m wall thickness) honest when it is stored as a
+    /// document-unit length.
+    #[inline]
+    pub fn from_metres(&self, v: f64) -> f64 {
+        if self.metres_per_unit.abs() > 1e-12 { v / self.metres_per_unit } else { v }
+    }
+
+    /// A short label for the UI ("mm", "m", …), or a bare ratio when it is not a standard unit.
+    pub fn label(&self) -> String {
+        match self.metres_per_unit {
+            x if (x - Self::MM).abs() < 1e-9 => "mm".into(),
+            x if (x - Self::CM).abs() < 1e-9 => "cm".into(),
+            x if (x - Self::M).abs() < 1e-9 => "m".into(),
+            x if (x - Self::INCH).abs() < 1e-9 => "in".into(),
+            x if (x - Self::FOOT).abs() < 1e-9 => "ft".into(),
+            x => format!("{x} m/unit"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Document {
     pub dobjects:    Vec<DObject>,
@@ -58,6 +137,10 @@ pub struct Document {
     /// Embedded reference raster underlays. Drafted over, not vectorized;
     /// persisted in RSM (v4+). Empty by default.
     pub raster_images: Vec<RasterImage>,
+    /// What one drawing unit is worth in the real world. Defaults to 1 unit = 1 metre,
+    /// `Assumed` — which is exactly how the app behaved before units existed, so adding this
+    /// field changes nothing until something explicitly sets it.
+    pub units: DocUnits,
     // Reserved for future slices — leave the field list extensible:
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
@@ -77,6 +160,7 @@ impl Default for Document {
             wall_styles: WallStyleTable::with_defaults(),
             blocks:      BlockTable::default(),
             raster_images: Vec::new(),
+            units:       DocUnits::default(),
         }
     }
 }

@@ -164,6 +164,11 @@ pub enum Command {
     /// `card on` / `card off` set explicitly. Also on F8 and the
     /// status-strip badge.
     Card(Option<bool>),
+    /// UNITS — declare what one drawing unit is worth in the real world, which is what lets
+    /// the 3D side scale a plan correctly instead of reading millimetres as metres.
+    /// `units` alone reports the current setting; `units mm` (etc.) sets it.
+    /// `None` = report only.
+    Units(Option<f64>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -253,6 +258,7 @@ impl Command {
             Command::BlockTaskRecorder  => "BlockTaskRecorder",
             Command::BlockTaskFinish    => "BlockTaskFinish",
             Command::Card(_)            => "Card",
+            Command::Units(_)           => "Units",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
@@ -459,6 +465,26 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 Some("off") | Some("0") => Ok(Command::Card(Some(false))),
                 Some(other) => Err(format!(
                     "card: expected `on` or `off`, got '{}'", other)),
+            }
+        }
+        "units" | "unit" | "insunits" => {
+            // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as
+            // metres-per-unit for anything non-standard (`units 0.001` == `units mm`).
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None => Ok(Command::Units(None)),
+                Some("mm") | Some("millimetre") | Some("millimeter") | Some("millimetres")
+                    | Some("millimeters") => Ok(Command::Units(Some(0.001))),
+                Some("cm") | Some("centimetre") | Some("centimeter") => Ok(Command::Units(Some(0.01))),
+                Some("m") | Some("metre") | Some("meter") | Some("metres") | Some("meters") =>
+                    Ok(Command::Units(Some(1.0))),
+                Some("in") | Some("inch") | Some("inches") => Ok(Command::Units(Some(0.0254))),
+                Some("ft") | Some("foot") | Some("feet") => Ok(Command::Units(Some(0.3048))),
+                Some(other) => match other.parse::<f64>() {
+                    Ok(v) if v > 0.0 => Ok(Command::Units(Some(v))),
+                    _ => Err(format!(
+                        "units: expected mm / cm / m / in / ft, or a positive metres-per-unit \
+                         number, got '{other}'")),
+                },
             }
         }
         "text" | "tx" => {
