@@ -7657,7 +7657,17 @@ impl CadApp {
         // selection sitting over a building.
         let o = {
             let l = &loops[0];
-            let c = l.iter().copied().fold(glam::Vec2::ZERO, |a, p| a + p) / (l.len().max(1) as f32);
+            // A closed loop REPEATS its first point, so a plain mean double-counts that corner
+            // and drags the probe off centre — for a rectangle, a fifth of the way toward one
+            // corner. On a flat wall that still lands on the face and nothing shows; on a
+            // CURVED one it lands off the surface in mid-air, and the thickness probe below
+            // then measures the gap instead of the wall.
+            let pts = if l.len() > 2 && (l[0] - l[l.len() - 1]).length() < 1e-6 {
+                &l[..l.len() - 1]
+            } else {
+                &l[..]
+            };
+            let c = pts.iter().copied().fold(glam::Vec2::ZERO, |a, p| a + p) / (pts.len().max(1) as f32);
             frame.from_uv(c)
         };
         let mut target: Option<(usize, f32)> = None;
@@ -7760,11 +7770,14 @@ impl CadApp {
         let mut made = 0;
         for pts in loops {
             if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
-                // One Difference per target body, each relocated to sit right AFTER its body
-                // so the group-based eval subtracts it from THAT body. Re-find the body by id
-                // every time, because each insert shifts the indices of the ones after it.
+                // One Difference per target body, each relocated to sit right AFTER its body.
+                // `eval` is a SEQUENTIAL accumulator — a Union flushes the body before it and
+                // starts a new one, and a Difference applies only to the most recent Union — so
+                // a cutter must sit directly behind every body it is meant to open. Appending a
+                // single cutter at the end instead would reach only the LAST body. Re-find the
+                // body by id every time, because each insert shifts the indices after it.
+                let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
                 for &tid in &targets {
-                    let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
                     self.factory.model.push(
                         cad_solid::BoolOp::Difference, plane, placement,
                         cad_solid::Primitive::Extrusion { profile, h, w, d },
@@ -7940,28 +7953,52 @@ impl CadApp {
     fn assembly_span(&self, origin: glam::Vec3, dir: glam::Vec3) -> (f32, Vec<u32>) {
         const GAP: f32 = 0.4;     // an empty span bigger than this = the room → stop
         let start = origin + dir * 1e-3;
-        // Every surface crossing along the ray, tagged with the body it belongs to.
-        let mut hits: Vec<(f32, u32)> = Vec::new();
+        // Every surface crossing along the ray, tagged with the body it belongs to and with
+        // whether the ray is LEAVING material there (the triangle faces the same way the ray
+        // travels) or arriving at it.
+        let mut hits: Vec<(f32, u32, bool)> = Vec::new();
         for f in &self.factory.model.features {
             if f.op != cad_solid::BoolOp::Union { continue; }
             let tris = self.factory.model.feature_world_positions(f);
             for c in tris.chunks_exact(3) {
                 let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
                 if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
-                    if t > 1e-4 { hits.push((t, f.id)); }
+                    if t > 1e-4 {
+                        let exiting = (b - a).cross(cc - a).dot(dir) > 0.0;
+                        hits.push((t, f.id, exiting));
+                    }
                 }
             }
         }
         hits.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         // Walk from the face outward; a gap larger than GAP means we have left the assembly.
+        //
+        // A GAP only exists between LEAVING material and ENTERING it again. The run between an
+        // entry and the following exit is the inside of a wall, however thick, and must never
+        // be measured against `GAP` — doing that is what made a through-cut stop short:
+        //
+        //   * a probe sitting ON the face starts INSIDE, so the very first crossing is the far
+        //     surface. Judged as a gap, any wall thicker than 400 mm reported a thickness of
+        //     ZERO, the cutter fell back to the bare ±0.1 m margin, and the opening never
+        //     reached the far side — while still reporting success.
+        //   * a probe sitting just OFF a curved face starts OUTSIDE. The march would then stop
+        //     at the near surface and report the width of the air gap instead of the wall.
+        //
+        // Whether the ray began inside is not assumed: it is read from the first crossing —
+        // a face the ray is LEAVING can only have been entered before the march started.
         let mut depth = 0.0_f32;
         let mut prev = 0.0_f32;
         let mut ids: Vec<u32> = Vec::new();
-        for (t, id) in hits {
-            if t - prev > GAP { break; }
+        let mut inside: Option<bool> = None;
+        for (t, id, exiting) in hits {
+            let was_inside = inside.unwrap_or(exiting);
+            if !was_inside && t - prev > GAP {
+                break;
+            }
             prev = t;
             depth = t;
             if !ids.contains(&id) { ids.push(id); }
+            inside = Some(!exiting);
         }
         (depth, ids)
     }
@@ -45030,6 +45067,373 @@ mod factory_sketch_tests {
         assert!(
             app.factory.model.features.iter().any(|f| f.op == cad_solid::BoolOp::Difference),
             "a Difference cutter was added to the model"
+        );
+    }
+
+    /// Build a curved wall (an arc footprint, sampled into segment Boxes exactly as a promoted
+    /// arc is) and cut a window straight through it. Returns the app plus the pieces the
+    /// caller needs to probe the result.
+    ///
+    /// `radius` / `half_span` set how sharply the wall curves across the opening — which is
+    /// the whole point: a straight prism cutter is aimed along ONE tangent normal, so the
+    /// further the wall bends away from that tangent, the deeper the cutter must reach.
+    #[cfg(test)]
+    fn curved_wall_with_window(radius: f32, win_half_angle: f32, thickness: f32)
+        -> (CadApp, glam::Vec3, glam::Vec3)
+    {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Arc footprint centred on the origin, sampled like `geom_outlines` samples an arc.
+        // ODD count: with an even one, angle 0 lands exactly on a segment JOINT and a probe
+        // there grazes two boxes' end caps instead of the wall faces — a degenerate spot.
+        let n_seg = 47;
+        let sweep = 1.2_f32; // radians of wall
+        let fp: Vec<glam::Vec2> = (0..=n_seg)
+            .map(|i| {
+                let a = -sweep * 0.5 + sweep * (i as f32 / n_seg as f32);
+                glam::Vec2::new(radius * a.cos(), radius * a.sin())
+            })
+            .collect();
+        app.factory.add_wall(fp, thickness, 3.0);
+        app.factory.recompute();
+
+        // Pick the OUTER face at the middle of the arc (angle 0 → +X).
+        let n = glam::Vec3::X;                       // outward normal there
+        let face = glam::Vec3::new(radius + thickness * 0.5, 0.0, 1.5);
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
+
+        // A window spanning ±win_half_angle of arc, drawn on the tangent plane.
+        let half_w = (radius * win_half_angle.sin()) as f64;
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![
+                v(-half_w, -0.7), v(half_w, -0.7), v(half_w, 0.7), v(-half_w, 0.7), v(-half_w, -0.7),
+            ],
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory_cut_sketch(true);
+        app.factory.recompute();
+        (app, face, n)
+    }
+
+    /// How many solid surfaces a ray crosses going from `from` along `dir` through the model.
+    #[cfg(test)]
+    fn surface_crossings(app: &CadApp, from: glam::Vec3, dir: glam::Vec3) -> usize {
+        let mut hits = 0;
+        for c in app.factory.cached.positions.chunks_exact(3) {
+            let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+            if cad_solid::ray_triangle(from, dir, a, b, cc).is_some_and(|t| t > 1e-4) {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
+    /// A curved facade built as ONE Extrusion with a curved-band profile — what you get from
+    /// Building / Room / Extrude on a curved outline, as opposed to the per-segment Boxes
+    /// "Make 3D wall" produces. The cutter is still a straight prism, so this is the shape
+    /// most likely to defeat it.
+    #[cfg(test)]
+    fn curved_extruded_wall(radius: f32, thickness: f32, sweep: f32) -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let n = 48;
+        let ro = radius + thickness * 0.5;
+        let ri = radius - thickness * 0.5;
+        let mut pts: Vec<glam::Vec2> = Vec::new();
+        for i in 0..=n {
+            let a = -sweep * 0.5 + sweep * (i as f32 / n as f32);
+            pts.push(glam::Vec2::new(ro * a.cos(), ro * a.sin()));
+        }
+        for i in (0..=n).rev() {
+            let a = -sweep * 0.5 + sweep * (i as f32 / n as f32);
+            pts.push(glam::Vec2::new(ri * a.cos(), ri * a.sin()));
+        }
+        if let Ok((profile, centre, w, d)) = app.factory.model.add_profile(&pts) {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::default(),
+                cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Extrusion { profile, h: 3.0, w, d },
+            );
+        }
+        app.factory.recompute();
+        app
+    }
+
+    /// The same window, cut through a curved facade built as one Extrusion.
+    #[test]
+    fn a_window_cuts_through_a_curved_extruded_wall() {
+        let (radius, thickness) = (4.0_f32, 0.3_f32);
+        let mut app = curved_extruded_wall(radius, thickness, 1.2);
+        let n = glam::Vec3::X;
+        let face = glam::Vec3::new(radius + thickness * 0.5, 0.0, 1.5);
+        // The probe must see the uncut wall first, or the assertion below is vacuous.
+        assert!(
+            surface_crossings(&app, face + n * 0.5, -n) >= 2,
+            "probe sees the uncut extruded wall",
+        );
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
+        let hw = 1.1_f64;
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![v(-hw, -0.7), v(hw, -0.7), v(hw, 0.7), v(-hw, 0.7), v(-hw, -0.7)],
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory_cut_sketch(true);
+        app.factory.recompute();
+        let crossings = surface_crossings(&app, face + n * 0.5, -n);
+        assert_eq!(
+            crossings, 0,
+            "the opening should be clear through, but {crossings} surface(s) remain",
+        );
+    }
+
+    /// `assembly_span` must measure a wall's real thickness. From a live dump it returned
+    /// `in_depth=0.000 out_depth=0.000` on a real building, which collapses the through-cutter
+    /// to the bare ±0.1 m margin and leaves the far face uncut.
+    ///
+    /// Two suspects, separated here: the ray-march's own gap rule, and f32 precision at the
+    /// survey-style coordinates a real DXF sits on (~3.5e3, -6.9e3).
+    #[test]
+    fn assembly_span_measures_wall_thickness() {
+        for (label, origin) in [
+            ("at the origin", glam::Vec3::ZERO),
+            ("at DXF coordinates", glam::Vec3::new(3517.27, -6852.23, 0.0)),
+        ] {
+            for thickness in [0.1_f32, 0.3, 0.5, 0.9] {
+                let mut app = CadApp::default();
+                app.doc.dobjects.clear();
+                // A wall slab: thin in Y, so the probe runs along -Y like the dump's normal.
+                app.factory.model.push(
+                    cad_solid::BoolOp::Union,
+                    cad_solid::Plane::default(),
+                    cad_solid::Placement {
+                        u: origin.x, v: origin.y, lift: 0.0,
+                        spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+                    },
+                    cad_solid::Primitive::Box { w: 6.0, d: thickness, h: 3.0 },
+                );
+                app.factory.recompute();
+                // Probe from the −Y face, heading +Y straight through the slab.
+                let face = origin + glam::Vec3::new(0.0, -thickness * 0.5, 1.5);
+                let (depth, ids) = app.assembly_span(face, glam::Vec3::Y);
+                assert!(
+                    (depth - thickness).abs() < 0.02,
+                    "{label}: a {thickness} m wall measured {depth} m (bodies {})",
+                    ids.len(),
+                );
+            }
+        }
+    }
+
+    /// The OUTWARD probe must still stop: from a wall's outer face, heading away from the
+    /// building, a wall on the far side of a room is NOT part of this assembly. This is what
+    /// the gap rule exists for, and the thick-wall fix must not cost it.
+    #[test]
+    fn assembly_span_does_not_reach_the_wall_across_the_room() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let mut wall = |y: f32| {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::default(),
+                cad_solid::Placement { u: 0.0, v: y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Box { w: 6.0, d: 0.5, h: 3.0 },
+            );
+        };
+        wall(0.0);
+        wall(5.0); // 4.5 m of room between them
+        app.factory.recompute();
+        // From the near wall's −Y face, heading −Y (away from the building): nothing belongs
+        // to this assembly, so the span must be 0 rather than reaching across the room.
+        let face = glam::Vec3::new(0.0, -0.25, 1.5);
+        let (out_depth, _) = app.assembly_span(face, -glam::Vec3::Y);
+        assert!(out_depth < 0.05, "outward span must stay local, got {out_depth}");
+        // Inward it must measure THIS wall (0.5 m) and stop before the far one.
+        let (in_depth, _) = app.assembly_span(face, glam::Vec3::Y);
+        assert!(
+            (in_depth - 0.5).abs() < 0.02,
+            "inward span is this wall's thickness, got {in_depth}",
+        );
+    }
+
+    /// Diagnostic: print what the cut actually measured on a thick curved wall.
+    #[test]
+    #[ignore = "diagnostic"]
+    fn diag_thick_curved_cut() {
+        let (radius, thickness, half_angle) = (8.0_f32, 0.6_f32, 0.12_f32);
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // ODD count: with an even one, angle 0 lands exactly on a segment JOINT and a probe
+        // there grazes two boxes' end caps instead of the wall faces — a degenerate spot.
+        let n_seg = 47;
+        let sweep = 1.2_f32;
+        let fp: Vec<glam::Vec2> = (0..=n_seg)
+            .map(|i| {
+                let a = -sweep * 0.5 + sweep * (i as f32 / n_seg as f32);
+                glam::Vec2::new(radius * a.cos(), radius * a.sin())
+            })
+            .collect();
+        app.factory.add_wall(fp, thickness, 3.0);
+        app.factory.recompute();
+        let n = glam::Vec3::X;
+        let face = glam::Vec3::new(radius + thickness * 0.5, 0.0, 1.5);
+        println!("bodies={}", app.factory.model.features.len());
+        println!("in  = {:?}", app.assembly_span(face, -n).0);
+        println!("out = {:?}", app.assembly_span(face, n).0);
+        println!("uncut crossings = {}", surface_crossings(&app, face + n * 0.5, -n));
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
+        let hw = (radius * half_angle.sin()) as f64;
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![v(-hw, -0.7), v(hw, -0.7), v(hw, 0.7), v(-hw, 0.7), v(-hw, -0.7)],
+            closed: true, widths: Vec::new(),
+        })));
+        let made = app.factory_cut_sketch(true);
+        app.factory.recompute();
+        println!("made={made} feats={}", app.factory.model.features.len());
+        println!("after crossings = {}", surface_crossings(&app, face + n * 0.5, -n));
+        // Where exactly is the leftover material?
+        let start = face + n * 0.5;
+        let mut ts: Vec<f32> = Vec::new();
+        for c in app.factory.cached.positions.chunks_exact(3) {
+            let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+            if let Some(t) = cad_solid::ray_triangle(start, -n, a, b, cc) { if t > 1e-4 { ts.push(t); } }
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("leftover hit distances from {start:?}: {ts:?}");
+        // Group-eval subtracts a Difference from the Union body it sits behind, so the ORDER
+        // of features decides whether a cut lands at all.
+        let ops: Vec<String> = app.factory.model.features.iter()
+            .map(|f| format!("{}{}", if f.op == cad_solid::BoolOp::Union { "U" } else { "D" }, f.id))
+            .collect();
+        println!("features: {}", ops.join(" "));
+        for f in &app.factory.model.features {
+            if f.op == cad_solid::BoolOp::Difference {
+                let (mn, mx) = f.world_aabb();
+                println!("  cutter #{} aabb x {:.3}..{:.3}  y {:.3}..{:.3}  z {:.3}..{:.3}",
+                    f.id, mn.x, mx.x, mn.y, mx.y, mn.z, mx.z);
+                break;
+            }
+        }
+        for f in &app.factory.model.features {
+            if f.op == cad_solid::BoolOp::Union && f.id == 24 {
+                let (mn, mx) = f.world_aabb();
+                println!("  body #24 aabb x {:.3}..{:.3}  y {:.3}..{:.3}  z {:.3}..{:.3}",
+                    mn.x, mx.x, mn.y, mx.y, mn.z, mx.z);
+            }
+        }
+        // Which Union body does the probe ray actually hit first?
+        for f in &app.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            let tris = app.factory.model.feature_world_positions(f);
+            for c in tris.chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(start, -n, a, b, cc) {
+                    if t > 1e-4 {
+                        println!("  ray hits Union body #{} at t={t:.4}", f.id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// ISOLATES the thick-wall fix from the many-bodies problem: ONE box, 0.6 m thick (past
+    /// the old 0.4 m gap threshold). If this passes and the curved case does not, the
+    /// remaining fault is the multi-body cut, not the depth measurement.
+    #[test]
+    fn a_window_cuts_through_a_single_thick_wall() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        app.factory.recompute();
+        let n = -glam::Vec3::Y;
+        let face = glam::Vec3::new(0.0, -0.3, 1.5);
+        assert!(surface_crossings(&app, face + n * 0.5, -n) >= 2, "probe sees the uncut wall");
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![v(-0.5, -0.5), v(0.5, -0.5), v(0.5, 0.5), v(-0.5, 0.5), v(-0.5, -0.5)],
+            closed: true, widths: Vec::new(),
+        })));
+        app.factory_cut_sketch(true);
+        app.factory.recompute();
+        let crossings = surface_crossings(&app, face + n * 0.5, -n);
+        assert_eq!(crossings, 0, "a 0.6 m wall must cut clean through, {crossings} remain");
+    }
+
+    /// END TO END, the reported bug: a window cut through a THICK curved wall. Before the
+    /// `assembly_span` fix the span measured 0, the cutter collapsed to the ±0.1 m margin, and
+    /// the far face survived — the opening showed from outside and not from inside.
+    #[test]
+    fn a_window_cuts_through_a_thick_curved_wall() {
+        // 0.6 m wall: past the 0.4 m gap threshold that used to zero the measurement.
+        let (app, face, n) = curved_wall_with_window(8.0, 0.12, 0.6);
+        let crossings = surface_crossings(&app, face + n * 0.5, -n);
+        assert_eq!(
+            crossings, 0,
+            "the opening must be clear through a thick wall, {crossings} surface(s) remain",
+        );
+    }
+
+    /// SANITY: the probe must actually see an uncut wall, or every assertion built on it is
+    /// vacuous. A ray at the middle of the arc, before any cut, must cross the two skins.
+    #[test]
+    fn the_probe_sees_an_uncut_curved_wall() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let (radius, thickness) = (4.0_f32, 0.3_f32);
+        // ODD count: with an even one, angle 0 lands exactly on a segment JOINT and a probe
+        // there grazes two boxes' end caps instead of the wall faces — a degenerate spot.
+        let n_seg = 47;
+        let sweep = 1.2_f32;
+        let fp: Vec<glam::Vec2> = (0..=n_seg)
+            .map(|i| {
+                let a = -sweep * 0.5 + sweep * (i as f32 / n_seg as f32);
+                glam::Vec2::new(radius * a.cos(), radius * a.sin())
+            })
+            .collect();
+        app.factory.add_wall(fp, thickness, 3.0);
+        app.factory.recompute();
+        let face = glam::Vec3::new(radius + thickness * 0.5, 0.0, 1.5);
+        let crossings = surface_crossings(&app, face + glam::Vec3::X * 0.5, -glam::Vec3::X);
+        assert!(
+            crossings >= 2,
+            "the probe must hit an uncut wall (got {crossings}) — otherwise the cut tests below \
+             prove nothing",
+        );
+    }
+
+    /// BASELINE: on a GENTLY curved wall the through-cut works — the window is open from both
+    /// sides, so a ray down the middle of the opening crosses no material at all.
+    #[test]
+    fn a_window_cuts_through_a_gently_curved_wall() {
+        let (app, face, n) = curved_wall_with_window(30.0, 0.02, 0.3);
+        let crossings = surface_crossings(&app, face + n * 0.5, -n);
+        assert_eq!(crossings, 0, "the opening is clear through the wall");
+    }
+
+    /// A TIGHTLY curved wall. The cutter is a straight prism aimed along the tangent normal at
+    /// ONE point, so a sharp curve is the case most likely to leave it short: across the
+    /// opening the wall bends away from that tangent by the sagitta.
+    #[test]
+    fn a_window_cuts_through_a_tightly_curved_wall() {
+        // R = 4 m, opening ~2.2 m wide → sagitta ≈ 0.15 m, past the 0.1 m margin.
+        let (app, face, n) = curved_wall_with_window(4.0, 0.28, 0.3);
+        let crossings = surface_crossings(&app, face + n * 0.5, -n);
+        assert_eq!(
+            crossings, 0,
+            "the opening should be clear through the wall, but {crossings} surface(s) remain — \
+             the inner skin was not reached",
         );
     }
 
