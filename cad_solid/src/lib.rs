@@ -205,6 +205,33 @@ pub struct Placement {
     pub roll_deg: f32,
 }
 
+/// Multiply every LENGTH in a primitive by `k`, leaving segment/stack counts (which are
+/// topology, not size) and the shared-table ids alone. Split out of [`Model::rescale`] so the
+/// exhaustive match is in one place and a newly added primitive fails to compile until its
+/// dimensions are handled here.
+fn scale_primitive(p: &mut Primitive, k: f32) {
+    match p {
+        Primitive::Box { w, d, h } => { *w *= k; *d *= k; *h *= k; }
+        Primitive::Cylinder { r, h, .. } => { *r *= k; *h *= k; }
+        Primitive::Sphere { r, .. } => *r *= k,
+        Primitive::Frustum { r_bottom, r_top, h, .. } => { *r_bottom *= k; *r_top *= k; *h *= k; }
+        Primitive::Torus { major_r, minor_r, .. } => { *major_r *= k; *minor_r *= k; }
+        Primitive::Capsule { r, h, .. } => { *r *= k; *h *= k; }
+        Primitive::Tube { r_outer, r_inner, h, .. } => { *r_outer *= k; *r_inner *= k; *h *= k; }
+        Primitive::Ellipsoid { rx, ry, rz, .. } => { *rx *= k; *ry *= k; *rz *= k; }
+        // `w`/`d` are a CACHE of the profile's extents (see the variant's docs). The profile
+        // itself is scaled once in `Model::rescale`; these must track it or `local_aabb` —
+        // which ray-pick and the selection highlight both use — reports the old size.
+        Primitive::Extrusion { h, w, d, .. } => { *h *= k; *w *= k; *d *= k; }
+        // Same: cached local AABB of a swept solid, scaled to match its profile and path.
+        Primitive::Sweep { bmin, bmax, .. } => {
+            for v in bmin.iter_mut().chain(bmax.iter_mut()) {
+                *v *= k;
+            }
+        }
+    }
+}
+
 /// Twice the signed area of a closed ring (shoelace). Sign gives the winding.
 fn signed_area2(p: &[Vec2]) -> f32 {
     let mut a = 0.0;
@@ -1003,6 +1030,58 @@ impl Model {
         self.paths.iter().find(|p| p.id == id)
     }
 
+    /// Scale the WHOLE model uniformly about the world origin.
+    ///
+    /// This is the operation [`Feature::scaled`] cannot be: that one deliberately refuses to
+    /// touch `Extrusion` / `Sweep`, because their shapes live in the shared profile and path
+    /// tables and resizing one entry would silently resize every other feature referencing it.
+    /// Here that objection disappears — every consumer is being scaled by the same factor, so
+    /// scaling each shared entry exactly once is not just safe, it is the only correct way to
+    /// do it. (Scaling per-feature would multiply a shared profile once per reference.)
+    ///
+    /// Scales every LENGTH and leaves every direction, angle and segment count alone:
+    /// placements, plane offsets and custom-basis origins, all primitive dimensions, and the
+    /// shared tables. Basis vectors `u`/`v` are unit directions and must NOT be scaled, or the
+    /// plane stops being orthonormal and every solid on it shears.
+    ///
+    /// Callers are responsible for anything living OUTSIDE the model that is keyed on world
+    /// coordinates — notably per-face paint keys, which quantise a plane offset.
+    pub fn rescale(&mut self, k: f32) {
+        if !(k.is_finite() && k > 0.0) || (k - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        // Shared tables FIRST and ONCE each — see the note above.
+        for pr in &mut self.profiles {
+            for p in &mut pr.pts {
+                p[0] *= k;
+                p[1] *= k;
+            }
+        }
+        for pa in &mut self.paths {
+            for p in &mut pa.pts {
+                p[0] *= k;
+                p[1] *= k;
+                p[2] *= k;
+            }
+        }
+        for f in &mut self.features {
+            f.placement.u *= k;
+            f.placement.v *= k;
+            f.placement.lift *= k;
+            // The plane's POSITION scales; its orientation does not.
+            f.plane.offset *= k;
+            if let Some(c) = f.plane.custom.as_mut() {
+                c.origin = [c.origin[0] * k, c.origin[1] * k, c.origin[2] * k];
+            }
+            scale_primitive(&mut f.primitive, k);
+        }
+        // Sketches are live UI state (not persisted), but a stale metre-space sketch sitting
+        // beside a rescaled solid would draw in the wrong place until it was reopened.
+        for sk in &mut self.sketches {
+            sk.frame.origin *= k;
+        }
+    }
+
     /// World-space triangle positions (3 per triangle) of one feature's raw mesh — for
     /// ray-pick against the real surface rather than the bounding box.
     pub fn feature_world_positions(&self, f: &Feature) -> Vec<[f32; 3]> {
@@ -1135,6 +1214,85 @@ mod tests {
         assert!(mn[0] > 4.9 && mx[0] < 7.1, "x spans 5..7, got {}..{}", mn[0], mx[0]);
         assert!(mn[1] > 1.4 && mx[1] < 2.6, "y around 2, got {}..{}", mn[1], mx[1]);
         assert!(mn[2] > 0.4 && mx[2] < 1.6, "z around 1, got {}..{}", mn[2], mx[2]);
+    }
+
+    /// A whole-model rescale must shrink the evaluated geometry by exactly `k`.
+    #[test]
+    fn rescaling_the_model_scales_the_built_geometry() {
+        let mut m = Model::default();
+        m.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Box { w: 3000.0, d: 1000.0, h: 2700.0 },
+        );
+        let (mn0, mx0) = m.eval().bounds().unwrap();
+        assert!((mx0[0] - mn0[0] - 3000.0).abs() < 1.0, "starts 3000 wide");
+        m.rescale(0.001);
+        let (mn, mx) = m.eval().bounds().unwrap();
+        assert!((mx[0] - mn[0] - 3.0).abs() < 0.01, "3000 units → 3 m, got {}", mx[0] - mn[0]);
+        assert!((mx[2] - mn[2] - 2.7).abs() < 0.01, "height came with it");
+    }
+
+    /// THE subtle one. Profiles are SHARED — several storeys of a building point at one
+    /// outline. Scaling per-feature would multiply that profile once per reference, so a
+    /// two-storey building would come out 1000x too small on a x0.001 rescale. `rescale`
+    /// must touch each shared entry exactly once.
+    #[test]
+    fn a_shared_profile_is_scaled_exactly_once() {
+        let mut m = Model::default();
+        let (profile, centre, w, d) = m.add_profile(&[
+            Vec2::new(0.0, 0.0), Vec2::new(1000.0, 0.0),
+            Vec2::new(1000.0, 1000.0), Vec2::new(0.0, 1000.0),
+        ]).unwrap();
+        // TWO features referencing the SAME profile — the storey pattern.
+        for lift in [0.0_f32, 1000.0] {
+            m.push(
+                BoolOp::Union, Plane::default(),
+                Placement { u: centre.x, v: centre.y, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                Primitive::Extrusion { profile, h: 1000.0, w, d },
+            );
+        }
+        m.rescale(0.001);
+        let (mn, mx) = m.eval().bounds().unwrap();
+        // 1000-unit footprint → 1 m; two 1000-tall storeys stacked → 2 m.
+        assert!((mx[0] - mn[0] - 1.0).abs() < 0.01,
+            "footprint scaled ONCE (got {}, would be 0.001 if scaled twice)", mx[0] - mn[0]);
+        assert!((mx[2] - mn[2] - 2.0).abs() < 0.01, "both storeys, {} tall", mx[2] - mn[2]);
+    }
+
+    /// Rescaling must not shear anything: a custom plane's basis vectors are DIRECTIONS, so
+    /// only its origin moves. Scaling `u`/`v` would break orthonormality.
+    #[test]
+    fn rescaling_moves_a_custom_plane_without_distorting_it() {
+        let mut m = Model::default();
+        m.push(
+            BoolOp::Union,
+            Plane::from_basis(Vec3::new(1000.0, 0.0, 0.0), Vec3::Y, Vec3::Z),
+            Placement::default(),
+            Primitive::Box { w: 100.0, d: 100.0, h: 100.0 },
+        );
+        m.rescale(0.001);
+        let p = m.features[0].plane;
+        let c = p.custom.expect("still a custom plane");
+        assert_eq!(c.origin, [1.0, 0.0, 0.0], "origin moved");
+        assert_eq!(c.u, [0.0, 1.0, 0.0], "u is a direction — unchanged");
+        assert_eq!(c.v, [0.0, 0.0, 1.0], "v is a direction — unchanged");
+        assert!((p.normal().length() - 1.0).abs() < 1e-6, "still orthonormal");
+    }
+
+    /// A no-op factor must be exactly that, and a nonsensical one must be refused rather
+    /// than silently collapsing the model to a point.
+    #[test]
+    fn rescale_refuses_nonsense_factors() {
+        let mut m = Model::default();
+        m.push(BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Box { w: 2.0, d: 2.0, h: 2.0 });
+        for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, 1.0] {
+            m.rescale(bad);
+            match m.features[0].primitive {
+                Primitive::Box { w, .. } => assert_eq!(w, 2.0, "factor {bad} left it alone"),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

@@ -5396,6 +5396,62 @@ impl FactoryState {
         self.dirty = true;
     }
 
+    /// Scale the ENTIRE 3D scene uniformly about the world origin.
+    ///
+    /// This is what makes a declared unit useful on a project that was BUILT before the unit
+    /// was known: promotion has been fixed for new work, but solids already in the model were
+    /// built reading millimetres as metres and are 1000x too large. Nothing does this
+    /// automatically — a file that opens must never silently move — so it is an explicit,
+    /// undoable action the user asks for.
+    ///
+    /// Scales the CSG model, wall footprints/heights/thicknesses, storey heights and furniture
+    /// placement. Furniture SIZE scales too: the point is a similarity transform of the whole
+    /// scene, and a piece that was enlarged to match an oversized building has to come back
+    /// down with it.
+    ///
+    /// Re-keys the per-face paint. `surface_key` quantises `d = n·a`, the plane's WORLD offset,
+    /// so every colour and texture assignment would orphan the moment the geometry moved.
+    /// (`paste_clipboard` does the same re-keying for the translation a paste applies.)
+    pub fn rescale_world(&mut self, k: f32) {
+        if !(k.is_finite() && k > 0.0) || (k - 1.0).abs() < f32::EPSILON {
+            return;
+        }
+        self.model.rescale(k);
+        for w in &mut self.walls {
+            for p in &mut w.footprint {
+                *p *= k;
+            }
+            w.thickness *= k;
+            w.height *= k;
+            w.base_z *= k;
+        }
+        for s in &mut self.storeys {
+            s.height *= k;
+        }
+        for f in &mut self.furniture {
+            f.pos = [f.pos[0] * k, f.pos[1] * k, f.pos[2] * k];
+            f.scale *= k;
+        }
+        // Re-key the per-face paint: only the plane-offset component of the key moves, and it
+        // moves by exactly `k` (the normal is a unit direction, so its quantised components
+        // are unchanged). Rebuilt into fresh maps because two distinct old keys can quantise
+        // onto the same new one after scaling down.
+        fn rekey<V: Clone>(
+            m: &std::collections::HashMap<SurfaceKey, V>,
+            k: f32,
+        ) -> std::collections::HashMap<SurfaceKey, V> {
+            m.iter()
+                .map(|(&(fid, nx, ny, nz, d), v)| {
+                    let d_world = d as f32 / 100.0;
+                    ((fid, nx, ny, nz, (d_world * k * 100.0).round() as i32), v.clone())
+                })
+                .collect()
+        }
+        self.surface_color = rekey(&self.surface_color, k);
+        self.surface_texture = rekey(&self.surface_texture, k);
+        self.recompute();
+    }
+
     /// Re-evaluate the CSG tree. Call ONLY when idle — csgrs walks a BSP per boolean.
     ///
     /// Hiding ceilings is NOT done here — it is a RENDER-time filter in [`Self::scene_verts`]

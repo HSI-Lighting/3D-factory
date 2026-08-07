@@ -12831,7 +12831,7 @@ impl CadApp {
                 self.history.push(format!(
                     "  CARD {}", if self.env.CrdEnb { "on" } else { "off" }));
             }
-            Ok(Command::Units(set_opt)) => {
+            Ok(Command::Units(set_opt, rescale)) => {
                 // UNITS — declare what one drawing unit means. This NEVER moves geometry: the
                 // numbers in the drawing are untouched, only their interpretation at the 2D→3D
                 // boundaries changes. So it is safe to set, safe to set back, and a mistake
@@ -12849,16 +12849,33 @@ impl CadApp {
                             u.label(), u.metres_per_unit, how));
                         self.history.push(
                             "  set with: units mm | cm | m | in | ft   (affects 3D scale only)".into());
+                        self.history.push(
+                            "  add `rescale` to also resize the 3D model already built".into());
                     }
                     Some(k) => {
                         self.snapshot_doc();
                         let was = self.doc.units;
                         self.doc.units =
                             cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::User);
+                        if rescale {
+                            // The RATIO between the old and new reading of the same drawing
+                            // numbers. A model built while the drawing was read as metres
+                            // (k_old = 1) but which is really millimetres (k_new = 0.001) is
+                            // 1000x too big, so it wants x0.001 — i.e. k_new / k_old.
+                            let ratio = (k / was.metres_per_unit) as f32;
+                            self.snapshot_factory();
+                            self.factory.rescale_world(ratio);
+                            self.factory.fit();
+                            self.history.push(format!(
+                                "  UNITS: 1 drawing unit = {} (was {}) — and the 3D model was \
+                                 rescaled x{ratio} to match (Ctrl+Z undoes it)",
+                                self.doc.units.label(), was.label()));
+                        } else {
                         self.history.push(format!(
                             "  UNITS: 1 drawing unit = {} (was {}) — existing 3D solids are NOT \
-                             rescaled; re-promote to rebuild them at the new scale",
-                            self.doc.units.label(), was.label()));
+                             rescaled; re-promote, or `units {} rescale`, to bring them along",
+                            self.doc.units.label(), was.label(), self.doc.units.label()));
+                        }
                     }
                 }
             }
@@ -44838,6 +44855,68 @@ mod factory_sketch_tests {
             "drawn wall {promoted_m} m must match the imported-centerline fallback {} m",
             app.factory.wall_thickness,
         );
+    }
+
+    /// THE ORIGINAL COMPLAINT, end to end: a building promoted from a millimetre plan while
+    /// the app still read those numbers as metres is 1000x too big. Declaring the unit with
+    /// `rescale` must bring the existing model down to true size.
+    #[test]
+    fn declaring_a_unit_with_rescale_fixes_an_already_built_model() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Built the old way: a 3000-unit wall read as 3000 METRES.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(3000.0, 0.0),
+        })));
+        app.selection = vec![app.doc.dobjects.len() - 1];
+        assert_eq!(app.make_3d_wall_from_selection().0, 1);
+        let (mn, mx) = app.factory.features_aabb().expect("bounds");
+        assert!((mx.x - mn.x - 3000.0).abs() < 1.0, "starts 3000 m long — the bug");
+
+        // Now say what the drawing really is, and bring the model with it.
+        app.factory.rescale_world(0.001);
+        let (mn, mx) = app.factory.features_aabb().expect("bounds");
+        assert!(
+            (mx.x - mn.x - 3.0).abs() < 0.05,
+            "the existing wall is now ~3 m, got {}", mx.x - mn.x,
+        );
+    }
+
+    /// A rescale must not orphan per-face paint. `surface_key` quantises the plane's WORLD
+    /// offset, so every colour assignment would lose its face the moment geometry moved.
+    #[test]
+    fn rescaling_keeps_per_face_paint_attached() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        // Paint a face whose plane sits 2 m out; after x0.5 it sits at 1 m.
+        let key = (7u32, 50, 0, 0, 200);
+        app.factory.surface_color.insert(key, [1.0, 0.0, 0.0]);
+        app.factory.rescale_world(0.5);
+        assert!(
+            !app.factory.surface_color.contains_key(&key),
+            "the old key must not survive — it points at where the face used to be",
+        );
+        assert_eq!(
+            app.factory.surface_color.get(&(7, 50, 0, 0, 100)),
+            Some(&[1.0, 0.0, 0.0]),
+            "the paint followed the face to its new plane offset",
+        );
+    }
+
+    /// Declaring a unit WITHOUT `rescale` must leave the built model exactly where it is —
+    /// that is the promise the whole design rests on.
+    #[test]
+    fn declaring_a_unit_alone_never_moves_existing_geometry() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let before = app.factory.features_aabb().expect("bounds");
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        let after = app.factory.features_aabb().expect("bounds");
+        assert_eq!(before, after, "setting a unit is a declaration, not a transform");
     }
 
     /// The reverse direction: a WORLD point painted on the plan must land where the drawing

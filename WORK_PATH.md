@@ -485,6 +485,36 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
   header-less file still loading unchanged, an assumed unit exporting as unitless, and a
   declared unit surviving write → read for all five common units.
 
+## 24. `units mm rescale` — fix a model that was ALREADY built wrong (Phase 3)
+
+- **The gap:** §21–23 fixed promotion and import, but a building made *before* its unit was
+  known is still 1000× too big. Nothing rescales it automatically — a file that opens must
+  never silently move — so this is an explicit, undoable action the user asks for.
+- **Built:** `Model::rescale(k)` (cad_solid) + `FactoryState::rescale_world(k)` (cad_app),
+  reached via `units <unit> rescale`. Factor is `k_new / k_old` — the ratio between the old and
+  new reading of the same drawing numbers.
+- **Why this is NOT `Feature::scaled`:** that one deliberately refuses to touch
+  `Extrusion`/`Sweep`, because their shapes live in the SHARED profile/path tables and resizing
+  one entry would resize every other feature referencing it. For a whole-model rescale that
+  objection inverts — every consumer is scaling by the same factor, so each shared entry must
+  be scaled **exactly once**. Scaling per-feature would multiply a shared profile once per
+  reference, and a two-storey building would come out 1000× too *small*. Pinned by
+  `a_shared_profile_is_scaled_exactly_once`.
+- **Scales:** shared profiles/paths (once each), placements, plane offsets and custom-basis
+  ORIGINS, all primitive dimensions incl. the `w`/`d` and `bmin`/`bmax` AABB caches (or
+  ray-pick reports the old size), wall footprints/thickness/height/base_z, storey heights,
+  furniture position and scale, sketch frame origins. **Does not scale** directions, angles or
+  segment counts — scaling a custom plane's `u`/`v` would break orthonormality and shear every
+  solid on it (`rescaling_moves_a_custom_plane_without_distorting_it`).
+- **Re-keys the per-face paint.** `surface_key` quantises `d = n·a`, the plane's WORLD offset,
+  so every colour/texture assignment would orphan the instant geometry moved. Rebuilt into
+  fresh maps because two old keys can quantise onto one new key after scaling down.
+- **Refuses nonsense** (0, negative, NaN, ∞, and 1.0 as a no-op) rather than collapsing the
+  model to a point.
+- **Verified:** 938 tests, incl. the end-to-end original complaint — a 3000-unit wall built as
+  3000 m comes back to ~3 m — plus paint surviving the move, and
+  `declaring_a_unit_alone_never_moves_existing_geometry` (the promise the whole design rests on).
+
 ## Open / not yet done
 
 - **Transform gizmos — Phase 2 (scale + extrude by drag):** uniform corner handle +
@@ -498,12 +528,7 @@ The cut tool went through several dump-driven iterations. Final behaviour lives 
 - **2D furniture blocks in 3D:** the plan's DXF furniture symbols are 2D-only; showing
   them in 3D (extrude footprints, or block→mesh mapping) is a separate feature — not
   started, awaiting a decision on approach.
-- **Units Phase 3** (Phases 1–2 done, see §21–23 — this is what remains):
-  - **Explicit "rescale the existing 3D model" action** for a project built before its unit
-    was declared. Must NOT run at load time (a load must never mutate geometry), and must
-    re-derive `surface_key` — the per-face colour/texture keys quantise a WORLD plane offset,
-    so rescaling orphans every paint assignment. `paste_clipboard`'s `rekey` closure is the
-    pattern to copy.
+- (Units Phases 1–3 are all done — see §21–24.)
 - **`GrdSpc` means two different things.** It is global (10.0) while `self.doc` alternates
   between a mm plan and a metre face sketch — so grid/snap is 10 mm on the plan and 10 METRES
   in a sketch. Discriminate on `factory.session.is_some()`, **not** on the unit value: a
