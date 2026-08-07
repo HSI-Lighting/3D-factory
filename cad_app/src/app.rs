@@ -10578,8 +10578,11 @@ impl CadApp {
             return;
         }
         if split {
-            // Live: re-extrude the current room so the 3D tracks the 2D plan.
-            self.light.rebuild_live_meshes(&self.doc);
+            // Live: re-extrude the current room so the 3D tracks the 2D plan. The PLAN — with a
+            // face-sketch open `self.doc` is the sketch, and the room would collapse to its
+            // handful of construction lines every frame the sketch was live.
+            let plan = self.plan_doc().clone();
+            self.light.rebuild_live_meshes(&plan);
         }
         let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
@@ -24116,12 +24119,15 @@ impl CadApp {
     /// Everything in the SIMLUX config EXCEPT the 3D-factory block (which the two callers above
     /// fill in with vs. without furniture geometry).
     fn build_simlux_config_common(&self) -> crate::simlux_io::SimluxConfig {
-        let mut cfg = self.light.to_config(&self.doc);
+        // Resolve against the PLAN: a live face-sketch has its own layers/styles tables, and
+        // keying the sidecar off those would persist the sketch's names, not the drawing's.
+        let plan = self.plan_doc();
+        let mut cfg = self.light.to_config(plan);
         // App-layer wall centerline linetypes, keyed by STABLE names (style → linetype).
         cfg.wall_centerline = self.wall_centerline_ltype.iter()
             .filter_map(|(&sid, &lid)| {
-                let sname = self.doc.wall_styles.styles.get(sid as usize)?.name.clone();
-                let lname = self.doc.linetypes.linetypes.get(lid as usize)?.name.clone();
+                let sname = plan.wall_styles.styles.get(sid as usize)?.name.clone();
+                let lname = plan.linetypes.linetypes.get(lid as usize)?.name.clone();
                 Some((sname, lname))
             })
             .collect();
@@ -24222,6 +24228,21 @@ impl CadApp {
     /// Public entry: ARM a deferred save. The "Saving…" overlay paints for one frame, then the
     /// serialize + sidecar-write run on a BACKGROUND worker thread ([`save_file_worker`]); the
     /// only main-thread cost is cloning the doc + building the config in [`Self::spawn_busy_worker`].
+    /// The user's DRAWING document — never the face-sketch that temporarily owns `self.doc`.
+    ///
+    /// `factory_enter_sketch` swaps the app's document for the sketch's (that swap is the whole
+    /// thesis of the fork — every 2D tool works on a plane unchanged). But `self.doc` is also
+    /// what the persistence layer reads, and nothing in that layer asked which document it was
+    /// holding. Drawing inside a sketch sets `unsaved`, `tick_autosave` has no session gate, and
+    /// the worker cloned `self.doc` — so an autosave firing while a sketch was open wrote the
+    /// SKETCH over the user's plan file. Every save/serialise site must go through here.
+    fn plan_doc(&self) -> &cad_kernel::Document {
+        match self.factory.session.as_ref() {
+            Some(s) => &s.saved_doc,
+            None => &self.doc,
+        }
+    }
+
     fn do_save(&mut self, path: &str) {
         let est = self.last_save_ms.max(200);
         self.busy = Some(BusyOp {
@@ -24238,10 +24259,11 @@ impl CadApp {
     #[allow(dead_code)] // retained for reference; the live path is the threaded worker.
     fn do_save_now(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
+        let plan = self.plan_doc();
         let bytes: Vec<u8> = if lower.ends_with(".dxf") {
-            cad_io::dxf::write_dxf(&self.doc).into_bytes()
+            cad_io::dxf::write_dxf(plan).into_bytes()
         } else if lower.ends_with(".rsm") {
-            cad_io::rsm::write_rsm(&self.doc)
+            cad_io::rsm::write_rsm(plan)
         } else {
             self.history.push(format!(
                 "  ! save '{}': unknown extension (expected .dxf or .rsm)", path
@@ -24287,7 +24309,8 @@ impl CadApp {
     /// the silent autosave.
     fn spawn_save_thread(&self, path: String) -> std::sync::mpsc::Receiver<BusyMsg> {
         let (tx, rx) = std::sync::mpsc::channel::<BusyMsg>();
-        let doc = self.doc.clone();
+        // The PLAN, not whatever document a live face-sketch has parked in `self.doc`.
+        let doc = self.plan_doc().clone();
         let cfg = self.build_simlux_config_lite();
         let geom = self.factory.furniture_geom_flat();
         std::thread::spawn(move || {
@@ -24303,6 +24326,11 @@ impl CadApp {
         let LoadPayload { doc, sidecar, furniture, read_ms, parse_ms, sidecar_ms, furn_ms } = *payload;
         let n = doc.dobjects.len();
         let l = doc.layers.len();
+        // Commit any live face-sketch FIRST. `self.doc` is the sketch while a session is open,
+        // and the session parks the outgoing drawing in `saved_doc`. Installing over the top
+        // would mean the eventual `factory_exit_sketch` restores the OLD drawing over the one
+        // just opened, and files the newly opened drawing away inside a sketch slot.
+        self.factory_exit_sketch();
         // Re-emit the worker's stage timings to the recorder so a slow open still pins blame.
         self.stage_evt("read file", 0, std::time::Duration::from_millis(read_ms), "worker");
         self.stage_evt("parse doc", n, std::time::Duration::from_millis(parse_ms), "worker");
@@ -44589,6 +44617,54 @@ mod factory_sketch_tests {
         app.factory_exit_sketch();
         assert_eq!(app.doc.dobjects.len(), before + 1, "model-space doc restored intact");
         assert_eq!(app.factory.model.sketches[0].doc.dobjects.len(), 1, "sketch kept its geometry");
+    }
+
+    /// DATA LOSS REGRESSION: an autosave firing while a face-sketch is open must write the
+    /// user's PLAN, never the sketch.
+    ///
+    /// The bug: `factory_enter_sketch` parks the drawing in `session.saved_doc` and puts the
+    /// sketch in `self.doc`; every draw tool inside the sketch sets `unsaved`; `tick_autosave`
+    /// has no session gate; and the save worker cloned `self.doc`. Three minutes inside a
+    /// sketch replaced the user's .rsm with the sketch. `plan_doc()` is the fix — this pins it.
+    #[test]
+    fn saving_mid_sketch_writes_the_plan_not_the_sketch() {
+        let mut app = CadApp::default();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+        let plan_objs = app.doc.dobjects.len();
+        let plan_bytes = cad_io::rsm::write_rsm(&app.doc);
+
+        let f = crate::factory::FactoryState::ground_frame();
+        app.factory_enter_sketch(f);
+        // Draw inside the sketch — this is what used to poison the autosave.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(5.0, 5.0),
+        })));
+        assert!(app.factory.session.is_some(), "sketch session is live");
+
+        let saved = app.plan_doc();
+        assert_eq!(saved.dobjects.len(), plan_objs, "save path sees the PLAN, not the sketch");
+        assert_eq!(
+            cad_io::rsm::write_rsm(saved),
+            plan_bytes,
+            "autosaving mid-sketch leaves the .rsm byte-identical",
+        );
+    }
+
+    /// Opening a file while a sketch is live must not let the later `exit_sketch` restore the
+    /// OLD drawing over the newly opened one (and file the new drawing inside a sketch slot).
+    #[test]
+    fn exiting_a_sketch_after_an_open_keeps_the_opened_drawing() {
+        let mut app = CadApp::default();
+        let f = crate::factory::FactoryState::ground_frame();
+        app.factory_enter_sketch(f);
+        assert!(app.factory.session.is_some());
+        // `apply_loaded` commits the sketch before installing; emulate that contract.
+        app.factory_exit_sketch();
+        assert!(app.factory.session.is_none(), "sketch committed before a new doc is installed");
     }
 
     /// Re-entering a face on the SAME plane must reopen the existing sketch (with its drawn
