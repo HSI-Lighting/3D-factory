@@ -36303,6 +36303,12 @@ impl eframe::App for CadApp {
                             self.env.UcsIcn = !self.env.UcsIcn;
                             let _ = self.env.save();
                         }
+                        if self.factory.open && drafting_badge(ui, "FURN", self.factory.show_furniture_outlines_2d,
+                            "Show placed furniture's outline on the 2D plan — a tracing \
+                             reference while drawing new furniture shapes.")
+                        {
+                            self.factory.show_furniture_outlines_2d = !self.factory.show_furniture_outlines_2d;
+                        }
                         ui.separator();
                         // Snap badges — click any letter to toggle.
                         for k in SnapKind::ALL {
@@ -36561,6 +36567,8 @@ impl eframe::App for CadApp {
             self.draw_factory_sketch_reference(&painter, rect);
             // All finished face-sketches, projected onto the plan — always visible.
             self.draw_factory_sketches_2d(&painter, rect);
+            // Placed furniture footprints, projected onto the plan — toggled by the FURN badge.
+            self.draw_furniture_outlines_2d(&painter, rect);
             // SIMLUX: lux heatmap + luminaire markers on the 2D plan (overlay default off).
             self.paint_lux_overlay(&painter, rect);
             self.paint_luminaires_2d(&painter, rect);
@@ -43711,6 +43719,44 @@ impl CadApp {
                         painter.line_segment([pa, pb], stroke);
                     }
                 }
+            }
+        }
+    }
+
+    /// Draw each placed furniture instance's top-down footprint on the 2D plan, as a tracing
+    /// reference while drawing new furniture shapes. The footprint is the (rotated) local
+    /// bounding box's 8 corners, posed and projected to XY, hulled — O(8) per instance, the
+    /// same cheap corner-transform `furniture_aabb` uses, so it costs nothing even with heavy
+    /// imported meshes (see the perf note on that function).
+    fn draw_furniture_outlines_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.factory.open || !self.factory.show_furniture_outlines_2d || self.factory.furniture.is_empty() {
+            return;
+        }
+        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 180, 90, 190));
+        let clip = painter.with_clip_rect(rect);
+        for inst in &self.factory.furniture {
+            let Some(asset) = self.factory.furniture_lib.get(inst.asset) else { continue };
+            let rm = inst.rot_mat();
+            let s = inst.scale_vec();
+            let pos = glam::Vec3::from(inst.pos);
+            let (lmn, lmx) = (asset.local_min, asset.local_max);
+            let mut corners_xy = Vec::with_capacity(8);
+            for cx in [lmn[0], lmx[0]] {
+                for cy in [lmn[1], lmx[1]] {
+                    for cz in [lmn[2], lmx[2]] {
+                        let w = rm * (glam::Vec3::new(cx, cy, cz) * s) + pos;
+                        corners_xy.push(Vec2::new(w.x as f64, w.y as f64));
+                    }
+                }
+            }
+            let hull = convex_hull(&corners_xy);
+            if hull.len() < 2 {
+                continue;
+            }
+            for i in 0..hull.len() {
+                let a = self.w2s(hull[i], rect);
+                let b = self.w2s(hull[(i + 1) % hull.len()], rect);
+                clip.line_segment([a, b], stroke);
             }
         }
     }

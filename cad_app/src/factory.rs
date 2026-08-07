@@ -705,6 +705,9 @@ pub struct FactoryState {
     pub cutaway_z: f32,
     /// Ceiling slab thickness, metres.
     pub ceiling_thickness: f32,
+    /// Show placed furniture's top-down footprint as an outline on the 2D plan — a tracing
+    /// reference while drawing new furniture shapes. VIEW ONLY; toggled by the FURN badge.
+    pub show_furniture_outlines_2d: bool,
 
     /// Rubber-band box-select in progress: `(start, current)` screen points. `None` = idle.
     pub marquee: Option<(egui::Pos2, egui::Pos2)>,
@@ -2567,6 +2570,7 @@ impl Default for FactoryState {
             cutaway: false,
             cutaway_z: 2.5,
             ceiling_thickness: 0.15,
+            show_furniture_outlines_2d: true,
             marquee: None,
             furniture_lib: Vec::new(),
             furniture: Vec::new(),
