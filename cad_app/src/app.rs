@@ -45438,10 +45438,11 @@ mod factory_sketch_tests {
         }
         // Distinct for neighbouring ids, so two touching bodies do separate.
         assert_ne!(depth_tiebreak(3), depth_tiebreak(4));
-        // Sub-visible: under a tenth of a millimetre at architectural scale.
+        // Big enough to beat the depth quantum (~0.3 mm at building range), small enough to
+        // be invisible: a millimetre is a tenth the thickness of plasterboard.
         for id in 0..64u32 {
             let d = depth_tiebreak(id);
-            assert!(d >= 0.0 && d < 0.0005, "id {id} nudged {d} m — that would be visible");
+            assert!(d >= 0.0 && d < 0.002, "id {id} nudged {d} m — that would be visible");
         }
     }
 

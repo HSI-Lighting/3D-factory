@@ -541,15 +541,24 @@ fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
 /// changes with the camera: the surface crawls, flickers, and reads as a pattern painted on it.
 ///
 /// Keying the nudge to the body id makes the winner CONSTANT instead of correct-but-arbitrary,
-/// which is what stops the crawl. The magnitude is the point: 0.06 mm is far below anything
-/// visible at architectural scale (a hair is ~0.07 mm) while being orders of magnitude above
-/// the depth buffer's resolution at normal viewing distances, so the tie is settled for good.
+/// which is what stops the crawl.
+///
+/// SIZING THIS IS THE WHOLE PROBLEM, and the first attempt got it wrong by choosing a value
+/// that was merely invisible. A nudge below the depth buffer's own resolution rounds to the
+/// same stored depth and does exactly nothing. Resolution at distance z is about
+/// `z² / (near · 2²⁴)`; across a building at ordinary viewing range that is a few tenths of a
+/// millimetre once `near` is sane (see the projection in `light3d`), so the nudge has to be
+/// comfortably above that — roughly a millimetre, not a hundredth of one.
+///
+/// A millimetre is still nothing at architectural scale: it is a tenth the thickness of a
+/// sheet of plasterboard, and it is applied along the surface normal, so a face moves within
+/// its own plane's tolerance rather than changing shape.
 ///
 /// This makes coincident faces STOP MOVING; it does not make overlapping solids correct. A
 /// model with a solid mass swallowing its own floors is still wrong — `diag` reports that.
 #[inline]
 pub fn depth_tiebreak(fid: u32) -> f32 {
-    (fid % 8) as f32 * 6e-5
+    (fid % 4) as f32 * 4e-4
 }
 
 /// The 12 edges of an AABB.

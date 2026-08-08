@@ -293,10 +293,17 @@ pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho
         let z = (dist * 20.0).max(200.0);
         Mat4::orthographic_rh_gl(-hw, hw, -hh, hh, -z, z)
     } else {
-        // Near scales with distance so the depth buffer keeps precision when dollied far
-        // back over a large plan (fixed 0.05 vs a 600k far plane = severe z-fighting). The
-        // 0.05 floor preserves close-up behaviour exactly for normal-sized models.
-        let near = (dist * 0.001).max(0.05);
+        // NEAR is what decides depth precision, and it decides it brutally: resolution at
+        // distance z is roughly z² / (near · 2²⁴), so it is LINEAR in near and quadratic in
+        // how far away you are looking. At the old dist·0.001 a 50 m view got near = 0.05 and
+        // ~3 mm of depth resolution — coarser than the gap between a floor slab and the solid
+        // sitting on it, which is why coplanar surfaces flickered across whole rooms.
+        //
+        // dist·0.01 gives 0.5 m at that range and ~0.3 mm of resolution: a tenfold gain for
+        // nothing, because when the camera is 50 m from what it is looking at there is
+        // nothing to see 5 cm in front of the lens. The 0.05 floor still governs close work,
+        // where near never binds and behaviour is unchanged.
+        let near = (dist * 0.01).max(0.05);
         Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), near, (dist * 6.0).max(80.0))
     };
     (proj * view).to_cols_array()
