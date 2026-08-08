@@ -7114,6 +7114,10 @@ impl FactoryState {
         let mut out = Vec::new();
         let c = [0.47, 0.69, 0.88]; // muted blue — reference, not built geometry
         let k = doc.units.metres_per_unit;
+        // Lifted a hair off the plane. A floor slab sits exactly ON `z`, and there is no
+        // polygon offset in this renderer, so drawing the plan at the same height makes the
+        // two fight for the depth buffer and the lines stipple in and out as the camera moves.
+        let z = z + 0.002;
         for d in &doc.dobjects {
             for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
                 for w in path.windows(2) {

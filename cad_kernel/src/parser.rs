@@ -173,6 +173,10 @@ pub enum Command {
     /// ALREADY built, for a project made before its unit was known. Off by default —
     /// declaring a unit must never move geometry on its own.
     Units(Option<f64>, bool),
+    /// DIAG — report what the 3D model is actually made of: overlapping / duplicated solids
+    /// and coplanar faces, which are what make surfaces flicker and interleave as the camera
+    /// moves. Read-only; changes nothing.
+    Diag,
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -263,6 +267,7 @@ impl Command {
             Command::BlockTaskFinish    => "BlockTaskFinish",
             Command::Card(_)            => "Card",
             Command::Units(..)          => "Units",
+            Command::Diag               => "Diag",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
@@ -471,6 +476,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
                     "card: expected `on` or `off`, got '{}'", other)),
             }
         }
+        "diag" | "diagnose" => Ok(Command::Diag),
         "units" | "unit" | "insunits" => {
             // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as
             // metres-per-unit for anything non-standard (`units 0.001` == `units mm`).

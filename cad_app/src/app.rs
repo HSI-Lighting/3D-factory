@@ -7946,6 +7946,81 @@ impl CadApp {
         });
     }
 
+    /// What the 3D model is actually made of — aimed squarely at surfaces that flicker or
+    /// interleave as the camera moves.
+    ///
+    /// There is no depth bias anywhere in the renderer, so two surfaces at the SAME place have
+    /// nothing to break the tie: which one wins is decided by floating-point noise and changes
+    /// with the camera. That reads as a pattern crawling across a wall, and it is routinely
+    /// mistaken for a texture. The usual cause is duplicated solids — most often a plan whose
+    /// walls are drawn as two parallel face lines, where promoting BOTH lines yields two
+    /// overlapping wall bodies with exactly coincident tops.
+    ///
+    /// Read-only: this reports, it never edits.
+    fn factory_geometry_report(&self) -> Vec<String> {
+        let mut out = vec!["  ── geometry report ─────────────────────────".to_string()];
+        let bodies: Vec<(u32, glam::Vec3, glam::Vec3)> = self
+            .factory
+            .model
+            .features
+            .iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Union)
+            .map(|f| {
+                let (mn, mx) = f.world_aabb();
+                (f.id, mn, mx)
+            })
+            .collect();
+        out.push(format!(
+            "  {} solid bodies, {} features, {} triangles, {} furniture",
+            bodies.len(),
+            self.factory.model.features.len(),
+            self.factory.cached.positions.len() / 3,
+            self.factory.furniture.len(),
+        ));
+
+        // Pairs whose boxes overlap by most of the SMALLER box — near-duplicates.
+        let vol = |mn: glam::Vec3, mx: glam::Vec3| {
+            let d = (mx - mn).max(glam::Vec3::splat(1e-4));
+            d.x * d.y * d.z
+        };
+        let mut dupes: Vec<(u32, u32, f32)> = Vec::new();
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                let (ia, imn, imx) = bodies[i];
+                let (jb, jmn, jmx) = bodies[j];
+                let omn = imn.max(jmn);
+                let omx = imx.min(jmx);
+                if omn.cmpgt(omx).any() {
+                    continue;
+                }
+                let share = vol(omn, omx) / vol(imn, imx).min(vol(jmn, jmx));
+                if share > 0.5 {
+                    dupes.push((ia, jb, share));
+                }
+            }
+        }
+        dupes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        if dupes.is_empty() {
+            out.push("  no overlapping bodies — surfaces should not fight".into());
+        } else {
+            out.push(format!(
+                "  ⚠ {} OVERLAPPING body pair(s) — each shares >50% of the smaller body.",
+                dupes.len()
+            ));
+            out.push("    Coincident faces have no depth bias to separate them, so they".into());
+            out.push("    flicker as the camera moves and look like texture on the wall.".into());
+            for (a, b, share) in dupes.iter().take(8) {
+                out.push(format!("      #{a} ∩ #{b}  ({:.0}% of the smaller)", share * 100.0));
+            }
+            if dupes.len() > 8 {
+                out.push(format!("      … and {} more", dupes.len() - 8));
+            }
+            out.push("    Likely cause: a wall drawn as TWO parallel face lines, with both".into());
+            out.push("    promoted. Promote the CENTRELINE only, or delete the duplicates.".into());
+        }
+        out
+    }
+
     /// Ray-march EVERY Union body from `origin` along `dir` and return `(depth, body_ids)` —
     /// how far solid material runs before the first big interior gap (`GAP`), plus the ids of
     /// every body in that run. Called once per direction (inward and outward) so a THROUGH
@@ -12940,6 +13015,11 @@ impl CadApp {
                             self.doc.units.label(), was.label(), self.doc.units.label()));
                         }
                     }
+                }
+            }
+            Ok(Command::Diag) => {
+                for line in self.factory_geometry_report() {
+                    self.history.push(line);
                 }
             }
             Ok(Command::Explode) => {
@@ -44982,6 +45062,37 @@ mod factory_sketch_tests {
         assert_eq!(before, after, "setting a unit is a declaration, not a transform");
     }
 
+    /// `diag` must actually name the thing that makes surfaces flicker: two solids in the same
+    /// place. Promoting BOTH face lines of a wall drawn as a pair 99 mm apart — which is how
+    /// the reported plan is drawn — gives two overlapping bodies with coincident tops.
+    #[test]
+    fn diag_reports_overlapping_bodies() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Clean model first: nothing overlapping.
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+        );
+        app.factory.recompute();
+        let clean = app.factory_geometry_report().join("\n");
+        assert!(clean.contains("no overlapping bodies"), "clean model reports clean:\n{clean}");
+
+        // Now the duplicate: a second wall 99 mm away, both 200 mm thick — they overlap
+        // almost entirely, and their tops are exactly coplanar.
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement { u: 0.0, v: 0.099, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+        );
+        app.factory.recompute();
+        let report = app.factory_geometry_report().join("\n");
+        assert!(
+            report.contains("OVERLAPPING body pair"),
+            "the duplicate wall must be reported:\n{report}",
+        );
+    }
+
     /// The plan must be OCCLUDED by the model by default. Painting it on a foreground layer
     /// put every line from the far side of the building onto the near wall, where it read as
     /// texture painted on the wall. X-ray stays available, off by default.
@@ -44998,9 +45109,13 @@ mod factory_sketch_tests {
         // Occluded mode: the plan is emitted as depth-tested world segments.
         let lines = app.factory.plan_lines(&app.doc, 0.0);
         assert!(!lines.is_empty(), "the plan becomes scene geometry the solids can hide");
-        // Its segments sit on the ground plane, in world metres.
+        // Its segments sit just ABOVE the ground plane — a floor slab lies exactly on it, and
+        // with no depth bias in the renderer, drawing both at the same height makes them fight.
         for v in &lines {
-            assert!(v.z.abs() < 1e-6, "plan segments lie on the ground plane");
+            assert!(
+                v.z > 0.0 && v.z < 0.02,
+                "plan segments sit a hair above the ground, got z = {}", v.z,
+            );
         }
     }
 
