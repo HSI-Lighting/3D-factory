@@ -13018,9 +13018,19 @@ impl CadApp {
                 }
             }
             Ok(Command::Diag) => {
-                for line in self.factory_geometry_report() {
-                    self.history.push(line);
+                let report = self.factory_geometry_report();
+                for line in &report {
+                    self.history.push(line.clone());
                 }
+                // Also into the RECORDER, so a session dump carries it — that is the channel
+                // this project already uses to get state out, and it saves copying the panel.
+                let n = self.factory.model.features.len();
+                self.factory_op_evt("diag", "command", report.join(" | "), n);
+                self.factory.status = report
+                    .iter()
+                    .find(|l| l.contains("OVERLAPPING"))
+                    .cloned()
+                    .unwrap_or_else(|| "geometry report written to the history panel".into());
             }
             Ok(Command::Explode) => {
                 // Select-first like erase: empty basket queues the op.
