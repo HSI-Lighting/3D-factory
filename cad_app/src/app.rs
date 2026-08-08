@@ -7978,45 +7978,72 @@ impl CadApp {
             self.factory.furniture.len(),
         ));
 
-        // Pairs whose boxes overlap by most of the SMALLER box — near-duplicates.
-        let vol = |mn: glam::Vec3, mx: glam::Vec3| {
-            let d = (mx - mn).max(glam::Vec3::splat(1e-4));
-            d.x * d.y * d.z
-        };
-        let mut dupes: Vec<(u32, u32, f32)> = Vec::new();
-        for i in 0..bodies.len() {
-            for j in (i + 1)..bodies.len() {
-                let (ia, imn, imx) = bodies[i];
-                let (jb, jmn, jmx) = bodies[j];
-                let omn = imn.max(jmn);
-                let omx = imx.min(jmx);
-                if omn.cmpgt(omx).any() {
+        // COINCIDENT FACES, not overlapping boxes. Box overlap is a poor signal here: a floor
+        // slab's box legitimately contains every wall standing on it, so it reports "100%
+        // overlap" for geometry that is perfectly fine. What actually flickers is two
+        // TRIANGLES on the same plane belonging to DIFFERENT bodies, so that is what is
+        // counted: each triangle's plane is quantised (normal folded so n and −n agree, since
+        // two solids meeting face to face share a plane) and planes carrying more than one
+        // body are the fighting ones.
+        use std::collections::{BTreeSet, HashMap};
+        let mut planes: HashMap<(i32, i32, i32, i32), BTreeSet<u32>> = HashMap::new();
+        for f in self.factory.model.features.iter().filter(|f| f.op == cad_solid::BoolOp::Union) {
+            for c in self.factory.model.feature_world_positions(f).chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                let n = (b - a).cross(cc - a).normalize_or_zero();
+                if n.length_squared() < 0.5 {
                     continue;
                 }
-                let share = vol(omn, omx) / vol(imn, imx).min(vol(jmn, jmx));
-                if share > 0.5 {
-                    dupes.push((ia, jb, share));
+                let n = if n.x + n.y + n.z < 0.0 { -n } else { n };
+                let d = n.dot(a);
+                let key = (
+                    (n.x * 200.0).round() as i32, (n.y * 200.0).round() as i32,
+                    (n.z * 200.0).round() as i32, (d * 500.0).round() as i32,
+                );
+                planes.entry(key).or_default().insert(f.id);
+            }
+        }
+        let mut pair_hits: HashMap<(u32, u32), usize> = HashMap::new();
+        for ids in planes.values().filter(|v| v.len() > 1) {
+            let ids: Vec<u32> = ids.iter().copied().collect();
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    *pair_hits.entry((ids[i], ids[j])).or_default() += 1;
                 }
             }
         }
-        dupes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        if dupes.is_empty() {
-            out.push("  no overlapping bodies — surfaces should not fight".into());
+        let mut ranked: Vec<_> = pair_hits.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let describe = |id: u32| -> String {
+            self.factory.model.features.iter().find(|f| f.id == id).map_or("?".into(), |f| {
+                let (mn, mx) = f.world_aabb();
+                let d = mx - mn;
+                format!("{} {:.1}×{:.1}×{:.1} m", f.primitive.kind_label(), d.x, d.y, d.z)
+            })
+        };
+
+        if ranked.is_empty() {
+            out.push("  no coincident faces between bodies — nothing should flicker".into());
         } else {
             out.push(format!(
-                "  ⚠ {} OVERLAPPING body pair(s) — each shares >50% of the smaller body.",
-                dupes.len()
+                "  ⚠ {} body pair(s) share faces on the SAME plane.",
+                ranked.len()
             ));
-            out.push("    Coincident faces have no depth bias to separate them, so they".into());
-            out.push("    flicker as the camera moves and look like texture on the wall.".into());
-            for (a, b, share) in dupes.iter().take(8) {
-                out.push(format!("      #{a} ∩ #{b}  ({:.0}% of the smaller)", share * 100.0));
+            out.push("    There is no depth bias in the renderer, so coincident faces have".into());
+            out.push("    nothing to break the tie: which one shows flips as the camera".into());
+            out.push("    moves. That is the pattern that looks like texture on a surface.".into());
+            for ((a, b), n) in ranked.iter().take(8) {
+                let dup = if describe(*a) == describe(*b) { "  ← SAME SIZE: a duplicate" } else { "" };
+                out.push(format!(
+                    "      #{a} vs #{b}: {n} coincident faces{dup}"
+                ));
+                out.push(format!("         {}  |  {}", describe(*a), describe(*b)));
             }
-            if dupes.len() > 8 {
-                out.push(format!("      … and {} more", dupes.len() - 8));
+            if ranked.len() > 8 {
+                out.push(format!("      … and {} more pair(s)", ranked.len() - 8));
             }
-            out.push("    Likely cause: a wall drawn as TWO parallel face lines, with both".into());
-            out.push("    promoted. Promote the CENTRELINE only, or delete the duplicates.".into());
+            out.push("    Select the ids above in the 3D view and delete the redundant one.".into());
         }
         out
     }
@@ -45072,6 +45099,116 @@ mod factory_sketch_tests {
         assert_eq!(before, after, "setting a unit is a declaration, not a transform");
     }
 
+    /// Load the USER'S actual saved project and measure it. Set `SIMLUX_DIAG` to the drawing
+    /// path (the sidecar beside it is what gets read).
+    ///
+    ///   SIMLUX_DIAG="D:\...\for3dfactorygym.dxf" cargo test -p cad_app diag_real_project -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs SIMLUX_DIAG=<drawing path>"]
+    fn diag_real_project() {
+        let Ok(path) = std::env::var("SIMLUX_DIAG") else {
+            println!("set SIMLUX_DIAG to the drawing path");
+            return;
+        };
+        let cfg = crate::simlux_io::load(std::path::Path::new(&path))
+            .expect("sidecar read")
+            .expect("sidecar exists");
+        let m = &cfg.factory.model;
+        let bodies: Vec<(u32, glam::Vec3, glam::Vec3)> = m
+            .features
+            .iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Union)
+            .map(|f| { let (a, b) = f.world_aabb(); (f.id, a, b) })
+            .collect();
+        println!("features={} bodies={} walls={} furniture={} storeys={}",
+            m.features.len(), bodies.len(), cfg.factory.walls.len(),
+            cfg.factory.furniture.len(), cfg.factory.storeys.len());
+        let diffs = m.features.iter().filter(|f| f.op == cad_solid::BoolOp::Difference).count();
+        println!("differences={diffs}");
+
+        // Overlapping bodies — the duplicate-solid hypothesis.
+        let vol = |mn: glam::Vec3, mx: glam::Vec3| {
+            let d = (mx - mn).max(glam::Vec3::splat(1e-4)); d.x * d.y * d.z
+        };
+        let mut dupes: Vec<(u32, u32, f32)> = Vec::new();
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                let (ia, imn, imx) = bodies[i];
+                let (jb, jmn, jmx) = bodies[j];
+                let omn = imn.max(jmn);
+                let omx = imx.min(jmx);
+                if omn.cmpgt(omx).any() { continue; }
+                let share = vol(omn, omx) / vol(imn, imx).min(vol(jmn, jmx));
+                if share > 0.5 { dupes.push((ia, jb, share)); }
+            }
+        }
+        dupes.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        println!("OVERLAPPING PAIRS: {}", dupes.len());
+        for (a, b, s) in dupes.iter().take(15) {
+            println!("   #{a} n #{b}  {:.0}%", s * 100.0);
+        }
+
+        // COPLANAR faces between DIFFERENT bodies — the thing that actually flickers.
+        // Quantise each triangle's plane (normal + offset) and count planes shared by more
+        // than one body.
+        use std::collections::HashMap;
+        let mut planes: HashMap<(i32, i32, i32, i32), std::collections::BTreeSet<u32>> = HashMap::new();
+        for f in m.features.iter().filter(|f| f.op == cad_solid::BoolOp::Union) {
+            for c in m.feature_world_positions(f).chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                let n = (b - a).cross(cc - a).normalize_or_zero();
+                if n.length_squared() < 0.5 { continue; }
+                // Fold n and -n together: two solids meeting face to face share a plane.
+                let n = if n.x + n.y + n.z < 0.0 { -n } else { n };
+                let d = n.dot(a);
+                let key = ((n.x * 200.0).round() as i32, (n.y * 200.0).round() as i32,
+                           (n.z * 200.0).round() as i32, (d * 500.0).round() as i32);
+                planes.entry(key).or_default().insert(f.id);
+            }
+        }
+        let shared: Vec<_> = planes.iter().filter(|(_, v)| v.len() > 1).collect();
+        println!("PLANES SHARED BY >1 BODY: {} (of {} planes)", shared.len(), planes.len());
+        // Which PAIRS share the most faces — those are the ones actually fighting.
+        let mut pair_hits: HashMap<(u32, u32), usize> = HashMap::new();
+        for (_, v) in &shared {
+            let ids: Vec<u32> = v.iter().copied().collect();
+            for i in 0..ids.len() {
+                for j in (i + 1)..ids.len() {
+                    *pair_hits.entry((ids[i], ids[j])).or_default() += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<_> = pair_hits.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("WORST PAIRS by shared faces:");
+        let info = |id: u32| -> String {
+            m.features.iter().find(|f| f.id == id).map_or("?".into(), |f| {
+                let (mn, mx) = f.world_aabb();
+                let d = mx - mn;
+                format!("{} {:.1}x{:.1}x{:.1}", f.primitive.kind_label(), d.x, d.y, d.z)
+            })
+        };
+        for ((a, b), n) in ranked.iter().take(10) {
+            println!("   #{a} vs #{b}: {n} coincident faces   [{} | {}]", info(*a), info(*b));
+        }
+        // Bodies with an (almost) IDENTICAL box — true duplicates, not containment.
+        println!("NEAR-IDENTICAL BOXES:");
+        let mut twins = 0;
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                let (ia, imn, imx) = bodies[i];
+                let (jb, jmn, jmx) = bodies[j];
+                if (imn - jmn).abs().max_element() < 0.05 && (imx - jmx).abs().max_element() < 0.05 {
+                    if twins < 10 {
+                        println!("   #{ia} == #{jb}   [{} | {}]", info(ia), info(jb));
+                    }
+                    twins += 1;
+                }
+            }
+        }
+        println!("   total near-identical pairs: {twins}");
+    }
+
     /// `diag` must actually name the thing that makes surfaces flicker: two solids in the same
     /// place. Promoting BOTH face lines of a wall drawn as a pair 99 mm apart — which is how
     /// the reported plan is drawn — gives two overlapping bodies with coincident tops.
@@ -45086,20 +45223,23 @@ mod factory_sketch_tests {
         );
         app.factory.recompute();
         let clean = app.factory_geometry_report().join("\n");
-        assert!(clean.contains("no overlapping bodies"), "clean model reports clean:\n{clean}");
+        assert!(clean.contains("no coincident faces"), "clean model reports clean:\n{clean}");
 
-        // Now the duplicate: a second wall 99 mm away, both 200 mm thick — they overlap
-        // almost entirely, and their tops are exactly coplanar.
+        // Now the duplicate: the SAME slab built twice, which is what the reported project
+        // turned out to contain — two identical extrusions with every face coincident.
         app.factory.model.push(
-            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
-            cad_solid::Placement { u: 0.0, v: 0.099, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
             cad_solid::Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
         );
         app.factory.recompute();
         let report = app.factory_geometry_report().join("\n");
         assert!(
-            report.contains("OVERLAPPING body pair"),
-            "the duplicate wall must be reported:\n{report}",
+            report.contains("share faces on the SAME plane"),
+            "the duplicate must be reported:\n{report}",
+        );
+        assert!(
+            report.contains("SAME SIZE: a duplicate"),
+            "an identical twin must be called out as a duplicate:\n{report}",
         );
     }
 
