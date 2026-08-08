@@ -708,6 +708,13 @@ pub struct FactoryState {
     /// Show placed furniture's top-down footprint as an outline on the 2D plan — a tracing
     /// reference while drawing new furniture shapes. VIEW ONLY; toggled by the FURN badge.
     pub show_furniture_outlines_2d: bool,
+    /// Draw the 2D plan THROUGH the model instead of letting solids hide it.
+    ///
+    /// Off by default: on a full architectural drawing the x-ray reads as texture painted on
+    /// the near wall, because every line on the far side of the building projects onto it.
+    /// Worth turning on when the plan is a bare outline you are tracing and the building
+    /// would otherwise cover it.
+    pub plan_xray: bool,
 
     /// Rubber-band box-select in progress: `(start, current)` screen points. `None` = idle.
     pub marquee: Option<(egui::Pos2, egui::Pos2)>,
@@ -2571,6 +2578,7 @@ impl Default for FactoryState {
             cutaway_z: 2.5,
             ceiling_thickness: 0.15,
             show_furniture_outlines_2d: true,
+            plan_xray: false,
             marquee: None,
             furniture_lib: Vec::new(),
             furniture: Vec::new(),
@@ -7094,6 +7102,33 @@ impl FactoryState {
     /// passed in here — lifted onto its frame, so what you draw on a face appears in the 3D
     /// view immediately (2D↔3D linked). `sketch_lines` can't show it because the active
     /// sketch's own `doc` is empty while it is being edited.
+    /// The 2D plan as DEPTH-TESTED world segments on the ground plane — so a wall in front of
+    /// it hides it, the way any other geometry would.
+    ///
+    /// The alternative (and the original behaviour) is [`crate::app::CadApp::paint_plan_underlay`],
+    /// which paints the same lines on an egui FOREGROUND layer so they read through the model.
+    /// That is genuinely useful when the plan is a bare outline you are tracing, and actively
+    /// confusing when it is a full drawing: every annotation block and hatch on the far side of
+    /// the building lands on the near wall and reads as a texture painted on it.
+    pub fn plan_lines(&self, doc: &cad_kernel::Document, z: f32) -> Vec<V3> {
+        let mut out = Vec::new();
+        let c = [0.47, 0.69, 0.88]; // muted blue — reference, not built geometry
+        let k = doc.units.metres_per_unit;
+        for d in &doc.dobjects {
+            for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
+                for w in path.windows(2) {
+                    seg(
+                        &mut out,
+                        Vec3::new(w[0].x, w[0].y, z),
+                        Vec3::new(w[1].x, w[1].y, z),
+                        c,
+                    );
+                }
+            }
+        }
+        out
+    }
+
     pub fn live_sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
         let mut out = Vec::new();
         let Some(session) = self.session.as_ref() else { return out };

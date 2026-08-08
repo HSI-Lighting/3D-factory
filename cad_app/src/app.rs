@@ -6571,7 +6571,9 @@ impl CadApp {
     /// `cad_solid::geom_outlines`, the same flattener the build tools use, so what you see
     /// is exactly what they will consume. Muted blue = reference, not built geometry.
     fn paint_plan_underlay(&self, ui: &egui::Ui, rect: egui::Rect, mvp: &[f32; 16]) {
-        if !self.factory.show_plan || self.doc.dobjects.is_empty() {
+        // X-RAY ONLY. By default the plan goes in with the depth-tested scene lines instead,
+        // so a wall in front of it hides it. See the call site in the 3D render.
+        if !self.factory.show_plan || !self.factory.plan_xray || self.doc.dobjects.is_empty() {
             return;
         }
         // Clipped to the viewport — a foreground layer otherwise spans the WHOLE window,
@@ -8731,10 +8733,28 @@ impl CadApp {
                     let plan_on = self.factory.show_plan;
                     if ui
                         .selectable_label(plan_on, "▦ Plan")
-                        .on_hover_text("Show the 2D drawing on the ground as a reference underlay")
+                        .on_hover_text(
+                            "Show the 2D drawing on the ground as a reference underlay. Solids \
+                             in front of it hide it, like any other geometry — use X-ray to see \
+                             it through the model.",
+                        )
                         .clicked()
                     {
                         self.factory.show_plan = !plan_on;
+                    }
+                    if plan_on {
+                        let xray = self.factory.plan_xray;
+                        if ui
+                            .selectable_label(xray, "X-ray")
+                            .on_hover_text(
+                                "Draw the plan THROUGH the model. Useful when it is a bare \
+                                 outline you are tracing; on a full drawing every line on the \
+                                 far side lands on the near wall and looks like texture on it.",
+                            )
+                            .clicked()
+                        {
+                            self.factory.plan_xray = !xray;
+                        }
                     }
                     // Hide ceilings — hide ONLY the room ceiling slabs in the view, so you
                     // see into the rooms while the surrounding roof and walls stay. VIEW
@@ -10413,10 +10433,16 @@ impl CadApp {
                 let mut lines = self.factory.overlay_lines();
                 lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
                 lines.extend(self.factory.live_sketch_lines(&self.doc)); // active sketch, live
-                // NOTE: the 2D PLAN is NOT added to `lines` — those are depth-tested GL
-                // segments the opaque solids would hide. The plan must read THROUGH the
-                // model, so it is painted on a foreground egui layer below (see
-                // `paint_plan_underlay`), which always sits over the opaque 3D texture.
+                // The 2D PLAN goes in with the depth-tested segments UNLESS x-ray is asked
+                // for. `lines` are occluded by the opaque solids, which is what makes a plan
+                // behind a wall stay behind it. The x-ray alternative — painting the same
+                // lines on a foreground egui layer that always sits over the 3D texture — is
+                // `paint_plan_underlay`, and on a full drawing it reads as texture on the near
+                // wall, because every line on the FAR side of the building projects onto it.
+                if self.factory.show_plan && !self.factory.plan_xray && !self.doc.dobjects.is_empty() {
+                    let z = self.factory.active_base_z();
+                    lines.extend(self.factory.plan_lines(&self.doc, z));
+                }
 
                 // ---- §0.6 PREVIEW — shade / ghost / marching-ants / blip -----
                 // The complete move, per BASIC_MODIFIERS_RULES §0.6 and §1:
@@ -44954,6 +44980,45 @@ mod factory_sketch_tests {
             cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
         let after = app.factory.features_aabb().expect("bounds");
         assert_eq!(before, after, "setting a unit is a declaration, not a transform");
+    }
+
+    /// The plan must be OCCLUDED by the model by default. Painting it on a foreground layer
+    /// put every line from the far side of the building onto the near wall, where it read as
+    /// texture painted on the wall. X-ray stays available, off by default.
+    #[test]
+    fn the_plan_is_depth_tested_unless_xray_is_asked_for() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(5.0, 0.0),
+        })));
+        assert!(app.factory.show_plan, "the plan is on by default");
+        assert!(!app.factory.plan_xray, "but NOT x-ray — solids hide it");
+        // Occluded mode: the plan is emitted as depth-tested world segments.
+        let lines = app.factory.plan_lines(&app.doc, 0.0);
+        assert!(!lines.is_empty(), "the plan becomes scene geometry the solids can hide");
+        // Its segments sit on the ground plane, in world metres.
+        for v in &lines {
+            assert!(v.z.abs() < 1e-6, "plan segments lie on the ground plane");
+        }
+    }
+
+    /// A millimetre plan's depth-tested lines must be in METRES too, or the reference sits
+    /// kilometres from the model it is a reference for.
+    #[test]
+    fn the_depth_tested_plan_is_scaled_to_metres() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.doc.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(3000.0, 0.0),
+        })));
+        let lines = app.factory.plan_lines(&app.doc, 0.0);
+        let far = lines.iter().map(|v| v.x).fold(0.0_f32, f32::max);
+        assert!((far - 3.0).abs() < 0.01, "3000 mm draws 3 m long, got {far}");
     }
 
     /// The reverse direction: a WORLD point painted on the plan must land where the drawing
