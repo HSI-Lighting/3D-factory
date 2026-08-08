@@ -8054,8 +8054,14 @@ impl CadApp {
         // counted: each triangle's plane is quantised (normal folded so n and −n agree, since
         // two solids meeting face to face share a plane) and planes carrying more than one
         // body are the fighting ones.
-        use std::collections::{BTreeSet, HashMap};
-        let mut planes: HashMap<(i32, i32, i32, i32), BTreeSet<u32>> = HashMap::new();
+        // Being on the same plane is NOT enough. A floor slab and the ceiling above it share
+        // the same outline, so their perimeter side faces lie in the same VERTICAL planes —
+        // at different heights, where they never overlap and never fight. Counting those gave
+        // a confident, entirely wrong answer. A pair only counts when their triangles on that
+        // plane actually occupy the same region of it, so each face carries its own box.
+        use std::collections::HashMap;
+        type Face = (u32, glam::Vec3, glam::Vec3); // body id + world AABB of the triangle
+        let mut planes: HashMap<(i32, i32, i32, i32), Vec<Face>> = HashMap::new();
         for f in self.factory.model.features.iter().filter(|f| f.op == cad_solid::BoolOp::Union) {
             for c in self.factory.model.feature_world_positions(f).chunks_exact(3) {
                 let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
@@ -8069,15 +8075,32 @@ impl CadApp {
                     (n.x * 200.0).round() as i32, (n.y * 200.0).round() as i32,
                     (n.z * 200.0).round() as i32, (d * 500.0).round() as i32,
                 );
-                planes.entry(key).or_default().insert(f.id);
+                let mn = a.min(b).min(cc);
+                let mx = a.max(b).max(cc);
+                planes.entry(key).or_default().push((f.id, mn, mx));
             }
         }
         let mut pair_hits: HashMap<(u32, u32), usize> = HashMap::new();
-        for ids in planes.values().filter(|v| v.len() > 1) {
-            let ids: Vec<u32> = ids.iter().copied().collect();
-            for i in 0..ids.len() {
-                for j in (i + 1)..ids.len() {
-                    *pair_hits.entry((ids[i], ids[j])).or_default() += 1;
+        for faces in planes.values() {
+            for i in 0..faces.len() {
+                for j in (i + 1)..faces.len() {
+                    let (ia, imn, imx) = faces[i];
+                    let (jb, jmn, jmx) = faces[j];
+                    if ia == jb {
+                        continue; // one body's own faces meeting edge-on is not a fight
+                    }
+                    // Real overlap IN the plane, not merely the same plane.
+                    let omn = imn.max(jmn);
+                    let omx = imx.min(jmx);
+                    let ov = omx - omn;
+                    // Two of the three axes must overlap by a real area; the third is the
+                    // plane's own thickness, which is ~0 by construction.
+                    let mut spans: Vec<f32> = vec![ov.x, ov.y, ov.z];
+                    spans.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    if spans[0] > 0.01 && spans[1] > 0.01 {
+                        let k = if ia < jb { (ia, jb) } else { (jb, ia) };
+                        *pair_hits.entry(k).or_default() += 1;
+                    }
                 }
             }
         }
@@ -45243,7 +45266,11 @@ mod factory_sketch_tests {
         // Quantise each triangle's plane (normal + offset) and count planes shared by more
         // than one body.
         use std::collections::HashMap;
-        let mut planes: HashMap<(i32, i32, i32, i32), std::collections::BTreeSet<u32>> = HashMap::new();
+        // Same plane is NOT enough. A floor and the ceiling above it share one outline, so
+        // their side faces lie in the same VERTICAL planes at different heights — they never
+        // overlap and never fight. Counting those produced a confident wrong answer, so each
+        // face now carries its box and real overlap IN the plane is required.
+        let mut planes: HashMap<(i32, i32, i32, i32), Vec<(u32, glam::Vec3, glam::Vec3)>> = HashMap::new();
         for f in m.features.iter().filter(|f| f.op == cad_solid::BoolOp::Union) {
             for c in m.feature_world_positions(f).chunks_exact(3) {
                 let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
@@ -45254,18 +45281,24 @@ mod factory_sketch_tests {
                 let d = n.dot(a);
                 let key = ((n.x * 200.0).round() as i32, (n.y * 200.0).round() as i32,
                            (n.z * 200.0).round() as i32, (d * 500.0).round() as i32);
-                planes.entry(key).or_default().insert(f.id);
+                planes.entry(key).or_default().push((f.id, a.min(b).min(cc), a.max(b).max(cc)));
             }
         }
-        let shared: Vec<_> = planes.iter().filter(|(_, v)| v.len() > 1).collect();
-        println!("PLANES SHARED BY >1 BODY: {} (of {} planes)", shared.len(), planes.len());
-        // Which PAIRS share the most faces — those are the ones actually fighting.
+        println!("PLANES: {}", planes.len());
         let mut pair_hits: HashMap<(u32, u32), usize> = HashMap::new();
-        for (_, v) in &shared {
-            let ids: Vec<u32> = v.iter().copied().collect();
-            for i in 0..ids.len() {
-                for j in (i + 1)..ids.len() {
-                    *pair_hits.entry((ids[i], ids[j])).or_default() += 1;
+        for faces in planes.values() {
+            for i in 0..faces.len() {
+                for j in (i + 1)..faces.len() {
+                    let (ia, imn, imx) = faces[i];
+                    let (jb, jmn, jmx) = faces[j];
+                    if ia == jb { continue; }
+                    let ov = imx.min(jmx) - imn.max(jmn);
+                    let mut s = vec![ov.x, ov.y, ov.z];
+                    s.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    if s[0] > 0.01 && s[1] > 0.01 {
+                        let k = if ia < jb { (ia, jb) } else { (jb, ia) };
+                        *pair_hits.entry(k).or_default() += 1;
+                    }
                 }
             }
         }
@@ -45321,6 +45354,75 @@ mod factory_sketch_tests {
             .collect();
         tri_counts.sort_by(|a, b| b.1.cmp(&a.1));
         println!("HEAVIEST BODIES (triangles): {:?}", &tri_counts[..tri_counts.len().min(8)]);
+
+        // Which texture is on which body — the direct read that settles what the weave is.
+        let texname = |ti: usize| f.textures.get(ti)
+            .map_or("?".to_string(), |t| format!("{} {}x{}", t.name, t.w, t.h));
+        println!("TEXTURE PER BODY (largest footprint first):");
+        let mut big: Vec<(u32, f32)> = cfg.factory.model.features.iter()
+            .filter(|x| x.op == cad_solid::BoolOp::Union)
+            .map(|x| { let (mn, mx) = x.world_aabb(); let d = mx - mn; (x.id, d.x * d.y) })
+            .collect();
+        big.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (id, _) in big.iter().take(12) {
+            let t = f.feature_textures.iter().find(|(fid, _)| fid == id).map(|(_, ti)| *ti);
+            let d = cfg.factory.model.features.iter().find(|x| x.id == *id)
+                .map(|x| { let (mn, mx) = x.world_aabb(); mx - mn }).unwrap_or_default();
+            println!("   #{id} {:.1}x{:.1}x{:.1} m  tex={}",
+                d.x, d.y, d.z, t.map_or("(none)".into(), texname));
+        }
+        for (i, t) in f.textures.iter().enumerate() {
+            if t.name.contains("herring") || t.name.contains("parquet") {
+                let users: Vec<u32> = f.feature_textures.iter()
+                    .filter(|(_, ti)| *ti == i).map(|(fid, _)| *fid).collect();
+                println!("HERRINGBONE tex[{i}] '{}' on features: {users:?}", t.name);
+            }
+        }
+
+        // What DEDUPE would do, by the same rule the app uses.
+        let sig = |x: &cad_solid::Feature| format!("{:?}|{:?}|{:?}", x.plane, x.placement, x.primitive);
+        let feats = &cfg.factory.model.features;
+        let mut seen = std::collections::HashSet::new();
+        let (mut would_drop, mut blocked) = (Vec::new(), Vec::new());
+        for (i, x) in feats.iter().enumerate() {
+            if x.op != cad_solid::BoolOp::Union { continue; }
+            if seen.insert(sig(x)) { continue; }
+            if feats.get(i + 1).is_some_and(|n| n.op == cad_solid::BoolOp::Difference) {
+                blocked.push(x.id);
+            } else {
+                would_drop.push(x.id);
+            }
+        }
+        println!("DEDUPE would delete {would_drop:?}");
+        println!("DEDUPE would SKIP (carry cuts) {blocked:?}");
+
+        // Degenerate solids: a zero (or near-zero) extent means two faces in ONE plane, which
+        // fight with each other no matter where the camera is.
+        println!("DEGENERATE BODIES (an extent under 1 mm):");
+        for x in feats.iter().filter(|x| x.op == cad_solid::BoolOp::Union) {
+            let (mn, mx) = x.world_aabb();
+            let d = mx - mn;
+            if d.x.min(d.y).min(d.z) < 0.001 {
+                let t = f.feature_textures.iter().find(|(fid, _)| *fid == x.id).map(|(_, ti)| *ti);
+                println!("   #{} {:?} {:.3}x{:.3}x{:.3} m at ({:.1},{:.1},{:.1}) tex={}",
+                    x.id, x.primitive.kind_label(), d.x, d.y, d.z, mn.x, mn.y, mn.z,
+                    t.map_or("(none)".into(), texname));
+            }
+        }
+        // Do #3 and #122 differ only by profile ID?
+        for id in [3u32, 122] {
+            if let Some(x) = feats.iter().find(|x| x.id == id) {
+                println!("#{id}: plane={:?}", x.plane);
+                println!("      place={:?}", x.placement);
+                println!("      prim={:?}", x.primitive);
+                if let cad_solid::Primitive::Extrusion { profile, .. } = x.primitive {
+                    if let Some(p) = cfg.factory.model.profile(profile) {
+                        println!("      profile {} has {} pts, first={:?}", profile, p.pts.len(),
+                            p.pts.first());
+                    }
+                }
+            }
+        }
     }
 
     /// `dedupe` must delete an exact twin — and must NOT delete one carrying its own cuts,
