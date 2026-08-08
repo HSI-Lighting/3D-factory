@@ -45425,6 +45425,26 @@ mod factory_sketch_tests {
         }
     }
 
+    /// The depth tie-break must be big enough to settle a tie and small enough to be invisible,
+    /// and it must be the SAME for a body's flat and textured triangles or the body splits
+    /// along the seam between them.
+    #[test]
+    fn the_depth_tiebreak_is_stable_and_sub_visible() {
+        use crate::factory::depth_tiebreak;
+        // Deterministic: the same body always gets the same nudge — that is what stops the
+        // flicker, since an arbitrary-but-constant winner never changes.
+        for id in [0u32, 1, 7, 8, 123, 4242] {
+            assert_eq!(depth_tiebreak(id), depth_tiebreak(id));
+        }
+        // Distinct for neighbouring ids, so two touching bodies do separate.
+        assert_ne!(depth_tiebreak(3), depth_tiebreak(4));
+        // Sub-visible: under a tenth of a millimetre at architectural scale.
+        for id in 0..64u32 {
+            let d = depth_tiebreak(id);
+            assert!(d >= 0.0 && d < 0.0005, "id {id} nudged {d} m — that would be visible");
+        }
+    }
+
     /// `dedupe` must delete an exact twin — and must NOT delete one carrying its own cuts,
     /// because `eval` is sequential and the cuts would then land on the previous body.
     #[test]

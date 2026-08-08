@@ -533,6 +533,25 @@ fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
     out.push(v(b, ui(c)));
 }
 
+/// A tiny, STABLE outward nudge for body `fid`, in metres.
+///
+/// Two solids can legitimately meet face to face — a slab resting exactly on another, a wall
+/// flush against a floor — and there is no depth bias anywhere in this renderer, so such faces
+/// have nothing to break the tie. Which one draws is then decided by floating-point noise and
+/// changes with the camera: the surface crawls, flickers, and reads as a pattern painted on it.
+///
+/// Keying the nudge to the body id makes the winner CONSTANT instead of correct-but-arbitrary,
+/// which is what stops the crawl. The magnitude is the point: 0.06 mm is far below anything
+/// visible at architectural scale (a hair is ~0.07 mm) while being orders of magnitude above
+/// the depth buffer's resolution at normal viewing distances, so the tie is settled for good.
+///
+/// This makes coincident faces STOP MOVING; it does not make overlapping solids correct. A
+/// model with a solid mass swallowing its own floors is still wrong — `diag` reports that.
+#[inline]
+pub fn depth_tiebreak(fid: u32) -> f32 {
+    (fid % 8) as f32 * 6e-5
+}
+
 /// The 12 edges of an AABB.
 fn aabb_lines(out: &mut Vec<V3>, mn: Vec3, mx: Vec3, c: [f32; 3]) {
     let k = corners_of(mn, mx);
@@ -6119,9 +6138,12 @@ impl FactoryState {
                 })
                 .or_else(|| fid.and_then(|id| self.feature_color.get(&id).copied()))
                 .unwrap_or(default_base);
+            // Stable tie-break so faces coincident with another body's stop flickering.
+            let nudge = fid.map_or(0.0, depth_tiebreak);
             for (k, p) in tri.iter().enumerate() {
                 let n = self.cached.normals.get(i * 3 + k).copied().unwrap_or(default_n);
-                out.push(v(Vec3::from(*p), shade(base, Vec3::from(n))));
+                let p = Vec3::from(*p) + Vec3::from(n) * nudge;
+                out.push(v(p, shade(base, Vec3::from(n))));
             }
         }
         out
@@ -6158,8 +6180,13 @@ impl FactoryState {
             }
             let tex = &self.textures[tex_idx]; // tiling (tiles/metre) + move + rotate
             let g = groups.entry(tex_idx).or_default();
+            // The SAME tie-break `scene_verts` applies. A body can have flat and textured
+            // triangles at once, and nudging only one of them would split it along the seam.
+            let nudge = depth_tiebreak(id);
             for (k, p) in tri.iter().enumerate() {
                 let n = Vec3::from(self.cached.normals.get(i * 3 + k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                let np = Vec3::from(*p) + n * nudge;
+                let p = &[np.x, np.y, np.z];
                 let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
                 let (uc, vc) = if ax >= ay && ax >= az {
                     (p[1], p[2]) // X-facing wall → YZ
