@@ -5427,6 +5427,19 @@ impl CadApp {
                 inst.texture = Some(idx);
                 inst.color = tint;
             }
+        } else if self.factory.selection.is_empty() {
+            // NOTHING SELECTED. This used to iterate an empty list and silently do nothing.
+            // Arm the texture as a face brush instead: clicking a face then textures THAT
+            // face, which is what an architectural surface usually wants — a wall's two sides
+            // are different materials, and a per-feature texture covers both.
+            self.undo_stack.pop(); // nothing changed yet; the paint click takes its own snapshot
+            self.factory.paint_surface_mode = true;
+            self.factory.surface_tex_brush = Some(idx);
+            self.factory.status =
+                format!("texture '{name}' armed — click a FACE to texture just that surface \
+                         ({w}×{h}). Select an object first to cover all of its faces.");
+            self.history.push(format!("  texture '{name}' armed for per-face painting"));
+            return;
         } else {
             for id in self.factory.selection.clone() {
                 self.factory.feature_texture.insert(id, idx);
@@ -5434,7 +5447,15 @@ impl CadApp {
             }
             self.factory.recompute();
         }
-        self.factory.status = format!("texture '{name}' applied ({w}×{h})");
+        // Say WHICH it was. A per-feature texture covers every face of the solid — both sides
+        // of a wall — and being surprised by that reads as "the texture is on the other side".
+        let n = self.factory.selection.len();
+        self.factory.status = if n > 0 {
+            format!("texture '{name}' applied to ALL faces of {n} object(s) ({w}×{h}) — \
+                     for one face only, tick 'Paint single surface' and click it")
+        } else {
+            format!("texture '{name}' applied ({w}×{h})")
+        };
         self.history.push(format!("  texture '{name}' applied ({w}×{h})"));
     }
 
@@ -7944,6 +7965,54 @@ impl CadApp {
             op: op.to_string(), source: source.to_string(), detail,
             features_before, features_after, bodies, tris,
         });
+    }
+
+    /// Delete solids that are an EXACT copy of an earlier one — same shape, same plane, same
+    /// placement. Returns `(removed, left_alone)`.
+    ///
+    /// Two solids in the same place have no depth bias to separate them, so which one draws
+    /// flips as the camera moves; that is the flicker this exists to remove. Removing an exact
+    /// twin cannot change the picture, because the survivor occupies precisely the same space.
+    ///
+    /// The one thing it will NOT do is delete a duplicate that carries its own cuts. `eval` is
+    /// sequential — a Union starts a new body and the Differences after it belong to it — so
+    /// removing such a Union would hand its cuts to the PREVIOUS body and punch holes in the
+    /// wrong solid. Those are counted and reported instead of guessed at.
+    fn factory_dedupe_solids(&mut self) -> (usize, usize) {
+        // Exact signature from the Debug form: every field of these types is a Copy scalar, so
+        // this is faithful, and it avoids widening `cad_solid`'s public API just to compare.
+        let sig = |f: &cad_solid::Feature| {
+            format!("{:?}|{:?}|{:?}", f.plane, f.placement, f.primitive)
+        };
+        let feats = &self.factory.model.features;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut drop_ids: Vec<u32> = Vec::new();
+        let mut left = 0usize;
+        for (i, f) in feats.iter().enumerate() {
+            if f.op != cad_solid::BoolOp::Union {
+                continue;
+            }
+            let s = sig(f);
+            if seen.insert(s) {
+                continue; // first of its kind — the one that stays
+            }
+            // A duplicate. Safe to drop only if no Difference is riding on it.
+            let owns_cut = feats
+                .get(i + 1)
+                .is_some_and(|n| n.op == cad_solid::BoolOp::Difference);
+            if owns_cut {
+                left += 1;
+            } else {
+                drop_ids.push(f.id);
+            }
+        }
+        for id in &drop_ids {
+            self.factory.model.features.retain(|f| f.id != *id);
+            self.factory.feature_color.remove(id);
+            self.factory.feature_texture.remove(id);
+            self.factory.ceilings.remove(id);
+        }
+        (drop_ids.len(), left)
     }
 
     /// What the 3D model is actually made of — aimed squarely at surfaces that flicker or
@@ -13058,6 +13127,28 @@ impl CadApp {
                     .find(|l| l.contains("OVERLAPPING"))
                     .cloned()
                     .unwrap_or_else(|| "geometry report written to the history panel".into());
+            }
+            Ok(Command::Dedupe) => {
+                self.snapshot_factory();
+                let (removed, kept_cut) = self.factory_dedupe_solids();
+                if removed == 0 {
+                    self.undo_stack.pop();
+                    self.factory.status = if kept_cut > 0 {
+                        format!("no duplicates removed — {kept_cut} carry their own cuts, so \
+                                 deleting them would take the cuts with them; remove those by hand")
+                    } else {
+                        "no duplicate solids found".into()
+                    };
+                } else {
+                    self.factory.recompute();
+                    self.factory.status =
+                        format!("{removed} duplicate solid(s) deleted — Ctrl+Z puts them back");
+                    self.history.push(format!("  dedupe: {removed} duplicate solid(s) deleted"));
+                    if kept_cut > 0 {
+                        self.history.push(format!(
+                            "  dedupe: {kept_cut} duplicate(s) LEFT because they carry cuts"));
+                    }
+                }
             }
             Ok(Command::Explode) => {
                 // Select-first like erase: empty basket queues the op.
@@ -45207,6 +45298,85 @@ mod factory_sketch_tests {
             }
         }
         println!("   total near-identical pairs: {twins}");
+
+        // MATERIALS — a fine regular weave over a whole face is as likely to be a texture or a
+        // procedural pattern as it is depth fighting, and the two need opposite fixes.
+        let f = &cfg.factory;
+        println!("MATERIALS: textures={} feature_tex={} surface_tex={} feature_col={} surface_col={}",
+            f.textures.len(), f.feature_textures.len(), f.surface_textures.len(),
+            f.feature_colors.len(), f.surface_colors.len());
+        for (i, t) in f.textures.iter().enumerate() {
+            println!("   tex[{i}] '{}' {}x{} scale={} rot={} opacity={} reflect={} proc={}",
+                t.name, t.w, t.h, t.scale, t.rot_deg, t.opacity, t.reflect,
+                if t.proc.is_some() { "YES" } else { "no" });
+        }
+        for (fid, ti) in f.feature_textures.iter().take(10) {
+            println!("   feature #{fid} -> tex {ti}");
+        }
+        // How finely is the geometry triangulated? Thousands of slivers across one face also
+        // shade as a weave.
+        let mut tri_counts: Vec<(u32, usize)> = cfg.factory.model.features.iter()
+            .filter(|x| x.op == cad_solid::BoolOp::Union)
+            .map(|x| (x.id, cfg.factory.model.feature_world_positions(x).len() / 3))
+            .collect();
+        tri_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        println!("HEAVIEST BODIES (triangles): {:?}", &tri_counts[..tri_counts.len().min(8)]);
+    }
+
+    /// `dedupe` must delete an exact twin — and must NOT delete one carrying its own cuts,
+    /// because `eval` is sequential and the cuts would then land on the previous body.
+    #[test]
+    fn dedupe_removes_exact_twins_but_keeps_cut_ones() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let mut slab = |app: &mut CadApp| {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+                cad_solid::Primitive::Box { w: 30.0, d: 12.0, h: 0.2 },
+            )
+        };
+        slab(&mut app);
+        slab(&mut app); // the exact twin — this is the reported #3 / #122 situation
+        app.factory.recompute();
+        let before = app.factory.model.features.len();
+        let (removed, kept) = app.factory_dedupe_solids();
+        assert_eq!(removed, 1, "the twin is deleted");
+        assert_eq!(kept, 0);
+        assert_eq!(app.factory.model.features.len(), before - 1);
+
+        // A twin that OWNS a cut must be left alone.
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        slab(&mut app);
+        slab(&mut app);
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        app.factory.recompute();
+        let (removed, kept) = app.factory_dedupe_solids();
+        assert_eq!(removed, 0, "a duplicate carrying a cut is NOT deleted");
+        assert_eq!(kept, 1, "…and it is reported instead");
+    }
+
+    /// A texture applied with nothing selected used to vanish into an empty loop. It now arms
+    /// a face brush, so the next click textures ONE face — a wall's two sides are different
+    /// materials, and a per-feature texture covers both.
+    #[test]
+    fn a_texture_with_no_selection_arms_a_face_brush() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        app.factory.selection.clear();
+        app.factory.sel_furniture.clear();
+        let ti = app.factory.ensure_solid_color_texture([0.5, 0.4, 0.3]);
+        app.apply_texture_index_to_selection(ti, "test", 1, 1);
+        assert!(app.factory.paint_surface_mode, "paint mode is on");
+        assert_eq!(app.factory.surface_tex_brush, Some(ti), "the texture is the brush");
+        assert!(
+            app.factory.feature_texture.is_empty(),
+            "and nothing was blanket-applied to a whole solid",
+        );
     }
 
     /// `diag` must actually name the thing that makes surfaces flicker: two solids in the same
