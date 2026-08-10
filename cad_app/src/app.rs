@@ -8660,6 +8660,41 @@ impl CadApp {
     /// Read-only: this reports, it never edits.
     fn factory_geometry_report(&self) -> Vec<String> {
         let mut out = vec!["  ── geometry report ─────────────────────────".to_string()];
+
+        // DO THE OPENINGS ACTUALLY GO THROUGH? Every cut, measured — not just the ones carrying
+        // the old fallback's signature.
+        //
+        // This lives here rather than in the automatic scene capture because it samples every
+        // opening against every body and costs a second on a real project; `diag` is typed
+        // deliberately, so it can afford that. It exists because "the windows look fine now" and
+        // "the cut is fixed" are different claims, and only one of them is checkable. A cutter
+        // can carry a healthy-looking depth and still leave one side of a window blind.
+        let cuts: Vec<&cad_solid::Feature> = self.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference).collect();
+        if !cuts.is_empty() {
+            let mut bad: Vec<String> = Vec::new();
+            let (mut full, mut nowall) = (0usize, 0usize);
+            for c in &cuts {
+                let (ok, total, short) = self.cut_coverage(c);
+                if total == 0 { nowall += 1; }
+                else if ok == total { full += 1; }
+                else {
+                    bad.push(format!(
+                        "      #{} reaches {ok}/{total} of the opening — short by {short:.3} m",
+                        c.id));
+                }
+            }
+            out.push(format!(
+                "  openings: {full} go fully through, {} do not, {nowall} sit over no wall \
+                 (of {} cuts)", bad.len(), cuts.len()));
+            for b in bad.iter().take(12) { out.push(b.clone()); }
+            if bad.len() > 12 {
+                out.push(format!("      … and {} more", bad.len() - 12));
+            }
+            if bad.is_empty() && nowall == 0 {
+                out.push("  every opening spans its wall at every sampled point".into());
+            }
+        }
         let bodies: Vec<(u32, glam::Vec3, glam::Vec3)> = self
             .factory
             .model
@@ -46562,6 +46597,44 @@ mod factory_sketch_tests {
         let after = app.factory.model.eval().tri_count();
         assert!(after > before_tris / 2,
             "cutting a window must not destroy the wall: {before_tris} → {after} triangles");
+    }
+
+    /// `diag` must answer "did the openings go through" for the WHOLE model, on demand.
+    ///
+    /// Two new cuts scoring 25/25 says those two are sound. It does not say the model is, and the
+    /// same dump that carried them also carried two cuts made on an earlier build that had come
+    /// out as the ±0.1 m fallback. "The windows look right now" and "the cut is fixed" are
+    /// different claims, and only one of them is checkable — so it should be checkable at any
+    /// time, over everything, not only for cuts made while the recorder happened to be running.
+    #[test]
+    fn diag_reports_which_openings_fail_to_go_through() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        let face = cad_solid::Plane::from_basis(
+            glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        // One opening that goes through…
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: -1.5, v: 0.0, lift: -0.8, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.6 },
+        );
+        // …and one that stops inside the wall.
+        let stopped = app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 1.5, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        app.factory.recompute();
+
+        let report = app.factory_geometry_report().join("\n");
+        assert!(report.contains("openings:"), "diag must report opening coverage:\n{report}");
+        assert!(report.contains("1 go fully through"), "the sound one must be counted:\n{report}");
+        assert!(report.contains(&format!("#{stopped} reaches")),
+            "the stopped one must be named, with how far it falls short:\n{report}");
     }
 
     /// The recorded cut event must say whether the opening actually went through.
