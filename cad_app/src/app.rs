@@ -8095,6 +8095,204 @@ impl CadApp {
         (drop_ids.len(), left)
     }
 
+    /// How many entries any one list in a scene capture prints. Past this the list says how
+    /// many it dropped. A 27-piece furniture set and a 159-feature model both fit; a survey
+    /// import with thousands cannot flood the dump.
+    const SCENE_LIST_MAX: usize = 48;
+
+    /// EVERYTHING the 3D renderer is fed, as one recorder event — see [`DbgEvent::FactoryScene`].
+    ///
+    /// Written after a rendering bug took several rounds to pin down because the dump could not
+    /// see any of it. The recorder knew the frame times and the 2D drawing; it did not know the
+    /// model's coordinates, its materials, its cut depths or its camera, so the only evidence
+    /// left was screenshots. Each section below is one of the questions that had to be answered
+    /// by hand at the time.
+    ///
+    /// Read-only, and cheap enough to take on demand: it walks the feature list and the texture
+    /// table once and formats strings. It does NOT walk the triangle soup.
+    fn factory_scene_capture(&self, reason: &str) -> crate::dbg_recorder::DbgEvent {
+        use cad_solid::BoolOp;
+        let f = &self.factory;
+        let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+
+        // ── WHERE THE MODEL IS ───────────────────────────────────────────────────────────
+        // First, because it silently sets the precision of everything downstream. A survey
+        // plan sits at coordinates in the thousands, and f32 has 24 bits of mantissa: at
+        // 6850 m one ULP is 0.8 mm. That is the size of a close-up pixel footprint, so any
+        // texture lookup or screen-space DERIVATIVE taken from an un-rebased world position
+        // is quantised — banding that crawls, and normals that speckle. Nothing in a frame
+        // time or a triangle count hints at it, which is exactly why it belongs here, stated
+        // as a number with its consequence spelled out.
+        let bounds = f.cached.bounds();
+        let mut model_lines = Vec::new();
+        match bounds {
+            Some((mn, mx)) => {
+                model_lines.push(format!(
+                    "world AABB  min=({:.3}, {:.3}, {:.3})  max=({:.3}, {:.3}, {:.3})  size=({:.2} × {:.2} × {:.2} m)",
+                    mn[0], mn[1], mn[2], mx[0], mx[1], mx[2],
+                    mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]));
+                let far = mn.iter().chain(mx.iter()).fold(0.0f32, |a, c| a.max(c.abs()));
+                let ulp = if far > 0.0 { far * f32::EPSILON } else { 0.0 };
+                model_lines.push(format!(
+                    "largest |coord| = {far:.1} m  →  f32 ULP {:.3} mm{}",
+                    ulp * 1000.0,
+                    if ulp > 1e-4 {
+                        "   ⚠ FAR FROM ORIGIN — anything reading world position at texel or \
+                         derivative scale MUST be rebased, and rebased PER VERTEX"
+                    } else { "" }));
+            }
+            None => model_lines.push("world AABB — empty model".into()),
+        }
+        let org = f.uv_rebase_origin();
+        model_lines.push(format!("uv_rebase_origin = ({:.1}, {:.1}, {:.1})", org[0], org[1], org[2]));
+        let u = self.doc.units;
+        model_lines.push(format!(
+            "doc units: {:.6} m/unit ({:?})   ·   plan↔3D scale {:.4}",
+            u.metres_per_unit, u.source, self.doc_k()));
+        sections.push(("model".into(), model_lines));
+
+        // ── CUTS ─────────────────────────────────────────────────────────────────────────
+        // A cut that stops inside the wall leaves solid material behind the glass, which
+        // reads as "the window is not transparent" and as the wall's own texture speckling
+        // through it. It is invisible in every other event: the FactoryOp that made it
+        // reported success, and the depth only becomes wrong later. Printed with the
+        // signature the broken thickness probe used to leave, so `repaircuts`' work — or the
+        // absence of it — is legible at a glance.
+        let mut cuts: Vec<&cad_solid::Feature> =
+            f.model.features.iter().filter(|x| x.op == BoolOp::Difference).collect();
+        // SUSPECTS FIRST, then by id. A cap that truncates in model order can hide the very
+        // cuts the section exists to show — on the real project all ten fitted, but only by
+        // luck. Ordering by what is wrong makes the cap safe instead of lucky.
+        let is_stopped = |c: &cad_solid::Feature| {
+            matches!(c.primitive,
+                cad_solid::Primitive::Extrusion { h, .. } | cad_solid::Primitive::Box { h, .. } if h <= 0.25)
+                && (c.placement.lift + 0.1).abs() <= 0.02
+        };
+        cuts.sort_by_key(|c| (!is_stopped(c), c.id));
+        let mut cut_lines = Vec::new();
+        for c in cuts.iter().take(Self::SCENE_LIST_MAX) {
+            let h = match c.primitive {
+                cad_solid::Primitive::Extrusion { h, .. } | cad_solid::Primitive::Box { h, .. } => Some(h),
+                _ => None,
+            };
+            let lift = c.placement.lift;
+            let suspect = is_stopped(c);
+            cut_lines.push(format!(
+                "#{:<4} {:<10} depth={} lift={lift:+.3}{}",
+                c.id,
+                c.primitive.kind_label(),
+                h.map_or("n/a".into(), |h| format!("{h:.3} m")),
+                if suspect { "   ⚠ STOPPED-CUT SIGNATURE (h≤0.25, lift≈−0.1) — run `repaircuts`" } else { "" }));
+        }
+        // Count the whole set, not only the printed page — a cap must never understate this.
+        let stopped_all = cuts.iter().filter(|c| is_stopped(c)).count();
+        if cuts.len() > Self::SCENE_LIST_MAX {
+            cut_lines.push(format!("… {} MORE OMITTED (cap {})",
+                cuts.len() - Self::SCENE_LIST_MAX, Self::SCENE_LIST_MAX));
+        }
+        cut_lines.push(format!("→ {stopped_all} of {} cuts carry the stopped-cut signature", cuts.len()));
+        sections.push(("cuts".into(), cut_lines));
+
+        // ── MATERIALS ────────────────────────────────────────────────────────────────────
+        // Which path a surface takes through the shader is the first thing worth knowing
+        // about a texture that looks wrong, and it was never recorded. Procedural vs pasted
+        // and triplanar vs mesh-UV are DIFFERENT code paths with different failure modes, so
+        // "the marble looks like bars" means nothing until you know which one drew it.
+        // IN USE FIRST. A project accumulates clipboard leftovers — the real one carries 77
+        // textures of which most are unused — and truncating in table order buries the handful
+        // that are actually on screen behind dozens that are not. Ordering by use makes the cap
+        // drop the irrelevant ones.
+        let usage = |i: usize| {
+            f.feature_texture.values().filter(|v| **v == i).count()
+                + f.surface_texture.values().filter(|v| **v == i).count()
+                + f.furniture.iter().filter(|fu| fu.texture == Some(i)).count()
+        };
+        let mut by_use: Vec<usize> = (0..f.textures.len()).collect();
+        by_use.sort_by_key(|&i| (std::cmp::Reverse(usage(i)), i));
+        let mut mat_lines = Vec::new();
+        for &i in by_use.iter().take(Self::SCENE_LIST_MAX) {
+            let t = &f.textures[i];
+            let feats = f.feature_texture.values().filter(|v| **v == i).count();
+            let surfs = f.surface_texture.values().filter(|v| **v == i).count();
+            let furn  = f.furniture.iter().filter(|fu| fu.texture == Some(i)).count();
+            mat_lines.push(format!(
+                "[{i:>2}] {:<22} {}  tiles/m={:.3} opacity={:.2} reflect={:.2} rot={:.0}° \
+                 offset=({:.2},{:.2}) maps:{}{}  used by {feats} feat / {surfs} surf / {furn} furn",
+                t.name,
+                match &t.proc {
+                    Some(p) => format!("PROCEDURAL {:?} (shader, world-space)", p.pattern),
+                    None => format!("image {}×{}", t.w, t.h),
+                },
+                t.scale, t.opacity, t.reflect, t.rot_deg, t.offset[0], t.offset[1],
+                if t.normal_map.is_some() { " nrm" } else { "" },
+                if t.rough_map.is_some() { " rgh" } else { "" }));
+        }
+        if f.textures.len() > Self::SCENE_LIST_MAX {
+            let dropped = f.textures.len() - Self::SCENE_LIST_MAX;
+            let dropped_used = by_use.iter().skip(Self::SCENE_LIST_MAX).filter(|&&i| usage(i) > 0).count();
+            mat_lines.push(format!(
+                "… {dropped} MORE OMITTED (cap {}), least-used first — {}",
+                Self::SCENE_LIST_MAX,
+                if dropped_used == 0 { "none of them in use".into() }
+                else { format!("⚠ {dropped_used} of them ARE in use") }));
+        }
+        if f.textures.is_empty() { mat_lines.push("(no textures — everything is flat-shaded)".into()); }
+        sections.push(("materials".into(), mat_lines));
+
+        // ── FURNITURE ────────────────────────────────────────────────────────────────────
+        // Instances are triangle soup, not CSG, so they appear in NO feature or body count.
+        // A window that is a placed asset is invisible to every other section here.
+        let mut furn_lines = Vec::new();
+        for (i, inst) in f.furniture.iter().enumerate().take(Self::SCENE_LIST_MAX) {
+            let a = f.furniture_lib.get(inst.asset);
+            furn_lines.push(format!(
+                "[{i:>2}] {:<24} tris={:<7} pos=({:.2},{:.2},{:.2}) rot=({:.0},{:.0},{:.0})° \
+                 scale={:.3}{} tex={:?} cuts={}",
+                a.map_or("<missing asset>", |a| a.name.as_str()),
+                a.map_or(0, |a| a.positions.len() / 3),
+                inst.pos[0], inst.pos[1], inst.pos[2],
+                inst.rot[0], inst.rot[1], inst.rot[2], inst.scale,
+                inst.fit.map_or(String::new(), |t| format!(" fit=({:.2},{:.2},{:.2})", t[0], t[1], t[2])),
+                inst.texture, inst.cuts.len()));
+        }
+        if f.furniture.len() > Self::SCENE_LIST_MAX {
+            furn_lines.push(format!("… {} MORE OMITTED (cap {})",
+                f.furniture.len() - Self::SCENE_LIST_MAX, Self::SCENE_LIST_MAX));
+        }
+        if f.furniture.is_empty() { furn_lines.push("(none placed)".into()); }
+        sections.push(("furniture".into(), furn_lines));
+
+        // ── RENDER STATE + CAMERA ────────────────────────────────────────────────────────
+        // Which passes were even switched on. Half of these can produce an artefact on their
+        // own, and asking the user to list them one at a time is how a diagnosis turns into
+        // a conversation. The camera is here because distance sets the depth resolution and
+        // the pixel footprint — both of which decide whether a precision fault is visible.
+        let s = &f.sun;
+        sections.push(("render".into(), vec![
+            format!("sun={} shadows={} cascades={} intensity={:.2} turbidity={:.1} sky_backdrop={}",
+                s.enabled, s.shadows, s.shadow_cascades, s.intensity, s.turbidity, s.sky_backdrop),
+            format!("ao={} gi={} ssr={} refract={} reflections={:.2}",
+                s.ao.enabled, s.gi.enabled, s.ssr.enabled, s.refract.enabled, s.reflections),
+            format!("env_map={} strength={:.2} rot={:.0}°  taa={}  clay={}",
+                f.env_map.is_some(), f.env_strength, f.env_rot_deg, f.taa_samples, f.clay_mode),
+            format!("hide_ceilings={} cutaway={} @ z={:.2}  plan_xray={} furn_outlines_2d={}",
+                f.hide_ceilings, f.cutaway, f.cutaway_z, f.plan_xray, f.show_furniture_outlines_2d),
+            format!("camera: target=({:.2},{:.2},{:.2}) dist={:.2} m yaw={:.1}° pitch={:.1}° ortho={}",
+                f.cam_target[0], f.cam_target[1], f.cam_target[2],
+                f.cam_dist, f.cam_yaw.to_degrees(), f.cam_pitch.to_degrees(), f.ortho),
+        ]));
+
+        let bodies = f.model.features.iter().filter(|x| x.op == BoolOp::Union).count();
+        crate::dbg_recorder::DbgEvent::FactoryScene {
+            reason:  reason.to_string(),
+            summary: format!(
+                "features={} bodies={} cuts={} tris={} furniture={} textures={} dirty={}",
+                f.model.features.len(), bodies, cuts.len(),
+                f.cached.positions.len() / 3, f.furniture.len(), f.textures.len(), f.dirty),
+            sections,
+        }
+    }
+
     /// What the 3D model is actually made of — aimed squarely at surfaces that flicker or
     /// interleave as the camera moves.
     ///
@@ -13244,6 +13442,23 @@ impl CadApp {
                     .cloned()
                     .unwrap_or_else(|| "geometry report written to the history panel".into());
             }
+            Ok(Command::Scene) => {
+                // Into the RECORDER whether or not it is running: when it is, the capture lands
+                // in the dump; when it is not, `push` is a no-op and the history panel below is
+                // the whole output. Either way the user gets it without arming anything first.
+                let evt = self.factory_scene_capture("`scene` command");
+                let text = crate::dbg_recorder::format_event_oneline(&evt);
+                self.dbg.push(evt, std::panic::Location::caller());
+                for line in text.lines() {
+                    self.history.push(format!("  {}", line.trim_end()));
+                }
+                self.factory.status = if self.dbg.recording {
+                    "3D scene captured — in the history panel AND the running recording".into()
+                } else {
+                    "3D scene written to the history panel — press Start in the Recorder to \
+                     capture it into a dump too".into()
+                };
+            }
             Ok(Command::RepairCuts) => {
                 self.snapshot_factory();
                 let (fixed, skipped) = self.factory_repair_shallow_cuts();
@@ -17074,13 +17289,25 @@ impl CadApp {
         let undo_d = self.undo_stack.len();
         let redo_d = self.redo_stack.len();
         self.dbg.take_snapshot(&self.doc, "session start", undo_d, redo_d, describe_verbose, loc);
+        // …and the 3D side, which the doc snapshot cannot see: it captures `doc`, and the whole
+        // model, its materials and its camera live in `factory`. Without this a dump of a
+        // rendering bug opens with a 2D line list and never mentions the thing being rendered.
+        let scene = self.factory_scene_capture("session start");
+        self.dbg.push(scene, loc);
         self.history.push(format!(
             "  🛰 recording started — every action will be captured"));
     }
 
     /// Stop the recording. Returns nothing — output is read via the
     /// "📋 Copy" button in the Recorder window.
+    #[track_caller]
     pub fn dbg_stop(&mut self) {
+        // Bracket the session: the closing 3D state, so a dump shows what the recorded actions
+        // actually did to the scene rather than only that they ran.
+        if self.dbg.recording {
+            let scene = self.factory_scene_capture("session end");
+            self.dbg.push(scene, std::panic::Location::caller());
+        }
         self.dbg.stop("user pressed Stop");
         self.history.push(format!(
             "  🛰 recording stopped — {} events, {} snapshots",
@@ -45341,6 +45568,30 @@ mod factory_sketch_tests {
         assert_eq!(before, after, "setting a unit is a declaration, not a transform");
     }
 
+    /// The same capture the recorder takes, run against a SAVED project without opening the app.
+    ///
+    ///   SIMLUX_DIAG="D:\...\for3dfactorygym.dxf" cargo test -p cad_app scene_of_real_project -- --ignored --nocapture
+    ///
+    /// Read-only — it loads the sidecar and prints. Useful when the app will not start, when the
+    /// question is about a file the user is not currently in, or to compare a file before and
+    /// after an edit without asking them to record a session.
+    #[test]
+    #[ignore = "needs SIMLUX_DIAG=<drawing path>"]
+    fn scene_of_real_project() {
+        let Ok(path) = std::env::var("SIMLUX_DIAG") else {
+            println!("set SIMLUX_DIAG to the drawing path");
+            return;
+        };
+        let cfg = crate::simlux_io::load(std::path::Path::new(&path))
+            .expect("sidecar read")
+            .expect("sidecar exists");
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory);
+        app.factory.recompute();
+        println!("{}", crate::dbg_recorder::format_event_oneline(
+            &app.factory_scene_capture(&format!("offline capture of {path}"))));
+    }
+
     /// Load the USER'S actual saved project and measure it. Set `SIMLUX_DIAG` to the drawing
     /// path (the sidecar beside it is what gets read).
     ///
@@ -45608,6 +45859,200 @@ mod factory_sketch_tests {
             (depth(2) - 0.05).abs() < 1e-6,
             "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
         );
+    }
+
+    /// Build a small scene FAR from the origin — a survey plan's coordinates — with one stopped
+    /// cut and one healthy one, and return its capture rendered as the dump would show it.
+    fn scene_dump_far_from_origin() -> (CadApp, String) {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // 6848 m out, which is where the real project sits.
+        let base = glam::Vec3::new(3499.6, -6848.0, 0.0);
+        app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(base, glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        let face = cad_solid::Plane::from_basis(
+            base + glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        // The broken probe's fallback: h = 0.2, lift = −0.1.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        // …and one that went all the way through.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 2.0, v: 0.0, lift: -0.7, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 0.4, d: 0.4, h: 1.4 },
+        );
+        app.factory.recompute();
+        let evt = app.factory_scene_capture("test");
+        let text = crate::dbg_recorder::format_event_oneline(&evt);
+        (app, text)
+    }
+
+    /// A dump must be able to answer a RENDERING question on its own.
+    ///
+    /// The recorder used to describe 3D only as frame timings and triangle counts. A dump of a
+    /// texture bug therefore contained no materials, no coordinates, no cut depths and no
+    /// camera — it proved the app was running and nothing more, and the diagnosis fell back to
+    /// reading screenshots. Each assertion below is a question that had to be answered by hand
+    /// during that investigation.
+    #[test]
+    fn a_scene_capture_answers_the_questions_a_rendering_bug_asks() {
+        let (_app, text) = scene_dump_far_from_origin();
+        for want in [
+            "world AABB",          // where is it
+            "f32 ULP",             // …and what precision does that leave
+            "uv_rebase_origin",    // what is the fix measured from
+            "── cuts ──",          // did the openings go through
+            "── materials ──",     // pasted or procedural, triplanar or mesh-UV
+            "── furniture ──",     // instances appear in no feature or body count
+            "── render ──",        // which passes were even on
+            "camera:",             // distance sets footprint and depth resolution
+        ] {
+            assert!(text.contains(want), "the capture must state {want:?}:\n{text}");
+        }
+    }
+
+    /// Distance from the origin is reported as a CONSEQUENCE, not just a coordinate.
+    ///
+    /// "min=(3499.6, −6848.0, 0)" is only a location. The fact that matters is that f32 has 24
+    /// bits of mantissa, so out there one ULP is ~0.8 mm — the size of a close-up pixel
+    /// footprint, which is what made texture lookups band and derivative-built normals speckle.
+    /// A reader should not have to know to do that arithmetic.
+    #[test]
+    fn a_far_model_reports_its_precision_not_only_its_position() {
+        let (_app, text) = scene_dump_far_from_origin();
+        assert!(text.contains("⚠ FAR FROM ORIGIN"), "the hazard must be flagged:\n{text}");
+        assert!(text.contains("PER VERTEX"),
+            "and name the fix — rebasing in the fragment shader is the trap that already cost a round");
+        // 6848 m × f32::EPSILON ≈ 0.8 mm. Assert the magnitude, not the digits.
+        let ulp = text.split("f32 ULP").nth(1).and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<f32>().ok())
+            .expect("the ULP is printed as a number of mm");
+        assert!((0.5..1.5).contains(&ulp), "expected ~0.8 mm at 6848 m, got {ulp}");
+    }
+
+    /// A cut that stopped inside the wall is named in the dump, and a good one is not.
+    ///
+    /// This is the state that reads as "the window is not transparent" and as speckle on the
+    /// glass — solid wall still standing behind it. Nothing else in a dump shows it: the
+    /// `FactoryOp` that made the cut reported success.
+    #[test]
+    fn a_stopped_cut_is_visible_in_the_dump() {
+        let (_app, text) = scene_dump_far_from_origin();
+        assert!(text.contains("STOPPED-CUT SIGNATURE"), "the shallow cut must be flagged:\n{text}");
+        assert!(text.contains("`repaircuts`"), "…and the dump should say what fixes it");
+        assert!(text.contains("→ 1 of 2 cuts carry the stopped-cut signature"),
+            "the tally counts the whole set, and the healthy cut is not in it:\n{text}");
+    }
+
+    /// Starting a recording captures the 3D scene, not only the 2D document.
+    ///
+    /// `take_snapshot` reads `doc`. The model, its materials and its camera live in `factory`,
+    /// so without a second capture a dump of a rendering bug opens with a list of 2D lines and
+    /// never mentions the thing being rendered — which is precisely what happened.
+    #[test]
+    fn starting_a_recording_captures_the_3d_scene() {
+        let mut app = CadApp::default();
+        app.dbg_start();
+        assert!(
+            app.dbg.events.iter().any(|r| matches!(
+                r.event, crate::dbg_recorder::DbgEvent::FactoryScene { .. })),
+            "the opening events must include a 3D scene capture");
+        app.dbg_stop();
+        let n = app.dbg.events.iter().filter(|r| matches!(
+            r.event, crate::dbg_recorder::DbgEvent::FactoryScene { .. })).count();
+        assert_eq!(n, 2, "a session is BRACKETED — the closing state shows what the actions did");
+    }
+
+    /// Every list in a capture is capped and says how many it dropped, so a truncated dump can
+    /// never be read as a complete one. The same contract `SNAP_GEOM_MAX` already carries.
+    #[test]
+    fn scene_lists_are_capped_and_admit_it() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 40.0, d: 4.0, h: 3.0 },
+        );
+        let over = CadApp::SCENE_LIST_MAX + 7;
+        for i in 0..over {
+            app.factory.model.push(
+                cad_solid::BoolOp::Difference,
+                cad_solid::Plane::from_basis(
+                    glam::Vec3::new(i as f32 * 0.5, -2.0, 1.5), glam::Vec3::X, glam::Vec3::Z),
+                cad_solid::Placement { u: 0.0, v: 0.0, lift: -3.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Box { w: 0.3, d: 0.3, h: 6.0 },
+            );
+        }
+        let text = crate::dbg_recorder::format_event_oneline(&app.factory_scene_capture("test"));
+        assert!(text.contains(&format!("… {} MORE OMITTED (cap {})", 7, CadApp::SCENE_LIST_MAX)),
+            "a capped list must report its omissions:\n{text}");
+        // …and the TALLY still counts every cut, not just the printed page.
+        assert!(text.contains(&format!("of {over} cuts")),
+            "the summary line counts the whole set, not the visible one:\n{text}");
+    }
+
+    /// A cap must drop the boring entries, never the diagnostic ones.
+    ///
+    /// Truncating in model or table order is a silent trap: the one broken cut, or the one
+    /// texture actually on screen, can sit past the cap and vanish from the dump — leaving a
+    /// capture that looks clean and is not. Both lists are therefore ordered by what a reader
+    /// came for: suspect cuts first, in-use materials first.
+    #[test]
+    fn a_cap_drops_the_irrelevant_entries_first() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 60.0, d: 4.0, h: 3.0 },
+        );
+        // Fill the page with healthy through-cuts…
+        for i in 0..CadApp::SCENE_LIST_MAX + 5 {
+            app.factory.model.push(
+                cad_solid::BoolOp::Difference,
+                cad_solid::Plane::from_basis(
+                    glam::Vec3::new(i as f32 * 0.6, -2.0, 1.5), glam::Vec3::X, glam::Vec3::Z),
+                cad_solid::Placement { u: 0.0, v: 0.0, lift: -3.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Box { w: 0.3, d: 0.3, h: 6.0 },
+            );
+        }
+        // …then the broken one, LAST, where a model-order cap would bury it.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference,
+            cad_solid::Plane::from_basis(glam::Vec3::new(1.0, -2.0, 1.5), glam::Vec3::X, glam::Vec3::Z),
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 0.3, d: 0.3, h: 0.2 },
+        );
+        let text = crate::dbg_recorder::format_event_oneline(&app.factory_scene_capture("test"));
+        assert!(text.contains("STOPPED-CUT SIGNATURE"),
+            "the last-added broken cut must survive the cap:\n{text}");
+
+        // Same contract for materials: an in-use one added after a pile of unused ones.
+        let mut app = CadApp::default();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+        );
+        let id = app.factory.model.features[0].id;
+        for i in 0..CadApp::SCENE_LIST_MAX + 3 {
+            app.factory.textures.push(crate::factory::TextureAsset::new(
+                format!("unused-{i}"), 1, 1, vec![128, 128, 128, 255]));
+        }
+        app.factory.textures.push(crate::factory::TextureAsset::new(
+            "THE-ONE-IN-USE".into(), 1, 1, vec![255, 0, 0, 255]));
+        let used = app.factory.textures.len() - 1;
+        app.factory.feature_texture.insert(id, used);
+        let text = crate::dbg_recorder::format_event_oneline(&app.factory_scene_capture("test"));
+        assert!(text.contains("THE-ONE-IN-USE"),
+            "the only material actually on screen must survive the cap:\n{text}");
+        assert!(text.contains("none of them in use"),
+            "…and the cap should say whether anything it dropped mattered:\n{text}");
     }
 
     /// Autosave must be OFF at every start. It is the only thing in the app that writes over a

@@ -291,6 +291,30 @@ pub enum DbgEvent {
         cache_rebuilt:    bool,
     },
 
+    /// THE 3D SCENE ITSELF — every input the renderer is handed, in one event.
+    ///
+    /// This is the recorder's biggest blind spot, closed. `FactoryOp` records 3D operations as
+    /// they happen and `FactoryPerf` records what a frame COST, but between them nothing
+    /// described what the scene actually IS. So a dump of a rendering bug showed forty
+    /// frame-time lines and no materials, no cut depths, no camera and no coordinates — enough
+    /// to prove the app was running and nothing else. Diagnosis fell back to reading
+    /// screenshots, which is guessing.
+    ///
+    /// Emitted at session START and STOP (so every dump brackets the 3D state), on demand via
+    /// the `scene` command, and after any op that rebuilds the model.
+    ///
+    /// `sections` are pre-formatted by the app — the recorder stays free of `cad_solid` and
+    /// `factory` types, exactly as `GeometryCapture` and `StretchRecord` do. Every list is
+    /// capped and reports its own omissions, so a truncated capture can never be misread as a
+    /// complete one.
+    FactoryScene {
+        reason:   String,
+        /// Headline: counts, world extent, and the f32 resolution that extent implies.
+        summary:  String,
+        /// `(section title, lines)`, in reading order.
+        sections: Vec<(String, Vec<String>)>,
+    },
+
     /// On-demand snapshot of the user-selected smart-dobject CANDIDATE —
     /// the full geometry (coordinates) of the chosen dobjects, whether an
     /// exploded set OR a block (then the block's DEFINITION-space contents
@@ -849,6 +873,17 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
                  upload={mb:.1} MB  rebuilt={cache_rebuilt}{}",
                 if slow { "  ⚠ SLOW" } else { "" },
             )
+        }
+        DbgEvent::FactoryScene { reason, summary, sections } => {
+            let mut s = format!("🎬 3D SCENE ({reason})\n         {summary}");
+            for (title, lines) in sections {
+                s.push_str(&format!("\n         ── {title} ──"));
+                for l in lines {
+                    s.push_str("\n           ");
+                    s.push_str(l);
+                }
+            }
+            s
         }
         DbgEvent::GeometryCapture { label, entries } => {
             let mut s = format!(
