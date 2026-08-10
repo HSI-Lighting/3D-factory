@@ -10541,6 +10541,15 @@ impl CadApp {
                 for m in pbr_maps {
                     needed_tex.insert(m);
                 }
+                // SORTED, and this is load-bearing. `HashSet` seeds a fresh random state per
+                // instance and this one is rebuilt every frame, so iterating it directly yields a
+                // different order each time. Everything built in this loop is folded IN ORDER
+                // into the renderer's "did anything change?" key, so an unstable order made
+                // identical content hash differently every frame and restarted the temporal
+                // accumulation forever — the screen-space passes never averaged, and a smooth
+                // material rendered as speckled noise that moved with the camera.
+                let mut needed_tex: Vec<usize> = needed_tex.into_iter().collect();
+                needed_tex.sort_unstable();
                 for &idx in &needed_tex {
                     if let Some(t) = self.factory.textures.get(idx) {
                         let rgba = self
@@ -45427,6 +45436,48 @@ mod factory_sketch_tests {
                 }
             }
         }
+    }
+
+    /// THE RENDER LOOP'S INPUTS MUST BE ORDER-STABLE, or temporal accumulation never converges.
+    ///
+    /// The renderer decides "did anything change?" by hashing the frame's inputs in order. Any
+    /// input built from a `HashMap`/`HashSet` — which reseed per instance and are rebuilt every
+    /// frame — hashes differently each time despite identical content, so the accumulator resets
+    /// forever and `n` never leaves 1/16. The screen-space passes get their smoothness from
+    /// averaging those samples, so a smooth material renders as speckled noise instead.
+    #[test]
+    fn textured_meshes_come_back_in_a_stable_order() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Several textured bodies, so there is an order to get wrong.
+        for k in 0..6 {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+                cad_solid::Placement { u: k as f32 * 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Box { w: 2.0, d: 0.3, h: 3.0 },
+            );
+        }
+        app.factory.recompute();
+        let ids: Vec<u32> = app.factory.model.features.iter().map(|f| f.id).collect();
+        for (k, id) in ids.iter().enumerate() {
+            let ti = app.factory.ensure_solid_color_texture([k as f32 / 6.0, 0.5, 0.5]);
+            app.factory.feature_texture.insert(*id, ti);
+        }
+        let order = |a: &Vec<(usize, Vec<crate::light3d::TexVtx>)>| -> Vec<usize> {
+            a.iter().map(|(ti, _)| *ti).collect()
+        };
+        let first = order(&app.factory.feature_textured_meshes());
+        assert!(first.len() > 1, "several texture groups, or this proves nothing");
+        // Rebuilt from a FRESH HashMap each call — the order must not move.
+        for _ in 0..8 {
+            assert_eq!(
+                order(&app.factory.feature_textured_meshes()), first,
+                "group order must be identical every frame",
+            );
+        }
+        let mut sorted = first.clone();
+        sorted.sort_unstable();
+        assert_eq!(first, sorted, "and it is sorted, not merely repeatable");
     }
 
     /// Texture coordinates must be REBASED near the origin. A plan imported from a survey sits

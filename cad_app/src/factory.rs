@@ -6246,7 +6246,18 @@ impl FactoryState {
                 });
             }
         }
-        groups.into_iter().collect()
+        // SORTED, and this is load-bearing rather than tidiness. `HashMap` seeds a fresh random
+        // state per instance and this map is rebuilt every frame, so its iteration order differs
+        // from frame to frame. The renderer's temporal accumulation hashes these groups IN ORDER
+        // to decide whether anything changed; an unstable order hashes identical content
+        // differently every frame, so the accumulator restarted forever and `n` never left 1/16.
+        //
+        // That is what kept screen-space noise visible: the GI gather gets its smoothness from
+        // averaging ~16 jittered samples, and it never got past the first. A smooth material
+        // then reads as speckled dots that change as the camera moves.
+        let mut out: Vec<(usize, Vec<crate::light3d::TexVtx>)> = groups.into_iter().collect();
+        out.sort_by_key(|(ti, _)| *ti);
+        out
     }
 
     /// Placed furniture as shaded triangles, ready to draw alongside the scene. Each
