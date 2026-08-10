@@ -623,6 +623,13 @@ const TEX_FS: &str = r#"
     // WORLD-SPACE (triplanar) mapping and its texel density, for geometry with no useful UVs.
     uniform int   u_triplanar;
     uniform float u_tpm;       // tiles per metre
+    // Origin the triplanar lookup is measured FROM. A plan imported from a survey sits at
+    // world coordinates in the thousands, and a texture coordinate that large is a precision
+    // disaster: the texel is picked by the FRACTIONAL part, so computing it from a huge number
+    // interpolated in f32 across a triangle throws away most of the bits that choose the
+    // texel. That shows as moiré banding which crawls with the camera, worst at grazing
+    // angles. Subtracting a whole-unit origin keeps the lookup near zero and the phase intact.
+    uniform vec3  u_uv_org;
     // TRANSMISSION — light that travels THROUGH the material (glTF's KHR_materials_transmission),
     // which is a different thing from alpha coverage and cannot be expressed by the blender. Needs
     // a copy of the opaque scene taken before any glass was drawn.
@@ -682,9 +689,10 @@ const TEX_FS: &str = r#"
     // planar projection leaves on every face that is not square to it.
     vec4 tri_or_uv(sampler2D s, vec2 uv, vec3 w) {
         if (u_triplanar == 0) return texture(s, uv);
-        return texture(s, v_wpos.yz * u_tpm) * w.x
-             + texture(s, v_wpos.xz * u_tpm) * w.y
-             + texture(s, v_wpos.xy * u_tpm) * w.z;
+        vec3 q = v_wpos - u_uv_org;   // near the origin — see u_uv_org
+        return texture(s, q.yz * u_tpm) * w.x
+             + texture(s, q.xz * u_tpm) * w.y
+             + texture(s, q.xy * u_tpm) * w.z;
     }
 
     // Cheap hash-based value noise + fBm in 3D — enough for grain/marble at this range.
@@ -840,9 +848,10 @@ const TEX_FS: &str = r#"
             twt = pow(abs(Ng), vec3(4.0));      // sharp blend: seams only in a narrow band
             twt /= max(twt.x + twt.y + twt.z, 1e-4);
             // One dominant-axis frame for anything needing a single consistent tangent basis.
-            uv = (twt.x >= twt.y && twt.x >= twt.z) ? v_wpos.yz * u_tpm
-               : (twt.y >= twt.z)                   ? v_wpos.xz * u_tpm
-                                                    : v_wpos.xy * u_tpm;
+            vec3 q = v_wpos - u_uv_org;   // near the origin — see u_uv_org
+            uv = (twt.x >= twt.y && twt.x >= twt.z) ? q.yz * u_tpm
+               : (twt.y >= twt.z)                   ? q.xz * u_tpm
+                                                    : q.xy * u_tpm;
         }
 
         float field = (u_proc > 0) ? proc_field(v_wpos) : 0.0;
@@ -2133,6 +2142,11 @@ pub struct Scene3dRenderer {
     u_tex_has_ao: Option<glow::UniformLocation>,
     u_tex_triplanar: Option<glow::UniformLocation>,
     u_tex_tpm: Option<glow::UniformLocation>,
+    /// Origin the triplanar lookup is measured from — keeps UVs near zero for a model at
+    /// survey coordinates, where large texture coordinates alias badly. See the shader.
+    u_tex_uv_org: Option<glow::UniformLocation>,
+    /// Set by the app to match the CPU-side UV rebase (see `FactoryState::feature_textured_meshes`).
+    pub uv_origin: [f32; 3],
     u_tex_rough_lo: Option<glow::UniformLocation>,
     u_tex_rough_hi: Option<glow::UniformLocation>,
     u_tex_bump: Option<glow::UniformLocation>,
@@ -2339,6 +2353,8 @@ impl Default for Scene3dRenderer {
             u_tex_has_ao: None,
             u_tex_triplanar: None,
             u_tex_tpm: None,
+            u_tex_uv_org: None,
+            uv_origin: [0.0; 3],
             u_tex_rough_lo: None,
             u_tex_rough_hi: None,
             u_tex_bump: None,
@@ -3168,6 +3184,7 @@ impl Scene3dRenderer {
                 self.u_tex_has_ao = gl.get_uniform_location(tex_prog, "u_has_ao");
                 self.u_tex_triplanar = gl.get_uniform_location(tex_prog, "u_triplanar");
                 self.u_tex_tpm = gl.get_uniform_location(tex_prog, "u_tpm");
+                self.u_tex_uv_org = gl.get_uniform_location(tex_prog, "u_uv_org");
                 self.u_tex_rough_lo = gl.get_uniform_location(tex_prog, "u_rough_lo");
                 self.u_tex_rough_hi = gl.get_uniform_location(tex_prog, "u_rough_hi");
                 self.u_tex_bump = gl.get_uniform_location(tex_prog, "u_bump");
@@ -3930,6 +3947,10 @@ impl Scene3dRenderer {
         if let Some(loc) = &self.u_tex_has_ao { gl.uniform_1_i32(Some(loc), aom.is_some() as i32); }
         if let Some(loc) = &self.u_tex_triplanar { gl.uniform_1_i32(Some(loc), pbr.triplanar as i32); }
         if let Some(loc) = &self.u_tex_tpm { gl.uniform_1_f32(Some(loc), pbr.tiles_per_m.max(1e-3)); }
+        if let Some(loc) = &self.u_tex_uv_org {
+            let o = self.uv_origin;
+            gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
+        }
         if let Some(loc) = &self.u_tex_rough_base { gl.uniform_1_f32(Some(loc), pbr.roughness); }
         if let Some(loc) = &self.u_tex_transmission { gl.uniform_1_f32(Some(loc), pbr.transmission.clamp(0.0, 1.0)); }
         if let Some(loc) = &self.u_tex_metallic { gl.uniform_1_f32(Some(loc), pbr.metallic.clamp(0.0, 1.0)); }

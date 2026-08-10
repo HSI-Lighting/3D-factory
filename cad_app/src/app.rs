@@ -10497,6 +10497,9 @@ impl CadApp {
                 // pass, sorted back-to-front so overlapping translucent solids read correctly.
                 let mut tex_feat_owned: Vec<(usize, Vec<crate::light3d::TexVtx>)> = Vec::new();
                 let mut tex_feat_transp_owned: Vec<(usize, Vec<crate::light3d::TexVtx>)> = Vec::new();
+                // Keep the shader's triplanar lookup on the SAME rebased origin the CPU UVs
+                // use — handed to the renderer once it is locked, below.
+                let uv_org = self.factory.uv_rebase_origin();
                 for (idx, verts) in self.factory.feature_textured_meshes() {
                     needed_tex.insert(idx);
                     let translucent = self.factory.textures.get(idx)
@@ -10747,6 +10750,7 @@ impl CadApp {
                                     }),
                                 );
                                 r.set_taa(gl, taa_samples);
+                                r.uv_origin = uv_org;
                                 r.render(
                                     gl, &verts, &overlay, &lines, &mvp, Some(scene_ver),
                                     &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
@@ -45421,6 +45425,42 @@ mod factory_sketch_tests {
                             p.pts.first());
                     }
                 }
+            }
+        }
+    }
+
+    /// Texture coordinates must be REBASED near the origin. A plan imported from a survey sits
+    /// at world coordinates in the thousands; the texel is chosen by the FRACTIONAL part, so a
+    /// UV that large loses the bits that pick it and the texture moirés. Invisible on a model
+    /// built near the origin — which is exactly why it survived every other test here.
+    #[test]
+    fn texture_uvs_are_rebased_near_the_origin() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+            cad_solid::Placement { u: 3517.0, v: -6852.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 6.0, d: 0.3, h: 3.0 },
+        );
+        app.factory.recompute();
+        let id = app.factory.model.features[0].id;
+        let ti = app.factory.ensure_solid_color_texture([0.6, 0.6, 0.6]);
+        app.factory.feature_texture.insert(id, ti);
+
+        let org = app.factory.uv_rebase_origin();
+        assert!(org[0] > 3000.0 && org[1] < -6000.0, "the origin tracks the model, got {org:?}");
+
+        let meshes = app.factory.feature_textured_meshes();
+        assert!(!meshes.is_empty(), "the textured wall is emitted");
+        for (_, verts) in &meshes {
+            for v in verts {
+                // The VERTEX keeps its true world position…
+                assert!(v.x > 3000.0, "geometry stays where it is: {}", v.x);
+                // …while the UV it carries is small enough for f32 to resolve a texel.
+                assert!(
+                    v.u.abs() < 100.0 && v.v.abs() < 100.0,
+                    "UV must be rebased near the origin, got ({}, {})", v.u, v.v,
+                );
             }
         }
     }

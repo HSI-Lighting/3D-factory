@@ -6163,12 +6163,41 @@ impl FactoryState {
     /// ~1 tile / metre, so a wall or floor tiles the image at a real, consistent scale (the
     /// classic "wallpaper / floor tile" mapping). Honours hide-ceilings and cutaway exactly
     /// like [`Self::scene_verts`], and the triangles are the ones that method skips.
+    /// The origin texture lookups are measured FROM, in world metres.
+    ///
+    /// A plan imported from a survey sits at coordinates in the thousands, and a texture
+    /// coordinate that large is a precision disaster: the texel is chosen by the FRACTIONAL
+    /// part, so deriving it from a huge number — then interpolating that in f32 across a
+    /// triangle — discards most of the bits that actually select the texel. It shows as moiré
+    /// banding that crawls with the camera, worst at grazing angles, and it is invisible on a
+    /// model built near the origin, which is why it survives every synthetic test.
+    ///
+    /// Rounded to whole units so the tiling PHASE does not shift as the model grows, and taken
+    /// once for the WHOLE model so neighbouring bodies stay aligned rather than breaking the
+    /// pattern at every seam. Shared with the shader's triplanar path so the two cannot drift.
+    pub fn uv_rebase_origin(&self) -> [f32; 3] {
+        self.cached
+            .bounds()
+            .map_or([0.0; 3], |(mn, _)| [mn[0].round(), mn[1].round(), mn[2].round()])
+    }
+
     pub fn feature_textured_meshes(&self) -> Vec<(usize, Vec<crate::light3d::TexVtx>)> {
         if self.feature_texture.is_empty() && self.surface_texture.is_empty() {
             return Vec::new();
         }
         let mut groups: std::collections::HashMap<usize, Vec<crate::light3d::TexVtx>> =
             std::collections::HashMap::new();
+        // REBASE the UV origin to the model, because these coordinates are WORLD ones and a
+        // plan imported from a survey sits at X≈3500, Y≈−6850. Texture coordinates in the
+        // thousands are a precision disaster: the texel is chosen by the FRACTIONAL part of
+        // the coordinate, and computing that from a large number — then interpolating it in
+        // f32 across a triangle — loses most of the bits that actually select the texel. The
+        // result is moiré banding that crawls as the camera moves, worst at grazing angles.
+        //
+        // Rounded to whole world units so the tiling PHASE is unchanged (the pattern does not
+        // jump when the model grows), and taken from the model rather than per feature so
+        // neighbouring bodies stay aligned instead of breaking the pattern at every seam.
+        let uv_org = self.uv_rebase_origin();
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
             let Some(id) = self.cached.face_ids.get(i).copied() else { continue };
             // Per-surface texture wins over the whole-feature one.
@@ -6196,13 +6225,16 @@ impl FactoryState {
                 let n = Vec3::from(self.cached.normals.get(i * 3 + k).copied().unwrap_or([0.0, 0.0, 1.0]));
                 let np = Vec3::from(*p) + n * nudge;
                 let p = &[np.x, np.y, np.z];
+                // UV from the REBASED position — see `uv_org`. The vertex itself keeps its
+                // true world coordinates; only the texture lookup is moved near the origin.
+                let q = [p[0] - uv_org[0], p[1] - uv_org[1], p[2] - uv_org[2]];
                 let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
                 let (uc, vc) = if ax >= ay && ax >= az {
-                    (p[1], p[2]) // X-facing wall → YZ
+                    (q[1], q[2]) // X-facing wall → YZ
                 } else if ay >= az {
-                    (p[0], p[2]) // Y-facing wall → XZ
+                    (q[0], q[2]) // Y-facing wall → XZ
                 } else {
-                    (p[0], p[1]) // floor / ceiling → XY
+                    (q[0], q[1]) // floor / ceiling → XY
                 };
                 let s = shade_scalar(n, false); // sun-aware; matches `shade`
                 let uv = tex.map_uv(uc, vc);
