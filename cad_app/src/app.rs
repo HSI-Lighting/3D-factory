@@ -7725,14 +7725,23 @@ impl CadApp {
         // measured on a real project the loop centroid lands 0.68–0.76 m clear of the masonry,
         // which is outside every candidate box. Refusing the cut there is wrong: the wall is
         // right in front of the sketch, just not underneath its centroid.
-        let target = target.or_else(|| {
-            let nrm = frame.u.cross(frame.v).normalize_or_zero();
-            [-nrm, nrm].into_iter()
+        let nrm = frame.u.cross(frame.v).normalize_or_zero();
+        let by_id = |me: &Self, id: u32| -> Option<(usize, f32)> {
+            me.factory.model.features.iter().position(|f| f.id == id).map(|i| (i, 0.0_f32))
+        };
+        let target = target
+            .or_else(|| [-nrm, nrm].into_iter()
                 .filter_map(|d| self.nearest_surface_body(o, d, Self::CUT_SEARCH))
-                .find_map(|id| self.factory.model.features.iter()
-                    .position(|f| f.id == id)
-                    .map(|i| (i, 0.0_f32)))
-        });
+                .find_map(|id| by_id(self, id)))
+            // Last resort: ask the WHOLE opening. Its centre can be over a gap between panels or
+            // past the end of one, in which case neither the box test nor a centre ray finds
+            // anything — and refusing a window that plainly overlaps a wall is the worst of the
+            // three answers.
+            .or_else(|| {
+                let mut seen = Vec::new();
+                let _ = self.wall_span_over_opening(&frame, nrm, &loops, -nrm, &mut seen);
+                seen.into_iter().find_map(|id| by_id(self, id))
+            });
         let Some((tidx, _)) = target else {
             self.factory.status = "no solid under this face to cut".into();
             return 0;
@@ -7792,6 +7801,10 @@ impl CadApp {
 
         let (in_depth, _in_ids) = self.assembly_span(anchor, inward);
         let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 }; // sign of inward along +Z(=n)
+        // Every body the WHOLE opening touches, gathered while measuring its depth below. These
+        // join the target list: the centre probe alone misses a wall the opening only partly
+        // overlaps, and a cutter that is never inserted behind a body cannot open it.
+        let mut grid_bodies: Vec<u32> = Vec::new();
         // First decide how far the cutter reaches on each face → lift/h in plane-local Z.
         let (lift, h, out_depth): (f32, f32, f32) = if through {
             let (out_depth, _out_ids) = self.assembly_span(anchor, -inward);
@@ -7810,7 +7823,7 @@ impl CadApp {
             // So take the union of the wall's span over a grid across the opening. The cutter is
             // only ever made LONGER by this, and only along its own axis, so it opens more of the
             // wall it is already cutting and cannot wander into anything else.
-            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &loops, inward) {
+            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &loops, inward, &mut grid_bodies) {
                 lo = lo.min(glo - MARGIN);
                 hi = hi.max(ghi + MARGIN);
             }
@@ -7863,6 +7876,14 @@ impl CadApp {
             for id in self.assembly_span(anchor, d).1 {
                 if !targets.contains(&id) { targets.push(id); }
             }
+        }
+        // …and everything the grid across the opening found, which is the only one of the three
+        // that sees a wall the opening merely CLIPS. Recorded on a real session: the failing
+        // window reported `in_depth=0.000 out_depth=0.000` and `targets=[1, 122, 124]` — no wall
+        // among them — while its two neighbours on the same curved run listed 52/53/54 and 50/51
+        // and cut correctly.
+        for id in grid_bodies {
+            if !targets.contains(&id) { targets.push(id); }
         }
         if targets.is_empty() { targets.push(target_id); }
         self.snapshot_factory();
@@ -8170,7 +8191,10 @@ impl CadApp {
             // on the real project, repairing from the centre alone still left openings reaching
             // 13 of 25 sample points, short by up to 0.519 m.
             let frame = cad_solid::Frame { origin: o, u: uax, v: vax };
-            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &prof, -n) {
+            // The repair only re-measures an existing cutter; it never re-targets one, so the
+            // bodies the grid touches are of no use here.
+            let mut _seen = Vec::new();
+            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &prof, -n, &mut _seen) {
                 lo = lo.min(glo - MARGIN);
                 hi = hi.max(ghi + MARGIN);
             }
@@ -8256,12 +8280,19 @@ impl CadApp {
     /// The grid is over the opening's (u,v) bounding box, which over-covers a non-rectangular
     /// profile. That is the safe direction: a sample off the profile can only make the cutter
     /// longer along its own axis, never wider, so it opens more of the wall it is already cutting.
+    /// `bodies` collects every Union the grid touched. The caller MUST fold these into its target
+    /// list: a window whose CENTRE overhangs the end of a panel, or spans a gap between two, finds
+    /// no wall under the centre probe at all — measured in a real session as
+    /// `in_depth=0.000 out_depth=0.000`, with the wall bodies absent from `targets` and the
+    /// opening left blind, while two neighbouring windows on the same wall cut correctly. The
+    /// depth was already being taken across the whole opening; the target list has to be too.
     fn wall_span_over_opening(
         &self,
         frame: &cad_solid::Frame,
         n: glam::Vec3,
         loops: &[Vec<glam::Vec2>],
         inward: glam::Vec3,
+        bodies: &mut Vec<u32>,
     ) -> Option<(f32, f32)> {
         const G: i32 = 4; // 5×5 samples — enough for a facet joint, cheap enough to run per cut
         let (mut umin, mut umax) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -8287,8 +8318,11 @@ impl CadApp {
                         .map(|(t, leaving)| (if leaving { 0.0 } else { t }, d)))
                     .min_by(|a, b| a.0.total_cmp(&b.0));
                 let Some((t, dir)) = near else { continue };
-                let thk = self.assembly_span(p + dir * t, dir).0;
+                let (thk, ids) = self.assembly_span(p + dir * t, dir);
                 if thk <= 1e-3 { continue; }
+                for id in ids {
+                    if !bodies.contains(&id) { bodies.push(id); }
+                }
                 // Into the plane's own axis, where `lift`/`h` live.
                 let sgn = dir.dot(n);
                 let (a, b) = (sgn * t, sgn * (t + thk));
@@ -46452,6 +46486,77 @@ mod factory_sketch_tests {
         let after = app.factory.model.eval().tri_count();
         assert!(after > before_tris / 2,
             "cutting a window must not destroy the wall: {before_tris} → {after} triangles");
+    }
+
+    /// An opening whose CENTRE finds no wall must still cut the wall it overlaps.
+    ///
+    /// Three windows were cut on one curved run in a single recorded session; two worked and one
+    /// did not, and the dump says exactly why:
+    ///
+    ///   worked   in_depth=0.199 out_depth=0.613  targets=[1, 52, 53, 54, 124]
+    ///   worked   in_depth=0.000 out_depth=0.848  targets=[1, 50, 51, 124]
+    ///   FAILED   in_depth=0.000 out_depth=0.000  targets=[1, 122, 124]
+    ///
+    /// The failing one found nothing under its centre probe, so neither the anchor nor the axis
+    /// ray contributed a body, and its target list came out with no wall in it at all — only the
+    /// two large bodies whose boxes span the building. The cutter was the right size (the grid had
+    /// already stretched it to h=0.748), in the right place, and inserted behind bodies it does
+    /// not touch. `eval` binds by position, so it opened nothing.
+    ///
+    /// The depth was already measured across the whole opening. The TARGET LIST has to be too.
+    ///
+    /// ⚠ This test guards the INVARIANT, not that change: it passes with the grid's contribution
+    /// to the target list disabled, because here the swept box already reaches both panels. So it
+    /// is not evidence that the real failure is fixed — reproducing that needs the saved file the
+    /// failing cut is in. Stated plainly so nobody later mistakes a green tick for a diagnosis.
+    #[test]
+    fn an_opening_whose_centre_misses_the_wall_still_cuts_what_it_overlaps() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Two wall panels with a 0.9 m gap between them. A window centred on that gap has no wall
+        // under its centre, and reaches both panels at its edges.
+        let mut ids = Vec::new();
+        for x in [-1.2_f32, 1.2] {
+            // u = X, v = Y ⇒ the normal is +Z, so the panel RISES. It is thin in Y, which is the
+            // axis the window looks along.
+            ids.push(app.factory.model.push(
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::from_basis(
+                    glam::Vec3::new(x, 0.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+                cad_solid::Placement::default(),
+                cad_solid::Primitive::Box { w: 1.5, d: 0.2, h: 3.0 },
+            ));
+        }
+        app.factory.recompute();
+
+        let frame = cad_solid::Frame {
+            origin: glam::Vec3::new(0.0, -0.4, 1.5),
+            u: glam::Vec3::X,
+            v: glam::Vec3::Z,
+        };
+        let mut sk = cad_solid::Sketch::new(frame);
+        // 3.2 m wide: its centre is over the gap, its ends are over both panels.
+        let rect = [(-1.6, -0.7), (1.6, -0.7), (1.6, 0.7), (-1.6, 0.7), (-1.6, -0.7)];
+        sk.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: rect.iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory.model.sketches.push(sk);
+
+        assert_eq!(app.factory_cut_sketch(true), 1, "the cut must be made");
+
+        // BOTH panels must carry a cutter — binding is by position in the feature list.
+        for id in &ids {
+            let at = app.factory.model.features.iter().position(|f| f.id == *id).expect("panel");
+            assert!(
+                app.factory.model.features.get(at + 1)
+                    .is_some_and(|f| f.op == cad_solid::BoolOp::Difference),
+                "panel #{id} was overlapped by the opening but got no cutter behind it — \
+                 the target list only asked the centre probe");
+        }
     }
 
     /// A repair is judged by the SOLID it leaves behind, never by the rule that made it.
