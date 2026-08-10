@@ -7720,6 +7720,19 @@ impl CadApp {
                 }
             }
         }
+        // Nothing's box contains the point? Then FIND the solid by ray. A sketch plane is not
+        // reliably on the surface it was drawn against — on a curved wall it is a tangent, and
+        // measured on a real project the loop centroid lands 0.68–0.76 m clear of the masonry,
+        // which is outside every candidate box. Refusing the cut there is wrong: the wall is
+        // right in front of the sketch, just not underneath its centroid.
+        let target = target.or_else(|| {
+            let nrm = frame.u.cross(frame.v).normalize_or_zero();
+            [-nrm, nrm].into_iter()
+                .filter_map(|d| self.nearest_surface_body(o, d, Self::CUT_SEARCH))
+                .find_map(|id| self.factory.model.features.iter()
+                    .position(|f| f.id == id)
+                    .map(|i| (i, 0.0_f32)))
+        });
         let Some((tidx, _)) = target else {
             self.factory.status = "no solid under this face to cut".into();
             return 0;
@@ -7752,20 +7765,61 @@ impl CadApp {
         // one-sided blind pocket, capped so it can never break through.
         const MARGIN: f32 = 0.1;
         let want = self.factory.element_height.max(0.02);
-        let (in_depth, _in_ids) = self.assembly_span(o, inward);
+
+        // RE-ANCHOR THE PROBE ONTO THE WALL before measuring anything.
+        //
+        // `o` is the drawn loop's centroid on the SKETCH plane, and that plane is not reliably on
+        // the surface. On a curved wall it is a tangent, and measured on a real project the
+        // centroid ends up 0.68–0.76 m clear of the masonry. `assembly_span` then starts in
+        // mid-air, meets the 0.4 m gap rule on its first crossing, and reports a thickness of
+        // ZERO — so the cutter falls back to the bare ±0.1 m margin and stops three quarters of a
+        // metre before it reaches the wall. Sampled across those openings, 0 of 25 points were
+        // covered; on the straight walls, where the probe lands on the surface, all 25 were.
+        //
+        // A crossing the ray LEAVES through means the sketch plane is already inside the wall, so
+        // the anchor is here and the distance is zero.
+        let anchor = [inward, -inward]
+            .into_iter()
+            .filter_map(|d| self.nearest_surface(o, d, Self::CUT_SEARCH)
+                .map(|(t, leaving)| (if leaving { 0.0 } else { t }, d)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(o, |(t, d)| o + d * t);
+        // Where that anchor sits along the plane normal. Every depth below is measured from it,
+        // but `lift`/`h` are in the plane's own coordinates, so the offset has to be carried
+        // through. `za` is ZERO when the sketch plane was already on the wall — which is the case
+        // this code used to assume, so a flat wall behaves exactly as before.
+        let za = (anchor - o).dot(n);
+
+        let (in_depth, _in_ids) = self.assembly_span(anchor, inward);
         let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 }; // sign of inward along +Z(=n)
         // First decide how far the cutter reaches on each face → lift/h in plane-local Z.
         let (lift, h, out_depth): (f32, f32, f32) = if through {
-            let (out_depth, _out_ids) = self.assembly_span(o, -inward);
-            let zeta_in = s_in * (in_depth + MARGIN);
-            let zeta_out = -s_in * (out_depth + MARGIN);
-            let (lo, hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
+            let (out_depth, _out_ids) = self.assembly_span(anchor, -inward);
+            let zeta_in = za + s_in * (in_depth + MARGIN);
+            let zeta_out = za - s_in * (out_depth + MARGIN);
+            let (mut lo, mut hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
+            // MEASURE ACROSS THE WHOLE OPENING, not just under its centre.
+            //
+            // One probe describes one point. A curved wall is faceted, so within a single window
+            // the far surface is further away at the edges than in the middle, and an opening
+            // that crosses a facet joint meets a panel half a metre deeper along the normal.
+            // Measured on the real project after the centre probe was fixed, openings still
+            // reached only 13 of 25 sample points, short by up to 0.519 m — a hole that is
+            // see-through in the middle and blind at one side.
+            //
+            // So take the union of the wall's span over a grid across the opening. The cutter is
+            // only ever made LONGER by this, and only along its own axis, so it opens more of the
+            // wall it is already cutting and cannot wander into anything else.
+            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &loops, inward) {
+                lo = lo.min(glo - MARGIN);
+                hi = hi.max(ghi + MARGIN);
+            }
             (lo, hi - lo, out_depth)
         } else {
-            // recess: blind pocket from the picked face inward by `want` (never through).
+            // recess: blind pocket from the WALL face inward by `want` (never through).
             let wall = (in_depth - EPS).max(EPS);
             let d = want.min(wall);
-            let (lift, h) = if s_in > 0.0 { (-EPS, d + EPS) } else { (-d, d + EPS) };
+            let (lift, h) = if s_in > 0.0 { (za - EPS, d + EPS) } else { (za - d, d + EPS) };
             (lift, h, 0.0)
         };
         // Which bodies to cut: EVERY Union body whose world AABB overlaps the cutter's swept
@@ -7796,6 +7850,18 @@ impl CadApp {
                 && amn.z <= bmax.z + pad && amx.z >= bmin.z - pad
             {
                 targets.push(f.id);
+            }
+        }
+        // …AND every body the cut AXIS actually runs through. A box search compares volumes: a
+        // thin cutter offset from the wall matches the big bodies whose boxes span the building
+        // and misses the wall itself. The ray answers "what does this opening pass through"
+        // directly. ADDING targets is safe — each gets its own cutter behind its own body, and a
+        // Difference that touches nothing is a no-op. (Never MOVE an existing one: a cutter that
+        // is harmless behind one body can remove most of another. That mistake cost 30% of this
+        // building once already.)
+        for d in [inward, -inward] {
+            for id in self.assembly_span(anchor, d).1 {
+                if !targets.contains(&id) { targets.push(id); }
             }
         }
         if targets.is_empty() { targets.push(target_id); }
@@ -8013,7 +8079,8 @@ impl CadApp {
         const SEARCH: f32 = 1.5;
         // The broken signature, and nothing else: a THROUGH cut is never legitimately this
         // shallow, and a RECESS is a deliberate blind pocket that must not be deepened.
-        let suspects: Vec<(usize, u32, glam::Vec3, glam::Vec3)> = self
+        type Suspect = (usize, u32, glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3, f32, f32);
+        let suspects: Vec<Suspect> = self
             .factory
             .model
             .features
@@ -8021,9 +8088,11 @@ impl CadApp {
             .enumerate()
             .filter(|(_, f)| f.op == cad_solid::BoolOp::Difference)
             .filter_map(|(i, f)| {
-                let h = match f.primitive {
-                    cad_solid::Primitive::Extrusion { h, .. } => h,
-                    cad_solid::Primitive::Box { h, .. } => h,
+                // `w`/`d` are the opening's own footprint on its plane — carried through so the
+                // wall can be measured across the WHOLE window, not only under its centre.
+                let (h, w, d) = match f.primitive {
+                    cad_solid::Primitive::Extrusion { h, w, d, .. } => (h, w, d),
+                    cad_solid::Primitive::Box { w, d, h } => (h, w, d),
                     _ => return None,
                 };
                 if h > 0.25 || (f.placement.lift + 0.1).abs() > 0.02 {
@@ -8035,14 +8104,21 @@ impl CadApp {
                 let (u, v) = f.plane.axes();
                 let n = u.cross(v).normalize_or_zero();
                 let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
-                (n.length_squared() > 0.5).then_some((i, f.id, o, n))
+                (n.length_squared() > 0.5).then_some((i, f.id, o, n, u, v, w, d))
             })
             .collect();
 
         // Measure FIRST, mutate after — `assembly_span` borrows the model.
         let mut plans: Vec<(usize, f32, f32)> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        for (i, id, o, n) in suspects {
+        for (i, id, o, n, uax, vax, w, d) in suspects {
+            // The opening's footprint, centred on `o` — a rectangle is the right over-cover here
+            // (see `wall_span_over_opening`): extra samples can only lengthen the cutter along
+            // its own axis, never widen it.
+            let prof = vec![vec![
+                glam::Vec2::new(-w * 0.5, -d * 0.5), glam::Vec2::new(w * 0.5, -d * 0.5),
+                glam::Vec2::new(w * 0.5, d * 0.5), glam::Vec2::new(-w * 0.5, d * 0.5),
+            ]];
             // FIND the wall. Whichever side it is on, the nearest surface within SEARCH is the
             // one this opening belongs to; `sgn` records which way that was along the normal.
             // A crossing the ray LEAVES through means the probe already stands in the wall, so
@@ -8087,7 +8163,17 @@ impl CadApp {
             // the near edge is simply where the ray entered.
             let near = if face_t <= 1e-6 { -self.assembly_span(o, -dir).0 } else { face_t };
             let (a, b) = (sgn * near, sgn * (face_t + thk));
-            let (lo, hi) = (a.min(b) - MARGIN, a.max(b) + MARGIN);
+            let (mut lo, mut hi) = (a.min(b) - MARGIN, a.max(b) + MARGIN);
+            // …and across the WHOLE opening, not just under its centre — the same correction the
+            // cut itself makes. A curved wall bends away toward a window's edges, so a cutter
+            // sized from one probe is see-through in the middle and blind at one side. Measured
+            // on the real project, repairing from the centre alone still left openings reaching
+            // 13 of 25 sample points, short by up to 0.519 m.
+            let frame = cad_solid::Frame { origin: o, u: uax, v: vax };
+            if let Some((glo, ghi)) = self.wall_span_over_opening(&frame, n, &prof, -n) {
+                lo = lo.min(glo - MARGIN);
+                hi = hi.max(ghi + MARGIN);
+            }
             plans.push((i, lo, hi - lo));
         }
         for (i, lift, h) in &plans {
@@ -8148,6 +8234,87 @@ impl CadApp {
             self.factory.ceilings.remove(id);
         }
         (drop_ids.len(), left)
+    }
+
+    /// How far to look for the wall an opening belongs to, when the sketch plane is not sitting
+    /// on it. Comfortably past the 0.76 m measured on a real curved wall, and well short of a
+    /// room's width so the search can never reach the wall opposite.
+    ///
+    /// Shared by the cut and by `repaircuts`, deliberately: the repair exists to redo what the
+    /// cut should have done, so the two must agree on what counts as "this wall".
+    const CUT_SEARCH: f32 = 1.5;
+
+    /// The wall's extent along the plane normal, taken over a GRID across the whole opening and
+    /// returned as `(lo, hi)` in plane-local Z. `None` when no sample finds a wall.
+    ///
+    /// A single probe under the opening's centre is only correct on a flat wall square to it. A
+    /// curved wall is faceted: within one window the surface bends away toward the edges, and an
+    /// opening spanning a facet joint meets the next panel further along the normal. Sizing the
+    /// cutter from the centre alone leaves an opening that is see-through in the middle and blind
+    /// at one side — measured at 13 of 25 sample points on the real project, short by 0.519 m.
+    ///
+    /// The grid is over the opening's (u,v) bounding box, which over-covers a non-rectangular
+    /// profile. That is the safe direction: a sample off the profile can only make the cutter
+    /// longer along its own axis, never wider, so it opens more of the wall it is already cutting.
+    fn wall_span_over_opening(
+        &self,
+        frame: &cad_solid::Frame,
+        n: glam::Vec3,
+        loops: &[Vec<glam::Vec2>],
+        inward: glam::Vec3,
+    ) -> Option<(f32, f32)> {
+        const G: i32 = 4; // 5×5 samples — enough for a facet joint, cheap enough to run per cut
+        let (mut umin, mut umax) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut vmin, mut vmax) = (f32::INFINITY, f32::NEG_INFINITY);
+        for lp in loops {
+            for p in lp {
+                umin = umin.min(p.x); umax = umax.max(p.x);
+                vmin = vmin.min(p.y); vmax = vmax.max(p.y);
+            }
+        }
+        if !umin.is_finite() || !vmin.is_finite() { return None; }
+
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for iu in 0..=G {
+            for iv in 0..=G {
+                let u = umin + (umax - umin) * (iu as f32 / G as f32);
+                let v = vmin + (vmax - vmin) * (iv as f32 / G as f32);
+                let p = frame.from_uv(glam::Vec2::new(u, v));
+                // Find the wall at THIS point, the same way the centre probe does.
+                let near = [inward, -inward]
+                    .into_iter()
+                    .filter_map(|d| self.nearest_surface(p, d, Self::CUT_SEARCH)
+                        .map(|(t, leaving)| (if leaving { 0.0 } else { t }, d)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((t, dir)) = near else { continue };
+                let thk = self.assembly_span(p + dir * t, dir).0;
+                if thk <= 1e-3 { continue; }
+                // Into the plane's own axis, where `lift`/`h` live.
+                let sgn = dir.dot(n);
+                let (a, b) = (sgn * t, sgn * (t + thk));
+                lo = lo.min(a.min(b));
+                hi = hi.max(a.max(b));
+            }
+        }
+        (lo.is_finite() && hi > lo).then_some((lo, hi))
+    }
+
+    /// Which Union body the nearest surface along `dir` belongs to, within `max`.
+    fn nearest_surface_body(&self, origin: glam::Vec3, dir: glam::Vec3, max: f32) -> Option<u32> {
+        let start = origin + dir * 1e-3;
+        let mut best: Option<(f32, u32)> = None;
+        for f in &self.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            for c in self.factory.model.feature_world_positions(f).chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                    if t > 1e-4 && t <= max && best.is_none_or(|(z, _)| t < z) {
+                        best = Some((t, f.id));
+                    }
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// How many entries any one list in a scene capture prints. Past this the list says how
@@ -45735,6 +45902,61 @@ mod factory_sketch_tests {
         // direction. This is the view that showed the reconstructed point sitting 0.64 m clear of
         // the wall — the reason the repair used to decline every one of these openings.
 
+        // DOES THE CUTTER ACTUALLY REACH THE WALL, ACROSS THE WHOLE OPENING?
+        //
+        // The one question that matters and the one nothing so far has answered. A depth measured
+        // at a single probe point says nothing about the EDGES of a window on a curved wall,
+        // where the surface bends away. So sample a grid over the opening's own footprint, and at
+        // each sample compare the cutter's span along the normal with where the wall actually is.
+        // This can fail — if every sample is covered, the cut is not the problem and I am wrong.
+        println!("\n=== does the cutter reach the wall? (grid over each opening) ===");
+        for f in app.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference)
+        {
+            let (h, w, d) = match f.primitive {
+                cad_solid::Primitive::Extrusion { h, w, d, .. } => (h, w, d),
+                cad_solid::Primitive::Box { w, d, h } => (h, w, d),
+                _ => continue,
+            };
+            let (uax, vax) = f.plane.axes();
+            let n = uax.cross(vax).normalize_or_zero();
+            if n.length_squared() < 0.5 { continue; }
+            let (lo, hi) = (f.placement.lift, f.placement.lift + h);
+            let (mut covered, mut short, mut nowall) = (0usize, 0usize, 0usize);
+            let mut worst = 0.0_f32;
+            const G: i32 = 4;
+            for iu in 0..=G {
+                for iv in 0..=G {
+                    let su = f.placement.u + w * (iu as f32 / G as f32 - 0.5);
+                    let sv = f.placement.v + d * (iv as f32 / G as f32 - 0.5);
+                    let p = f.plane.origin() + uax * su + vax * sv;
+                    // Where the wall is at THIS point, in the cutter's own axis.
+                    let near = [(-1.0_f32, -n), (1.0_f32, n)].into_iter()
+                        .filter_map(|(sgn, dir)| app.nearest_surface(p, dir, 3.0)
+                            .map(|(t, leaving)| (if leaving { 0.0 } else { t }, sgn, dir)))
+                        .min_by(|a, b| a.0.total_cmp(&b.0));
+                    let Some((t, sgn, dir)) = near else { nowall += 1; continue };
+                    let thk = app.assembly_span(p + dir * t, dir).0;
+                    if thk <= 1e-3 { nowall += 1; continue; }
+                    let (a, b) = (sgn * t, sgn * (t + thk));
+                    let (wlo, whi) = (a.min(b), a.max(b));
+                    // Covered means the cutter spans the wall at this sample.
+                    if lo <= wlo + 1e-3 && hi >= whi - 1e-3 { covered += 1; }
+                    else {
+                        // Shortfall is how far the cutter fails to reach at EITHER end. The wall
+                        // is often entirely past one end, so both directions must be measured.
+                        short += 1;
+                        worst = worst.max((lo - wlo).max(0.0)).max((whi - hi).max(0.0));
+                    }
+                }
+            }
+            let total = (G + 1) * (G + 1);
+            let flag = if short > 0 { "  ⚠ DOES NOT REACH" } else { "" };
+            println!("  cut #{:<4} cutter spans {lo:+.3}…{hi:+.3}  · {covered}/{total} samples \
+                      covered, {short} short (worst by {worst:.3} m), {nowall} no wall{flag}",
+                f.id);
+        }
+
         println!("\n=== per-cut probe ===");
         for f in app.factory.model.features.iter()
             .filter(|f| f.op == cad_solid::BoolOp::Difference)
@@ -45788,9 +46010,59 @@ mod factory_sketch_tests {
         // DRY-RUN the repair on the real geometry. Read-only — nothing is written back — but it
         // answers the question the capture raises and the user cannot: would `repaircuts`
         // actually fix these, or does it skip them?
+        let tris_before = app.factory.model.eval().tri_count();
         let (fixed, notes) = app.factory_repair_shallow_cuts();
+        app.factory.recompute();
+        let tris_after = app.factory.model.eval().tri_count();
         println!("\n=== repaircuts DRY RUN ===\n{fixed} would be re-cut, {} left alone", notes.len());
         for n in &notes { println!("{n}"); }
+        println!("  solid: {tris_before} → {tris_after} triangles{}",
+            if tris_after * 10 < tris_before * 9 { "   ⚠ GEOMETRY LOST" } else { "" });
+        // Did the repair actually make the openings REACH? The only honest test, and one that
+        // can come back negative.
+        let mut reach_ok = 0usize;
+        let mut reach_bad = 0usize;
+        for c in app.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference)
+        {
+            let (ok, total, worst) = {
+                let (h, w, d) = match c.primitive {
+                    cad_solid::Primitive::Extrusion { h, w, d, .. } => (h, w, d),
+                    cad_solid::Primitive::Box { w, d, h } => (h, w, d),
+                    _ => continue,
+                };
+                let (uax, vax) = c.plane.axes();
+                let n = uax.cross(vax).normalize_or_zero();
+                let (lo, hi) = (c.placement.lift, c.placement.lift + h);
+                let (mut k, mut t_, mut worst) = (0usize, 0usize, 0.0_f32);
+                for iu in 0..=4 {
+                    for iv in 0..=4 {
+                        let p = c.plane.origin()
+                            + uax * (c.placement.u + w * (iu as f32 / 4.0 - 0.5))
+                            + vax * (c.placement.v + d * (iv as f32 / 4.0 - 0.5));
+                        let near = [(-1.0_f32, -n), (1.0_f32, n)].into_iter()
+                            .filter_map(|(sgn, dir)| app.nearest_surface(p, dir, 3.0)
+                                .map(|(t, lv)| (if lv { 0.0 } else { t }, sgn, dir)))
+                            .min_by(|a, b| a.0.total_cmp(&b.0));
+                        let Some((t, sgn, dir)) = near else { continue };
+                        let thk = app.assembly_span(p + dir * t, dir).0;
+                        if thk <= 1e-3 { continue; }
+                        t_ += 1;
+                        let (a, b) = (sgn * t, sgn * (t + thk));
+                        let (wlo, whi) = (a.min(b), a.max(b));
+                        if lo <= wlo + 1e-3 && hi >= whi - 1e-3 { k += 1; }
+                        else { worst = worst.max((lo - wlo).max(0.0)).max((whi - hi).max(0.0)); }
+                    }
+                }
+                (k, t_, worst)
+            };
+            if total == 0 { continue; }
+            if ok == total { reach_ok += 1; } else {
+                reach_bad += 1;
+                println!("  · cut #{} still reaches only {ok}/{total}, short by {worst:.3} m", c.id);
+            }
+        }
+        println!("  AFTER REPAIR: {reach_ok} opening(s) fully reach the wall, {reach_bad} still do not");
         if fixed > 0 {
             app.factory.recompute();
             println!("{}", crate::dbg_recorder::format_event_oneline(
@@ -46065,6 +46337,121 @@ mod factory_sketch_tests {
             (depth(2) - 0.05).abs() < 1e-6,
             "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
         );
+    }
+
+    /// Fraction of an opening where the cutter actually spans the wall, sampled on a grid.
+    ///
+    /// The measure that should have been used from the start. A depth taken at ONE probe point
+    /// says nothing about the rest of the window, and "the cut is bound to the right body" says
+    /// nothing about whether it reaches the masonry at all. This asks the only question that
+    /// matters — at each point across the opening, does the cutter's span along its normal
+    /// contain the wall? — and it can come back clean, which is what makes it evidence.
+    fn cutter_coverage(app: &CadApp, cut: &cad_solid::Feature) -> (usize, usize, f32) {
+        let (h, w, d) = match cut.primitive {
+            cad_solid::Primitive::Extrusion { h, w, d, .. } => (h, w, d),
+            cad_solid::Primitive::Box { w, d, h } => (h, w, d),
+            _ => return (0, 0, 0.0),
+        };
+        let (uax, vax) = cut.plane.axes();
+        let n = uax.cross(vax).normalize_or_zero();
+        let (lo, hi) = (cut.placement.lift, cut.placement.lift + h);
+        let (mut ok, mut total, mut worst) = (0usize, 0usize, 0.0_f32);
+        const G: i32 = 4;
+        for iu in 0..=G {
+            for iv in 0..=G {
+                let su = cut.placement.u + w * (iu as f32 / G as f32 - 0.5);
+                let sv = cut.placement.v + d * (iv as f32 / G as f32 - 0.5);
+                let p = cut.plane.origin() + uax * su + vax * sv;
+                let near = [(-1.0_f32, -n), (1.0_f32, n)].into_iter()
+                    .filter_map(|(sgn, dir)| app.nearest_surface(p, dir, 3.0)
+                        .map(|(t, leaving)| (if leaving { 0.0 } else { t }, sgn, dir)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((t, sgn, dir)) = near else { continue };
+                let thk = app.assembly_span(p + dir * t, dir).0;
+                if thk <= 1e-3 { continue; }
+                total += 1;
+                let (a, b) = (sgn * t, sgn * (t + thk));
+                let (wlo, whi) = (a.min(b), a.max(b));
+                if lo <= wlo + 1e-3 && hi >= whi - 1e-3 { ok += 1; }
+                else { worst = worst.max((lo - wlo).max(0.0)).max((whi - hi).max(0.0)); }
+            }
+        }
+        (ok, total, worst)
+    }
+
+    /// A window cut on a CURVED wall must go through, across the whole opening.
+    ///
+    /// The reported bug, reduced to geometry. A curved wall is faceted, and the sketch plane is a
+    /// tangent — so the drawn loop's centroid stands clear of the masonry, measured at 0.68–0.76 m
+    /// on the real project. `assembly_span` then starts in mid-air, meets the 0.4 m gap rule at
+    /// its first crossing and reports ZERO thickness, and the cutter falls back to ±0.1 m: three
+    /// quarters of a metre short of ever touching the wall. Sampled across those real openings, 0
+    /// of 25 points were covered, while every straight-wall opening scored 25 of 25.
+    ///
+    /// Coverage is the assertion, not depth. A cutter can be deep and still miss, and a single
+    /// centre probe cannot see the edges of a window on a curve.
+    #[test]
+    fn a_window_on_a_curved_wall_is_cut_through_across_the_whole_opening() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // A faceted curved wall: 9 panels on a 12 m radius arc, 200 mm thick, centred on −Y.
+        // Odd count so the probe cannot land exactly on a joint.
+        let (r, thick) = (12.0_f32, 0.2_f32);
+        let step = 0.06_f32; // ~3.4° per panel
+        for i in 0..9 {
+            let a = (i as f32 - 4.0) * step;
+            let (s, c) = a.sin_cos();
+            // Arc centred at (0, r); the wall's mid-surface passes through the origin at a = 0.
+            let mid = glam::Vec3::new(r * s, r - r * c, 0.0);
+            let along = glam::Vec3::new(c, s, 0.0);
+            let out = glam::Vec3::new(-s, -c, 0.0); // away from the arc centre
+            // u = out, v = along ⇒ the normal is +Z, so the panel RISES. Getting this backwards
+            // built the wall below the floor, where the window could never meet it.
+            app.factory.model.push(
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::from_basis(glam::Vec3::new(mid.x, mid.y, 0.0), out, along),
+                cad_solid::Placement::default(),
+                cad_solid::Primitive::Box { w: thick, d: r * step * 1.05, h: 3.0 },
+            );
+        }
+        app.factory.recompute();
+        let before_tris = app.factory.model.eval().tri_count();
+
+        // A 1.2 m × 1.6 m window on the tangent plane at the arc's centre, standing OUTSIDE the
+        // wall exactly as a real one does.
+        let frame = cad_solid::Frame {
+            origin: glam::Vec3::new(0.0, -0.65, 1.5),
+            u: glam::Vec3::X,
+            v: glam::Vec3::Z,
+        };
+        let mut sk = cad_solid::Sketch::new(frame);
+        let rect = [(-0.6, -0.8), (0.6, -0.8), (0.6, 0.8), (-0.6, 0.8), (-0.6, -0.8)];
+        sk.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: rect.iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory.model.sketches.push(sk);
+
+        assert_eq!(app.factory_cut_sketch(true), 1, "the cut must be made, not refused");
+
+        // EVERY cutter this produced must span the wall wherever it meets it.
+        let cuts: Vec<_> = app.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference).collect();
+        assert!(!cuts.is_empty(), "a through-cut must produce at least one cutter");
+        for c in &cuts {
+            let (ok, total, worst) = cutter_coverage(&app, c);
+            if total == 0 { continue; } // this cutter does not meet the wall — a harmless no-op
+            assert_eq!(ok, total,
+                "cut #{} reaches the wall at only {ok}/{total} points across the opening, \
+                 short by {worst:.3} m — the window will not be see-through there", c.id);
+        }
+        // And the wall is opened, not demolished: material is removed, but the wall survives.
+        let after = app.factory.model.eval().tri_count();
+        assert!(after > before_tris / 2,
+            "cutting a window must not destroy the wall: {before_tris} → {after} triangles");
     }
 
     /// A repair is judged by the SOLID it leaves behind, never by the rule that made it.
