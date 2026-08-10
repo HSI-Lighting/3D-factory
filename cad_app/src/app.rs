@@ -8243,6 +8243,9 @@ impl CadApp {
         // Instances are triangle soup, not CSG, so they appear in NO feature or body count.
         // A window that is a placed asset is invisible to every other section here.
         let mut furn_lines = Vec::new();
+        // Translucent-vertex count PER ASSET, cached: the meshes run to half a million verts and
+        // the same asset is placed many times over.
+        let mut glassy: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         for (i, inst) in f.furniture.iter().enumerate().take(Self::SCENE_LIST_MAX) {
             let a = f.furniture_lib.get(inst.asset);
             furn_lines.push(format!(
@@ -8254,6 +8257,25 @@ impl CadApp {
                 inst.rot[0], inst.rot[1], inst.rot[2], inst.scale,
                 inst.fit.map_or(String::new(), |t| format!(" fit=({:.2},{:.2},{:.2})", t[0], t[1], t[2])),
                 inst.texture, inst.cuts.len()));
+            // WHICH PASS this piece draws in, which is the question `tex=None` raises and does
+            // not answer. A piece with translucent triangles is peeled into the blended glass
+            // pass — a different shader with different failure modes — and untextured pieces
+            // never touch the textured program at all. Knowing that immediately is the
+            // difference between fixing the right shader and fixing a neighbouring one.
+            if let Some(a) = a {
+                let glass = *glassy.entry(inst.asset).or_insert_with(|| {
+                    a.alpha.iter().filter(|v| **v < 0.999).count()
+                });
+                let pass = match (inst.texture.is_some() || !inst.surface_texture.is_empty(), glass > 0) {
+                    (true, true)  => "textured + blended-glass",
+                    (true, false) => "textured",
+                    (false, true) => "FLAT + blended-glass (TRANSP program)",
+                    (false, false) => "flat",
+                };
+                furn_lines.push(format!(
+                    "       ↳ pass={pass}  translucent_verts={glass}  surface_tex={}",
+                    inst.surface_texture.len()));
+            }
         }
         if f.furniture.len() > Self::SCENE_LIST_MAX {
             furn_lines.push(format!("… {} MORE OMITTED (cap {})",
@@ -10674,7 +10696,7 @@ impl CadApp {
                     Vec::new();
                 // Translucent furniture (glass panes), tagged with a camera-space depth so the
                 // blended pass can be sorted back-to-front. Sorted + stripped of the depth below.
-                let mut transp_draws_owned: Vec<(f32, u64, StdArc<Vec<crate::light3d::V3A>>, [f32; 16])> =
+                let mut transp_draws_owned: Vec<(f32, u64, StdArc<Vec<crate::light3d::V3A>>, [f32; 16], [f32; 16])> =
                     Vec::new();
                 // Translucent TEXTURED furniture (glass that shows an image), same depth tagging + model.
                 let mut tex_transp_draws_owned: Vec<(f32, usize, u64, StdArc<Vec<crate::light3d::TexVtx>>, [f32; 16], [f32; 16])> =
@@ -10758,7 +10780,10 @@ impl CadApp {
                                 .entry(tkey)
                                 .or_insert_with(|| StdArc::new(tverts))
                                 .clone();
-                            transp_draws_owned.push((depth, tkey, tmesh, fmvp));
+                            // The WORLD model too, not only camera·model: the glass shader has to
+                            // build a normal, and doing that from a depth-buffer reconstruction is
+                            // what made every pane speckle on a plan sited at 6852 m. See TRANSP_VS.
+                            transp_draws_owned.push((depth, tkey, tmesh, fmvp, model));
                         }
                     }
                 }
@@ -11003,8 +11028,9 @@ impl CadApp {
                             let furn: Vec<(u64, &[crate::light3d::V3], [f32; 16], [f32; 16])> =
                                 furn_draws.iter().map(|(k, m, mv, md)| (*k, m.as_slice(), *mv, *md)).collect();
                             // Translucent furniture (already sorted back-to-front); drop the depth.
-                            let transp: Vec<(u64, &[crate::light3d::V3A], [f32; 16])> =
-                                transp_draws_owned.iter().map(|(_d, k, m, mv)| (*k, m.as_slice(), *mv)).collect();
+                            let transp: Vec<(u64, &[crate::light3d::V3A], [f32; 16], [f32; 16])> =
+                                transp_draws_owned.iter()
+                                    .map(|(_d, k, m, mv, md)| (*k, m.as_slice(), *mv, *md)).collect();
                             // Textured furniture + the pixels its images need.
                             let tex_assets: Vec<(usize, i32, i32, &[u8])> = tex_assets_owned
                                 .iter()

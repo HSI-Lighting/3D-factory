@@ -491,9 +491,24 @@ const TRANSP_VS: &str = r#"
     layout(location=1) in vec3 a_col;
     layout(location=2) in float a_a;
     uniform mat4 u_mvp;
+    // World placement + the rebase origin, so the fragment shader can build the pane's normal
+    // from an INTERPOLATED position near zero. It used to reconstruct that position from the
+    // depth buffer and differentiate it, which cannot work on a plan sited at survey
+    // coordinates: the reconstruction lands at ~6852 m where an f32 ULP is 0.8 mm — the size of
+    // a close-up pixel footprint — and it carries the depth buffer's own nonlinearity on top.
+    // dFdx of that is noise, and the normal built from it feeds a FIFTH-POWER Fresnel term and
+    // the refraction offset, so every pane speckled and smeared, and reshuffled as the camera
+    // moved. Interpolating a small value instead carries ~1e-6 m.
+    uniform mat4 u_model;   // local → world
+    uniform vec3 u_uv_org;  // whole-unit origin the rebase is measured from
     out vec3 v_col;
     out float v_a;
-    void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); v_col = a_col; v_a = a_a; }
+    out vec3 v_qpos;        // world position, rebased — see above
+    void main() {
+        gl_Position = u_mvp * vec4(a_pos, 1.0);
+        v_col = a_col; v_a = a_a;
+        v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;
+    }
 "#;
 
 // A copy of the OPAQUE scene, composed the way the composite composes it, taken just before the
@@ -517,14 +532,15 @@ const TRANSP_FS: &str = r#"
     #version 330 core
     in vec3 v_col;
     in float v_a;
+    in vec3 v_qpos;     // world position rebased to u_uv_org — see TRANSP_VS
     layout(location=0) out vec4 frag;
     layout(location=1) out vec4 amb_out;
     ALBEDO_OUT_GLSL
     uniform int u_linearize;
+    uniform vec3 u_uv_org;
     // REFRACTION. `u_scene` is the opaque scene as it stood before this pass began.
     uniform sampler2D u_scene;
     uniform mat4  u_scene_vp;      // the WORLD→clip matrix, not this draw's camera·model
-    uniform mat4  u_scene_inv_vp;
     uniform vec3  u_refr_cam;
     uniform vec2  u_refr_vp;       // viewport size in pixels
     uniform float u_refr_ior;
@@ -534,17 +550,20 @@ const TRANSP_FS: &str = r#"
     void main() {
         vec3 tint = u_linearize == 1 ? srgb_to_lin(v_col) : v_col;
         if (u_refr_on == 1) {
-            // The pane's own world position, reconstructed from this fragment's depth. The
-            // transparent pass is drawn with camera·model, so inverting THAT would land in model
-            // space — the scene's own inverse view-projection is passed in separately for exactly
-            // this reason.
+            // The pane's own position, REBASED — interpolated from the vertices rather than
+            // reconstructed from the depth buffer. The reconstruction was the bug: on a plan at
+            // survey coordinates it lands near 6852 m, where an f32 ULP is 0.8 mm, and it adds
+            // the depth buffer's nonlinearity on top. Differentiating that gives a normal made
+            // mostly of noise, which then drives a fifth-power Fresnel and the refraction offset
+            // — so a pane speckled and smeared, and reshuffled whenever the camera moved.
             vec2 uv = gl_FragCoord.xy / u_refr_vp;
-            vec4 h = u_scene_inv_vp * vec4(uv * 2.0 - 1.0, gl_FragCoord.z * 2.0 - 1.0, 1.0);
-            vec3 P = h.xyz / h.w;
-            // The pane's normal from screen-space derivatives of that position. Glass is flat, so
-            // this is exact — and it means no per-vertex normal has to be threaded through a
-            // vertex format that never carried one.
-            vec3 N = normalize(cross(dFdx(P), dFdy(P)));
+            vec3 Q = v_qpos;
+            // Glass is flat, so screen-space derivatives of a small, linearly interpolated
+            // position give the normal exactly — and no per-vertex normal has to be threaded
+            // through a vertex format that never carried one.
+            vec3 N = normalize(cross(dFdx(Q), dFdy(Q)));
+            // Back to world for the ray maths. Kept at metre scale, where f32 is ample.
+            vec3 P = Q + u_uv_org;
             vec3 V = normalize(P - u_refr_cam);
             if (dot(N, V) > 0.0) N = -N;
             // Where the ray comes out after crossing `u_refr_thick` of glass, projected back to
@@ -2063,6 +2082,11 @@ pub struct Scene3dRenderer {
     // keyed like `furn_bufs` but holding only the translucent triangles of an asset.
     transp_prog: Option<glow::Program>,
     u_transp_mvp: Option<glow::UniformLocation>,
+    /// Local→world for the glass pass, and the rebase origin. The pane's normal is built from an
+    /// interpolated rebased position; see TRANSP_VS for why reconstructing it from depth cannot
+    /// work on a model sited at survey coordinates.
+    u_transp_model: Option<glow::UniformLocation>,
+    u_transp_uv_org: Option<glow::UniformLocation>,
     // Refraction uniforms on the transparent program — see [`RefractSettings`].
     u_transp_scene: Option<glow::UniformLocation>,
     u_transp_scene_vp: Option<glow::UniformLocation>,
@@ -2081,7 +2105,7 @@ pub struct Scene3dRenderer {
     u_tex_ssr_dist: Option<glow::UniformLocation>,
     u_tex_ssr_thick: Option<glow::UniformLocation>,
     u_tex_ssr_frame: Option<glow::UniformLocation>,
-    u_transp_inv_vp: Option<glow::UniformLocation>,
+
     u_transp_cam: Option<glow::UniformLocation>,
     u_transp_refr_vp: Option<glow::UniformLocation>,
     u_transp_ior: Option<glow::UniformLocation>,
@@ -2311,6 +2335,8 @@ impl Default for Scene3dRenderer {
             furn_bufs: std::collections::HashMap::new(),
             transp_prog: None,
             u_transp_mvp: None,
+            u_transp_model: None,
+            u_transp_uv_org: None,
             u_transp_scene: None,
             u_transp_scene_vp: None,
             u_tex_tr_on: None,
@@ -2325,7 +2351,7 @@ impl Default for Scene3dRenderer {
             u_tex_ssr_dist: None,
             u_tex_ssr_thick: None,
             u_tex_ssr_frame: None,
-            u_transp_inv_vp: None,
+
             u_transp_cam: None,
             u_transp_refr_vp: None,
             u_transp_ior: None,
@@ -3161,12 +3187,14 @@ impl Scene3dRenderer {
                 self.u_transp_linearize = gl.get_uniform_location(transp_prog, "u_linearize");
                 self.u_transp_scene = gl.get_uniform_location(transp_prog, "u_scene");
                 self.u_transp_scene_vp = gl.get_uniform_location(transp_prog, "u_scene_vp");
-                self.u_transp_inv_vp = gl.get_uniform_location(transp_prog, "u_scene_inv_vp");
+
                 self.u_transp_cam = gl.get_uniform_location(transp_prog, "u_refr_cam");
                 self.u_transp_refr_vp = gl.get_uniform_location(transp_prog, "u_refr_vp");
                 self.u_transp_ior = gl.get_uniform_location(transp_prog, "u_refr_ior");
                 self.u_transp_thick = gl.get_uniform_location(transp_prog, "u_refr_thick");
                 self.u_transp_refr_on = gl.get_uniform_location(transp_prog, "u_refr_on");
+                self.u_transp_model = gl.get_uniform_location(transp_prog, "u_model");
+                self.u_transp_uv_org = gl.get_uniform_location(transp_prog, "u_uv_org");
                 self.transp_prog = Some(transp_prog);
             }
 
@@ -3877,7 +3905,7 @@ impl Scene3dRenderer {
     /// Draw one furniture instance's TRANSLUCENT triangles (glass panes etc.) from a persistent
     /// per-key buffer of [`V3A`]. Blend state (SRC_ALPHA / ONE_MINUS_SRC_ALPHA, depth-write off)
     /// is set once by the caller around the whole transparent pass; ordering is handled CPU-side.
-    unsafe fn draw_transp(&mut self, gl: &glow::Context, key: u64, verts: &[V3A], mvp: &[f32; 16]) {
+    unsafe fn draw_transp(&mut self, gl: &glow::Context, key: u64, verts: &[V3A], mvp: &[f32; 16], model: &[f32; 16]) {
         let Some(prog) = self.transp_prog else { return };
         let entry = self.transp_bufs.get(&key).copied();
         let (vao, count) = match entry {
@@ -3903,6 +3931,13 @@ impl Scene3dRenderer {
         };
         gl.use_program(Some(prog));
         if let Some(loc) = &self.u_transp_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp); }
+        // Verts are LOCAL, so the world placement has to come in separately — the pane's normal
+        // is built from it. See TRANSP_VS.
+        if let Some(loc) = &self.u_transp_model { gl.uniform_matrix_4_f32_slice(Some(loc), false, model); }
+        if let Some(loc) = &self.u_transp_uv_org {
+            let o = self.uv_origin;
+            gl.uniform_3_f32(Some(loc), o[0], o[1], o[2]);
+        }
         gl.bind_vertex_array(Some(vao));
         gl.draw_arrays(glow::TRIANGLES, 0, count);
         gl.bind_vertex_array(None);
@@ -4110,7 +4145,7 @@ impl Scene3dRenderer {
         // TRANSLUCENT furniture triangles, each `(key, local_mesh, camera·model)` like `furn` but
         // holding only the see-through faces (glass). Uploaded once per key, drawn in a blended
         // pass after all opaque geometry; the caller passes them BACK-TO-FRONT for correct order.
-        transp: &[(u64, &[V3A], [f32; 16])],
+        transp: &[(u64, &[V3A], [f32; 16], [f32; 16])],
         // Textures referenced by `tex_draws` this frame, as `(index, w, h, rgba)` — uploaded
         // to GL once and cached by index, so re-pasting the same texture never re-uploads.
         tex_assets: &[(usize, i32, i32, &[u8])],
@@ -4209,10 +4244,13 @@ impl Scene3dRenderer {
                 f.f32s(mv);
                 f.f32s(md);
             }
-            for (k, m, mv) in transp {
+            for (k, m, mv, md) in transp {
                 f.u64(*k);
                 f.u64(m.len() as u64);
                 f.f32s(mv);
+                // The world model is part of what the pass draws now — a pane that moves without
+                // its camera·model changing would otherwise reuse a stale accumulation.
+                f.f32s(md);
             }
             for (i, w, h, px) in tex_assets {
                 f.u64(*i as u64);
@@ -4331,7 +4369,7 @@ impl Scene3dRenderer {
                     gl.delete_buffer(vbo);
                     false
                 });
-                let live_transp: HashSet<u64> = transp.iter().map(|&(k, _, _)| k).collect();
+                let live_transp: HashSet<u64> = transp.iter().map(|&(k, _, _, _)| k).collect();
                 self.transp_bufs.retain(|k, &mut (vao, vbo, _)| {
                     if live_transp.contains(k) { return true; }
                     gl.delete_vertex_array(vao);
@@ -4638,10 +4676,8 @@ impl Scene3dRenderer {
                         gl.active_texture(glow::TEXTURE5);
                         gl.bind_texture(glow::TEXTURE_2D, self.refr_tex);
                         gl.active_texture(glow::TEXTURE0);
-                        let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
                         if let Some(l) = &self.u_transp_scene { gl.uniform_1_i32(Some(l), 5); }
                         if let Some(l) = &self.u_transp_scene_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
-                        if let Some(l) = &self.u_transp_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
                         if let Some(l) = &self.u_transp_cam { gl.uniform_3_f32(Some(l), cam_pos[0], cam_pos[1], cam_pos[2]); }
                         if let Some(l) = &self.u_transp_refr_vp { gl.uniform_2_f32(Some(l), vp_w as f32, vp_h as f32); }
                         if let Some(l) = &self.u_transp_ior { gl.uniform_1_f32(Some(l), env.refract.ior.max(1.0)); }
@@ -4651,8 +4687,8 @@ impl Scene3dRenderer {
                 gl.enable(glow::BLEND);
                 gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
                 gl.depth_mask(false);
-                for &(key, verts, ref tmvp) in transp {
-                    self.draw_transp(gl, key, verts, tmvp);
+                for &(key, verts, ref tmvp, ref tmodel) in transp {
+                    self.draw_transp(gl, key, verts, tmvp, tmodel);
                 }
                 if refract {
                     gl.active_texture(glow::TEXTURE5);
@@ -5514,21 +5550,38 @@ mod taa_tests {
         );
     }
 
-    /// Refraction needs a world position and a normal, and the transparent vertex format carries
-    /// NEITHER — so it takes both from the depth buffer instead.
+    /// A refracting pane builds its normal from an INTERPOLATED rebased position, never from a
+    /// depth-buffer reconstruction.
     ///
-    /// The pane's position is reconstructed from this fragment's own `gl_FragCoord.z` using the
-    /// SCENE's inverse view-projection, which has to be passed in separately: the transparent pass
-    /// is drawn with camera·model, so inverting the matrix it was drawn with would land in model
-    /// space, not world. The normal is then the screen-space derivative of that position — exact
-    /// for flat glass, and it means no per-vertex normal has to be threaded through a format that
-    /// never had one.
+    /// The reconstruction is what this test used to require, and it was the bug. The transparent
+    /// vertex format carries no normal, so the shader recovered the pane's world position from
+    /// `gl_FragCoord.z` through the scene's inverse view-projection, then differentiated it. On a
+    /// plan sited at survey coordinates that position lands near 6852 m, where an f32 ULP is
+    /// 0.8 mm — the size of a close-up pixel footprint — and the reconstruction adds the depth
+    /// buffer's own nonlinearity on top. `dFdx` of that is mostly cancellation noise.
+    ///
+    /// The consequence was severe because of what the normal feeds: a FIFTH-POWER Fresnel term,
+    /// which turns a small angular error into a swing between 0.04 and ~1.0, and the refraction
+    /// offset, which then samples the scene copy somewhere arbitrary. Panes speckled and smeared,
+    /// and the pattern reshuffled whenever the camera moved. The branch writes OPAQUE, so the
+    /// artefact REPLACED the glass rather than tinting it.
+    ///
+    /// The fix is the one the textured pass needed: interpolate a small value. `u_model` and
+    /// `u_uv_org` are threaded into the pass so the vertex shader can emit `v_qpos` — the verts
+    /// are local, so the world placement has to come in separately.
     #[test]
-    fn refraction_takes_position_and_normal_from_the_depth_buffer() {
-        assert!(TRANSP_FS.contains("u_scene_inv_vp * vec4(uv * 2.0 - 1.0, gl_FragCoord.z"),
-            "the pane's world position is not reconstructed from its own depth");
-        assert!(TRANSP_FS.contains("normalize(cross(dFdx(P), dFdy(P)))"),
-            "the pane's normal is not taken from the reconstructed position");
+    fn a_refracting_pane_builds_its_normal_from_a_rebased_vertex_position() {
+        assert!(TRANSP_VS.contains("v_qpos = (u_model * vec4(a_pos, 1.0)).xyz - u_uv_org;"),
+            "the rebase must happen per vertex — verts are LOCAL, so the world model is required");
+        assert!(TRANSP_FS.contains("normalize(cross(dFdx(Q), dFdy(Q)))"),
+            "the normal must come from the rebased position");
+        assert!(!TRANSP_FS.contains("gl_FragCoord.z"),
+            "reconstructing position from depth is the bug — it quantises before the derivative");
+        assert!(!TRANSP_FS.contains("dFdx(P)"),
+            "and the un-rebased world position must never be differentiated");
+        // World metres are still needed for the ray itself, and f32 is ample there.
+        assert!(TRANSP_FS.contains("vec3 P = Q + u_uv_org;"),
+            "the refraction ray works in world space, which is fine at metre scale");
         // The SCENE matrix, not the draw's own: `u_mvp` is camera·model here.
         assert!(TRANSP_FS.contains("u_scene_vp"), "there is no world-space projection to re-project with");
         assert!(!TRANSP_FS.contains("inverse(u_mvp)"), "inverting the draw matrix lands in model space");
