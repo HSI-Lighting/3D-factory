@@ -8122,8 +8122,22 @@ impl CadApp {
         /// How far to look for the wall this opening belongs to. Comfortably past the 0.64 m seen
         /// in practice, and well short of the room's width so it cannot grab the wall opposite.
         const SEARCH: f32 = 1.5;
-        // The broken signature, and nothing else: a THROUGH cut is never legitimately this
-        // shallow, and a RECESS is a deliberate blind pocket that must not be deepened.
+        // WHAT COUNTS AS BROKEN. Two signatures, and between them they leave recesses alone.
+        //
+        //   1. the old fallback's shape — h ≤ 0.25 with lift ≈ −0.1, which no hand-made cut has;
+        //   2. PARTIAL coverage: the cutter spans the wall at some points across the opening and
+        //      not others.
+        //
+        // The second is the one that matters now, and it is safe for a reason worth stating. A
+        // RECESS is a deliberate blind pocket, so it fails to reach EVERYWHERE — 0 of N. A
+        // through-cut defeated by a curved wall reaches the middle of the window and stops short
+        // at one side. Partial coverage is therefore a thing a recess cannot be.
+        //
+        // Measured on the real project, `diag` reported twelve openings not going through, and
+        // not one of them still carried the old signature — so the first rule alone had stopped
+        // repairing anything. Six are partial (21/25, 13/25, 13/15) and get fixed; the other six
+        // are 0 of N and stay untouched, because at that point a blind pocket and a failed
+        // opening look identical and only the person who drew it knows which it was.
         type Suspect = (usize, u32, glam::Vec3, glam::Vec3, glam::Vec3, glam::Vec3, f32, f32);
         let suspects: Vec<Suspect> = self
             .factory
@@ -8140,8 +8154,12 @@ impl CadApp {
                     cad_solid::Primitive::Box { w, d, h } => (h, w, d),
                     _ => return None,
                 };
-                if h > 0.25 || (f.placement.lift + 0.1).abs() > 0.02 {
-                    return None;
+                let fallback_shape = h <= 0.25 && (f.placement.lift + 0.1).abs() <= 0.02;
+                if !fallback_shape {
+                    let (ok, total, _) = self.cut_coverage(f);
+                    // Partial only. `ok == total` is sound; `ok == 0` is indistinguishable from a
+                    // recess and must not be guessed at.
+                    if total == 0 || ok == 0 || ok == total { return None; }
                 }
                 // A STARTING GUESS at where the sketch was, and nothing more — measured on the
                 // real project this lands up to 0.64 m off the wall, and four separate cuts
@@ -46597,6 +46615,73 @@ mod factory_sketch_tests {
         let after = app.factory.model.eval().tri_count();
         assert!(after > before_tris / 2,
             "cutting a window must not destroy the wall: {before_tris} → {after} triangles");
+    }
+
+    /// PARTIAL coverage is repairable; blind-everywhere is not.
+    ///
+    /// `diag` on the real project found twelve openings not going through, and not one still
+    /// carried the old `h ≤ 0.25, lift ≈ −0.1` fallback shape — so the repair, keyed on that
+    /// shape alone, would have fixed none of them. Coverage is the real signal.
+    ///
+    /// The discrimination that makes this safe: a RECESS is a deliberate blind pocket, so it
+    /// fails to reach EVERYWHERE — 0 of N. A through-cut beaten by a wall that thickens or curves
+    /// away reaches part of the opening and stops short over the rest. Partial coverage is a
+    /// thing a recess cannot be, so repairing only partials never deepens a pocket.
+    #[test]
+    fn repaircuts_fixes_a_partly_reaching_opening_and_leaves_a_blind_one() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // A wall that STEPS: thin on one side, thick on the other, sharing a near face.
+        for (x, thick) in [(-0.75_f32, 0.2_f32), (0.75, 0.8)] {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union,
+                cad_solid::Plane::from_basis(
+                    glam::Vec3::new(x, thick * 0.5, 0.0), glam::Vec3::X, glam::Vec3::Y),
+                cad_solid::Placement::default(),
+                cad_solid::Primitive::Box { w: 1.5, d: thick, h: 3.0 },
+            );
+        }
+        let face = cad_solid::Plane::from_basis(
+            glam::Vec3::new(0.0, 0.0, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        // An opening spanning the step, cut deep enough for the THIN half only.
+        let partial = app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.45, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 2.0, d: 1.0, h: 0.6 },
+        );
+        // …and a genuine blind pocket, well clear of it.
+        let recess = app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: -1.2, v: 1.0, lift: -0.06, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 0.3, d: 0.3, h: 0.06 },
+        );
+        app.factory.recompute();
+
+        let cov = |app: &CadApp, id: u32| {
+            let f = app.factory.model.features.iter().find(|f| f.id == id).expect("feature");
+            app.cut_coverage(f)
+        };
+        let (ok, total, _) = cov(&app, partial);
+        assert!(total > 0 && ok > 0 && ok < total,
+            "the fixture must be PARTIAL for this test to mean anything, got {ok}/{total}");
+        let (rok, rtotal, _) = cov(&app, recess);
+        assert!(rtotal > 0 && rok == 0, "the recess must read blind-everywhere, got {rok}/{rtotal}");
+        let recess_h_before = match app.factory.model.features.iter()
+            .find(|f| f.id == recess).unwrap().primitive
+        { cad_solid::Primitive::Box { h, .. } => h, _ => f32::NAN };
+
+        let (fixed, _notes) = app.factory_repair_shallow_cuts();
+        app.factory.recompute();
+
+        assert!(fixed >= 1, "the partly-reaching opening must be repaired");
+        let (ok2, total2, _) = cov(&app, partial);
+        assert_eq!(ok2, total2, "…and must then span the wall everywhere, got {ok2}/{total2}");
+
+        let recess_h_after = match app.factory.model.features.iter()
+            .find(|f| f.id == recess).unwrap().primitive
+        { cad_solid::Primitive::Box { h, .. } => h, _ => f32::NAN };
+        assert_eq!(recess_h_before, recess_h_after,
+            "a blind pocket must never be deepened — it cannot be told from a failed opening");
     }
 
     /// `diag` must answer "did the openings go through" for the WHOLE model, on demand.
