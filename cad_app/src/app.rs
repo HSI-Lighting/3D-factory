@@ -13566,8 +13566,31 @@ impl CadApp {
             }
             Ok(Command::RepairCuts) => {
                 self.snapshot_factory();
+                // MEASURE THE SOLID FIRST. A repair that edits booleans can carve away far more
+                // than it opens, and a version of this command shipped that removed 30% of a real
+                // building — "verified", at the time, with the same heuristic that had done the
+                // editing, so the check could only ever agree with itself. The evaluated mesh is
+                // the one witness independent of whatever the repair believed about the model.
+                let tris_before = self.factory.model.eval().tri_count();
                 let (fixed, notes) = self.factory_repair_shallow_cuts();
                 let skipped = notes.len();
+                // Deepening a stopped opening cuts a reveal, which ADDS surfaces. It has no
+                // business destroying the building, so losing a tenth of it means the repair was
+                // wrong about something — put it back rather than hand over a wrecked model.
+                if fixed > 0 {
+                    let tris_after = self.factory.model.eval().tri_count();
+                    if tris_after * 10 < tris_before * 9 {
+                        self.do_undo();
+                        self.factory.status = format!(
+                            "repair ABANDONED — it would have cut the model from {tris_before} to \
+                             {tris_after} triangles. Nothing was changed.");
+                        self.history.push(format!(
+                            "  repaircuts: REFUSED — {tris_before} → {tris_after} triangles. \
+                             Deepening an opening cannot destroy geometry, so a measurement was \
+                             wrong somewhere. The model is untouched."));
+                        return;
+                    }
+                }
                 if fixed == 0 {
                     self.undo_stack.pop();
                     self.factory.status = if skipped > 0 {
@@ -46042,6 +46065,50 @@ mod factory_sketch_tests {
             (depth(2) - 0.05).abs() < 1e-6,
             "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
         );
+    }
+
+    /// A repair is judged by the SOLID it leaves behind, never by the rule that made it.
+    ///
+    /// A version of `repaircuts` shipped that re-bound cuts to whichever body a ray found nearest,
+    /// and it removed 30% of a real building — 7485 triangles down to 5261. It passed its own
+    /// check because that check counted mismatches with the same function that had chosen the
+    /// moves, so it could only ever report success. Circular verification is worse than none: it
+    /// converts a wrong belief into apparent evidence.
+    ///
+    /// Deepening a stopped opening cuts a reveal, which ADDS surfaces. Nothing this command does
+    /// can legitimately shrink the model by a tenth, so that is the line, measured on the
+    /// evaluated mesh — the one witness that does not depend on what the repair believed.
+    #[test]
+    fn a_repair_that_destroys_geometry_is_abandoned() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        let face = cad_solid::Plane::from_basis(
+            glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        app.factory.recompute();
+        let before = app.factory.model.eval().tri_count();
+
+        app.run_command("repaircuts");
+
+        // The legitimate repair goes through, and the building is still standing.
+        let after = app.factory.model.eval().tri_count();
+        assert!(after * 10 >= before * 9,
+            "a repair must never shrink the solid by a tenth: {before} → {after}");
+        assert!(!app.factory.status.contains("ABANDONED"),
+            "…and a sound repair must not trip the guard: {}", app.factory.status);
+        // It did do the work it was asked to do.
+        let h = match app.factory.model.features[1].primitive {
+            cad_solid::Primitive::Box { h, .. } => h, _ => f32::NAN,
+        };
+        assert!(h > 0.6, "the stopped cut is still deepened, got {h}");
     }
 
     /// `repaircuts` must FIND the wall, not assume the sketch plane is sitting on it.
