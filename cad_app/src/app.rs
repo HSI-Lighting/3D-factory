@@ -7921,10 +7921,34 @@ impl CadApp {
         let what = if through { "opening(s) cut through" } else { "recess(es) cut" };
         self.factory_consume_sketch(fin_idx, is_sel);
         self.factory.recompute();
+        // DID IT ACTUALLY GO THROUGH? Sample the finished cutter against the wall across the whole
+        // opening and record the verdict with the op.
+        //
+        // Everything else here describes what the cut INTENDED. Three windows drawn on one wall in
+        // one session produced three plausible-looking events and one blind window, and telling
+        // them apart meant re-deriving the geometry by hand afterwards — twice, from dumps that
+        // had already truncated. A cut that does not reach should say so where it happens.
+        let (cov_ok, cov_total, cov_short) = self
+            .factory
+            .model
+            .features
+            .iter()
+            .rev()
+            .find(|f| f.op == cad_solid::BoolOp::Difference)
+            .map_or((0, 0, 0.0), |c| self.cut_coverage(c));
+        let verdict = if cov_total == 0 {
+            "  ⚠ NO WALL under this opening".to_string()
+        } else if cov_ok < cov_total {
+            format!("  ⚠ DOES NOT GO THROUGH at {}/{cov_total} points, short by {cov_short:.3} m",
+                cov_total - cov_ok)
+        } else {
+            String::new()
+        };
         let detail = format!(
             "through={through} primary=#{target_id} targets={targets:?} \
              probe=({:.2},{:.2},{:.2}) normal=({:.2},{:.2},{:.2}) inward=({:.2},{:.2},{:.2}) \
-             in_depth={in_depth:.3} out_depth={out_depth:.3} lift={:.3} h={:.3} loops={n_loops} bodies_cut={} made={made}",
+             in_depth={in_depth:.3} out_depth={out_depth:.3} lift={:.3} h={:.3} loops={n_loops} \
+             bodies_cut={} made={made} coverage={cov_ok}/{cov_total}{verdict}",
             o.x, o.y, o.z, n.x, n.y, n.z, inward.x, inward.y, inward.z,
             lift, h, targets.len(),
         );
@@ -8333,6 +8357,46 @@ impl CadApp {
         (lo.is_finite() && hi > lo).then_some((lo, hi))
     }
 
+    /// How much of an opening the cutter actually spans: `(covered, sampled, worst shortfall)`.
+    ///
+    /// The only honest test of a through-cut. Depth describes one point; a cutter can be deep and
+    /// still miss, and on a curved wall it routinely opens the middle of a window and leaves one
+    /// side blind. `sampled` counts only the grid points that FIND a wall, so an opening hanging
+    /// past the end of a panel is not scored against the air beside it.
+    pub fn cut_coverage(&self, cut: &cad_solid::Feature) -> (usize, usize, f32) {
+        let (h, w, d) = match cut.primitive {
+            cad_solid::Primitive::Extrusion { h, w, d, .. } => (h, w, d),
+            cad_solid::Primitive::Box { w, d, h } => (h, w, d),
+            _ => return (0, 0, 0.0),
+        };
+        let (uax, vax) = cut.plane.axes();
+        let n = uax.cross(vax).normalize_or_zero();
+        if n.length_squared() < 0.5 { return (0, 0, 0.0); }
+        let (lo, hi) = (cut.placement.lift, cut.placement.lift + h);
+        let (mut ok, mut total, mut worst) = (0usize, 0usize, 0.0_f32);
+        const G: i32 = 4;
+        for iu in 0..=G {
+            for iv in 0..=G {
+                let p = cut.plane.origin()
+                    + uax * (cut.placement.u + w * (iu as f32 / G as f32 - 0.5))
+                    + vax * (cut.placement.v + d * (iv as f32 / G as f32 - 0.5));
+                let near = [(-1.0_f32, -n), (1.0_f32, n)].into_iter()
+                    .filter_map(|(sgn, dir)| self.nearest_surface(p, dir, Self::CUT_SEARCH)
+                        .map(|(t, leaving)| (if leaving { 0.0 } else { t }, sgn, dir)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                let Some((t, sgn, dir)) = near else { continue };
+                let thk = self.assembly_span(p + dir * t, dir).0;
+                if thk <= 1e-3 { continue; }
+                total += 1;
+                let (a, b) = (sgn * t, sgn * (t + thk));
+                let (wlo, whi) = (a.min(b), a.max(b));
+                if lo <= wlo + 1e-3 && hi >= whi - 1e-3 { ok += 1; }
+                else { worst = worst.max((lo - wlo).max(0.0)).max((whi - hi).max(0.0)); }
+            }
+        }
+        (ok, total, worst)
+    }
+
     /// Which Union body the nearest surface along `dir` belongs to, within `max`.
     fn nearest_surface_body(&self, origin: glam::Vec3, dir: glam::Vec3, max: f32) -> Option<u32> {
         let start = origin + dir * 1e-3;
@@ -8355,6 +8419,15 @@ impl CadApp {
     /// many it dropped. A 27-piece furniture set and a 159-feature model both fit; a survey
     /// import with thousands cannot flood the dump.
     const SCENE_LIST_MAX: usize = 48;
+
+    /// Materials get a much tighter cap than the other lists.
+    ///
+    /// A working project accumulates dozens of near-identical clipboard textures — this one has
+    /// 77, most of them one 540×360 clip used by one feature — and printing 48 of them TWICE
+    /// (session start and end) pushed a real dump past the paste limit and truncated away the
+    /// very cut events being investigated. Twice. The list is ordered by use, so the few that
+    /// matter are at the top; the rest are summarised in a line.
+    const SCENE_MATERIALS_MAX: usize = 12;
 
     /// EVERYTHING the 3D renderer is fed, as one recorder event — see [`DbgEvent::FactoryScene`].
     ///
@@ -8466,7 +8539,7 @@ impl CadApp {
         let mut by_use: Vec<usize> = (0..f.textures.len()).collect();
         by_use.sort_by_key(|&i| (std::cmp::Reverse(usage(i)), i));
         let mut mat_lines = Vec::new();
-        for &i in by_use.iter().take(Self::SCENE_LIST_MAX) {
+        for &i in by_use.iter().take(Self::SCENE_MATERIALS_MAX) {
             let t = &f.textures[i];
             let feats = f.feature_texture.values().filter(|v| **v == i).count();
             let surfs = f.surface_texture.values().filter(|v| **v == i).count();
@@ -8483,14 +8556,17 @@ impl CadApp {
                 if t.normal_map.is_some() { " nrm" } else { "" },
                 if t.rough_map.is_some() { " rgh" } else { "" }));
         }
-        if f.textures.len() > Self::SCENE_LIST_MAX {
-            let dropped = f.textures.len() - Self::SCENE_LIST_MAX;
-            let dropped_used = by_use.iter().skip(Self::SCENE_LIST_MAX).filter(|&&i| usage(i) > 0).count();
+        if f.textures.len() > Self::SCENE_MATERIALS_MAX {
+            let rest: Vec<usize> = by_use.iter().skip(Self::SCENE_MATERIALS_MAX).copied().collect();
+            let used = rest.iter().filter(|&&i| usage(i) > 0).count();
+            let procs = rest.iter().filter(|&&i| f.textures[i].proc.is_some()).count();
+            let transl = rest.iter().filter(|&&i| f.textures[i].opacity < 0.999).count();
+            // Say what was dropped in the terms that matter, so the summary can still rule things
+            // in or out: a procedural or see-through material is a different shader path.
             mat_lines.push(format!(
-                "… {dropped} MORE OMITTED (cap {}), least-used first — {}",
-                Self::SCENE_LIST_MAX,
-                if dropped_used == 0 { "none of them in use".into() }
-                else { format!("⚠ {dropped_used} of them ARE in use") }));
+                "… {} more (cap {}), least-used first: {used} in use, {procs} procedural, \
+                 {transl} see-through",
+                rest.len(), Self::SCENE_MATERIALS_MAX));
         }
         if f.textures.is_empty() { mat_lines.push("(no textures — everything is flat-shaded)".into()); }
         sections.push(("materials".into(), mat_lines));
@@ -46488,6 +46564,48 @@ mod factory_sketch_tests {
             "cutting a window must not destroy the wall: {before_tris} → {after} triangles");
     }
 
+    /// The recorded cut event must say whether the opening actually went through.
+    ///
+    /// Three windows were drawn on one wall in one session; one came out blind. All three events
+    /// looked equally plausible — targets, depths, a normal — and separating them meant deriving
+    /// the geometry by hand afterwards, from dumps that had already truncated. Twice.
+    ///
+    /// Coverage is the verdict, and it belongs where the cut happens. `in_depth`/`out_depth`
+    /// describe the probe, not the result.
+    #[test]
+    fn a_cut_that_does_not_go_through_says_so_in_the_recording() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        let face = cad_solid::Plane::from_basis(
+            glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        // A deliberately stopped cutter: 0.2 m into a 0.6 m wall.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        app.factory.recompute();
+        let stopped = app.factory.model.features[1].clone();
+        let (ok, total, short) = app.cut_coverage(&stopped);
+        assert!(total > 0, "the sampler must find the wall under this opening");
+        assert!(ok < total, "a 0.2 m cutter cannot span a 0.6 m wall — got {ok}/{total}");
+        assert!(short > 0.2, "and it should report how far it falls short, got {short}");
+
+        // …while a cutter that spans the wall reports clean.
+        app.factory.model.features[1].placement.lift = -0.8;
+        if let cad_solid::Primitive::Box { h, .. } = &mut app.factory.model.features[1].primitive {
+            *h = 1.6;
+        }
+        app.factory.recompute();
+        let through = app.factory.model.features[1].clone();
+        let (ok2, total2, _) = app.cut_coverage(&through);
+        assert_eq!(ok2, total2, "a cutter spanning the wall must score {total2}/{total2}");
+    }
+
     /// An opening whose CENTRE finds no wall must still cut the wall it overlaps.
     ///
     /// Three windows were cut on one curved run in a single recorded session; two worked and one
@@ -46867,8 +46985,8 @@ mod factory_sketch_tests {
         let text = crate::dbg_recorder::format_event_oneline(&app.factory_scene_capture("test"));
         assert!(text.contains("THE-ONE-IN-USE"),
             "the only material actually on screen must survive the cap:\n{text}");
-        assert!(text.contains("none of them in use"),
-            "…and the cap should say whether anything it dropped mattered:\n{text}");
+        assert!(text.contains("0 in use, 0 procedural, 0 see-through"),
+            "…and the cap should say what it dropped, in the terms that rule things in or out:\n{text}");
     }
 
     /// Autosave must be OFF at every start. It is the only thing in the app that writes over a
