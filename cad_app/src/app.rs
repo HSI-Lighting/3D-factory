@@ -8600,6 +8600,14 @@ impl CadApp {
                 "… {} more (cap {}), least-used first: {used} in use, {procs} procedural, \
                  {transl} see-through",
                 rest.len(), Self::SCENE_MATERIALS_MAX));
+            // A material that is ON SCREEN must never be invisible here — the cap exists to stop
+            // the dump truncating, not to hide the thing being investigated. Ids only, so it
+            // stays one line however many there are.
+            let used_ids: Vec<String> = rest.iter().filter(|&&i| usage(i) > 0)
+                .map(|i| i.to_string()).collect();
+            if !used_ids.is_empty() {
+                mat_lines.push(format!("    in use but not listed: [{}]", used_ids.join(", ")));
+            }
         }
         if f.textures.is_empty() { mat_lines.push("(no textures — everything is flat-shaded)".into()); }
         sections.push(("materials".into(), mat_lines));
@@ -10750,6 +10758,19 @@ impl CadApp {
                                     "FURN FACE pick @({:.0},{:.0}) inst#{fi} mode={} → {} group(s) = {sel_tris}/{asset_tris} tris {:?} (part_ids={has_parts}, brush={:?})",
                                     pos.x, pos.y, if piece { "piece" } else { "face" }, g.len(),
                                     &g[..g.len().min(6)], self.factory.furn_tex_brush,
+                                ),
+                                // `furniture_face_at` returns None for two unrelated reasons, and
+                                // reporting both as "the ray missed" sends the reader hunting a
+                                // pick bug that is not there. A decimated mesh REFUSES the pick
+                                // outright — face painting simply does not work on it — which is
+                                // a different problem with a different fix.
+                                None if self.factory.furniture.get(fi)
+                                    .and_then(|inst| self.factory.furniture_lib.get(inst.asset))
+                                    .is_some_and(|a| a.needs_lod()) => format!(
+                                    "FURN FACE pick @({:.0},{:.0}) inst#{fi} mode={} → REFUSED: \
+                                     {asset_tris}-triangle mesh is decimated for display, so face \
+                                     picking is unavailable on it (not a miss)",
+                                    pos.x, pos.y, if piece { "piece" } else { "face" },
                                 ),
                                 None => format!(
                                     "FURN FACE pick @({:.0},{:.0}) inst#{fi} mode={} → MISS (ray didn't hit the mesh)",
@@ -17795,7 +17816,7 @@ impl CadApp {
         let loc = std::panic::Location::caller();
         let undo_d = self.undo_stack.len();
         let redo_d = self.redo_stack.len();
-        self.dbg.take_snapshot(&self.doc, "session start", undo_d, redo_d, describe_verbose, loc);
+        self.dbg.take_snapshot(Self::plan_doc_of(self.factory.session.as_ref(), &self.doc), "session start", undo_d, redo_d, describe_verbose, loc);
         // …and the 3D side, which the doc snapshot cannot see: it captures `doc`, and the whole
         // model, its materials and its camera live in `factory`. Without this a dump of a
         // rendering bug opens with a 2D line list and never mentions the thing being rendered.
@@ -17998,7 +18019,7 @@ impl CadApp {
             let undo_d = self.undo_stack.len();
             let redo_d = self.redo_stack.len();
             self.dbg.take_snapshot(
-                &self.doc,
+                Self::plan_doc_of(self.factory.session.as_ref(), &self.doc),
                 "auto cadence",
                 undo_d,
                 redo_d,
@@ -18249,7 +18270,7 @@ impl CadApp {
                     let undo_d = self.undo_stack.len();
                     let redo_d = self.redo_stack.len();
                     self.dbg.take_snapshot(
-                        &self.doc, "manual snap",
+                        Self::plan_doc_of(self.factory.session.as_ref(), &self.doc), "manual snap",
                         undo_d, redo_d,
                         describe_verbose,
                         std::panic::Location::caller());
@@ -25472,9 +25493,22 @@ impl CadApp {
     /// the worker cloned `self.doc` — so an autosave firing while a sketch was open wrote the
     /// SKETCH over the user's plan file. Every save/serialise site must go through here.
     fn plan_doc(&self) -> &cad_kernel::Document {
-        match self.factory.session.as_ref() {
+        Self::plan_doc_of(self.factory.session.as_ref(), &self.doc)
+    }
+
+    /// The same choice, taken from the two FIELDS rather than from `&self`.
+    ///
+    /// `plan_doc(&self)` borrows the whole struct, so it cannot be handed to a method on another
+    /// field — `self.dbg.take_snapshot(self.plan_doc(), …)` is a borrow error. Splitting it this
+    /// way lets the compiler see that `dbg` and `doc`/`factory` are disjoint, which is what the
+    /// recorder's snapshot sites need. One definition, so the two cannot drift.
+    fn plan_doc_of<'a>(
+        session: Option<&'a crate::factory::SketchSession>,
+        doc: &'a cad_kernel::Document,
+    ) -> &'a cad_kernel::Document {
+        match session {
             Some(s) => &s.saved_doc,
-            None => &self.doc,
+            None => doc,
         }
     }
 
@@ -46757,6 +46791,44 @@ mod factory_sketch_tests {
             "a blind pocket must never be deepened — it cannot be told from a failed opening");
     }
 
+    /// A recorder snapshot captures the DRAWING, even mid face-sketch.
+    ///
+    /// While a face-sketch session is live, `doc` is the sketch — so an auto-cadence snapshot
+    /// taken then recorded an empty drawing. A real session shows it twice:
+    ///
+    ///     📷 SNAP[1] 0 dobj, undo=0, redo=0  (auto cadence)
+    ///
+    /// on a project holding 1442 objects. The same substitution once let autosave write a sketch
+    /// over someone's plan, which is why `plan_doc()` exists; the recorder simply never got it.
+    #[test]
+    fn a_snapshot_taken_during_a_face_sketch_still_records_the_drawing() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..7 {
+            app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(i as f64, 0.0), b: Vec2::new(i as f64, 5.0),
+            })));
+        }
+        let drawing = app.doc.dobjects.len();
+
+        // Enter a face sketch: `doc` is swapped for the sketch, and the drawing is parked.
+        app.factory.add_box();
+        app.factory.recompute();
+        let frame = cad_solid::Frame {
+            origin: glam::Vec3::new(0.0, 0.0, 1.0), u: glam::Vec3::X, v: glam::Vec3::Y,
+        };
+        app.factory_enter_sketch(frame);
+        assert!(app.factory.session.is_some(), "the sketch session must be live for this test");
+        assert!(app.doc.dobjects.len() < drawing, "…and `doc` must now be the sketch");
+
+        // Every snapshot path — session start, auto cadence, the 📷 button — goes through
+        // `take_snapshot`; this exercises the first, which is the one a dump always contains.
+        app.dbg_start();
+        let snap = app.dbg.snapshots.first().expect("a snapshot was taken");
+        assert_eq!(snap.geom.len() + snap.omitted, drawing,
+            "the snapshot must hold the DRAWING's {drawing} objects, not the sketch's");
+    }
+
     /// `diag` must answer "did the openings go through" for the WHOLE model, on demand.
     ///
     /// Two new cuts scoring 25/25 says those two are sound. It does not say the model is, and the
@@ -49551,7 +49623,7 @@ mod snapshot_scaling_tests {
     }
 
     fn snap(app: &mut CadApp, tag: &str) {
-        app.dbg.take_snapshot(&app.doc, tag, 0, 0, describe_verbose, std::panic::Location::caller());
+        app.dbg.take_snapshot(CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc), tag, 0, 0, describe_verbose, std::panic::Location::caller());
     }
 
     fn app_with(n: usize) -> CadApp {

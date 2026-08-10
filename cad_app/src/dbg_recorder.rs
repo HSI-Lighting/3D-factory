@@ -1177,19 +1177,12 @@ macro_rules! dbg_event {
     }};
 }
 
-/// Take a Document snapshot tagged with `reason`. Forwards undo/redo
-/// depths and the call site.
-#[macro_export]
-macro_rules! dbg_snapshot {
-    ($app:expr, $reason:expr) => {{
-        if $app.dbg.recording {
-            $app.dbg.take_snapshot(
-                &$app.doc,
-                $reason,
-                $app.undo_stack.len(),
-                $app.redo_stack.len(),
-                std::panic::Location::caller(),
-            );
-        }
-    }};
-}
+// There was a `dbg_snapshot!` macro here. It was DEAD and it could not compile: it called
+// `take_snapshot` without the `describe` argument, so any use of it was a type error. Nothing
+// used it, which is the only reason that went unnoticed.
+//
+// It is deleted rather than repaired because it was actively misleading — it read as the
+// sanctioned way to take a snapshot while the three real call sites (session start, auto cadence,
+// the 📷 button) all call `take_snapshot` directly. A macro that cannot compile is worse than no
+// macro: it invites a fix in the wrong place. Snapshots must pass `plan_doc()`, never `doc`,
+// which while a face-sketch session is live IS the sketch.
