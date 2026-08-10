@@ -7720,6 +7720,19 @@ impl CadApp {
                 }
             }
         }
+        // Nothing's box contains the point? Then FIND the solid by ray. A sketch plane is not
+        // reliably on the surface it was drawn against — on a curved wall it is a tangent, and in
+        // practice the loop centroid lands as much as 0.64 m clear of the masonry, which is
+        // outside every candidate box. Refusing the cut there is wrong: the wall is right in
+        // front of the sketch, just not underneath its centroid.
+        let target = target.or_else(|| {
+            let nrm = frame.u.cross(frame.v).normalize_or_zero();
+            [-nrm, nrm].into_iter()
+                .filter_map(|d| self.nearest_surface_body(o, d, Self::CUT_SEARCH))
+                .find_map(|id| self.factory.model.features.iter()
+                    .position(|f| f.id == id)
+                    .map(|i| (i, 0.0_f32)))
+        });
         let Some((tidx, _)) = target else {
             self.factory.status = "no solid under this face to cut".into();
             return 0;
@@ -7752,20 +7765,50 @@ impl CadApp {
         // one-sided blind pocket, capped so it can never break through.
         const MARGIN: f32 = 0.1;
         let want = self.factory.element_height.max(0.02);
-        let (in_depth, _in_ids) = self.assembly_span(o, inward);
+
+        // RE-ANCHOR THE PROBE ONTO THE WALL before measuring anything.
+        //
+        // `o` is the drawn loop's centroid on the SKETCH plane, and that plane is not reliably on
+        // the surface — on a curved wall it is a tangent, and measured on a real project the
+        // centroid ends up as much as 0.64 m clear of the masonry. Everything downstream is then
+        // wrong at once, which is why this looked like several unrelated faults:
+        //
+        //   * `assembly_span` starts in mid-air, hits the 0.4 m gap rule on its first crossing
+        //     and reports a thickness of ZERO, so the cutter falls back to the bare ±0.1 m
+        //     margin — the "stopped cut" that leaves solid wall behind the glass;
+        //   * the swept box below is then a thin slab floating off the wall, so the body search
+        //     misses the wall entirely and finds only the huge bodies whose bounding boxes span
+        //     the building. The cut is subtracted from those instead. Measured on the real file,
+        //     20 of 27 cuts were bound to a body they do not sit in, and NONE of the curved-wall
+        //     openings were bound to the curved wall.
+        //
+        // A crossing the ray LEAVES through means the sketch plane is already inside the wall, so
+        // the anchor is here and the distance is zero.
+        let anchor = [inward, -inward]
+            .into_iter()
+            .filter_map(|d| self.nearest_surface(o, d, Self::CUT_SEARCH)
+                .map(|(t, leaving)| (if leaving { 0.0 } else { t }, d)))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map_or(o, |(t, d)| o + d * t);
+        // Where that anchor sits along the plane normal — every depth below is measured from it,
+        // but `lift`/`h` must still be expressed in the plane's own coordinates. `za` is zero when
+        // the sketch plane was already on the wall, which is the case this used to assume.
+        let za = (anchor - o).dot(n);
+
+        let (in_depth, _in_ids) = self.assembly_span(anchor, inward);
         let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 }; // sign of inward along +Z(=n)
         // First decide how far the cutter reaches on each face → lift/h in plane-local Z.
         let (lift, h, out_depth): (f32, f32, f32) = if through {
-            let (out_depth, _out_ids) = self.assembly_span(o, -inward);
-            let zeta_in = s_in * (in_depth + MARGIN);
-            let zeta_out = -s_in * (out_depth + MARGIN);
+            let (out_depth, _out_ids) = self.assembly_span(anchor, -inward);
+            let zeta_in = za + s_in * (in_depth + MARGIN);
+            let zeta_out = za - s_in * (out_depth + MARGIN);
             let (lo, hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
             (lo, hi - lo, out_depth)
         } else {
-            // recess: blind pocket from the picked face inward by `want` (never through).
+            // recess: blind pocket from the WALL face inward by `want` (never through).
             let wall = (in_depth - EPS).max(EPS);
             let d = want.min(wall);
-            let (lift, h) = if s_in > 0.0 { (-EPS, d + EPS) } else { (-d, d + EPS) };
+            let (lift, h) = if s_in > 0.0 { (za - EPS, d + EPS) } else { (za - d, d + EPS) };
             (lift, h, 0.0)
         };
         // Which bodies to cut: EVERY Union body whose world AABB overlaps the cutter's swept
@@ -7796,6 +7839,16 @@ impl CadApp {
                 && amn.z <= bmax.z + pad && amx.z >= bmin.z - pad
             {
                 targets.push(f.id);
+            }
+        }
+        // …AND every body the cut AXIS actually runs through, which is the one test that cannot
+        // be fooled by where the sketch plane happens to be. A box search compares volumes: a
+        // slab or a shell whose bounding box spans the whole building matches every opening in
+        // it, while the wall the opening is truly drawn on can be missed if the cutter is offset
+        // or thin. The ray answers "what does this opening pass through" directly.
+        for d in [inward, -inward] {
+            for id in self.assembly_span(anchor, d).1 {
+                if !targets.contains(&id) { targets.push(id); }
             }
         }
         if targets.is_empty() { targets.push(target_id); }
@@ -7978,6 +8031,82 @@ impl CadApp {
         });
     }
 
+    /// The body an opening physically sits in: the nearest Union surface either way along its
+    /// own normal, within [`Self::CUT_SEARCH`]. `None` when nothing is near enough to attribute.
+    fn body_at_opening(&self, o: glam::Vec3, n: glam::Vec3) -> Option<u32> {
+        [-n, n]
+            .into_iter()
+            .filter_map(|d| self.nearest_surface(o, d, Self::CUT_SEARCH)
+                .and_then(|(t, _)| self.nearest_surface_body(o, d, Self::CUT_SEARCH).map(|id| (t, id))))
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id)| id)
+    }
+
+    /// Move every cut to sit directly after the body it actually opens. Returns how many moved.
+    ///
+    /// `eval` is a sequential accumulator: a Difference applies ONLY to the body started by the
+    /// most recent preceding Union, so a cut's POSITION in the feature list is what decides its
+    /// target — not its geometry. A cutter in exactly the right place, the right size and the
+    /// right shape does nothing at all if it is sitting behind the wrong Union.
+    ///
+    /// Measured on the real project, 20 of 27 cuts were bound to a body they do not sit in, and
+    /// not one of the curved-wall openings was bound to the curved wall — which is exactly why
+    /// those windows showed no hole. The cut tool now binds correctly, but a saved file records
+    /// the order it was written with, so existing work needs this.
+    ///
+    /// Openings that cannot be attributed to any body keep the owner they have. Being unsure is
+    /// a reason to leave a cut alone, not to move it somewhere arbitrary.
+    fn factory_rebind_cuts(&mut self) -> usize {
+        use cad_solid::BoolOp;
+        // Current owner and desired owner for every non-Union feature, in list order.
+        let mut owner: Option<u32> = None;
+        let mut plan: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new(); // (id, current, wanted)
+        for f in &self.factory.model.features {
+            match f.op {
+                BoolOp::Union => owner = Some(f.id),
+                _ => {
+                    let (u, v) = f.plane.axes();
+                    let n = u.cross(v).normalize_or_zero();
+                    // Only a Difference is re-bound. An Intersection is a shaping operation whose
+                    // meaning depends on the body it follows, so moving one changes the result.
+                    let want = (f.op == BoolOp::Difference && n.length_squared() > 0.5)
+                        .then(|| {
+                            let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
+                            self.body_at_opening(o, n)
+                        })
+                        .flatten();
+                    plan.push((f.id, owner, want));
+                }
+            }
+        }
+        let target_of = |id: u32| -> Option<u32> {
+            plan.iter().find(|(i, _, _)| *i == id).and_then(|(_, cur, want)| want.or(*cur))
+        };
+        let moved = plan.iter()
+            .filter(|(_, cur, want)| matches!((cur, want), (Some(c), Some(w)) if c != w))
+            .count();
+        if moved == 0 { return 0; }
+
+        // REBUILD in one pass: each Union followed by the features that belong to it, keeping
+        // their relative order. Rebuilding beats a sequence of removes and inserts, where every
+        // move shifts the indices the next one was computed from.
+        let feats = std::mem::take(&mut self.factory.model.features);
+        let mut out: Vec<cad_solid::Feature> = Vec::new();
+        // Anything before the first Union has no body and cannot be bound; it stays at the front,
+        // where it is the no-op it already was.
+        for f in feats.iter().take_while(|f| f.op != BoolOp::Union) {
+            out.push(f.clone());
+        }
+        for u in feats.iter().filter(|f| f.op == BoolOp::Union) {
+            out.push(u.clone());
+            for f in feats.iter().filter(|f| f.op != BoolOp::Union) {
+                if target_of(f.id) == Some(u.id) { out.push(f.clone()); }
+            }
+        }
+        self.factory.model.features = out;
+        moved
+    }
+
     /// Re-measure openings cut by the broken thickness probe, which stopped 100 mm into the
     /// wall instead of going through. Returns `(repaired, left_alone)`.
     ///
@@ -7997,7 +8126,7 @@ impl CadApp {
     /// cannot be recovered. Four cuts sharing one identical reconstructed point gave that away.
     ///
     /// So the wall is FOUND instead of assumed: cast along the cutter's normal in both directions,
-    /// take the nearest surface within [`SEARCH`], and measure the assembly from there — which is
+    /// take the nearest surface within [`Self::CUT_SEARCH`], and measure the assembly from there — which is
     /// the situation `assembly_span` was built for, a probe sitting ON a face. Self-correcting,
     /// and it does not depend on how a placement happens to be encoded.
     ///
@@ -8008,9 +8137,9 @@ impl CadApp {
     /// wrong piece of the building. Naming them is more use than guessing at them.
     fn factory_repair_shallow_cuts(&mut self) -> (usize, Vec<String>) {
         const MARGIN: f32 = 0.1;
-        /// How far to look for the wall this opening belongs to. Comfortably past the 0.64 m seen
-        /// in practice, and well short of the room's width so it cannot grab the wall opposite.
-        const SEARCH: f32 = 1.5;
+        // Same reach the CUT uses — see `Self::CUT_SEARCH`. The repair redoes what the cut should
+        // have done, so the two must agree on what counts as "this wall".
+        const SEARCH: f32 = CadApp::CUT_SEARCH;
         // The broken signature, and nothing else: a THROUGH cut is never legitimately this
         // shallow, and a RECESS is a deliberate blind pocket that must not be deepened.
         let suspects: Vec<(usize, u32, glam::Vec3, glam::Vec3)> = self
@@ -8154,6 +8283,14 @@ impl CadApp {
     /// many it dropped. A 27-piece furniture set and a 159-feature model both fit; a survey
     /// import with thousands cannot flood the dump.
     const SCENE_LIST_MAX: usize = 48;
+
+    /// How far to look for the wall an opening belongs to, when the sketch plane is not sitting
+    /// on it. Comfortably past the 0.64 m seen in practice on a curved wall, and well short of a
+    /// room's width so the search can never reach the wall opposite.
+    ///
+    /// Shared by the cut itself and by `repaircuts`, deliberately: the repair exists to redo what
+    /// the cut should have done, so the two must agree on what counts as "this wall".
+    const CUT_SEARCH: f32 = 1.5;
 
     /// EVERYTHING the 3D renderer is fed, as one recorder event — see [`DbgEvent::FactoryScene`].
     ///
@@ -8517,6 +8654,25 @@ impl CadApp {
             }
         }
         best
+    }
+
+    /// Which Union body the nearest surface along `dir` belongs to, within `max`. The companion
+    /// to [`Self::nearest_surface`], for asking "what is this opening actually drawn on?".
+    fn nearest_surface_body(&self, origin: glam::Vec3, dir: glam::Vec3, max: f32) -> Option<u32> {
+        let start = origin + dir * 1e-3;
+        let mut best: Option<(f32, u32)> = None;
+        for f in &self.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            for c in self.factory.model.feature_world_positions(f).chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                    if t > 1e-4 && t <= max && best.is_none_or(|(z, _)| t < z) {
+                        best = Some((t, f.id));
+                    }
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// Ray-march EVERY Union body from `origin` along `dir` and return `(depth, body_ids)` —
@@ -13566,9 +13722,18 @@ impl CadApp {
             }
             Ok(Command::RepairCuts) => {
                 self.snapshot_factory();
+                // RE-BIND FIRST. A cut applied to the wrong body opens nothing, and deepening it
+                // would only make a bigger hole in the wrong place — so put each one behind the
+                // body it actually sits in before touching any depth.
+                let rebound = self.factory_rebind_cuts();
+                if rebound > 0 {
+                    self.history.push(format!(
+                        "  repaircuts: {rebound} cut(s) re-bound to the body they sit in \
+                         (a cut applied to the wrong solid opens nothing)"));
+                }
                 let (fixed, notes) = self.factory_repair_shallow_cuts();
                 let skipped = notes.len();
-                if fixed == 0 {
+                if fixed == 0 && rebound == 0 {
                     self.undo_stack.pop();
                     self.factory.status = if skipped > 0 {
                         format!("{skipped} shallow cut(s) found, but none could be attributed to \
@@ -13578,11 +13743,16 @@ impl CadApp {
                     };
                 } else {
                     self.factory.recompute();
-                    self.factory.status = format!(
-                        "{fixed} opening(s) re-cut through the full wall — Ctrl+Z undoes it");
-                    self.history.push(format!(
-                        "  repaircuts: {fixed} opening(s) deepened{}",
-                        if skipped > 0 { format!(", {skipped} left alone") } else { String::new() }));
+                    self.factory.status = match (rebound, fixed) {
+                        (0, f) => format!("{f} opening(s) re-cut through the full wall — Ctrl+Z undoes it"),
+                        (r, 0) => format!("{r} cut(s) moved onto the body they open — Ctrl+Z undoes it"),
+                        (r, f) => format!("{r} cut(s) re-bound and {f} deepened — Ctrl+Z undoes it"),
+                    };
+                    if fixed > 0 {
+                        self.history.push(format!(
+                            "  repaircuts: {fixed} opening(s) deepened{}",
+                            if skipped > 0 { format!(", {skipped} left alone") } else { String::new() }));
+                    }
                 }
                 // Name every one left alone, with the distance that decided it. A bare count is
                 // not actionable; these have to be redrawn by hand and the user needs to know
@@ -45708,10 +45878,42 @@ mod factory_sketch_tests {
         println!("{}", crate::dbg_recorder::format_event_oneline(
             &app.factory_scene_capture(&format!("offline capture of {path}"))));
 
+        // WHICH BODY DOES EACH CUT ACTUALLY CUT? `eval` is a sequential accumulator: a Difference
+        // applies ONLY to the body started by the most recent preceding Union. A cut's POSITION
+        // in the feature list decides its target, not its geometry — so if the wall the opening
+        // was drawn on is not that body, the cut lands elsewhere, or on nothing, while every
+        // other signal still reports success.
+        println!("\n=== cut → body binding ===");
+        let mut owner: Option<u32> = None;
+        let mut mismatched = 0usize;
+        for f in &app.factory.model.features {
+            match f.op {
+                cad_solid::BoolOp::Union => owner = Some(f.id),
+                cad_solid::BoolOp::Difference => {
+                    let (u, v) = f.plane.axes();
+                    let n = u.cross(v).normalize_or_zero();
+                    let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
+                    // The body the opening physically sits in: the first one a ray reaches
+                    // either way along the normal.
+                    let hit = [-n, n].into_iter()
+                        .filter_map(|d| app.nearest_surface_body(o, d, 3.0))
+                        .next();
+                    let bad = matches!((owner, hit), (Some(b), Some(h)) if b != h);
+                    if bad { mismatched += 1; }
+                    println!("  cut #{:<4} bound to body #{:<4} · sits in {:<8} {}",
+                        f.id,
+                        owner.map_or("—".into(), |b| b.to_string()),
+                        hit.map_or("—".into(), |h| format!("#{h}")),
+                        if bad { "⚠ MISMATCH — applied to the wrong body" } else { "" });
+                }
+                _ => {}
+            }
+        }
+        println!("  → {mismatched} cut(s) bound to a body they do not sit in");
+
         // Per-suspect probe trace: where the face point lands, and what the ray finds in EACH
         // direction. This is the view that showed the reconstructed point sitting 0.64 m clear of
         // the wall — the reason the repair used to decline every one of these openings.
-
         println!("\n=== per-cut probe ===");
         for f in app.factory.model.features.iter()
             .filter(|f| f.op == cad_solid::BoolOp::Difference)
@@ -45765,9 +45967,29 @@ mod factory_sketch_tests {
         // DRY-RUN the repair on the real geometry. Read-only — nothing is written back — but it
         // answers the question the capture raises and the user cannot: would `repaircuts`
         // actually fix these, or does it skip them?
+        let rebound = app.factory_rebind_cuts();
         let (fixed, notes) = app.factory_repair_shallow_cuts();
-        println!("\n=== repaircuts DRY RUN ===\n{fixed} would be re-cut, {} left alone", notes.len());
+        println!("\n=== repaircuts DRY RUN ===\n{rebound} would be re-bound, {fixed} re-cut, \
+                  {} left alone", notes.len());
         for n in &notes { println!("{n}"); }
+        // Re-check the binding after the move: it must come out clean.
+        let mut owner: Option<u32> = None;
+        let mut still = 0usize;
+        for f in &app.factory.model.features {
+            match f.op {
+                cad_solid::BoolOp::Union => owner = Some(f.id),
+                cad_solid::BoolOp::Difference => {
+                    let (u, v) = f.plane.axes();
+                    let n = u.cross(v).normalize_or_zero();
+                    let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
+                    if let (Some(b), Some(h)) = (owner, app.body_at_opening(o, n)) {
+                        if b != h { still += 1; }
+                    }
+                }
+                _ => {}
+            }
+        }
+        println!("after re-binding: {still} cut(s) still bound to a body they do not sit in");
         if fixed > 0 {
             app.factory.recompute();
             println!("{}", crate::dbg_recorder::format_event_oneline(
@@ -46042,6 +46264,127 @@ mod factory_sketch_tests {
             (depth(2) - 0.05).abs() < 1e-6,
             "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
         );
+    }
+
+    /// A cut sitting behind the wrong Union is moved onto the body it actually opens.
+    ///
+    /// `eval` is a sequential accumulator, so a Difference applies only to the body started by the
+    /// most recent preceding Union. A cutter of the right shape, in the right place, does nothing
+    /// whatsoever if it is appended after a different body — and that is what a file written by
+    /// the old cut path contains. On the real project 20 of 27 cuts were bound this way, none of
+    /// the curved-wall openings among them, which is why those windows showed no hole.
+    ///
+    /// Fixing the cut tool cannot help work already saved: a file records the order it was
+    /// written with. So `repaircuts` re-binds as well as re-measures.
+    #[test]
+    fn rebinding_moves_a_cut_behind_the_body_it_opens() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let wall = app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        // A second body elsewhere, added AFTER — so an appended cut binds to this one.
+        let other = app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, 20.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        // The opening: drawn on the FIRST wall, appended last, so bound to the second.
+        let cut = app.factory.model.push(
+            cad_solid::BoolOp::Difference,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z),
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.4, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.8 },
+        );
+        app.factory.recompute();
+
+        let ids = |app: &CadApp| -> Vec<u32> { app.factory.model.features.iter().map(|f| f.id).collect() };
+        assert_eq!(ids(&app), vec![wall, other, cut], "the cut starts behind the wrong body");
+
+        assert_eq!(app.factory_rebind_cuts(), 1, "exactly the one mis-bound cut moves");
+        assert_eq!(ids(&app), vec![wall, cut, other],
+            "the cut must now sit directly behind the wall it opens");
+
+        // Idempotent: a second pass has nothing left to do.
+        assert_eq!(app.factory_rebind_cuts(), 0, "re-binding a correct model must be a no-op");
+    }
+
+    /// A window drawn on a wall the SKETCH PLANE does not sit on must still cut THAT wall.
+    ///
+    /// This is the "cuts aren't being made on the curved surface" report, reduced. On a curved
+    /// wall the sketch plane is a tangent, so the drawn loop's centroid stands clear of the
+    /// masonry — measured at 0.64 m on the real project. Three things then went wrong at once,
+    /// which is why it presented as several unrelated faults:
+    ///
+    ///   * the "solid under this face" search is box-containment, and the centroid is inside no
+    ///     box, so the cut was refused outright;
+    ///   * `assembly_span` started in mid-air, hit the 0.4 m gap rule on its first crossing and
+    ///     reported zero thickness, so the cutter fell back to ±0.1 m — the stopped cut;
+    ///   * the swept box used to choose target bodies then floated off the wall, so the cut was
+    ///     bound to whatever large body did overlap it. On the real file 20 of 27 cuts were bound
+    ///     to a body they do not sit in, and not one curved-wall opening was bound to the curved
+    ///     wall — which is precisely why no hole appeared.
+    ///
+    /// `eval` is a sequential accumulator, so binding is decided by POSITION in the feature list:
+    /// a Difference applies only to the body started by the most recent preceding Union. Cutting
+    /// the right shape in the right place is not enough if it lands after the wrong Union.
+    #[test]
+    fn a_cut_binds_to_the_wall_it_was_drawn_on_not_the_one_its_sketch_plane_is_in() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // A 200 mm wall. Its near face is 0.6 m from the sketch plane below.
+        let wall = app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -1.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.2, h: 3.0 },
+        );
+        // …and a second, later body elsewhere — the shape of the real failure, where the cut was
+        // appended at the end and so bound to whichever Union happened to come last.
+        let other = app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, 6.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.2, h: 3.0 },
+        );
+        app.factory.recompute();
+
+        // A finished sketch on a plane 0.6 m clear of the wall, carrying a 1 m square.
+        let frame = cad_solid::Frame {
+            origin: glam::Vec3::new(0.0, -0.3, 1.5),
+            u: glam::Vec3::X,
+            v: glam::Vec3::Z,
+        };
+        let mut sk = cad_solid::Sketch::new(frame);
+        let sq = [(-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5), (-0.5, -0.5)];
+        sk.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: sq.iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory.model.sketches.push(sk);
+
+        assert_eq!(app.factory_cut_sketch(true), 1, "the cut must be made, not refused");
+
+        // The Difference must sit immediately after the WALL's Union — that is what binds it.
+        let feats = &app.factory.model.features;
+        let wi = feats.iter().position(|f| f.id == wall).expect("the wall survives");
+        let cut = feats.get(wi + 1).expect("a cutter must follow the wall it opens");
+        assert_eq!(cut.op, cad_solid::BoolOp::Difference,
+            "the feature after the wall must be its cutter — `eval` binds by position");
+        // …and it must actually SPAN the wall, which sits 0.6 … 0.8 along the normal.
+        let h = match cut.primitive { cad_solid::Primitive::Extrusion { h, .. } => h, _ => f32::NAN };
+        assert!(h >= 0.35, "the cutter must span the 0.2 m wall plus margins, got {h}");
+        assert!(cut.placement.lift >= 0.4 && cut.placement.lift <= 0.6,
+            "it must START at the wall, not at the sketch plane: lift {}", cut.placement.lift);
+        // The unrelated body 6 m away must not have been opened.
+        let oi = feats.iter().position(|f| f.id == other).expect("the other body survives");
+        assert!(feats.get(oi + 1).is_none_or(|f| f.op != cad_solid::BoolOp::Difference),
+            "a body the opening does not touch must not be cut");
     }
 
     /// `repaircuts` must FIND the wall, not assume the sketch plane is sitting on it.
