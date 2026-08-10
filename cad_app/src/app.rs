@@ -2035,8 +2035,19 @@ pub struct CadApp {
     /// `unsaved` already cleared so the close isn't vetoed again.
     pending_close: bool,
     /// Autosave: silently re-save the CURRENT file in the background every few minutes when there
-    /// are unsaved edits, so a crash or power loss can't wipe an afternoon's work. On by default;
-    /// only ever writes to an already-saved `.dxf`/`.rsm` (never an untitled doc).
+    /// are unsaved edits. Only ever writes to an already-saved `.dxf`/`.rsm`, never an untitled
+    /// doc.
+    ///
+    /// **OFF at every start, and deliberately not remembered.** It is the only thing in the app
+    /// that writes over a user's file with no user action at all, and it destroyed a project:
+    /// undoing past an open left the app holding its empty startup state while still pointed at
+    /// the real file, and three minutes later autosave committed that emptiness to disk. The
+    /// undo bug is fixed, but the asymmetry stands — a bug reachable only through an explicit
+    /// save is a bad afternoon, the same bug reachable through a timer is a lost project.
+    ///
+    /// So it starts off every session and the user turns it on when they want it. Persisting the
+    /// choice would defeat the point: the whole risk is it being on when nobody is thinking
+    /// about it.
     autosave_on: bool,
     /// The background autosave worker's result channel while one is running (`None` = idle).
     autosave_rx: Option<std::sync::mpsc::Receiver<BusyMsg>>,
@@ -3707,7 +3718,7 @@ impl Default for CadApp {
             arch_couch: cad_solid::couch::CouchInput::default(),
             close_after_save: false,
             pending_close: false,
-            autosave_on: true,
+            autosave_on: false, // OFF every start — see the field's docs
             autosave_rx: None,
             last_autosave: std::time::Instant::now(),
             edit_seq: 0,
@@ -35545,7 +35556,11 @@ impl eframe::App for CadApp {
                                 if a_on { "⤓ Autosave: on" } else { "⤓ Autosave: off" }).small())
                             .on_hover_text(
                                 "Silently re-saves the open .dxf/.rsm a few minutes after an edit \
-                                 (atomic write — an interrupted save can't corrupt the file). Click to toggle.")
+                                 (atomic write — an interrupted save can't corrupt the file).\n\n\
+                                 OFF every time the app starts, and not remembered between \
+                                 sessions: it is the only thing here that writes over your file \
+                                 with no action from you, so it is never on unless you just \
+                                 turned it on. Click to toggle.")
                             .clicked()
                         {
                             self.autosave_on = !a_on;
@@ -45449,6 +45464,25 @@ mod factory_sketch_tests {
         }
     }
 
+    /// Autosave must be OFF at every start. It is the only thing in the app that writes over a
+    /// user's file with no user action, and it is how an empty document reached disk and
+    /// destroyed a project. A bug reachable only through an explicit save costs an afternoon;
+    /// the same bug reachable through a timer costs the project.
+    #[test]
+    fn autosave_starts_off_and_is_not_remembered() {
+        assert!(
+            !CadApp::default().autosave_on,
+            "autosave must default to OFF — nothing may overwrite a file unattended",
+        );
+        // Turning it on is a session-only choice: a NEW app is off again, whatever the last
+        // session did. Persisting it would defeat the point, since the risk is precisely that
+        // it is on while nobody is thinking about it.
+        let mut app = CadApp::default();
+        app.autosave_on = true;
+        drop(app);
+        assert!(!CadApp::default().autosave_on, "a fresh session starts off again");
+    }
+
     /// DATA LOSS REGRESSION. Opening a file must drop the undo history, because every entry in
     /// it snapshots a DIFFERENT document — including the empty one the app starts with. Left in
     /// place, Ctrl+Z after an open walks out of the opened file into the previous document,
@@ -46724,6 +46758,13 @@ mod autosave_tests {
     #[test]
     fn autosave_gates_then_fires() {
         let mut app = CadApp::default();
+        // Autosave is OFF at every start now (it is the only unattended writer, and it is how an
+        // empty document once reached a user's file). Turn it on explicitly, exactly as the user
+        // must — the gate below is the FIRST thing this test covers.
+        assert!(!app.autosave_on, "off until asked for");
+        app.tick_autosave();
+        assert!(app.autosave_rx.is_none(), "off → no autosave, whatever else is true");
+        app.autosave_on = true;
         // Clean → never.
         app.unsaved = false;
         app.tick_autosave();
