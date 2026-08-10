@@ -8808,6 +8808,12 @@ impl CadApp {
         let mut ranked: Vec<_> = pair_hits.into_iter().collect();
         ranked.sort_by(|a, b| b.1.cmp(&a.1));
 
+        // EXACTLY what `factory_dedupe_solids` treats as a duplicate, so the report and the
+        // command can never disagree about the word. `None` = no such body.
+        let dedupe_sig = |id: u32| -> Option<String> {
+            self.factory.model.features.iter().find(|f| f.id == id)
+                .map(|f| format!("{:?}|{:?}|{:?}", f.plane, f.placement, f.primitive))
+        };
         let describe = |id: u32| -> String {
             self.factory.model.features.iter().find(|f| f.id == id).map_or("?".into(), |f| {
                 let (mn, mx) = f.world_aabb();
@@ -8827,7 +8833,20 @@ impl CadApp {
             out.push("    nothing to break the tie: which one shows flips as the camera".into());
             out.push("    moves. That is the pattern that looks like texture on a surface.".into());
             for ((a, b), n) in ranked.iter().take(8) {
-                let dup = if describe(*a) == describe(*b) { "  ← SAME SIZE: a duplicate" } else { "" };
+                // Say only what is known. This used to print "← SAME SIZE: a duplicate" whenever
+                // two bodies shared a KIND and a bounding box rounded to 0.1 m — which is not
+                // what `dedupe` means by a duplicate at all. `dedupe` requires an exact match of
+                // plane, placement and primitive, so it correctly refused a pair `diag` had just
+                // called a duplicate, and the two tools flatly contradicted each other in front
+                // of the user. Use `dedupe`'s own test, and when it does not hold, say what the
+                // pair actually is and who has to deal with it.
+                let dup = if dedupe_sig(*a).is_some() && dedupe_sig(*a) == dedupe_sig(*b) {
+                    "  ← EXACT TWIN: `dedupe` removes it"
+                } else if describe(*a) == describe(*b) {
+                    "  ← same size, different definition — `dedupe` will NOT touch it"
+                } else {
+                    ""
+                };
                 out.push(format!(
                     "      #{a} vs #{b}: {n} coincident faces{dup}"
                 ));
@@ -8836,7 +8855,9 @@ impl CadApp {
             if ranked.len() > 8 {
                 out.push(format!("      … and {} more pair(s)", ranked.len() - 8));
             }
-            out.push("    Select the ids above in the 3D view and delete the redundant one.".into());
+            out.push("    `dedupe` removes EXACT twins only. Anything marked otherwise is two".into());
+            out.push("    different solids sharing space — decide which is redundant and delete".into());
+            out.push("    it in the 3D view; nothing can make that call for you.".into());
         }
         out
     }
@@ -47440,9 +47461,31 @@ mod factory_sketch_tests {
             "the duplicate must be reported:\n{report}",
         );
         assert!(
-            report.contains("SAME SIZE: a duplicate"),
-            "an identical twin must be called out as a duplicate:\n{report}",
+            report.contains("EXACT TWIN: `dedupe` removes it"),
+            "an identical twin must be called out as one `dedupe` will take:\n{report}",
         );
+
+        // …and a pair that merely SHARES A BOUNDING SIZE must not be called a duplicate.
+        //
+        // This wording contradicted the command in front of the user: `diag` said "a duplicate"
+        // for any two bodies with the same kind and box rounded to 0.1 m, then `dedupe` — which
+        // requires an exact plane/placement/primitive match — answered "no duplicate solids
+        // found". Two tools of mine, flatly disagreeing, on a wasted errand.
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for lift in [0.0_f32, 0.05] {
+            app.factory.model.push(
+                cad_solid::BoolOp::Union, cad_solid::Plane::default(),
+                cad_solid::Placement { u: 0.0, v: 0.0, lift, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                cad_solid::Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+            );
+        }
+        app.factory.recompute();
+        let report = app.factory_geometry_report().join("\n");
+        assert!(!report.contains("EXACT TWIN"),
+            "these differ in placement, so `dedupe` will not touch them:\n{report}");
+        assert!(report.contains("same size, different definition"),
+            "…and the report must say so, rather than promise a fix that will not happen:\n{report}");
     }
 
     /// The plan must be OCCLUDED by the model by default. Painting it on a foreground layer
