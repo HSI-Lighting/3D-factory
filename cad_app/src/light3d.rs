@@ -592,7 +592,27 @@ const TEX_VS: &str = r#"
     out float v_shade;
     out float v_a;
     out vec3 v_wpos;   // WORLD position — reflection sheen, sun lighting, shadow lookup, normal maps
-    void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); v_uv = a_uv; v_shade = a_shade; v_a = a_a; v_wpos = (u_model * vec4(a_pos, 1.0)).xyz; }
+    // The SAME position measured from `u_uv_org`, and the one every texture lookup, procedural
+    // field and screen-space DERIVATIVE must use. Subtracting the origin in the FRAGMENT shader
+    // — which is what this code used to do — cannot work: `v_wpos` arrives there already
+    // interpolated at survey coordinates in the thousands, where an f32 ULP is ~0.8 mm, so the
+    // value is quantised to 0.8 mm steps BEFORE the subtraction and those bits are simply gone.
+    // Rebasing here interpolates a number near zero instead, which carries ~1e-6 m. The
+    // subtraction itself is exact — the operands are within a factor of two of each other, so
+    // Sterbenz applies and no rounding occurs.
+    //
+    // It matters twice over. The texture coordinate quantises into visible bands, and — worse —
+    // dFdx/dFdy of a value whose steps are the size of a close-up pixel footprint is
+    // catastrophic cancellation, so the reconstructed normal jitters between neighbouring pixels
+    // and lights as black speckle that reshuffles whenever the camera moves.
+    uniform vec3 u_uv_org;
+    out vec3 v_qpos;
+    void main() {
+        gl_Position = u_mvp * vec4(a_pos, 1.0);
+        v_uv = a_uv; v_shade = a_shade; v_a = a_a;
+        v_wpos = (u_model * vec4(a_pos, 1.0)).xyz;
+        v_qpos = v_wpos - u_uv_org;
+    }
 "#;
 
 const TEX_FS: &str = r#"
@@ -601,6 +621,10 @@ const TEX_FS: &str = r#"
     in float v_shade;
     in float v_a;
     in vec3 v_wpos;
+    // World position REBASED to `u_uv_org` in the vertex shader — see TEX_VS. Everything that
+    // reads position at a fine scale (texture lookup, procedural field, and every dFdx/dFdy)
+    // must use this one; `v_wpos` is for lighting, which only needs metres.
+    in vec3 v_qpos;
     // 0 = direct + specular + emission · 1 = the diffuse AMBIENT term, the only thing AO darkens.
     layout(location=0) out vec4 frag;
     layout(location=1) out vec4 amb_out;
@@ -689,7 +713,7 @@ const TEX_FS: &str = r#"
     // planar projection leaves on every face that is not square to it.
     vec4 tri_or_uv(sampler2D s, vec2 uv, vec3 w) {
         if (u_triplanar == 0) return texture(s, uv);
-        vec3 q = v_wpos - u_uv_org;   // near the origin — see u_uv_org
+        vec3 q = v_qpos;              // already near the origin — see u_uv_org / TEX_VS
         return texture(s, q.yz * u_tpm) * w.x
              + texture(s, q.xz * u_tpm) * w.y
              + texture(s, q.xy * u_tpm) * w.z;
@@ -832,8 +856,11 @@ const TEX_FS: &str = r#"
         }
 
         // Geometric normal from screen-space derivatives (no per-vertex normal needed), faced to
-        // the viewer so two-sided surfaces light correctly.
-        vec3 Ng = normalize(cross(dFdx(v_wpos), dFdy(v_wpos)));
+        // the viewer so two-sided surfaces light correctly. Differentiate the REBASED position:
+        // `v_wpos` at survey coordinates is quantised to ~0.8 mm, which is the size of a close-up
+        // pixel footprint, so its derivative is mostly cancellation noise and the normal — hence
+        // the shading — flickers pixel to pixel.
+        vec3 Ng = normalize(cross(dFdx(v_qpos), dFdy(v_qpos)));
         vec3 V = normalize(u_cam - v_wpos);
         if (dot(Ng, V) < 0.0) Ng = -Ng;
         vec3 N = Ng;
@@ -848,13 +875,17 @@ const TEX_FS: &str = r#"
             twt = pow(abs(Ng), vec3(4.0));      // sharp blend: seams only in a narrow band
             twt /= max(twt.x + twt.y + twt.z, 1e-4);
             // One dominant-axis frame for anything needing a single consistent tangent basis.
-            vec3 q = v_wpos - u_uv_org;   // near the origin — see u_uv_org
+            vec3 q = v_qpos;              // already near the origin — see u_uv_org / TEX_VS
             uv = (twt.x >= twt.y && twt.x >= twt.z) ? q.yz * u_tpm
                : (twt.y >= twt.z)                   ? q.xz * u_tpm
                                                     : q.xy * u_tpm;
         }
 
-        float field = (u_proc > 0) ? proc_field(v_wpos) : 0.0;
+        // REBASED, like every other fine-scale read of position. A procedural field sampled at
+        // survey coordinates is evaluated on a ~0.8 mm lattice, and `proc_bump`'s central
+        // difference then steps by an epsilon of the same order — so the relief it returns is
+        // quantisation, not the pattern.
+        float field = (u_proc > 0) ? proc_field(v_qpos) : 0.0;
         vec4 t = (u_proc > 0) ? vec4(proc_color(field), 1.0) : tri_or_uv(u_img, uv, twt);
         // Clay: flat grey, keep t.a for glass. Image albedo arrives already linear — the sampler
         // decodes it, because albedo textures upload as SRGB8_ALPHA8 (data maps do not).
@@ -862,7 +893,7 @@ const TEX_FS: &str = r#"
 
         // Tangent-space normal map via a derivative cotangent frame (Schüler) — no stored tangents.
         if (u_has_nrm == 1) {
-            vec3 dp1 = dFdx(v_wpos), dp2 = dFdy(v_wpos);
+            vec3 dp1 = dFdx(v_qpos), dp2 = dFdy(v_qpos);
             vec2 duv1 = dFdx(uv), duv2 = dFdy(uv);
             vec3 dp2perp = cross(dp2, Ng), dp1perp = cross(Ng, dp1);
             vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
@@ -873,7 +904,7 @@ const TEX_FS: &str = r#"
             N = normalize(TBN * nm);
         }
         // …and the procedural's own relief, from the field that already coloured it.
-        N = proc_bump(N, v_wpos, field);
+        N = proc_bump(N, v_qpos, field);
 
         // ROUGHNESS, in priority order: a map, then the procedural's own lo→hi range, then the
         // material's scalar. The middle one is what makes a procedural stop looking like a picture:
@@ -5553,6 +5584,47 @@ mod taa_tests {
             "the scene copy already carries the ambient behind this surface — adding it twice would double it");
     }
 
+    /// Fine-scale position is read REBASED, and the rebase happens in the vertex shader.
+    ///
+    /// The first attempt at this subtracted `u_uv_org` in the FRAGMENT shader. That reads as a
+    /// fix and is not one: `v_wpos` arrives already interpolated, and on a survey plan at
+    /// X≈3500, Y≈−6850 an f32 ULP is 6850·2⁻²³ ≈ 0.8 mm, so the coordinate is quantised to a
+    /// 0.8 mm lattice BEFORE the subtraction. Moving a number that has already lost its low bits
+    /// does not bring them back. Rebasing per VERTEX interpolates a value near zero instead.
+    ///
+    /// Two separate symptoms, one cause, which is why fixing only the texture lookup left half
+    /// the problem on screen:
+    ///   · the texture coordinate steps in 0.8 mm bands — banding that crawls with the camera;
+    ///   · dFdx/dFdy of that same value is catastrophic cancellation, because 0.8 mm is the size
+    ///     of a close-up pixel footprint. The geometric normal, the normal-map TBN and the
+    ///     procedural bump are all built from those derivatives, so they jitter pixel to pixel
+    ///     and light as black speckle that reshuffles whenever the camera moves.
+    ///
+    /// `v_wpos` itself must stay: shadow lookup, sun, the camera vector, SSR and the transmission
+    /// re-projection all need true world metres, and all of them are coarse enough not to care.
+    #[test]
+    fn fine_scale_position_is_rebased_in_the_vertex_shader() {
+        assert!(TEX_VS.contains("v_qpos = v_wpos - u_uv_org;"),
+            "the rebase must happen per vertex, so what gets interpolated is already small");
+        assert!(TEX_VS.contains("uniform vec3 u_uv_org;"),
+            "…which means the vertex stage needs the uniform too");
+
+        let src = assemble_tex_fs();
+        assert!(!src.contains("v_wpos - u_uv_org"),
+            "rebasing in the fragment shader is the bug — the bits are gone before it runs");
+        for d in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
+            assert!(!src.contains(d),
+                "{d}: differentiating the un-rebased position is cancellation noise, not a normal");
+        }
+        for call in ["proc_field(v_qpos)", "proc_bump(N, v_qpos, field)",
+                     "cross(dFdx(v_qpos), dFdy(v_qpos))", "dFdx(v_qpos), dp2 = dFdy(v_qpos)"] {
+            assert!(src.contains(call), "{call} must read the rebased position");
+        }
+        // The lighting reads that legitimately want world metres are still world metres.
+        assert!(src.contains("normalize(u_cam - v_wpos)") && src.contains("shadow_lit(v_wpos)"),
+            "lighting is coarse and needs the true world position — do not rebase it");
+    }
+
     /// A MEDIUM's surface lying ON an opaque one is the container, and must not be drawn.
     ///
     /// Modelled water is a closed box in a pool liner — measured on the villa, five of its six
@@ -5576,7 +5648,7 @@ mod taa_tests {
         assert!(!block.contains("gl_FrontFacing"), "and it must not depend on winding");
         assert!(!block.contains("v_a"), "…nor on coverage");
         // Before any shading work — everything after it would be wasted on a discarded fragment.
-        let shade = src.find("vec3 Ng = normalize(cross(dFdx(v_wpos)").expect("the shading");
+        let shade = src.find("vec3 Ng = normalize(cross(dFdx(v_qpos)").expect("the shading");
         assert!(at < shade, "discard first");
     }
 
