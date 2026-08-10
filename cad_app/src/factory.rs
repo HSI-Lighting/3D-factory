@@ -2329,12 +2329,19 @@ impl ApertureKind {
     pub fn label(self) -> &'static str {
         match self { ApertureKind::Door => "Door", ApertureKind::Window => "Window" }
     }
-    /// Bundled default mesh, relative to the working dir. Both use the app's own OBJ/FBX readers.
+    /// The bundled mesh's name WITHIN `assets/` — a stable identifier, not a place to open.
     pub fn asset_path(self) -> &'static str {
         match self {
             ApertureKind::Door => "assets/apertures/door.fbx",
             ApertureKind::Window => "assets/apertures/window.obj",
         }
+    }
+
+    /// …and where it actually is on disk. Resolved against the EXECUTABLE, because a bare
+    /// relative path only finds anything when the app was launched from the repo root — see
+    /// [`crate::assets`]. Both use the app's own OBJ/FBX readers.
+    pub fn asset_file(self) -> std::path::PathBuf {
+        crate::assets::path(self.asset_path())
     }
 }
 

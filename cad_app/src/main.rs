@@ -9,6 +9,7 @@ mod env_map; // HDR image-based lighting — a real environment instead of the a
 mod env; // environment lighting — the analytic sky, its SH ambient, and the AO settings
 mod factory;   // 3D Factory — cad_solid wired into the app
 mod gpu;
+mod assets; // where bundled data lives at runtime — see the module docs
 mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
 mod light;
@@ -35,6 +36,13 @@ mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
+    // Say which build this is and what data it found, before anything else can go wrong. Both
+    // questions have cost real time here: a repair was twice run against a stale binary, and a
+    // bundled library that fails to resolve shows up as EMPTY MENUS rather than as an error, so
+    // a broken install looks like an app with no content. Two lines on stderr, once.
+    eprintln!("[simlux] build {}", option_env!("SIMLUX_BUILD").unwrap_or("unknown"));
+    eprintln!("{}", assets::report());
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])

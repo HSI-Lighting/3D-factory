@@ -21,3 +21,7 @@ Desktop.ini
 
 # SIMLUX sidecars written next to a drawing during local editing (per-drawing state).
 *.simlux.json
+
+# Build output of packaging/build-package.ps1 — a packaged copy of what is already
+# in the tree, so committing it would double every asset for no gain.
+/dist

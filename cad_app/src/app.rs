@@ -4488,7 +4488,7 @@ impl CadApp {
                 .on_hover_text("Apply an image file (PNG/JPG) to the selection — e.g. the bundled CC0 textures")
                 .clicked()
             {
-                let cc0 = std::path::Path::new("assets/cc0/textures");
+                let cc0 = crate::assets::path("assets/cc0/textures");
                 if cc0.is_dir() {
                     self.file_dialog_dir = Some(cc0.to_path_buf());
                 }
@@ -5262,7 +5262,7 @@ impl CadApp {
             .clicked()
         {
             // Default the picker to the bundled CC0 texture folder when it exists.
-            let cc0 = std::path::Path::new("assets/cc0/textures");
+            let cc0 = crate::assets::path("assets/cc0/textures");
             if cc0.is_dir() {
                 self.file_dialog_dir = Some(cc0.to_path_buf());
             }
@@ -5815,7 +5815,8 @@ impl CadApp {
             self.factory.aperture_asset[kind.idx()] = Some(idx);
             return Some(idx);
         }
-        let path = kind.asset_path();
+        let path = kind.asset_file();
+        let path = &path.to_string_lossy().into_owned();
         let mesh = match Self::factory_parse_mesh_file(path) {
             Some(m) => m,
             None => {
@@ -6247,8 +6248,14 @@ impl CadApp {
 
     /// The handle library folder. Ships beside the Blender assets; absent on a bare checkout, in
     /// which case the picker says so rather than pretending the library is empty.
+    /// The bundled handle library.
+    ///
+    /// This was an absolute path into a personal working folder on a G: drive, so the door-handle
+    /// picker was empty on every machine but one — and silently, because a missing library just
+    /// means "no handles to offer". The library now ships in `assets/handles` and resolves
+    /// relative to the executable like everything else.
     fn handle_lib_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(r"G:\blender dev\staircase\door handles_\assets\handles")
+        crate::assets::path("assets/handles")
     }
 
     /// Decode a handle's preview PNG into an egui texture, once. The tiles are 640 square with an
@@ -6438,7 +6445,8 @@ impl CadApp {
         use crate::factory::ApertureKind;
         // Only the window carries glass; the door mesh is opaque (and FBX alpha isn't parsed).
         let kind = ApertureKind::Window;
-        let path = kind.asset_path();
+        let path = kind.asset_file();
+        let path = &path.to_string_lossy().into_owned();
         if !path.to_ascii_lowercase().ends_with(".obj") {
             return;
         }
@@ -9505,7 +9513,7 @@ impl CadApp {
                             .clicked()
                         {
                             // Default the picker to the bundled CC0 furniture folder if present.
-                            let cc0 = std::path::Path::new("assets/cc0/furniture");
+                            let cc0 = crate::assets::path("assets/cc0/furniture");
                             if cc0.is_dir() {
                                 self.file_dialog_dir = Some(cc0.to_path_buf());
                             }
@@ -21976,7 +21984,7 @@ impl CadApp {
                     }
                 }
                 if ui.small_button("📂").on_hover_text("Load an image file (PNG/JPG) as a new material").clicked() {
-                    let cc0 = std::path::Path::new("assets/cc0/textures");
+                    let cc0 = crate::assets::path("assets/cc0/textures");
                     if cc0.is_dir() {
                         self.file_dialog_dir = Some(cc0.to_path_buf());
                     }
