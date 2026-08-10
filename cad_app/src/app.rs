@@ -2001,6 +2001,20 @@ pub struct CadApp {
     /// One-shot: on the first frame, auto-load the villa test model (opt-in — see the autoload
     /// site for why it is no longer on by default).
     villa_autoloaded: bool,
+    /// `SIMLUX_REPAIR=<drawing>` — open that file and run `repaircuts` + `diag` on it, once.
+    ///
+    /// 0 = not looked at · 1 = open issued, waiting · 2 = finished · 3 = not requested.
+    ///
+    /// This exists because the repair was run twice against a STALE BUILD without anyone
+    /// noticing. The older binary keyed the repair on a signature that none of the failing cuts
+    /// carried any more, so it correctly reported "no shallow cuts found" and did nothing — which
+    /// reads exactly like success. Running it from the same binary that was just built removes
+    /// that whole class of confusion.
+    ///
+    /// It deliberately does NOT save. Opening and repairing are recoverable; overwriting a 304 MB
+    /// project from a startup flag is not, and this project has already lost work to an automatic
+    /// write once.
+    startup_repair: u8,
     arch_tab: ArchTab,
     arch_stair: cad_solid::architecture::StairParams,
     arch_spiral: cad_solid::architecture::SpiralParams,
@@ -3694,6 +3708,7 @@ impl Default for CadApp {
             texset_target: None,
             scene_import_pending: false,
             villa_autoloaded: false,
+            startup_repair: 0,
             arch_tab: ArchTab::Staircase,
             arch_stair: cad_solid::architecture::StairParams::default(),
             arch_spiral: cad_solid::architecture::SpiralParams::default(),
@@ -8658,7 +8673,8 @@ impl CadApp {
         crate::dbg_recorder::DbgEvent::FactoryScene {
             reason:  reason.to_string(),
             summary: format!(
-                "features={} bodies={} cuts={} tris={} furniture={} textures={} dirty={}",
+                "build={}  features={} bodies={} cuts={} tris={} furniture={} textures={} dirty={}",
+                option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
                 f.model.features.len(), bodies, cuts.len(),
                 f.cached.positions.len() / 3, f.furniture.len(), f.textures.len(), f.dirty),
             sections,
@@ -35450,6 +35466,42 @@ impl eframe::App for CadApp {
                 // cannot drift apart in how they scale or place a scene.
                 self.import_scene_file(VILLA_SCENE);
             }
+        }
+
+        // ---- SIMLUX_REPAIR=<drawing> — open it and repair its openings, once ---------------------
+        // Same shape as the villa autoload above, and for a sharper reason: this repair was twice
+        // run against a stale binary, where it keyed on a signature the failing cuts no longer
+        // carried and so reported "no shallow cuts found" — indistinguishable from success. Driving
+        // it from the binary that was just built makes "which build is this?" unanswerable-wrong.
+        //
+        // It does not save. The result goes to the history panel AND to stderr, so it can be read
+        // from the console without touching the file.
+        match self.startup_repair {
+            0 => {
+                match std::env::var("SIMLUX_REPAIR") {
+                    Ok(p) if !p.is_empty() => {
+                        self.startup_repair = 1;
+                        eprintln!("[repair] opening {p}");
+                        self.do_open(&p);
+                    }
+                    _ => self.startup_repair = 3,
+                }
+            }
+            // The open runs on the busy worker over several frames; wait for it to land. A failed
+            // open clears `busy` too, and the report below then simply finds nothing to do.
+            1 if self.busy.is_none() => {
+                self.startup_repair = 2;
+                let before = self.factory.model.eval().tri_count();
+                self.run_command("repaircuts");
+                self.run_command("diag");
+                let after = self.factory.model.eval().tri_count();
+                for l in self.history.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                    eprintln!("[repair] {l}");
+                }
+                eprintln!("[repair] solid {before} → {after} triangles");
+                eprintln!("[repair] NOT saved — review it, then Ctrl+S if you are happy.");
+            }
+            _ => {}
         }
 
         // ---- Loading / saving overlay ----------------------------------------------
