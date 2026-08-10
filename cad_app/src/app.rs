@@ -7978,6 +7978,75 @@ impl CadApp {
         });
     }
 
+    /// Re-measure openings cut by the broken thickness probe, which stopped 100 mm into the
+    /// wall instead of going through. Returns `(repaired, left_alone)`.
+    ///
+    /// `assembly_span` used to treat the run from the probe to the FIRST surface as a gap — but
+    /// that run IS the wall — so any wall thicker than the 0.4 m gap measured zero and the
+    /// cutter fell back to the bare ±0.1 m margin. Those cuts are still sitting in saved
+    /// projects, because a file records the cut that was made, not the one that was meant.
+    ///
+    /// Each is re-probed with the FIXED span, from the same face point and along the same
+    /// normal the original cut used, and its depth rewritten. A cut whose wall still cannot be
+    /// measured is left exactly as it is rather than guessed at.
+    fn factory_repair_shallow_cuts(&mut self) -> (usize, usize) {
+        const MARGIN: f32 = 0.1;
+        // The broken signature, and nothing else: a THROUGH cut is never legitimately this
+        // shallow, and a RECESS is a deliberate blind pocket that must not be deepened.
+        let suspects: Vec<(usize, glam::Vec3, glam::Vec3)> = self
+            .factory
+            .model
+            .features
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.op == cad_solid::BoolOp::Difference)
+            .filter_map(|(i, f)| {
+                let h = match f.primitive {
+                    cad_solid::Primitive::Extrusion { h, .. } => h,
+                    cad_solid::Primitive::Box { h, .. } => h,
+                    _ => return None,
+                };
+                if h > 0.25 || (f.placement.lift + 0.1).abs() > 0.02 {
+                    return None;
+                }
+                // The face the sketch was drawn on: the cutter's own plane at the placement its
+                // profile centre gave it, with the lift taken back off.
+                let (u, v) = f.plane.axes();
+                let n = u.cross(v).normalize_or_zero();
+                let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
+                (n.length_squared() > 0.5).then_some((i, o, n))
+            })
+            .collect();
+
+        // Measure FIRST, mutate after — `assembly_span` borrows the model.
+        let mut plans: Vec<(usize, f32, f32)> = Vec::new();
+        let mut skipped = 0usize;
+        for (i, o, n) in suspects {
+            let inward = -n; // a face pick gives an OUTWARD normal, as when the cut was made
+            let in_depth = self.assembly_span(o, inward).0;
+            let out_depth = self.assembly_span(o, -inward).0;
+            if in_depth <= 0.05 {
+                skipped += 1; // still unmeasurable — leave it rather than invent a depth
+                continue;
+            }
+            let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 };
+            let zeta_in = s_in * (in_depth + MARGIN);
+            let zeta_out = -s_in * (out_depth + MARGIN);
+            let (lo, hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
+            plans.push((i, lo, hi - lo));
+        }
+        for (i, lift, h) in &plans {
+            let f = &mut self.factory.model.features[*i];
+            f.placement.lift = *lift;
+            match &mut f.primitive {
+                cad_solid::Primitive::Extrusion { h: fh, .. } => *fh = *h,
+                cad_solid::Primitive::Box { h: fh, .. } => *fh = *h,
+                _ => {}
+            }
+        }
+        (plans.len(), skipped)
+    }
+
     /// Delete solids that are an EXACT copy of an earlier one — same shape, same plane, same
     /// placement. Returns `(removed, left_alone)`.
     ///
@@ -13174,6 +13243,26 @@ impl CadApp {
                     .find(|l| l.contains("OVERLAPPING"))
                     .cloned()
                     .unwrap_or_else(|| "geometry report written to the history panel".into());
+            }
+            Ok(Command::RepairCuts) => {
+                self.snapshot_factory();
+                let (fixed, skipped) = self.factory_repair_shallow_cuts();
+                if fixed == 0 {
+                    self.undo_stack.pop();
+                    self.factory.status = if skipped > 0 {
+                        format!("{skipped} shallow cut(s) found, but the wall at each still \
+                                 cannot be measured — left untouched")
+                    } else {
+                        "no shallow cuts found — every opening goes through".into()
+                    };
+                } else {
+                    self.factory.recompute();
+                    self.factory.status = format!(
+                        "{fixed} opening(s) re-cut through the full wall — Ctrl+Z undoes it");
+                    self.history.push(format!(
+                        "  repaircuts: {fixed} opening(s) deepened{}",
+                        if skipped > 0 { format!(", {skipped} left unmeasurable") } else { String::new() }));
+                }
             }
             Ok(Command::Dedupe) => {
                 self.snapshot_factory();
@@ -45432,6 +45521,21 @@ mod factory_sketch_tests {
                 would_drop.push(x.id);
             }
         }
+        // How DEEP is each cut? A through-cut whose extent along its normal is only ~0.2 m is
+        // one made by the broken thickness probe: it opened the near face and stopped.
+        println!("CUT DEPTHS (Difference features):");
+        let mut shallow = 0;
+        for x in feats.iter().filter(|x| x.op == cad_solid::BoolOp::Difference) {
+            let h = match x.primitive {
+                cad_solid::Primitive::Extrusion { h, .. } => h,
+                cad_solid::Primitive::Box { h, .. } => h,
+                _ => f32::NAN,
+            };
+            if h.is_finite() && h <= 0.25 { shallow += 1; }
+            println!("   cut #{} h={:.3} m  lift={:.3}", x.id, h, x.placement.lift);
+        }
+        let n_diff = feats.iter().filter(|x| x.op == cad_solid::BoolOp::Difference).count();
+        println!("   → {shallow} of {n_diff} cuts are 0.25 m or shallower");
         println!("DEDUPE would delete {would_drop:?}");
         println!("DEDUPE would SKIP (carry cuts) {blocked:?}");
 
@@ -45462,6 +45566,48 @@ mod factory_sketch_tests {
                 }
             }
         }
+    }
+
+    /// `repaircuts` must deepen a cut left shallow by the broken probe, and must NOT touch a
+    /// recess — a blind pocket is deliberate, and deepening one would punch a hole through the
+    /// piece it was sunk into.
+    #[test]
+    fn repaircuts_deepens_a_stopped_cut_but_leaves_a_recess() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // A 0.6 m wall — thicker than the old 0.4 m gap, so the old probe measured zero.
+        app.factory.model.push(
+            cad_solid::BoolOp::Union, cad_solid::Plane::default(), cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.6, h: 3.0 },
+        );
+        // A cutter with the broken signature: h = 0.2, lift = −0.1, on the −Y face.
+        let face = cad_solid::Plane::from_basis(
+            glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z);
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        // …and a genuine RECESS: a deliberate blind pocket, deeper than the broken signature.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference, face,
+            cad_solid::Placement { u: 2.0, v: 0.0, lift: -0.05, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 0.4, d: 0.4, h: 0.05 },
+        );
+        app.factory.recompute();
+
+        let (fixed, _skipped) = app.factory_repair_shallow_cuts();
+        assert_eq!(fixed, 1, "only the stopped through-cut is repaired");
+
+        let depth = |i: usize| match app.factory.model.features[i].primitive {
+            cad_solid::Primitive::Box { h, .. } => h,
+            _ => f32::NAN,
+        };
+        assert!(depth(1) > 0.6, "the through-cut now spans the wall, got {}", depth(1));
+        assert!(
+            (depth(2) - 0.05).abs() < 1e-6,
+            "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
+        );
     }
 
     /// Autosave must be OFF at every start. It is the only thing in the app that writes over a

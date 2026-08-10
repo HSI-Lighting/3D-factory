@@ -173,6 +173,9 @@ pub enum Command {
     /// ALREADY built, for a project made before its unit was known. Off by default —
     /// declaring a unit must never move geometry on its own.
     Units(Option<f64>, bool),
+    /// REPAIRCUTS — re-measure openings that were cut by the broken thickness probe and never
+    /// reached the far face. Undoable.
+    RepairCuts,
     /// DEDUPE — delete solids that are an exact copy of another (same shape, same plane, same
     /// placement). Two solids in one place have no depth bias to separate them, so they flicker
     /// as the camera moves. Undoable.
@@ -273,6 +276,7 @@ impl Command {
             Command::Units(..)          => "Units",
             Command::Diag               => "Diag",
             Command::Dedupe             => "Dedupe",
+            Command::RepairCuts         => "RepairCuts",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
@@ -483,6 +487,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         }
         "diag" | "diagnose" => Ok(Command::Diag),
         "dedupe" | "dedup" => Ok(Command::Dedupe),
+        "repaircuts" | "repaircut" | "fixcuts" => Ok(Command::RepairCuts),
         "units" | "unit" | "insunits" => {
             // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as
             // metres-per-unit for anything non-standard (`units 0.001` == `units mm`).
