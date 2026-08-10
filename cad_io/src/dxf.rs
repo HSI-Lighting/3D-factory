@@ -1176,3 +1176,18 @@ mod tests {
         assert_eq!(back.dobjects[0].style.layer, id);
     }
 }
+
+#[cfg(test)]
+mod probe_real {
+    #[test]
+    #[ignore = "needs DXF_PROBE=<path>"]
+    fn read_a_real_dxf() {
+        let Ok(p) = std::env::var("DXF_PROBE") else { return };
+        let text = std::fs::read_to_string(&p).expect("read");
+        println!("file bytes = {}", text.len());
+        match super::read_dxf(&text) {
+            Ok(d) => println!("OK dobjects={} layers={} units={:?}", d.dobjects.len(), d.layers.len(), d.units),
+            Err(e) => println!("ERR {e}"),
+        }
+    }
+}

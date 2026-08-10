@@ -24737,6 +24737,17 @@ impl CadApp {
         self.stage_evt("parse doc", n, std::time::Duration::from_millis(parse_ms), "worker");
         // Install the parsed doc + invalidate caches.
         self.doc = doc;
+        // DROP THE HISTORY. It belongs to the document being replaced, and every entry in it is
+        // a full snapshot of a DIFFERENT drawing — including the empty one the app starts with.
+        // Left in place, Ctrl+Z after opening a file walks backwards out of that file and into
+        // the previous document; the app then holds a pristine default while `current_file`
+        // still points at the real project, and the next save — or the 3-minute autosave, which
+        // needs no user action at all — writes that emptiness over it.
+        //
+        // This destroyed a user's project: a 213 KB drawing and a 304 MB model replaced by a
+        // default document with zero entities and `features: []`.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         self.selection.clear();
         self.selection_prev.clear();
         self.selected = None;
@@ -45436,6 +45447,44 @@ mod factory_sketch_tests {
                 }
             }
         }
+    }
+
+    /// DATA LOSS REGRESSION. Opening a file must drop the undo history, because every entry in
+    /// it snapshots a DIFFERENT document — including the empty one the app starts with. Left in
+    /// place, Ctrl+Z after an open walks out of the opened file into the previous document,
+    /// while `current_file` still points at the real project; the next save (or the unattended
+    /// 3-minute autosave) then writes that emptiness over it.
+    #[test]
+    fn opening_a_file_drops_the_undo_history() {
+        let mut app = CadApp::default();
+        // Some history against the STARTING document.
+        for _ in 0..3 {
+            app.snapshot_doc();
+            app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(0.0, 0.0), b: Vec2::new(1.0, 0.0),
+            })));
+        }
+        assert!(!app.undo_stack.is_empty(), "there is history to carry over");
+
+        // Now "open" a different drawing through the real install path.
+        let mut opened = cad_kernel::Document::default();
+        for k in 0..5 {
+            opened.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(k as f64, 0.0), b: Vec2::new(k as f64, 5.0),
+            })));
+        }
+        let payload = Box::new(LoadPayload {
+            doc: opened, sidecar: None, furniture: Vec::new(),
+            read_ms: 0, parse_ms: 0, sidecar_ms: 0, furn_ms: 0,
+        });
+        app.apply_loaded("C:/tmp/opened.rsm", payload);
+
+        assert_eq!(app.doc.dobjects.len(), 5, "the opened drawing is installed");
+        assert!(
+            app.undo_stack.is_empty() && app.redo_stack.is_empty(),
+            "history from the PREVIOUS document must not survive the open — undoing into it \
+             leaves an empty app pointed at the opened file, and autosave then overwrites it",
+        );
     }
 
     /// THE RENDER LOOP'S INPUTS MUST BE ORDER-STABLE, or temporal accumulation never converges.
