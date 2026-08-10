@@ -1512,18 +1512,45 @@ const SKY_FS: &str = r#"
 //
 // World space rather than view space on purpose: the radius is then a length in metres that means
 // the same thing at any zoom, which is what lets it be a user setting instead of a magic number.
+/// A view-projection with the camera translation factored OUT, plus its inverse.
+///
+/// Every full-screen pass that recovers a position from the depth buffer gets these instead of
+/// the world matrices. A world reconstruction on a plan sited at survey coordinates lands near
+/// 6852 m, where an f32 ULP is 0.8 mm; a screen-space derivative of that is cancellation noise,
+/// and passes like SSAO build their surface NORMAL from exactly that derivative. Reconstructing
+/// relative to the camera keeps every value at scene scale — metres — where f32 has bits to
+/// spare, and it costs nothing: a screen-space pass never needed absolute coordinates.
+///
+/// `vp · T(cam)` cancels the translation ANALYTICALLY (`vp = P·V` and `V = R·T(−cam)`, so the
+/// product is `P·R`), and both matrices come out translation-free. The multiply and the inverse
+/// run in f64 deliberately: doing that cancellation in f32 would leave a ~0.8 mm residue in the
+/// translation column and hand back the very error this exists to remove.
+fn camera_relative_vp(vp: &[f32; 16], cam: [f32; 3]) -> ([f32; 16], [f32; 16]) {
+    let vp64 = glam::DMat4::from_cols_array(&std::array::from_fn(|i| vp[i] as f64));
+    let rel = vp64 * glam::DMat4::from_translation(
+        glam::DVec3::new(cam[0] as f64, cam[1] as f64, cam[2] as f64));
+    (rel.as_mat4().to_cols_array(), rel.inverse().as_mat4().to_cols_array())
+}
+
 const SSAO_FS: &str = r#"
     #version 330 core
     in vec2 v_uv;
     out vec4 frag;
     uniform sampler2D u_depth;
+    // CAMERA-RELATIVE view-projection and its inverse — see `camera_relative_vp`. Everything in
+    // this pass is measured from the camera, which is therefore the origin and needs no uniform.
+    // Reconstructing WORLD positions here was a real bug: on a plan at survey coordinates they
+    // land near 6852 m, an f32 ULP is 0.8 mm, and `N` below is a screen-space DERIVATIVE of that
+    // — so the normal was largely cancellation noise, the sample hemisphere pointed anywhere, and
+    // occlusion came out as blotchy speckle that crawled with the camera.
     uniform mat4 u_vp;
     uniform mat4 u_inv_vp;
-    uniform vec3 u_cam;
     uniform float u_radius;
     uniform float u_strength;
 
-    vec3 world_at(vec2 uv) {
+    // Position RELATIVE TO THE CAMERA. Occlusion is a purely local comparison, so absolute
+    // coordinates were never needed — only their difference, which is what this returns directly.
+    vec3 rel_at(vec2 uv) {
         float d = texture(u_depth, uv).r;
         vec4 p = u_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
         return p.xyz / p.w;
@@ -1532,11 +1559,11 @@ const SSAO_FS: &str = r#"
     void main() {
         float d0 = texture(u_depth, v_uv).r;
         if (d0 >= 0.99999) { frag = vec4(1.0); return; }   // background — nothing to occlude
-        vec3 P = world_at(v_uv);
+        vec3 P = rel_at(v_uv);
         // The normal comes from the depth buffer's own screen-space derivatives, so no normal
         // target is needed. It is faceted at silhouettes; the blur that follows hides that.
         vec3 N = normalize(cross(dFdx(P), dFdy(P)));
-        if (dot(N, u_cam - P) < 0.0) N = -N;
+        if (dot(N, -P) < 0.0) N = -N;   // …towards the camera, which sits at the origin here
         vec3 up = abs(N.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
         vec3 T = normalize(cross(N, up));
         vec3 B = cross(N, T);
@@ -1556,8 +1583,8 @@ const SSAO_FS: &str = r#"
             if (cp.w <= 0.0) continue;
             vec2 su = cp.xy / cp.w * 0.5 + 0.5;
             if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) continue;
-            float sample_d = length(sp - u_cam);
-            float scene_d = length(world_at(su) - u_cam);
+            float sample_d = length(sp);           // already measured from the camera
+            float scene_d = length(rel_at(su));
             float bias = 0.02 + 0.01 * sample_d;   // scales with distance: no acne when dollied out
             if (scene_d < sample_d - bias) {
                 // Range check — a wall forty metres behind a table must not shadow it.
@@ -1595,15 +1622,17 @@ const SSGI_FS: &str = r#"
     uniform sampler2D u_alb;    // attachment 2 — diffuse albedo
     uniform sampler2D u_ao;
     uniform int   u_ao_on;
+    // CAMERA-RELATIVE, like SSAO — see `camera_relative_vp`. Every position here is used only in
+    // differences (`to = Q - P`, distances, normals), so absolute coordinates bought nothing and
+    // cost the precision the normals are built from.
     uniform mat4  u_vp;
     uniform mat4  u_inv_vp;
-    uniform vec3  u_cam;
     uniform float u_radius;
     uniform float u_strength;
     uniform vec2  u_texel;
     uniform int   u_frame;
 
-    vec3 world_at(vec2 uv) {
+    vec3 rel_at(vec2 uv) {
         float d = texture(u_depth, uv).r;
         vec4 p = u_inv_vp * vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
         return p.xyz / p.w;
@@ -1619,8 +1648,8 @@ const SSGI_FS: &str = r#"
     // The emitter's normal, by finite difference on the depth buffer. `dFdx` cannot be used for
     // this: the point is fetched from a texture, so its derivative across the quad is meaningless.
     vec3 normal_at(vec2 uv, vec3 c) {
-        vec3 dx = world_at(uv + vec2(u_texel.x, 0.0)) - c;
-        vec3 dy = world_at(uv + vec2(0.0, u_texel.y)) - c;
+        vec3 dx = rel_at(uv + vec2(u_texel.x, 0.0)) - c;
+        vec3 dy = rel_at(uv + vec2(0.0, u_texel.y)) - c;
         return normalize(cross(dx, dy));
     }
 
@@ -1631,9 +1660,9 @@ const SSGI_FS: &str = r#"
         // Nothing to bounce with: background, glass, or a UI swatch. All three write zero albedo.
         if (alb.r + alb.g + alb.b <= 0.0) { frag = vec4(0.0); return; }
 
-        vec3 P = world_at(v_uv);
+        vec3 P = rel_at(v_uv);
         vec3 N = normalize(cross(dFdx(P), dFdy(P)));
-        if (dot(N, u_cam - P) < 0.0) N = -N;
+        if (dot(N, -P) < 0.0) N = -N;   // …towards the camera, at the origin here
         vec3 up = abs(N.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
         vec3 T = normalize(cross(N, up));
         vec3 B = cross(N, T);
@@ -1654,7 +1683,7 @@ const SSGI_FS: &str = r#"
             vec2 su = cp.xy / cp.w * 0.5 + 0.5;
             if (su.x < 0.0 || su.x > 1.0 || su.y < 0.0 || su.y > 1.0) continue;
             if (texture(u_depth, su).r >= 0.99999) continue;   // sky is not a bounce card
-            vec3 Q = world_at(su);
+            vec3 Q = rel_at(su);
             vec3 to = Q - P;
             float dist = length(to);
             if (dist < 1e-3 || dist > u_radius) continue;
@@ -2267,7 +2296,7 @@ pub struct Scene3dRenderer {
     u_ssao_depth: Option<glow::UniformLocation>,
     u_ssao_vp: Option<glow::UniformLocation>,
     u_ssao_inv_vp: Option<glow::UniformLocation>,
-    u_ssao_cam: Option<glow::UniformLocation>,
+
     u_ssao_radius: Option<glow::UniformLocation>,
     u_ssao_strength: Option<glow::UniformLocation>,
     blur_prog: Option<glow::Program>,
@@ -2468,7 +2497,7 @@ impl Default for Scene3dRenderer {
             u_ssao_depth: None,
             u_ssao_vp: None,
             u_ssao_inv_vp: None,
-            u_ssao_cam: None,
+
             u_ssao_radius: None,
             u_ssao_strength: None,
             blur_prog: None,
@@ -3326,7 +3355,7 @@ impl Scene3dRenderer {
                 self.u_ssao_depth = gl.get_uniform_location(p, "u_depth");
                 self.u_ssao_vp = gl.get_uniform_location(p, "u_vp");
                 self.u_ssao_inv_vp = gl.get_uniform_location(p, "u_inv_vp");
-                self.u_ssao_cam = gl.get_uniform_location(p, "u_cam");
+
                 self.u_ssao_radius = gl.get_uniform_location(p, "u_radius");
                 self.u_ssao_strength = gl.get_uniform_location(p, "u_strength");
                 self.ssao_prog = Some(p);
@@ -3489,7 +3518,7 @@ impl Scene3dRenderer {
         let (Some(prog), Some(blur), Some(depth)) = (self.ssao_prog, self.blur_prog, self.depth) else { return false };
         let (Some(f0), Some(f1), Some(t0)) = (self.ao_fbo[0], self.ao_fbo[1], self.ao_tex[0]) else { return false };
         let (Some(vao), Some(vbo)) = (self.blit_vao, self.blit_vbo) else { return false };
-        let inv = Mat4::from_cols_array(mvp).inverse().to_cols_array();
+        let (rel_vp, rel_inv) = camera_relative_vp(mvp, cam);
 
         // A full-NDC quad; the same buffer the composite uses, re-uploaded.
         const FULL: [f32; 24] = [
@@ -3507,9 +3536,10 @@ impl Scene3dRenderer {
         gl.active_texture(glow::TEXTURE0);
         gl.bind_texture(glow::TEXTURE_2D, Some(depth));
         if let Some(l) = &self.u_ssao_depth { gl.uniform_1_i32(Some(l), 0); }
-        if let Some(l) = &self.u_ssao_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, mvp); }
-        if let Some(l) = &self.u_ssao_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &inv); }
-        if let Some(l) = &self.u_ssao_cam { gl.uniform_3_f32(Some(l), cam[0], cam[1], cam[2]); }
+        // CAMERA-RELATIVE, not world — see `camera_relative_vp`. The camera is the origin in this
+        // pass, so there is no `u_cam` to send.
+        if let Some(l) = &self.u_ssao_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_vp); }
+        if let Some(l) = &self.u_ssao_inv_vp { gl.uniform_matrix_4_f32_slice(Some(l), false, &rel_inv); }
         if let Some(l) = &self.u_ssao_radius { gl.uniform_1_f32(Some(l), ao.radius.max(0.01)); }
         if let Some(l) = &self.u_ssao_strength { gl.uniform_1_f32(Some(l), ao.strength.clamp(0.0, 2.0)); }
         gl.bind_vertex_array(Some(vao));
@@ -3648,7 +3678,9 @@ impl Scene3dRenderer {
     /// texture nothing ever wrote.
     unsafe fn run_ssgi(
         &mut self, gl: &glow::Context, gi: &crate::env::GiSettings, ao_ready: bool,
-        mvp: &[f32; 16], inv_vp: &[f32; 16], cam: [f32; 3], w: i32, h: i32,
+        // No `inv_vp`: this pass derives its own CAMERA-RELATIVE pair from `mvp` + `cam`, because
+        // the world one the caller holds is exactly what made the gather's normals noise.
+        mvp: &[f32; 16], cam: [f32; 3], w: i32, h: i32,
     ) -> bool {
         if !gi.enabled || gi.strength <= 0.0 {
             return false;
@@ -3734,14 +3766,15 @@ impl Scene3dRenderer {
                 gl.uniform_1_i32(Some(&l), v);
             }
         }
+        // CAMERA-RELATIVE — see `camera_relative_vp`. Computed here rather than taking the
+        // caller's `inv_vp`, which is the WORLD one and is still what the fog wants (fog needs a
+        // distance from the camera, not a normal, and is unaffected by the precision this fixes).
+        let (rel_vp, rel_inv) = camera_relative_vp(mvp, cam);
         if let Some(l) = gl.get_uniform_location(prog, "u_vp") {
-            gl.uniform_matrix_4_f32_slice(Some(&l), false, mvp);
+            gl.uniform_matrix_4_f32_slice(Some(&l), false, &rel_vp);
         }
         if let Some(l) = gl.get_uniform_location(prog, "u_inv_vp") {
-            gl.uniform_matrix_4_f32_slice(Some(&l), false, inv_vp);
-        }
-        if let Some(l) = gl.get_uniform_location(prog, "u_cam") {
-            gl.uniform_3_f32(Some(&l), cam[0], cam[1], cam[2]);
+            gl.uniform_matrix_4_f32_slice(Some(&l), false, &rel_inv);
         }
         if let Some(l) = gl.get_uniform_location(prog, "u_radius") {
             gl.uniform_1_f32(Some(&l), gi.radius.max(0.05));
@@ -4852,7 +4885,7 @@ impl Scene3dRenderer {
             // Before the accumulation resolve, so its noise is averaged away by the same sixteen
             // samples that anti-alias the image — a gather this sparse needs that.
             let ssgi_ready =
-                self.run_ssgi(gl, &env.gi, ao_ready, mvp, &inv_vp, cam_pos, vp_w, vp_h);
+                self.run_ssgi(gl, &env.gi, ao_ready, mvp, cam_pos, vp_w, vp_h);
             let accumulated = if taa_on {
                 let t = self.taa_resolve(
                     gl, vp_w, vp_h, ao_ready, bloom_ready, ssgi_ready, color, &env.fog, cam_pos,
@@ -5548,6 +5581,103 @@ mod taa_tests {
             off.is_some(),
             "the shadow map is cleared and drawn while egui's window-space scissor is still active"
         );
+    }
+
+    /// NO screen-space pass may build a normal by differentiating a WORLD position.
+    ///
+    /// This bug was found and fixed three separate times in three shaders — the textured pass, the
+    /// glass pass, and then SSAO and SSGI — because each one had written it independently. The
+    /// shape is always the same: recover a position at survey coordinates (~6852 m here, where an
+    /// f32 ULP is 0.8 mm, the size of a close-up pixel footprint), then take `dFdx`/`dFdy` of it.
+    /// The derivative is then mostly cancellation noise, and every one of these shaders feeds that
+    /// noise into a normal.
+    ///
+    /// Two legitimate ways out, and this test accepts only those. A pass with vertices interpolates
+    /// a REBASED position from them (`v_qpos`). A full-screen pass reconstructs CAMERA-RELATIVE
+    /// (`rel_at`), which needs no absolute coordinates at all because occlusion and bounce are
+    /// local comparisons.
+    ///
+    /// A fourth site would be a real regression, not a style question, so it is worth a test that
+    /// no new shader can quietly sidestep.
+    #[test]
+    fn no_screen_space_pass_differentiates_a_world_position() {
+        for (name, src) in [
+            ("ssao", SSAO_FS.to_string()),
+            ("ssgi", SSGI_FS.to_string()),
+            ("transparent", assemble_transp_fs()),
+            ("textured", assemble_tex_fs()),
+        ] {
+            assert!(!src.contains("world_at("),
+                "{name}: a world-space depth reconstruction is the bug — reconstruct relative to \
+                 the camera (`rel_at`) instead");
+            for bad in ["dFdx(v_wpos)", "dFdy(v_wpos)"] {
+                assert!(!src.contains(bad),
+                    "{name}: {bad} differentiates an un-rebased position, which is cancellation noise");
+            }
+        }
+        // The glass pass keeps `P` for the WORLD position it needs for the refraction ray, so
+        // there the name itself is the tell — its normal must come from `Q`.
+        let transp = assemble_transp_fs();
+        for bad in ["dFdx(P)", "dFdy(P)"] {
+            assert!(!transp.contains(bad),
+                "transparent: {bad} — the pane's normal must come from the rebased Q, not world P");
+        }
+        // …and the two passes that DO build a normal this way must be doing it the accepted way.
+        assert!(SSAO_FS.contains("vec3 P = rel_at(v_uv);") && SSAO_FS.contains("cross(dFdx(P), dFdy(P))"),
+            "SSAO's normal must come from a camera-relative reconstruction");
+        assert!(SSGI_FS.contains("vec3 P = rel_at(v_uv);"),
+            "SSGI's gather must work camera-relative too");
+    }
+
+    /// Factoring the camera translation out must happen in f64, and must actually remove it.
+    ///
+    /// Doing `vp · T(cam)` in f32 would leave a residue of about one ULP at the camera's distance
+    /// — ~0.8 mm on this project — in the translation column, which is precisely the error the
+    /// whole exercise exists to delete. The cancellation is exact in f64.
+    #[test]
+    fn the_camera_translation_factors_out_exactly() {
+        // A camera 6852 m from the origin, looking down at the model — the real project's siting.
+        let eye = glam::Vec3::new(3516.0, -6846.0, 12.0);
+        let view = glam::Mat4::look_at_rh(eye, glam::Vec3::new(3516.0, -6838.0, 1.4), glam::Vec3::Z);
+        let proj = glam::Mat4::perspective_rh_gl(0.9, 1.5, 0.1, 500.0);
+        let vp = (proj * view).to_cols_array();
+        let (rel_vp, rel_inv) = camera_relative_vp(&vp, eye.to_array());
+
+        let world = glam::Vec3::new(3516.0, -6840.0, 3.0);   // ~11 m in front of the camera
+        let want = world - eye;
+        let clip = glam::Mat4::from_cols_array(&vp) * world.extend(1.0);
+
+        // FORWARD: projecting the camera-relative position lands in the same clip position the
+        // world matrix gives the world one. That is what "the translation is factored out" means.
+        //
+        // The tolerance is relative and loose on purpose. `vp` ARRIVES as f32 built at 6852 m, so
+        // it already carries ~one ULP there (~0.8 mm) before this function sees it, and no amount
+        // of f64 downstream can recover what was never in the input. That residue is harmless
+        // because it is a CONSTANT offset shared by every fragment — the fault being fixed is the
+        // per-pixel one, where neighbouring fragments disagree and the derivative between them is
+        // noise. Working relative is what makes those neighbours consistent.
+        let clip_rel = glam::Mat4::from_cols_array(&rel_vp) * want.extend(1.0);
+        assert!((clip_rel - clip).truncate().length() / clip.w.abs() < 1e-4,
+            "rel_vp does not agree with vp: {clip_rel:?} vs {clip:?}");
+
+        // BACKWARD: the reconstruction hands back an 11 m relative position, not a 6852 m absolute
+        // one. That is the whole point — every value downstream stays at scene scale.
+        //
+        // The tolerance is 10 mm, and the residual is worth naming because it is NOT this
+        // function's doing: a depth round-trip amplifies error by dz/d(ndc_z) ≈ z²/2·near, which
+        // at 11 m with a 0.1 m near plane is ~580 m per unit of NDC. Feed it clip coordinates
+        // that are merely f32-exact and ~7 mm comes back out. It is harmless here for the reason
+        // the whole exercise is about: that error is a SMOOTH function of depth, so neighbouring
+        // fragments agree and the derivative between them is clean. The world-space version was
+        // not smooth — it was a 0.8 mm lattice that neighbouring fragments landed on differently.
+        // For reference the actual depth-buffer quantum at this range is z²/(near·2²⁴) ≈ 0.07 mm,
+        // an order below the 0.8 mm the world reconstruction threw away before it even started.
+        let ndc = clip.truncate() / clip.w;
+        let back = glam::Mat4::from_cols_array(&rel_inv) * ndc.extend(1.0);
+        let rel = back.truncate() / back.w;
+        assert!((rel - want).length() < 1e-2,
+            "expected the camera-relative {want:?}, got {rel:?}");
+        assert!(rel.length() < 20.0, "…which must be at SCENE scale, not survey scale");
     }
 
     /// A refracting pane builds its normal from an INTERPOLATED rebased position, never from a
@@ -6327,7 +6457,7 @@ mod tests {
     #[test]
     fn shader_helpers_are_defined_before_use() {
         for (name, src) in assembled() {
-            for func in ["srgb_to_lin", "shadow_lit", "apply_view", "d_ggx", "v_smith", "f_schlick", "sh_ambient", "sky_radiance", "env_sample", "world_at", "ssr_world", "ssr_trace"] {
+            for func in ["srgb_to_lin", "shadow_lit", "apply_view", "d_ggx", "v_smith", "f_schlick", "sh_ambient", "sky_radiance", "env_sample", "rel_at", "ssr_world", "ssr_trace"] {
                 let def = src.find(&format!("{func}(")).filter(|_| src.contains(&format!(" {func}(")));
                 // Every return type the helpers actually use — `vec3`/`float` alone missed
                 // `ssr_trace`, which returns a vec4 (rgb + confidence) and so read as undefined.
@@ -6385,9 +6515,13 @@ mod tests {
         for u in ["u_inv_vp", "u_cam"].into_iter().chain(sky_names) {
             assert!(sky.contains(u), "sky shader has no `{u}`");
         }
-        for u in ["u_depth", "u_vp", "u_inv_vp", "u_cam", "u_radius", "u_strength"] {
+        // No `u_cam`: SSAO works CAMERA-RELATIVE, so the camera is the origin. See
+        // `camera_relative_vp` — a world reconstruction here quantises at survey coordinates and
+        // the normal is a derivative of it.
+        for u in ["u_depth", "u_vp", "u_inv_vp", "u_radius", "u_strength"] {
             assert!(SSAO_FS.contains(u), "ssao shader has no `{u}`");
         }
+        assert!(!SSAO_FS.contains("u_cam"), "SSAO must not reintroduce an absolute camera position");
         assert!(BLUR_FS.contains("u_ao"), "blur shader has no `u_ao`");
     }
 

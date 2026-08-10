@@ -7986,14 +7986,34 @@ impl CadApp {
     /// cutter fell back to the bare ±0.1 m margin. Those cuts are still sitting in saved
     /// projects, because a file records the cut that was made, not the one that was meant.
     ///
-    /// Each is re-probed with the FIXED span, from the same face point and along the same
-    /// normal the original cut used, and its depth rewritten. A cut whose wall still cannot be
-    /// measured is left exactly as it is rather than guessed at.
-    fn factory_repair_shallow_cuts(&mut self) -> (usize, usize) {
+    /// Each is re-probed with the FIXED span and its depth rewritten. A cut whose wall still
+    /// cannot be found is left exactly as it is rather than guessed at.
+    ///
+    /// The probe does NOT trust the face point reconstructed from the sketch plane. Measured on
+    /// the real project, that point lands up to 0.64 m clear of the wall — outside the building,
+    /// in mid-air — so the 0.4 m gap rule broke the walk on the very first crossing and every one
+    /// of the ten openings reported "unmeasurable". `plane.origin() + u·place.u + v·place.v` is
+    /// evidently not where the sketch was drawn, and the original pick point is not stored, so it
+    /// cannot be recovered. Four cuts sharing one identical reconstructed point gave that away.
+    ///
+    /// So the wall is FOUND instead of assumed: cast along the cutter's normal in both directions,
+    /// take the nearest surface within [`SEARCH`], and measure the assembly from there — which is
+    /// the situation `assembly_span` was built for, a probe sitting ON a face. Self-correcting,
+    /// and it does not depend on how a placement happens to be encoded.
+    ///
+    /// Returns `(repaired, notes)` — one note per opening left alone, saying how far the nearest
+    /// wall actually was. Four of the ten on the real project sit 2.14 m from anything, which is
+    /// too far to attribute to a wall with any confidence: at that range the nearest surface is
+    /// as likely to be across the room, and deepening into it would punch a hole through the
+    /// wrong piece of the building. Naming them is more use than guessing at them.
+    fn factory_repair_shallow_cuts(&mut self) -> (usize, Vec<String>) {
         const MARGIN: f32 = 0.1;
+        /// How far to look for the wall this opening belongs to. Comfortably past the 0.64 m seen
+        /// in practice, and well short of the room's width so it cannot grab the wall opposite.
+        const SEARCH: f32 = 1.5;
         // The broken signature, and nothing else: a THROUGH cut is never legitimately this
         // shallow, and a RECESS is a deliberate blind pocket that must not be deepened.
-        let suspects: Vec<(usize, glam::Vec3, glam::Vec3)> = self
+        let suspects: Vec<(usize, u32, glam::Vec3, glam::Vec3)> = self
             .factory
             .model
             .features
@@ -8009,30 +8029,65 @@ impl CadApp {
                 if h > 0.25 || (f.placement.lift + 0.1).abs() > 0.02 {
                     return None;
                 }
-                // The face the sketch was drawn on: the cutter's own plane at the placement its
-                // profile centre gave it, with the lift taken back off.
+                // A STARTING GUESS at where the sketch was, and nothing more — measured on the
+                // real project this lands up to 0.64 m off the wall, and four separate cuts
+                // reduce to one identical point. The wall is found by search below.
                 let (u, v) = f.plane.axes();
                 let n = u.cross(v).normalize_or_zero();
                 let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
-                (n.length_squared() > 0.5).then_some((i, o, n))
+                (n.length_squared() > 0.5).then_some((i, f.id, o, n))
             })
             .collect();
 
         // Measure FIRST, mutate after — `assembly_span` borrows the model.
         let mut plans: Vec<(usize, f32, f32)> = Vec::new();
-        let mut skipped = 0usize;
-        for (i, o, n) in suspects {
-            let inward = -n; // a face pick gives an OUTWARD normal, as when the cut was made
-            let in_depth = self.assembly_span(o, inward).0;
-            let out_depth = self.assembly_span(o, -inward).0;
-            if in_depth <= 0.05 {
-                skipped += 1; // still unmeasurable — leave it rather than invent a depth
+        let mut notes: Vec<String> = Vec::new();
+        for (i, id, o, n) in suspects {
+            // FIND the wall. Whichever side it is on, the nearest surface within SEARCH is the
+            // one this opening belongs to; `sgn` records which way that was along the normal.
+            // A crossing the ray LEAVES through means the probe already stands in the wall, so
+            // there is nothing to travel: the face is here, at zero.
+            let toward = [(-1.0_f32, -n), (1.0_f32, n)]
+                .into_iter()
+                .filter_map(|(sgn, d)| self.nearest_surface(o, d, SEARCH)
+                    .map(|(t, leaving)| (if leaving { 0.0 } else { t }, sgn, d)))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
+            let Some((face_t, sgn, dir)) = toward else {
+                // Say how far away the nearest wall actually is — that number is what tells the
+                // user whether this is a near miss or an opening adrift in the middle of a room.
+                const REPORT: f32 = 8.0;
+                let far = [-n, n].into_iter()
+                    .filter_map(|d| self.nearest_surface(o, d, REPORT).map(|(t, _)| t))
+                    .min_by(f32::total_cmp);
+                notes.push(match far {
+                    Some(t) => format!(
+                        "  · cut #{id}: nearest wall is {t:.2} m away — too far to attribute \
+                         ({SEARCH:.1} m limit). Redraw this opening on the wall itself."),
+                    None => format!(
+                        "  · cut #{id}: no wall within {REPORT:.0} m in either direction. \
+                         Redraw this opening on the wall itself."),
+                });
+                continue;
+            };
+            // Measure the assembly from ON that face, which is what the span expects.
+            let face = o + dir * face_t;
+            let thk = self.assembly_span(face, dir).0;
+            if thk <= 0.05 {
+                notes.push(format!(
+                    "  · cut #{id}: found a surface {face_t:.2} m away but could not measure its \
+                     thickness — left as it is."));
                 continue;
             }
-            let s_in = if inward.dot(n) > 0.0 { 1.0_f32 } else { -1.0 };
-            let zeta_in = s_in * (in_depth + MARGIN);
-            let zeta_out = -s_in * (out_depth + MARGIN);
-            let (lo, hi) = (zeta_in.min(zeta_out), zeta_in.max(zeta_out));
+            // Back into the cutter's own axis: the wall occupies `near … face_t + thk` along
+            // `dir`, which is `sgn` times that along the plane normal. Margin on both ends so the
+            // cut breaks cleanly through instead of leaving a skin.
+            //
+            // When the probe started INSIDE (`face_t == 0`) the wall also runs BEHIND it, so the
+            // near edge is measured backwards rather than assumed to be at the probe. Otherwise
+            // the near edge is simply where the ray entered.
+            let near = if face_t <= 1e-6 { -self.assembly_span(o, -dir).0 } else { face_t };
+            let (a, b) = (sgn * near, sgn * (face_t + thk));
+            let (lo, hi) = (a.min(b) - MARGIN, a.max(b) + MARGIN);
             plans.push((i, lo, hi - lo));
         }
         for (i, lift, h) in &plans {
@@ -8044,7 +8099,7 @@ impl CadApp {
                 _ => {}
             }
         }
-        (plans.len(), skipped)
+        (plans.len(), notes)
     }
 
     /// Delete solids that are an EXACT copy of an earlier one — same shape, same plane, same
@@ -8438,6 +8493,30 @@ impl CadApp {
             out.push("    Select the ids above in the 3D view and delete the redundant one.".into());
         }
         out
+    }
+
+    /// The nearest Union surface along `dir` as `(distance, leaving)`, or `None` if there is none
+    /// within `max`. Unlike [`Self::assembly_span`] there is no gap rule here: this is looking for
+    /// a surface that may be some way off, which is the very case the gap rule exists to reject.
+    ///
+    /// `leaving` is the part that matters to callers. If the first crossing is one the ray EXITS
+    /// through, the probe was already inside material and the distance is to the far side — so
+    /// anchoring at it would skip the whole wall and start the cut beyond it.
+    fn nearest_surface(&self, origin: glam::Vec3, dir: glam::Vec3, max: f32) -> Option<(f32, bool)> {
+        let start = origin + dir * 1e-3;
+        let mut best: Option<(f32, bool)> = None;
+        for f in &self.factory.model.features {
+            if f.op != cad_solid::BoolOp::Union { continue; }
+            for c in self.factory.model.feature_world_positions(f).chunks_exact(3) {
+                let (a, b, cc) = (glam::Vec3::from(c[0]), glam::Vec3::from(c[1]), glam::Vec3::from(c[2]));
+                if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                    if t > 1e-4 && t <= max && best.is_none_or(|(z, _)| t < z) {
+                        best = Some((t, (b - a).cross(cc - a).dot(dir) > 0.0));
+                    }
+                }
+            }
+        }
+        best
     }
 
     /// Ray-march EVERY Union body from `origin` along `dir` and return `(depth, body_ids)` —
@@ -13487,12 +13566,13 @@ impl CadApp {
             }
             Ok(Command::RepairCuts) => {
                 self.snapshot_factory();
-                let (fixed, skipped) = self.factory_repair_shallow_cuts();
+                let (fixed, notes) = self.factory_repair_shallow_cuts();
+                let skipped = notes.len();
                 if fixed == 0 {
                     self.undo_stack.pop();
                     self.factory.status = if skipped > 0 {
-                        format!("{skipped} shallow cut(s) found, but the wall at each still \
-                                 cannot be measured — left untouched")
+                        format!("{skipped} shallow cut(s) found, but none could be attributed to \
+                                 a wall — see the history panel for each")
                     } else {
                         "no shallow cuts found — every opening goes through".into()
                     };
@@ -13502,7 +13582,18 @@ impl CadApp {
                         "{fixed} opening(s) re-cut through the full wall — Ctrl+Z undoes it");
                     self.history.push(format!(
                         "  repaircuts: {fixed} opening(s) deepened{}",
-                        if skipped > 0 { format!(", {skipped} left unmeasurable") } else { String::new() }));
+                        if skipped > 0 { format!(", {skipped} left alone") } else { String::new() }));
+                }
+                // Name every one left alone, with the distance that decided it. A bare count is
+                // not actionable; these have to be redrawn by hand and the user needs to know
+                // WHICH, and why the repair would not have been safe.
+                if skipped > 0 {
+                    self.history.push(format!(
+                        "  {skipped} opening(s) left alone — the repair only deepens a cut it can \
+                         attribute to a wall, because guessing punches holes in the wrong one:"));
+                    for n in &notes {
+                        self.history.push(n.clone());
+                    }
                 }
             }
             Ok(Command::Dedupe) => {
@@ -45616,6 +45707,72 @@ mod factory_sketch_tests {
         app.factory.recompute();
         println!("{}", crate::dbg_recorder::format_event_oneline(
             &app.factory_scene_capture(&format!("offline capture of {path}"))));
+
+        // Per-suspect probe trace: where the face point lands, and what the ray finds in EACH
+        // direction. This is the view that showed the reconstructed point sitting 0.64 m clear of
+        // the wall — the reason the repair used to decline every one of these openings.
+
+        println!("\n=== per-cut probe ===");
+        for f in app.factory.model.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference)
+        {
+            let h = match f.primitive {
+                cad_solid::Primitive::Extrusion { h, .. } | cad_solid::Primitive::Box { h, .. } => h,
+                _ => continue,
+            };
+            if h > 0.25 || (f.placement.lift + 0.1).abs() > 0.02 { continue; }
+            let (u, v) = f.plane.axes();
+            let n = u.cross(v).normalize_or_zero();
+            let o = f.plane.origin() + u * f.placement.u + v * f.placement.v;
+            let (din, ids_in) = app.assembly_span(o, -n);
+            let (dout, ids_out) = app.assembly_span(o, n);
+            // The cutter's OWN centre: it is a 0.2 m box straddling the face (lift −0.1, h 0.2),
+            // so its middle sits on the wall surface in the middle of the opening — regardless of
+            // how the sketch's placement happens to be encoded.
+            let (cmn, cmx) = f.world_aabb();
+            let c = (cmn + cmx) * 0.5;
+            let (cin, cids_in) = app.assembly_span(c, -n);
+            let (cout, cids_out) = app.assembly_span(c, n);
+            println!("  #{:<4} placement o=({:.2},{:.2},{:.2}) n=({:.2},{:.2},{:.2})  in={din:.3} {ids_in:?}  out={dout:.3} {ids_out:?}",
+                f.id, o.x, o.y, o.z, n.x, n.y, n.z);
+            println!("        aabb centre=({:.2},{:.2},{:.2})  in={cin:.3} {cids_in:?}  out={cout:.3} {cids_out:?}",
+                c.x, c.y, c.z);
+            // RAW crossings, so the GAP rule and the probe origin can be told apart: an empty
+            // list means the ray found no material at all, while a populated one means the walk
+            // gave up at the first gap.
+            for (label, dir) in [("in ", -n), ("out", n)] {
+                let mut hits: Vec<(f32, u32, bool)> = Vec::new();
+                let start = o + dir * 1e-3;
+                for uf in app.factory.model.features.iter()
+                    .filter(|x| x.op == cad_solid::BoolOp::Union)
+                {
+                    let tris = app.factory.model.feature_world_positions(uf);
+                    for ch in tris.chunks_exact(3) {
+                        let (a, b, cc) = (glam::Vec3::from(ch[0]), glam::Vec3::from(ch[1]), glam::Vec3::from(ch[2]));
+                        if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                            if t > 1e-4 { hits.push((t, uf.id, (b - a).cross(cc - a).dot(dir) > 0.0)); }
+                        }
+                    }
+                }
+                hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let show: Vec<String> = hits.iter().take(5)
+                    .map(|(t, id, ex)| format!("{t:.3}@#{id}{}", if *ex { "↑" } else { "↓" }))
+                    .collect();
+                println!("        {label} raw: {} crossing(s)  {}", hits.len(), show.join(" "));
+            }
+        }
+
+        // DRY-RUN the repair on the real geometry. Read-only — nothing is written back — but it
+        // answers the question the capture raises and the user cannot: would `repaircuts`
+        // actually fix these, or does it skip them?
+        let (fixed, notes) = app.factory_repair_shallow_cuts();
+        println!("\n=== repaircuts DRY RUN ===\n{fixed} would be re-cut, {} left alone", notes.len());
+        for n in &notes { println!("{n}"); }
+        if fixed > 0 {
+            app.factory.recompute();
+            println!("{}", crate::dbg_recorder::format_event_oneline(
+                &app.factory_scene_capture("after repaircuts (in memory only)")));
+        }
     }
 
     /// Load the USER'S actual saved project and measure it. Set `SIMLUX_DIAG` to the drawing
@@ -45885,6 +46042,80 @@ mod factory_sketch_tests {
             (depth(2) - 0.05).abs() < 1e-6,
             "the recess is untouched — a blind pocket is deliberate, got {}", depth(2),
         );
+    }
+
+    /// `repaircuts` must FIND the wall, not assume the sketch plane is sitting on it.
+    ///
+    /// Measured on the real project, the face point rebuilt from `plane.origin() + u·place.u +
+    /// v·place.v` lands up to 0.64 m clear of the wall — outside the building, in mid-air. The
+    /// probe then hit the 0.4 m gap rule on its first crossing and every one of the ten openings
+    /// reported "unmeasurable", so the repair fixed nothing at all while reporting success. Four
+    /// separate cuts collapsing to one identical point is what gave the reconstruction away.
+    ///
+    /// Here the wall stands 0.6 m from that reconstructed point, exactly as it does in the file.
+    #[test]
+    fn repaircuts_finds_a_wall_the_sketch_plane_does_not_sit_on() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // A 200 mm wall whose near face is 0.6 m from where the cutter's plane claims to be.
+        app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -1.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.2, h: 3.0 },
+        );
+        // The stopped cut, with its plane floating 0.6 m off that wall.
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z),
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        app.factory.recompute();
+
+        let (fixed, notes) = app.factory_repair_shallow_cuts();
+        assert_eq!(fixed, 1, "the wall is 0.6 m away and findable; notes: {notes:?}");
+        let f = &app.factory.model.features[1];
+        let h = match f.primitive { cad_solid::Primitive::Box { h, .. } => h, _ => f32::NAN };
+        // The wall occupies 0.6 … 0.8 along the normal, so the cutter must span that plus a
+        // margin at each end — NOT merely be made deeper from where it was.
+        assert!((h - 0.4).abs() < 0.02, "expected a 0.4 m cutter spanning the wall, got {h}");
+        assert!((f.placement.lift - 0.5).abs() < 0.02,
+            "the cut must START at the wall's near face, not at the sketch plane: {}",
+            f.placement.lift);
+    }
+
+    /// A wall too far off to attribute is NAMED, never guessed at.
+    ///
+    /// Four of the ten openings on the real project sit 2.14 m from anything. At that range the
+    /// nearest surface is as likely to be across the room, and deepening into it would punch a
+    /// hole through the wrong part of the building — so the repair declines and says which cut
+    /// and how far, which is what makes it fixable by hand.
+    #[test]
+    fn repaircuts_names_an_opening_it_cannot_attribute_instead_of_guessing() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -3.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 0.2, h: 3.0 },
+        );
+        app.factory.model.push(
+            cad_solid::BoolOp::Difference,
+            cad_solid::Plane::from_basis(glam::Vec3::new(0.0, -0.3, 1.5), glam::Vec3::X, glam::Vec3::Z),
+            cad_solid::Placement { u: 0.0, v: 0.0, lift: -0.1, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 0.2 },
+        );
+        app.factory.recompute();
+        let before = app.factory.model.features[1].placement.lift;
+
+        let (fixed, notes) = app.factory_repair_shallow_cuts();
+        assert_eq!(fixed, 0, "a wall 2.6 m away must not be cut into");
+        assert_eq!(notes.len(), 1, "…and the opening must be reported, not silently dropped");
+        assert!(notes[0].contains("nearest wall is 2.6") && notes[0].contains("Redraw"),
+            "the note must give the distance and what to do: {}", notes[0]);
+        assert_eq!(app.factory.model.features[1].placement.lift, before, "and nothing was touched");
     }
 
     /// Build a small scene FAR from the origin — a survey plan's coordinates — with one stopped
