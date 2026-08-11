@@ -64,16 +64,60 @@ where — check it after the merge:
 
 Any `MISSING` there means LFS did not resolve.
 
+**You may not need LFS at all.** It matters only for the asset-backed features. If you are taking
+the parametric generators, EULUMDAT photometry, the renderer or the packaging work, those carry
+**no binary assets** — every generator builds its geometry in code. LFS is required only for the
+bundled Furniture, Handles, Apertures and Texture libraries.
+
 ---
 
-## 2. Merge, do not rebase
+## 2. Getting the commits in
 
-Use `git merge --no-ff`. Rebasing this branch is a trap: `cad_app/src/app.rs` has **274 hunks**
-across 50 commits, and a rebase replays every one of those conflicts against every intermediate
-commit — including `537c3fd`, which is **reverted by the very next commit** (`634eb7b`) and would
-have to be conflict-resolved twice for no benefit. One merge resolves each region once.
+**First, check whether we share history at all:**
+
+```bash
+git cat-file -e 13cdd07 2>/dev/null && echo "shared ancestor — use 2a" || echo "unrelated — use 2b"
+```
+
+### 2a. You descend from `13cdd07` — merge, do not rebase
+
+Use `git merge --no-ff`. Rebasing is a trap: `cad_app/src/app.rs` has **274 hunks** across 50
+commits, and a rebase replays every one of those conflicts against every intermediate commit —
+including `537c3fd`, which is **reverted by the very next commit** (`634eb7b`) and would have to be
+conflict-resolved twice for no benefit. One merge resolves each region once.
 
 If your policy forbids merge commits, squash-merge instead. Do not rebase.
+
+### 2b. Unrelated histories — patch, but do not hand-port
+
+If your tree is a *copy* of `13cdd07` into a different repo rather than a descendant of it, `git
+merge` is not available to you: with `--allow-unrelated-histories` every shared file arrives as
+"added by both" and you get a conflict in all of them.
+
+**You still do not have to port by hand.** Fetch this repo so the blobs exist locally, then let git
+do a three-way apply against them:
+
+```bash
+git remote add simlux https://github.com/Yaseen-Anwar/3D-factory.git
+git fetch simlux fresh-main            # 13cdd07 and f9d0c5f are now real objects in YOUR repo
+git format-patch 13cdd07..f9d0c5f --stdout > port.patch
+git am -3 < port.patch                 # -3 = three-way merge using the blobs just fetched
+```
+
+`-3` is what makes this work: each patch carries the pre- and post-image blob hashes, and once
+those blobs are fetched git can do a real merge instead of an exact-context match. Because your
+files were copied from `13cdd07` unchanged, most hunks apply cleanly and you get conflict markers
+only where your tree genuinely diverged — which is the information you actually want.
+
+`git am` stops at the first conflict. Resolve, `git add`, `git am --continue`. To take one group
+only (see §7), scope it by path instead:
+
+```bash
+git diff 13cdd07 f9d0c5f -- cad_solid/src/ cad_light/src/ldt.rs | git apply -3 --stat
+git diff 13cdd07 f9d0c5f -- cad_solid/src/ cad_light/src/ldt.rs | git apply -3
+```
+
+Hand-porting a 13,402-line diff is a last resort, not the starting point.
 
 ---
 
@@ -323,6 +367,56 @@ The 50 commits are not equally entangled. Ranked by how cleanly each group lifts
 | **Units** | 4 | **No** — spans `cad_kernel`, `cad_io`, `cad_light`, `app.rs` by design. All or nothing. |
 | **Cut / opening repairs** | 9 | **No** — later commits fix earlier ones; taking a subset reintroduces fixed bugs |
 | **SIMLUX lighting workflow** | 4 | Depends on Units |
+
+### 7.1 If your architecture requires the shared crates to stay byte-identical
+
+A legitimate constraint, and skipping Units satisfies it — **but check `parser.rs` before you
+conclude that.** Here is every shared-crate change, attributed:
+
+| file | change | belongs to |
+|---|---|---|
+| `cad_kernel/src/document.rs` | +84 | Units — 100% |
+| `cad_kernel/src/lib.rs` | ±1 | Units — 100% |
+| `cad_io/src/rsm.rs` | +88 | Units — 100% |
+| `cad_io/src/dxf.rs` | +150 | Units — 100% |
+| `cad_kernel/src/parser.rs` | +61 | Units **plus 4 unrelated 3D diagnostics** |
+
+So skipping Units leaves `cad_kernel` and `cad_io` byte-identical **except** `parser.rs`, which
+also carries `Diag`, `Dedupe`, `RepairCuts` and `Scene`. Those are 3D-only diagnostics with no
+connection to Units. Two ways out:
+
+- **Skip them too** — then all five files stay byte-identical and the invariant holds exactly.
+  You lose `diag` (finds coincident faces and duplicate solids), `repaircuts` (re-measures openings
+  that stop short) and `scene` (a measured dump of 3D state). All three are debugging tools, not
+  product features — but they are the tools that found the last four real bugs in this branch.
+- **Re-home them** — if your plugin has its own command hook, dispatch these four there instead of
+  adding variants to `cad_kernel::Command`. They only ever act on 3D state.
+
+### 7.2 What skipping Units actually costs
+
+Not "no mm/inch drawing scale in 3D". The concrete failure is: **a plan drawn or imported in
+millimetres builds a 3D model 1000× too large.** A 5000-unit wall becomes a 5000-metre wall. That
+is the bug Units exists to fix, and it is not cosmetic — it makes the 3D Factory unusable on a mm
+drawing, which is what most DXF architectural plans are.
+
+So make this decision on one question — **do your drawings arrive in millimetres?** If they arrive
+in metres, `metres_per_unit` is 1.0, Units is a no-op for you, and skipping it costs nothing at all.
+If they arrive in mm, skipping Units means the 3D side is wrong for your main input format, and the
+architectural purity buys you a feature that does not work.
+
+### 7.3 Two claims worth checking before you decide
+
+Both of these came back from a reviewer, and both are narrower than they sound:
+
+- **"The `.rsm` format change reaches the stable 2D app."** It does not. The writer is conditional
+  (§5.1): a document whose unit was never declared is written as **v7, byte-identical**. A 2D-only
+  app never sets a unit, so it never writes a v8 file. What *does* change is DXF, which now always
+  emits two extra header lines — `$INSUNITS` with code **0 = unitless**, which is precisely what
+  omitting the variable used to mean. Semantics identical, bytes two lines longer.
+- **"`cad_light::extrude` silently returns metres."** True, and worth flagging (§3.4) — but the
+  multiplier is `metres_per_unit`, which is **1.0** for every document that has not declared a
+  unit. For an existing drawing the output is bit-identical. The change can only alter a result on
+  a drawing that opted in.
 
 Two commits deserve a warning if you cherry-pick:
 
