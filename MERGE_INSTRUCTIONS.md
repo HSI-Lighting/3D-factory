@@ -1,9 +1,24 @@
 # Merging the 3D Factory / SIMLUX work
 
-**Branch:** `fresh-main` · **Remote:** `yaseen` (`github.com/Yaseen-Anwar/3D-factory`)
+**Repository:** `https://github.com/HSI-Lighting/3D-factory.git`
+**Branch to take:** `fresh-main` · **Base branch:** `main`
 **Range:** `13cdd07..f9d0c5f` — **50 commits**, 2026‑07‑30 → 2026‑08‑11
 **Base:** `13cdd07` "3D Factory: import perf, cut fixes, FBX, 3-axis rotation, recorder" — this is
-also the tip of `yaseen/main`, so **`main` has not moved since we branched.**
+also the tip of `main`, so **`main` has not moved since we branched.**
+
+Confirm you are looking at the same thing before reading further:
+
+```bash
+git ls-remote --heads https://github.com/HSI-Lighting/3D-factory.git
+# fresh-main -> f9d0c5f13889ccf1abf86666000c5d78ad89409d
+# main       -> 13cdd0727351dc5602944dd2274e046108c9177f
+```
+
+Every line number, file path and count in this document is taken from **`f9d0c5f`**, the tip of
+`fresh-main`, so it describes exactly what you get when you fetch — not a local working tree.
+Nothing here depends on anything unpushed. Note that `/target` and `/dist` are gitignored: you
+build from source, and there is no packaged binary in the repo (run `packaging/build-package.ps1`
+to produce one).
 
 > Written for the team integrating this alongside their own work. It is ordered by what will
 > actually cost you time: the four things that break a build come first, the conflict map second,
@@ -26,12 +41,14 @@ also the tip of `yaseen/main`, so **`main` has not moved since we branched.**
 | Test baseline after merge | **1006 tests, 0 failures** across the workspace |
 
 ```bash
-git lfs install                      # REQUIRED — see §1
-git fetch yaseen
-git checkout main
-git merge --no-ff yaseen/fresh-main  # merge, do not rebase — see §2
-cargo test --workspace               # expect 1006 passed, 0 failed
+git lfs install                                                      # REQUIRED — see §1
+git remote add factory https://github.com/HSI-Lighting/3D-factory.git
+git fetch factory
+git merge --no-ff factory/fresh-main   # ONLY if you descend from 13cdd07 — check §2 first
+cargo test --workspace                 # expect 1006 passed, 0 failed
 ```
+
+`factory` is just a name — use whatever you like, but the rest of this document spells it that way.
 
 ---
 
@@ -73,11 +90,20 @@ bundled Furniture, Handles, Apertures and Texture libraries.
 
 ## 2. Getting the commits in
 
-**First, check whether we share history at all:**
+**First, check whether we share history at all.** Fetch, then ask whether `13cdd07` is an ancestor
+of your branch — not merely whether the object exists, because after a fetch it always does:
 
 ```bash
-git cat-file -e 13cdd07 2>/dev/null && echo "shared ancestor — use 2a" || echo "unrelated — use 2b"
+git remote add factory https://github.com/HSI-Lighting/3D-factory.git
+git fetch factory
+git merge-base --is-ancestor 13cdd07 HEAD \
+  && echo "descendant  -> use 2a" \
+  || echo "unrelated   -> use 2b"
 ```
+
+If your 3D code was **copied** out of `13cdd07` into a different repository rather than branched
+from it, you are in **2b** — the files may be identical but the history is not shared, and `git
+merge` will not do what you want.
 
 ### 2a. You descend from `13cdd07` — merge, do not rebase
 
@@ -98,11 +124,14 @@ merge` is not available to you: with `--allow-unrelated-histories` every shared 
 do a three-way apply against them:
 
 ```bash
-git remote add simlux https://github.com/Yaseen-Anwar/3D-factory.git
-git fetch simlux fresh-main            # 13cdd07 and f9d0c5f are now real objects in YOUR repo
+git remote add factory https://github.com/HSI-Lighting/3D-factory.git
+git fetch factory                      # 13cdd07 and f9d0c5f are now real objects in YOUR repo
 git format-patch 13cdd07..f9d0c5f --stdout > port.patch
 git am -3 < port.patch                 # -3 = three-way merge using the blobs just fetched
 ```
+
+`git fetch` alone is enough — you do not have to check the branch out, and nothing in your working
+tree changes. It only puts the objects in your store so `-3` has something to merge against.
 
 `-3` is what makes this work: each patch carries the pre- and post-image blob hashes, and once
 those blobs are fetched git can do a real merge instead of an exact-context match. Because your
