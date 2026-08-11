@@ -93,6 +93,47 @@ pub fn mesh_bbox(meshes: &[Mesh]) -> Option<(f32, f32, f32, f32)> {
     b
 }
 
+/// Height of the CEILING over `(x, y)`, searching upward from `from_z`.
+///
+/// A luminaire hangs from whatever is above it, and that is not one number. The array mounted
+/// everything at a single `mount_height`, which is only right in a box: a real building has a
+/// lower ceiling over the entrance than over the hall, soffits round the perimeter, and slopes.
+/// One height for all of them buries some fixtures in the slab above and leaves others floating a
+/// metre below the ceiling — and the lux result then describes that, not the design.
+///
+/// "Ceiling" means the nearest DOWN-FACING surface above the point: the underside of something. An
+/// up-facing triangle at the same height is the TOP of that slab, seen from the floor above, and
+/// fixing a luminaire to it would put it inside the structure.
+///
+/// `None` when nothing is overhead — an outdoor area, or a point outside the footprint — so the
+/// caller keeps its own default instead of inventing a height.
+pub fn ceiling_above(meshes: &[Mesh], x: f32, y: f32, from_z: f32) -> Option<f32> {
+    let origin = glam::Vec3::new(x, y, from_z);
+    let up = glam::Vec3::Z;
+    let mut best: Option<f32> = None;
+    for m in meshes {
+        for t in &m.triangles {
+            let (a, b, c) = (
+                m.vertices[t.a as usize].to_vec3(),
+                m.vertices[t.b as usize].to_vec3(),
+                m.vertices[t.c as usize].to_vec3(),
+            );
+            // Down-facing only: a ray straight up hits both faces of a slab, and the underside is
+            // the one a luminaire can be fixed to.
+            let n = (b - a).cross(c - a);
+            if n.z >= 0.0 {
+                continue;
+            }
+            if let Some(d) = cad_solid::ray_triangle(origin, up, a, b, c) {
+                if d > 1e-3 && best.is_none_or(|z| d < z) {
+                    best = Some(d);
+                }
+            }
+        }
+    }
+    best.map(|d| from_z + d)
+}
+
 /// Height of the lighting geometry (max z − min z), or `None` if empty.
 pub fn mesh_height(meshes: &[Mesh]) -> Option<f32> {
     let mut lo = f32::INFINITY;
@@ -183,6 +224,11 @@ pub struct LightState {
     /// Rows/columns for the ▼ Luminaires grid array — the usual way a room is lit.
     pub array_rows: u32,
     pub array_cols: u32,
+    /// Mount fixtures to the ceiling found ABOVE each point, rather than one fixed height.
+    /// A real building has soffits, steps and slopes; one height suits only a box.
+    pub mount_to_ceiling: bool,
+    /// Drop below that ceiling — 0 is surface-mounted, 0.3 a short pendant.
+    pub ceiling_drop: f32,
     /// Mounting height for newly placed fixtures (defaults to room height).
     pub mount_height: f32,
     /// Last computed grid + its plane + extruded scene.
@@ -243,6 +289,8 @@ impl LightState {
             next_id: 1,
             array_rows: 3,
             array_cols: 4,
+            mount_to_ceiling: true,
+            ceiling_drop: 0.0,
             mount_height: 3.0,
             grid: None,
             plane: None,
@@ -367,25 +415,53 @@ impl LightState {
         }
         let (dx, dy) = (w / cols as f32, d / rows as f32);
         let mut n = 0;
+        let mut found_ceiling = 0usize;
+        let (mut zlo, mut zhi) = (f32::INFINITY, f32::NEG_INFINITY);
         for r in 0..rows {
             for c in 0..cols {
                 let x = x0 + dx * (c as f32 + 0.5);
                 let y = y0 + dy * (r as f32 + 0.5);
+                // Each fixture finds ITS OWN ceiling. Search from the work plane, which is inside
+                // the room by definition — starting at the floor would catch the floor slab's own
+                // underside from the storey below.
+                let z = match (self.mount_to_ceiling, ceiling_above(&self.meshes, x, y, self.plane_height)) {
+                    (true, Some(zc)) => {
+                        found_ceiling += 1;
+                        zc - self.ceiling_drop
+                    }
+                    // Nothing overhead, or the user asked for a fixed height.
+                    _ => self.mount_height,
+                };
+                zlo = zlo.min(z);
+                zhi = zhi.max(z);
                 let id = self.next_id;
                 self.next_id += 1;
                 self.luminaires.push(Luminaire {
                     id,
                     profile: self.active_profile.clone(),
-                    position: Vertex::new(x, y, self.mount_height),
+                    position: Vertex::new(x, y, z),
                     rotation_deg: 0.0,
                     dimming: 1.0,
                 });
                 n += 1;
             }
         }
+        // Report the SPREAD of mounting heights, not just one number: on a stepped ceiling that
+        // spread is the useful fact, and it is the only sign that some fixtures found no ceiling
+        // and fell back.
+        let height = if (zhi - zlo).abs() < 1e-3 {
+            format!("{zlo:.2} m")
+        } else {
+            format!("{zlo:.2}–{zhi:.2} m")
+        };
+        let missed = n - found_ceiling;
         self.last_msg = format!(
-            "Placed {n} fixtures ({rows}x{cols}) at {:.2} m, {:.2} x {:.2} m pitch — press Calculate.",
-            self.mount_height, dx, dy
+            "Placed {n} fixtures ({rows}×{cols}) at {height}, {dx:.2} × {dy:.2} m pitch{} — press Calculate.",
+            if self.mount_to_ceiling && missed > 0 {
+                format!(" · {missed} found no ceiling and used {:.2} m", self.mount_height)
+            } else {
+                String::new()
+            },
         );
         n
     }
@@ -678,9 +754,18 @@ impl LightState {
                     ui.close_menu();
                 }
                 ui.separator();
+                ui.label(egui::RichText::new("mounting").small().weak());
+                ui.checkbox(&mut self.mount_to_ceiling, "follow the ceiling")
+                    .on_hover_text("Each fixture finds the ceiling above its own position — soffits, steps and slopes all mount correctly. Off: everything at one height.");
                 ui.horizontal(|ui| {
-                    ui.label("mount at");
-                    ui.add(egui::DragValue::new(&mut self.mount_height).speed(0.05).suffix(" m").range(0.1..=30.0));
+                    if self.mount_to_ceiling {
+                        ui.label("drop below it");
+                        ui.add(egui::DragValue::new(&mut self.ceiling_drop).speed(0.02).suffix(" m").range(0.0..=5.0))
+                            .on_hover_text("0 = surface-mounted · 0.3 = a short pendant");
+                    } else {
+                        ui.label("mount at");
+                        ui.add(egui::DragValue::new(&mut self.mount_height).speed(0.05).suffix(" m").range(0.1..=30.0));
+                    }
                 });
                 ui.checkbox(&mut self.auto_center_light, "auto-place one at the centre if none")
                     .on_hover_text("A convenience for a first look; turn it off once you place fixtures yourself");
@@ -1211,5 +1296,127 @@ mod array_tests {
         assert_eq!(s.add_luminaire_grid((5.0, 5.0, 5.0, 5.0), 3, 3), 0);
         assert!(s.luminaires.is_empty(), "no room means no array");
         assert!(s.last_msg.contains("bounds"), "and it should say why: {}", s.last_msg);
+    }
+}
+
+#[cfg(test)]
+mod mounting_tests {
+    use super::*;
+
+    /// Two bays at different ceiling heights, sharing a floor. Bay A spans x 0..6 with its ceiling
+    /// at 4 m; bay B spans x 6..12 at 2.5 m — the shape of an entrance soffit beside a hall.
+    fn stepped_room() -> Vec<Mesh> {
+        let quad = |z: f32, x0: f32, x1: f32, down: bool| -> Mesh {
+            // Wound so the normal points DOWN when `down`, which is what marks an underside.
+            let v = |x: f32, y: f32| Vertex::new(x, y, z);
+            let (a, b, c, d) = if down {
+                (v(x0, 0.0), v(x0, 8.0), v(x1, 8.0), v(x1, 0.0))
+            } else {
+                (v(x0, 0.0), v(x1, 0.0), v(x1, 8.0), v(x0, 8.0))
+            };
+            Mesh {
+                vertices: vec![a, b, c, d],
+                triangles: vec![
+                    cad_light::Triangle { a: 0, b: 1, c: 2 },
+                    cad_light::Triangle { a: 0, b: 2, c: 3 },
+                ],
+                material: if down { 2 } else { 0 },
+            }
+        };
+        vec![
+            quad(0.0, 0.0, 12.0, false), // floor, up-facing
+            quad(4.0, 0.0, 6.0, true),   // high ceiling over bay A
+            quad(2.5, 6.0, 12.0, true),  // low ceiling over bay B
+        ]
+    }
+
+    /// The ceiling is found PER POINT, and it is the underside — not the floor, and not the top of
+    /// the slab seen from above.
+    #[test]
+    fn each_point_finds_the_ceiling_above_it() {
+        let m = stepped_room();
+        let a = ceiling_above(&m, 3.0, 4.0, 0.8).expect("bay A has a ceiling");
+        let b = ceiling_above(&m, 9.0, 4.0, 0.8).expect("bay B has a ceiling");
+        assert!((a - 4.0).abs() < 1e-3, "bay A ceiling is 4 m, got {a}");
+        assert!((b - 2.5).abs() < 1e-3, "bay B ceiling is 2.5 m, got {b}");
+        // Outside the footprint there is nothing overhead, and inventing a height would be worse
+        // than saying so.
+        assert!(ceiling_above(&m, 50.0, 4.0, 0.8).is_none(), "nothing overhead outside the room");
+    }
+
+    /// An UP-facing surface is not a ceiling. A ray cast upward crosses both faces of a slab, and
+    /// hanging a luminaire from the top one would put it inside the structure.
+    #[test]
+    fn the_top_of_a_slab_is_not_a_ceiling() {
+        let up_only = vec![Mesh {
+            vertices: vec![
+                Vertex::new(0.0, 0.0, 3.0), Vertex::new(6.0, 0.0, 3.0),
+                Vertex::new(6.0, 6.0, 3.0), Vertex::new(0.0, 6.0, 3.0),
+            ],
+            triangles: vec![
+                cad_light::Triangle { a: 0, b: 1, c: 2 },
+                cad_light::Triangle { a: 0, b: 2, c: 3 },
+            ],
+            material: 0,
+        }];
+        assert!(ceiling_above(&up_only, 3.0, 3.0, 0.8).is_none(),
+            "an up-facing surface overhead is the TOP of a slab, not a ceiling");
+    }
+
+    /// The array follows the stepped ceiling instead of putting everything at one height.
+    ///
+    /// One mounting height is right only in a box. Across a step it buries some fixtures in the
+    /// slab above and leaves the rest hanging a metre low — and the lux figures then describe
+    /// that, not the design, with nothing on screen to say so.
+    #[test]
+    fn the_array_mounts_each_fixture_to_its_own_ceiling() {
+        let mut s = LightState::new();
+        s.luminaires.clear();
+        s.meshes = stepped_room();
+        s.mount_to_ceiling = true;
+        s.ceiling_drop = 0.0;
+        s.plane_height = 0.8;
+
+        // 1 row x 4 cols over 0..12 => x at 1.5, 4.5, 7.5, 10.5: two under each bay.
+        assert_eq!(s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 4), 4);
+        let mut by_x: Vec<(f32, f32)> =
+            s.luminaires.iter().map(|l| (l.position.x, l.position.z)).collect();
+        by_x.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!((by_x[0].1 - 4.0).abs() < 1e-3, "x=1.5 is under the high bay, got z={}", by_x[0].1);
+        assert!((by_x[1].1 - 4.0).abs() < 1e-3, "x=4.5 is under the high bay, got z={}", by_x[1].1);
+        assert!((by_x[2].1 - 2.5).abs() < 1e-3, "x=7.5 is under the low bay, got z={}", by_x[2].1);
+        assert!((by_x[3].1 - 2.5).abs() < 1e-3, "x=10.5 is under the low bay, got z={}", by_x[3].1);
+        assert!(s.last_msg.contains("2.50–4.00 m"),
+            "the message should report the SPREAD on a stepped ceiling: {}", s.last_msg);
+    }
+
+    /// A pendant drop hangs below whatever it is fixed to, per fixture.
+    #[test]
+    fn a_pendant_drop_is_measured_from_each_ceiling() {
+        let mut s = LightState::new();
+        s.luminaires.clear();
+        s.meshes = stepped_room();
+        s.mount_to_ceiling = true;
+        s.ceiling_drop = 0.5;
+        s.plane_height = 0.8;
+        s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 2);
+        let mut z: Vec<f32> = s.luminaires.iter().map(|l| l.position.z).collect();
+        z.sort_by(f32::total_cmp);
+        assert!((z[0] - 2.0).abs() < 1e-3, "0.5 m below the 2.5 m ceiling, got {}", z[0]);
+        assert!((z[1] - 3.5).abs() < 1e-3, "0.5 m below the 4 m ceiling, got {}", z[1]);
+    }
+
+    /// Turning it OFF restores one fixed height — the old behaviour, kept for a designer who wants
+    /// a uniform mounting plane regardless of what the ceiling does.
+    #[test]
+    fn a_fixed_height_is_still_available() {
+        let mut s = LightState::new();
+        s.luminaires.clear();
+        s.meshes = stepped_room();
+        s.mount_to_ceiling = false;
+        s.mount_height = 3.2;
+        s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 4);
+        assert!(s.luminaires.iter().all(|l| (l.position.z - 3.2).abs() < 1e-6),
+            "with the toggle off every fixture sits at the set height");
     }
 }
