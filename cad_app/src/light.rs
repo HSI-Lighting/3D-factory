@@ -180,6 +180,9 @@ pub struct LightState {
     pub place_mode: bool,
     /// Monotonic id source for placed luminaires.
     pub next_id: u32,
+    /// Rows/columns for the ▼ Luminaires grid array — the usual way a room is lit.
+    pub array_rows: u32,
+    pub array_cols: u32,
     /// Mounting height for newly placed fixtures (defaults to room height).
     pub mount_height: f32,
     /// Last computed grid + its plane + extruded scene.
@@ -238,6 +241,8 @@ impl LightState {
             auto_center_light: true,
             place_mode: false,
             next_id: 1,
+            array_rows: 3,
+            array_cols: 4,
             mount_height: 3.0,
             grid: None,
             plane: None,
@@ -337,6 +342,59 @@ impl LightState {
     }
 
     /// Drop a luminaire at plan position (x, y) on the mounting plane.
+    /// Lay out a regular grid of luminaires over `bounds`, inset from the walls.
+    ///
+    /// The way lighting is actually designed, and the thing that was missing. Placing fixtures one
+    /// click at a time is fine for a feature light and hopeless for a room: a gym wants a 6x4 array
+    /// on a regular pitch, and getting there by hand is twenty-four clicks that will not be evenly
+    /// spaced. The spacing convention is the standard one — fixtures sit at the CENTRE of each
+    /// cell, so the gap to the wall is half the gap between fixtures, which is what gives an even
+    /// wash rather than hot edges.
+    ///
+    /// Returns how many were placed.
+    pub fn add_luminaire_grid(
+        &mut self,
+        bounds: (f32, f32, f32, f32),
+        rows: u32,
+        cols: u32,
+    ) -> usize {
+        let (x0, y0, x1, y1) = bounds;
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        let (w, d) = (x1 - x0, y1 - y0);
+        if w <= 0.0 || d <= 0.0 {
+            self.last_msg = "No room bounds yet — build or import geometry first.".into();
+            return 0;
+        }
+        let (dx, dy) = (w / cols as f32, d / rows as f32);
+        let mut n = 0;
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = x0 + dx * (c as f32 + 0.5);
+                let y = y0 + dy * (r as f32 + 0.5);
+                let id = self.next_id;
+                self.next_id += 1;
+                self.luminaires.push(Luminaire {
+                    id,
+                    profile: self.active_profile.clone(),
+                    position: Vertex::new(x, y, self.mount_height),
+                    rotation_deg: 0.0,
+                    dimming: 1.0,
+                });
+                n += 1;
+            }
+        }
+        self.last_msg = format!(
+            "Placed {n} fixtures ({rows}x{cols}) at {:.2} m, {:.2} x {:.2} m pitch — press Calculate.",
+            self.mount_height, dx, dy
+        );
+        n
+    }
+
+    /// Plan-view bounds of the current lighting geometry, for laying out an array.
+    pub fn room_bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        mesh_bbox(&self.meshes)
+    }
+
     pub fn add_luminaire_at(&mut self, x: f32, y: f32) {
         let id = self.next_id;
         self.next_id += 1;
@@ -573,6 +631,187 @@ impl LightState {
     }
 
     /// Draw the panel body. Returns actions the app must run (they need `&Document`).
+    /// The SIMLUX toolbar — the same shape as the 3D Factory's, and for the same reason.
+    ///
+    /// The lighting controls were a tall stack of numbered sections in a side panel, so getting a
+    /// fixture into a room meant reading the whole column to find out which step you were on. The
+    /// Factory solved this already: grouped `▼` menus on one wrapped row, with the state that
+    /// matters on a line underneath. Matching it means one thing to learn, not two.
+    ///
+    /// Grouped by the QUESTION being answered, not by the code behind it:
+    ///   Luminaires — what is emitting, and where
+    ///   Photometry — which real fitting it is
+    ///   Calculation — how the answer is worked out
+    ///   Surfaces — what the room is made of
+    ///   Display — how the result is drawn
+    pub fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
+        let mut action = LightAction::default();
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("▼ Luminaires", |ui| {
+                ui.label(egui::RichText::new("place").small().weak());
+                let placing = self.place_mode;
+                if ui
+                    .selectable_label(placing, if placing { "◉ Placing — click the plan" } else { "＋ Place one (click the plan)" })
+                    .on_hover_text("Then click in the 2D plan to drop a fixture at the mounting height")
+                    .clicked()
+                {
+                    self.place_mode = !placing;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("array — the usual way to light a room").small().weak());
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.array_rows).range(1..=40).prefix("rows "));
+                    ui.add(egui::DragValue::new(&mut self.array_cols).range(1..=40).prefix("cols "));
+                });
+                if ui
+                    .button("⊞  Lay out grid over the room")
+                    .on_hover_text("Fixtures at the centre of each cell, so the gap to the wall is half the gap between fixtures")
+                    .clicked()
+                {
+                    if let Some(b) = self.room_bounds() {
+                        let (rows, cols) = (self.array_rows, self.array_cols);
+                        self.add_luminaire_grid(b, rows, cols);
+                    } else {
+                        self.last_msg = "No room yet — build one in the 3D Factory, or draw a closed outline.".into();
+                    }
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("mount at");
+                    ui.add(egui::DragValue::new(&mut self.mount_height).speed(0.05).suffix(" m").range(0.1..=30.0));
+                });
+                ui.checkbox(&mut self.auto_center_light, "auto-place one at the centre if none")
+                    .on_hover_text("A convenience for a first look; turn it off once you place fixtures yourself");
+                ui.separator();
+                if ui.button("🗑  Remove all fixtures").clicked() {
+                    let n = self.luminaires.len();
+                    self.luminaires.clear();
+                    self.last_msg = format!("Removed {n} fixture(s).");
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("▼ Photometry", |ui| {
+                ui.label(egui::RichText::new("IES (.ies) or EULUMDAT (.ldt)").small().weak());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.ies_path)
+                            .desired_width(240.0)
+                            .hint_text(r"C:\path\to\fitting.ldt"),
+                    );
+                    if ui.button("Load").clicked() {
+                        self.import_photometry();
+                    }
+                });
+                ui.separator();
+                ui.label(egui::RichText::new("loaded — click to make active").small().weak());
+                // Sorted, because a HashMap would reorder the list on every repaint and the entry
+                // under the cursor would not be the one that gets clicked.
+                let mut names: Vec<String> = self.profiles.keys().cloned().collect();
+                names.sort();
+                for n in names {
+                    let active = n == self.active_profile;
+                    let detail = self.profiles.get(&n).map(|p| {
+                        if p.lumens > 0.0 {
+                            format!("{:.0} lm · {:.0} W · peak {:.0} cd", p.lumens, p.watts, p.peak_candela())
+                        } else {
+                            format!("peak {:.0} cd", p.peak_candela())
+                        }
+                    });
+                    if ui.selectable_label(active, &n).on_hover_text(detail.unwrap_or_default()).clicked() {
+                        self.active_profile = n.clone();
+                        ui.close_menu();
+                    }
+                }
+            });
+
+            ui.menu_button("▼ Calculation", |ui| {
+                egui::Grid::new("simlux_calc_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    ui.label("work plane").on_hover_text("Height above the floor the lux is measured at — 0.8 m is the usual desk height");
+                    ui.add(egui::DragValue::new(&mut self.plane_height).speed(0.05).suffix(" m").range(0.0..=10.0));
+                    ui.end_row();
+                    ui.label("grid cell").on_hover_text("Target spacing of the measurement grid; finer is slower");
+                    ui.add(egui::DragValue::new(&mut self.cell_size).speed(0.05).suffix(" m").range(0.05..=5.0));
+                    ui.end_row();
+                    ui.label("bounces").on_hover_text("Indirect light: 0 is direct only, which under-reads a bright room badly");
+                    ui.add(egui::DragValue::new(&mut self.settings.max_bounces).range(0..=8));
+                    ui.end_row();
+                    ui.label("rays").on_hover_text("Samples per point for the indirect term — more is smoother and slower");
+                    ui.add(egui::DragValue::new(&mut self.settings.rays_per_point).range(1..=4096));
+                    ui.end_row();
+                });
+            });
+
+            ui.menu_button("▼ Surfaces", |ui| {
+                ui.label(egui::RichText::new("reflectance — how much light a surface returns").small().weak());
+                egui::Grid::new("simlux_mat_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    for m in &mut self.materials {
+                        ui.label(&m.name);
+                        ui.add(egui::DragValue::new(&mut m.reflectance).speed(0.01).range(0.0..=1.0));
+                        ui.end_row();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Surfaces are sorted by which way they face:\nup = floor, down = ceiling, upright = wall.")
+                        .small().weak(),
+                );
+            });
+
+            ui.menu_button("▼ Display", |ui| {
+                ui.checkbox(&mut self.floor_heatmap, "false-colour on the floor");
+            });
+
+            ui.separator();
+            if ui
+                .button("⚡ Calculate")
+                .on_hover_text("Trace the room and compute the lux grid")
+                .clicked()
+            {
+                action.calculate = true;
+            }
+        });
+
+        // The state line, exactly as the Factory reports features/tris/selection: what is loaded,
+        // and what the last answer was.
+        ui.horizontal_wrapped(|ui| {
+            let small = |t: String| egui::RichText::new(t).small().weak();
+            ui.label(
+                egui::RichText::new(format!("{} fixture(s)", self.luminaires.len()))
+                    .small()
+                    .strong(),
+            );
+            ui.label(small(format!("· {}", self.active_profile)));
+            if let Some(g) = self.grid.as_ref() {
+                ui.label(small(format!("· avg {:.0} lx", g.avg)));
+                ui.label(small(format!("· min {:.0}", g.min)));
+                ui.label(small(format!("· max {:.0}", g.max)));
+                // UNIFORMITY. EN 12464 specifies U0 = Emin/Eavg, and a scheme is judged on it as
+                // much as on the average — 500 lx at U0 = 0.2 is a room with dark patches, and
+                // nothing in min/avg/max on its own says that.
+                if g.avg > 0.0 {
+                    let u0 = g.min / g.avg;
+                    ui.label(
+                        egui::RichText::new(format!("· U₀ {u0:.2}"))
+                            .small()
+                            .color(if u0 >= 0.6 {
+                                egui::Color32::from_rgb(120, 200, 120)
+                            } else if u0 >= 0.4 {
+                                egui::Color32::from_rgb(220, 190, 100)
+                            } else {
+                                egui::Color32::from_rgb(220, 130, 120)
+                            }),
+                    )
+                    .on_hover_text("Uniformity Emin/Eavg. EN 12464 asks 0.60 for most work areas, 0.40 for circulation.");
+                }
+            } else {
+                ui.label(small("· not calculated".into()));
+            }
+        });
+        action
+    }
+
     pub fn panel_ui(&mut self, ui: &mut egui::Ui, layers: &[(u32, String)]) -> LightAction {
         let mut action = LightAction::default();
         ui.set_min_width(260.0);
@@ -921,5 +1160,56 @@ mod tests {
         assert!(x0 > 3000.0, "…and it must be found where the building actually is, not at the origin");
         let h = mesh_height(&meshes).expect("a box has height");
         assert!((h - 3.0).abs() < 0.01, "height should be 3 m, got {h}");
+    }
+}
+
+#[cfg(test)]
+mod array_tests {
+    use super::*;
+
+    /// A grid array lays fixtures at CELL CENTRES, so the gap to the wall is half the gap between
+    /// fixtures.
+    ///
+    /// This is the standard spacing convention and the reason the tool exists: placing 24 fittings
+    /// by hand is 24 clicks that will not be evenly spaced, and putting them at cell CORNERS
+    /// instead pushes the outer row against the wall, which over-lights the perimeter and leaves
+    /// the middle short.
+    #[test]
+    fn a_grid_array_centres_fixtures_in_their_cells() {
+        let mut s = LightState::new();
+        s.mount_height = 3.0;
+        s.luminaires.clear();
+
+        // A 12 x 8 m room, 2 rows x 3 cols => 4 m x 4 m pitch, 2 m to each wall.
+        let n = s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 2, 3);
+        assert_eq!(n, 6, "2 rows x 3 cols is 6 fixtures");
+        assert_eq!(s.luminaires.len(), 6);
+
+        let xs: Vec<f32> = {
+            let mut v: Vec<f32> = s.luminaires.iter().map(|l| l.position.x).collect();
+            v.sort_by(f32::total_cmp);
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            v
+        };
+        assert_eq!(xs.len(), 3, "three distinct columns, got {xs:?}");
+        assert!((xs[0] - 2.0).abs() < 1e-3, "first column at half a pitch from the wall, got {}", xs[0]);
+        assert!((xs[1] - 6.0).abs() < 1e-3);
+        assert!((xs[2] - 10.0).abs() < 1e-3, "last column symmetric to the first, got {}", xs[2]);
+
+        // Every one is at the mounting height, not the floor.
+        assert!(s.luminaires.iter().all(|l| (l.position.z - 3.0).abs() < 1e-6),
+            "fixtures must sit at the mount height");
+        // …and they all carry the active photometry, or the array would be lit by nothing.
+        assert!(s.luminaires.iter().all(|l| l.profile == s.active_profile));
+    }
+
+    /// A degenerate room is refused rather than filled with fixtures stacked on one spot.
+    #[test]
+    fn an_empty_room_places_nothing() {
+        let mut s = LightState::new();
+        s.luminaires.clear();
+        assert_eq!(s.add_luminaire_grid((5.0, 5.0, 5.0, 5.0), 3, 3), 0);
+        assert!(s.luminaires.is_empty(), "no room means no array");
+        assert!(s.last_msg.contains("bounds"), "and it should say why: {}", s.last_msg);
     }
 }

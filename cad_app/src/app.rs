@@ -11678,15 +11678,17 @@ impl CadApp {
                 });
                 ui.separator();
 
-                if let Some(g) = self.light.grid.as_ref() {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("avg {:.0}", g.avg)).small());
-                        ui.label(egui::RichText::new(format!("· min {:.0}", g.min)).small().weak());
-                        ui.label(egui::RichText::new(format!("· max {:.0} lx", g.max)).small().weak());
-                    });
-                    crate::light::legend_bar(ui, self.light.scale_ceiling());
-                    ui.separator();
+                // The SIMLUX toolbar, in the same grouped-menu shape as the 3D Factory's. It used
+                // to be a bare colour legend here and a tall column of numbered steps in a side
+                // panel, so "how do I add a light" had no answer anywhere on screen.
+                let act = self.light.toolbar_ui(ui);
+                if act.calculate {
+                    self.light.calculate(&self.doc, Some(&self.factory));
                 }
+                if self.light.grid.is_some() {
+                    crate::light::legend_bar(ui, self.light.scale_ceiling());
+                }
+                ui.separator();
 
                 let size = ui.available_size();
                 let (resp, painter) = ui.allocate_painter(size, egui::Sense::drag());
