@@ -366,6 +366,18 @@ pub struct SimluxConfig {
     /// written before this existed still loads, as an empty factory.
     #[serde(default)]
     pub factory: FactoryDoc,
+    /// PLACED LUMINAIRES — the lighting layout itself.
+    ///
+    /// These were not persisted at all, so a scheme laid out over a whole building was gone the
+    /// moment the project was reopened, with nothing on screen to say it had happened. `profile`
+    /// is a library key, so the fittings above resolve them by name on load; a fixture whose
+    /// fitting is missing comes back UNASSIGNED rather than pointing at nothing.
+    #[serde(default)]
+    pub luminaires: Vec<cad_light::Luminaire>,
+    /// Next free fixture id, so reopening a project does not restart numbering at #1 and hand two
+    /// fixtures the same id.
+    #[serde(default)]
+    pub next_luminaire_id: u32,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

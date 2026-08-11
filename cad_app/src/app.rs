@@ -1931,6 +1931,11 @@ pub struct CadApp {
     stretch_window_box: Option<(Vec2, Vec2)>,
     /// In-app file browser (Open / Save As). `None` when closed.
     file_dialog: Option<FileDialog>,
+    /// A pointer gesture on the plan that belongs to the SIMLUX lighting layout (placing a point,
+    /// or dragging a fixture). Latched from press to release, because the drafting canvas decides
+    /// what a click meant at RELEASE time: without the latch, dropping a light point on press
+    /// would still let the release select whatever entity was underneath.
+    light_gesture: bool,
     /// Imported raster awaiting the raster→vector editor (see `cad_raster`).
     raster_doc: Option<cad_raster::RasterDoc>,
     /// The open raster→vector editor (examine + adjust). `Some` after import.
@@ -2903,7 +2908,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture, PickFolder, ImportHdri }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportObj, ImportTexture, PickFolder, ImportHdri, ImportIes }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -3675,6 +3680,7 @@ impl Default for CadApp {
             pending_release_swallow: false,
             stretch_window_box: None,
             file_dialog: None,
+            light_gesture: false,
             raster_doc: None,
             raster_editor: None,
             underlay_tex: Vec::new(),
@@ -3922,6 +3928,9 @@ impl CadApp {
         if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
         if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
+        if action.import_photometry {
+            self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
+        }
         if action.calculate {
             self.light.calculate(&self.doc, Some(&self.factory));
         }
@@ -3960,21 +3969,191 @@ impl CadApp {
         }
     }
 
+    /// Pick tolerance for a luminaire marker, converted from screen pixels to WORLD METRES.
+    ///
+    /// The marker is drawn at a fixed pixel size, so its grab radius has to be a fixed pixel size
+    /// too — a world-space tolerance would be impossible to hit zoomed out and would swallow half
+    /// the room zoomed in. Two conversions, because the plan is in drawing units and the lighting
+    /// layout is in metres: px → drawing units (`self.scale`) → metres (the document unit).
+    fn lum_pick_tol_m(&self) -> f32 {
+        let px_per_m = self.doc.units.from_metres(1.0) as f32 * self.scale;
+        crate::light::PICK_PX / px_per_m.max(1e-6)
+    }
+
+    /// SIMLUX luminaire editing on the 2D plan — place, select, drag, delete.
+    ///
+    /// This is the whole point of the two-step workflow: a light POINT is a mark on the plan that
+    /// stays editable. Before this, "place" was a checkbox that nothing read — no click handler
+    /// existed anywhere — so a fixture could only ever arrive via the grid array and, once there,
+    /// could not be moved at all.
+    ///
+    /// Returns TRUE when the gesture belongs to the lighting layout, so the drafting canvas can
+    /// skip its own click/drag handling for that frame. It deliberately does NOT feed
+    /// `canvas_locked`: panning and zooming must keep working while points are being placed, and
+    /// that gate stops them.
+    fn simlux_pointer_2d(
+        &mut self,
+        resp: &egui::Response,
+        rect: egui::Rect,
+        ctx: &egui::Context,
+    ) -> bool {
+        // Only while SIMLUX is on screen. The markers are not drawn otherwise either, and an
+        // invisible thing must never eat a click.
+        if !(self.light.simlux_mode || self.light.view3d_open || self.light.window_open) {
+            self.light.hover = None;
+            self.light.drag = None;
+            self.light_gesture = false;
+            return false;
+        }
+        let tol = self.lum_pick_tol_m();
+        // `interact_pointer_pos` first: during a drag the pointer may leave the canvas, and the
+        // fixture should keep following it rather than freeze at the edge.
+        let ptr = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
+        let at = ptr.map(|p| {
+            let w = self.s2w_m(p, rect);
+            (w.x as f32, w.y as f32)
+        });
+        let over_canvas = ptr.is_some_and(|p| rect.contains(p));
+        self.light.hover = match at {
+            Some((x, y)) if over_canvas => self.light.pick_at(x, y, tol),
+            _ => None,
+        };
+
+        // ---- a drag in progress owns everything until the button comes up ----
+        if self.light.drag.is_some() {
+            if let Some(a) = at {
+                self.light.drag_to(a);
+            }
+            if ctx.input(|i| i.pointer.primary_released()) {
+                self.light.end_drag();
+            }
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            self.light_gesture = true;
+            return true;
+        }
+
+        // ---- press: grab a marker, or drop a new point ----
+        if ctx.input(|i| i.pointer.primary_pressed()) && over_canvas {
+            if let Some((x, y)) = at {
+                let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                if let Some(id) = self.light.pick_at(x, y, tol) {
+                    if additive {
+                        self.light.select(id, true);
+                    } else {
+                        // A press on a marker starts a drag AND selects it. A press that never
+                        // moves ends as a plain selection (`end_drag` reports it did nothing), so
+                        // one gesture covers both "pick this one" and "move this one".
+                        self.light.begin_drag(id, (x, y));
+                    }
+                    self.light_gesture = true;
+                    return true;
+                }
+                if self.light.place_mode {
+                    let id = self.light.place_point(x, y);
+                    // Placing arms a drag on the new point, so press-move-release puts it down
+                    // AND positions it in one gesture — and a plain click leaves it where it fell.
+                    self.light.begin_drag(id, (x, y));
+                    self.light_gesture = true;
+                    return true;
+                }
+                // A click on bare plan with fixtures selected drops the selection — but does NOT
+                // consume the click, so the drafting canvas selects entities exactly as before.
+                if !self.light.selected.is_empty() {
+                    self.light.clear_selection();
+                }
+            }
+        }
+        if ctx.input(|i| i.pointer.primary_released()) {
+            self.light_gesture = false;
+        }
+
+        // ---- keys: Esc leaves placement, Del removes the selected fixtures ----
+        //
+        // Only while nothing has keyboard focus. `Context::input` reads RAW key state, which a
+        // focused text field does not filter — without this guard, pressing Delete while editing
+        // the command line or a fitting's name would quietly delete fixtures on the plan.
+        let typing = ctx.memory(|m| m.focused().is_some());
+        if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.light.place_mode {
+                self.light.place_mode = false;
+                self.light.last_msg = "Stopped placing.".into();
+            } else if !self.light.selected.is_empty() {
+                self.light.clear_selection();
+            }
+        }
+        // Delete is the drafting ERASE key, so it is only taken when the drawing has no selection
+        // of its own — otherwise a light selection left over from earlier would silently swallow
+        // an erase the user meant for the geometry.
+        if !typing
+            && !self.light.selected.is_empty()
+            && self.selection.is_empty()
+            && self.selected.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
+        {
+            self.light.delete_selected();
+        }
+
+        // Cursor + gesture ownership: while placing, the plan IS the placement tool, so clicks
+        // belong to it for as long as the mode is on.
+        if self.light.hover.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            return over_canvas;
+        }
+        if self.light.place_mode && over_canvas {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            return true;
+        }
+        self.light_gesture
+    }
+
     /// Paint placed luminaires as markers on the 2D plan.
+    ///
+    /// Three states have to be readable at a glance, because each one means a different next
+    /// action: SELECTED (what a drag/delete/assign will act on), UNASSIGNED (a point that will
+    /// emit nothing until a fitting is chosen), and hovered (what a press will grab). An
+    /// unassigned point is drawn HOLLOW — it is a mark on the plan, not a light yet.
     fn paint_luminaires_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if self.light.luminaires.is_empty() {
+        let show_ghost = self.light.place_mode
+            && (self.light.simlux_mode || self.light.view3d_open || self.light.window_open);
+        if self.light.luminaires.is_empty() && !show_ghost {
             return;
         }
         let clip = painter.with_clip_rect(rect);
         let gold = egui::Color32::from_rgb(255, 214, 90);
         let dark = egui::Color32::from_rgb(70, 48, 0);
+        let sel = egui::Color32::from_rgb(120, 190, 255);
+        let waiting = egui::Color32::from_rgb(230, 170, 90);
         for l in &self.light.luminaires {
             // Luminaire positions are METRES (cad_light `Vertex`).
             let p = self.w2s_m(Vec2::new(l.position.x as f64, l.position.y as f64), rect);
-            clip.circle_filled(p, 5.0, gold);
-            clip.circle_stroke(p, 8.0, egui::Stroke::new(1.5, dark));
-            clip.line_segment([egui::pos2(p.x - 9.0, p.y), egui::pos2(p.x + 9.0, p.y)], egui::Stroke::new(1.0, gold));
-            clip.line_segment([egui::pos2(p.x, p.y - 9.0), egui::pos2(p.x, p.y + 9.0)], egui::Stroke::new(1.0, gold));
+            let is_sel = self.light.selected.contains(&l.id);
+            let is_hot = self.light.hover == Some(l.id);
+            let assigned = self.light.is_assigned(l);
+            let body = if assigned { gold } else { waiting };
+            if assigned {
+                clip.circle_filled(p, 5.0, body);
+            } else {
+                // Hollow: nothing is emitting here yet.
+                clip.circle_stroke(p, 5.0, egui::Stroke::new(1.5, body));
+            }
+            clip.circle_stroke(p, 8.0, egui::Stroke::new(1.5, if is_sel { sel } else { dark }));
+            if is_sel || is_hot {
+                clip.circle_stroke(p, 11.0, egui::Stroke::new(1.0, if is_sel { sel } else { gold }));
+            }
+            clip.line_segment([egui::pos2(p.x - 9.0, p.y), egui::pos2(p.x + 9.0, p.y)], egui::Stroke::new(1.0, body));
+            clip.line_segment([egui::pos2(p.x, p.y - 9.0), egui::pos2(p.x, p.y + 9.0)], egui::Stroke::new(1.0, body));
+        }
+        // The ghost marker under the cursor, so placement mode is visible on the PLAN and not only
+        // in a toolbar that is on the other half of the screen.
+        if show_ghost {
+            if let Some(p) = painter.ctx().pointer_hover_pos() {
+                if rect.contains(p) {
+                    let faint = egui::Color32::from_rgba_unmultiplied(255, 214, 90, 110);
+                    clip.circle_stroke(p, 5.0, egui::Stroke::new(1.0, faint));
+                    clip.line_segment([egui::pos2(p.x - 12.0, p.y), egui::pos2(p.x + 12.0, p.y)], egui::Stroke::new(1.0, faint));
+                    clip.line_segment([egui::pos2(p.x, p.y - 12.0), egui::pos2(p.x, p.y + 12.0)], egui::Stroke::new(1.0, faint));
+                }
+            }
         }
     }
 
@@ -11658,6 +11837,9 @@ impl CadApp {
         let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
         let mut leave_workspace = false;
+        // Opening the picker mutates `self.file_dialog`, and the panel closure already holds
+        // `self` — so the request is carried out after the panel is drawn.
+        let mut open_ies_picker = false;
         let base = egui::SidePanel::right("simlux_3d_panel").min_width(220.0);
         let base = if split {
             base.exact_width(half)
@@ -11682,6 +11864,9 @@ impl CadApp {
                 // to be a bare colour legend here and a tall column of numbered steps in a side
                 // panel, so "how do I add a light" had no answer anywhere on screen.
                 let act = self.light.toolbar_ui(ui);
+                if act.import_photometry {
+                    open_ies_picker = true;
+                }
                 if act.calculate {
                     self.light.calculate(&self.doc, Some(&self.factory));
                 }
@@ -11764,6 +11949,9 @@ impl CadApp {
                     ui.ctx().request_repaint();
                 }
             });
+        if open_ies_picker {
+            self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
+        }
         if leave_workspace {
             // ✕ in workspace mode exits the split entirely.
             self.light.simlux_mode = false;
@@ -26039,6 +26227,10 @@ impl CadApp {
                             lname.ends_with(".obj") || lname.ends_with(".3ds")
                             || lname.ends_with(".fbx") || lname.ends_with(".glb")
                             || lname.ends_with(".gltf"),
+                        // Photometric files. `.ies` is LM-63, `.ldt` EULUMDAT - between them,
+                        // what every manufacturer publishes.
+                        FileDialogMode::ImportIes =>
+                            lname.ends_with(".ies") || lname.ends_with(".ldt"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
                         FileDialogMode::PickFolder => false, // folders only
                     };
@@ -26061,6 +26253,7 @@ impl CadApp {
             FileDialogMode::ImportObj    => "Import furniture  ·  OBJ / 3DS / FBX / glTF",
             FileDialogMode::ImportTexture => "Load texture  ·  PNG / JPG image",
             FileDialogMode::ImportHdri => "Load environment  ·  HDR / EXR",
+            FileDialogMode::ImportIes => "Import light file  ·  IES / EULUMDAT",
             FileDialogMode::Save => "Save As",
             FileDialogMode::PickFolder => "Choose output folder  ·  Radiance render",
         };
@@ -26147,7 +26340,7 @@ impl CadApp {
                                     FileDialogMode::Open => "Type  ",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
                                     | FileDialogMode::ImportObj | FileDialogMode::ImportTexture => "Type  ",
-                                    FileDialogMode::ImportHdri => "Type  ",
+                                    FileDialogMode::ImportHdri | FileDialogMode::ImportIes => "Type  ",
                                     FileDialogMode::Save => "Format",
                                     FileDialogMode::PickFolder => unreachable!(),
                                 });
@@ -26171,6 +26364,7 @@ impl CadApp {
                                     | FileDialogMode::ImportTexture => "pick an image above",
                                     FileDialogMode::ImportObj => "pick an .obj, .3ds, .fbx, .glb or .gltf above",
                                     FileDialogMode::ImportHdri => "pick an .hdr or .exr above",
+                                    FileDialogMode::ImportIes => "pick an .ies or .ldt above",
                                     FileDialogMode::Save => "drawing name",
                                     FileDialogMode::PickFolder => "optional — new subfolder to create here",
                                 }));
@@ -26188,6 +26382,7 @@ impl CadApp {
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster
                                     | FileDialogMode::ImportObj | FileDialogMode::ImportTexture
                                     | FileDialogMode::ImportHdri => "Open",
+                                    FileDialogMode::ImportIes => "Import",
                                     FileDialogMode::Save => "Save",
                                     FileDialogMode::PickFolder => "Use this folder",
                                 };
@@ -26342,6 +26537,13 @@ impl CadApp {
                 FileDialogMode::ImportTexture => {
                     let path = dlg.dir.join(name);
                     self.load_texture_from_file(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportIes => {
+                    // A photometric file joins the FITTINGS library and becomes the chosen one,
+                    // the same way an imported mesh joins the furniture library.
+                    let path = dlg.dir.join(name);
+                    self.light.load_photometry(&path.to_string_lossy());
+                    self.history.push(format!("  {}", self.light.last_msg));
                 }
                 FileDialogMode::ImportHdri => {
                     // Loading does the SH projection and the GGX prefilter, once. Both are
@@ -37816,6 +38018,10 @@ impl eframe::App for CadApp {
             // all block editing happens inside that window. Every interaction
             // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
             let canvas_locked = self.block_editor.is_some();
+            // SIMLUX: placing / moving light points on the plan. Gates the primary click+drag
+            // handlers only (see `simlux_pointer_2d`) — pan, zoom and the right-click menu stay
+            // live, because laying out a lighting grid means moving around the drawing.
+            let light_grab = !canvas_locked && self.simlux_pointer_2d(&resp, rect, ctx);
             // ---- right-click shortcut (context) menu --------------------
             // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
             // when there's a selection or something on the clipboard.
@@ -38227,8 +38433,8 @@ impl eframe::App for CadApp {
             // resp.clicked() fires only when egui classifies the press+release
             // as a click (small motion); drag_stopped() fires when a release
             // ends a drag — including a "click" that egui saw as a tiny drag.
-            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom;
-            let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom;
+            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom && !light_grab;
+            let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom && !light_grab;
             // SESSION RECORDER — every mouse press/release with the
             // FULL gesture context. Press position is stashed on self
             // and re-read at release time to derive the real drag
@@ -38482,6 +38688,7 @@ impl eframe::App for CadApp {
             let press_fires_click = in_click_only_phase;
             let press_now = press_fires_click
                 && !rt_zoom
+                && !light_grab
                 && ctx.input(|i| i.pointer.primary_pressed())
                 && resp.contains_pointer();
             let click_now = if press_fires_click { press_now } else { click_now };
@@ -38498,7 +38705,7 @@ impl eframe::App for CadApp {
             // Geom::with_grip_moved() decides what changes (e.g. circle
             // quadrant → radius; line midpoint → translate whole line).
             let mut grip_drag_consumed_click = false;
-            if pointer_mode_idle && self.env.GrpEnb && !rt_zoom {
+            if pointer_mode_idle && self.env.GrpEnb && !rt_zoom && !light_grab {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary)
                     && !canvas_locked;
                 // Drag-grab ONLY: a primary-button drag that begins near a grip.

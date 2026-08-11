@@ -18,6 +18,37 @@ use cad_kernel::Document;
 /// Key for the always-available synthetic luminaire (works before any IES import).
 pub const BUILTIN: &str = "Built-in downlight (1000 cd)";
 
+/// A placed point that has no fitting on it yet.
+///
+/// The workflow is deliberately two-step — mark WHERE the lights go, then say WHICH fitting goes
+/// in each spot — because that is the order the decisions are actually made: the layout comes from
+/// the room and the fitting comes from a catalogue, often after the layout is agreed. An empty
+/// profile name is the honest representation of "not chosen yet": the engine skips it (an unknown
+/// profile contributes nothing), the marker is drawn hollow, and the toolbar says how many are
+/// still waiting rather than quietly substituting a light the user never picked.
+pub const UNASSIGNED: &str = "";
+
+/// Pick radius for a luminaire marker on the 2D plan, in SCREEN pixels.
+///
+/// Screen-space, not world-space: a fixture must be as easy to grab zoomed out as zoomed in, and
+/// this is the same reasoning the grip pick radius (`GrpHvR`) already follows.
+pub const PICK_PX: f32 = 11.0;
+
+/// A drag in progress on the plan: which fixtures, and where they were when it started.
+///
+/// Positions are captured at PRESS so the drag is always measured from the original pose. Applying
+/// per-frame deltas instead accumulates rounding, and a drag that is nudged back to where it began
+/// would not land back on the same coordinates.
+#[derive(Clone, Debug)]
+pub struct LumDrag {
+    /// `(id, x, y)` at press time — every selected fixture moves together.
+    pub start: Vec<(u32, f32, f32)>,
+    /// Plan point (metres) the drag began at.
+    pub from: (f32, f32),
+    /// Set once the pointer has actually moved, so a press-and-release stays a click.
+    pub moved: bool,
+}
+
 /// Turn the 3D Factory's evaluated solid into lighting geometry.
 ///
 /// SIMLUX used to build its scene by EXTRUDING THE 2D DOCUMENT — every closed outline pulled up to
@@ -179,6 +210,9 @@ pub struct LightAction {
     pub remove_layer: Option<u32>,
     /// Move the current selection onto the dedicated SIMLUX layer + use it for 3D.
     pub shift_to_simlux: bool,
+    /// Open the file browser to import a photometric file — the same gesture as importing
+    /// furniture, because it is the same kind of act: bringing a manufacturer's product in.
+    pub import_photometry: bool,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -219,6 +253,14 @@ pub struct LightState {
     pub auto_center_light: bool,
     /// When set, canvas clicks drop a luminaire (P4 placement mode).
     pub place_mode: bool,
+    /// Ids of the selected fixtures. Selection is what "assign a fitting", "delete" and "drag"
+    /// all act on, so it is the one piece of state the whole editing flow shares.
+    pub selected: Vec<u32>,
+    /// Fixture under the pointer, refreshed each frame by the canvas handler — the marker lights
+    /// up before it is pressed, so it is clear WHAT will be grabbed.
+    pub hover: Option<u32>,
+    /// A drag in progress, if any.
+    pub drag: Option<LumDrag>,
     /// Monotonic id source for placed luminaires.
     pub next_id: u32,
     /// Rows/columns for the ▼ Luminaires grid array — the usual way a room is lit.
@@ -276,7 +318,11 @@ impl LightState {
         Self {
             window_open: false,
             profiles,
-            active_profile: BUILTIN.to_string(),
+            // NOT the built-in. Starting with a fitting already chosen makes the second step of
+            // the workflow invisible: every point silently becomes a generic downlight and the
+            // user never learns that a fitting is something they pick. Empty means "not chosen",
+            // which is the truth on a fresh project.
+            active_profile: UNASSIGNED.to_string(),
             materials: default_materials(),
             room_height: 3.0,
             room: Vec::new(),
@@ -286,6 +332,9 @@ impl LightState {
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
+            selected: Vec::new(),
+            hover: None,
+            drag: None,
             next_id: 1,
             array_rows: 3,
             array_cols: 4,
@@ -298,7 +347,8 @@ impl LightState {
             show_overlay: true,
             scale_max: None,
             ies_path: String::new(),
-            last_msg: "Draw a room, set the height, then Calculate.".to_string(),
+            last_msg: "① Import your light files · ② click the plan to mark where they go · ③ pick a fitting for them."
+                .to_string(),
             view3d_open: false,
             simlux_mode: false,
             simlux_fit_pending: false,
@@ -318,6 +368,254 @@ impl LightState {
             .max(1e-3)
     }
 
+    /// The fitting a NEW point should get: the chosen one, or nothing.
+    fn default_profile(&self) -> String {
+        if self.profiles.contains_key(&self.active_profile) {
+            self.active_profile.clone()
+        } else {
+            UNASSIGNED.to_string()
+        }
+    }
+
+    /// Fixtures that still have no fitting on them.
+    pub fn unassigned_count(&self) -> usize {
+        self.luminaires
+            .iter()
+            .filter(|l| !self.profiles.contains_key(&l.profile))
+            .count()
+    }
+
+    /// True when this fixture has a real fitting behind it — the marker is drawn solid, and the
+    /// engine will actually emit from it.
+    pub fn is_assigned(&self, l: &Luminaire) -> bool {
+        self.profiles.contains_key(&l.profile)
+    }
+
+    /// Mounting height for a point on the plan: the ceiling above it, less the drop.
+    ///
+    /// Shared by every placement path — single click, grid array, and the re-mount after a drag —
+    /// so a fixture moved under a lower soffit ends up exactly where the array would have put it.
+    /// The search starts at the WORK PLANE, which is inside the room by definition; starting at
+    /// the floor would catch the floor slab's own underside from the storey below.
+    pub fn mount_z_at(&self, x: f32, y: f32) -> (f32, bool) {
+        match (self.mount_to_ceiling, ceiling_above(&self.meshes, x, y, self.plane_height)) {
+            (true, Some(zc)) => (zc - self.ceiling_drop, true),
+            _ => (self.mount_height, false),
+        }
+    }
+
+    /// The fixture nearest `(x, y)` within `tol` metres, or `None`.
+    ///
+    /// Nearest rather than first-within-tolerance: on a tight pitch two markers overlap, and
+    /// grabbing whichever happens to be earlier in the list is how a drag moves the wrong light.
+    pub fn pick_at(&self, x: f32, y: f32, tol: f32) -> Option<u32> {
+        let mut best: Option<(f32, u32)> = None;
+        for l in &self.luminaires {
+            let (dx, dy) = (l.position.x - x, l.position.y - y);
+            let d2 = dx * dx + dy * dy;
+            if d2 <= tol * tol && best.is_none_or(|(b, _)| d2 < b) {
+                best = Some((d2, l.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Drop a light POINT at `(x, y)` — step ② of the workflow. Returns its id.
+    ///
+    /// The point carries whatever fitting is currently chosen, which is usually nothing: marking
+    /// out a layout does not require having decided on a product yet.
+    pub fn place_point(&mut self, x: f32, y: f32) -> u32 {
+        let (z, on_ceiling) = self.mount_z_at(x, y);
+        let id = self.next_id;
+        self.next_id += 1;
+        let profile = self.default_profile();
+        self.luminaires.push(Luminaire {
+            id,
+            profile: profile.clone(),
+            position: Vertex::new(x, y, z),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        });
+        self.selected = vec![id];
+        let what = if profile.is_empty() {
+            "no fitting yet".to_string()
+        } else {
+            profile.clone()
+        };
+        self.last_msg = format!(
+            "Point #{id} at ({x:.2}, {y:.2}) · {z:.2} m{} · {what} — {} point(s) placed.",
+            if on_ceiling { " (ceiling)" } else { "" },
+            self.luminaires.len(),
+        );
+        id
+    }
+
+    /// Select one fixture. `additive` (Shift/Ctrl) toggles it into the existing selection.
+    pub fn select(&mut self, id: u32, additive: bool) {
+        if additive {
+            if let Some(i) = self.selected.iter().position(|&s| s == id) {
+                self.selected.remove(i);
+            } else {
+                self.selected.push(id);
+            }
+        } else {
+            self.selected = vec![id];
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+    }
+
+    pub fn select_all(&mut self) {
+        self.selected = self.luminaires.iter().map(|l| l.id).collect();
+    }
+
+    /// Start dragging. A press on an UNSELECTED fixture selects it first, so a drag always moves
+    /// what is under the pointer rather than a selection made earlier and forgotten.
+    pub fn begin_drag(&mut self, id: u32, at: (f32, f32)) {
+        if !self.selected.contains(&id) {
+            self.selected = vec![id];
+        }
+        let start = self
+            .luminaires
+            .iter()
+            .filter(|l| self.selected.contains(&l.id))
+            .map(|l| (l.id, l.position.x, l.position.y))
+            .collect();
+        self.drag = Some(LumDrag { start, from: at, moved: false });
+    }
+
+    /// Move the dragged fixtures so the grabbed one follows the pointer.
+    pub fn drag_to(&mut self, at: (f32, f32)) {
+        let Some(d) = self.drag.as_mut() else { return };
+        let (dx, dy) = (at.0 - d.from.0, at.1 - d.from.1);
+        if dx.abs() > 1e-4 || dy.abs() > 1e-4 {
+            d.moved = true;
+        }
+        let start = d.start.clone();
+        for (id, x0, y0) in start {
+            if let Some(l) = self.luminaires.iter_mut().find(|l| l.id == id) {
+                l.position.x = x0 + dx;
+                l.position.y = y0 + dy;
+            }
+        }
+    }
+
+    /// Finish a drag: re-mount every fixture that moved, and report. Returns whether anything
+    /// actually moved (a press-and-release that never moved is a click, and stays a selection).
+    ///
+    /// The re-mount is the point of doing this at the END rather than per frame: `ceiling_above`
+    /// walks the whole model, so dragging across a 500k-triangle building would cost that on every
+    /// frame — and the height is only interesting once the fixture has landed somewhere.
+    pub fn end_drag(&mut self) -> bool {
+        let Some(d) = self.drag.take() else { return false };
+        if !d.moved {
+            return false;
+        }
+        let ids: Vec<u32> = d.start.iter().map(|(id, _, _)| *id).collect();
+        let mut zlo = f32::INFINITY;
+        let mut zhi = f32::NEG_INFINITY;
+        for id in &ids {
+            let Some((x, y)) = self
+                .luminaires
+                .iter()
+                .find(|l| l.id == *id)
+                .map(|l| (l.position.x, l.position.y))
+            else {
+                continue;
+            };
+            let (z, _) = self.mount_z_at(x, y);
+            if let Some(l) = self.luminaires.iter_mut().find(|l| l.id == *id) {
+                l.position.z = z;
+            }
+            zlo = zlo.min(z);
+            zhi = zhi.max(z);
+        }
+        let height = if (zhi - zlo).abs() < 1e-3 {
+            format!("{zlo:.2} m")
+        } else {
+            format!("{zlo:.2}–{zhi:.2} m")
+        };
+        self.last_msg = format!(
+            "Moved {} fixture(s) — now at {height}. Re-run Calculate to update the result.",
+            ids.len()
+        );
+        true
+    }
+
+    /// Delete the selected fixtures. Returns how many went.
+    pub fn delete_selected(&mut self) -> usize {
+        let before = self.luminaires.len();
+        let sel = std::mem::take(&mut self.selected);
+        self.luminaires.retain(|l| !sel.contains(&l.id));
+        let n = before - self.luminaires.len();
+        if n > 0 {
+            self.last_msg = format!("Deleted {n} fixture(s) — {} left.", self.luminaires.len());
+        }
+        self.drag = None;
+        n
+    }
+
+    /// Put `name` on the fixtures that should get it — step ③.
+    ///
+    /// Targets, in order: the SELECTION if there is one, else every point still waiting for a
+    /// fitting, else nothing (the fitting simply becomes the default for the next point placed).
+    /// That order is what makes one click do the obvious thing in each of the three situations a
+    /// user is actually in — some points picked out, a fresh layout to fill, or setting up before
+    /// placing anything.
+    pub fn assign_profile(&mut self, name: &str) -> usize {
+        self.active_profile = name.to_string();
+        let known: Vec<String> = self.profiles.keys().cloned().collect();
+        let targets: Vec<u32> = if !self.selected.is_empty() {
+            self.selected.clone()
+        } else {
+            self.luminaires
+                .iter()
+                .filter(|l| !known.contains(&l.profile))
+                .map(|l| l.id)
+                .collect()
+        };
+        for l in self.luminaires.iter_mut() {
+            if targets.contains(&l.id) {
+                l.profile = name.to_string();
+            }
+        }
+        let n = targets.len();
+        self.last_msg = if n == 0 {
+            format!("'{name}' is now the fitting for new points — click the plan to place them.")
+        } else if !self.selected.is_empty() {
+            format!("Assigned '{name}' to {n} selected fixture(s) — press Calculate.")
+        } else {
+            format!("Assigned '{name}' to {n} point(s) that had none — press Calculate.")
+        };
+        n
+    }
+
+    /// Forget an imported fitting. Fixtures that used it fall back to unassigned rather than
+    /// silently pointing at a profile that no longer exists.
+    pub fn remove_profile(&mut self, name: &str) {
+        if name == BUILTIN {
+            return; // the built-in is generated, not imported — there is nothing to remove
+        }
+        self.profiles.remove(name);
+        let mut orphaned = 0;
+        for l in self.luminaires.iter_mut() {
+            if l.profile == name {
+                l.profile = UNASSIGNED.to_string();
+                orphaned += 1;
+            }
+        }
+        if self.active_profile == name {
+            self.active_profile = UNASSIGNED.to_string();
+        }
+        self.last_msg = if orphaned > 0 {
+            format!("Removed '{name}' — {orphaned} fixture(s) now need a fitting.")
+        } else {
+            format!("Removed '{name}'.")
+        };
+    }
+
     /// Load a photometric file — IES (`.ies`) or EULUMDAT (`.ldt`).
     ///
     /// The FORMAT IS CHOSEN BY CONTENT, with the extension only as a tie-break. Manufacturers
@@ -329,15 +627,24 @@ impl LightState {
     /// bytes are read raw and mapped, which is exact for the printable range either format uses.
     fn import_photometry(&mut self) {
         let path = self.ies_path.trim().trim_matches('"').to_string();
+        self.load_photometry(&path);
+    }
+
+    /// Import the photometric file at `path` into the library, and make it the chosen fitting.
+    ///
+    /// Public because the file browser calls it: photometry is imported the way furniture is,
+    /// through the same picker, rather than by typing a path into a box.
+    pub fn load_photometry(&mut self, path: &str) -> bool {
+        let path = path.trim().trim_matches('"').to_string();
         if path.is_empty() {
             self.last_msg = "Enter a .ies or .ldt file path first.".to_string();
-            return;
+            return false;
         }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
                 self.last_msg = format!("Read error: {e}");
-                return;
+                return false;
             }
         };
         let text: String = match String::from_utf8(bytes.clone()) {
@@ -376,17 +683,28 @@ impl LightState {
                 let key = prof.name.clone();
                 // Report the photometry, not just the name: a wrong flux or a peak in the wrong
                 // place is visible here and nowhere else until the whole calculation looks odd.
-                self.last_msg = format!(
-                    "Loaded {kind} '{key}' — {:.0} lm, {:.0} W, peak {:.0} cd",
+                let detail = format!(
+                    "{:.0} lm, {:.0} W, peak {:.0} cd",
                     prof.lumens.max(0.0),
                     prof.watts,
                     prof.peak_candela(),
                 );
-                self.active_profile = key.clone();
-                self.profiles.insert(key, prof);
+                self.profiles.insert(key.clone(), prof);
+                self.ies_path = path.clone();
+                // An import makes it the chosen fitting AND fills in any points already marked
+                // out — importing a file right after laying out a grid is the common order, and
+                // having to click the fitting again afterwards is a step with no decision in it.
+                let n = self.assign_profile(&key);
+                self.last_msg = if n > 0 {
+                    format!("Loaded {kind} '{key}' ({detail}) → {n} fixture(s).")
+                } else {
+                    format!("Loaded {kind} '{key}' — {detail}. Click the plan to place it.")
+                };
+                return true;
             }
             Err(e) => self.last_msg = format!("{kind} parse error: {e}"),
         }
+        false
     }
 
     /// Drop a luminaire at plan position (x, y) on the mounting plane.
@@ -417,35 +735,35 @@ impl LightState {
         let mut n = 0;
         let mut found_ceiling = 0usize;
         let (mut zlo, mut zhi) = (f32::INFINITY, f32::NEG_INFINITY);
+        let profile = self.default_profile();
+        let mut placed = Vec::new();
         for r in 0..rows {
             for c in 0..cols {
                 let x = x0 + dx * (c as f32 + 0.5);
                 let y = y0 + dy * (r as f32 + 0.5);
-                // Each fixture finds ITS OWN ceiling. Search from the work plane, which is inside
-                // the room by definition — starting at the floor would catch the floor slab's own
-                // underside from the storey below.
-                let z = match (self.mount_to_ceiling, ceiling_above(&self.meshes, x, y, self.plane_height)) {
-                    (true, Some(zc)) => {
-                        found_ceiling += 1;
-                        zc - self.ceiling_drop
-                    }
-                    // Nothing overhead, or the user asked for a fixed height.
-                    _ => self.mount_height,
-                };
+                // Each fixture finds ITS OWN ceiling — see `mount_z_at`.
+                let (z, on_ceiling) = self.mount_z_at(x, y);
+                if on_ceiling {
+                    found_ceiling += 1;
+                }
                 zlo = zlo.min(z);
                 zhi = zhi.max(z);
                 let id = self.next_id;
                 self.next_id += 1;
                 self.luminaires.push(Luminaire {
                     id,
-                    profile: self.active_profile.clone(),
+                    profile: profile.clone(),
                     position: Vertex::new(x, y, z),
                     rotation_deg: 0.0,
                     dimming: 1.0,
                 });
+                placed.push(id);
                 n += 1;
             }
         }
+        // The new array IS the selection, so the next act — choosing a fitting for it, nudging it,
+        // deleting it because the pitch was wrong — needs no further picking.
+        self.selected = placed;
         // Report the SPREAD of mounting heights, not just one number: on a stepped ceiling that
         // spread is the useful fact, and it is the only sign that some fixtures found no ceiling
         // and fell back.
@@ -456,11 +774,16 @@ impl LightState {
         };
         let missed = n - found_ceiling;
         self.last_msg = format!(
-            "Placed {n} fixtures ({rows}×{cols}) at {height}, {dx:.2} × {dy:.2} m pitch{} — press Calculate.",
+            "Placed {n} points ({rows}×{cols}) at {height}, {dx:.2} × {dy:.2} m pitch{}{}",
             if self.mount_to_ceiling && missed > 0 {
                 format!(" · {missed} found no ceiling and used {:.2} m", self.mount_height)
             } else {
                 String::new()
+            },
+            if profile.is_empty() {
+                " — now pick a fitting for them in ▼ Fittings."
+            } else {
+                " — press Calculate."
             },
         );
         n
@@ -469,19 +792,6 @@ impl LightState {
     /// Plan-view bounds of the current lighting geometry, for laying out an array.
     pub fn room_bounds(&self) -> Option<(f32, f32, f32, f32)> {
         mesh_bbox(&self.meshes)
-    }
-
-    pub fn add_luminaire_at(&mut self, x: f32, y: f32) {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.luminaires.push(Luminaire {
-            id,
-            profile: self.active_profile.clone(),
-            position: Vertex::new(x, y, self.mount_height),
-            rotation_deg: 0.0,
-            dimming: 1.0,
-        });
-        self.last_msg = format!("Placed fixture #{id} at ({x:.2}, {y:.2}) — press Calculate.");
     }
 
     /// Import (Phase B) every drafted dobject on `layer_id` into the room, at
@@ -571,7 +881,13 @@ impl LightState {
         let lums = if self.luminaires.is_empty() && self.auto_center_light {
             vec![Luminaire {
                 id: 1,
-                profile: self.active_profile.clone(),
+                // A stand-in light needs a real profile behind it or the "first look" it exists to
+                // give is a black room; the built-in is what that means.
+                profile: if self.profiles.contains_key(&self.active_profile) {
+                    self.active_profile.clone()
+                } else {
+                    BUILTIN.to_string()
+                },
                 position: Vertex::new(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), self.room_height),
                 rotation_deg: 0.0,
                 dimming: 1.0,
@@ -580,9 +896,20 @@ impl LightState {
             self.luminaires.clone()
         };
         let grid = calc_lux(&meshes, &lums, &self.profiles, &self.materials, &plane, &self.settings);
+        // A point with no fitting emits nothing, and a result computed from half a layout looks
+        // exactly like a result computed from all of it. Say so, on the same line as the numbers.
+        let waiting = self.unassigned_count();
         self.last_msg = format!(
-            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx",
-            cols, rows, grid.avg, grid.min, grid.max
+            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx{}",
+            cols,
+            rows,
+            grid.avg,
+            grid.min,
+            grid.max,
+            match waiting {
+                0 => String::new(),
+                n => format!("  ⚠ {n} point(s) have no fitting and emit nothing — pick one in ▼ Fittings"),
+            },
         );
         self.grid = Some(grid);
         self.plane = Some(plane);
@@ -666,6 +993,8 @@ impl LightState {
             // Likewise the 3D Factory model: `light` doesn't own it, so it stays empty
             // here and the caller fills it from `factory.to_persist()`.
             factory: Default::default(),
+            luminaires: self.luminaires.clone(),
+            next_luminaire_id: self.next_id,
         }
     }
 
@@ -676,8 +1005,25 @@ impl LightState {
         for (k, v) in cfg.ies_library {
             self.profiles.insert(k, v);
         }
-        if self.profiles.contains_key(&cfg.active_profile) {
+        // An EMPTY active profile is a real state — "no fitting chosen yet" — so it restores as
+        // written. Anything else has to name a fitting that is actually in the library.
+        if cfg.active_profile.is_empty() || self.profiles.contains_key(&cfg.active_profile) {
             self.active_profile = cfg.active_profile;
+        }
+        // The placed layout. A fixture whose fitting did not come back with the library is left
+        // unassigned — visible as a hollow marker and counted in the toolbar — rather than kept
+        // pointing at a name that resolves to nothing and silently emits no light.
+        if !cfg.luminaires.is_empty() {
+            self.luminaires = cfg.luminaires;
+            for l in self.luminaires.iter_mut() {
+                if !self.profiles.contains_key(&l.profile) {
+                    l.profile = UNASSIGNED.to_string();
+                }
+            }
+            self.selected.clear();
+            self.drag = None;
+            let highest = self.luminaires.iter().map(|l| l.id).max().unwrap_or(0);
+            self.next_id = cfg.next_luminaire_id.max(highest + 1);
         }
         if !cfg.materials.is_empty() {
             self.materials = cfg.materials;
@@ -714,26 +1060,129 @@ impl LightState {
     /// Factory solved this already: grouped `▼` menus on one wrapped row, with the state that
     /// matters on a line underneath. Matching it means one thing to learn, not two.
     ///
-    /// Grouped by the QUESTION being answered, not by the code behind it:
-    ///   Luminaires — what is emitting, and where
-    ///   Photometry — which real fitting it is
+    /// Grouped by the QUESTION being answered, not by the code behind it, and ordered by the
+    /// order the questions come up:
+    ///   Fittings — which real products are available, imported from the manufacturer's files
+    ///   Luminaires — where they go, and which fitting is in each spot
     ///   Calculation — how the answer is worked out
     ///   Surfaces — what the room is made of
     ///   Display — how the result is drawn
     pub fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
         let mut action = LightAction::default();
         ui.horizontal_wrapped(|ui| {
+            // ---- ① the LIBRARY of imported fittings -------------------------------------
+            //
+            // First on the bar because it is first in the workflow, and because a photometric
+            // file is a product brought into the project exactly as a piece of furniture is.
+            let waiting = self.unassigned_count();
+            let fittings = self.profiles.len();
+            ui.menu_button("▼ Fittings", |ui| {
+                if ui
+                    .button("📂  Import light file…")
+                    .on_hover_text("IES (.ies) or EULUMDAT (.ldt) from the manufacturer — the same picker furniture uses")
+                    .clicked()
+                {
+                    action.import_photometry = true;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(if waiting > 0 {
+                        format!("click a fitting → the {waiting} point(s) with none")
+                    } else if !self.selected.is_empty() {
+                        format!("click a fitting → the {} selected", self.selected.len())
+                    } else {
+                        "click a fitting → use it for new points".to_string()
+                    })
+                    .small()
+                    .weak(),
+                );
+                // Sorted, because a HashMap would reorder the list on every repaint and the entry
+                // under the cursor would not be the one that gets clicked.
+                let mut names: Vec<String> = self.profiles.keys().cloned().collect();
+                names.sort();
+                let mut assign: Option<String> = None;
+                let mut drop: Option<String> = None;
+                for n in &names {
+                    let active = *n == self.active_profile;
+                    let used = self.luminaires.iter().filter(|l| l.profile == *n).count();
+                    let detail = self.profiles.get(n).map(|p| {
+                        if p.lumens > 0.0 {
+                            format!("{:.0} lm · {:.0} W · peak {:.0} cd", p.lumens, p.watts, p.peak_candela())
+                        } else {
+                            format!("peak {:.0} cd", p.peak_candela())
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let label = if used > 0 { format!("{n}   ({used})") } else { n.clone() };
+                        if ui
+                            .selectable_label(active, label)
+                            .on_hover_text(detail.unwrap_or_default())
+                            .clicked()
+                        {
+                            assign = Some(n.clone());
+                        }
+                        if *n != BUILTIN && ui.small_button("✕").on_hover_text("Remove from the library").clicked() {
+                            drop = Some(n.clone());
+                        }
+                    });
+                }
+                if let Some(n) = assign {
+                    self.assign_profile(&n);
+                    ui.close_menu();
+                }
+                if let Some(n) = drop {
+                    self.remove_profile(&n);
+                }
+                if names.len() <= 1 {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Only the built-in is loaded.\nImport a manufacturer file to light\nthe real product.")
+                            .small()
+                            .weak(),
+                    );
+                }
+            })
+            .response
+            .on_hover_text(format!("{fittings} fitting(s) in the library"));
+
+            // ---- ② where the lights go, ③ what goes in each spot -----------------------
             ui.menu_button("▼ Luminaires", |ui| {
                 ui.label(egui::RichText::new("place").small().weak());
                 let placing = self.place_mode;
                 if ui
-                    .selectable_label(placing, if placing { "◉ Placing — click the plan" } else { "＋ Place one (click the plan)" })
-                    .on_hover_text("Then click in the 2D plan to drop a fixture at the mounting height")
+                    .selectable_label(placing, if placing { "◉ Placing — click the plan (Esc to stop)" } else { "＋ Place points on the plan" })
+                    .on_hover_text("Click the 2D plan to mark each spot. Points stay editable: drag to move, click to select, Del to delete.")
                     .clicked()
                 {
                     self.place_mode = !placing;
+                    if self.place_mode {
+                        self.last_msg = "Click the plan to mark each light position · drag a marker to move it · Esc to stop.".into();
+                    }
                     ui.close_menu();
                 }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("selection — {} of {}", self.selected.len(), self.luminaires.len()))
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("All").clicked() {
+                        self.select_all();
+                    }
+                    if ui.button("None").clicked() {
+                        self.clear_selection();
+                    }
+                    let can_del = !self.selected.is_empty();
+                    if ui
+                        .add_enabled(can_del, egui::Button::new("🗑 Delete"))
+                        .on_hover_text("Del also does this while the plan has focus")
+                        .clicked()
+                    {
+                        self.delete_selected();
+                    }
+                });
                 ui.separator();
                 ui.label(egui::RichText::new("array — the usual way to light a room").small().weak());
                 ui.horizontal(|ui| {
@@ -773,42 +1222,10 @@ impl LightState {
                 if ui.button("🗑  Remove all fixtures").clicked() {
                     let n = self.luminaires.len();
                     self.luminaires.clear();
+                    self.selected.clear();
+                    self.drag = None;
                     self.last_msg = format!("Removed {n} fixture(s).");
                     ui.close_menu();
-                }
-            });
-
-            ui.menu_button("▼ Photometry", |ui| {
-                ui.label(egui::RichText::new("IES (.ies) or EULUMDAT (.ldt)").small().weak());
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.ies_path)
-                            .desired_width(240.0)
-                            .hint_text(r"C:\path\to\fitting.ldt"),
-                    );
-                    if ui.button("Load").clicked() {
-                        self.import_photometry();
-                    }
-                });
-                ui.separator();
-                ui.label(egui::RichText::new("loaded — click to make active").small().weak());
-                // Sorted, because a HashMap would reorder the list on every repaint and the entry
-                // under the cursor would not be the one that gets clicked.
-                let mut names: Vec<String> = self.profiles.keys().cloned().collect();
-                names.sort();
-                for n in names {
-                    let active = n == self.active_profile;
-                    let detail = self.profiles.get(&n).map(|p| {
-                        if p.lumens > 0.0 {
-                            format!("{:.0} lm · {:.0} W · peak {:.0} cd", p.lumens, p.watts, p.peak_candela())
-                        } else {
-                            format!("peak {:.0} cd", p.peak_candela())
-                        }
-                    });
-                    if ui.selectable_label(active, &n).on_hover_text(detail.unwrap_or_default()).clicked() {
-                        self.active_profile = n.clone();
-                        ui.close_menu();
-                    }
                 }
             });
 
@@ -867,7 +1284,36 @@ impl LightState {
                     .small()
                     .strong(),
             );
-            ui.label(small(format!("· {}", self.active_profile)));
+            if !self.selected.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("· {} selected", self.selected.len()))
+                        .small()
+                        .color(egui::Color32::from_rgb(120, 190, 255)),
+                );
+            }
+            // The one number that explains a dark result, kept on screen rather than only in the
+            // message that the next status line overwrites.
+            let waiting = self.unassigned_count();
+            if waiting > 0 {
+                ui.label(
+                    egui::RichText::new(format!("· {waiting} need a fitting"))
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 170, 90)),
+                )
+                .on_hover_text("Points with no fitting emit nothing. ▼ Fittings → click one.");
+            }
+            ui.label(small(format!(
+                "· {}",
+                if self.active_profile.is_empty() { "no fitting chosen" } else { &self.active_profile }
+            )));
+            if self.place_mode {
+                ui.label(
+                    egui::RichText::new("· PLACING — click the plan")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 214, 90)),
+                );
+            }
             if let Some(g) = self.grid.as_ref() {
                 ui.label(small(format!("· avg {:.0} lx", g.avg)));
                 ui.label(small(format!("· min {:.0}", g.min)));
@@ -989,7 +1435,16 @@ impl LightState {
                 }
             });
         ui.horizontal(|ui| {
-            ui.label("IES:");
+            if ui
+                .button("📂  Import light file…")
+                .on_hover_text("IES (.ies) or EULUMDAT (.ldt)")
+                .clicked()
+            {
+                action.import_photometry = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("path:");
             ui.add(
                 egui::TextEdit::singleline(&mut self.ies_path)
                     .desired_width(150.0)
@@ -1010,30 +1465,59 @@ impl LightState {
         });
         let place_label = if self.place_mode { "◉ Placing… click the plan" } else { "＋ Place on plan" };
         if ui.selectable_label(self.place_mode, place_label)
-            .on_hover_text("Toggle, then click points on the 2D plan to drop fixtures. Esc / untoggle to stop.")
+            .on_hover_text("Toggle, then click points on the 2D plan to drop fixtures. Drag a marker to move it. Esc / untoggle to stop.")
             .clicked()
         {
             self.place_mode = !self.place_mode;
         }
         ui.add(egui::Slider::new(&mut self.mount_height, 0.0..=8.0).text("Mount height (m)"));
         if !self.luminaires.is_empty() {
-            let mut remove: Option<usize> = None;
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                for (i, l) in self.luminaires.iter_mut().enumerate() {
+            // The list is a SELECTION view, not a read-out: clicking a row selects that fixture on
+            // the plan, which is how you find #17 in a grid of forty identical markers.
+            let mut remove: Option<u32> = None;
+            let mut click: Option<u32> = None;
+            let known: Vec<String> = self.profiles.keys().cloned().collect();
+            let selected = self.selected.clone();
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for l in self.luminaires.iter_mut() {
+                    let sel = selected.contains(&l.id);
+                    let fitted = known.contains(&l.profile);
                     ui.horizontal(|ui| {
-                        ui.label(format!("#{}  ({:.1}, {:.1}, {:.1})", l.id, l.position.x, l.position.y, l.position.z));
+                        let label = format!(
+                            "#{}  ({:.1}, {:.1}, {:.1})  {}",
+                            l.id,
+                            l.position.x,
+                            l.position.y,
+                            l.position.z,
+                            if fitted { l.profile.as_str() } else { "— no fitting —" },
+                        );
+                        let text = if fitted {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).color(egui::Color32::from_rgb(230, 170, 90))
+                        };
+                        if ui.selectable_label(sel, text).clicked() {
+                            click = Some(l.id);
+                        }
                         if ui.small_button("✕").clicked() {
-                            remove = Some(i);
+                            remove = Some(l.id);
                         }
                         ui.add(egui::Slider::new(&mut l.dimming, 0.0..=1.0).text("dim"));
                     });
                 }
             });
-            if let Some(i) = remove {
-                self.luminaires.remove(i);
+            if let Some(id) = click {
+                let additive = ui.input(|i| i.modifiers.shift || i.modifiers.ctrl);
+                self.select(id, additive);
+            }
+            if let Some(id) = remove {
+                self.luminaires.retain(|l| l.id != id);
+                self.selected.retain(|&s| s != id);
             }
             if ui.button("Clear all fixtures").clicked() {
                 self.luminaires.clear();
+                self.selected.clear();
+                self.drag = None;
             }
         }
 
@@ -1305,7 +1789,7 @@ mod mounting_tests {
 
     /// Two bays at different ceiling heights, sharing a floor. Bay A spans x 0..6 with its ceiling
     /// at 4 m; bay B spans x 6..12 at 2.5 m — the shape of an entrance soffit beside a hall.
-    fn stepped_room() -> Vec<Mesh> {
+    pub(super) fn stepped_room() -> Vec<Mesh> {
         let quad = |z: f32, x0: f32, x1: f32, down: bool| -> Mesh {
             // Wound so the normal points DOWN when `down`, which is what marks an underside.
             let v = |x: f32, y: f32| Vertex::new(x, y, z);
@@ -1418,5 +1902,238 @@ mod mounting_tests {
         s.add_luminaire_grid((0.0, 0.0, 12.0, 8.0), 1, 4);
         assert!(s.luminaires.iter().all(|l| (l.position.z - 3.2).abs() < 1e-6),
             "with the toggle off every fixture sits at the set height");
+    }
+}
+
+/// Placing, picking, moving and fitting out the light points.
+///
+/// The workflow these cover is the one the user asked for: mark the spots first, choose the
+/// product afterwards, and be able to change your mind about either. Before this, "place" was a
+/// checkbox no click handler read, and a placed fixture could not be moved at all.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn room() -> LightState {
+        let mut s = LightState::new();
+        s.luminaires.clear();
+        s.mount_to_ceiling = false;
+        s.mount_height = 3.0;
+        s
+    }
+
+    /// A real fitting, so "assigned" can be told from "not".
+    fn fitting(name: &str) -> IesProfile {
+        let mut p = builtin_downlight();
+        p.name = name.to_string();
+        p
+    }
+
+    /// A fresh project has NO fitting chosen, so a placed point is a mark on the plan and nothing
+    /// more. Starting with the built-in already active would make step ③ invisible: every point
+    /// would silently become a generic downlight the user never picked.
+    #[test]
+    fn a_new_point_starts_without_a_fitting() {
+        let mut s = room();
+        assert_eq!(s.active_profile, UNASSIGNED, "nothing is chosen on a fresh project");
+        let id = s.place_point(2.0, 3.0);
+        assert_eq!(s.luminaires.len(), 1);
+        assert_eq!(s.unassigned_count(), 1, "the point is waiting for a fitting");
+        assert_eq!(s.selected, vec![id], "and it is selected, ready to be fitted out");
+        assert!(!s.is_assigned(&s.luminaires[0]));
+    }
+
+    /// Step ③: choosing a fitting fills in the points that have none.
+    #[test]
+    fn choosing_a_fitting_fills_in_the_points_that_have_none() {
+        let mut s = room();
+        s.profiles.insert("Downlight 3000K".into(), fitting("Downlight 3000K"));
+        s.place_point(1.0, 1.0);
+        s.place_point(2.0, 1.0);
+        s.place_point(3.0, 1.0);
+        s.clear_selection(); // nothing picked out — so it should reach every waiting point
+        assert_eq!(s.assign_profile("Downlight 3000K"), 3);
+        assert_eq!(s.unassigned_count(), 0);
+        assert!(s.luminaires.iter().all(|l| l.profile == "Downlight 3000K"));
+    }
+
+    /// …but a SELECTION wins over "everything unassigned". Re-fitting part of a layout is the
+    /// normal second act of a design, and it must not touch the rest.
+    #[test]
+    fn a_selection_narrows_the_assignment_to_it() {
+        let mut s = room();
+        s.profiles.insert("A".into(), fitting("A"));
+        s.profiles.insert("B".into(), fitting("B"));
+        let a = s.place_point(1.0, 1.0);
+        let b = s.place_point(2.0, 1.0);
+        let c = s.place_point(3.0, 1.0);
+        s.clear_selection();
+        s.assign_profile("A");
+        s.select(b, false);
+        s.select(c, true);
+        assert_eq!(s.assign_profile("B"), 2);
+        let by = |id: u32| s.luminaires.iter().find(|l| l.id == id).unwrap().profile.clone();
+        assert_eq!(by(a), "A", "the unselected fixture keeps its fitting");
+        assert_eq!(by(b), "B");
+        assert_eq!(by(c), "B");
+    }
+
+    /// Picking takes the NEAREST marker, not the first one within reach. On a tight pitch two
+    /// markers overlap, and grabbing whichever came first in the list moves the wrong light.
+    #[test]
+    fn picking_takes_the_nearest_marker() {
+        let mut s = room();
+        let far = s.place_point(0.0, 0.0);
+        let near = s.place_point(0.30, 0.0);
+        assert_eq!(s.pick_at(0.25, 0.0, 0.5), Some(near), "0.25 is nearer the 0.30 marker");
+        assert_eq!(s.pick_at(0.05, 0.0, 0.5), Some(far));
+        assert_eq!(s.pick_at(5.0, 5.0, 0.5), None, "nothing within reach");
+    }
+
+    /// A fixture can be MOVED — the thing that was impossible before. The drag carries the whole
+    /// selection, so a grid can be nudged as one.
+    #[test]
+    fn a_drag_moves_every_selected_fixture_together() {
+        let mut s = room();
+        let a = s.place_point(1.0, 1.0);
+        let b = s.place_point(3.0, 1.0);
+        s.select(a, false);
+        s.select(b, true);
+        s.begin_drag(a, (1.0, 1.0));
+        s.drag_to((1.5, 2.0));
+        assert!(s.end_drag(), "the drag moved something");
+        let pos = |id: u32| {
+            let l = s.luminaires.iter().find(|l| l.id == id).unwrap();
+            (l.position.x, l.position.y)
+        };
+        assert_eq!(pos(a), (1.5, 2.0));
+        assert_eq!(pos(b), (3.5, 2.0), "the other selected fixture moved by the same delta");
+    }
+
+    /// Pressing on an UNSELECTED marker grabs that one alone — a drag always moves what is under
+    /// the pointer, not a selection made earlier and forgotten about.
+    #[test]
+    fn pressing_an_unselected_marker_grabs_only_it() {
+        let mut s = room();
+        let a = s.place_point(1.0, 1.0);
+        let b = s.place_point(3.0, 1.0);
+        s.select(a, false);
+        s.begin_drag(b, (3.0, 1.0));
+        s.drag_to((4.0, 1.0));
+        s.end_drag();
+        assert_eq!(s.selected, vec![b]);
+        let by = |id: u32| s.luminaires.iter().find(|l| l.id == id).unwrap().position.x;
+        assert_eq!(by(a), 1.0, "the previously selected fixture stayed put");
+        assert_eq!(by(b), 4.0);
+    }
+
+    /// A press that never moves is a CLICK: it selects, and reports that nothing moved, so the
+    /// same gesture serves both "pick this one" and "move this one".
+    #[test]
+    fn a_press_without_motion_is_a_selection_not_a_move() {
+        let mut s = room();
+        let a = s.place_point(1.0, 1.0);
+        s.begin_drag(a, (1.0, 1.0));
+        assert!(!s.end_drag(), "nothing moved");
+        assert_eq!(s.selected, vec![a], "but it is now selected");
+        let l = &s.luminaires[0];
+        assert_eq!((l.position.x, l.position.y), (1.0, 1.0));
+    }
+
+    /// Dropping a fixture under a different ceiling RE-MOUNTS it. A light dragged from the hall to
+    /// under the soffit belongs to the soffit; keeping the old height would bury it in the slab.
+    #[test]
+    fn a_dropped_fixture_re_mounts_to_the_ceiling_it_landed_under() {
+        let mut s = room();
+        s.meshes = super::mounting_tests::stepped_room();
+        s.mount_to_ceiling = true;
+        s.plane_height = 0.8;
+        let id = s.place_point(3.0, 4.0); // under the 4 m bay
+        assert!((s.luminaires[0].position.z - 4.0).abs() < 1e-3);
+        s.begin_drag(id, (3.0, 4.0));
+        s.drag_to((9.0, 4.0)); // over into the 2.5 m bay
+        assert!(s.end_drag());
+        assert!((s.luminaires[0].position.z - 2.5).abs() < 1e-3,
+            "it should hang from the low ceiling it was dropped under, got {}",
+            s.luminaires[0].position.z);
+    }
+
+    /// Deleting removes exactly the selection and nothing else.
+    #[test]
+    fn delete_removes_the_selection_only() {
+        let mut s = room();
+        let a = s.place_point(1.0, 1.0);
+        let b = s.place_point(2.0, 1.0);
+        let c = s.place_point(3.0, 1.0);
+        s.select(a, false);
+        s.select(c, true);
+        assert_eq!(s.delete_selected(), 2);
+        assert_eq!(s.luminaires.len(), 1);
+        assert_eq!(s.luminaires[0].id, b);
+        assert!(s.selected.is_empty());
+    }
+
+    /// Removing a fitting from the library leaves its fixtures UNASSIGNED — visible and counted —
+    /// rather than pointing at a name that resolves to nothing and silently emits no light.
+    #[test]
+    fn removing_a_fitting_leaves_its_fixtures_needing_one() {
+        let mut s = room();
+        s.profiles.insert("A".into(), fitting("A"));
+        s.place_point(1.0, 1.0);
+        s.place_point(2.0, 1.0);
+        s.clear_selection();
+        s.assign_profile("A");
+        assert_eq!(s.unassigned_count(), 0);
+        s.remove_profile("A");
+        assert_eq!(s.unassigned_count(), 2, "both fixtures now need a fitting");
+        assert_eq!(s.active_profile, UNASSIGNED);
+    }
+
+    /// The built-in is generated rather than imported, so it cannot be removed — the library is
+    /// never empty and there is always something to light a room with.
+    #[test]
+    fn the_builtin_fitting_cannot_be_removed() {
+        let mut s = room();
+        s.remove_profile(BUILTIN);
+        assert!(s.profiles.contains_key(BUILTIN));
+    }
+
+    /// Ids keep counting up across a save/reopen. Restarting at #1 would hand two fixtures the
+    /// same id, and every id-keyed operation — select, drag, delete — would then hit both.
+    #[test]
+    fn reopening_a_project_keeps_the_layout_and_the_id_sequence() {
+        let mut s = room();
+        s.profiles.insert("A".into(), fitting("A"));
+        s.place_point(1.0, 1.0);
+        s.place_point(2.0, 1.0);
+        s.clear_selection();
+        s.assign_profile("A");
+        let doc = Document::default();
+        let cfg = s.to_config(&doc);
+        assert_eq!(cfg.luminaires.len(), 2, "the layout is written to the sidecar");
+
+        let mut reopened = LightState::new();
+        reopened.luminaires.clear();
+        reopened.apply_config(cfg, &doc);
+        assert_eq!(reopened.luminaires.len(), 2);
+        assert_eq!(reopened.unassigned_count(), 0, "the fitting came back with the library");
+        let next = reopened.place_point(9.0, 9.0);
+        assert!(next > 2, "a new point gets a fresh id, not one already in use");
+    }
+
+    /// A fixture whose fitting did NOT come back comes in unassigned, so the toolbar can say so.
+    #[test]
+    fn a_missing_fitting_comes_back_as_unassigned() {
+        let mut s = room();
+        s.profiles.insert("Gone".into(), fitting("Gone"));
+        s.place_point(1.0, 1.0);
+        s.clear_selection();
+        s.assign_profile("Gone");
+        let doc = Document::default();
+        let mut cfg = s.to_config(&doc);
+        cfg.ies_library.clear(); // the library entry went missing
+        let mut reopened = LightState::new();
+        reopened.apply_config(cfg, &doc);
+        assert_eq!(reopened.unassigned_count(), 1);
     }
 }
