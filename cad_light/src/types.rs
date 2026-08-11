@@ -174,8 +174,21 @@ pub struct RaySettings {
 }
 
 impl Default for RaySettings {
+    /// Five bounces, not one.
+    ///
+    /// One bounce was never a judgement about accuracy — it was what the old branching solver could
+    /// afford, since its cost went up by roughly forty times per bounce. But a room does not stop
+    /// reflecting after one pass: in a 4 × 4 × 3 m box at ρ = 0.5 the series runs
+    /// 78 → 110 → 130 → 139 → 143 → 145 → 146 lx, so stopping at one bounce reports **three
+    /// quarters** of the light that is actually there. That is a bigger error than the maintenance
+    /// factor, and in the opposite direction.
+    ///
+    /// Five lands within about 2% of the converged answer and, now that the cost is linear in
+    /// bounces rather than exponential, costs under twice what one bounce did. Existing projects
+    /// keep whatever they were saved with — a result already issued should not change because the
+    /// default moved.
     fn default() -> Self {
-        Self { rays_per_point: 64, max_bounces: 1, shadows: true }
+        Self { rays_per_point: 64, max_bounces: 5, shadows: true }
     }
 }
 

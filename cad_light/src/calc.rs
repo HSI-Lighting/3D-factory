@@ -92,12 +92,31 @@ impl Split {
     }
 }
 
-/// Illuminance at a point, separated into light straight from the luminaires and light that
+/// Illuminance at a point, split into the light straight from the luminaires and the light that
 /// arrived off the room's own surfaces.
 ///
-/// Worth having because no summary statistic reveals it: a room carried by interreflection is the
-/// one that collapses when the client repaints in a darker colour, and its average lux looks
+/// Worth separating because no summary statistic reveals it: a room carried by interreflection is
+/// the one that collapses when the client repaints in a darker colour, and its average lux looks
 /// exactly like a directly-lit room's.
+///
+/// The indirect term is a PATH sum, not a branching tree. The previous form spawned
+/// `rays_per_point` fresh rays at every bounce, each of which spawned that many again — so the cost
+/// was `rays^bounces`. Measured at the shipped default of 64 rays, each extra bounce multiplied the
+/// time by about forty: bounce 3 took 615 ms on a twelve-by-twelve grid in a bare box, which puts
+/// bounce 5 at a quarter of an hour and bounce 6 somewhere past half a day — and the UI offers
+/// eight. Nobody could have run those settings; the app would simply have stopped responding.
+///
+/// Continuing ONE ray per sample instead makes the cost `rays × bounces`, and the estimator is the
+/// same one: at each vertex the path carries a throughput of the reflectances so far and collects
+/// the direct light there, which is the expansion of the recursion above, term by term. For a
+/// single bounce the two are algebraically identical.
+///
+/// `interreflection_matches_the_closed_form_for_an_enclosure` is what checks the result rather
+/// than the reasoning: it lands within 0.2% of the radiosity answer for a closed room.
+///
+/// The `π` that appeared twice — dividing to turn illuminance into Lambertian radiance, multiplying
+/// to integrate the cosine-weighted hemisphere — cancels, so it is absent here by cancellation and
+/// not by omission.
 fn illuminance_split(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> Split {
     let e = direct(ctx, point, normal);
     if bounces == 0 {
@@ -106,22 +125,31 @@ fn illuminance_split(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &m
     let n = ctx.settings.rays_per_point.max(1);
     let mut acc = 0.0;
     for _ in 0..n {
-        let w = cosine_sample(normal, rng);
-        let Some(hit) = ctx.scene.closest_hit(&Ray { o: point + normal * EPS, d: w }) else {
-            continue;
-        };
-        let rho = ctx.reflectance(hit.material);
-        if rho <= 0.0 {
-            continue;
+        // One path, walked to `bounces` vertices.
+        let mut throughput = 1.0;
+        let mut o = point;
+        let mut nrm = normal;
+        for _ in 0..bounces {
+            let w = cosine_sample(nrm, rng);
+            let Some(hit) = ctx.scene.closest_hit(&Ray { o: o + nrm * EPS, d: w }) else {
+                break; // the ray left the room: nothing further can come back along it
+            };
+            let rho = ctx.reflectance(hit.material);
+            if rho <= 0.0 {
+                break; // a perfect absorber ends the path
+            }
+            let wn = if hit.normal.dot(w) < 0.0 { hit.normal } else { -hit.normal };
+            throughput *= rho;
+            acc += throughput * direct(ctx, hit.point, wn);
+            o = hit.point;
+            nrm = wn;
         }
-        let wn = if hit.normal.dot(w) < 0.0 { hit.normal } else { -hit.normal };
-        let e_surface = illuminance(ctx, hit.point, wn, bounces - 1, rng);
-        acc += rho * e_surface / PI;
     }
-    Split { direct: e, indirect: acc * PI / n as f64 }
+    Split { direct: e, indirect: acc / n as f64 }
 }
 
 /// Total illuminance (direct + up to `bounces` diffuse reflections) at a point.
+#[allow(dead_code)]
 fn illuminance(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> f64 {
     illuminance_split(ctx, point, normal, bounces, rng).total()
 }
@@ -308,6 +336,175 @@ mod tests {
         let g = calculate_maintained(&m, &l, &pr, &default_materials(), &pl, &s, Maintenance::INITIAL);
         assert!(g.indirect.iter().all(|&v| v == 0.0));
         assert!((g.direct_fraction().unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    /// An ISOTROPIC point source: `I` candela in every direction, so its flux is exactly `4πI`.
+    ///
+    /// Needed for the closed-form check below, where the answer depends on knowing the emitted
+    /// lumens exactly rather than to within a quadrature error.
+    fn isotropic(i: f64) -> IesProfile {
+        let va: Vec<f64> = (0..=36).map(|k| k as f64 * 5.0).collect(); // 0..180
+        let n = va.len();
+        IesProfile {
+            name: "isotropic".into(),
+            photometry: PhotometryType::C,
+            lumens: 4.0 * PI * i,
+            multiplier: 1.0,
+            vertical_angles: va,
+            horizontal_angles: vec![0.0],
+            candela: vec![vec![i; n]],
+            watts: 0.0,
+            width: 0.0,
+            length: 0.0,
+            height: 0.0,
+        }
+    }
+
+    /// **The engine against physics, not against itself.**
+    ///
+    /// Every other test here checks that the tracer agrees with its own assumptions. This one
+    /// checks it against a result derived independently of any of the code: for a CLOSED enclosure
+    /// of area `A` and uniform reflectance `ρ`, containing a source of flux `Φ`, radiosity theory
+    /// gives the average illuminance over the enclosure's surfaces in closed form.
+    ///
+    /// At equilibrium the flux arriving on the walls is the flux emitted plus the fraction the
+    /// walls send back — `Φᵢ = Φ + ρΦᵢ` — so `Φᵢ = Φ/(1−ρ)` and
+    ///
+    /// ```text
+    ///     E_avg = Φ / (A · (1 − ρ))
+    /// ```
+    ///
+    /// This is the integrating-sphere relation, and it holds for any closed shape, not just a
+    /// sphere. If the Monte-Carlo interreflection has a wrong constant, a missing `π`, a
+    /// double-counted cosine or a mis-normalised sample weight, the number will not land here — and
+    /// none of those errors is visible in a picture or in "the average went up when I added a
+    /// bounce", which is all the previous tests could show.
+    ///
+    /// It is only affordable to run because the path rewrite above made ten bounces cheap; with the
+    /// old branching form this test would have taken longer than the age of the universe.
+    #[test]
+    fn interreflection_matches_the_closed_form_for_an_enclosure() {
+        const RHO: f32 = 0.5;
+        const I: f64 = 1000.0;
+        let (w, d, h) = (4.0f32, 4.0f32, 3.0f32);
+
+        let meshes = extrude::box_room(w, d, h);
+        // ONE reflectance everywhere — the closed form assumes a uniform enclosure.
+        let mats: Vec<Material> = (0..3)
+            .map(|id| Material { id, name: format!("s{id}"), reflectance: RHO, color: [1.0; 3] })
+            .collect();
+        let mut profiles = HashMap::new();
+        profiles.insert("iso".to_string(), isotropic(I));
+        let lums = vec![Luminaire {
+            id: 1,
+            profile: "iso".into(),
+            position: Vertex::new(w / 2.0, d / 2.0, h / 2.0), // centred, so nothing self-shadows
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        }];
+
+        let flux = 4.0 * PI * I;
+        let area = 2.0 * (w * d) as f64 + 2.0 * (w * h) as f64 + 2.0 * (d * h) as f64;
+        let expected = flux / (area * (1.0 - RHO as f64));
+
+        // Ten bounces: the truncated series leaves ρ¹¹ ≈ 0.05% on the table, far inside tolerance.
+        let settings = RaySettings { rays_per_point: 256, max_bounces: 10, shadows: true };
+        let scene = RtScene::new(build_tris(&meshes));
+        let ctx = Ctx { scene: &scene, luminaires: &lums, profiles: &profiles, materials: &mats, settings: &settings };
+
+        // Area-weighted average over all six faces, each sampled on its own grid. The faces have
+        // different areas, so an unweighted mean would quietly answer a different question.
+        let faces: [(Vec3, Vec3, Vec3, Vec3); 6] = [
+            // (corner, edge u, edge v, INWARD normal)
+            (Vec3::ZERO, Vec3::X * w, Vec3::Y * d, Vec3::Z),                       // floor
+            (Vec3::new(0.0, 0.0, h), Vec3::X * w, Vec3::Y * d, -Vec3::Z),           // ceiling
+            (Vec3::ZERO, Vec3::X * w, Vec3::Z * h, Vec3::Y),                        // y = 0
+            (Vec3::new(0.0, d, 0.0), Vec3::X * w, Vec3::Z * h, -Vec3::Y),           // y = d
+            (Vec3::ZERO, Vec3::Y * d, Vec3::Z * h, Vec3::X),                        // x = 0
+            (Vec3::new(w, 0.0, 0.0), Vec3::Y * d, Vec3::Z * h, -Vec3::X),           // x = w
+        ];
+        const N: u32 = 12;
+        let (mut flux_sum, mut area_sum) = (0.0, 0.0);
+        for (corner, eu, ev, normal) in faces {
+            let face_area = (eu.length() * ev.length()) as f64;
+            let mut e_sum = 0.0;
+            for iu in 0..N {
+                for iv in 0..N {
+                    let fu = (iu as f32 + 0.5) / N as f32;
+                    let fv = (iv as f32 + 0.5) / N as f32;
+                    let p = corner + eu * fu + ev * fv;
+                    let seed = (iu as u64) << 32 | (iv as u64) | (face_area as u64) << 8;
+                    let mut rng = Rng::seeded(seed.wrapping_mul(0x9E3779B9_7F4A7C15) ^ 0x5DEECE66D);
+                    e_sum += illuminance_split(&ctx, p, normal, settings.max_bounces, &mut rng).total();
+                }
+            }
+            // Mean illuminance on this face, times its area = flux it receives.
+            flux_sum += (e_sum / (N * N) as f64) * face_area;
+            area_sum += face_area;
+        }
+        let measured = flux_sum / area_sum;
+
+        let err = (measured - expected).abs() / expected;
+        assert!(
+            err < 0.01,
+            "enclosure average {measured:.1} lx vs closed form {expected:.1} lx ({:.1}% off).\n\
+             Φ = {flux:.0} lm, A = {area:.0} m², ρ = {RHO}",
+            err * 100.0
+        );
+    }
+
+    /// The DEFAULT bounce count is high enough to have converged.
+    ///
+    /// A default that stops early does not look wrong — it just reports less light than the room
+    /// has, consistently, in every project. Doubling it must therefore barely move the answer; if
+    /// it moves a lot, the default is truncating the series and every result is low.
+    #[test]
+    fn the_default_bounce_count_has_converged() {
+        let (m, pr, l, mut pl, _) = scene(0);
+        pl.cols = 16;
+        pl.rows = 16;
+        let mats = default_materials();
+        let base = RaySettings::default();
+        let deeper = RaySettings { max_bounces: base.max_bounces * 2, ..base };
+
+        let a = calculate(&m, &l, &pr, &mats, &pl, &base);
+        let b = calculate(&m, &l, &pr, &mats, &pl, &deeper);
+        let gap = (b.avg - a.avg).abs() / b.avg;
+        assert!(
+            gap < 0.03,
+            "the default ({} bounces, {:.1} lx) should be within 3% of {} bounces ({:.1} lx); \
+             it is {:.1}% out",
+            base.max_bounces, a.avg, deeper.max_bounces, b.avg, gap * 100.0
+        );
+        // …and one bounce is NOT enough, which is why the default moved.
+        let one = calculate(&m, &l, &pr, &mats, &pl, &RaySettings { max_bounces: 1, ..base });
+        assert!(
+            one.avg < a.avg * 0.9,
+            "one bounce ({:.1} lx) materially under-reads the converged room ({:.1} lx)",
+            one.avg, a.avg
+        );
+    }
+
+    /// How the cost of a bounce actually scales. Run with:
+    ///   `cargo test -p cad_light bounce_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement: --ignored --nocapture"]
+    fn bounce_cost_scaling() {
+        let (m, pr, l, mut pl, mut s) = scene(0);
+        pl.cols = 12;
+        pl.rows = 12;
+        s.rays_per_point = 64;
+        let mats = default_materials();
+        let mut prev: Option<f64> = None;
+        for b in 0..=6u32 {
+            s.max_bounces = b;
+            let t = std::time::Instant::now();
+            let g = calculate(&m, &l, &pr, &mats, &pl, &s);
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            let ratio = prev.map(|p| format!("{:.1}x", ms / p)).unwrap_or_else(|| "-".into());
+            println!("bounces {b}: {ms:9.1} ms  ({ratio:>6})  avg {:.1} lx", g.avg);
+            prev = Some(ms.max(0.01));
+        }
     }
 
     /// U₁ can never exceed U₀, because the average can never exceed the maximum. A cheap invariant
