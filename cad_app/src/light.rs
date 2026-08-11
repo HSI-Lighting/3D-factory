@@ -9,13 +9,102 @@
 use std::collections::HashMap;
 
 use cad_light::{
-    bbox, calculate as calc_lux, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
+    bbox, calculate as calc_lux, default_materials, extrude, extrude_handles, parse_ies, parse_ldt,
+    CalcPlane,
     IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
 };
 use cad_kernel::Document;
 
 /// Key for the always-available synthetic luminaire (works before any IES import).
 pub const BUILTIN: &str = "Built-in downlight (1000 cd)";
+
+/// Turn the 3D Factory's evaluated solid into lighting geometry.
+///
+/// SIMLUX used to build its scene by EXTRUDING THE 2D DOCUMENT — every closed outline pulled up to
+/// one room height. That is a fair stand-in for a bare plan and completely wrong once a building
+/// exists in the Factory: the extrusion has no window or door openings, no floor slabs at their
+/// real levels, no curved or sloped surfaces, and no storeys. A lighting result is only as good as
+/// the room it was given, so the calculation was solving a shoebox that merely shared a footprint
+/// with the model on screen.
+///
+/// Triangles are bucketed by ORIENTATION into the engine's three standing materials — up-facing is
+/// floor (0.20), down-facing is ceiling (0.70), the rest are walls (0.50), which is what
+/// `default_materials()` already defines and what a designer would assume. Reading reflectance
+/// from each surface's own colour is the obvious next step; orientation is the honest starting
+/// point, because a number guessed from an albedo texture is not more truthful, only more precise.
+///
+/// Returns empty when the model is empty, so the caller falls back to the extrusion and a
+/// 2D-only project keeps working exactly as before.
+pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
+    let pos = &f.cached.positions;
+    if pos.len() < 3 {
+        return Vec::new();
+    }
+    // One bucket per material, so the engine sees three meshes and not thousands.
+    let mut buckets: [Vec<Vertex>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for tri in pos.chunks_exact(3) {
+        let (a, b, c) = (
+            glam::Vec3::from(tri[0]),
+            glam::Vec3::from(tri[1]),
+            glam::Vec3::from(tri[2]),
+        );
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        if n.length_squared() < 0.5 {
+            continue; // degenerate sliver: it can only add noise to the trace
+        }
+        // 0.7 ≈ 45°, so a surface is floor or ceiling only when it is nearer flat than upright.
+        // A sloped ceiling therefore reads as a wall, which is the conservative way round.
+        let id = if n.z > 0.7 { 0 } else if n.z < -0.7 { 2 } else { 1 };
+        for p in [a, b, c] {
+            buckets[id].push(Vertex::new(p.x, p.y, p.z));
+        }
+    }
+    let mut out = Vec::new();
+    for (id, verts) in buckets.into_iter().enumerate() {
+        if verts.is_empty() {
+            continue;
+        }
+        // Already a per-triangle soup, so the indices are just 0,1,2,3,… Welding would save a
+        // little memory and cost the sharp edges that the BVH is perfectly happy to keep.
+        let triangles = (0..verts.len() as u32 / 3)
+            .map(|t| cad_light::Triangle { a: t * 3, b: t * 3 + 1, c: t * 3 + 2 })
+            .collect();
+        out.push(Mesh { vertices: verts, triangles, material: id as u32 });
+    }
+    out
+}
+
+/// Plan-view extent `(min_x, min_y, max_x, max_y)` of lighting geometry, or `None` if empty.
+///
+/// The counterpart to `cad_light::bbox`, which measures the 2D DOCUMENT. Once the room comes from
+/// the 3D model those two answer different questions: a drawing contains dimensions, notes and a
+/// title block that are not part of the building, and a survey plan puts the whole thing
+/// kilometres from the origin.
+pub fn mesh_bbox(meshes: &[Mesh]) -> Option<(f32, f32, f32, f32)> {
+    let mut b: Option<(f32, f32, f32, f32)> = None;
+    for m in meshes {
+        for v in &m.vertices {
+            b = Some(match b {
+                None => (v.x, v.y, v.x, v.y),
+                Some((x0, y0, x1, y1)) => (x0.min(v.x), y0.min(v.y), x1.max(v.x), y1.max(v.y)),
+            });
+        }
+    }
+    b
+}
+
+/// Height of the lighting geometry (max z − min z), or `None` if empty.
+pub fn mesh_height(meshes: &[Mesh]) -> Option<f32> {
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for m in meshes {
+        for v in &m.vertices {
+            lo = lo.min(v.z);
+            hi = hi.max(v.z);
+        }
+    }
+    (hi > lo).then(|| hi - lo)
+}
 
 /// A cosine (Lambertian) downlight: I(γ) = 1000·cos γ cd, axially symmetric.
 fn builtin_downlight() -> IesProfile {
@@ -176,29 +265,74 @@ impl LightState {
             .max(1e-3)
     }
 
-    fn import_ies(&mut self) {
+    /// Load a photometric file — IES (`.ies`) or EULUMDAT (`.ldt`).
+    ///
+    /// The FORMAT IS CHOSEN BY CONTENT, with the extension only as a tie-break. Manufacturers
+    /// rename these files constantly, and a `.ies` that is really EULUMDAT should still load
+    /// rather than produce a parse error the user cannot act on.
+    ///
+    /// Manufacturer files are also routinely Latin-1, not UTF-8 — degree signs in luminaire names
+    /// are near-universal ("PULSE MG - 14°"). `read_to_string` rejects those outright, so the
+    /// bytes are read raw and mapped, which is exact for the printable range either format uses.
+    fn import_photometry(&mut self) {
         let path = self.ies_path.trim().trim_matches('"').to_string();
         if path.is_empty() {
-            self.last_msg = "Enter a .ies file path first.".to_string();
+            self.last_msg = "Enter a .ies or .ldt file path first.".to_string();
             return;
         }
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_ies(&text) {
-                Ok(mut prof) => {
-                    if prof.name.trim().is_empty() {
-                        prof.name = std::path::Path::new(&path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "IES".to_string());
-                    }
-                    let key = prof.name.clone();
-                    self.active_profile = key.clone();
-                    self.profiles.insert(key.clone(), prof);
-                    self.last_msg = format!("Loaded IES '{key}'.");
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.last_msg = format!("Read error: {e}");
+                return;
+            }
+        };
+        let text: String = match String::from_utf8(bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => bytes.iter().map(|&b| b as char).collect(),
+        };
+
+        // IES announces itself: every LM-63 file carries a TILT= line. EULUMDAT has no marker at
+        // all, being a bare list of values, so it is what remains.
+        let looks_ies = text.lines().take(60).any(|l| l.trim_start().starts_with("TILT="));
+        let ext_ldt = std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("ldt"));
+        let (parsed, kind) = if looks_ies && !ext_ldt {
+            (parse_ies(&text), "IES")
+        } else {
+            match parse_ldt(&text) {
+                // A file that is neither still deserves the better of the two errors, so try the
+                // other reader before giving up.
+                Err(e_ldt) => match parse_ies(&text) {
+                    Ok(p) => (Ok(p), "IES"),
+                    Err(_) => (Err(e_ldt), "EULUMDAT"),
+                },
+                ok => (ok, "EULUMDAT"),
+            }
+        };
+
+        match parsed {
+            Ok(mut prof) => {
+                if prof.name.trim().is_empty() {
+                    prof.name = std::path::Path::new(&path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| kind.to_string());
                 }
-                Err(e) => self.last_msg = format!("IES parse error: {e}"),
-            },
-            Err(e) => self.last_msg = format!("Read error: {e}"),
+                let key = prof.name.clone();
+                // Report the photometry, not just the name: a wrong flux or a peak in the wrong
+                // place is visible here and nowhere else until the whole calculation looks odd.
+                self.last_msg = format!(
+                    "Loaded {kind} '{key}' — {:.0} lm, {:.0} W, peak {:.0} cd",
+                    prof.lumens.max(0.0),
+                    prof.watts,
+                    prof.peak_candela(),
+                );
+                self.active_profile = key.clone();
+                self.profiles.insert(key, prof);
+            }
+            Err(e) => self.last_msg = format!("{kind} parse error: {e}"),
         }
     }
 
@@ -249,11 +383,45 @@ impl LightState {
     }
 
     /// Run the lux engine on `doc` and store the grid + plane + scene.
-    pub fn calculate(&mut self, doc: &Document) {
-        let Some((min_x, min_y, max_x, max_y)) = bbox(doc) else {
+    /// The ONE geometry source, shared by the 3D view and the calculation.
+    ///
+    /// These were two separate expressions that happened to agree — until the view learned about
+    /// the Factory model and the calculation did not, at which point the picture would have shown
+    /// the real building while the numbers described an extruded footprint. A lighting result that
+    /// disagrees with the room on screen is worse than no result, because nothing about it looks
+    /// wrong.
+    fn scene_meshes(
+        &self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> Vec<Mesh> {
+        let from_3d = factory.map(meshes_from_factory).unwrap_or_default();
+        if !from_3d.is_empty() {
+            return from_3d;
+        }
+        if self.room.is_empty() {
+            extrude(doc, self.room_height)
+        } else {
+            let mut m = Vec::new();
+            for g in &self.room {
+                m.extend(extrude_handles(doc, &g.handles, g.height));
+            }
+            m
+        }
+    }
+
+    pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
+        let meshes = self.scene_meshes(doc, factory);
+        // The calculation plane must cover whatever is actually being lit. With a 3D model that is
+        // the MODEL's footprint, which need not match the 2D drawing's at all — a plan carries
+        // dimensions, notes and title blocks that are not part of the building, and a building can
+        // sit anywhere relative to them.
+        let bounds = if meshes.is_empty() { None } else { mesh_bbox(&meshes) };
+        let Some((min_x, min_y, max_x, max_y)) = bounds.or_else(|| bbox(doc)) else {
             self.grid = None;
             self.plane = None;
-            self.last_msg = "No geometry — draw walls / a closed room first.".to_string();
+            self.last_msg = "No geometry — draw a closed room, or build one in the 3D Factory."
+                .to_string();
             return;
         };
         let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
@@ -265,18 +433,6 @@ impl LightState {
             depth: d,
             cols,
             rows,
-        };
-        // Phase C: build the room from imported per-layer groups (each at its
-        // own height); fall back to extruding the whole document when nothing
-        // has been imported yet, so the legacy one-click flow still works.
-        let meshes = if self.room.is_empty() {
-            extrude(doc, self.room_height)
-        } else {
-            let mut m = Vec::new();
-            for g in &self.room {
-                m.extend(extrude_handles(doc, &g.handles, g.height));
-            }
-            m
         };
         let lums = if self.luminaires.is_empty() && self.auto_center_light {
             vec![Luminaire {
@@ -310,22 +466,29 @@ impl LightState {
     /// calc, so the right-hand 3D view tracks whatever is drawn/imported on the
     /// left 2D plan. Cheap (geometry only). Fits the orbit camera ONCE, the
     /// first frame after the workspace is entered (`simlux_fit_pending`).
-    pub fn rebuild_live_meshes(&mut self, doc: &Document) {
-        self.meshes = if self.room.is_empty() {
-            extrude(doc, self.room_height)
-        } else {
-            let mut m = Vec::new();
-            for g in &self.room {
-                m.extend(extrude_handles(doc, &g.handles, g.height));
-            }
-            m
-        };
+    /// Rebuild the lighting geometry. `factory` is the 3D model, when there is one.
+    ///
+    /// The Factory model WINS whenever it holds anything: it is the real building, with its
+    /// openings, slabs and storeys, and the 2D extrusion is a footprint pulled to a single height.
+    /// The extrusion stays as the fallback so a plan-only project is unaffected — that is still a
+    /// perfectly good way to get a first lux figure before any 3D work exists.
+    pub fn rebuild_live_meshes_with(
+        &mut self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) {
+        self.meshes = self.scene_meshes(doc, factory);
+        // Frame what is actually THERE. Framing from the 2D drawing pointed the camera at the
+        // plan's extent — title block, dimensions and all — which with a 3D model loaded is not
+        // where the building is, and on a survey plan sited kilometres from the origin is not
+        // even close.
         if self.simlux_fit_pending {
-            if let Some((min_x, min_y, max_x, max_y)) = bbox(doc) {
+            let scene = mesh_bbox(&self.meshes).or_else(|| bbox(doc));
+            if let Some((min_x, min_y, max_x, max_y)) = scene {
                 let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
-                self.cam_target =
-                    [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * self.room_height];
-                let diag = (w * w + d * d + self.room_height * self.room_height).sqrt();
+                let h = mesh_height(&self.meshes).unwrap_or(self.room_height);
+                self.cam_target = [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * h];
+                let diag = (w * w + d * d + h * h).sqrt();
                 self.cam_dist = (diag * 1.3).max(3.0);
                 self.simlux_fit_pending = false;
             }
@@ -509,7 +672,7 @@ impl LightState {
                     .hint_text(r"C:\path\to\file.ies"),
             );
             if ui.button("Load").clicked() {
-                self.import_ies();
+                self.import_photometry();
             }
         });
         ui.checkbox(&mut self.auto_center_light, "Auto-place one at room centre if none placed");
@@ -682,4 +845,81 @@ pub fn legend_bar(ui: &mut egui::Ui, max: f64) {
         ui.add_space(180.0);
         ui.label(format!("{max:.0} lx"));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A box built in the Factory becomes lighting geometry, split by orientation.
+    ///
+    /// The SIMLUX scene used to be the 2D document extruded to one height — a footprint with no
+    /// openings, no slabs at their real levels and no storeys. With a building in the Factory that
+    /// is the wrong room, and a lighting result is only as good as the room it was given.
+    #[test]
+    fn the_factory_model_becomes_lighting_geometry() {
+        let mut f = crate::factory::FactoryState::default();
+        f.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+        );
+        f.recompute();
+
+        let meshes = meshes_from_factory(&f);
+        assert!(!meshes.is_empty(), "a solid box must produce lighting geometry");
+
+        // A closed box has all three orientations, and each must land in its own material so the
+        // engine's floor/wall/ceiling reflectances (0.20 / 0.50 / 0.70) actually apply.
+        let mats: std::collections::HashSet<u32> = meshes.iter().map(|m| m.material).collect();
+        assert!(mats.contains(&0), "an up-facing surface must be FLOOR");
+        assert!(mats.contains(&1), "the sides must be WALL");
+        assert!(mats.contains(&2), "a down-facing surface must be CEILING");
+
+        // Every triangle index must be in range, or the ray tracer walks off the end of a vertex
+        // list — a crash rather than a wrong answer, but only on someone else's model.
+        for m in &meshes {
+            for t in &m.triangles {
+                for i in [t.a, t.b, t.c] {
+                    assert!((i as usize) < m.vertices.len(),
+                        "index {i} is past the {} vertices of material {}", m.vertices.len(), m.material);
+                }
+            }
+        }
+    }
+
+    /// An EMPTY model falls back to the 2D extrusion, so a plan-only project is untouched.
+    #[test]
+    fn an_empty_factory_leaves_the_2d_workflow_alone() {
+        let f = crate::factory::FactoryState::default();
+        assert!(meshes_from_factory(&f).is_empty(),
+            "nothing modelled means nothing to hand over — the extrusion must stay in charge");
+    }
+
+    /// The bounds come from the GEOMETRY, not the drawing.
+    ///
+    /// The calculation plane and the camera used to be framed from the 2D document's extent,
+    /// which includes dimensions, notes and a title block, and on a survey plan sits kilometres
+    /// from the building. With the room coming from the model, those are different questions.
+    #[test]
+    fn scene_bounds_measure_the_model_not_the_drawing() {
+        let mut f = crate::factory::FactoryState::default();
+        f.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::from_basis(
+                glam::Vec3::new(3500.0, -6850.0, 0.0), glam::Vec3::X, glam::Vec3::Y),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+        );
+        f.recompute();
+        let meshes = meshes_from_factory(&f);
+
+        let (x0, y0, x1, y1) = mesh_bbox(&meshes).expect("a box has bounds");
+        assert!((x1 - x0 - 6.0).abs() < 0.01, "width should be 6 m, got {}", x1 - x0);
+        assert!((y1 - y0 - 4.0).abs() < 0.01, "depth should be 4 m, got {}", y1 - y0);
+        assert!(x0 > 3000.0, "…and it must be found where the building actually is, not at the origin");
+        let h = mesh_height(&meshes).expect("a box has height");
+        assert!((h - 3.0).abs() < 0.01, "height should be 3 m, got {h}");
+    }
 }

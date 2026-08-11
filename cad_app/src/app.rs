@@ -3923,7 +3923,7 @@ impl CadApp {
         if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
         if action.calculate {
-            self.light.calculate(&self.doc);
+            self.light.calculate(&self.doc, Some(&self.factory));
         }
     }
 
@@ -11650,7 +11650,10 @@ impl CadApp {
             // face-sketch open `self.doc` is the sketch, and the room would collapse to its
             // handful of construction lines every frame the sketch was live.
             let plan = self.plan_doc().clone();
-            self.light.rebuild_live_meshes(&plan);
+            // …and hand it the 3D MODEL, which is the real building. The extrusion behind this is
+            // only a footprint pulled to one height: no openings, no slabs, no storeys. It stays
+            // as the fallback for a plan-only project.
+            self.light.rebuild_live_meshes_with(&plan, Some(&self.factory));
         }
         let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
@@ -37100,7 +37103,7 @@ impl eframe::App for CadApp {
                         .color(egui::Color32::from_rgb(150, 165, 185)));
                     if ui.button("  ⚡  Calculate lux").clicked() {
                         self.light.window_open = true;
-                        self.light.calculate(&self.doc);
+                        self.light.calculate(&self.doc, Some(&self.factory));
                         ui.close_menu();
                     }
                     ui.separator();
