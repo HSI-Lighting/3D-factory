@@ -27,6 +27,90 @@ to produce one).
 
 ---
 
+## Reply to your review of the first draft
+
+**Read this first if you sent that feedback — it says what changed and where.**
+
+**Note on the branch tip.** `fresh-main` is now at `513a015`, not `f9d0c5f`. The 50 commits to
+integrate still end at **`f9d0c5f`**; the commits above it are this document only, so the range in
+the header is right even though `git log` shows a different tip.
+
+### You were right about unrelated histories — that was my mistake
+
+The first draft's central instruction was `git merge --no-ff`, which assumed your tree descends
+from `13cdd07`. Yours doesn't: the 3D code was **copied** across repositories, so there is no
+shared ancestor and `13cdd07` isn't even a valid object in your repo. I should have checked that
+assumption and didn't. **§2 is rewritten** and now branches on it, with a test that works after a
+fetch (`git merge-base --is-ancestor`, not `git cat-file -e` — the object exists for everyone the
+moment they fetch, so the first draft's check would have told you the wrong thing too).
+
+**But you do not have to hand-port a 13,402-line diff.** Fetching this repo puts the blobs in your
+object store, and `git am -3` can then do a real three-way merge against them:
+
+```bash
+git remote add factory https://github.com/HSI-Lighting/3D-factory.git
+git fetch factory
+git format-patch 13cdd07..f9d0c5f --stdout | git am -3
+```
+
+Because your files were copied from `13cdd07` unmodified, most hunks apply cleanly and you get
+conflict markers only where your tree actually diverged. Full detail, including how to scope it to
+one group, is in **§2b**.
+
+### Two of your claims are narrower than they look
+
+Both checked against the code rather than argued — see **§7.3**:
+
+- **"The `.rsm` format change reaches the stable 2D app."** It does not. `version_for()` writes
+  **v7, byte-identical**, for any document whose unit was never declared, and a 2D-only app never
+  declares one — so it never writes a v8 file. The format that does change is **DXF**, by two
+  header lines carrying `$INSUNITS` with code **0 = unitless**, which is exactly what omitting the
+  variable already meant. Same semantics, two lines longer.
+- **"`cad_light::extrude` silently returns metres."** True, and worth flagging — but the multiplier
+  is `metres_per_unit`, which is **1.0** for every document that has not declared a unit. For an
+  existing drawing the output is bit-identical. It can only change a result on a drawing that
+  opted in.
+
+### One thing the first draft left you to trip over
+
+`cad_kernel/src/parser.rs` is **not only Units.** It also carries `Diag`, `Dedupe`, `RepairCuts`
+and `Scene` — 3D-only diagnostics with no connection to Units at all. So "skip Units" leaves
+`cad_kernel` and `cad_io` byte-identical **except that one file**. Skip those four as well, or
+re-home them in your own command hook. **§7.1** attributes every shared-crate line so you can see
+exactly what belongs to what.
+
+### Git LFS may not matter to you
+
+It is required only for the asset-backed libraries. The parametric generators, EULUMDAT photometry
+and the renderer carry **no binary assets** — every generator builds its geometry in code, and none
+of them reference `doc.units` or any bundled file. If those are the groups you take, you can skip
+LFS entirely. **§1**.
+
+### The Units decision, reframed
+
+You described the cost of skipping it as "no mm/inch drawing scale in 3D". The concrete failure is
+sharper: **a plan in millimetres builds a 3D model 1000× too large** — a 5000-unit wall becomes a
+5000-metre wall. That is the bug Units exists to fix.
+
+So decide it on one question, not on architecture: **do your drawings arrive in millimetres?**
+
+- **In metres** → `metres_per_unit` is 1.0, Units is a no-op for you, skipping costs nothing. Keep
+  the shared crates byte-identical and take the additive groups.
+- **In millimetres** (what most imported DXF architectural plans are) → skipping Units means the
+  3D Factory is wrong for your main input format, and the invariant buys you a feature that does
+  not work.
+
+**§7.2.**
+
+### Our answer to your proposal
+
+Yes — install LFS if you need it, port the additive groups first, and leave Units out **for now**.
+That is the right first move either way: those groups are genuinely separable, they touch no shared
+crate except the four diagnostic command variants above, and getting them in tells you nothing
+about Units that you need to decide today. Settle Units afterwards, on the millimetre question.
+
+---
+
 ## 0. TL;DR
 
 | | |
@@ -52,7 +136,7 @@ cargo test --workspace                 # expect 1006 passed, 0 failed
 
 ---
 
-## 1. Before you start: Git LFS is mandatory
+## 1. Git LFS — mandatory if you take the asset libraries
 
 The bundled assets (CC0 furniture, textures, door handles, apertures — **16 MB**) are tracked with
 **Git LFS**, configured in `.gitattributes`:
@@ -435,7 +519,8 @@ architectural purity buys you a feature that does not work.
 
 ### 7.3 Two claims worth checking before you decide
 
-Both of these came back from a reviewer, and both are narrower than they sound:
+Both of these came back in the review of the first draft, and both are narrower than they sound
+(summarised at the top of this document):
 
 - **"The `.rsm` format change reaches the stable 2D app."** It does not. The writer is conditional
   (§5.1): a document whose unit was never declared is written as **v7, byte-identical**. A 2D-only
