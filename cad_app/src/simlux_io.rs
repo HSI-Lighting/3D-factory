@@ -378,6 +378,11 @@ pub struct SimluxConfig {
     /// fixtures the same id.
     #[serde(default)]
     pub next_luminaire_id: u32,
+    /// The MAINTENANCE FACTOR the results are quoted at. `None` in a sidecar written before this
+    /// existed — those projects were calculated at the initial condition, and are restored that
+    /// way rather than silently acquiring a factor that would change every number in them.
+    #[serde(default)]
+    pub maintenance: Option<cad_light::Maintenance>,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

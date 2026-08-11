@@ -13,13 +13,13 @@ pub mod ldt;
 pub mod rt;
 pub mod types;
 
-pub use calc::calculate;
+pub use calc::{calculate, calculate_maintained};
 pub use extrude::{bbox, box_room, extrude, extrude_handles, triangulate};
 pub use ies::{parse as parse_ies, IesProfile, PhotometryType};
 pub use ldt::{parse as parse_ldt, Symmetry};
 pub use types::{
-    default_materials, CalcPlane, LuxGrid, Luminaire, Material, MaterialId, Mesh, RaySettings,
-    Triangle, Vertex,
+    default_materials, installation_summary, CalcPlane, Installation, LuxGrid, Luminaire,
+    Maintenance, Material, MaterialId, Mesh, RaySettings, Triangle, Vertex,
 };
 
 use std::collections::HashMap;

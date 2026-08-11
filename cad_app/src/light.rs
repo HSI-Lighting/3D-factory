@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 
 use cad_light::{
-    bbox, calculate as calc_lux, default_materials, extrude, extrude_handles, parse_ies, parse_ldt,
-    CalcPlane,
-    IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
+    bbox, calculate_maintained as calc_lux, default_materials, extrude, extrude_handles,
+    installation_summary, parse_ies, parse_ldt, CalcPlane, IesProfile, Installation, LuxGrid,
+    Luminaire, Maintenance, Material, Mesh, PhotometryType, RaySettings, Vertex,
 };
 use cad_kernel::Document;
 
@@ -248,6 +248,14 @@ pub struct LightState {
     pub cell_size: f32,
     /// Ray-tracer controls.
     pub settings: RaySettings,
+    /// The maintenance factor the result is quoted at (EN 12464-1 / CIE 97).
+    ///
+    /// SIMLUX used to compute INITIAL illuminance and present it as the answer, which overstates a
+    /// design by the whole of this factor — around 20% — and can turn a scheme that fails into one
+    /// that appears to pass. Every lux figure the app now reports is maintained.
+    pub maintenance: Maintenance,
+    /// Connected load of the last calculation — filled in by [`LightState::calculate`].
+    pub installation: Option<Installation>,
     /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
     pub luminaires: Vec<Luminaire>,
     pub auto_center_light: bool,
@@ -329,6 +337,8 @@ impl LightState {
             plane_height: 0.8,
             cell_size: 0.25,
             settings: RaySettings::default(),
+            maintenance: Maintenance::default(),
+            installation: None,
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
@@ -895,17 +905,32 @@ impl LightState {
         } else {
             self.luminaires.clone()
         };
-        let grid = calc_lux(&meshes, &lums, &self.profiles, &self.materials, &plane, &self.settings);
+        let grid = calc_lux(
+            &meshes,
+            &lums,
+            &self.profiles,
+            &self.materials,
+            &plane,
+            &self.settings,
+            self.maintenance,
+        );
+        // What the scheme costs to run, over the area actually assessed. The calculation plane's
+        // extent, not the true floor area — for an L-shaped room those differ, and the honest thing
+        // is to say which one the density is per, which the UI does.
+        self.installation =
+            Some(installation_summary(&lums, &self.profiles, (w * d) as f64));
         // A point with no fitting emits nothing, and a result computed from half a layout looks
         // exactly like a result computed from all of it. Say so, on the same line as the numbers.
         let waiting = self.unassigned_count();
         self.last_msg = format!(
-            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx{}",
+            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx maintained (MF {:.2}) · U₀ {:.2}{}",
             cols,
             rows,
             grid.avg,
             grid.min,
             grid.max,
+            grid.maintenance,
+            grid.u0(),
             match waiting {
                 0 => String::new(),
                 n => format!("  ⚠ {n} point(s) have no fitting and emit nothing — pick one in ▼ Fittings"),
@@ -995,6 +1020,7 @@ impl LightState {
             factory: Default::default(),
             luminaires: self.luminaires.clone(),
             next_luminaire_id: self.next_id,
+            maintenance: Some(self.maintenance),
         }
     }
 
@@ -1029,6 +1055,10 @@ impl LightState {
             self.materials = cfg.materials;
         }
         self.settings = cfg.settings;
+        // A project saved before maintenance existed was quoted at the INITIAL condition. Restore
+        // it that way: adopting today's default would silently change every number in a result the
+        // user has already read, reported, or issued.
+        self.maintenance = cfg.maintenance.unwrap_or(Maintenance::INITIAL);
         if cfg.room_height > 0.0 {
             self.room_height = cfg.room_height;
         }
@@ -1244,6 +1274,44 @@ impl LightState {
                     ui.add(egui::DragValue::new(&mut self.settings.rays_per_point).range(1..=4096));
                     ui.end_row();
                 });
+                ui.separator();
+                // MAINTENANCE. Every illuminance a designer quotes is the maintained one — what
+                // the scheme still delivers at the end of the cleaning cycle, not on day one.
+                ui.label(
+                    egui::RichText::new(format!("maintenance factor — MF {:.2}", self.maintenance.factor()))
+                        .small()
+                        .strong(),
+                );
+                egui::Grid::new("simlux_mf_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                    let mut row = |ui: &mut egui::Ui, label: &str, tip: &str, v: &mut f64| {
+                        ui.label(label).on_hover_text(tip);
+                        ui.add(egui::DragValue::new(v).speed(0.005).range(0.1..=1.0).fixed_decimals(2));
+                        ui.end_row();
+                    };
+                    row(ui, "LLMF", "Lamp lumen maintenance — output left after the operating interval, from the luminaire's data sheet", &mut self.maintenance.llmf);
+                    row(ui, "LSF", "Lamp survival — the fraction still lit. 1.00 for LED with spot replacement", &mut self.maintenance.lsf);
+                    row(ui, "LMF", "Luminaire maintenance — dirt on the optic, set by the cleaning interval and room cleanliness", &mut self.maintenance.lmf);
+                    row(ui, "RSMF", "Room surface maintenance — the room's own surfaces darkening", &mut self.maintenance.rsmf);
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Clean office (0.80)").clicked() {
+                        self.maintenance = Maintenance::default();
+                    }
+                    if ui
+                        .button("Initial (1.00)")
+                        .on_hover_text("Day-one condition. Useful for comparison — NOT what a scheme is submitted at.")
+                        .clicked()
+                    {
+                        self.maintenance = Maintenance::INITIAL;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Defaults are a clean interior on a 3-year cycle.\nSet all four from the data sheet + CIE 97 for a submission.",
+                    )
+                    .small()
+                    .weak(),
+                );
             });
 
             ui.menu_button("▼ Surfaces", |ui| {
@@ -1318,6 +1386,24 @@ impl LightState {
                 ui.label(small(format!("· avg {:.0} lx", g.avg)));
                 ui.label(small(format!("· min {:.0}", g.min)));
                 ui.label(small(format!("· max {:.0}", g.max)));
+                // Which condition the figures are for. A lux number without this is ambiguous, and
+                // the ambiguity always flatters the design.
+                ui.label(
+                    egui::RichText::new(if g.maintenance < 0.999 {
+                        format!("· maintained MF {:.2}", g.maintenance)
+                    } else {
+                        "· INITIAL (MF 1.00)".to_string()
+                    })
+                    .small()
+                    .color(if g.maintenance < 0.999 {
+                        egui::Color32::from_rgb(150, 200, 150)
+                    } else {
+                        egui::Color32::from_rgb(230, 170, 90)
+                    }),
+                )
+                .on_hover_text(
+                    "EN 12464 limits are on MAINTAINED illuminance. ▼ Calculation → maintenance factor.",
+                );
                 // UNIFORMITY. EN 12464 specifies U0 = Emin/Eavg, and a scheme is judged on it as
                 // much as on the average — 500 lx at U0 = 0.2 is a room with dark patches, and
                 // nothing in min/avg/max on its own says that.
@@ -1588,10 +1674,76 @@ impl LightState {
         // ---- Results ----------------------------------------------------
         if let Some(g) = &self.grid {
             ui.separator();
-            let uo = if g.avg > 0.0 { g.min / g.avg } else { 0.0 };
-            ui.label(format!("Average   {:.0} lx", g.avg));
-            ui.label(format!("Min / Max   {:.0} / {:.0} lx", g.min, g.max));
-            ui.label(format!("Uniformity Uo (min/avg)   {:.2}", uo));
+            ui.label(
+                egui::RichText::new(if g.maintenance < 0.999 {
+                    format!("Results — MAINTAINED (MF {:.2})", g.maintenance)
+                } else {
+                    "Results — INITIAL (no maintenance allowance)".to_string()
+                })
+                .strong(),
+            );
+            egui::Grid::new("simlux_results").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                    ui.label(egui::RichText::new(k).small().weak());
+                    ui.label(v);
+                    ui.end_row();
+                };
+                row(ui, "Average  Eavg", format!("{:.0} lx", g.avg));
+                row(ui, "Minimum  Emin", format!("{:.0} lx", g.min));
+                row(ui, "Maximum  Emax", format!("{:.0} lx", g.max));
+                row(ui, "Median", format!("{:.0} lx", g.median()));
+                // Percentiles say what the average cannot: 500 lx average is a different room
+                // when a tenth of it sits at 450 than when it sits at 150.
+                row(ui, "10th / 90th pct", format!("{:.0} / {:.0} lx", g.percentile(10.0), g.percentile(90.0)));
+                row(ui, "Uniformity  U₀ = Emin/Eavg", format!("{:.2}", g.u0()));
+                row(ui, "Diversity  U₁ = Emin/Emax", format!("{:.2}", g.u1()));
+                if let Some(f) = g.direct_fraction() {
+                    row(ui, "Direct / indirect", format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0));
+                }
+            });
+            // EN 12464-1 judges a workplace on U₀, and a scheme can meet its average and still
+            // fail here — so say which it is rather than leaving the reader to compare.
+            let u0 = g.u0();
+            let (verdict, col) = if u0 >= 0.60 {
+                ("meets 0.60 (work areas)", egui::Color32::from_rgb(120, 200, 120))
+            } else if u0 >= 0.40 {
+                ("meets 0.40 (circulation) — below 0.60 for work areas", egui::Color32::from_rgb(220, 190, 100))
+            } else {
+                ("below 0.40 — fails EN 12464 uniformity", egui::Color32::from_rgb(220, 130, 120))
+            };
+            ui.label(egui::RichText::new(format!("U₀ {u0:.2} · {verdict}")).small().color(col));
+
+            if let Some(i) = &self.installation {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Installation").strong());
+                egui::Grid::new("simlux_energy").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
+                    let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
+                        ui.label(egui::RichText::new(k).small().weak());
+                        ui.label(v);
+                        ui.end_row();
+                    };
+                    row(ui, "Fixtures", format!("{}", i.count));
+                    row(ui, "Connected load", format!("{:.0} W", i.total_watts));
+                    row(ui, "Power density", format!("{:.2} W/m²", i.power_density));
+                    row(ui, "Installed flux", format!("{:.0} lm", i.total_lumens));
+                    if i.efficacy > 0.0 {
+                        row(ui, "Efficacy", format!("{:.0} lm/W", i.efficacy));
+                    }
+                    row(ui, "Assessed area", format!("{:.1} m²", i.area_m2));
+                });
+                // A density computed from half the fixtures looks exactly like one computed from
+                // all of them, so an incomplete file has to announce itself.
+                if i.missing_watts > 0 || i.missing_lumens > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "⚠ {} fitting(s) declare no wattage, {} no flux — the figures above exclude them.",
+                            i.missing_watts, i.missing_lumens
+                        ))
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 170, 90)),
+                    );
+                }
+            }
             legend_bar(ui, self.scale_ceiling());
         }
 
@@ -2119,6 +2271,45 @@ mod placement_tests {
         assert_eq!(reopened.unassigned_count(), 0, "the fitting came back with the library");
         let next = reopened.place_point(9.0, 9.0);
         assert!(next > 2, "a new point gets a fresh id, not one already in use");
+    }
+
+    /// A NEW project computes maintained illuminance. This is the setting that decides whether
+    /// every lux figure the app reports is submittable or 20% optimistic, so it is pinned.
+    #[test]
+    fn a_new_project_is_quoted_at_a_maintenance_factor() {
+        let s = LightState::new();
+        let mf = s.maintenance.factor();
+        assert!(mf < 1.0, "a fresh project must not report INITIAL lux as the answer, got {mf}");
+        assert!((0.78..=0.82).contains(&mf), "the shipped default is about 0.80, got {mf}");
+    }
+
+    /// …but a project saved BEFORE maintenance existed comes back at the initial condition.
+    ///
+    /// Adopting today's default on load would silently restate every number in a result the user
+    /// has already read and possibly issued — a 20% change to a document they believe they are
+    /// merely reopening.
+    #[test]
+    fn an_older_project_reopens_at_the_condition_it_was_calculated_at() {
+        let doc = Document::default();
+        let mut s = LightState::new();
+        let mut cfg = s.to_config(&doc);
+        cfg.maintenance = None; // as written by a build that predates the factor
+        s.apply_config(cfg, &doc);
+        assert_eq!(s.maintenance.factor(), 1.0, "restored as INITIAL, not silently maintained");
+    }
+
+    /// A maintenance factor set by the user round-trips a save.
+    #[test]
+    fn the_maintenance_factor_survives_a_save() {
+        let doc = Document::default();
+        let mut s = LightState::new();
+        s.maintenance = Maintenance { llmf: 0.88, lsf: 0.99, lmf: 0.85, rsmf: 0.92 };
+        let want = s.maintenance.factor();
+        let cfg = s.to_config(&doc);
+        let mut reopened = LightState::new();
+        reopened.apply_config(cfg, &doc);
+        assert!((reopened.maintenance.factor() - want).abs() < 1e-12);
+        assert!((reopened.maintenance.llmf - 0.88).abs() < 1e-12, "the sub-factors, not just the product");
     }
 
     /// A fixture whose fitting did NOT come back comes in unassigned, so the toolbar can say so.
