@@ -42759,18 +42759,41 @@ impl eframe::App for CadApp {
                 draw_viewport_active_frame(&painter, rect, self.active_view == ActiveView::TwoD);
             }
 
-            if in_click_only_phase {
+            // THE CURSOR SAYS WHICH MODE YOU ARE IN — always, not only sometimes.
+            //
+            // Two cursors already existed, but the selection one was drawn ONLY during an explicit
+            // select-mode session. The normal idle state is itself the always-on selector, and it
+            // drew nothing at all — so most of the time the canvas showed the plain OS arrow and
+            // the mode was invisible. Now exactly one of the two is on screen whenever the pointer
+            // is over the canvas:
+            //
+            //   OPERATION  square + full crosshair — a click places a POINT, at the snapped
+            //              position, so the cursor sits where the point will land rather than
+            //              where the mouse is.
+            //   SELECTION  pickbox + arrow — a click picks an OBJECT, so it follows the mouse
+            //              exactly and the box reads as the pick aperture.
+            // …unless the LIGHTING layer owns the pointer. It sets its own crosshair for placing a
+            // fixture and a grab hand over a marker, and those say something this pair cannot.
+            let light_owns_cursor = self.light.place_mode
+                || self.light.hover.is_some()
+                || self.light.drag.is_some();
+            if !canvas_locked && !light_owns_cursor {
                 if let Some(raw_p) = resp.hover_pos() {
-                    let constrained_world = snap_hit.map(|h| h.point)
-                        .unwrap_or_else(|| self.apply_constraints(self.s2w(raw_p, rect)));
-                    let p = self.w2s(constrained_world, rect);
-                    draw_draft_cursor(&painter, p);
-                }
-            } else if self.select_mode != SelectMode::Off {
-                // SELECTION phase — a visually DIFFERENT cursor (pickbox + ^ arrow),
-                // so "I'm picking objects" never looks like "I'm placing a point".
-                if let Some(p) = resp.hover_pos() {
-                    draw_select_cursor(&painter, p);
+                    if rect.contains(raw_p) {
+                        // Hide the OS arrow so the drawn cursor is THE cursor — two pointers on a
+                        // drafting canvas read as a glitch, and the offset between them is
+                        // actively misleading while snapping.
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                        if in_click_only_phase {
+                            let constrained_world = snap_hit
+                                .map(|h| h.point)
+                                .unwrap_or_else(|| self.apply_constraints(self.s2w(raw_p, rect)));
+                            let p = self.w2s(constrained_world, rect);
+                            draw_draft_cursor(&painter, p);
+                        } else {
+                            draw_select_cursor(&painter, raw_p);
+                        }
+                    }
                 }
             }
 
