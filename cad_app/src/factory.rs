@@ -6287,7 +6287,7 @@ impl FactoryState {
     ///                         intermediate storey's slab is NOT hidden, only the roof/ceiling).
     /// World outline (XY polygon) of a slab/box feature, or `None` for a shape with no
     /// closed outline. Extrusions carry their real profile; a Box is its rotated rectangle.
-    fn feature_world_outline(&self, f: &cad_solid::Feature) -> Option<Vec<Vec2>> {
+    pub fn feature_world_outline(&self, f: &cad_solid::Feature) -> Option<Vec<Vec2>> {
         match &f.primitive {
             Primitive::Extrusion { profile, .. } => {
                 let p = self.model.profile(*profile)?;
@@ -6317,6 +6317,71 @@ impl FactoryState {
             }
             _ => None,
         }
+    }
+
+    /// PLAN FOOTPRINT of any feature — what it covers looked at from above.
+    ///
+    /// [`Self::feature_world_outline`] is deliberately narrow: it answers "what closed outline does
+    /// this slab have" for the carve logic, and says `None` for everything round. That is right for
+    /// carving and wrong for DRAWING — a cylinder that returns `None` is simply absent from the
+    /// plan, and a column you cannot see is indistinguishable from a column that is not there.
+    ///
+    /// So this never returns `None`. Exact where the shape allows, bounding rectangle where it does
+    /// not, but always SOMETHING.
+    pub fn feature_plan_footprint(&self, f: &cad_solid::Feature) -> Vec<Vec2> {
+        let p = &f.placement;
+        // A tilted shape's plan outline is not its upright one — fall through to the world AABB,
+        // which is computed from the real transform and is honest about a tilt.
+        let upright = p.pitch_deg.abs() < 1e-3 && p.roll_deg.abs() < 1e-3;
+
+        let ring = |n: u32, rx: f32, ry: f32, phase: f32| -> Vec<Vec2> {
+            let n = n.max(3);
+            (0..n)
+                .map(|i| {
+                    let a = phase + std::f32::consts::TAU * i as f32 / n as f32;
+                    Vec2::new(p.u + rx * a.cos(), p.v + ry * a.sin())
+                })
+                .collect()
+        };
+        let spin = p.spin_deg.to_radians();
+
+        if upright {
+            if let Some(o) = self.feature_world_outline(f) {
+                return o;
+            }
+            match f.primitive {
+                // Facetted around the vertical axis: the n-gon IS the footprint, exactly. A
+                // 4-sided Frustum is a pyramid, and drawing it as a circle would be a lie.
+                Primitive::Cylinder { r, sides, .. } => return ring(sides, r, r, spin),
+                Primitive::Tube { r_outer, sides, .. } => return ring(sides, r_outer, r_outer, spin),
+                Primitive::Frustum { r_bottom, r_top, sides, .. } => {
+                    // The wider of the two ends is what the shape covers.
+                    let r = r_bottom.max(r_top);
+                    return ring(sides, r, r, spin);
+                }
+                Primitive::Sphere { r, segments, .. } => return ring(segments, r, r, spin),
+                Primitive::Capsule { r, segments, .. } => return ring(segments, r, r, spin),
+                Primitive::Torus { major_r, minor_r, seg_major, .. } => {
+                    return ring(seg_major, major_r + minor_r, major_r + minor_r, spin)
+                }
+                Primitive::Ellipsoid { rx, ry, segments, .. } => {
+                    // Only axis-aligned radii are meaningful here; a spun ellipse needs the corner
+                    // rotation, so hand a spun one to the AABB below rather than draw it wrong.
+                    if spin.abs() < 1e-3 {
+                        return ring(segments, rx, ry, 0.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let (mn, mx) = f.world_aabb();
+        vec![
+            Vec2::new(mn.x, mn.y),
+            Vec2::new(mx.x, mn.y),
+            Vec2::new(mx.x, mx.y),
+            Vec2::new(mn.x, mx.y),
+        ]
     }
 
     fn detect_ceiling_caps(&self) -> std::collections::HashSet<u32> {
@@ -12743,5 +12808,104 @@ mod building_height_truth {
             void_h >= 6.0,
             "the void must still punch clear through a 6 m building, got {void_h}",
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_footprint_tests {
+    use super::*;
+
+    fn feat(p: Primitive) -> cad_solid::Feature {
+        cad_solid::Feature {
+            id: 1,
+            op: cad_solid::BoolOp::Union,
+            plane: cad_solid::Plane::default(),
+            placement: cad_solid::Placement { u: 0.0, v: 0.0, ..Default::default() },
+            primitive: p,
+        }
+    }
+
+    /// THE GUARANTEE. The 2D overlay drew only what `feature_world_outline` could describe, which
+    /// is boxes and extrusions — so a column, a dome or a ramp built from anything round was simply
+    /// absent from the plan, and absent is indistinguishable from "not there". Every primitive the
+    /// app can build must put SOMETHING on the plan.
+    #[test]
+    fn every_primitive_has_a_plan_footprint() {
+        let st = FactoryState::default();
+        let all = [
+            Primitive::Box { w: 2.0, d: 3.0, h: 1.0 },
+            Primitive::Cylinder { r: 1.0, h: 2.0, sides: 24 },
+            Primitive::Sphere { r: 1.0, segments: 16, stacks: 8 },
+            Primitive::Frustum { r_bottom: 1.0, r_top: 0.5, h: 2.0, sides: 6 },
+            Primitive::Torus { major_r: 2.0, minor_r: 0.3, seg_major: 24, seg_minor: 8 },
+            Primitive::Capsule { r: 0.5, h: 2.0, segments: 16, stacks: 8 },
+            Primitive::Tube { r_outer: 1.0, r_inner: 0.6, h: 2.0, sides: 24 },
+            Primitive::Ellipsoid { rx: 2.0, ry: 1.0, rz: 0.5, segments: 16, stacks: 8 },
+        ];
+        for p in all {
+            let fp = st.feature_plan_footprint(&feat(p));
+            assert!(
+                fp.len() >= 3,
+                "{p:?} produced {} points — it would be invisible on the plan",
+                fp.len(),
+            );
+            // And it must have real extent, not a degenerate dot.
+            let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+            for q in &fp {
+                mn = mn.min(*q);
+                mx = mx.max(*q);
+            }
+            assert!(
+                mx.x - mn.x > 1e-3 && mx.y - mn.y > 1e-3,
+                "{p:?} produced a degenerate footprint {mn:?}..{mx:?}",
+            );
+        }
+    }
+
+    /// A cylinder is a CIRCLE in plan, not the square of its bounding box. If this ever falls back
+    /// to the AABB, a round column reads as a square one.
+    #[test]
+    fn a_cylinder_is_round_in_plan() {
+        let st = FactoryState::default();
+        let fp = st.feature_plan_footprint(&feat(Primitive::Cylinder { r: 1.5, h: 2.0, sides: 32 }));
+        assert_eq!(fp.len(), 32);
+        for q in &fp {
+            let r = (q.x * q.x + q.y * q.y).sqrt();
+            assert!((r - 1.5).abs() < 1e-3, "vertex at radius {r}, expected 1.5");
+        }
+    }
+
+    /// A 4-sided Frustum is a PYRAMID. Drawing every round-ish primitive as a circle would put a
+    /// disc where a square base is.
+    #[test]
+    fn a_four_sided_frustum_is_a_quadrilateral_not_a_disc() {
+        let st = FactoryState::default();
+        let fp = st.feature_plan_footprint(&feat(Primitive::Frustum {
+            r_bottom: 1.0,
+            r_top: 0.0,
+            h: 2.0,
+            sides: 4,
+        }));
+        assert_eq!(fp.len(), 4, "a pyramid has four corners in plan");
+    }
+
+    /// A tilted shape's upright outline is the WRONG outline, so it falls back to the world AABB —
+    /// which must still be big enough to contain the tilted shape.
+    #[test]
+    fn a_tilted_solid_falls_back_to_a_bound_that_contains_it() {
+        let st = FactoryState::default();
+        let mut f = feat(Primitive::Box { w: 4.0, d: 1.0, h: 1.0 });
+        f.placement.pitch_deg = 45.0;
+        let fp = st.feature_plan_footprint(&f);
+        let (mn, mx) = f.world_aabb();
+        for q in &fp {
+            assert!(
+                q.x >= mn.x - 1e-3 && q.x <= mx.x + 1e-3 && q.y >= mn.y - 1e-3 && q.y <= mx.y + 1e-3,
+                "footprint point {q:?} escapes the solid's own bounds",
+            );
+        }
+        let w = fp.iter().fold(f32::NEG_INFINITY, |a, q| a.max(q.x))
+            - fp.iter().fold(f32::INFINITY, |a, q| a.min(q.x));
+        assert!((w - (mx.x - mn.x)).abs() < 1e-3, "the fallback must be the full bound");
     }
 }

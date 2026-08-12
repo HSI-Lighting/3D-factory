@@ -38488,9 +38488,14 @@ impl eframe::App for CadApp {
                             self.env.UcsIcn = !self.env.UcsIcn;
                             let _ = self.env.save();
                         }
-                        if self.factory.open && drafting_badge(ui, "FURN", self.factory.show_furniture_outlines_2d,
-                            "Show placed furniture's outline on the 2D plan — a tracing \
-                             reference while drawing new furniture shapes.")
+                        // Gated on there being a MODEL, not on the 3D panel being open: the whole
+                        // point is to see the 3D work while drawing in 2D, and the panel is
+                        // routinely closed to make room for the canvas.
+                        let has_model = !self.factory.model.features.is_empty()
+                            || !self.factory.furniture.is_empty();
+                        if has_model && drafting_badge(ui, "3D", self.factory.show_furniture_outlines_2d,
+                            "Show the 3D model on the 2D plan — buildings, rooms, furniture, \
+                             apertures and architecture, as footprints you can trace and snap to.")
                         {
                             self.factory.show_furniture_outlines_2d = !self.factory.show_furniture_outlines_2d;
                         }
@@ -45855,6 +45860,25 @@ impl RasterEditor {
 }
 
 
+/// Which kind of thing an overlay outline came from — so a wall, a room boundary and a chair are
+/// tellable apart at a glance on a busy plan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlanLayer {
+    Solid,
+    Room,
+    Furniture,
+}
+
+impl PlanLayer {
+    fn color(self) -> egui::Color32 {
+        match self {
+            PlanLayer::Solid => egui::Color32::from_rgba_unmultiplied(150, 190, 230, 170),
+            PlanLayer::Room => egui::Color32::from_rgba_unmultiplied(140, 215, 170, 165),
+            PlanLayer::Furniture => egui::Color32::from_rgba_unmultiplied(230, 180, 90, 190),
+        }
+    }
+}
+
 impl CadApp {
     /// File ▸ Import ▸ Image — load a raster into a `RasterDoc` and run the
     /// convertibility analyzer. The interactive raster→vector editor is a
@@ -46013,41 +46037,120 @@ impl CadApp {
         }
     }
 
-    /// Draw each placed furniture instance's top-down footprint on the 2D plan, as a tracing
-    /// reference while drawing new furniture shapes. The footprint is the (rotated) local
-    /// bounding box's 8 corners, posed and projected to XY, hulled — O(8) per instance, the
-    /// same cheap corner-transform `furniture_aabb` uses, so it costs nothing even with heavy
-    /// imported meshes (see the perf note on that function).
-    fn draw_furniture_outlines_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if !self.factory.open || !self.factory.show_furniture_outlines_2d || self.factory.furniture.is_empty() {
-            return;
+    /// WHAT the 2D overlay of the 3D model consists of — closed polygons in the canvas's own
+    /// coordinates, tagged by layer so the painter can colour them apart.
+    ///
+    /// Split out of the painter so it is testable: the bug this replaced ("the FURN toggle does
+    /// nothing") was in the *selection* of what to draw, not in the drawing, and there was no way
+    /// to assert on it without a live egui pointer.
+    fn plan_overlay_shapes(&self) -> Vec<(PlanLayer, Vec<Vec2>)> {
+        let mut out = Vec::new();
+        if !self.factory.show_furniture_outlines_2d {
+            return out;
         }
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(230, 180, 90, 190));
-        let clip = painter.with_clip_rect(rect);
+
+        // WHICH PLANE AM I DRAWING ON? In the global view the canvas IS world XY, so a top-down
+        // footprint lands where it belongs. Inside a sketch session — every standard view, and any
+        // face sketch — the canvas is that plane's (u,v), and pushing world XY through `w2s_m`
+        // would lay the plan on its side over a correct elevation.
+        let frame = self
+            .factory
+            .session
+            .as_ref()
+            .and_then(|s| self.factory.model.sketches.get(s.idx))
+            .map(|sk| sk.frame);
+
+        // SOLIDS — buildings, walls, slabs, and every architecture generator.
+        //
+        // This overlay used to draw furniture and nothing else, and RETURNED EARLY when there was
+        // none. So a model of a building with rooms in it put nothing at all on the plan and the
+        // badge appeared to do nothing — which is how it was reported. What is in the model belongs
+        // on the plan, whatever kind of thing it is.
+        //
+        // Union features only: a Difference is a VOID, and drawing the shape of a hole among the
+        // walls reads as another wall.
+        //
+        // Global view only: on a sketch plane the solids are already drawn, properly projected as
+        // an elevation, by `sketch_ref` (see `factory_enter_sketch`). Plan footprints on top of
+        // that would be a second, wrong copy.
+        if frame.is_none() {
+            for f in &self.factory.model.features {
+                if f.op != cad_solid::BoolOp::Union {
+                    continue;
+                }
+                let outline = self.factory.feature_plan_footprint(f);
+                if outline.len() >= 2 {
+                    out.push((
+                        PlanLayer::Solid,
+                        outline.iter().map(|p| Vec2::new(p.x as f64, p.y as f64)).collect(),
+                    ));
+                }
+            }
+
+            // ROOMS. A carved room is a Difference — skipped with the other cutters above — and its
+            // own walls were removed when it was carved. Without this a room is in the model, named
+            // in the Rooms menu, and nowhere at all on the plan, even though its footprint is the
+            // single most useful line on an architectural drawing.
+            for room in &self.factory.rooms {
+                if room.footprint.len() >= 2 {
+                    out.push((
+                        PlanLayer::Room,
+                        room.footprint.iter().map(|p| Vec2::new(p.x as f64, p.y as f64)).collect(),
+                    ));
+                }
+            }
+        }
+
+        // FURNITURE and APERTURES, in every view — global and sketch alike. `sketch_ref` is built
+        // from the evaluated SOLID mesh and furniture is not in it, so on a plane this is the only
+        // thing that puts a chair, a door or a window on the drawing.
+        //
+        // The footprint is the local bounding box's 8 corners, posed and hulled — O(8) per
+        // instance, the same cheap corner transform `furniture_aabb` uses, so it costs nothing even
+        // with heavy imported meshes (see the perf note on that function).
         for inst in &self.factory.furniture {
             let Some(asset) = self.factory.furniture_lib.get(inst.asset) else { continue };
             let rm = inst.rot_mat();
             let s = inst.scale_vec();
             let pos = glam::Vec3::from(inst.pos);
             let (lmn, lmx) = (asset.local_min, asset.local_max);
-            let mut corners_xy = Vec::with_capacity(8);
+            let mut corners = Vec::with_capacity(8);
             for cx in [lmn[0], lmx[0]] {
                 for cy in [lmn[1], lmx[1]] {
                     for cz in [lmn[2], lmx[2]] {
                         let w = rm * (glam::Vec3::new(cx, cy, cz) * s) + pos;
-                        corners_xy.push(Vec2::new(w.x as f64, w.y as f64));
+                        let p = match &frame {
+                            Some(fr) => fr.to_uv(w),
+                            None => glam::Vec2::new(w.x, w.y),
+                        };
+                        corners.push(Vec2::new(p.x as f64, p.y as f64));
                     }
                 }
             }
-            let hull = convex_hull(&corners_xy);
-            if hull.len() < 2 {
-                continue;
+            let hull = convex_hull(&corners);
+            if hull.len() >= 2 {
+                out.push((PlanLayer::Furniture, hull));
             }
-            // Furniture is posed in WORLD metres, so the footprint divides by the drawing's
-            // unit on the way onto the plan.
-            for i in 0..hull.len() {
-                let a = self.w2s_m(hull[i], rect);
-                let b = self.w2s_m(hull[(i + 1) % hull.len()], rect);
+        }
+        out
+    }
+
+    /// Draw the 3D model on the 2D canvas — buildings, rooms, furniture, apertures and
+    /// architecture — as a tracing and snapping reference. Geometry comes from
+    /// [`Self::plan_overlay_shapes`]; this only colours and strokes it.
+    fn draw_furniture_outlines_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let shapes = self.plan_overlay_shapes();
+        if shapes.is_empty() {
+            return;
+        }
+        let clip = painter.with_clip_rect(rect);
+        for (layer, poly) in shapes {
+            // Everything here is posed in WORLD METRES, so it divides by the drawing's unit on the
+            // way onto the plan — `w2s_m`, not `w2s`.
+            let stroke = egui::Stroke::new(1.0, layer.color());
+            for i in 0..poly.len() {
+                let a = self.w2s_m(poly[i], rect);
+                let b = self.w2s_m(poly[(i + 1) % poly.len()], rect);
                 clip.line_segment([a, b], stroke);
             }
         }
@@ -51370,5 +51473,122 @@ mod plan_views {
         assert_eq!(app.factory.plan_view, PV::Left);
         app.factory_exit_sketch();
         assert_eq!(app.factory.plan_view, PV::Global);
+    }
+}
+
+/// The 2D overlay of the 3D model.
+///
+/// Reported as: "the FURN [toggle] we added to view furnitures on the 2d is not working. why is
+/// that? all furnitures, 3d objects, apertures, and architectures that are added need to be seen in
+/// the 2d."
+///
+/// It was not broken — it was never more than furniture. The painter opened with
+///
+///     if !factory.open || !show_furniture_outlines_2d || factory.furniture.is_empty() { return }
+///
+/// so a building with rooms in it and no furniture drew NOTHING, and the toggle looked dead. The
+/// badge was hidden too whenever the 3D panel was closed, which is exactly when you want it.
+#[cfg(test)]
+mod plan_overlay {
+    use super::*;
+
+    fn square(n: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(n, 0.0),
+            glam::Vec2::new(n, n),
+            glam::Vec2::new(0.0, n),
+            glam::Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    fn layers(app: &CadApp) -> Vec<PlanLayer> {
+        app.plan_overlay_shapes().into_iter().map(|(l, _)| l).collect()
+    }
+
+    /// THE BUG. A building and a room, no furniture — the case that put nothing on the plan.
+    #[test]
+    fn a_model_with_no_furniture_still_draws() {
+        let mut app = CadApp::default();
+        app.factory.building_height = 3.0;
+        app.factory.add_building_outline(&square(6.0), 3.0).expect("building");
+        app.factory
+            .add_room(&vec![
+                glam::Vec2::new(0.2, 0.2),
+                glam::Vec2::new(5.8, 0.2),
+                glam::Vec2::new(5.8, 5.8),
+                glam::Vec2::new(0.2, 5.8),
+                glam::Vec2::new(0.2, 0.2),
+            ])
+            .expect("room");
+        app.factory.recompute();
+        assert!(app.factory.furniture.is_empty(), "the reported case has no furniture at all");
+
+        let ls = layers(&app);
+        assert!(ls.contains(&PlanLayer::Solid), "the building must be on the plan, got {ls:?}");
+        assert!(ls.contains(&PlanLayer::Room), "the room must be on the plan, got {ls:?}");
+    }
+
+    /// A carved room is a Difference — a hole. Cutters are deliberately not drawn (a window's cut
+    /// among the walls reads as another wall), so the room has to come from its own record or it
+    /// vanishes: present in the model, listed in the Rooms menu, absent from the drawing.
+    #[test]
+    fn a_carved_room_is_drawn_from_its_record_not_its_cutter() {
+        let mut app = CadApp::default();
+        app.factory.building_height = 3.0;
+        app.factory.add_building_outline(&square(6.0), 3.0).expect("building");
+        app.factory
+            .add_room(&vec![
+                glam::Vec2::new(1.0, 1.0),
+                glam::Vec2::new(5.0, 1.0),
+                glam::Vec2::new(5.0, 5.0),
+                glam::Vec2::new(1.0, 5.0),
+                glam::Vec2::new(1.0, 1.0),
+            ])
+            .expect("room");
+        app.factory.recompute();
+        assert!(app.factory.rooms[0].carve.is_some(), "this room IS a cutter, not a solid");
+
+        let rooms: Vec<_> = app
+            .plan_overlay_shapes()
+            .into_iter()
+            .filter(|(l, _)| *l == PlanLayer::Room)
+            .collect();
+        assert_eq!(rooms.len(), 1, "one room in, one room outline out");
+        // …and it is the room's own boundary, not the building's.
+        let xs: Vec<f64> = rooms[0].1.iter().map(|p| p.x).collect();
+        let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((lo - 1.0).abs() < 1e-3 && (hi - 5.0).abs() < 1e-3, "got x {lo}..{hi}, want 1..5");
+    }
+
+    /// The toggle is the whole point of the toggle.
+    #[test]
+    fn the_toggle_turns_it_off() {
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&square(6.0), 3.0).expect("building");
+        assert!(!app.plan_overlay_shapes().is_empty(), "on by default");
+        app.factory.show_furniture_outlines_2d = false;
+        assert!(app.plan_overlay_shapes().is_empty(), "off must mean off");
+    }
+
+    /// A VOID is not a wall. Cutters — window and door openings, room carves — must not be stroked
+    /// as solids, or every opening reads as a block sitting in the wall it was cut from.
+    #[test]
+    fn cutters_are_not_drawn_as_solids() {
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&square(6.0), 3.0).expect("building");
+        let solids_before =
+            layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
+        app.factory.model.features.push(cad_solid::Feature {
+            id: 9999,
+            op: cad_solid::BoolOp::Difference,
+            plane: cad_solid::Plane::default(),
+            placement: cad_solid::Placement { u: 3.0, v: 3.0, ..Default::default() },
+            primitive: cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        });
+        assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
+        let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
+        assert_eq!(solids_after, solids_before, "a cutter added a solid outline to the plan");
     }
 }
