@@ -7098,7 +7098,7 @@ impl CadApp {
                 ui.label(egui::RichText::new("Dimensions").small().weak());
                 // The dimension editor reports whether anything changed; snapshot on the
                 // first change of an interaction only (a held drag keeps the same undo step).
-                if crate::factory::primitive_dim_fields(ui, &mut prim) {
+                if crate::factory::primitive_dim_fields(ui, ufu, &mut prim) {
                     if !self.factory.dim_edit_active {
                         self.snapshot_factory();
                         self.factory.dim_edit_active = true;

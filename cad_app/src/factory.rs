@@ -1238,14 +1238,25 @@ impl Draw3dKind {
 ///
 /// The Extrusion's outline is a stored profile, not a set of scalars, so only its HEIGHT
 /// is editable here — the shape is fixed once drawn.
-pub fn primitive_dim_fields(ui: &mut egui::Ui, p: &mut Primitive) -> bool {
-    fn f(ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32) -> bool {
+/// Every length here is in the Factory's WORKING UNIT.
+///
+/// This whole family was missed by the unit sweep: it lives in this file, and the sweep counted
+/// metre-suffixed fields in `app.rs` only. The result was a properties panel reading
+/// `height 4.00 m` with millimetre fields directly above it — so typing 1000 for a metre-tall
+/// solid produced one a KILOMETRE tall, which is the "1000 m above the building" that was
+/// reported. It covers every primitive's dimensions, not just the extrusion that was noticed.
+pub fn primitive_dim_fields(
+    ui: &mut egui::Ui,
+    units: cad_kernel::DocUnits,
+    p: &mut Primitive,
+) -> bool {
+    let f = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            ui.add(egui::DragValue::new(v).speed(0.02).range(min..=1e5).suffix(" m")).changed()
+            length_ui(ui, units, v, 0.02, min as f64, 1e5).changed()
         })
         .inner
-    }
+    };
     fn u(ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32) -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
@@ -12409,5 +12420,47 @@ mod carved_rooms {
         f.recompute();
         let last = f.cached.bounds().expect("bounds").1[2];
         assert!((last - 3.70).abs() < 1e-3, "0.40 + 3.00 + 0.30 = 3.70, got {last}");
+    }
+}
+
+/// No length field in the 3D Factory may be hard-coded to metres.
+#[cfg(test)]
+mod working_unit_coverage {
+    /// **A source-level guard for the whole class of bug.**
+    ///
+    /// The unit sweep counted metre-suffixed fields in `app.rs` and missed `primitive_dim_fields`
+    /// here — so the properties panel showed `height 4.00 m` with millimetre fields directly above
+    /// it, and typing 1000 for a metre-tall solid produced one a KILOMETRE tall.
+    ///
+    /// A grep is a blunt test and it is the right one here: the failure was not a wrong
+    /// calculation but a field that never went through the conversion at all, and nothing about
+    /// its behaviour distinguishes it until someone types into it. Checking the source catches the
+    /// next one at compile-of-the-test time rather than in a screenshot.
+    ///
+    /// `light.rs` is deliberately exempt: SIMLUX quotes mounting height and work plane in metres
+    /// because every lighting standard and report does, and matching the Factory there would put
+    /// the panel at odds with the documents it exists to produce.
+    #[test]
+    fn no_factory_length_field_is_hard_coded_to_metres() {
+        for (file, src) in [
+            ("factory.rs", include_str!("factory.rs")),
+            ("app.rs", include_str!("app.rs")),
+        ] {
+            // Assembled at RUNTIME so this line does not contain the pattern it hunts for — a
+            // literal here would make the guard fail on itself, permanently.
+            let needle = format!("suffix(\" {}\")", "m");
+            let bad: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains(&needle))
+                .map(|(i, _)| i + 1)
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{file}: length fields at lines {bad:?} are hard-coded to metres. Use \
+                 `crate::factory::length_ui`, which shows the Factory working unit — a millimetre \
+                 project must not have a metre field hiding among them.",
+            );
+        }
     }
 }
