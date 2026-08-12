@@ -61,6 +61,141 @@ pub struct WallInst {
     pub base_z: f32,
 }
 
+/// A ROOM as an editable object, rather than the loose features it happened to create.
+///
+/// `add_room` used to build a floor slab, a ring of wall boxes and a ceiling slab, then forget
+/// which was which. Nothing tied them together, so a room could not be renamed, re-heighted or even
+/// listed — the only way to change one was to delete every piece and draw it again. It also meant
+/// an opening could not say which room it was in, because no room existed to be in.
+///
+/// The record owns the PARAMETERS and the feature ids they produced, and that is what makes an edit
+/// possible in place: changing the clear height resizes each wall box and lifts the ceiling slab
+/// while leaving every feature id alone — so a window already cut into a wall survives its room
+/// getting taller.
+#[derive(Clone, Debug)]
+pub struct RoomInst {
+    pub id: u32,
+    /// What the room is called. Shown on the plan, and what openings are grouped under.
+    pub name: String,
+    /// Ground-plane outline, closed.
+    pub footprint: Vec<Vec2>,
+    /// Z the room stands on — the storey it was built on.
+    pub base_z: f32,
+    /// CLEAR height: floor top to ceiling underside. The slabs are additional, so the structure is
+    /// always `floor_t + height + ceiling_t` tall. See the `room_height_meaning` tests.
+    pub height: f32,
+    pub floor_t: f32,
+    pub ceiling_t: f32,
+    pub wall_t: f32,
+    pub open_top: bool,
+    /// The features this room owns, so an edit can find them and a delete can take them all.
+    pub floor: Option<u32>,
+    pub walls: Vec<u32>,
+    pub ceiling: Option<u32>,
+}
+
+impl RoomInst {
+    /// Overall height of the built structure — what actually occupies space.
+    pub fn overall_height(&self) -> f32 {
+        self.floor_t + self.height + if self.open_top { 0.0 } else { self.ceiling_t }
+    }
+
+    /// Where to put the room's NAME on the plan — a point guaranteed to be inside the outline.
+    ///
+    /// The area centroid is the obvious choice and it is not enough: for a concave outline it can
+    /// land in the notch. An L-shaped room 6 × 6 with a 4 × 4 bite out of it centroids at
+    /// (2.2, 2.2), which is in the missing corner — so the name would print over whichever room is
+    /// really there. A test pins that exact case.
+    ///
+    /// So: use the centroid when it genuinely is inside, and otherwise take the midpoint of the
+    /// widest horizontal span the room has. That is inside by construction, and for an L or a
+    /// corridor it puts the label along the fat part, which is where a person would write it.
+    pub fn label_point(&self) -> Vec2 {
+        let c = self.centroid();
+        if self.contains(c) {
+            return c;
+        }
+        let n = self.footprint.len();
+        if n < 3 {
+            return c;
+        }
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in &self.footprint {
+            lo = lo.min(p.y);
+            hi = hi.max(p.y);
+        }
+        let mut best: Option<(f32, Vec2)> = None;
+        const SCANS: u32 = 32;
+        for k in 1..SCANS {
+            let y = lo + (hi - lo) * k as f32 / SCANS as f32;
+            // Every crossing of this scan line, sorted; the inside runs are consecutive pairs.
+            let mut xs: Vec<f32> = Vec::new();
+            let mut j = n - 1;
+            for i in 0..n {
+                let (a, b) = (self.footprint[i], self.footprint[j]);
+                if (a.y > y) != (b.y > y) {
+                    let t = (y - a.y) / (b.y - a.y);
+                    xs.push(a.x + t * (b.x - a.x));
+                }
+                j = i;
+            }
+            xs.sort_by(f32::total_cmp);
+            for pair in xs.chunks_exact(2) {
+                let w = pair[1] - pair[0];
+                if best.is_none_or(|(bw, _)| w > bw) {
+                    best = Some((w, Vec2::new((pair[0] + pair[1]) * 0.5, y)));
+                }
+            }
+        }
+        best.map(|(_, p)| p).unwrap_or(c)
+    }
+
+    /// Area-weighted centroid of the footprint. Correct as a centre of mass, and NOT necessarily
+    /// inside a concave outline — [`Self::label_point`] is the one that is.
+    pub fn centroid(&self) -> Vec2 {
+        let n = self.footprint.len();
+        if n == 0 {
+            return Vec2::ZERO;
+        }
+        let (mut a2, mut cx, mut cy) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let p = self.footprint[i];
+            let q = self.footprint[(i + 1) % n];
+            let cross = p.x * q.y - q.x * p.y;
+            a2 += cross;
+            cx += (p.x + q.x) * cross;
+            cy += (p.y + q.y) * cross;
+        }
+        if a2.abs() < 1e-9 {
+            let s: Vec2 = self.footprint.iter().copied().fold(Vec2::ZERO, |a, b| a + b);
+            return s / n as f32;
+        }
+        Vec2::new(cx / (3.0 * a2), cy / (3.0 * a2))
+    }
+
+    /// Is `p` inside this room's outline? Even-odd ray cast — the test that lets an opening say
+    /// which room it belongs to.
+    pub fn contains(&self, p: Vec2) -> bool {
+        let n = self.footprint.len();
+        if n < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut j = n - 1;
+        for i in 0..n {
+            let (a, b) = (self.footprint[i], self.footprint[j]);
+            if (a.y > p.y) != (b.y > p.y) {
+                let t = (p.y - a.y) / (b.y - a.y);
+                if p.x < a.x + t * (b.x - a.x) {
+                    inside = !inside;
+                }
+            }
+            j = i;
+        }
+        inside
+    }
+}
+
 /// An open sketch-on-plane session.
 ///
 /// **The core trick of 3D_Factory:** while this is live, the app's active `doc` IS the
@@ -803,6 +938,11 @@ pub struct FactoryState {
     /// Tracked so they can be hidden as a group without deleting them; the lighting model
     /// still contains them.
     pub ceilings: std::collections::HashSet<u32>,
+    /// Every ROOM built, as an editable record. See [`RoomInst`].
+    pub rooms: Vec<RoomInst>,
+    /// Monotonic room id. Never reused, so a rename or a delete cannot be confused with the room
+    /// that happens to occupy the same slot afterwards.
+    pub next_room_id: u32,
     /// Feature ids DETECTED as ceiling/roof caps by GEOMETRY (a thin, horizontal slab that
     /// is the topmost cap of the model). Recomputed on every [`Self::recompute`]. This is
     /// the drift-proof backstop for [`Self::hide_ceilings`]: the hand-tracked `ceilings`
@@ -2700,6 +2840,8 @@ impl Default for FactoryState {
             dim_edit_active: false,
             show_plan: true,
             ceilings: std::collections::HashSet::new(),
+            rooms: Vec::new(),
+            next_room_id: 1,
             ceiling_caps: std::collections::HashSet::new(),
             hide_ceilings: false,
             cutaway: false,
@@ -4859,9 +5001,11 @@ impl FactoryState {
 
         // WALLS: one box per outline edge, sitting on the floor slab.
         let wall_base = base + floor_t;
+        let mut wall_ids = Vec::new();
         for e in footprint.windows(2) {
             if let Some(id) = self.push_wall_box(e[0], e[1], wall_t, h, wall_base) {
                 self.feature_color.insert(id, WALL_COL);
+                wall_ids.push(id);
             }
         }
         // Close the loop if the outline wasn't already closed.
@@ -4870,18 +5014,39 @@ impl FactoryState {
             if (a - b).length() > 1e-4 {
                 if let Some(id) = self.push_wall_box(a, b, wall_t, h, wall_base) {
                     self.feature_color.insert(id, WALL_COL);
+                    wall_ids.push(id);
                 }
             }
         }
 
         // CEILING slab on top of the walls, tracked so it can be hidden — unless open sky.
+        let mut ceiling_id = None;
         if !self.room_open_top {
             let ct = self.ceiling_thickness.max(0.02);
             if let Some(cid) = self.add_slab(footprint, ct, wall_base + h + ct) {
                 self.feature_color.insert(cid, CEIL_COL);
                 self.ceilings.insert(cid);
+                ceiling_id = Some(cid);
             }
         }
+
+        // REGISTER the room, so it can be found, named, re-heighted and deleted as one thing.
+        let rid = self.next_room_id;
+        self.next_room_id += 1;
+        self.rooms.push(RoomInst {
+            id: rid,
+            name: format!("Room {rid}"),
+            footprint: footprint.to_vec(),
+            base_z: base,
+            height: h,
+            floor_t,
+            ceiling_t: self.ceiling_thickness.max(0.02),
+            wall_t,
+            open_top: self.room_open_top,
+            floor: Some(floor_id),
+            walls: wall_ids,
+            ceiling: ceiling_id,
+        });
 
         self.selection = vec![floor_id];
         self.dirty = true;
@@ -4913,6 +5078,148 @@ impl FactoryState {
             },
         );
         Ok(floor_id)
+    }
+
+    /// Index of a room by id.
+    pub fn room_index(&self, id: u32) -> Option<usize> {
+        self.rooms.iter().position(|r| r.id == id)
+    }
+
+    /// Rename a room. The name is what appears on the plan and what openings are grouped under.
+    pub fn rename_room(&mut self, id: u32, name: &str) {
+        if let Some(i) = self.room_index(id) {
+            let n = name.trim();
+            // An empty name would leave a room unlabelled on the plan and unfindable in the
+            // openings list, so it falls back to something addressable rather than to nothing.
+            self.rooms[i].name = if n.is_empty() { format!("Room {id}") } else { n.to_string() };
+        }
+    }
+
+    /// Change a built room's CLEAR height, in place.
+    ///
+    /// The thing that was impossible: a room's height was fixed the moment it was drawn, and the
+    /// only way to change it was to delete every piece and draw it again — losing any window
+    /// already cut into its walls.
+    ///
+    /// Each wall is a Box whose `h` is its height, placed at the wall base, so resizing grows it
+    /// upward from the floor. The ceiling is an Extrusion lifted so its TOP lands at a given z, so
+    /// it moves by its lift alone. Neither touches a feature id, and that is what lets cuts and
+    /// apertures already in those walls survive the edit.
+    pub fn set_room_height(&mut self, id: u32, height: f32) {
+        let Some(i) = self.room_index(id) else { return };
+        let h = height.max(0.05);
+        if (self.rooms[i].height - h).abs() < 1e-6 {
+            return;
+        }
+        self.rooms[i].height = h;
+        let (walls, ceiling, base_z, floor_t, ct, wall_t) = {
+            let r = &self.rooms[i];
+            (r.walls.clone(), r.ceiling, r.base_z, r.floor_t, r.ceiling_t, r.wall_t)
+        };
+        for fid in walls {
+            if let Some(f) = self.model.get_mut(fid) {
+                if let Primitive::Box { w, .. } = f.primitive {
+                    f.primitive = Primitive::Box { w, d: wall_t, h };
+                }
+            }
+        }
+        if let Some(cid) = ceiling {
+            // The ceiling's TOP sits at wall_base + h + ct, and an extrusion rises +Z from its
+            // lift — so the lift is that top less its own thickness.
+            let top = base_z + floor_t + h + ct;
+            if let Some(f) = self.model.get_mut(cid) {
+                f.placement.lift = top - ct;
+            }
+        }
+        self.dirty = true;
+        self.status = format!(
+            "{}: clear height {} · {} overall.",
+            self.rooms[i].name,
+            length_str(self.units, h),
+            length_str(self.units, self.rooms[i].overall_height()),
+        );
+    }
+
+    /// Every feature a room owns — what a delete has to take, and what selecting it should cover.
+    pub fn room_features(&self, id: u32) -> Vec<u32> {
+        let Some(i) = self.room_index(id) else { return Vec::new() };
+        let r = &self.rooms[i];
+        r.floor.iter().chain(r.ceiling.iter()).copied().chain(r.walls.iter().copied()).collect()
+    }
+
+    /// The room whose outline contains `p` — how an opening finds the room it is in.
+    ///
+    /// Smallest-first, so a room inside a larger space (a store within a hall) wins over the space
+    /// enclosing it. Without that the outer room would claim every opening in the building.
+    pub fn room_at(&self, p: Vec2) -> Option<u32> {
+        let mut best: Option<(f32, u32)> = None;
+        for r in &self.rooms {
+            if !r.contains(p) {
+                continue;
+            }
+            let n = r.footprint.len();
+            let mut a2 = 0.0f32;
+            for k in 0..n {
+                let (u, v) = (r.footprint[k], r.footprint[(k + 1) % n]);
+                a2 += u.x * v.y - v.x * u.y;
+            }
+            let area = a2.abs() * 0.5;
+            if best.is_none_or(|(b, _)| area < b) {
+                best = Some((area, r.id));
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
+    /// Drop a room: its geometry and its record, as one act.
+    pub fn delete_room(&mut self, id: u32) {
+        for f in self.room_features(id) {
+            self.model.remove(f);
+            self.feature_color.remove(&f);
+            self.ceilings.remove(&f);
+            self.feature_group.remove(&f);
+        }
+        let name = self
+            .room_index(id)
+            .map(|i| self.rooms[i].name.clone())
+            .unwrap_or_else(|| format!("Room {id}"));
+        self.rooms.retain(|r| r.id != id);
+        self.selection.clear();
+        self.dirty = true;
+        self.status = format!("Deleted {name}.");
+    }
+
+    /// The OPENINGS inside a room — indices into `furniture`, for apertures whose position falls
+    /// within that room's outline.
+    ///
+    /// What makes an openings list say which room each one belongs to. An aperture is placed in a
+    /// wall, and a wall is shared between two rooms, so this attributes it by where the piece
+    /// actually sits — the smaller room wins, via [`Self::room_at`].
+    pub fn openings_in_room(&self, id: u32) -> Vec<usize> {
+        let Some(i) = self.room_index(id) else { return Vec::new() };
+        let r = &self.rooms[i];
+        (0..self.furniture.len())
+            .filter(|&k| self.is_aperture(k))
+            .filter(|&k| {
+                let p = self.furniture[k].pos;
+                r.contains(Vec2::new(p[0], p[1]))
+            })
+            .collect()
+    }
+
+    /// Every aperture that falls in no room at all — in an external wall, or outside the model.
+    ///
+    /// Listed rather than dropped: an opening the app cannot place is exactly the one a user needs
+    /// to be told about, and silently omitting it from a grouped list would read as "there are
+    /// none".
+    pub fn openings_without_a_room(&self) -> Vec<usize> {
+        (0..self.furniture.len())
+            .filter(|&k| self.is_aperture(k))
+            .filter(|&k| {
+                let p = self.furniture[k].pos;
+                self.room_at(Vec2::new(p[0], p[1])).is_none()
+            })
+            .collect()
     }
 
     /// Floor of the active storey — its top face is the level the walls stand on.
@@ -5086,6 +5393,25 @@ impl FactoryState {
                 .map(|(&(f, a, b, c, d), &ti)| (f, a, b, c, d, ti))
                 .collect(),
             feature_groups: self.feature_group.iter().map(|(&f, &g)| (f, g)).collect(),
+            rooms: self
+                .rooms
+                .iter()
+                .map(|r| crate::simlux_io::RoomRec {
+                    id: r.id,
+                    name: r.name.clone(),
+                    footprint: r.footprint.iter().map(|p| [p.x, p.y]).collect(),
+                    base_z: r.base_z,
+                    height: r.height,
+                    floor_t: r.floor_t,
+                    ceiling_t: r.ceiling_t,
+                    wall_t: r.wall_t,
+                    open_top: r.open_top,
+                    floor: r.floor,
+                    walls: r.walls.clone(),
+                    ceiling: r.ceiling,
+                })
+                .collect(),
+            next_room_id: self.next_room_id,
             working_unit_m: self.units.metres_per_unit,
         }
     }
@@ -5260,6 +5586,29 @@ impl FactoryState {
         if d.working_unit_m > 0.0 {
             self.units = cad_kernel::DocUnits::new(d.working_unit_m, cad_kernel::UnitSource::User);
         }
+        // ROOMS. A feature the model no longer holds is dropped from the room rather than left
+        // dangling — a room pointing at geometry that is not there would resize nothing and
+        // delete nothing, which is worse than a room that knows it has lost a wall.
+        self.rooms = d
+            .rooms
+            .into_iter()
+            .map(|r| RoomInst {
+                id: r.id,
+                name: r.name,
+                footprint: r.footprint.iter().map(|p| Vec2::new(p[0], p[1])).collect(),
+                base_z: r.base_z,
+                height: r.height,
+                floor_t: r.floor_t,
+                ceiling_t: r.ceiling_t,
+                wall_t: r.wall_t,
+                open_top: r.open_top,
+                floor: r.floor.filter(|f| have.contains(f)),
+                walls: r.walls.into_iter().filter(|f| have.contains(f)).collect(),
+                ceiling: r.ceiling.filter(|f| have.contains(f)),
+            })
+            .collect();
+        let highest = self.rooms.iter().map(|r| r.id).max().unwrap_or(0);
+        self.next_room_id = d.next_room_id.max(highest + 1);
         // CUTS are stored as a list, not as geometry, so a loaded piece has to be re-cut before it
         // matches what was saved. Replaying them here (rather than trusting the saved mesh) is what
         // keeps them editable across a reload — and means a later fix to the boolean improves old
@@ -11580,5 +11929,184 @@ mod room_height_meaning {
             mx[2] - mn[2],
         );
         assert!(!f.status.contains("ceiling"), "and no ceiling in the breakdown: {}", f.status);
+    }
+}
+
+/// Rooms as editable objects: named, re-heightable, and able to say what is inside them.
+///
+/// Reported as "once a room is made there's no way of adjusting its height". There was not — a
+/// room was a floor slab, a ring of wall boxes and a ceiling slab with nothing tying them together,
+/// so the only way to change one was to delete every piece and draw it again.
+#[cfg(test)]
+mod rooms {
+    use super::*;
+
+    fn square(m: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(m, 0.0),
+            Vec2::new(m, m),
+            Vec2::new(0.0, m),
+            Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    fn a_room() -> FactoryState {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.20;
+        f.room_height = 3.00;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = false;
+        f.building_height = 4.0;
+        f.add_room(&square(5.0)).expect("the room builds");
+        f
+    }
+
+    /// Building a room REGISTERS it, with the pieces it owns.
+    #[test]
+    fn a_built_room_is_an_object_not_just_geometry() {
+        let f = a_room();
+        assert_eq!(f.rooms.len(), 1);
+        let r = &f.rooms[0];
+        assert!(r.floor.is_some(), "it owns its floor");
+        assert!(r.ceiling.is_some(), "and its ceiling");
+        assert_eq!(r.walls.len(), 4, "and one wall per edge of the square");
+        assert_eq!(f.room_features(r.id).len(), 6, "6 features in total");
+    }
+
+    /// **The reported failure.** A room's clear height can be changed after it is built, and the
+    /// structure follows.
+    #[test]
+    fn a_rooms_height_can_be_changed_after_it_is_built() {
+        let mut f = a_room();
+        let id = f.rooms[0].id;
+        f.recompute();
+        let before = f.cached.bounds().expect("bounds").1[2];
+        assert!((before - 3.35).abs() < 1e-3, "0.20 + 3.00 + 0.15 = 3.35 m, got {before}");
+
+        f.set_room_height(id, 3.9);
+        f.recompute();
+        let after = f.cached.bounds().expect("bounds").1[2];
+        assert!((after - 4.25).abs() < 1e-3, "0.20 + 3.90 + 0.15 = 4.25 m, got {after}");
+        assert!((f.rooms[0].height - 3.9).abs() < 1e-6, "and the record agrees");
+    }
+
+    /// The edit happens IN PLACE — every feature id survives.
+    ///
+    /// This is the point of editing rather than rebuilding: a window cut into a wall references
+    /// that wall's feature. Delete and recreate the walls and the cut is orphaned, so raising a
+    /// room's height would silently destroy its openings.
+    #[test]
+    fn changing_the_height_keeps_every_feature_id() {
+        let mut f = a_room();
+        let id = f.rooms[0].id;
+        let before = f.room_features(id);
+        f.set_room_height(id, 4.5);
+        let after = f.room_features(id);
+        assert_eq!(before, after, "the same features, resized — not new ones");
+    }
+
+    /// A room can be renamed, and an empty name falls back to something addressable rather than
+    /// leaving it unlabelled on the plan and unfindable in the openings list.
+    #[test]
+    fn a_room_can_be_renamed_but_never_to_nothing() {
+        let mut f = a_room();
+        let id = f.rooms[0].id;
+        f.rename_room(id, "  Reception  ");
+        assert_eq!(f.rooms[0].name, "Reception", "trimmed");
+        f.rename_room(id, "   ");
+        assert_eq!(f.rooms[0].name, format!("Room {id}"), "empty falls back");
+    }
+
+    /// A point inside the outline finds the room; one outside finds nothing.
+    #[test]
+    fn a_point_finds_the_room_it_is_in() {
+        let f = a_room();
+        let id = f.rooms[0].id;
+        assert_eq!(f.room_at(Vec2::new(2.5, 2.5)), Some(id));
+        assert_eq!(f.room_at(Vec2::new(50.0, 50.0)), None);
+    }
+
+    /// A room INSIDE another wins — the smaller outline is the one a piece is really in.
+    ///
+    /// Without this the enclosing space claims every opening in the building, which makes the
+    /// grouping useless exactly where it is needed most.
+    #[test]
+    fn the_smaller_room_wins_when_one_contains_another() {
+        let mut f = FactoryState::default();
+        f.add_room(&square(20.0)).expect("hall");
+        let hall = f.rooms[0].id;
+        // A store in the corner of the hall.
+        f.add_room(&vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(4.0, 1.0),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(1.0, 4.0),
+            Vec2::new(1.0, 1.0),
+        ])
+        .expect("store");
+        let store = f.rooms[1].id;
+        assert_eq!(f.room_at(Vec2::new(2.5, 2.5)), Some(store), "inside the store");
+        assert_eq!(f.room_at(Vec2::new(10.0, 10.0)), Some(hall), "out in the hall");
+    }
+
+    /// The area-weighted centroid lands INSIDE an L-shaped room. The mean of the corners does not,
+    /// which would print the name over a different room.
+    #[test]
+    fn an_l_shaped_room_labels_inside_itself() {
+        let mut f = FactoryState::default();
+        let l = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(6.0, 0.0),
+            Vec2::new(6.0, 2.0),
+            Vec2::new(2.0, 2.0),
+            Vec2::new(2.0, 6.0),
+            Vec2::new(0.0, 6.0),
+            Vec2::new(0.0, 0.0),
+        ];
+        f.add_room(&l).expect("L room");
+        let r = &f.rooms[0];
+        assert!(
+            !r.contains(r.centroid()),
+            "this L is the case where the AREA centroid falls in the notch — that is why \n             label_point exists",
+        );
+        assert!(
+            r.contains(r.label_point()),
+            "the label itself must sit inside the room, got {:?}",
+            r.label_point(),
+        );
+    }
+
+    /// Deleting a room takes its geometry AND its record.
+    #[test]
+    fn deleting_a_room_takes_everything_with_it() {
+        let mut f = a_room();
+        let id = f.rooms[0].id;
+        let feats = f.room_features(id);
+        f.delete_room(id);
+        assert!(f.rooms.is_empty(), "the record is gone");
+        for fid in feats {
+            assert!(!f.model.features.iter().any(|x| x.id == fid), "feature {fid} should be gone too");
+        }
+    }
+
+    /// Rooms survive a save, with their names, heights and the pieces they own.
+    #[test]
+    fn rooms_round_trip_through_the_sidecar() {
+        let mut f = a_room();
+        let id = f.rooms[0].id;
+        f.rename_room(id, "Reception");
+        f.set_room_height(id, 3.6);
+        let doc = f.to_persist();
+        assert_eq!(doc.rooms.len(), 1);
+
+        let mut reopened = FactoryState::default();
+        reopened.apply_persist(doc);
+        assert_eq!(reopened.rooms.len(), 1);
+        let r = &reopened.rooms[0];
+        assert_eq!(r.name, "Reception");
+        assert!((r.height - 3.6).abs() < 1e-6);
+        assert_eq!(r.walls.len(), 4, "and it still owns its walls");
+        assert!(reopened.next_room_id > id, "ids keep counting up");
     }
 }

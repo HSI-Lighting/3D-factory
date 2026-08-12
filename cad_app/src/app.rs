@@ -4139,6 +4139,44 @@ impl CadApp {
         self.light_gesture
     }
 
+    /// Paint each room's NAME on the plan, at the centre of its outline.
+    ///
+    /// A room is named in the ▼ Rooms list; this is where that name becomes useful. On a plan with
+    /// eight rooms in it, "which one is the store?" is otherwise answered by clicking each in turn.
+    ///
+    /// Drawn at the AREA-WEIGHTED centroid so an L-shaped room labels inside itself — the mean of
+    /// the corners can fall outside a concave outline entirely, putting the name in another room.
+    fn paint_room_names_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.factory.rooms.is_empty() {
+            return;
+        }
+        let clip = painter.with_clip_rect(rect);
+        for r in &self.factory.rooms {
+            let c = r.label_point();
+            // Room footprints are METRES (the Factory's world), like every other 3D overlay.
+            let p = self.w2s_m(Vec2::new(c.x as f64, c.y as f64), rect);
+            if !rect.contains(p) {
+                continue;
+            }
+            let label = format!(
+                "{}\n{}",
+                r.name,
+                crate::factory::length_str(self.factory.units, r.height),
+            );
+            // A soft plate behind the text, because a name over a hatched or dense plan is
+            // unreadable without one.
+            let galley = clip.layout_no_wrap(
+                label.clone(),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(210, 225, 240),
+            );
+            let pad = egui::vec2(6.0, 3.0);
+            let box_rect = egui::Rect::from_center_size(p, galley.size() + pad * 2.0);
+            clip.rect_filled(box_rect, 3.0, egui::Color32::from_rgba_unmultiplied(16, 28, 40, 190));
+            clip.galley(box_rect.min + pad, galley, egui::Color32::PLACEHOLDER);
+        }
+    }
+
     /// Paint placed luminaires as markers on the 2D plan.
     ///
     /// Three states have to be readable at a glance, because each one means a different next
@@ -5111,6 +5149,69 @@ impl CadApp {
         {
             self.factory_import_aperture(ApertureKind::Window);
             ui.close_menu();
+        }
+
+        // ---- PLACED apertures, GROUPED BY ROOM ------------------------------------------------
+        //
+        // A flat list of "Window 7, Window 8, Door 3" is unusable on a real plan: the names carry
+        // no location, so finding the door of the store means clicking each in turn. Grouping by
+        // the room the piece actually stands in turns the list into the plan.
+        let grouped: Vec<(String, Vec<usize>)> = self
+            .factory
+            .rooms
+            .iter()
+            .map(|r| (r.name.clone(), self.factory.openings_in_room(r.id)))
+            .filter(|(_, v)| !v.is_empty())
+            .collect();
+        let orphans = self.factory.openings_without_a_room();
+        if !grouped.is_empty() || !orphans.is_empty() {
+            ui.separator();
+            ui.label(egui::RichText::new("  Placed — by room").small().weak());
+            let mut pick: Option<usize> = None;
+            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                for (name, items) in &grouped {
+                    ui.label(egui::RichText::new(format!("  {name}  ({})", items.len())).small().strong());
+                    for &k in items {
+                        let label = self
+                            .factory
+                            .furniture
+                            .get(k)
+                            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| format!("piece {k}"));
+                        if ui.small_button(format!("      {label}")).clicked() {
+                            pick = Some(k);
+                        }
+                    }
+                }
+                // Anything in no room at all is LISTED, not dropped: an opening the app cannot
+                // place is exactly the one worth being told about, and omitting it silently reads
+                // as "there are none".
+                if !orphans.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("  Not in a room  ({})", orphans.len()))
+                            .small()
+                            .color(egui::Color32::from_rgb(230, 170, 90)),
+                    )
+                    .on_hover_text("In an external wall, or outside every room outline");
+                    for &k in &orphans {
+                        let label = self
+                            .factory
+                            .furniture
+                            .get(k)
+                            .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| format!("piece {k}"));
+                        if ui.small_button(format!("      {label}")).clicked() {
+                            pick = Some(k);
+                        }
+                    }
+                }
+            });
+            if let Some(k) = pick {
+                self.factory.select_furniture(k);
+                ui.close_menu();
+            }
         }
     }
 
@@ -9668,6 +9769,92 @@ impl CadApp {
                         "Turn the selected 2D geometry into 3D — walls, a building mass, \
                          floors and ceilings",
                     );
+
+                    // ▼ ROOMS — every room built, editable after the fact.
+                    //
+                    // A room used to be unreachable once drawn: its height was fixed at the moment
+                    // of creation and the only way to change it was to delete every piece and draw
+                    // it again, losing any window already cut into its walls.
+                    {
+                        let n = self.factory.rooms.len();
+                        ui.menu_button(format!("▼ Rooms ({n})"), |ui| {
+                            if n == 0 {
+                                ui.label(
+                                    egui::RichText::new("No rooms yet.\nDraw a closed outline, then ▼ Room → Make room.")
+                                        .small()
+                                        .weak(),
+                                );
+                                return;
+                            }
+                            ui.label(
+                                egui::RichText::new("name · clear height — both editable")
+                                    .small()
+                                    .weak(),
+                            );
+                            let u = self.factory.units;
+                            let mut rename: Option<(u32, String)> = None;
+                            let mut set_h: Option<(u32, f32)> = None;
+                            let mut select: Option<u32> = None;
+                            let mut remove: Option<u32> = None;
+                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                for r in &self.factory.rooms {
+                                    ui.horizontal(|ui| {
+                                        let mut name = r.name.clone();
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut name)
+                                                    .desired_width(120.0)
+                                                    .hint_text("room name"),
+                                            )
+                                            .changed()
+                                        {
+                                            rename = Some((r.id, name));
+                                        }
+                                        let mut h = r.height;
+                                        if crate::factory::length_ui(ui, u, &mut h, 0.02, 0.3, 30.0)
+                                            .on_hover_text("Clear height — floor top to ceiling underside. The slabs are extra.")
+                                            .changed()
+                                        {
+                                            set_h = Some((r.id, h));
+                                        }
+                                        if ui.small_button("◎").on_hover_text("Select this room's geometry").clicked() {
+                                            select = Some(r.id);
+                                        }
+                                        if ui.small_button("🗑").on_hover_text("Delete the whole room").clicked() {
+                                            remove = Some(r.id);
+                                        }
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "      {} overall · {} openings",
+                                            crate::factory::length_str(u, r.overall_height()),
+                                            self.factory.openings_in_room(r.id).len(),
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
+                            if let Some((id, name)) = rename {
+                                self.factory.rename_room(id, &name);
+                            }
+                            if let Some((id, h)) = set_h {
+                                self.snapshot_factory();
+                                self.factory.set_room_height(id, h);
+                            }
+                            if let Some(id) = select {
+                                self.factory.selection = self.factory.room_features(id);
+                                ui.close_menu();
+                            }
+                            if let Some(id) = remove {
+                                self.snapshot_factory();
+                                self.factory.delete_room(id);
+                                ui.close_menu();
+                            }
+                        })
+                        .response
+                        .on_hover_text("Every room built — rename, change its height, select or delete it");
+                    }
 
                     ui.menu_button("▼ Room", |ui| {
                         ui.label(
@@ -38359,6 +38546,8 @@ impl eframe::App for CadApp {
             self.draw_factory_sketches_2d(&painter, rect);
             // Placed furniture footprints, projected onto the plan — toggled by the FURN badge.
             self.draw_furniture_outlines_2d(&painter, rect);
+            // Room names, above the outlines so a label is never buried under furniture.
+            self.paint_room_names_2d(&painter, rect);
             // SIMLUX: lux heatmap + luminaire markers on the 2D plan (overlay default off).
             self.paint_lux_overlay(&painter, rect);
             self.paint_luminaires_2d(&painter, rect);

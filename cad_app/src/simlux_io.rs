@@ -31,6 +31,26 @@ pub struct WallRec {
     pub base_z: f32,
 }
 
+/// One ROOM as it survives a save. Mirrors `factory::RoomInst`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RoomRec {
+    pub id: u32,
+    pub name: String,
+    pub footprint: Vec<[f32; 2]>,
+    pub base_z: f32,
+    /// CLEAR height — floor top to ceiling underside. The slabs are additional.
+    pub height: f32,
+    pub floor_t: f32,
+    pub ceiling_t: f32,
+    pub wall_t: f32,
+    pub open_top: bool,
+    /// Feature ids the room owns. A feature that no longer exists is dropped on load rather than
+    /// leaving the room pointing at geometry that is not there.
+    pub floor: Option<u32>,
+    pub walls: Vec<u32>,
+    pub ceiling: Option<u32>,
+}
+
 /// One building level. Mirrors `factory::Storey`. `base_z` is NOT stored — it is derived
 /// by summing the heights below, so the stack cannot be loaded non-contiguous.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -95,6 +115,17 @@ pub struct FactoryDoc {
     /// GROUPS of CSG features: `(feature_id, group_id)` — members select/move/delete as one.
     #[serde(default)]
     pub feature_groups: Vec<(u32, u32)>,
+    /// Every ROOM, as an editable record. Mirrors `factory::RoomInst`; footprint points are
+    /// `[f32; 2]` for the same reason `WallRec` uses them — glam is built without serde here, and
+    /// the on-disk shape should not track a maths library's representation.
+    ///
+    /// Without this a reopened project has rooms as loose geometry again: no names, no heights to
+    /// adjust, and openings that cannot say which room they are in.
+    #[serde(default)]
+    pub rooms: Vec<RoomRec>,
+    /// Next free room id, so reopening does not restart numbering and hand two rooms the same id.
+    #[serde(default)]
+    pub next_room_id: u32,
     /// The Factory's WORKING UNIT — metres per unit, e.g. `0.001` for millimetres.
     ///
     /// A display and input preference, not a property of the geometry: the model is stored in
