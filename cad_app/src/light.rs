@@ -256,6 +256,15 @@ pub struct LightState {
     pub maintenance: Maintenance,
     /// Connected load of the last calculation — filled in by [`LightState::calculate`].
     pub installation: Option<Installation>,
+    /// Height the cylindrical illuminance is measured at — eye level. 1.2 m is the seated figure
+    /// EN 12464-1 uses; 1.6 m is standing.
+    pub eye_height: f32,
+    /// Mean CYLINDRICAL illuminance at eye height, from the last calculation.
+    ///
+    /// The measure of whether a space renders faces and solid objects. A room can hold 500 lx on
+    /// the desks and still read as flat and cave-like, and this is the only number that says so —
+    /// EN 12464-1 asks for at least 50 lx in most occupied spaces, and more where faces matter.
+    pub cylindrical_avg: Option<f64>,
     /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
     pub luminaires: Vec<Luminaire>,
     pub auto_center_light: bool,
@@ -339,6 +348,8 @@ impl LightState {
             settings: RaySettings::default(),
             maintenance: Maintenance::default(),
             installation: None,
+            eye_height: 1.2,
+            cylindrical_avg: None,
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
@@ -914,6 +925,32 @@ impl LightState {
             &self.settings,
             self.maintenance,
         );
+        // MEAN CYLINDRICAL ILLUMINANCE at eye height — how well the space renders faces and solid
+        // objects, which the horizontal grid cannot report at any resolution.
+        //
+        // On a COARSE sub-grid deliberately: every point costs 24 azimuth evaluations, so measuring
+        // it at the work plane's resolution would multiply the whole calculation by twenty-four to
+        // refine a single room-average figure that a 12 × 12 sample already settles.
+        self.cylindrical_avg = {
+            let ev = cad_light::Evaluator::new(
+                &meshes,
+                &lums,
+                &self.profiles,
+                &self.materials,
+                self.settings,
+                self.maintenance,
+            );
+            const N: u32 = 12;
+            let mut sum = 0.0;
+            for r in 0..N {
+                for c in 0..N {
+                    let x = min_x + w * (c as f32 + 0.5) / N as f32;
+                    let y = min_y + d * (r as f32 + 0.5) / N as f32;
+                    sum += ev.cylindrical(glam::Vec3::new(x, y, self.eye_height));
+                }
+            }
+            Some(sum / (N * N) as f64)
+        };
         // What the scheme costs to run, over the area actually assessed. The calculation plane's
         // extent, not the true floor area — for an L-shaped room those differ, and the honest thing
         // is to say which one the density is per, which the UI does.
@@ -1266,6 +1303,9 @@ impl LightState {
                     ui.end_row();
                     ui.label("grid cell").on_hover_text("Target spacing of the measurement grid; finer is slower");
                     ui.add(egui::DragValue::new(&mut self.cell_size).speed(0.05).suffix(" m").range(0.05..=5.0));
+                    ui.end_row();
+                    ui.label("eye height").on_hover_text("Height the cylindrical illuminance Ez is measured at — 1.2 m seated, 1.6 m standing");
+                    ui.add(egui::DragValue::new(&mut self.eye_height).speed(0.05).suffix(" m").range(0.3..=2.5));
                     ui.end_row();
                     ui.label("bounces").on_hover_text("Indirect light: 0 is direct only, which under-reads a bright room badly");
                     ui.add(egui::DragValue::new(&mut self.settings.max_bounces).range(0..=8));
@@ -1700,7 +1740,26 @@ impl LightState {
                 if let Some(f) = g.direct_fraction() {
                     row(ui, "Direct / indirect", format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0));
                 }
+                if let Some(ez) = self.cylindrical_avg {
+                    row(
+                        ui,
+                        &format!("Cylindrical  Ez @ {:.1} m", self.eye_height),
+                        format!("{ez:.0} lx"),
+                    );
+                }
             });
+            // Ez is the one number that says whether the space renders faces. A room can hold its
+            // average on the desks and still read as flat, and nothing else on this panel shows it.
+            if let Some(ez) = self.cylindrical_avg {
+                let (verdict, col) = if ez >= 150.0 {
+                    ("good modelling — faces read well", egui::Color32::from_rgb(120, 200, 120))
+                } else if ez >= 50.0 {
+                    ("meets the usual 50 lx minimum", egui::Color32::from_rgb(220, 190, 100))
+                } else {
+                    ("below 50 lx — the space will read flat", egui::Color32::from_rgb(220, 130, 120))
+                };
+                ui.label(egui::RichText::new(format!("Ez {ez:.0} lx · {verdict}")).small().color(col));
+            }
             // EN 12464-1 judges a workplace on U₀, and a scheme can meet its average and still
             // fail here — so say which it is rather than leaving the reader to compare.
             let u0 = g.u0();

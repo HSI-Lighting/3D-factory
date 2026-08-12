@@ -18,17 +18,152 @@ fn v3(v: Vertex) -> Vec3 {
     v.to_vec3()
 }
 
-struct Ctx<'a> {
-    scene: &'a RtScene,
+/// A scene prepared for measurement: geometry, luminaires, materials and settings, with the BVH
+/// already built.
+///
+/// This is the engine's one primitive — illuminance at a point, facing a direction, including
+/// interreflection. Nearly every quantity a lighting report contains is that same integral asked
+/// with a different normal or averaged over a different set of them: vertical illuminance is one
+/// direction, cylindrical is the mean over azimuth, scalar is the mean over the whole sphere, and a
+/// diffuse surface's luminance is its illuminance times `ρ/π`. None of them needs new physics, and
+/// none of them should rebuild the BVH — hence a reusable evaluator rather than a function per
+/// metric.
+pub struct Evaluator<'a> {
+    scene: RtScene,
     luminaires: &'a [Luminaire],
     profiles: &'a HashMap<String, IesProfile>,
     materials: &'a [Material],
-    settings: &'a RaySettings,
+    settings: RaySettings,
+    /// Applied to every value this evaluator returns, so a maintained scene stays maintained
+    /// whichever quantity is asked for.
+    maintenance: f64,
 }
 
-impl Ctx<'_> {
+impl<'a> Evaluator<'a> {
+    pub fn new(
+        meshes: &[Mesh],
+        luminaires: &'a [Luminaire],
+        profiles: &'a HashMap<String, IesProfile>,
+        materials: &'a [Material],
+        settings: RaySettings,
+        maintenance: Maintenance,
+    ) -> Self {
+        Evaluator {
+            scene: RtScene::new(build_tris(meshes)),
+            luminaires,
+            profiles,
+            materials,
+            settings,
+            maintenance: maintenance.factor(),
+        }
+    }
+
     fn reflectance(&self, id: MaterialId) -> f64 {
         self.materials.iter().find(|m| m.id == id).map(|m| m.reflectance as f64).unwrap_or(0.5)
+    }
+
+    /// A deterministic RNG for a point, so the same query always gives the same answer.
+    ///
+    /// Monte-Carlo results that wobble between runs are impossible to review: a designer who
+    /// re-runs a calculation and gets 497 lx instead of 499 cannot tell a change they made from
+    /// sampling noise.
+    fn rng_at(&self, p: Vec3, salt: u64) -> Rng {
+        let q = |f: f32| (f as f64 * 8192.0) as i64 as u64;
+        let h = q(p.x)
+            .wrapping_mul(0x9E3779B9_7F4A7C15)
+            ^ q(p.y).wrapping_mul(0xC2B2AE3D_27D4EB4F)
+            ^ q(p.z).wrapping_mul(0x1656_67B1_9E37_79F9)
+            ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        Rng::seeded(h | 1)
+    }
+
+    /// Illuminance (lux) at `point` on a plane whose normal is `normal`.
+    pub fn illuminance(&self, point: Vec3, normal: Vec3) -> f64 {
+        let mut rng = self.rng_at(point, normal.x.to_bits() as u64);
+        illuminance_split(self, point, normal, self.settings.max_bounces, &mut rng).total()
+            * self.maintenance
+    }
+
+    /// Illuminance at `point`, as `(direct, indirect)`.
+    pub fn illuminance_parts(&self, point: Vec3, normal: Vec3) -> (f64, f64) {
+        let mut rng = self.rng_at(point, normal.x.to_bits() as u64);
+        let s = illuminance_split(self, point, normal, self.settings.max_bounces, &mut rng);
+        (s.direct * self.maintenance, s.indirect * self.maintenance)
+    }
+
+    /// **Vertical illuminance** `E_v` on a vertical plane facing `azimuth_deg` (0° = +X).
+    ///
+    /// What a wall, a whiteboard or a face turned that way receives. EN 12464 sets requirements on
+    /// it for exactly those, and a scheme optimised only for the horizontal work plane routinely
+    /// misses them — downlights put light on desks and very little on anything upright.
+    pub fn vertical(&self, point: Vec3, azimuth_deg: f64) -> f64 {
+        let a = azimuth_deg.to_radians();
+        self.illuminance(point, Vec3::new(a.cos() as f32, a.sin() as f32, 0.0))
+    }
+
+    /// **Cylindrical illuminance** `E_z` — the mean illuminance on an infinitesimal vertical
+    /// cylinder, which is the mean of the vertical illuminance over every azimuth.
+    ///
+    /// That equivalence is the definition, not an approximation: the average illuminance over the
+    /// cylinder's curved surface is by construction the average of the planar illuminance of the
+    /// surface elements making it up, and those elements' normals sweep the horizon uniformly. So
+    /// it is computed by sampling azimuths rather than by a formula taken on trust.
+    ///
+    /// It is the standard measure of how well a space renders faces and solid objects — a room can
+    /// hold 500 lx on the desks and still feel flat and cave-like, and `E_z` is the number that
+    /// says so.
+    pub fn cylindrical(&self, point: Vec3) -> f64 {
+        const N: u32 = 24;
+        let mut sum = 0.0;
+        for i in 0..N {
+            sum += self.vertical(point, 360.0 * i as f64 / N as f64);
+        }
+        sum / N as f64
+    }
+
+    /// **Semi-cylindrical illuminance** `E_sc` facing `azimuth_deg`.
+    ///
+    /// The mean over the half of the horizon the surface faces — the light reaching a face looking
+    /// that way, which is what facial-recognition criteria in circulation and security areas are
+    /// written against. Directional by nature: facing a luminaire and facing away from it give
+    /// different answers, which is the whole point of the measure.
+    pub fn semi_cylindrical(&self, point: Vec3, azimuth_deg: f64) -> f64 {
+        const N: u32 = 16;
+        let mut sum = 0.0;
+        for i in 0..N {
+            // Mid-points of N equal slices spanning the facing half, −90°..+90°.
+            let off = -90.0 + 180.0 * (i as f64 + 0.5) / N as f64;
+            sum += self.vertical(point, azimuth_deg + off);
+        }
+        sum / N as f64
+    }
+
+    /// **Scalar (spherical) illuminance** `E_s` — the mean planar illuminance over every possible
+    /// orientation, i.e. the light density at the point regardless of which way anything faces.
+    ///
+    /// Sampled over a deterministic Fibonacci sphere rather than randomly, so the answer is stable
+    /// between runs and the quadrature error is a fixed small bias instead of per-call noise.
+    pub fn scalar(&self, point: Vec3) -> f64 {
+        const N: u32 = 64;
+        let ga = std::f64::consts::PI * (3.0 - 5.0f64.sqrt()); // golden angle
+        let mut sum = 0.0;
+        for i in 0..N {
+            let z = 1.0 - 2.0 * (i as f64 + 0.5) / N as f64;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let th = ga * i as f64;
+            let n = Vec3::new((r * th.cos()) as f32, (r * th.sin()) as f32, z as f32);
+            sum += self.illuminance(point, n);
+        }
+        sum / N as f64
+    }
+
+    /// **Luminance** (cd/m²) of a diffuse surface at `point` facing `normal`, with reflectance `ρ`.
+    ///
+    /// `L = ρ·E/π` — exact for a Lambertian surface, which is what this engine's materials are.
+    /// EN 12464-1 puts floors on the room's surfaces, not only on the work plane, and this is the
+    /// quantity those clauses are written in.
+    pub fn luminance(&self, point: Vec3, normal: Vec3, reflectance: f64) -> f64 {
+        reflectance * self.illuminance(point, normal) / PI
     }
 }
 
@@ -47,10 +182,10 @@ fn intensity_toward(prof: &IesProfile, lum: &Luminaire, point: Vec3) -> f64 {
 }
 
 /// Direct illuminance (lux) at a surface point with the given outward `normal`.
-fn direct(ctx: &Ctx, point: Vec3, normal: Vec3) -> f64 {
+fn direct(ev: &Evaluator, point: Vec3, normal: Vec3) -> f64 {
     let mut e = 0.0;
-    for lum in ctx.luminaires {
-        let Some(prof) = ctx.profiles.get(&lum.profile) else {
+    for lum in ev.luminaires {
+        let Some(prof) = ev.profiles.get(&lum.profile) else {
             continue;
         };
         let lpos = v3(lum.position);
@@ -67,7 +202,7 @@ fn direct(ctx: &Ctx, point: Vec3, normal: Vec3) -> f64 {
         if intensity <= 0.0 {
             continue;
         }
-        if ctx.settings.shadows && ctx.scene.occluded(point + normal * EPS, lpos) {
+        if ev.settings.shadows && ev.scene.occluded(point + normal * EPS, lpos) {
             continue;
         }
         e += intensity * cos_inc / (dist as f64 * dist as f64);
@@ -117,12 +252,12 @@ impl Split {
 /// The `π` that appeared twice — dividing to turn illuminance into Lambertian radiance, multiplying
 /// to integrate the cosine-weighted hemisphere — cancels, so it is absent here by cancellation and
 /// not by omission.
-fn illuminance_split(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> Split {
-    let e = direct(ctx, point, normal);
+fn illuminance_split(ev: &Evaluator, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> Split {
+    let e = direct(ev, point, normal);
     if bounces == 0 {
         return Split { direct: e, indirect: 0.0 };
     }
-    let n = ctx.settings.rays_per_point.max(1);
+    let n = ev.settings.rays_per_point.max(1);
     let mut acc = 0.0;
     for _ in 0..n {
         // One path, walked to `bounces` vertices.
@@ -131,16 +266,16 @@ fn illuminance_split(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &m
         let mut nrm = normal;
         for _ in 0..bounces {
             let w = cosine_sample(nrm, rng);
-            let Some(hit) = ctx.scene.closest_hit(&Ray { o: o + nrm * EPS, d: w }) else {
+            let Some(hit) = ev.scene.closest_hit(&Ray { o: o + nrm * EPS, d: w }) else {
                 break; // the ray left the room: nothing further can come back along it
             };
-            let rho = ctx.reflectance(hit.material);
+            let rho = ev.reflectance(hit.material);
             if rho <= 0.0 {
                 break; // a perfect absorber ends the path
             }
             let wn = if hit.normal.dot(w) < 0.0 { hit.normal } else { -hit.normal };
             throughput *= rho;
-            acc += throughput * direct(ctx, hit.point, wn);
+            acc += throughput * direct(ev, hit.point, wn);
             o = hit.point;
             nrm = wn;
         }
@@ -150,8 +285,8 @@ fn illuminance_split(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &m
 
 /// Total illuminance (direct + up to `bounces` diffuse reflections) at a point.
 #[allow(dead_code)]
-fn illuminance(ctx: &Ctx, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> f64 {
-    illuminance_split(ctx, point, normal, bounces, rng).total()
+fn illuminance(ev: &Evaluator, point: Vec3, normal: Vec3, bounces: u32, rng: &mut Rng) -> f64 {
+    illuminance_split(ev, point, normal, bounces, rng).total()
 }
 
 fn build_tris(meshes: &[Mesh]) -> Vec<Tri> {
@@ -205,11 +340,9 @@ pub fn calculate_maintained(
     settings: &RaySettings,
     maintenance: Maintenance,
 ) -> LuxGrid {
-    let scene = RtScene::new(build_tris(meshes));
-    let ctx = Ctx { scene: &scene, luminaires, profiles, materials, settings };
+    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
     let cols = plane.cols.max(1);
     let rows = plane.rows.max(1);
-    let bounces = settings.max_bounces;
     let normal = Vec3::Z;
     let count = (cols * rows) as usize;
     let mf = maintenance.factor();
@@ -218,10 +351,7 @@ pub fn calculate_maintained(
         .into_par_iter()
         .map(|i| {
             let (col, row) = (i as u32 % cols, i as u32 / cols);
-            let p = v3(plane.sample_point(col, row));
-            let mut rng = Rng::seeded((i as u64).wrapping_mul(0x9E3779B9_7F4A7C15) ^ 0xD1B54A3);
-            let s = illuminance_split(&ctx, p, normal, bounces, &mut rng);
-            (s.direct * mf, s.indirect * mf)
+            ev.illuminance_parts(v3(plane.sample_point(col, row)), normal)
         })
         .collect();
 
@@ -409,8 +539,7 @@ mod tests {
 
         // Ten bounces: the truncated series leaves ρ¹¹ ≈ 0.05% on the table, far inside tolerance.
         let settings = RaySettings { rays_per_point: 256, max_bounces: 10, shadows: true };
-        let scene = RtScene::new(build_tris(&meshes));
-        let ctx = Ctx { scene: &scene, luminaires: &lums, profiles: &profiles, materials: &mats, settings: &settings };
+        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
 
         // Area-weighted average over all six faces, each sampled on its own grid. The faces have
         // different areas, so an unweighted mean would quietly answer a different question.
@@ -425,17 +554,15 @@ mod tests {
         ];
         const N: u32 = 12;
         let (mut flux_sum, mut area_sum) = (0.0, 0.0);
-        for (corner, eu, ev, normal) in faces {
-            let face_area = (eu.length() * ev.length()) as f64;
+        for (corner, edge_u, edge_v, normal) in faces {
+            let face_area = (edge_u.length() * edge_v.length()) as f64;
             let mut e_sum = 0.0;
             for iu in 0..N {
                 for iv in 0..N {
                     let fu = (iu as f32 + 0.5) / N as f32;
                     let fv = (iv as f32 + 0.5) / N as f32;
-                    let p = corner + eu * fu + ev * fv;
-                    let seed = (iu as u64) << 32 | (iv as u64) | (face_area as u64) << 8;
-                    let mut rng = Rng::seeded(seed.wrapping_mul(0x9E3779B9_7F4A7C15) ^ 0x5DEECE66D);
-                    e_sum += illuminance_split(&ctx, p, normal, settings.max_bounces, &mut rng).total();
+                    let p = corner + edge_u * fu + edge_v * fv;
+                    e_sum += ev.illuminance(p, normal);
                 }
             }
             // Mean illuminance on this face, times its area = flux it receives.
@@ -483,6 +610,154 @@ mod tests {
             "one bounce ({:.1} lx) materially under-reads the converged room ({:.1} lx)",
             one.avg, a.avg
         );
+    }
+
+    /// A bare isotropic source in empty space, so every metric has a closed form to be checked
+    /// against. No geometry at all: nothing to reflect off, nothing to occlude.
+    fn free_field(i: f64) -> (Vec<Mesh>, HashMap<String, IesProfile>, Vec<Luminaire>, RaySettings) {
+        let mut profiles = HashMap::new();
+        profiles.insert("iso".to_string(), isotropic(i));
+        let lums = vec![Luminaire {
+            id: 1,
+            profile: "iso".into(),
+            position: Vertex::new(0.0, 0.0, 0.0),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        }];
+        (Vec::new(), profiles, lums, RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false })
+    }
+
+    /// **Each directional quantity against its closed form**, for a point source at distance `d`
+    /// with intensity `I`. Every one of these is derived from the definition, not copied from a
+    /// table, and they are the checks that distinguish a correct implementation from a plausible
+    /// one — a swapped sine, a missing `π` or a half-range integrated over the wrong half all give
+    /// answers that look perfectly reasonable on screen.
+    ///
+    /// * planar, facing the source:      `E = I/d²`
+    /// * scalar (spherical):             `E_s = I/(4d²)`   — a quarter, because averaging
+    ///   `max(n·ω, 0)` over all orientations of `n` gives ¼
+    /// * cylindrical, source on the horizon: `E_z = I/(πd²)` — averaging `max(cos φ, 0)` over
+    ///   azimuth gives `1/π`
+    /// * cylindrical, source overhead:   `E_z = 0` — a vertical cylinder presents no projected
+    ///   area to a source directly above it
+    #[test]
+    fn the_directional_quantities_match_their_closed_forms() {
+        const I: f64 = 1000.0;
+        const D: f32 = 2.0;
+        let (m, pr, l, s) = free_field(I);
+        let ev = Evaluator::new(&m, &l, &pr, &[], s, Maintenance::INITIAL);
+        let e_perp = I / (D as f64 * D as f64); // 250 lx
+
+        // The source sits at the origin; measure at distance D along +X.
+        let p = Vec3::new(D, 0.0, 0.0);
+        let close = |got: f64, want: f64, what: &str| {
+            let err = (got - want).abs() / want.max(1e-9);
+            assert!(err < 0.02, "{what}: got {got:.2}, expected {want:.2} ({:.1}% out)", err * 100.0);
+        };
+
+        // Planar, facing straight back at the source.
+        close(ev.illuminance(p, -Vec3::X), e_perp, "planar facing the source");
+        // …and facing away from it: nothing, since the source is behind the plane.
+        assert!(ev.illuminance(p, Vec3::X) < 1e-9, "a plane facing away receives nothing");
+
+        // Scalar: a quarter of the perpendicular illuminance.
+        close(ev.scalar(p), e_perp / 4.0, "scalar illuminance");
+
+        // Cylindrical with the source on the horizon: 1/π of it.
+        close(ev.cylindrical(p), e_perp / PI, "cylindrical, source on the horizon");
+
+        // Cylindrical with the source directly overhead: zero, at every height.
+        let below = Vec3::new(0.0, 0.0, -D);
+        assert!(
+            ev.cylindrical(below) < 1e-6,
+            "a vertical cylinder under a source presents no area to it, got {}",
+            ev.cylindrical(below)
+        );
+        // …while the horizontal plane there gets the full I/d².
+        close(ev.illuminance(below, Vec3::Z), e_perp, "horizontal under the source");
+    }
+
+    /// Semi-cylindrical illuminance is DIRECTIONAL: facing the source and facing away give
+    /// different answers, and their mean is the full cylindrical value.
+    ///
+    /// The mean is the sharp part. Two halves of the horizon average to the whole, so if the
+    /// half-range were integrated over the wrong span or normalised by the wrong constant, this
+    /// identity would break while each individual number still looked sensible.
+    #[test]
+    fn semi_cylindrical_faces_a_direction_and_averages_to_cylindrical() {
+        const I: f64 = 1000.0;
+        let (m, pr, l, s) = free_field(I);
+        let ev = Evaluator::new(&m, &l, &pr, &[], s, Maintenance::INITIAL);
+        let p = Vec3::new(2.0, 0.0, 0.0); // source is at the origin, i.e. toward azimuth 180°
+
+        let toward = ev.semi_cylindrical(p, 180.0);
+        let away = ev.semi_cylindrical(p, 0.0);
+        assert!(toward > away, "facing the source ({toward:.1}) must beat facing away ({away:.1})");
+        assert!(away < 1e-6, "facing away from the only source, a half-cylinder sees nothing");
+
+        let mean = 0.5 * (toward + away);
+        let cyl = ev.cylindrical(p);
+        let err = (mean - cyl).abs() / cyl;
+        assert!(err < 0.02, "the two halves ({mean:.2}) should average to cylindrical ({cyl:.2})");
+    }
+
+    /// Luminance of a diffuse surface is `ρE/π`, and it tracks the illuminance that produced it.
+    #[test]
+    fn diffuse_luminance_is_reflectance_times_illuminance_over_pi() {
+        const I: f64 = 1000.0;
+        let (m, pr, l, s) = free_field(I);
+        let ev = Evaluator::new(&m, &l, &pr, &[], s, Maintenance::INITIAL);
+        let p = Vec3::new(0.0, 0.0, -2.0);
+        let e = ev.illuminance(p, Vec3::Z);
+        let l70 = ev.luminance(p, Vec3::Z, 0.70);
+        assert!((l70 - 0.70 * e / PI).abs() < 1e-9);
+        // A darker surface returns proportionally less.
+        let l20 = ev.luminance(p, Vec3::Z, 0.20);
+        assert!((l20 / l70 - 0.20 / 0.70).abs() < 1e-9);
+    }
+
+    /// The maintenance factor reaches EVERY quantity, not just the horizontal grid.
+    ///
+    /// It would be easy to apply it in `calculate` alone and leave the wall and face measures at
+    /// the initial condition — and a report mixing the two would be wrong in a way nothing on the
+    /// page would reveal.
+    #[test]
+    fn maintenance_reaches_every_quantity_not_only_the_work_plane() {
+        const I: f64 = 1000.0;
+        let (m, pr, l, s) = free_field(I);
+        let mf = Maintenance { llmf: 0.9, lsf: 1.0, lmf: 0.9, rsmf: 1.0 };
+        let initial = Evaluator::new(&m, &l, &pr, &[], s, Maintenance::INITIAL);
+        let kept = Evaluator::new(&m, &l, &pr, &[], s, mf);
+        let p = Vec3::new(2.0, 0.0, 0.0);
+        let f = mf.factor();
+        for (a, b, what) in [
+            (initial.illuminance(p, -Vec3::X), kept.illuminance(p, -Vec3::X), "planar"),
+            (initial.cylindrical(p), kept.cylindrical(p), "cylindrical"),
+            (initial.semi_cylindrical(p, 180.0), kept.semi_cylindrical(p, 180.0), "semi-cylindrical"),
+            (initial.scalar(p), kept.scalar(p), "scalar"),
+            (initial.luminance(p, -Vec3::X, 0.5), kept.luminance(p, -Vec3::X, 0.5), "luminance"),
+        ] {
+            assert!((b - a * f).abs() < 1e-9, "{what}: {b} should be {a} x {f}");
+        }
+    }
+
+    /// Asking twice gives the same answer. Monte-Carlo results that wobble between runs cannot be
+    /// reviewed — a designer re-running a calculation must be able to tell a change they made from
+    /// sampling noise.
+    #[test]
+    fn the_same_query_twice_gives_the_same_answer() {
+        let (m, pr, l, mut pl, _) = scene(0);
+        pl.cols = 6;
+        pl.rows = 6;
+        let mats = default_materials();
+        let s = RaySettings { rays_per_point: 32, max_bounces: 3, shadows: true };
+        let ev = Evaluator::new(&m, &l, &pr, &mats, s, Maintenance::INITIAL);
+        let p = Vec3::new(2.0, 2.0, 0.8);
+        assert_eq!(ev.illuminance(p, Vec3::Z), ev.illuminance(p, Vec3::Z));
+        assert_eq!(ev.cylindrical(p), ev.cylindrical(p));
+        let a = calculate(&m, &l, &pr, &mats, &pl, &s);
+        let b = calculate(&m, &l, &pr, &mats, &pl, &s);
+        assert_eq!(a.values, b.values, "the whole grid is reproducible, not just one point");
     }
 
     /// How the cost of a bounce actually scales. Run with:
