@@ -138,6 +138,14 @@ pub struct FactoryDoc {
     /// loader keeps its own default rather than reinterpreting anything.
     #[serde(default)]
     pub working_unit_m: f64,
+    /// WHERE newly added objects land — see `factory::PlaceMode`. A working preference like the
+    /// unit above, persisted so a project reopens behaving the way it was left. `None` (an older
+    /// file) means "not recorded" and the loader keeps its own default.
+    #[serde(default)]
+    pub place_mode: Option<crate::factory::PlaceMode>,
+    /// The distance from the origin used by `PlaceMode::Offset`, in METRES.
+    #[serde(default)]
+    pub place_offset: Option<[f32; 3]>,
 }
 
 /// One pasted texture as persisted: PNG bytes, base64-encoded. Mirrors `factory::TextureAsset`.

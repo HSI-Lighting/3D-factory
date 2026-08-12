@@ -3974,6 +3974,130 @@ impl CadApp {
         }
     }
 
+    /// WHICH WINDOW the command line is talking to.
+    ///
+    /// The 3D Factory has to be on screen for the answer to be "3D": `active_view` remembers the
+    /// last viewport interacted with and does not forget when the panel closes, and a command line
+    /// aimed at a viewport that is not there would swallow every 2D command typed after it.
+    fn command_target(&self) -> ActiveView {
+        if self.factory.open && self.active_view == ActiveView::ThreeD {
+            ActiveView::ThreeD
+        } else {
+            ActiveView::TwoD
+        }
+    }
+
+    /// Words that belong to the 3D Factory alone. Used to tell someone which window owns what they
+    /// typed, rather than answering "unknown command".
+    fn is_factory_only_command(raw: &str) -> bool {
+        let w = raw.trim().to_ascii_lowercase();
+        let head = w.split_whitespace().next().unwrap_or("");
+        matches!(head, "place" | "placeat" | "at" | "centre" | "center" | "click" | "offset")
+    }
+
+    /// The 3D command line's PLACEMENT vocabulary. Returns true when the line was one of these.
+    ///
+    /// This is the typed half of the answer to "the user has no control, it gets added at the
+    /// origin": the menu sets the mode, and these set it and act on it without leaving the keyboard.
+    ///
+    ///   `click` / `centre` / `origin`      — set where new objects land
+    ///   `offset X Y [Z]`                   — set the mode AND the distance in one line
+    ///   `at X Y [Z]`                       — put the waiting object (or the selection) there now
+    ///   `place`                            — hand the SELECTION back to a placing click
+    fn factory_place_command(&mut self, raw: &str) -> bool {
+        use crate::factory::{AwaitingPlace, PlaceMode};
+        let lc = raw.trim().to_ascii_lowercase();
+        let mut it = lc.split_whitespace();
+        let Some(head) = it.next() else { return false };
+        // Lengths are typed in the FACTORY's working unit, like every other 3D number.
+        let nums: Vec<f32> = it.filter_map(|t| t.parse::<f64>().ok()).map(|v| {
+            (v * self.factory.units.metres_per_unit) as f32
+        }).collect();
+
+        let set_mode = |app: &mut Self, m: PlaceMode| {
+            app.factory.place_mode = m;
+            if m != PlaceMode::Click {
+                app.factory.awaiting_place = None;
+            }
+            app.factory.status = m.hint().into();
+            app.history.push(format!("  place mode: {}", m.label()));
+        };
+
+        match head {
+            "click" => set_mode(self, PlaceMode::Click),
+            "centre" | "center" => set_mode(self, PlaceMode::Centre),
+            "origin" => set_mode(self, PlaceMode::Origin),
+            "offset" => {
+                // A bare `offset` selects the mode and keeps the distance already set; with numbers
+                // it sets both, because typing the distance is the whole reason to type this.
+                if nums.len() >= 2 {
+                    self.factory.place_offset =
+                        [nums[0], nums[1], nums.get(2).copied().unwrap_or(0.0)];
+                }
+                set_mode(self, PlaceMode::Offset);
+                let u = self.factory.units;
+                let o = self.factory.place_offset;
+                self.factory.status = format!(
+                    "New objects land at {}, {}, {} from the origin",
+                    crate::factory::length_str(u, o[0]),
+                    crate::factory::length_str(u, o[1]),
+                    crate::factory::length_str(u, o[2]),
+                );
+            }
+            "at" | "placeat" => {
+                if nums.len() < 2 {
+                    self.factory.status =
+                        "at X Y — the point to put it at, in the working unit".into();
+                    self.history.push("  at: needs X and Y".into());
+                    return true;
+                }
+                let p = glam::Vec3::new(nums[0], nums[1], 0.0);
+                // Nothing waiting? Then this is "move what is selected there" — the same question
+                // with the same answer, and refusing it would be pedantry.
+                if self.factory.awaiting_place.is_none() && !self.factory_arm_selection_placement() {
+                    self.factory.status = "at: nothing selected and nothing waiting".into();
+                    self.history.push("  at: nothing to place".into());
+                    return true;
+                }
+                self.factory_finish_awaited_placement(p);
+            }
+            "place" => {
+                if self.factory.awaiting_place.is_some() {
+                    self.factory.status = "Already waiting — click the 2D or 3D window".into();
+                    return true;
+                }
+                if !self.factory_arm_selection_placement() {
+                    self.factory.status = "place: select a solid or a furniture piece first".into();
+                    self.history.push("  place: nothing selected".into());
+                    return true;
+                }
+                let what = match self.factory.awaiting_place {
+                    Some(AwaitingPlace::Furniture(_)) => "furniture",
+                    _ => "solid",
+                };
+                self.factory.status =
+                    format!("Click the 2D or 3D window to place the {what}  [Esc leaves it]");
+                self.history.push(format!("  place: {what} — click either window"));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Hand the current 3D selection to a placing click. False when nothing is selected.
+    fn factory_arm_selection_placement(&mut self) -> bool {
+        use crate::factory::AwaitingPlace;
+        if let Some(i) = self.factory.sel_furn_primary() {
+            self.factory.awaiting_place = Some(AwaitingPlace::Furniture(i));
+            return true;
+        }
+        if let Some(&id) = self.factory.selection.first() {
+            self.factory.awaiting_place = Some(AwaitingPlace::Feature(id));
+            return true;
+        }
+        false
+    }
+
     /// Paint the computed lux grid as a 2D false-colour overlay on the plan,
     /// mapping each work-plane cell through the same `w2s` view transform as the
     /// geometry so the heatmap tracks pan/zoom exactly. Clipped to the canvas.
@@ -4029,6 +4153,63 @@ impl CadApp {
     /// skip its own click/drag handling for that frame. It deliberately does NOT feed
     /// `canvas_locked`: panning and zooming must keep working while points are being placed, and
     /// that gate stops them.
+    /// Let a click on the 2D PLAN say where a newly added 3D object goes.
+    ///
+    /// Asked for as: "a place the user can click on the 3d or 2d window". The 3D viewport has had a
+    /// placement click since Draw3D; the plan never has, so anything added while the 2D canvas was
+    /// in front landed wherever the code chose and stayed there.
+    ///
+    /// Returns TRUE when the click was the placing one, so the drafting canvas skips its own
+    /// click handling for that frame — otherwise saying where a sofa goes also starts a line.
+    /// Like [`Self::simlux_pointer_2d`] it does not feed `canvas_locked`: panning and zooming to
+    /// find the right spot must keep working while an object waits.
+    fn factory_placing_pointer_2d(&mut self, resp: &egui::Response, rect: egui::Rect) -> bool {
+        if self.factory.awaiting_place.is_none() {
+            return false;
+        }
+        if !resp.clicked() {
+            // Still armed, so the click gates stay suppressed for the whole gesture — a press that
+            // has not yet become a click must not fall through and start drawing.
+            return resp.is_pointer_button_down_on();
+        }
+        let Some(pos) = resp.interact_pointer_pos() else { return false };
+        // The plan is in DOCUMENT units and the model is in metres; `s2w_m` is the one that
+        // converts. Z comes from the storey the object was built on, not from the plan.
+        let w = self.s2w_m(pos, rect);
+        self.factory_finish_awaited_placement(glam::Vec3::new(w.x as f32, w.y as f32, 0.0));
+        true
+    }
+
+    /// Land the waiting object at `at` and say so — the shared tail of the 2D and 3D placing
+    /// clicks, so both windows behave identically.
+    fn factory_finish_awaited_placement(&mut self, at: glam::Vec3) {
+        // Snapshot BEFORE the move, and only now that a real point exists: an armed object that is
+        // never clicked must not leave an empty undo step behind.
+        self.snapshot_factory();
+        let what = self.factory.place_awaiting_at(at);
+        if what.is_none() {
+            return; // the object went away underneath us (undo, delete) — nothing to place
+        }
+        let name = match what {
+            Some(crate::factory::AwaitingPlace::Furniture(i)) => self
+                .factory
+                .furniture
+                .get(i)
+                .and_then(|f| self.factory.furniture_lib.get(f.asset))
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "object".into()),
+            _ => "solid".into(),
+        };
+        self.factory.recompute();
+        let u = self.factory.units;
+        self.factory.status = format!(
+            "{name} placed at {}, {}",
+            crate::factory::length_str(u, at.x),
+            crate::factory::length_str(u, at.y),
+        );
+        self.factory_note(format!("place ✓ {name} ({:.2},{:.2})", at.x, at.y));
+    }
+
     fn simlux_pointer_2d(
         &mut self,
         resp: &egui::Response,
@@ -6039,7 +6220,7 @@ impl CadApp {
         // Drop it at the MODEL's centre, not world origin. Imported drawings live at their
         // DXF coordinates (e.g. X≈3619, Y≈956), so placing at (0,0,0) put furniture km away,
         // off-screen — it looked like the import "did nothing". Land it where the building is.
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at); // selects the new instance (sel_furniture)
         // Bind each material to its region via the per-face system: every face-group inherits the
         // texture of the PART (glTF primitive) it belongs to, so each material shows on its own
@@ -6832,7 +7013,7 @@ impl CadApp {
     fn factory_import_aperture(&mut self, kind: crate::factory::ApertureKind) {
         let Some(idx) = self.factory_ensure_aperture_asset(kind) else { return };
         self.snapshot_factory();
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at); // uniform scale, user moves/sizes it
         self.factory.open = true;
         self.factory.status = format!("{} imported — move it into place", kind.label());
@@ -9815,6 +9996,63 @@ impl CadApp {
                     })
                     .response
                     .on_hover_text("The unit every length in the 3D Factory is typed and shown in");
+
+                    // WHERE new objects land. Beside the unit for the same reason: it is a decision
+                    // that applies to everything you are about to add, not a property of any one
+                    // thing. Reported as "the user has no control, it gets added at the origin".
+                    let pm = self.factory.place_mode;
+                    ui.menu_button(format!("▼ {}", pm.label()), |ui| {
+                        ui.label(
+                            egui::RichText::new("where new objects land").small().weak(),
+                        );
+                        for m in crate::factory::PlaceMode::ALL {
+                            if ui
+                                .selectable_label(m == pm, m.label())
+                                .on_hover_text(m.hint())
+                                .clicked()
+                            {
+                                self.factory.place_mode = m;
+                                // Switching AWAY from Click while something waits would leave it
+                                // stranded, armed forever with no click coming for it.
+                                if m != crate::factory::PlaceMode::Click {
+                                    self.factory.awaiting_place = None;
+                                }
+                                self.factory.status = m.hint().into();
+                                ui.close_menu();
+                            }
+                        }
+                        if self.factory.place_mode == crate::factory::PlaceMode::Offset {
+                            ui.separator();
+                            ui.label(egui::RichText::new("distance from origin").small().weak());
+                            let u = self.factory.units;
+                            for (axis, i) in [("X", 0usize), ("Y", 1), ("Z", 2)] {
+                                ui.horizontal(|ui| {
+                                    ui.label(axis);
+                                    crate::factory::length_ui(
+                                        ui,
+                                        u,
+                                        &mut self.factory.place_offset[i],
+                                        0.05,
+                                        -10_000.0,
+                                        10_000.0,
+                                    );
+                                });
+                            }
+                        }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(
+                                "Applies to 3D solids, furniture, apertures and architecture.\n\
+                                 A door or window drawn on a wall is unaffected — it already\n\
+                                 goes exactly where you drew it.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    })
+                    .response
+                    .on_hover_text(pm.hint());
+
                     ui.separator();
                     ui.menu_button("▼ 3D solids", |ui| {
                         for k in crate::factory::Draw3dKind::ALL {
@@ -10244,7 +10482,7 @@ impl CadApp {
                                     self.snapshot_factory();
                                     // Drop it where the building is, NOT at world origin —
                                     // otherwise it lands km away (DXF coords) and is invisible.
-                                    let at = self.factory.default_place_at();
+                                    let at = self.factory.place_at();
                                     self.factory.place_furniture(i, at);
                                     // No fit() — placing furniture must not yank the camera
                                     // out to a zoomed-out view; it lands at the model centre,
@@ -11376,6 +11614,17 @@ impl CadApp {
                                 self.factory_note(format!("3D place ✓ ({:.2},{:.2})", w.x, w.y));
                             } else {
                                 self.factory.place_pending = Some(prim); // missed the plane
+                            }
+                            return_after_click = true;
+                        }
+                        // …then the object that was just ADDED and is waiting to be told where it
+                        // goes. Same rule as above: a click that misses the plane stays armed.
+                        else if self.factory.awaiting_place.is_some() {
+                            let snapped = self.factory.snap_vertex(pos, rect, &mvp).map(|(w, _)| w);
+                            if let Some(w) =
+                                snapped.or_else(|| self.factory.cursor_on_plane(pos, rect, &mvp))
+                            {
+                                self.factory_finish_awaited_placement(w);
                             }
                             return_after_click = true;
                         }
@@ -12841,7 +13090,61 @@ impl CadApp {
                 self.history.push(format!("  - erased {n} solid(s)"));
                 return;
             }
+            // ---- 3D COMMAND vocabulary — placement ------------------------------------
+            // "we will have a 3d command window … the 2d command window's commands won't work on
+            // the 3d factory or vice versa; for it to work the user has to click on the window
+            // they want access to."
+            if self.factory_place_command(trimmed) {
+                return;
+            }
+
+            // ---- THE BOUNDARY. A 2D DRAWING command does not run against the 3D model.
+            //
+            // `Add` and `SetTool` are exactly the set that creates 2D geometry — line, circle,
+            // wall, text and the rest. BOTH are needed: `line x1,y1 x2,y2` parses to `Add`, but a
+            // bare `line` — the form people actually type — parses to `SetTool`, and matching only
+            // `Add` let every interactive 2D tool straight through.
+            //
+            // Refusing on those two discriminators rather than a hand-kept list of names is what
+            // keeps this honest as the 2D side grows: a command added there is covered here the day
+            // it is added, and nothing shared (zoom, select, undo, setvar) is caught by accident.
+            //
+            // It REFUSES rather than silently doing nothing, and it names the way out. A command
+            // that vanishes without explanation is the bug this feature exists to fix, not a
+            // shape to reproduce.
+            //
+            // Gated on `command_target()`, not on `active_view` alone, so the refusal and the dock
+            // title can never disagree — a window titled "Command" must never refuse a 2D command.
+            // The enclosing block's gate is deliberately left as `active_view` ALONE: requiring
+            // `factory.open` there is the change that hijacked `m` out of 2D drawing twice.
+            if self.command_target() == ActiveView::ThreeD
+                && matches!(
+                    cad_kernel::parser::parse(trimmed),
+                    Ok(cad_kernel::parser::Command::Add(_) | cad_kernel::parser::Command::SetTool(_))
+                )
+            {
+                let msg = format!(
+                    "'{trimmed}' is a 2D command — click the 2D window to draw with it."
+                );
+                self.history.push(format!("  ⚠ {msg}"));
+                self.factory.status = msg;
+                return;
+            }
             // anything else falls through to the 2D dispatcher untouched
+        }
+        // ---- …and the same boundary the other way. A 3D word typed at the 2D command line is a
+        // sign the user thinks they are talking to the Factory. Say which window owns it instead of
+        // reporting "unknown command", which reads as "that is not a thing".
+        //
+        // Only words the 2D parser does NOT claim: where both sides recognise a name, the window
+        // you are in wins. 2D is the default view, so 2D keeps its own vocabulary intact.
+        else if Self::is_factory_only_command(trimmed)
+            && cad_kernel::parser::parse(trimmed).is_err()
+        {
+            let msg =
+                format!("'{trimmed}' is a 3D Factory command — click the 3D window to use it.");
+            self.history.push(format!("  ⚠ {msg}"));
+            return;
         }
 
         // ---- SYSVAR value entry (after `setvar NAME` or a bare var name) ----
@@ -20988,7 +21291,19 @@ impl CadApp {
         // active command — or the idle "command:" ready prompt when nothing
         // is active. It always shows, so the user always knows what's expected.
         if self.current_prompt.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "command:");
+            // The idle prompt names the window it belongs to, so the command line is never
+            // ambiguous about which model it is about to act on. An object waiting for a placing
+            // click outranks both — that is the one thing the app needs from you right now.
+            if self.factory.awaiting_place.is_some() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 200, 110),
+                    "click the 2D or 3D window to place it  ·  `at X Y` to type the point  ·  Esc leaves it",
+                );
+            } else if self.command_target() == ActiveView::ThreeD {
+                ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "3D command:");
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "command:");
+            }
         } else {
             ui.colored_label(
                 egui::Color32::from_rgb(0x18, 0x4c, 0x04), &self.current_prompt);
@@ -25190,7 +25505,7 @@ impl CadApp {
             })
             .collect();
 
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
             let g = a.group_geom();
@@ -25294,7 +25609,7 @@ impl CadApp {
             })
             .collect();
 
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
             let g = a.group_geom();
@@ -25398,7 +25713,7 @@ impl CadApp {
             })
             .collect();
 
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at); // selects the new instance
         // Bind each part's material to its face-groups (mirror the glTF multi-material import). The
         // immutable asset borrow is closed before the mutable instance borrow.
@@ -25485,7 +25800,7 @@ impl CadApp {
             })
             .collect();
 
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
             let g = a.group_geom();
@@ -25570,7 +25885,7 @@ impl CadApp {
                 Material::Rod => Some(rod),
             })
             .collect();
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
             let g = a.group_geom();
@@ -25643,7 +25958,7 @@ impl CadApp {
             })
             .collect();
 
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         let fg_tex = self.factory.furniture_lib.get(idx).map(|a| {
             let g = a.group_geom();
@@ -25881,7 +26196,7 @@ impl CadApp {
                 a.part_ids = part_ids; // one id per TRIANGLE
             }
         }
-        let at = self.factory.default_place_at();
+        let at = self.factory.place_at();
         self.factory.place_furniture(idx, at);
         self.factory.open = true;
         self.factory.status = format!("{name} {verb} ({tris} tris) — placed at model centre");
@@ -36495,6 +36810,15 @@ impl eframe::App for CadApp {
                 self.factory_note("3D place: cancelled".into());
                 return;
             }
+            // An object waiting to be told where it goes: Esc stops the waiting and LEAVES IT
+            // WHERE IT IS. It is already a real object — Esc means "here is fine", not "throw it
+            // away", which is why nothing is undone here.
+            if self.factory.awaiting_place.is_some() {
+                self.factory.awaiting_place = None;
+                self.factory.status = "Left where it landed — Ctrl+Z to remove it".into();
+                self.factory_note("place: left in place".into());
+                return;
+            }
             // 3D zoom: Esc exits any zoom mode, before the 2D cancel-everything below.
             if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
                 self.factory.zoom_mode = crate::factory::ZoomMode::Off;
@@ -38570,8 +38894,16 @@ impl eframe::App for CadApp {
         // to the CENTER column (WORKSPACE_SYSTEM). The history/prompt/input body
         // is `command_bar_body` — one implementation for both docking modes.
         {
+            // THE TITLE SAYS WHICH WINDOW IT IS TALKING TO. Asked for as: "when the user is using
+            // the 3d factory the command window's name will change to 3d command. and when the user
+            // clicks on the 2d window it changes back to just command".
+            //
+            // It reads `active_view` — the viewport last interacted with — which is the same gate
+            // the shared `move`/`copy`/`rotate` commands already dispatch on. So the title is not a
+            // second opinion about where a command will go; it is a readout of the one that decides.
+            let three_d = self.command_target() == ActiveView::ThreeD;
             let cfg = crate::dock::DockConfig {
-                id: "command", title: "Command", badge: None,
+                id: "command", title: if three_d { "3D Command" } else { "Command" }, badge: None,
                 dock_region: crate::dock::DockRegion::Bottom,
                 size: 150.0, min: 96.0, max: 320.0,
                 resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
@@ -38612,6 +38944,11 @@ impl eframe::App for CadApp {
             // handlers only (see `simlux_pointer_2d`) — pan, zoom and the right-click menu stay
             // live, because laying out a lighting grid means moving around the drawing.
             let light_grab = !canvas_locked && self.simlux_pointer_2d(&resp, rect, ctx);
+            // 3D FACTORY placement: an object added with "Click to place" is waiting to be told
+            // where it goes, and the plan is a perfectly good place to say so — asked for as "a
+            // place the user can click on the 3d or 2d window". Gated in alongside `light_grab` so
+            // the placing click never also selects or starts drawing something.
+            let place_grab = !canvas_locked && self.factory_placing_pointer_2d(&resp, rect);
             // ---- right-click shortcut (context) menu --------------------
             // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
             // when there's a selection or something on the clipboard.
@@ -39025,8 +39362,8 @@ impl eframe::App for CadApp {
             // resp.clicked() fires only when egui classifies the press+release
             // as a click (small motion); drag_stopped() fires when a release
             // ends a drag — including a "click" that egui saw as a tiny drag.
-            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom && !light_grab;
-            let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom && !light_grab;
+            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom && !light_grab && !place_grab;
+            let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom && !light_grab && !place_grab;
             // SESSION RECORDER — every mouse press/release with the
             // FULL gesture context. Press position is stashed on self
             // and re-read at release time to derive the real drag
@@ -39281,6 +39618,7 @@ impl eframe::App for CadApp {
             let press_now = press_fires_click
                 && !rt_zoom
                 && !light_grab
+                && !place_grab
                 && ctx.input(|i| i.pointer.primary_pressed())
                 && resp.contains_pointer();
             let click_now = if press_fires_click { press_now } else { click_now };
@@ -39297,7 +39635,7 @@ impl eframe::App for CadApp {
             // Geom::with_grip_moved() decides what changes (e.g. circle
             // quadrant → radius; line midpoint → translate whole line).
             let mut grip_drag_consumed_click = false;
-            if pointer_mode_idle && self.env.GrpEnb && !rt_zoom && !light_grab {
+            if pointer_mode_idle && self.env.GrpEnb && !rt_zoom && !light_grab && !place_grab {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary)
                     && !canvas_locked;
                 // Drag-grab ONLY: a primary-button drag that begins near a grip.
@@ -42914,7 +43252,10 @@ impl eframe::App for CadApp {
                         // drafting canvas read as a glitch, and the offset between them is
                         // actively misleading while snapping.
                         ctx.set_cursor_icon(egui::CursorIcon::None);
-                        if in_click_only_phase {
+                        // An object waiting to be placed is asking for a POINT, so the plan shows
+                        // the drafting cursor even though no 2D tool is running. The pointer is
+                        // the app's answer to "what is this click going to do?".
+                        if in_click_only_phase || self.factory.awaiting_place.is_some() {
                             let constrained_world = snap_hit
                                 .map(|h| h.point)
                                 .unwrap_or_else(|| self.apply_constraints(self.s2w(raw_p, rect)));
@@ -51590,5 +51931,183 @@ mod plan_overlay {
         assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
         let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
         assert_eq!(solids_after, solids_before, "a cutter added a solid outline to the plan");
+    }
+}
+
+/// ONE command line, TWO windows.
+///
+/// Asked for as: "we will have a 3d command window. the 2d cad has a command window where the
+/// parameters of a tool can be entered. we will use the same window. the user is using the 3d
+/// factory[,] the command window's name will change to 3d command. and when the user click[s] on
+/// the 2d window it changes back to just command so now it works for the cad. the 2d command
+/// window's command won't work on the 3d factory or vice versa[;] for it to work the user ha[s] to
+/// click on the window they want access to."
+#[cfg(test)]
+mod command_target {
+    use super::*;
+
+    fn app_in_3d() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.active_view = ActiveView::ThreeD;
+        app
+    }
+
+    /// The title is a readout of the thing that actually decides, not a second opinion.
+    #[test]
+    fn the_target_follows_the_window_you_last_touched() {
+        let mut app = app_in_3d();
+        assert_eq!(app.command_target(), ActiveView::ThreeD);
+        app.active_view = ActiveView::TwoD; // …a click on the plan
+        assert_eq!(app.command_target(), ActiveView::TwoD);
+    }
+
+    /// A viewport that is not on screen cannot be the one you are working in. Without this the
+    /// command line would keep swallowing 2D commands after the Factory panel was closed.
+    #[test]
+    fn closing_the_factory_hands_the_command_line_back() {
+        let mut app = app_in_3d();
+        app.factory.open = false;
+        assert_eq!(app.command_target(), ActiveView::TwoD);
+    }
+
+    /// THE BOUNDARY, 2D → 3D. `line` draws on the plan; against a 3D model it means nothing, and
+    /// running it anyway is how a command "silently does nothing".
+    #[test]
+    fn a_2d_drawing_command_is_refused_in_the_3d_window() {
+        let mut app = app_in_3d();
+        let before = app.doc.dobjects.len();
+        app.run_command("line");
+        assert_eq!(app.doc.dobjects.len(), before, "nothing may be drawn");
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(last.contains("2D command"), "it must SAY why, got {last:?}");
+        assert!(last.contains("click the 2D window"), "…and name the way out, got {last:?}");
+    }
+
+    /// …and the same command in its own window is untouched. A boundary that also blocks the thing
+    /// it is meant to protect is just a break.
+    #[test]
+    fn the_same_command_still_works_in_the_2d_window() {
+        let mut app = app_in_3d();
+        app.active_view = ActiveView::TwoD;
+        app.run_command("line");
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(!last.contains("2D command"), "2D must keep its own vocabulary, got {last:?}");
+    }
+
+    /// THE BOUNDARY, 3D → 2D. A Factory word typed at the 2D prompt is someone talking to the wrong
+    /// window; "unknown command" would read as "that is not a thing".
+    #[test]
+    fn a_3d_command_is_refused_in_the_2d_window() {
+        let mut app = CadApp::default();
+        app.active_view = ActiveView::TwoD;
+        app.run_command("place");
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(last.contains("3D Factory command"), "got {last:?}");
+        assert!(last.contains("click the 3D window"), "got {last:?}");
+    }
+
+    /// Shared commands are shared. `move` dispatches by active view and must not be caught by
+    /// either refusal.
+    #[test]
+    fn a_shared_command_crosses_freely() {
+        for view in [ActiveView::TwoD, ActiveView::ThreeD] {
+            let mut app = app_in_3d();
+            app.active_view = view;
+            app.run_command("move");
+            let last = app.history.last().cloned().unwrap_or_default();
+            assert!(!last.contains("is a 2D command"), "{view:?}: {last:?}");
+            assert!(!last.contains("is a 3D Factory command"), "{view:?}: {last:?}");
+        }
+    }
+
+    // ---- the placement vocabulary --------------------------------------------------------
+
+    #[test]
+    fn the_mode_words_set_the_mode() {
+        use crate::factory::PlaceMode;
+        let mut app = app_in_3d();
+        for (word, want) in [
+            ("origin", PlaceMode::Origin),
+            ("centre", PlaceMode::Centre),
+            ("center", PlaceMode::Centre),
+            ("click", PlaceMode::Click),
+        ] {
+            app.run_command(word);
+            assert_eq!(app.factory.place_mode, want, "typing '{word}'");
+        }
+    }
+
+    /// `offset 2000 500` in millimetres is 2 m, 0.5 m — typed lengths go through the FACTORY's
+    /// working unit like every other 3D number. Reading them as metres is the class of bug that
+    /// built a 4.4 km building.
+    #[test]
+    fn offset_is_typed_in_the_working_unit() {
+        let mut app = app_in_3d();
+        app.factory.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::MM,
+            cad_kernel::UnitSource::User,
+        );
+        app.run_command("offset 2000 500");
+        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Offset);
+        assert!((app.factory.place_offset[0] - 2.0).abs() < 1e-6, "{:?}", app.factory.place_offset);
+        assert!((app.factory.place_offset[1] - 0.5).abs() < 1e-6, "{:?}", app.factory.place_offset);
+    }
+
+    /// Switching away from Click while something waits would strand it: armed forever, with no
+    /// click coming for it.
+    #[test]
+    fn leaving_click_mode_releases_whatever_was_waiting() {
+        let mut app = app_in_3d();
+        app.factory.add_box();
+        assert!(app.factory.awaiting_place.is_some());
+        app.run_command("origin");
+        assert!(app.factory.awaiting_place.is_none(), "nothing may be left waiting");
+    }
+
+    /// `at X Y` is the typed half of the placing click — the same point, from the keyboard.
+    #[test]
+    fn at_places_the_waiting_object_without_a_click() {
+        let mut app = app_in_3d();
+        app.factory.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::M,
+            cad_kernel::UnitSource::User,
+        );
+        app.factory.add_box();
+        let id = *app.factory.selection.first().unwrap();
+        app.run_command("at 12 34");
+        assert!(app.factory.awaiting_place.is_none(), "the wait is over");
+        let f = app.factory.model.features.iter().find(|f| f.id == id).unwrap();
+        let (w, d) = match f.primitive {
+            cad_solid::Primitive::Box { w, d, .. } => (w, d),
+            _ => panic!("a box"),
+        };
+        assert!((f.placement.u - (12.0 + w * 0.5)).abs() < 1e-4, "u = {}", f.placement.u);
+        assert!((f.placement.v - (34.0 + d * 0.5)).abs() < 1e-4, "v = {}", f.placement.v);
+    }
+
+    /// `place` re-arms something already built, so a piece can be repositioned by the same gesture
+    /// that put it down.
+    #[test]
+    fn place_hands_the_selection_back_to_a_click() {
+        let mut app = app_in_3d();
+        app.factory.place_mode = crate::factory::PlaceMode::Centre; // nothing waiting
+        app.factory.add_box();
+        assert!(app.factory.awaiting_place.is_none());
+        app.run_command("place");
+        let id = *app.factory.selection.first().unwrap();
+        assert_eq!(
+            app.factory.awaiting_place,
+            Some(crate::factory::AwaitingPlace::Feature(id)),
+        );
+    }
+
+    #[test]
+    fn place_with_nothing_selected_says_so() {
+        let mut app = app_in_3d();
+        app.factory.place_mode = crate::factory::PlaceMode::Centre;
+        app.run_command("place");
+        assert!(app.factory.awaiting_place.is_none());
+        assert!(app.factory.status.contains("select"), "got {:?}", app.factory.status);
     }
 }

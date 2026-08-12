@@ -20,6 +20,80 @@ pub enum StdView {
     Top, Bottom, Front, Back, Left, Right, Iso,
 }
 
+/// WHERE a newly added 3D object, furniture piece or architecture element lands.
+///
+/// Reported as: "when a 3d object, furniture, or room element etc … [is] placed the user has no
+/// control, it gets added at the origin. the user needs the control. the user can choose whether it
+/// gets added at the origin, or at a distance from the origin and a place the user can click on the
+/// 3d or 2d window."
+///
+/// `Centre` is what every add path used to do unconditionally — and it is not the world origin on
+/// purpose: an imported drawing sits at its DXF coordinates (X≈3619, Y≈956), so a piece dropped at
+/// (0,0) is kilometres off-screen and looks like nothing happened. That behaviour is kept, as an
+/// option rather than the only possibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum PlaceMode {
+    /// Click the 2D or 3D window to say where it goes. THE DEFAULT.
+    #[default]
+    Click,
+    /// The centre of the current model — where a piece is certain to be visible.
+    Centre,
+    /// World (0, 0), whatever the model is doing.
+    Origin,
+    /// A fixed distance from the world origin — [`FactoryState::place_offset`].
+    Offset,
+}
+
+impl PlaceMode {
+    pub const ALL: [PlaceMode; 4] =
+        [PlaceMode::Click, PlaceMode::Centre, PlaceMode::Origin, PlaceMode::Offset];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlaceMode::Click => "Click to place",
+            PlaceMode::Centre => "Model centre",
+            PlaceMode::Origin => "World origin",
+            PlaceMode::Offset => "Offset from origin",
+        }
+    }
+
+    /// The word the 3D command line accepts for this mode.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            PlaceMode::Click => "click",
+            PlaceMode::Centre => "centre",
+            PlaceMode::Origin => "origin",
+            PlaceMode::Offset => "offset",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            PlaceMode::Click => {
+                "New objects wait for a click — in either window — before they settle."
+            }
+            PlaceMode::Centre => "New objects land at the middle of the model, always in view.",
+            PlaceMode::Origin => "New objects land at world (0, 0).",
+            PlaceMode::Offset => "New objects land at a fixed distance from world (0, 0).",
+        }
+    }
+}
+
+/// The object that has just been added and is waiting on a click to say where it goes.
+///
+/// It ALREADY EXISTS at the position [`PlaceMode::Centre`] would have chosen. Building it first and
+/// moving it second is what keeps this from touching the nine add paths: each one still creates its
+/// object, binds its textures and writes its status exactly as before, and none of them has to know
+/// a click is coming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AwaitingPlace {
+    /// Index into [`FactoryState::furniture`] — furniture, apertures, and every parametric
+    /// generator, all of which are furniture instances.
+    Furniture(usize),
+    /// A CSG feature id — boxes, cylinders, and the rest of the solid primitives.
+    Feature(u32),
+}
+
 /// Which plane the 2D CANVAS draws on — the orthographic view the drafting side is looking along.
 /// Distinct from [`StdView`], which aims the 3D camera; this decides what the 2D tools edit.
 ///
@@ -951,6 +1025,14 @@ pub struct FactoryState {
     /// view — created at the picked point (a Box's corner / everything else centred),
     /// not at the origin. `None` = nothing waiting to be placed.
     pub place_pending: Option<Primitive>,
+
+    /// WHERE a newly added object lands. See [`PlaceMode`] and [`FactoryState::place_at`].
+    pub place_mode: PlaceMode,
+    /// The distance from the world origin used by [`PlaceMode::Offset`], in metres.
+    pub place_offset: [f32; 3],
+    /// The object that was just added and is waiting for a click — in EITHER window — to say
+    /// where it goes. See [`FactoryState::place_awaiting_at`].
+    pub awaiting_place: Option<AwaitingPlace>,
 
     /// 3D wall extrusion height — the ONE thing a 2D wall lacks. A promoted wall keeps
     /// its own (per-wall) thickness and rises to this height. Kept in the 3D layer, NOT
@@ -2895,6 +2977,12 @@ impl Default for FactoryState {
             draw3d: None,
             draw3d_edit: None,
             place_pending: None,
+            // CLICK by default. The complaint was that everything landed at the origin with no say
+            // in it; the fix is not a better default position, it is being ASKED. Switch it to
+            // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
+            place_mode: PlaceMode::Click,
+            place_offset: [0.0, 0.0, 0.0],
+            awaiting_place: None,
             wall_height: 2.7,
             wall_thickness: 0.2,
             walls: Vec::new(),
@@ -2984,6 +3072,7 @@ impl FactoryState {
         let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
+        self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
     }
 
@@ -3225,6 +3314,64 @@ impl FactoryState {
         }
     }
 
+    /// WHERE a newly added object lands, per [`PlaceMode`].
+    ///
+    /// Reported as: "when a 3d object, furniture, or room element etc … [is] placed the user has no
+    /// control, it gets added at the origin". Every add path called `default_place_at` and there was
+    /// no way to say otherwise. This is the one place that decides, so every add path obeys the same
+    /// setting.
+    ///
+    /// [`PlaceMode::Click`] resolves to the same point as `Centre` — the object has to EXIST before
+    /// it can be moved, and it lands somewhere visible while it waits for the click. See
+    /// [`Self::awaiting_place`].
+    pub fn place_at(&self) -> Vec3 {
+        match self.place_mode {
+            PlaceMode::Centre | PlaceMode::Click => self.default_place_at(),
+            PlaceMode::Origin => Vec3::new(0.0, 0.0, 0.0),
+            PlaceMode::Offset => Vec3::from(self.place_offset),
+        }
+    }
+
+    /// Hand the just-added object to the placing click, if the user asked for one.
+    ///
+    /// Called at the END of every add — the object is already built and positioned, so nothing
+    /// downstream (texture binding, part ids, status) has to know about placement at all. If the
+    /// click never comes the object simply stays where it landed; Esc says so explicitly.
+    fn arm_placement(&mut self, what: AwaitingPlace) {
+        if self.place_mode == PlaceMode::Click {
+            self.awaiting_place = Some(what);
+        }
+    }
+
+    /// Move whatever is waiting on a placing click to `at`, and disarm. Returns what moved, so the
+    /// caller can name it in the status line.
+    ///
+    /// Only X and Y come from the click: Z is the storey the object was built on. A click on the
+    /// ground plane is a plan position, not an instruction to drop a first-floor slab to the ground.
+    pub fn place_awaiting_at(&mut self, at: Vec3) -> Option<AwaitingPlace> {
+        let what = self.awaiting_place.take()?;
+        match what {
+            AwaitingPlace::Furniture(i) => {
+                let inst = self.furniture.get_mut(i)?;
+                inst.pos[0] = at.x;
+                inst.pos[1] = at.y;
+            }
+            AwaitingPlace::Feature(id) => {
+                let f = self.model.features.iter_mut().find(|f| f.id == id)?;
+                // A Box's click point is its NEAR CORNER, matching `place_primitive` — the same
+                // click must not mean two different things depending on how the box was created.
+                let (ox, oy) = match f.primitive {
+                    Primitive::Box { w, d, .. } => (w * 0.5, d * 0.5),
+                    _ => (0.0, 0.0),
+                };
+                f.placement.u = at.x + ox;
+                f.placement.v = at.y + oy;
+            }
+        }
+        self.dirty = true;
+        Some(what)
+    }
+
     /// Copy the current 3D selection (a furniture instance OR a single CSG feature) into the
     /// paste buffer, with its colour/texture. Returns true if something was captured.
     pub fn copy_selection(&mut self) -> bool {
@@ -3368,7 +3515,13 @@ impl FactoryState {
             surface_texture: std::collections::HashMap::new(),
             ..Default::default()
         });
-        self.select_furniture(self.furniture.len() - 1);
+        let i = self.furniture.len() - 1;
+        self.select_furniture(i);
+        // EVERY furniture add funnels through here — imports, apertures, and all nine parametric
+        // generators — so arming once here gives the placing click to all of them without any of
+        // them knowing about it. `place_aperture` deliberately does NOT come through this function:
+        // an aperture fitted into an opening the user drew is already exactly where it belongs.
+        self.arm_placement(AwaitingPlace::Furniture(i));
     }
 
     /// Place aperture library asset `asset` (a door/window mesh) so it exactly FILLS an opening
@@ -5692,6 +5845,8 @@ impl FactoryState {
                 .collect(),
             next_room_id: self.next_room_id,
             working_unit_m: self.units.metres_per_unit,
+            place_mode: Some(self.place_mode),
+            place_offset: Some(self.place_offset),
         }
     }
 
@@ -5865,6 +6020,14 @@ impl FactoryState {
         if d.working_unit_m > 0.0 {
             self.units = cad_kernel::DocUnits::new(d.working_unit_m, cad_kernel::UnitSource::User);
         }
+        // Placement preference. Absent from a file written before it existed, and then the default
+        // stands — the same rule as the working unit above.
+        if let Some(m) = d.place_mode {
+            self.place_mode = m;
+        }
+        if let Some(o) = d.place_offset {
+            self.place_offset = o;
+        }
         // ROOMS. A feature the model no longer holds is dropped from the room rather than left
         // dangling — a room pointing at geometry that is not there would resize nothing and
         // delete nothing, which is worse than a room that knows it has lost a wall.
@@ -5911,6 +6074,7 @@ impl FactoryState {
         let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
+        self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
     }
 
@@ -5940,6 +6104,7 @@ impl FactoryState {
         let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
+        self.arm_placement(AwaitingPlace::Feature(id));
         self.dirty = true;
     }
 
@@ -12907,5 +13072,189 @@ mod plan_footprint_tests {
         let w = fp.iter().fold(f32::NEG_INFINITY, |a, q| a.max(q.x))
             - fp.iter().fold(f32::INFINITY, |a, q| a.min(q.x));
         assert!((w - (mx.x - mn.x)).abs() < 1e-3, "the fallback must be the full bound");
+    }
+}
+
+/// WHERE a newly added object lands.
+///
+/// Reported as: "now when a 3d object, furniture, or room element etc except the drawn furnitures
+/// are being placed the user has no control it gets added at the origin. the user needs the
+/// control." Every add path called `default_place_at()` and nothing could say otherwise.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn with_a_model() -> FactoryState {
+        let mut st = FactoryState::default();
+        // A building well away from the world origin — the DXF-coordinate case that is the whole
+        // reason `Centre` exists and is not simply (0,0).
+        let placement = Placement { u: 100.0, v: 50.0, ..Placement::default() };
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            placement,
+            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+        );
+        st.recompute();
+        st
+    }
+
+    fn tri_mesh() -> crate::mesh_io::ObjMesh {
+        crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            color: None,
+            alpha: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn each_mode_resolves_to_its_own_point() {
+        let mut st = with_a_model();
+
+        st.place_mode = PlaceMode::Origin;
+        let o = st.place_at();
+        assert!(o.x.abs() < 1e-6 && o.y.abs() < 1e-6, "World origin means (0,0), got {o:?}");
+
+        st.place_mode = PlaceMode::Centre;
+        let c = st.place_at();
+        assert!(
+            (c.x - 100.0).abs() < 1e-3 && (c.y - 50.0).abs() < 1e-3,
+            "Centre must follow the model out to its DXF coordinates, got {c:?}",
+        );
+
+        st.place_mode = PlaceMode::Offset;
+        st.place_offset = [3.0, 4.0, 0.0];
+        let f = st.place_at();
+        assert!((f.x - 3.0).abs() < 1e-6 && (f.y - 4.0).abs() < 1e-6, "got {f:?}");
+
+        // Click has to land somewhere VISIBLE while it waits, so it borrows Centre's answer. A piece
+        // parked at (0,0) while the building is 100 m away is off-screen, and off-screen reads as
+        // "nothing happened" — the bug this replaced.
+        st.place_mode = PlaceMode::Click;
+        let k = st.place_at();
+        assert!((k.x - 100.0).abs() < 1e-3, "Click must park it in view, got {k:?}");
+    }
+
+    /// The default. The complaint was never that the origin is the wrong point — it is that nobody
+    /// was asked.
+    #[test]
+    fn the_default_is_to_ask() {
+        assert_eq!(FactoryState::default().place_mode, PlaceMode::Click);
+    }
+
+    /// EVERY furniture add funnels through `place_furniture`, so arming there covers imports,
+    /// apertures and all nine parametric generators at once.
+    #[test]
+    fn adding_furniture_arms_the_placing_click() {
+        let mut st = with_a_model();
+        let idx = st.add_furniture_asset("chair".into(), tri_mesh());
+        let at = st.place_at();
+        st.place_furniture(idx, at);
+        assert_eq!(
+            st.awaiting_place,
+            Some(AwaitingPlace::Furniture(0)),
+            "a new piece must wait to be told where it goes",
+        );
+
+        // …and the click moves it, in plan only.
+        let z_before = st.furniture[0].pos[2];
+        let what = st.place_awaiting_at(Vec3::new(7.0, 8.0, 0.0));
+        assert_eq!(what, Some(AwaitingPlace::Furniture(0)));
+        assert!((st.furniture[0].pos[0] - 7.0).abs() < 1e-6);
+        assert!((st.furniture[0].pos[1] - 8.0).abs() < 1e-6);
+        assert!(
+            (st.furniture[0].pos[2] - z_before).abs() < 1e-6,
+            "Z is the storey it was built on — a ground-plane click must not drop it a floor",
+        );
+        assert!(st.awaiting_place.is_none(), "and the wait is over");
+    }
+
+    #[test]
+    fn adding_a_solid_arms_the_placing_click() {
+        let mut st = with_a_model();
+        st.place_mode = PlaceMode::Click;
+        st.add_box();
+        let id = *st.selection.first().expect("the new box is selected");
+        assert_eq!(st.awaiting_place, Some(AwaitingPlace::Feature(id)));
+
+        st.place_awaiting_at(Vec3::new(20.0, 30.0, 0.0));
+        let f = st.model.features.iter().find(|f| f.id == id).expect("still there");
+        // A Box's click point is its NEAR CORNER — the meaning `place_primitive` already gives it.
+        // The same click must not mean two different things depending on how the box was made.
+        let (w, d) = match f.primitive {
+            Primitive::Box { w, d, .. } => (w, d),
+            _ => panic!("a box"),
+        };
+        assert!((f.placement.u - (20.0 + w * 0.5)).abs() < 1e-6, "u = {}", f.placement.u);
+        assert!((f.placement.v - (30.0 + d * 0.5)).abs() < 1e-6, "v = {}", f.placement.v);
+    }
+
+    /// In any mode but Click, nothing waits — the object is finished the moment it is added.
+    #[test]
+    fn the_other_modes_do_not_wait() {
+        for m in [PlaceMode::Centre, PlaceMode::Origin, PlaceMode::Offset] {
+            let mut st = with_a_model();
+            st.place_mode = m;
+            st.add_box();
+            assert!(st.awaiting_place.is_none(), "{m:?} must not arm a click");
+            st.awaiting_place = None;
+            st.add_cylinder();
+            assert!(st.awaiting_place.is_none(), "{m:?} must not arm a click for a cylinder");
+        }
+    }
+
+    /// An aperture FITTED into an opening the user drew is already exactly where it belongs. Asking
+    /// for a click would be asking twice — "except the drawn furnitures".
+    #[test]
+    fn a_fitted_aperture_does_not_wait() {
+        let mut st = with_a_model();
+        let idx = st.add_furniture_asset("window".into(), tri_mesh());
+        st.awaiting_place = None;
+        st.place_aperture(idx, Vec3::new(5.0, 0.0, 1.2), Vec3::X, 1.2, 1.4, 0.2);
+        assert!(
+            st.awaiting_place.is_none(),
+            "a drawn aperture is already in its opening — it must not ask to be placed",
+        );
+    }
+
+    /// The object can go away underneath the wait — undone, or deleted from the panel. Placing then
+    /// has nothing to move, and must say so rather than panic on a stale index.
+    #[test]
+    fn placing_something_that_is_gone_is_harmless() {
+        let mut st = with_a_model();
+        st.awaiting_place = Some(AwaitingPlace::Furniture(7)); // never existed
+        assert_eq!(st.place_awaiting_at(Vec3::new(1.0, 1.0, 0.0)), None);
+        st.awaiting_place = Some(AwaitingPlace::Feature(4242)); // no such id
+        assert_eq!(st.place_awaiting_at(Vec3::new(1.0, 1.0, 0.0)), None);
+    }
+
+    /// The preference survives save/reload, like the working unit beside it.
+    #[test]
+    fn the_placement_preference_round_trips() {
+        let mut st = with_a_model();
+        st.place_mode = PlaceMode::Offset;
+        st.place_offset = [1.5, -2.5, 0.75];
+        let doc = st.to_persist();
+
+        let mut back = FactoryState::default();
+        back.apply_persist(doc);
+        assert_eq!(back.place_mode, PlaceMode::Offset);
+        assert!((back.place_offset[0] - 1.5).abs() < 1e-6);
+        assert!((back.place_offset[2] - 0.75).abs() < 1e-6);
+    }
+
+    /// A project written before this existed says nothing about placement, and then the default
+    /// stands — the same rule the working unit follows.
+    #[test]
+    fn an_older_project_keeps_the_default() {
+        let st = with_a_model();
+        let mut doc = st.to_persist();
+        doc.place_mode = None;
+        doc.place_offset = None;
+        let mut back = FactoryState::default();
+        back.place_mode = PlaceMode::Centre;
+        back.apply_persist(doc);
+        assert_eq!(back.place_mode, PlaceMode::Centre, "an absent field must not overwrite");
     }
 }
