@@ -181,3 +181,80 @@ mod tests {
         assert_eq!(p.intensity(95.0, 0.0), 0.0); // above range
     }
 }
+
+/// Parse every real photometric file in `PHOTOMETRY_DIR` and report what it says.
+///
+///   PHOTOMETRY_DIR="D:/.../WORKING" cargo test -p cad_light photometry_probe -- --ignored --nocapture
+///
+/// The counterpart to `ldt_probe_real_files`, and for the same reason: a synthetic fixture only
+/// proves the parser agrees with whoever wrote the fixture. Real manufacturer files carry absolute
+/// photometry, negative dimensions meaning "circular", multi-lamp sets and unit codes that nobody
+/// would think to invent.
+///
+/// It also reports LUMINOUS EFFICACY, which is the cheapest possible sanity check on a file: white
+/// light cannot exceed roughly 250–300 lm/W even in theory, and real LEDs sit near 100–160. A file
+/// claiming more than that is wrong, and it will be wrong in whatever tool loads it — which is
+/// worth knowing before a calculation is built on it.
+#[test]
+#[ignore = "needs PHOTOMETRY_DIR=<folder of .ies/.ldt files>"]
+fn photometry_probe_real_files() {
+    let Ok(dir) = std::env::var("PHOTOMETRY_DIR") else {
+        println!("set PHOTOMETRY_DIR to a folder of .ies / .ldt files");
+        return;
+    };
+    let mut rows: Vec<String> = Vec::new();
+    let (mut ok, mut bad, mut suspect) = (0, 0, 0);
+    for e in std::fs::read_dir(&dir).expect("read PHOTOMETRY_DIR").flatten() {
+        let p = e.path();
+        let is_ies = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ies"));
+        let is_ldt = p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ldt"));
+        if !is_ies && !is_ldt {
+            continue;
+        }
+        let bytes = std::fs::read(&p).expect("read file");
+        let text: String = match String::from_utf8(bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => bytes.iter().map(|&b| b as char).collect(),
+        };
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        let parsed = if is_ies { parse(&text) } else { crate::ldt::parse(&text) };
+        match parsed {
+            Ok(prof) => {
+                ok += 1;
+                let eff = if prof.watts > 0.0 && prof.lumens > 0.0 {
+                    prof.lumens / prof.watts
+                } else {
+                    f64::NAN
+                };
+                let flag = if eff.is_finite() && eff > 250.0 {
+                    suspect += 1;
+                    "  <-- IMPOSSIBLE EFFICACY, the file is wrong"
+                } else {
+                    ""
+                };
+                rows.push(format!(
+                    "OK   {name}\n     {:.0} lm · {:.0} W · {} · peak {:.0} cd · nadir {:.0} cd\n     \
+                     {} C-planes x {} gamma · {:.2} x {:.2} x {:.2} m{flag}",
+                    prof.lumens.max(0.0),
+                    prof.watts,
+                    if eff.is_finite() { format!("{eff:.0} lm/W") } else { "efficacy unknown".into() },
+                    prof.peak_candela(),
+                    prof.intensity(0.0, 0.0),
+                    prof.horizontal_angles.len(),
+                    prof.vertical_angles.len(),
+                    prof.length, prof.width, prof.height,
+                ));
+            }
+            Err(err) => {
+                bad += 1;
+                rows.push(format!("FAIL {name}\n     {err}"));
+            }
+        }
+    }
+    rows.sort();
+    for r in &rows {
+        println!("{r}");
+    }
+    println!("\n{ok} parsed, {bad} failed, {suspect} physically impossible");
+    assert_eq!(bad, 0, "every manufacturer file in the folder should parse");
+}
