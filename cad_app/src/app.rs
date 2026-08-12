@@ -9796,7 +9796,10 @@ impl CadApp {
                             let mut set_h: Option<(u32, f32)> = None;
                             let mut select: Option<u32> = None;
                             let mut remove: Option<u32> = None;
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            let mut set_floor: Option<(u32, f32)> = None;
+                            let mut set_ceil: Option<(u32, f32)> = None;
+                            let mut fit: Option<(u32, f32)> = None;
+                            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                                 for r in &self.factory.rooms {
                                     ui.horizontal(|ui| {
                                         let mut name = r.name.clone();
@@ -9824,17 +9827,76 @@ impl CadApp {
                                             remove = Some(r.id);
                                         }
                                     });
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new("floor").small().weak());
+                                        let mut ft = r.floor_t;
+                                        if crate::factory::length_ui(ui, u, &mut ft, 0.01, 0.02, 2.0)
+                                            .on_hover_text("Slab below the room")
+                                            .changed()
+                                        {
+                                            set_floor = Some((r.id, ft));
+                                        }
+                                        ui.label(egui::RichText::new("ceiling").small().weak());
+                                        let mut ctk = r.ceiling_t;
+                                        if crate::factory::length_ui(ui, u, &mut ctk, 0.01, 0.02, 2.0)
+                                            .on_hover_text("Slab above the room")
+                                            .changed()
+                                        {
+                                            set_ceil = Some((r.id, ctk));
+                                        }
+                                    });
+                                    // The sum, and whether it fits. The three numbers interact, and
+                                    // the result is otherwise visible only as a picture that looks
+                                    // wrong — which is how this was reported in the first place.
+                                    let over = r.overall_height();
+                                    let fits = over <= self.factory.building_height + 1e-4;
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "      {} overall · {} openings",
-                                            crate::factory::length_str(u, r.overall_height()),
+                                            "      {} overall · {} openings{}",
+                                            crate::factory::length_str(u, over),
                                             self.factory.openings_in_room(r.id).len(),
+                                            if fits {
+                                                String::new()
+                                            } else {
+                                                format!(
+                                                    "   ⚠ {} over the building",
+                                                    crate::factory::length_str(
+                                                        u,
+                                                        over - self.factory.building_height,
+                                                    )
+                                                )
+                                            },
                                         ))
                                         .small()
-                                        .weak(),
+                                        .color(if fits {
+                                            egui::Color32::from_gray(140)
+                                        } else {
+                                            egui::Color32::from_rgb(230, 170, 90)
+                                        }),
                                     );
+                                    if !fits && ui.small_button("      ⤓ Fit to building").clicked() {
+                                        let ct = if r.open_top { 0.0 } else { r.ceiling_t };
+                                        fit = Some((
+                                            r.id,
+                                            (self.factory.building_height - r.floor_t - ct).max(0.05),
+                                        ));
+                                    }
+                                    ui.separator();
                                 }
                             });
+                            if let Some((id, h)) = fit {
+                                self.snapshot_factory();
+                                self.factory.set_room_height(id, h);
+                            }
+                            if let Some((id, t)) = set_floor {
+                                self.snapshot_factory();
+                                self.factory.set_room_floor(id, t);
+                            }
+                            if let Some((id, t)) = set_ceil {
+                                self.snapshot_factory();
+                                self.factory.set_room_ceiling(id, t);
+                            }
                             if let Some((id, name)) = rename {
                                 self.factory.rename_room(id, &name);
                             }
@@ -9876,6 +9938,30 @@ impl CadApp {
                             { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_floor, 0.01, 0.0, 2.0) }
                                 .on_hover_text("Slab left BELOW the room on this storey");
                         });
+                        ui.horizontal(|ui| {
+                            ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  ceiling thickness").small().weak()));
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.ceiling_thickness, 0.01, 0.02, 2.0) }
+                                .on_hover_text("Slab ABOVE the room. Counts toward the overall height, like the floor does.");
+                        });
+                        // SUGGEST a height that fits, rather than leaving the user to subtract two
+                        // slab thicknesses from the building height themselves — which is precisely
+                        // the sum they were getting wrong.
+                        {
+                            let want = self.factory.suggested_room_height();
+                            let u = self.factory.units;
+                            if (self.factory.room_height - want).abs() > 1e-3
+                                && ui
+                                    .button(format!(
+                                        "  ⤓ Use {} — fills the {} building",
+                                        crate::factory::length_str(u, want),
+                                        crate::factory::length_str(u, self.factory.building_height),
+                                    ))
+                                    .on_hover_text("Building height less the floor and ceiling slabs")
+                                    .clicked()
+                            {
+                                self.factory.room_height = want;
+                            }
+                        }
                         ui.checkbox(&mut self.factory.room_open_top, "  open to sky (no ceiling)")
                             .on_hover_text(
                                 "Off (default): the room has a ceiling — what the lighting \

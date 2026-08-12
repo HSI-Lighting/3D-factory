@@ -90,8 +90,19 @@ pub struct RoomInst {
     pub open_top: bool,
     /// The features this room owns, so an edit can find them and a delete can take them all.
     pub floor: Option<u32>,
+    /// Perimeter walls — EMPTY when the room was carved out of an enclosing building.
+    ///
+    /// A carved room's wall IS the material left around the void. Building a second ring of walls
+    /// inside that annulus is what made rooms look lopsided: two concentric rings at different
+    /// heights, the building's and the room's, stepping against one another.
     pub walls: Vec<u32>,
     pub ceiling: Option<u32>,
+    /// The Difference feature that punched this room's void out of the enclosing building.
+    ///
+    /// Owned by the room so that deleting the room removes it and the building returns to solid.
+    /// Without this the void outlived the room and left a permanent hole — the area could never be
+    /// built in again.
+    pub carve: Option<u32>,
 }
 
 impl RoomInst {
@@ -4922,7 +4933,7 @@ impl FactoryState {
     /// room footprint. The carve is the room footprint extruded from `base` up through the
     /// building's top, subtracted (`BoolOp::Difference`). The Difference feature is placed
     /// IMMEDIATELY AFTER the building so the group-based `eval` applies it to that body.
-    fn carve_interior_from_building(&mut self, footprint: &[Vec2], base: f32) -> bool {
+    fn carve_interior_from_building(&mut self, footprint: &[Vec2], base: f32) -> Option<u32> {
         // Find the enclosing building and its feature index + top height.
         let mut target: Option<(usize, f32)> = None;
         for (i, f) in self.model.features.iter().enumerate() {
@@ -4939,10 +4950,10 @@ impl FactoryState {
                 }
             }
         }
-        let Some((idx, top)) = target else { return false };
+        let Some((idx, top)) = target else { return None };
         // Build the void, then move it to sit right after the building it cuts.
         let Ok((profile, centre, w, d)) = self.model.add_profile(footprint) else {
-            return false;
+            return None;
         };
         let void_h = (top - base).max(0.1) + 0.02; // punch fully through the building
         let placement = Placement { u: centre.x, v: centre.y, lift: base, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
@@ -4954,11 +4965,13 @@ impl FactoryState {
         );
         // `push` appended at the end; relocate it to just after the building feature so the
         // difference cuts the BUILDING body and nothing else.
+        let mut void_id = None;
         if let Some(void) = self.model.features.pop() {
+            void_id = Some(void.id);
             self.model.features.insert(idx + 1, void);
         }
         self.dirty = true;
-        true
+        void_id
     }
 
     pub fn add_room(&mut self, footprint: &[Vec2]) -> Result<u32, RoomError> {
@@ -4983,7 +4996,7 @@ impl FactoryState {
         // solid cap. Then hiding the room's ceiling reveals the floor while the surrounding
         // wall — its own solid, with its own top — stays. Without this, a solid building
         // over a room can never be "seen into".
-        self.carve_interior_from_building(footprint, base);
+        let carve = self.carve_interior_from_building(footprint, base);
 
         // Distinct default colours (≈ real reflectances) so floor / walls / ceiling are
         // TELLABLE APART from any angle — including straight down, where hiding the light
@@ -5000,21 +5013,28 @@ impl FactoryState {
         self.feature_color.insert(floor_id, FLOOR_COL);
 
         // WALLS: one box per outline edge, sitting on the floor slab.
+        //
+        // ONLY when the room was NOT carved from a building. If it was, the material left around
+        // the void already IS the wall, and adding a second ring inside it produced two concentric
+        // walls at different heights — the building's full height against the room's floor + clear
+        // — which is the step that made rooms look lopsided.
         let wall_base = base + floor_t;
         let mut wall_ids = Vec::new();
-        for e in footprint.windows(2) {
-            if let Some(id) = self.push_wall_box(e[0], e[1], wall_t, h, wall_base) {
-                self.feature_color.insert(id, WALL_COL);
-                wall_ids.push(id);
-            }
-        }
-        // Close the loop if the outline wasn't already closed.
-        if footprint.len() >= 3 {
-            let (a, b) = (footprint[footprint.len() - 1], footprint[0]);
-            if (a - b).length() > 1e-4 {
-                if let Some(id) = self.push_wall_box(a, b, wall_t, h, wall_base) {
+        if carve.is_none() {
+            for e in footprint.windows(2) {
+                if let Some(id) = self.push_wall_box(e[0], e[1], wall_t, h, wall_base) {
                     self.feature_color.insert(id, WALL_COL);
                     wall_ids.push(id);
+                }
+            }
+            // Close the loop if the outline wasn't already closed.
+            if footprint.len() >= 3 {
+                let (a, b) = (footprint[footprint.len() - 1], footprint[0]);
+                if (a - b).length() > 1e-4 {
+                    if let Some(id) = self.push_wall_box(a, b, wall_t, h, wall_base) {
+                        self.feature_color.insert(id, WALL_COL);
+                        wall_ids.push(id);
+                    }
                 }
             }
         }
@@ -5046,6 +5066,7 @@ impl FactoryState {
             floor: Some(floor_id),
             walls: wall_ids,
             ceiling: ceiling_id,
+            carve,
         });
 
         self.selection = vec![floor_id];
@@ -5112,14 +5133,29 @@ impl FactoryState {
             return;
         }
         self.rooms[i].height = h;
-        let (walls, ceiling, base_z, floor_t, ct, wall_t) = {
+        let (walls, ceiling, carve, base_z, floor_t, ct, wall_t) = {
             let r = &self.rooms[i];
-            (r.walls.clone(), r.ceiling, r.base_z, r.floor_t, r.ceiling_t, r.wall_t)
+            (r.walls.clone(), r.ceiling, r.carve, r.base_z, r.floor_t, r.ceiling_t, r.wall_t)
         };
         for fid in walls {
             if let Some(f) = self.model.get_mut(fid) {
                 if let Primitive::Box { w, .. } = f.primitive {
                     f.primitive = Primitive::Box { w, d: wall_t, h };
+                }
+            }
+        }
+        // A CARVED room's height is the void's height — the building around it is the wall, so
+        // raising the room means cutting further up through that building.
+        if let Some(cid) = carve {
+            if let Some(f) = self.model.get_mut(cid) {
+                if let Primitive::Extrusion { profile, w, d, h: was } = f.primitive {
+                    // GROW ONLY. The void was cut to punch clear THROUGH the building, which is
+                    // what turns the building into a wall ring rather than a cap sitting over the
+                    // room. Re-sizing it to the room's own height would put that cap back — a test
+                    // caught exactly that. So it only ever reaches further, when the room outgrows
+                    // the void it was given.
+                    let need = floor_t + h + ct + 0.02;
+                    f.primitive = Primitive::Extrusion { profile, h: was.max(need), w, d };
                 }
             }
         }
@@ -5138,6 +5174,85 @@ impl FactoryState {
             length_str(self.units, h),
             length_str(self.units, self.rooms[i].overall_height()),
         );
+    }
+
+    /// Change a built room's FLOOR thickness. The walls stand on the slab, so everything above it
+    /// moves with it.
+    pub fn set_room_floor(&mut self, id: u32, thickness: f32) {
+        let Some(i) = self.room_index(id) else { return };
+        let t = thickness.max(0.02);
+        if (self.rooms[i].floor_t - t).abs() < 1e-6 {
+            return;
+        }
+        self.rooms[i].floor_t = t;
+        self.rebuild_room_levels(id);
+    }
+
+    /// Change a built room's CEILING thickness.
+    pub fn set_room_ceiling(&mut self, id: u32, thickness: f32) {
+        let Some(i) = self.room_index(id) else { return };
+        let t = thickness.max(0.02);
+        if (self.rooms[i].ceiling_t - t).abs() < 1e-6 {
+            return;
+        }
+        self.rooms[i].ceiling_t = t;
+        self.rebuild_room_levels(id);
+    }
+
+    /// Re-seat a room's slabs and walls after a thickness change.
+    ///
+    /// The floor's TOP is the level everything else is measured from, so changing its thickness
+    /// moves the wall bases and the ceiling with it — otherwise a thicker floor would swallow the
+    /// bottom of the walls and leave the ceiling where it was.
+    fn rebuild_room_levels(&mut self, id: u32) {
+        let Some(i) = self.room_index(id) else { return };
+        let (floor, walls, ceiling, carve, base_z, floor_t, h, ct) = {
+            let r = &self.rooms[i];
+            (r.floor, r.walls.clone(), r.ceiling, r.carve, r.base_z, r.floor_t, r.height, r.ceiling_t)
+        };
+        if let Some(fid) = floor {
+            if let Some(f) = self.model.get_mut(fid) {
+                if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
+                    f.primitive = Primitive::Extrusion { profile, h: floor_t, w, d };
+                    f.placement.lift = base_z; // top lands at base + floor_t
+                }
+            }
+        }
+        let wall_base = base_z + floor_t;
+        for fid in walls {
+            if let Some(f) = self.model.get_mut(fid) {
+                f.placement.lift = wall_base;
+            }
+        }
+        if let Some(cid) = ceiling {
+            if let Some(f) = self.model.get_mut(cid) {
+                if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
+                    f.primitive = Primitive::Extrusion { profile, h: ct, w, d };
+                    f.placement.lift = wall_base + h;
+                }
+            }
+        }
+        if let Some(cid) = carve {
+            if let Some(f) = self.model.get_mut(cid) {
+                if let Primitive::Extrusion { profile, w, d, .. } = f.primitive {
+                    f.primitive =
+                        Primitive::Extrusion { profile, h: (floor_t + h + ct + 0.02).max(0.1), w, d };
+                    f.placement.lift = base_z;
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// A clear height that FITS the building — what to suggest rather than making the user work it
+    /// out from three numbers that interact.
+    ///
+    /// The structure is `floor + clear + ceiling`, so the clear height a building can take is what
+    /// is left of it after the two slabs. Never below a usable room, so a building too short for
+    /// one says so through the warning rather than by silently proposing a crawlspace.
+    pub fn suggested_room_height(&self) -> f32 {
+        let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
+        (self.building_height - self.room_floor.max(0.02) - ct).max(2.1)
     }
 
     /// Every feature a room owns — what a delete has to take, and what selecting it should cover.
@@ -5171,9 +5286,14 @@ impl FactoryState {
         best.map(|(_, id)| id)
     }
 
-    /// Drop a room: its geometry and its record, as one act.
+    /// Drop a room: its geometry, its void, and its record, as one act.
+    ///
+    /// Removing the CARVE is what makes the area buildable again. Deleting only the room's own
+    /// pieces left the Difference feature still cutting the building, so the floor plate kept a
+    /// permanent hole where the room had been and nothing could be put back there.
     pub fn delete_room(&mut self, id: u32) {
-        for f in self.room_features(id) {
+        let carve = self.room_index(id).and_then(|i| self.rooms[i].carve);
+        for f in self.room_features(id).into_iter().chain(carve) {
             self.model.remove(f);
             self.feature_color.remove(&f);
             self.ceilings.remove(&f);
@@ -5409,6 +5529,7 @@ impl FactoryState {
                     floor: r.floor,
                     walls: r.walls.clone(),
                     ceiling: r.ceiling,
+                    carve: r.carve,
                 })
                 .collect(),
             next_room_id: self.next_room_id,
@@ -5605,6 +5726,7 @@ impl FactoryState {
                 floor: r.floor.filter(|f| have.contains(f)),
                 walls: r.walls.into_iter().filter(|f| have.contains(f)).collect(),
                 ceiling: r.ceiling.filter(|f| have.contains(f)),
+                carve: r.carve.filter(|f| have.contains(f)),
             })
             .collect();
         let highest = self.rooms.iter().map(|r| r.id).max().unwrap_or(0);
@@ -12108,5 +12230,184 @@ mod rooms {
         assert!((r.height - 3.6).abs() < 1e-6);
         assert_eq!(r.walls.len(), 4, "and it still owns its walls");
         assert!(reopened.next_room_id > id, "ids keep counting up");
+    }
+}
+
+/// A room carved out of a building: one set of walls, and a hole that closes when it is deleted.
+///
+/// Reported together — "the rooms are being built lopsided" and "when a room is deleted that area
+/// becomes hollow". Both come from the carve: making a room inside a building punched a void AND
+/// built a second ring of walls inside it, and deleting the room removed the walls but left the
+/// void cutting the building for good.
+#[cfg(test)]
+mod carved_rooms {
+    use super::*;
+
+    fn square(m: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(m, 0.0),
+            Vec2::new(m, m),
+            Vec2::new(0.0, m),
+            Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    fn inner(lo: f32, hi: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(lo, lo),
+            Vec2::new(hi, lo),
+            Vec2::new(hi, hi),
+            Vec2::new(lo, hi),
+            Vec2::new(lo, lo),
+        ]
+    }
+
+    /// A building with a room carved into it.
+    fn building_with_room() -> FactoryState {
+        let mut f = FactoryState::default();
+        f.building_height = 4.0;
+        f.room_floor = 0.2;
+        f.room_height = 3.0;
+        f.ceiling_thickness = 0.15;
+        f.add_building_outline(&square(10.0), 4.0).expect("building");
+        f.add_room(&inner(1.0, 9.0)).expect("room");
+        f
+    }
+
+    /// **Lopsided.** A carved room does NOT build its own ring of walls — the building material
+    /// left around the void is the wall. Two rings at different heights is what the step was.
+    #[test]
+    fn a_carved_room_does_not_add_a_second_ring_of_walls() {
+        let f = building_with_room();
+        let r = &f.rooms[0];
+        assert!(r.carve.is_some(), "it was carved from the building");
+        assert!(
+            r.walls.is_empty(),
+            "the building is the wall — {} extra walls would step against it",
+            r.walls.len(),
+        );
+    }
+
+    /// A FREE-STANDING room, with no building to carve, still builds its own walls.
+    #[test]
+    fn a_free_standing_room_still_builds_its_walls() {
+        let mut f = FactoryState::default();
+        f.add_room(&square(5.0)).expect("room");
+        let r = &f.rooms[0];
+        assert!(r.carve.is_none(), "nothing to carve");
+        assert_eq!(r.walls.len(), 4, "so it provides its own walls");
+    }
+
+    /// **The hollow.** Deleting a carved room removes the void too, so the building is solid again
+    /// and the area can be built in a second time.
+    #[test]
+    fn deleting_a_carved_room_makes_the_building_whole_again() {
+        let mut f = building_with_room();
+        let id = f.rooms[0].id;
+        let carve = f.rooms[0].carve.expect("carved");
+        f.recompute();
+        let hollow = f.cached.positions.len();
+
+        f.delete_room(id);
+        assert!(
+            !f.model.features.iter().any(|x| x.id == carve),
+            "the void must go with the room, or the hole is permanent",
+        );
+        f.recompute();
+        // A solid building has FEWER triangles than one with a room-sized void cut through it.
+        assert!(
+            f.cached.positions.len() < hollow,
+            "the building should be solid again ({} tris vs {hollow} hollow)",
+            f.cached.positions.len(),
+        );
+
+        // …and the same area accepts a new room.
+        f.add_room(&inner(1.0, 9.0)).expect("the area can be built in again");
+        assert_eq!(f.rooms.len(), 1);
+    }
+
+    /// Raising a carved room's height cuts further up through the building, rather than leaving a
+    /// lip of material over the room.
+    #[test]
+    fn raising_a_carved_room_takes_the_void_with_it() {
+        let mut f = building_with_room();
+        let id = f.rooms[0].id;
+        let carve = f.rooms[0].carve.expect("carved");
+        let before = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+            Primitive::Extrusion { h, .. } => h,
+            _ => panic!("the void is an extrusion"),
+        };
+        // A MODEST raise must not shrink the void — that would leave a cap of building
+        // material sitting over the room.
+        f.set_room_height(id, 3.6);
+        let modest = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+            Primitive::Extrusion { h, .. } => h,
+            _ => panic!("the void is an extrusion"),
+        };
+        assert!(
+            (modest - before).abs() < 1e-6,
+            "still punching clear through the building ({before} → {modest})",
+        );
+        // Raising it PAST the building does grow the void, so the room is never capped.
+        f.set_room_height(id, 6.0);
+        let tall = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+            Primitive::Extrusion { h, .. } => h,
+            _ => panic!("the void is an extrusion"),
+        };
+        assert!(tall > before, "the void grew with the room ({before} → {tall})");
+    }
+
+    /// The suggested height is the building less both slabs — the sum users were getting wrong.
+    #[test]
+    fn the_suggested_height_fills_the_building_exactly() {
+        let mut f = FactoryState::default();
+        f.building_height = 4.0;
+        f.room_floor = 0.2;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = false;
+        let want = f.suggested_room_height();
+        assert!((want - 3.65).abs() < 1e-6, "4.00 − 0.20 − 0.15 = 3.65, got {want}");
+
+        f.room_height = want;
+        f.add_room(&square(5.0)).expect("room");
+        let over = f.rooms[0].overall_height();
+        assert!((over - 4.0).abs() < 1e-6, "which builds to exactly the building height, got {over}");
+    }
+
+    /// Open to sky: no ceiling slab, so the suggestion has more room to give.
+    #[test]
+    fn an_open_topped_room_is_offered_the_ceiling_back() {
+        let mut f = FactoryState::default();
+        f.building_height = 4.0;
+        f.room_floor = 0.2;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = true;
+        assert!((f.suggested_room_height() - 3.8).abs() < 1e-6, "4.00 − 0.20 = 3.80");
+    }
+
+    /// Floor and ceiling thickness are adjustable after the fact, and everything above the floor
+    /// moves with it — otherwise a thicker slab would swallow the bottom of the walls.
+    #[test]
+    fn floor_and_ceiling_thickness_can_be_changed_after_building() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.2;
+        f.room_height = 3.0;
+        f.ceiling_thickness = 0.15;
+        f.add_room(&square(5.0)).expect("room");
+        let id = f.rooms[0].id;
+        f.recompute();
+        let before = f.cached.bounds().expect("bounds").1[2];
+        assert!((before - 3.35).abs() < 1e-3);
+
+        f.set_room_floor(id, 0.4);
+        f.recompute();
+        let after = f.cached.bounds().expect("bounds").1[2];
+        assert!((after - 3.55).abs() < 1e-3, "0.40 + 3.00 + 0.15 = 3.55, got {after}");
+
+        f.set_room_ceiling(id, 0.3);
+        f.recompute();
+        let last = f.cached.bounds().expect("bounds").1[2];
+        assert!((last - 3.70).abs() < 1e-3, "0.40 + 3.00 + 0.30 = 3.70, got {last}");
     }
 }

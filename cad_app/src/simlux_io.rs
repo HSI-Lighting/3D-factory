@@ -49,6 +49,10 @@ pub struct RoomRec {
     pub floor: Option<u32>,
     pub walls: Vec<u32>,
     pub ceiling: Option<u32>,
+    /// The Difference feature that carved this room out of a building, when it was carved from
+    /// one. Removing it on delete is what returns the building to solid.
+    #[serde(default)]
+    pub carve: Option<u32>,
 }
 
 /// One building level. Mirrors `factory::Storey`. `base_z` is NOT stored — it is derived
