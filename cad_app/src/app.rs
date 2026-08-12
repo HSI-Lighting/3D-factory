@@ -8696,8 +8696,22 @@ impl CadApp {
         model_lines.push(format!("uv_rebase_origin = ({:.1}, {:.1}, {:.1})", org[0], org[1], org[2]));
         let u = self.doc.units;
         model_lines.push(format!(
-            "doc units: {:.6} m/unit ({:?})   ·   plan↔3D scale {:.4}",
-            u.metres_per_unit, u.source, self.doc_k()));
+            "doc units: {:.6} m/unit ({:?})   ·   factory working unit: {}   ·   plan↔3D scale {:.6}",
+            u.metres_per_unit, u.source, self.factory.units.label(), self.doc_k()));
+        // A footprint hundreds of times the height is the signature of a wrong plan→3D scale: a
+        // millimetre outline read as metres builds a thousand times too wide under a storey-height
+        // extrusion, and the result draws as a sheet with nothing else on screen explaining it.
+        // Stated here as a number, because that is the one place someone will look afterwards.
+        if let Some((mn, mx)) = bounds {
+            let footprint = (mx[0] - mn[0]).max(mx[1] - mn[1]);
+            let h = mx[2] - mn[2];
+            if h > 1e-6 && footprint / h > 200.0 {
+                model_lines.push(format!(
+                    "⚠ FOOTPRINT {:.0}× THE HEIGHT ({:.1} m across, {:.2} m tall) — the shape of a \
+                     wrong plan↔3D scale. Check the units line above.",
+                    footprint / h, footprint, h));
+            }
+        }
         sections.push(("model".into(), model_lines));
 
         // ── CUTS ─────────────────────────────────────────────────────────────────────────
@@ -25890,6 +25904,30 @@ impl CadApp {
                 "  units: the file declares 1 drawing unit = {} — 3D builds use it from now on \
                  (nothing existing was rescaled; `units` to change)",
                 self.doc.units.label()));
+        } else {
+            // The file declares NOTHING — the common case for DXF, since most exporters omit
+            // `$INSUNITS`. Adopt the Factory's working unit rather than assuming metres.
+            //
+            // Assuming metres was never neutral, it was a guess, and on a drawing that is really
+            // in millimetres it fails silently and enormously: a 4400-unit outline becomes a
+            // 4400-METRE footprint, and extruded to a 3 m storey that draws as a flat sheet 4.4 km
+            // across with nothing on screen to explain it. This was reported from a real import.
+            //
+            // Adopted into the DOCUMENT, not applied as a hidden fallback at the 2D→3D boundary.
+            // That distinction matters: the drawing now genuinely declares a scale, so every path
+            // that reads it agrees — promotion, dimensions, the save, the DXF export — instead of
+            // one boundary quietly disagreeing with the rest. It is also visible and reversible,
+            // through the same `units` command that has always owned this, and it moves nothing.
+            //
+            // Only on IMPORT. Geometry built in memory is in whatever units its author meant, and
+            // has no file to have declared anything.
+            let u = self.factory.units;
+            self.doc.units = cad_kernel::DocUnits::new(u.metres_per_unit, cad_kernel::UnitSource::User);
+            self.history.push(format!(
+                "  units: the file declares none — read as {} (the 3D Factory working unit). \
+                 Nothing was rescaled. If this drawing is in something else, `units <unit>` now, \
+                 before building.",
+                u.label()));
         }
     }
 
@@ -50312,5 +50350,119 @@ mod perf_investigation {
             let bytes = n * 200; // rough per-dobject
             println!("  ≈ resident per undo level          : {:8.1} MB", bytes as f64 / 1e6);
         }
+    }
+}
+
+/// What an imported drawing's scale is taken to be when the file does not say.
+///
+/// Reported from the field: a DXF with no `$INSUNITS` — the common case, since most exporters
+/// omit it — had its 4400-unit outline read as **4400 metres**. Extruded to a 3 m storey that is
+/// a sheet 4.4 km across, and nothing on screen said why.
+#[cfg(test)]
+mod imported_drawing_scale {
+    use super::*;
+
+    fn payload(doc: Document) -> Box<LoadPayload> {
+        Box::new(LoadPayload {
+            doc,
+            sidecar: None,
+            furniture: Vec::new(),
+            read_ms: 0,
+            parse_ms: 0,
+            sidecar_ms: 0,
+            furn_ms: 0,
+        })
+    }
+
+    /// A square whose corners are the ones from the report, in drawing units.
+    fn square(size: f64) -> Document {
+        let mut d = Document::default();
+        d.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (size, 0.0), (size, size), (0.0, size)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })));
+        d
+    }
+
+    /// A file that declares NOTHING is read at the Factory's working unit — millimetres by
+    /// default — rather than assumed to be metres.
+    #[test]
+    fn an_undeclared_file_is_read_at_the_factory_working_unit() {
+        let mut app = CadApp::default();
+        assert!((app.factory.units.metres_per_unit - cad_kernel::DocUnits::MM).abs() < 1e-12);
+        app.apply_loaded("plan.dxf", payload(square(4400.0)));
+
+        assert!(
+            (app.doc.units.metres_per_unit - cad_kernel::DocUnits::MM).abs() < 1e-12,
+            "the drawing should now declare millimetres, not sit at an assumed metre",
+        );
+        assert_eq!(app.doc.units.source, cad_kernel::UnitSource::User);
+        // 4400 units is 4.4 m, so the promotion scale is a thousandth.
+        assert!((app.doc_k() - 0.001).abs() < 1e-12, "plan→3D scale, got {}", app.doc_k());
+        assert!(
+            app.history.iter().any(|h| h.contains("declares none")),
+            "the substitution must be stated, not silent: {:?}",
+            app.history.last(),
+        );
+    }
+
+    /// The flat sheet itself: at the adopted scale a 4400-unit outline is 4.4 m across, which
+    /// against a 3 m storey is a room. Before the fix it was 4400 m — a ratio of 1467.
+    #[test]
+    fn the_reported_outline_is_a_room_and_not_a_sheet() {
+        let mut app = CadApp::default();
+        app.apply_loaded("plan.dxf", payload(square(4400.0)));
+        let loops = CadApp::closed_loops_of(&app.doc);
+        let l = loops.first().expect("the square is closed");
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in l {
+            lo = lo.min(p.x);
+            hi = hi.max(p.x);
+        }
+        let footprint = hi - lo;
+        assert!((footprint - 4.4).abs() < 0.05, "4400 mm is 4.4 m, got {footprint} m");
+        let storey = app.factory.room_height.max(3.0);
+        assert!(
+            footprint / storey < 200.0,
+            "{footprint:.1} m across a {storey:.1} m storey is still a sheet",
+        );
+    }
+
+    /// A file that DOES declare its unit still wins — the working unit fills a gap, it does not
+    /// overrule a statement the file made about itself.
+    #[test]
+    fn a_declared_file_unit_is_not_overwritten() {
+        let mut app = CadApp::default();
+        let mut doc = square(3.0);
+        doc.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::Declared);
+        app.apply_loaded("plan.dxf", payload(doc));
+        assert!((app.doc.units.metres_per_unit - 1.0).abs() < 1e-12);
+        assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Declared);
+        assert!((app.doc_k() - 1.0).abs() < 1e-12);
+    }
+
+    /// Setting the Factory to metres restores the old reading for anyone whose undeclared
+    /// drawings really are in metres.
+    #[test]
+    fn a_metre_working_unit_reads_an_undeclared_file_as_metres() {
+        let mut app = CadApp::default();
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        app.apply_loaded("plan.dxf", payload(square(3.0)));
+        assert!((app.doc_k() - 1.0).abs() < 1e-12);
+    }
+
+    /// Geometry built IN MEMORY is untouched — it has no file to have declared anything, and its
+    /// author meant whatever they typed. This is what keeps every existing behaviour intact.
+    #[test]
+    fn an_in_memory_document_keeps_assuming_metres() {
+        let app = CadApp::default();
+        assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Assumed);
+        assert!((app.doc_k() - 1.0).abs() < 1e-12, "nothing imported, nothing changed");
     }
 }
