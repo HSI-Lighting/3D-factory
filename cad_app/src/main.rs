@@ -40,7 +40,11 @@ fn main() -> Result<(), eframe::Error> {
     // questions have cost real time here: a repair was twice run against a stale binary, and a
     // bundled library that fails to resolve shows up as EMPTY MENUS rather than as an error, so
     // a broken install looks like an app with no content. Two lines on stderr, once.
-    eprintln!("[simlux] build {}", option_env!("SIMLUX_BUILD").unwrap_or("unknown"));
+    eprintln!(
+        "[simlux] build {} ({})",
+        option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
+        option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
+    );
     eprintln!("{}", assets::report());
 
     let options = eframe::NativeOptions {

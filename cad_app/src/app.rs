@@ -8915,7 +8915,8 @@ impl CadApp {
         crate::dbg_recorder::DbgEvent::FactoryScene {
             reason:  reason.to_string(),
             summary: format!(
-                "build={}  features={} bodies={} cuts={} tris={} furniture={} textures={} dirty={}",
+                "build={} ({})  features={} bodies={} cuts={} tris={} furniture={} textures={} dirty={}",
+                option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
                 option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
                 f.model.features.len(), bodies, cuts.len(),
                 f.cached.positions.len() / 3, f.furniture.len(), f.textures.len(), f.dirty),

@@ -30,7 +30,20 @@ fn main() {
         .is_some_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
 
     println!("cargo:rustc-env=SIMLUX_BUILD={short}{}", if dirty { "+dirty" } else { "" });
+
+    // The RELEASE NUMBER people actually say out loud — "build 3" — kept beside the commit rather
+    // than instead of it. A short hash is precise and unmemorable; a sequence is memorable and
+    // says nothing about what is in it. Someone reporting a problem gives the number, and the
+    // number leads straight back to the commit.
+    let number = std::fs::read_to_string("../packaging/build-number.txt")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or_else(|| "?".to_string());
+    println!("cargo:rustc-env=SIMLUX_BUILD_NO={number}");
+
     // Re-run when HEAD moves, so the stamp cannot go stale on an incremental build.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/index");
+    println!("cargo:rerun-if-changed=../packaging/build-number.txt");
 }
