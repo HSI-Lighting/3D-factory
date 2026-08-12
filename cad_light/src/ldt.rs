@@ -98,14 +98,23 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
     // ratios (10 values) follow. Everything after that is angles and intensities, so getting this
     // count wrong shifts the entire distribution.
     let n_lamp_sets = int(25, "number of lamp sets")?.max(1) as usize;
-    let mut flux_lm = 0.0_f64;
-    let mut watts = 0.0_f64;
-    for s in 0..n_lamp_sets {
-        let base = 26 + s * 6;
-        // 2nd line of a set is the lamp type, 3rd its total flux, 6th the wattage.
-        flux_lm += num(base + 2, "total luminous flux").unwrap_or(0.0).abs();
-        watts += num(base + 5, "wattage").unwrap_or(0.0);
-    }
+    // The sets are ALTERNATIVES, not simultaneous lamps.
+    //
+    // A EULUMDAT file describes one luminaire that can be supplied with any of `n` standard lamp
+    // configurations; the buyer picks one. They must not be added together — and this reader did
+    // add them, which inflated both the flux and, because the candela table is stored per
+    // kilolumen, every intensity in the distribution along with it.
+    //
+    // Caught by comparison with a DIALux report on a real project: `FONDO.ldt` carries three sets —
+    // 4000 lm/40 W, 3000 lm/30 W, 4000 lm/40 W. This reader reported 11000 lm and 110 W; DIALux
+    // reported 4000 lm and 40 W, and DIALux is right. The scheme's light from that fitting was
+    // therefore overstated by 2.75x.
+    //
+    // The first set is taken, which is what DIALux does and what a file's author means by listing
+    // it first. Offering the choice is the fuller answer and is worth doing once anything needs it.
+    let base = 26;
+    let flux_lm = num(base + 2, "total luminous flux").unwrap_or(0.0).abs();
+    let watts = num(base + 5, "wattage").unwrap_or(0.0);
     if flux_lm <= 0.0 {
         return Err("total luminous flux is zero — cannot convert cd/klm to candela".to_string());
     }
