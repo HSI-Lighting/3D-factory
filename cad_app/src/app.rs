@@ -7431,6 +7431,64 @@ impl CadApp {
         Some((Vec2::new(mnx, mny), Vec2::new(mxx, mxy)))
     }
 
+    /// The plane a standard view puts the 2D canvas on.
+    ///
+    /// ANCHORED on the SELECTION when there is one, else on the whole model — "show me this thing
+    /// from the front" and "show me the building from the front" are the same request with a
+    /// different subject, so they are the same control.
+    ///
+    /// The plane sits at the FAR side of the subject looking back through it, so the whole object
+    /// is in front of the drawing plane rather than half behind it.
+    fn factory_plan_view_frame(&self, view: crate::factory::PlanView) -> Option<cad_solid::Frame> {
+        use crate::factory::PlanView as PV;
+        use glam::Vec3;
+        if view == PV::Global {
+            return None;
+        }
+        let (mn, mx) = self
+            .factory
+            .selection_aabb()
+            .or_else(|| self.factory.features_aabb())?;
+        let c = (mn + mx) * 0.5;
+        let (origin, normal) = match view {
+            PV::Global => unreachable!(),
+            PV::Top => (Vec3::new(c.x, c.y, mx.z), Vec3::Z),
+            PV::Front => (Vec3::new(c.x, mn.y, c.z), -Vec3::Y),
+            PV::Back => (Vec3::new(c.x, mx.y, c.z), Vec3::Y),
+            PV::Left => (Vec3::new(mn.x, c.y, c.z), -Vec3::X),
+            PV::Right => (Vec3::new(mx.x, c.y, c.z), Vec3::X),
+        };
+        Some(cad_solid::Frame::from_point_normal(origin, normal))
+    }
+
+    /// Switch the 2D canvas to a standard view.
+    ///
+    /// GLOBAL leaves any sketch and returns to the drawing. The others open — or REOPEN — a sketch
+    /// on that plane: `factory_enter_sketch` already reuses a coplanar sketch rather than starting
+    /// a blank one, so work drawn on a face before is still there when you come back to it.
+    fn factory_set_plan_view(&mut self, view: crate::factory::PlanView) {
+        use crate::factory::PlanView as PV;
+        if view == PV::Global {
+            self.factory_exit_sketch();
+            self.factory.plan_view = PV::Global;
+            self.factory.status =
+                "Global view — the drawing's own plan. Sketches on other planes are hidden.".into();
+            return;
+        }
+        let subject = if self.factory.selection_aabb().is_some() { "selection" } else { "model" };
+        let Some(frame) = self.factory_plan_view_frame(view) else {
+            self.factory.status =
+                "Nothing built yet — a standard view needs a model to look at.".into();
+            return;
+        };
+        self.factory_enter_sketch(frame);
+        self.factory.plan_view = view;
+        self.factory.status = format!(
+            "{} view of the {subject} — every 2D tool draws on this plane, and stays on it.",
+            view.label(),
+        );
+    }
+
     fn factory_enter_sketch(&mut self, frame: cad_solid::Frame) {
         if self.factory.session.is_some() {
             self.factory_exit_sketch();
@@ -7486,6 +7544,9 @@ impl CadApp {
     /// Close the sketch: put the drawn document back into the model and restore the
     /// model-space document + its undo history.
     fn factory_exit_sketch(&mut self) {
+        // Back on the drawing, so the view toggle must say so. Leaving it reading "Front" while
+        // the canvas is the plan would make the control a label that lies.
+        self.factory.plan_view = crate::factory::PlanView::Global;
         self.factory.sketch_ref.clear();
         self.factory.editing_cutout = false; // any cutout-edit ends when the sketch closes
         if let Some(s) = self.factory.session.take() {
@@ -42455,11 +42516,63 @@ impl eframe::App for CadApp {
                 }
             }
 
-            // HUD: cursor world coords + tool hint
+            // ---- VIEW TOGGLE — which plane the 2D canvas is drawing on -----------------------
+            //
+            // GLOBAL is the drawing itself: the ground plan, and the only one of these that is not
+            // a sketch plane. The other five stand IN THE MODEL and are opened through the same
+            // route as "draw on this face" — so every 2D tool works there unchanged, and anything
+            // drawn on a plane is still there when you come back to it.
+            //
+            // The subject follows the SELECTION: pick an object and the views are of that object;
+            // pick nothing and they are of the whole model. One control, because it is one request.
+            {
+                let cur = self.factory.plan_view;
+                let has_model = self.factory.features_aabb().is_some();
+                let subject = if self.factory.selection_aabb().is_some() { "selection" } else { "model" };
+                let mut want: Option<crate::factory::PlanView> = None;
+                egui::Area::new(egui::Id::new("plan_view_toggle"))
+                    .fixed_pos(rect.left_top() + egui::vec2(10.0, 6.0))
+                    .order(egui::Order::Middle)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for v in crate::factory::PlanView::ALL {
+                                        // Only GLOBAL is reachable with nothing built — the rest
+                                        // need something to stand a plane against.
+                                        let usable = v == crate::factory::PlanView::Global || has_model;
+                                        let hint = if usable {
+                                            format!("{} — of the {subject}", v.hint())
+                                        } else {
+                                            "Build something first — a view needs a model to look at".into()
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                usable,
+                                                egui::SelectableLabel::new(cur == v, v.label()),
+                                            )
+                                            .on_hover_text(hint)
+                                            .clicked()
+                                        {
+                                            want = Some(v);
+                                        }
+                                    }
+                                });
+                            });
+                    });
+                if let Some(v) = want {
+                    if v != cur {
+                        self.factory_set_plan_view(v);
+                    }
+                }
+            }
+
+            // HUD: cursor world coords + tool hint. Below the view toggle, which owns the corner.
             if let Some(pos) = resp.hover_pos() {
                 let w = self.s2w(pos, rect);
                 painter.text(
-                    rect.left_top() + egui::vec2(10.0, 8.0),
+                    rect.left_top() + egui::vec2(10.0, 38.0),
                     egui::Align2::LEFT_TOP,
                     format!(
                         "cursor: ({:>9.3}, {:>9.3})   scale: {:>6.2} px/u",
@@ -42470,7 +42583,7 @@ impl eframe::App for CadApp {
                 );
             }
             painter.text(
-                rect.left_top() + egui::vec2(10.0, 28.0),
+                rect.left_top() + egui::vec2(10.0, 58.0),
                 egui::Align2::LEFT_TOP,
                 current_hint(self.tool, self.arc_method, self.pending.len()),
                 crate::theme::typ::data_code(),
@@ -45865,9 +45978,22 @@ impl CadApp {
             return;
         }
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(150, 170, 205, 130));
+        // GLOBAL view shows only what is drawn on the GROUND PLANE.
+        //
+        // Every finished sketch used to be flattened onto the plan at once, so a wall elevation
+        // and a ceiling layout landed on top of the floor plan as one unreadable overlay — and
+        // nothing said which lines belonged to which plane. The plan is a horizontal cut; a sketch
+        // standing vertically in the model is not part of it.
+        //
+        // In any other view the canvas IS a sketch on that plane, so the same rule holds by
+        // construction: you see the plane you are on.
+        let ground_only = self.factory.plan_view == crate::factory::PlanView::Global;
         for (i, sk) in self.factory.model.sketches.iter().enumerate() {
             if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
                 continue; // the active sketch is the live canvas — don't double-draw it
+            }
+            if ground_only && sk.frame.normal().z.abs() < 0.999 {
+                continue; // not a horizontal plane, so not part of the plan
             }
             for d in &sk.doc.dobjects {
                 // By the SKETCH's own unit (metre-space, so k = 1 today) — `from_uv` below
@@ -51113,5 +51239,136 @@ mod room_regressions {
              crossed the whole building",
         );
         assert!(depth > 0.05, "and it is not zero either — there IS a wall here, got {depth:.3}");
+    }
+}
+
+/// Standard orthographic views for the 2D canvas.
+///
+/// Asked for as: the 2D side only ever shows the ground plan, and other planes are reachable only
+/// by right-clicking a face. There should be a toggle for Top / Front / Back / Left / Right — of
+/// the selected object if one is selected, of the whole model if not — and the global view should
+/// show only what is drawn on the ground plane.
+#[cfg(test)]
+mod plan_views {
+    use super::*;
+    use crate::factory::PlanView as PV;
+
+    fn square(m: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(m, 0.0),
+            glam::Vec2::new(m, m),
+            glam::Vec2::new(0.0, m),
+            glam::Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    fn with_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&square(10.0), 4.0).expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    /// Each view faces the axis its name implies, and the five model views are real planes.
+    #[test]
+    fn every_view_faces_the_direction_it_is_named_after() {
+        let app = with_building();
+        for (v, want) in [
+            (PV::Top, glam::Vec3::Z),
+            (PV::Front, -glam::Vec3::Y),
+            (PV::Back, glam::Vec3::Y),
+            (PV::Left, -glam::Vec3::X),
+            (PV::Right, glam::Vec3::X),
+        ] {
+            let f = app.factory_plan_view_frame(v).expect("a model exists");
+            assert!(
+                f.normal().dot(want) > 0.999,
+                "{} should look along {want:?}, got {:?}",
+                v.label(),
+                f.normal(),
+            );
+        }
+        assert!(app.factory_plan_view_frame(PV::Global).is_none(), "Global is the drawing, not a plane");
+    }
+
+    /// The plane sits at the FAR side of the subject, so the whole thing is in front of it rather
+    /// than half behind the drawing plane.
+    #[test]
+    fn the_plane_stands_clear_of_the_subject() {
+        let app = with_building();
+        let (mn, mx) = app.factory.features_aabb().expect("bounds");
+        assert!((app.factory_plan_view_frame(PV::Front).unwrap().origin.y - mn.y).abs() < 1e-3);
+        assert!((app.factory_plan_view_frame(PV::Back).unwrap().origin.y - mx.y).abs() < 1e-3);
+        assert!((app.factory_plan_view_frame(PV::Left).unwrap().origin.x - mn.x).abs() < 1e-3);
+        assert!((app.factory_plan_view_frame(PV::Right).unwrap().origin.x - mx.x).abs() < 1e-3);
+        assert!((app.factory_plan_view_frame(PV::Top).unwrap().origin.z - mx.z).abs() < 1e-3);
+    }
+
+    /// **The subject follows the selection.** Nothing selected → the whole model. Something
+    /// selected → that object. One control, because it is one request with a different subject.
+    #[test]
+    fn the_view_is_of_the_selection_when_there_is_one() {
+        let mut app = with_building();
+        let whole = app.factory_plan_view_frame(PV::Front).unwrap().origin;
+
+        // A small solid off to one side, selected.
+        let id = app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement { u: 30.0, v: 30.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        app.factory.selection = vec![id];
+        let picked = app.factory_plan_view_frame(PV::Front).unwrap().origin;
+        assert!(
+            (picked - whole).length() > 5.0,
+            "the view should re-anchor on the selection, moved only {:.2} m",
+            (picked - whole).length(),
+        );
+    }
+
+    /// With nothing built there is no plane to stand, and the app says so rather than silently
+    /// doing nothing.
+    #[test]
+    fn a_view_needs_something_to_look_at() {
+        let mut app = CadApp::default();
+        assert!(app.factory_plan_view_frame(PV::Front).is_none());
+        app.factory_set_plan_view(PV::Front);
+        assert_eq!(app.factory.plan_view, PV::Global, "it stays where it was");
+        assert!(app.factory.status.contains("Nothing built"), "and explains: {}", app.factory.status);
+    }
+
+    /// Switching to a view opens a sketch on that plane; returning to Global leaves it. Coming
+    /// BACK to the same view reopens the same sketch, so work drawn there is still there.
+    #[test]
+    fn a_view_is_a_sketch_plane_and_returning_reopens_it() {
+        let mut app = with_building();
+        app.factory_set_plan_view(PV::Front);
+        assert_eq!(app.factory.plan_view, PV::Front);
+        assert!(app.factory.session.is_some(), "the canvas is now a sketch on that plane");
+        let n = app.factory.model.sketches.len();
+
+        app.factory_set_plan_view(PV::Global);
+        assert_eq!(app.factory.plan_view, PV::Global);
+        assert!(app.factory.session.is_none(), "back on the drawing");
+
+        app.factory_set_plan_view(PV::Front);
+        assert_eq!(
+            app.factory.model.sketches.len(),
+            n,
+            "returning REOPENS the same sketch rather than starting a blank one",
+        );
+    }
+
+    /// Leaving a sketch by any route puts the toggle back to Global — a control that says "Front"
+    /// while the canvas is the plan is a label that lies.
+    #[test]
+    fn leaving_a_sketch_resets_the_toggle() {
+        let mut app = with_building();
+        app.factory_set_plan_view(PV::Left);
+        assert_eq!(app.factory.plan_view, PV::Left);
+        app.factory_exit_sketch();
+        assert_eq!(app.factory.plan_view, PV::Global);
     }
 }

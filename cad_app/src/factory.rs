@@ -20,6 +20,59 @@ pub enum StdView {
     Top, Bottom, Front, Back, Left, Right, Iso,
 }
 
+/// Which plane the 2D CANVAS draws on — the orthographic view the drafting side is looking along.
+/// Distinct from [`StdView`], which aims the 3D camera; this decides what the 2D tools edit.
+///
+/// `Global` is the drawing's own plan: the document every 2D tool has always worked on, and the
+/// only one of these that is not a sketch plane. The other five are planes standing in the MODEL,
+/// opened by the same route as "draw on this face" — which is why every 2D tool works in them
+/// without learning anything new, and why a drawing made on one is still there when you return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PlanView {
+    #[default]
+    Global,
+    Top,
+    Front,
+    Back,
+    Left,
+    Right,
+}
+
+impl PlanView {
+    pub const ALL: [PlanView; 6] = [
+        PlanView::Global,
+        PlanView::Top,
+        PlanView::Front,
+        PlanView::Back,
+        PlanView::Left,
+        PlanView::Right,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanView::Global => "Global",
+            PlanView::Top => "Top",
+            PlanView::Front => "Front",
+            PlanView::Back => "Back",
+            PlanView::Left => "Left",
+            PlanView::Right => "Right",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            PlanView::Global => {
+                "The drawing's own plan — the ground plane. Sketches on other planes are hidden."
+            }
+            PlanView::Top => "A sketch plane looking down on the model",
+            PlanView::Front => "A sketch plane on the front face",
+            PlanView::Back => "A sketch plane on the back face",
+            PlanView::Left => "A sketch plane on the left face",
+            PlanView::Right => "A sketch plane on the right face",
+        }
+    }
+}
+
 /// The 3D-Factory zoom mode — mirrors the 2D zoom command. Bare `z` → `Window` (the 2D
 /// default: DRAG a box, or click two corners, with an amber "zoom window" rubber-band);
 /// `z r` → `RealTime` (drag up/down dollies). `Off` = idle.
@@ -949,6 +1002,8 @@ pub struct FactoryState {
     /// Tracked so they can be hidden as a group without deleting them; the lighting model
     /// still contains them.
     pub ceilings: std::collections::HashSet<u32>,
+    /// Which plane the 2D canvas is drawing on. See [`PlanView`].
+    pub plan_view: PlanView,
     /// Every ROOM built, as an editable record. See [`RoomInst`].
     pub rooms: Vec<RoomInst>,
     /// Monotonic room id. Never reused, so a rename or a delete cannot be confused with the room
@@ -2862,6 +2917,7 @@ impl Default for FactoryState {
             dim_edit_active: false,
             show_plan: true,
             ceilings: std::collections::HashSet::new(),
+            plan_view: PlanView::Global,
             rooms: Vec::new(),
             next_room_id: 1,
             ceiling_caps: std::collections::HashSet::new(),
