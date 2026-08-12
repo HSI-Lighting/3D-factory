@@ -9897,7 +9897,7 @@ impl CadApp {
                                     // the result is otherwise visible only as a picture that looks
                                     // wrong — which is how this was reported in the first place.
                                     let over = r.overall_height();
-                                    let fits = over <= self.factory.building_height + 1e-4;
+                                    let fits = over <= self.factory.effective_building_height() + 1e-4;
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "      {} overall · {} openings{}",
@@ -9910,7 +9910,7 @@ impl CadApp {
                                                     "   ⚠ {} over the building",
                                                     crate::factory::length_str(
                                                         u,
-                                                        over - self.factory.building_height,
+                                                        over - self.factory.effective_building_height(),
                                                     )
                                                 )
                                             },
@@ -9926,7 +9926,7 @@ impl CadApp {
                                         let ct = if r.open_top { 0.0 } else { r.ceiling_t };
                                         fit = Some((
                                             r.id,
-                                            (self.factory.building_height - r.floor_t - ct).max(0.05),
+                                            (self.factory.effective_building_height() - r.floor_t - ct).max(0.05),
                                         ));
                                     }
                                     ui.separator();
@@ -10029,7 +10029,7 @@ impl CadApp {
                             let u = f.units;
                             let ct = if f.room_open_top { 0.0 } else { f.ceiling_thickness.max(0.02) };
                             let overall = f.room_floor.max(0.02) + f.room_height.max(0.05) + ct;
-                            let fits = overall <= f.building_height + 1e-4;
+                            let fits = overall <= f.effective_building_height() + 1e-4;
                             ui.label(
                                 egui::RichText::new(format!(
                                     "  overall {}  =  {} floor + {} clear{}",
@@ -37743,11 +37743,23 @@ impl eframe::App for CadApp {
                         ui.add_space(8.0);
                         ui.label("Building height");
                         let u = self.factory.units;
-                        crate::factory::length_ui(ui, u, &mut self.factory.building_height, 0.05, 0.05, 500.0)
+                        let mut bh = self.factory.building_height;
+                        let r = crate::factory::length_ui(ui, u, &mut bh, 0.05, 0.05, 500.0)
                             .on_hover_text(
                                 "Storey height the structure rises to.\n\
-                                 Every building element opens at this height.",
+                                 Changing it RESIZES a building already standing — it is not only \
+                                 a template for the next one.",
                             );
+                        // It used to be a template ONLY: the field moved and the building did not,
+                        // so a building resized elsewhere went on being reported at this stale
+                        // number and every room check measured against a building that had gone.
+                        if r.drag_started() || (r.changed() && !r.dragged()) {
+                            self.snapshot_factory();
+                        }
+                        if r.changed() {
+                            self.factory.set_building_height(bh);
+                            self.factory.recompute();
+                        }
                     });
                     ui.separator();
                     // The build TOOLS (3D solids, Make building / walls / floor / ceiling,

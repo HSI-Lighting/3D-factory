@@ -5098,12 +5098,12 @@ impl FactoryState {
             length_str(self.units, floor_t),
             length_str(self.units, h),
             if ct > 0.0 { format!(" + {} ceiling", length_str(self.units, ct)) } else { String::new() },
-            if overall > self.building_height + 1e-4 {
+            if overall > self.effective_building_height() + 1e-4 {
                 format!(
                     "  ⚠ {} taller than the {} building — the room stands proud of the top. \
                      Room height is the CLEAR height; the slabs are extra.",
-                    length_str(self.units, overall - self.building_height),
-                    length_str(self.units, self.building_height),
+                    length_str(self.units, overall - self.effective_building_height()),
+                    length_str(self.units, self.effective_building_height()),
                 )
             } else {
                 String::new()
@@ -5263,7 +5263,98 @@ impl FactoryState {
     /// one says so through the warning rather than by silently proposing a crawlspace.
     pub fn suggested_room_height(&self) -> f32 {
         let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
-        (self.building_height - self.room_floor.max(0.02) - ct).max(2.1)
+        (self.effective_building_height() - self.room_floor.max(0.02) - ct).max(2.1)
+    }
+
+    /// Top of the building that is ACTUALLY STANDING, measured from the model.
+    ///
+    /// `building_height` is a TEMPLATE — the height the NEXT building is raised to — and it keeps
+    /// no connection to one already built. Resize a building through its own height field and the
+    /// geometry changes while the template does not, so every check written against the template
+    /// compares a room to a building that no longer exists: a 4 m building reported as 3 m, and a
+    /// room that fits it warned as standing 1000 mm proud of the top.
+    ///
+    /// The same test the carve uses to find its target: a Union solid too tall to be a slab.
+    /// `None` when nothing is built, so the caller falls back to the template — which at that
+    /// point is the only statement about the building there is.
+    pub fn building_top(&self) -> Option<f32> {
+        // A ROOM'S OWN WALLS ARE NOT THE BUILDING. Without this a free-standing room measures
+        // itself: its wall boxes are Union solids well over the slab threshold, so a room with no
+        // building around it reported its own wall top as the height it had to fit inside — and
+        // then warned that it did not. A test caught exactly that.
+        let owned: std::collections::HashSet<u32> =
+            self.rooms.iter().flat_map(|r| self.room_features(r.id)).collect();
+        let mut top: Option<f32> = None;
+        for f in &self.model.features {
+            if f.op != BoolOp::Union || owned.contains(&f.id) {
+                continue;
+            }
+            let (mn, mx) = f.world_aabb();
+            if (mx.z - mn.z) <= 0.5 {
+                continue; // a thin slab is a floor or a ceiling, not a mass
+            }
+            top = Some(top.map_or(mx.z, |t: f32| t.max(mx.z)));
+        }
+        top
+    }
+
+    /// The height a room is judged against: what is standing, or the template when nothing is.
+    pub fn effective_building_height(&self) -> f32 {
+        self.building_top().unwrap_or(self.building_height)
+    }
+
+    /// Raise or lower the building ALREADY BUILT, from the template field.
+    ///
+    /// The counterpart to [`Self::set_room_height`], and missing for the same reason: the height
+    /// was fixed at the moment of creation. Any room carved out of the building has its void grown
+    /// to match, so a building made taller cannot seal itself back over its own rooms.
+    ///
+    /// Returns how many masses were resized.
+    pub fn set_building_height(&mut self, height: f32) -> usize {
+        let h = height.max(0.05);
+        let ids: Vec<u32> = self
+            .model
+            .features
+            .iter()
+            .filter(|f| f.op == BoolOp::Union)
+            .filter(|f| {
+                let (mn, mx) = f.world_aabb();
+                (mx.z - mn.z) > 0.5
+            })
+            .map(|f| f.id)
+            .collect();
+        for id in &ids {
+            if let Some(f) = self.model.get_mut(*id) {
+                match f.primitive {
+                    Primitive::Extrusion { profile, w, d, .. } => {
+                        f.primitive = Primitive::Extrusion { profile, h, w, d };
+                    }
+                    Primitive::Box { w, d, .. } => {
+                        f.primitive = Primitive::Box { w, d, h };
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let rooms: Vec<(Option<u32>, f32)> = self.rooms.iter().map(|r| (r.carve, r.base_z)).collect();
+        for (carve, base_z) in rooms {
+            if let Some(cid) = carve {
+                if let Some(f) = self.model.get_mut(cid) {
+                    if let Primitive::Extrusion { profile, w, d, h: was } = f.primitive {
+                        let need = (h - base_z).max(0.1) + 0.02;
+                        f.primitive = Primitive::Extrusion { profile, h: was.max(need), w, d };
+                    }
+                }
+            }
+        }
+        self.building_height = h;
+        self.dirty = true;
+        self.status = format!(
+            "Building height {} — {} mass(es) resized.",
+            length_str(self.units, h),
+            ids.len(),
+        );
+        ids.len()
     }
 
     /// Every feature a room owns — what a delete has to take, and what selecting it should cover.
@@ -12462,5 +12553,139 @@ mod working_unit_coverage {
                  project must not have a metre field hiding among them.",
             );
         }
+    }
+}
+
+/// The building a room is judged against is the one that is standing, not a stale template.
+///
+/// Reported as "why does it still say the building is 3000 mm even though I changed it to 4000 mm?
+/// it builds it correctly though" — the geometry was right and the number beside it was three
+/// versions out of date.
+#[cfg(test)]
+mod building_height_truth {
+    use super::*;
+
+    fn square(m: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(m, 0.0),
+            Vec2::new(m, m),
+            Vec2::new(0.0, m),
+            Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    /// Resizing the building through its own feature — which is what the properties panel does —
+    /// changes what a room is measured against, even though the template field is untouched.
+    #[test]
+    fn the_building_is_measured_not_remembered() {
+        let mut f = FactoryState::default();
+        assert!((f.building_height - 3.0).abs() < 1e-6, "the template starts at 3 m");
+        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        assert!((f.effective_building_height() - 3.0).abs() < 1e-3);
+
+        // Raise it the way the properties panel does: edit the primitive directly.
+        if let Some(feat) = f.model.get_mut(id) {
+            if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
+                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+            }
+        }
+        assert!(
+            (f.effective_building_height() - 4.0).abs() < 1e-3,
+            "the standing building is 4 m, whatever the template still says",
+        );
+        assert!((f.building_height - 3.0).abs() < 1e-6, "and the template really is untouched");
+    }
+
+    /// A 4 m room in a 4 m building raises NO warning. Against the stale 3 m template it claimed
+    /// the room stood 1000 mm proud of the top — the report exactly.
+    #[test]
+    fn a_room_that_fits_the_real_building_is_not_warned_about() {
+        let mut f = FactoryState::default();
+        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        if let Some(feat) = f.model.get_mut(id) {
+            if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
+                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+            }
+        }
+        f.room_floor = 0.05;
+        f.room_height = 3.9;
+        f.ceiling_thickness = 0.05;
+        f.add_room(&vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(9.0, 1.0),
+            Vec2::new(9.0, 9.0),
+            Vec2::new(1.0, 9.0),
+            Vec2::new(1.0, 1.0),
+        ])
+        .expect("room");
+        assert!(
+            (f.rooms[0].overall_height() - 4.0).abs() < 1e-3,
+            "50 + 3900 + 50 = 4000 mm overall",
+        );
+        assert!(
+            !f.status.contains("taller than"),
+            "it fits the 4 m building that is standing: {}",
+            f.status,
+        );
+    }
+
+    /// The suggestion follows the real building too.
+    #[test]
+    fn the_suggested_height_follows_the_standing_building() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.05;
+        f.ceiling_thickness = 0.05;
+        let id = f.add_building_outline(&square(10.0), 3.0).expect("building");
+        if let Some(feat) = f.model.get_mut(id) {
+            if let Primitive::Extrusion { profile, w, d, .. } = feat.primitive {
+                feat.primitive = Primitive::Extrusion { profile, h: 4.0, w, d };
+            }
+        }
+        assert!(
+            (f.suggested_room_height() - 3.9).abs() < 1e-3,
+            "4.00 − 0.05 − 0.05 = 3.90, got {}",
+            f.suggested_room_height(),
+        );
+    }
+
+    /// And the template field now RESIZES what is standing, rather than describing nothing.
+    #[test]
+    fn setting_the_height_resizes_the_building() {
+        let mut f = FactoryState::default();
+        f.add_building_outline(&square(10.0), 3.0).expect("building");
+        assert_eq!(f.set_building_height(4.5), 1, "one mass resized");
+        f.recompute();
+        let top = f.cached.bounds().expect("bounds").1[2];
+        assert!((top - 4.5).abs() < 1e-3, "the geometry followed, got {top}");
+        assert!((f.effective_building_height() - 4.5).abs() < 1e-3);
+    }
+
+    /// Raising the building must not seal it back over a room carved out of it.
+    #[test]
+    fn a_taller_building_does_not_close_over_its_rooms() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.1;
+        f.room_height = 2.7;
+        f.ceiling_thickness = 0.1;
+        f.add_building_outline(&square(10.0), 3.0).expect("building");
+        f.add_room(&vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(9.0, 1.0),
+            Vec2::new(9.0, 9.0),
+            Vec2::new(1.0, 9.0),
+            Vec2::new(1.0, 1.0),
+        ])
+        .expect("room");
+        let carve = f.rooms[0].carve.expect("carved");
+        f.set_building_height(6.0);
+        let void_h = match f.model.features.iter().find(|x| x.id == carve).unwrap().primitive {
+            Primitive::Extrusion { h, .. } => h,
+            _ => panic!("the void is an extrusion"),
+        };
+        assert!(
+            void_h >= 6.0,
+            "the void must still punch clear through a 6 m building, got {void_h}",
+        );
     }
 }
