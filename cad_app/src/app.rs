@@ -1342,6 +1342,13 @@ pub struct CadApp {
     /// non-whitespace). Pressing Enter on an EMPTY cmd at the top-level
     /// prompt re-runs this — AutoCAD's "repeat last command".
     last_command:  Option<String>,
+    /// Which widget held the keyboard at the START of this frame, before any panel drew.
+    ///
+    /// The global Enter/Space cascade consults this to tell "the user pressed Enter at the command
+    /// prompt" from "the user finished typing a number into a field". Captured early because a
+    /// field that commits on Enter gives up focus while it is being drawn, so by the time the
+    /// cascade runs the answer would be None — passing the guard exactly when it is needed.
+    focus_at_frame_start: Option<egui::Id>,
     /// Counter for the 2-stage "Enter to cancel" pattern during a
     /// select-mode wait with an empty basket: 0 = no Enters yet, 1 =
     /// notice shown, 2 = next Enter cancels. Resets on any state
@@ -3513,6 +3520,7 @@ impl Default for CadApp {
             history:            Vec::new(),
             current_prompt:     String::new(),
             last_command:       None,
+            focus_at_frame_start: None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
@@ -3901,6 +3909,31 @@ toolbar:
 enum CmdUndo { Handled, NothingLeft, NoCommand }
 
 impl CadApp {
+    /// The command line's own widget id.
+    ///
+    /// The one field allowed to drive the global Enter/Space cascade. Everything else that can
+    /// hold the keyboard — every DragValue, every dialog field — owns its own Enter, and must not
+    /// have it re-read as "repeat the last command".
+    fn cmd_line_id() -> egui::Id {
+        egui::Id::new("simlux::command_line")
+    }
+
+    /// True when a field OTHER than the command line holds the keyboard.
+    ///
+    /// Every global key handler that can destroy work has to ask this. A keystroke belongs to
+    /// whoever has focus: Enter in a wall-height box confirms a wall height, and Delete in one
+    /// removes a digit. Read globally and acted on regardless, those same two keys repeat the last
+    /// command and erase the selection — so typing a number could empty the drawing, which is
+    /// exactly what was reported.
+    ///
+    /// Uses the focus captured at FRAME START, because a field that commits on Enter surrenders
+    /// focus while it is being drawn; asking afterwards returns None precisely when it matters.
+    #[inline]
+    fn typing_in_a_field(&self) -> bool {
+        self.focus_at_frame_start
+            .is_some_and(|id| id != Self::cmd_line_id())
+    }
+
     // ---- commands & math -----------------------------------------------
 
     // ===== SIMLUX lighting integration (grafted from simLUX main) ========
@@ -20533,7 +20566,10 @@ impl CadApp {
             let row_h = ui.spacing().interact_size.y;
             let text_resp = ui.add_sized(
                 [(ui.available_width() - btn_w - 8.0).max(40.0), row_h],
-                egui::TextEdit::singleline(&mut self.cmd),
+                // A STABLE id, so the global Enter handler can recognise this one field as the
+                // one that is allowed to drive the command cascade. Every other focused widget
+                // owns its own Enter. See `focus_at_frame_start`.
+                egui::TextEdit::singleline(&mut self.cmd).id(Self::cmd_line_id()),
             );
             let run_clicked = ui.button("run").clicked();
             let enter_pressed = (text_resp.lost_focus()
@@ -35794,6 +35830,20 @@ impl eframe::App for CadApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
+        // WHO OWNS THE KEYBOARD, taken BEFORE any panel is drawn.
+        //
+        // Enter is read from the global context further down and run through the command cascade,
+        // which ends in "repeat the last command". That handler never asked whether anyone was
+        // typing — so entering a wall height in a menu, or any other number in any other field,
+        // committed the value AND re-ran the previous command. With `clear` behind it that wipes
+        // the drawing, which is what "everything in the window disappears" was.
+        //
+        // Read here rather than at the cascade because a field that commits on Enter SURRENDERS
+        // FOCUS as it is drawn; by the time the cascade runs, `focused()` is already None and the
+        // guard would pass exactly when it is needed. Frame start is the last moment the answer is
+        // still the truth about the keystroke.
+        self.focus_at_frame_start = ctx.memory(|m| m.focused());
+
 
         // Install the global design-token Visuals so every default-styled widget
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
@@ -36252,6 +36302,7 @@ impl eframe::App for CadApp {
         // could be dropped by egui's end-of-frame focus grant. Guarded so it
         // never fires while editing text or running another command/flow.
         if ctx.input(|i| i.key_pressed(egui::Key::Delete))
+            && !self.typing_in_a_field()
             && !self.selection.is_empty()
             && self.layer_rename.is_none()
             && self.cmd.trim().is_empty()
@@ -36268,6 +36319,7 @@ impl eframe::App for CadApp {
         // Delete is Delete). Independent of the 2D branch above: in 3D the 2D `selection`
         // is empty, so that branch does not fire.
         if ctx.input(|i| i.key_pressed(egui::Key::Delete))
+            && !self.typing_in_a_field()
             && self.active_view == ActiveView::ThreeD
             && self.factory.has_any_selection()
             && self.cmd.trim().is_empty()
@@ -36342,8 +36394,15 @@ impl eframe::App for CadApp {
         // `feedback_rust_cad_user_terminates_sessions` — the program
         // never auto-terminates editing sessions; only the user does,
         // and a single Enter must not chain through multiple phases.
-        let enter_now  = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-        let space_now  = ctx.input(|i| i.key_pressed(egui::Key::Space));
+        // A field other than the command line owns the keyboard ⇒ this Enter is ITS Enter.
+        //
+        // Without this the cascade below also ran, and its last branch repeats the previous
+        // command — so committing a value in any numeric field re-ran whatever was last typed.
+        // With `clear` or `erase` behind it that empties the drawing, and the only visible effect
+        // is that everything vanishes the moment a number is confirmed.
+        let typing_elsewhere = self.typing_in_a_field();
+        let enter_now  = !typing_elsewhere && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let space_now  = !typing_elsewhere && ctx.input(|i| i.key_pressed(egui::Key::Space));
         let cmd_is_empty = self.cmd.trim().is_empty();
         // Same gate as the cmd-line space-submit: while typing a text
         // body (or entering text height), Space is a LITERAL space —
@@ -50464,5 +50523,93 @@ mod imported_drawing_scale {
         let app = CadApp::default();
         assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Assumed);
         assert!((app.doc_k() - 1.0).abs() < 1e-12, "nothing imported, nothing changed");
+    }
+}
+
+/// Who owns a keystroke — the focused field, or the global command cascade.
+///
+/// Reported from the field: entering a wall height in a menu and pressing Enter made the drawing
+/// vanish. Enter was read from the global context with no regard for focus, so the value committed
+/// AND the cascade ran to its last branch, which repeats the previous command. With `clear` behind
+/// it that empties the document. The same hole let Delete — pressed to remove a digit — erase the
+/// current selection.
+#[cfg(test)]
+mod keystroke_ownership {
+    use super::*;
+
+    fn field_id() -> egui::Id {
+        egui::Id::new("some_drag_value")
+    }
+
+    /// A field other than the command line holds the keyboard ⇒ the key is that field's.
+    #[test]
+    fn a_focused_field_owns_its_own_keystrokes() {
+        let mut app = CadApp::default();
+        app.focus_at_frame_start = Some(field_id());
+        assert!(app.typing_in_a_field());
+    }
+
+    /// The COMMAND LINE is the one field that drives the cascade — that is its entire job, and
+    /// guarding it would break the primary way the app is driven.
+    #[test]
+    fn the_command_line_still_drives_the_cascade() {
+        let mut app = CadApp::default();
+        app.focus_at_frame_start = Some(CadApp::cmd_line_id());
+        assert!(!app.typing_in_a_field(), "the command line must keep its Enter");
+    }
+
+    /// Nothing focused — plain drafting — behaves exactly as before. This is what keeps Enter
+    /// repeating the last command and Delete erasing the selection when the user means them to.
+    #[test]
+    fn with_nothing_focused_the_global_keys_still_work() {
+        let app = CadApp::default();
+        assert_eq!(app.focus_at_frame_start, None);
+        assert!(!app.typing_in_a_field());
+    }
+
+    /// The command line's id is STABLE across calls. Derived fresh each time it is asked for, so
+    /// if it were not deterministic the guard would reject the command line at random and Enter
+    /// would intermittently stop working.
+    #[test]
+    fn the_command_line_id_is_stable() {
+        assert_eq!(CadApp::cmd_line_id(), CadApp::cmd_line_id());
+        assert_ne!(CadApp::cmd_line_id(), field_id());
+    }
+
+    /// **The reported failure.** A drawing, a last command of `clear`, and a value confirmed in a
+    /// field: the document must survive. Before the guard the cascade re-ran `clear` and the 12
+    /// objects went to zero, which is what "everything in the window disappears" was.
+    #[test]
+    fn confirming_a_value_in_a_field_does_not_repeat_the_last_command() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..12 {
+            app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(0.0, i as f64),
+                b: Vec2::new(1000.0, i as f64),
+            })));
+        }
+        app.last_command = Some("clear".into());
+        assert_eq!(app.doc.dobjects.len(), 12);
+
+        // A wall-height field holds the keyboard; the user presses Enter to confirm.
+        app.focus_at_frame_start = Some(field_id());
+        assert!(app.typing_in_a_field(), "the field owns this Enter");
+        // The cascade's repeat branch is gated on exactly this, so it does not run.
+        if !app.typing_in_a_field() {
+            if let Some(last) = app.last_command.clone() {
+                app.run_command(&last);
+            }
+        }
+        assert_eq!(app.doc.dobjects.len(), 12, "the drawing must still be there");
+
+        // …and with focus back on the command line, Enter repeats as designed.
+        app.focus_at_frame_start = Some(CadApp::cmd_line_id());
+        if !app.typing_in_a_field() {
+            if let Some(last) = app.last_command.clone() {
+                app.run_command(&last);
+            }
+        }
+        assert_eq!(app.doc.dobjects.len(), 0, "at the command prompt, Enter still repeats `clear`");
     }
 }
