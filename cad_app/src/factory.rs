@@ -605,9 +605,100 @@ struct FaceOutline {
 /// two orders of magnitude above that, and exists only so the worst case stays bounded.
 const MAX_OUTLINE_EDGES: usize = 20_000;
 
+/// How many decimals a length deserves in a given unit.
+///
+/// A millimetre field showing `2700.00` is noise — nobody dimensions a building to a hundredth of a
+/// millimetre. A metre field showing `2` instead of `2.700` has lost the dimension entirely. The
+/// right number of decimals is a property of the unit, not a constant.
+pub fn length_decimals(u: cad_kernel::DocUnits) -> usize {
+    match u.metres_per_unit {
+        m if m <= 0.0015 => 0, // mm — whole millimetres
+        m if m <= 0.015 => 1,  // cm
+        m if m <= 0.03 => 2,   // inch
+        _ => 3,                // m, ft — millimetre resolution needs three
+    }
+}
+
+/// A DragValue over a length **stored in metres**, typed and displayed in `u`.
+///
+/// The one place metres become user-facing numbers. `speed_m`, `min_m` and `max_m` are given in
+/// METRES by the caller, so the call sites keep reading as the physical limits they are and the
+/// conversion happens once, here.
+///
+/// Converting the RANGE matters as much as converting the value: a field clamped to `0.02..=2.0`
+/// would refuse every legal millimetre entry, and a drag speed left at `0.01` would move a
+/// millimetre field by a hundredth of a millimetre per pixel — which reads as a field that has
+/// stopped responding.
+pub fn length_ui(
+    ui: &mut egui::Ui,
+    u: cad_kernel::DocUnits,
+    v: &mut f32,
+    speed_m: f64,
+    min_m: f64,
+    max_m: f64,
+) -> egui::Response {
+    let mut shown = u.from_metres(*v as f64);
+    let r = ui.add(
+        egui::DragValue::new(&mut shown)
+            .speed(u.from_metres(speed_m))
+            .range(u.from_metres(min_m)..=u.from_metres(max_m))
+            .max_decimals(length_decimals(u))
+            .suffix(format!(" {}", u.label())),
+    );
+    if r.changed() {
+        *v = u.to_metres(shown) as f32;
+    }
+    r
+}
+
+/// [`length_ui`] with a label printed inside the field — `x`, `radius`, `reach` and so on.
+pub fn length_ui_pre(
+    ui: &mut egui::Ui,
+    u: cad_kernel::DocUnits,
+    prefix: &str,
+    v: &mut f32,
+    speed_m: f64,
+    min_m: f64,
+    max_m: f64,
+) -> egui::Response {
+    let mut shown = u.from_metres(*v as f64);
+    let r = ui.add(
+        egui::DragValue::new(&mut shown)
+            .speed(u.from_metres(speed_m))
+            .range(u.from_metres(min_m)..=u.from_metres(max_m))
+            .max_decimals(length_decimals(u))
+            .prefix(prefix)
+            .suffix(format!(" {}", u.label())),
+    );
+    if r.changed() {
+        *v = u.to_metres(shown) as f32;
+    }
+    r
+}
+
+/// Format a length held in metres for display in `u`, with its unit.
+pub fn length_str(u: cad_kernel::DocUnits, metres: f32) -> String {
+    format!("{:.*} {}", length_decimals(u), u.from_metres(metres as f64), u.label())
+}
+
 /// 3D Factory state — the model + its view. Lives on `CadApp` as one field.
 pub struct FactoryState {
     pub open: bool,
+    /// The unit lengths are TYPED AND SHOWN in, throughout the Factory.
+    ///
+    /// Everything is STORED in metres and always will be: the lux engine measures in metres, the
+    /// sun's position is computed for a building in metres, imported meshes are normalised to
+    /// metres, and every physical constant in the renderer assumes them. This setting changes only
+    /// what a typed number means and what is printed beside it — so switching it can never move a
+    /// wall, which is the same guarantee the 2D `units` command makes, for the same reason.
+    ///
+    /// Independent of the drawing's own unit (`Document::units`). A drawing states what its
+    /// coordinates mean, which is a fact about that file; this states what someone building in 3D
+    /// would rather type, which is a preference. Promotion from 2D still converts through the
+    /// drawing's unit exactly as before — this setting is not in that path at all.
+    ///
+    /// Millimetres by default, because that is what building drawings are dimensioned in.
+    pub units: cad_kernel::DocUnits,
     pub model: Model,
     /// Evaluated CSG mesh, rebuilt only when `dirty` (csgrs is not cheap).
     pub cached: SolidMesh,
@@ -2562,6 +2653,8 @@ impl Default for FactoryState {
     fn default() -> Self {
         Self {
             open: false,
+            // Millimetres — what building drawings are dimensioned in. Storage stays metres.
+            units: cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User),
             model: Model::default(),
             cached: SolidMesh::default(),
             dirty: false,
@@ -4966,6 +5059,7 @@ impl FactoryState {
                 .map(|(&(f, a, b, c, d), &ti)| (f, a, b, c, d, ti))
                 .collect(),
             feature_groups: self.feature_group.iter().map(|(&f, &g)| (f, g)).collect(),
+            working_unit_m: self.units.metres_per_unit,
         }
     }
 
@@ -5133,6 +5227,12 @@ impl FactoryState {
             .filter(|&(id, _)| have.contains(&id))
             .collect();
         self.next_group_id = self.feature_group.values().copied().max().unwrap_or(0) + 1;
+        // The working unit, if the sidecar recorded one. A project reopens showing the numbers it
+        // was authored with; a sidecar written before this existed says nothing, and the default
+        // stands rather than the geometry being reinterpreted.
+        if d.working_unit_m > 0.0 {
+            self.units = cad_kernel::DocUnits::new(d.working_unit_m, cad_kernel::UnitSource::User);
+        }
         // CUTS are stored as a list, not as geometry, so a loaded piece has to be re-cut before it
         // matches what was saved. Replaying them here (rather than trusting the saved mesh) is what
         // keeps them editable across a reload — and means a later fix to the boolean improves old
@@ -11245,5 +11345,118 @@ mod water_material {
         let back = decode_texture_rec(&rec).expect("round trip");
         assert!((back.transmission - src.transmission).abs() < 1e-6,
             "reloaded as {} instead of {}", back.transmission, src.transmission);
+    }
+}
+
+/// The Factory's working unit — an input and display preference, never a change to the model.
+#[cfg(test)]
+mod working_unit {
+    use super::*;
+    use cad_kernel::{DocUnits, UnitSource};
+
+    fn mm() -> DocUnits {
+        DocUnits::new(DocUnits::MM, UnitSource::User)
+    }
+
+    /// The default is millimetres, because that is what building drawings are dimensioned in and
+    /// what the 2D side of this app is usually working in.
+    #[test]
+    fn a_new_factory_works_in_millimetres() {
+        let f = FactoryState::default();
+        assert!((f.units.metres_per_unit - DocUnits::MM).abs() < 1e-12);
+        assert_eq!(f.units.label(), "mm");
+    }
+
+    /// **Switching the unit must never move geometry.**
+    ///
+    /// The whole design rests on this: lengths are stored in metres and the unit is a lens over
+    /// them. If a switch moved anything, the setting would be unusable — nobody could change their
+    /// mind about how they prefer to type, and a project opened by someone with a different
+    /// preference would be a different building.
+    #[test]
+    fn changing_the_unit_moves_nothing() {
+        let mut f = FactoryState::default();
+        f.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 6.0, d: 4.0, h: 3.0 },
+        );
+        f.wall_height = 2.7;
+        f.wall_thickness = 0.2;
+        let before = format!("{:?}", f.model.features[0].primitive);
+
+        for m in [DocUnits::M, DocUnits::INCH, DocUnits::FOOT, DocUnits::CM, DocUnits::MM] {
+            f.units = DocUnits::new(m, UnitSource::User);
+            assert_eq!(
+                format!("{:?}", f.model.features[0].primitive),
+                before,
+                "the solid changed when the working unit became {}",
+                f.units.label()
+            );
+            assert_eq!(f.wall_height, 2.7, "a stored length is metres whatever the unit says");
+            assert_eq!(f.wall_thickness, 0.2);
+        }
+    }
+
+    /// A metre value is SHOWN as the same physical length in whatever unit is chosen.
+    #[test]
+    fn the_same_length_reads_correctly_in_every_unit() {
+        let cases = [
+            (DocUnits::MM, 2700.0, "mm"),
+            (DocUnits::CM, 270.0, "cm"),
+            (DocUnits::M, 2.7, "m"),
+        ];
+        for (m, want, label) in cases {
+            let u = DocUnits::new(m, UnitSource::User);
+            assert_eq!(u.label(), label);
+            assert!(
+                (u.from_metres(2.7) - want).abs() < 1e-6,
+                "2.7 m should read {want} {label}, got {}",
+                u.from_metres(2.7)
+            );
+            // …and typing that number back gives the metre value again.
+            assert!((u.to_metres(want) - 2.7).abs() < 1e-9);
+        }
+    }
+
+    /// Decimals follow the unit. Whole millimetres, three decimals in metres — a mm field showing
+    /// hundredths is noise, and a metre field showing none has thrown the dimension away.
+    #[test]
+    fn a_length_is_shown_to_a_useful_precision() {
+        assert_eq!(length_decimals(DocUnits::new(DocUnits::MM, UnitSource::User)), 0);
+        assert_eq!(length_decimals(DocUnits::new(DocUnits::CM, UnitSource::User)), 1);
+        assert_eq!(length_decimals(DocUnits::new(DocUnits::M, UnitSource::User)), 3);
+        assert_eq!(length_str(mm(), 2.7), "2700 mm");
+        assert_eq!(length_str(DocUnits::new(DocUnits::M, UnitSource::User), 2.7), "2.700 m");
+    }
+
+    /// The unit survives a save, so a project reopens showing the numbers it was authored with.
+    #[test]
+    fn the_working_unit_round_trips_through_the_sidecar() {
+        let mut f = FactoryState::default();
+        f.units = cad_kernel::DocUnits::new(cad_kernel::DocUnits::INCH, UnitSource::User);
+        let doc = f.to_persist();
+        assert!((doc.working_unit_m - DocUnits::INCH).abs() < 1e-12);
+
+        let mut reopened = FactoryState::default();
+        reopened.apply_persist(doc);
+        assert!((reopened.units.metres_per_unit - DocUnits::INCH).abs() < 1e-12);
+        assert_eq!(reopened.units.label(), "in");
+    }
+
+    /// A sidecar written BEFORE the working unit existed records nothing, and the default stands.
+    /// Reinterpreting an old project's numbers would be the one way this feature could do harm.
+    #[test]
+    fn an_older_project_keeps_the_default_unit() {
+        let mut f = FactoryState::default();
+        let mut doc = f.to_persist();
+        doc.working_unit_m = 0.0; // as written by a build that predates the field
+        f.units = cad_kernel::DocUnits::new(DocUnits::FOOT, UnitSource::User);
+        f.apply_persist(doc);
+        assert!(
+            (f.units.metres_per_unit - DocUnits::FOOT).abs() < 1e-12,
+            "an unrecorded unit must not silently reset the one in use"
+        );
     }
 }

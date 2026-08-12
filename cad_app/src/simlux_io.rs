@@ -95,6 +95,14 @@ pub struct FactoryDoc {
     /// GROUPS of CSG features: `(feature_id, group_id)` — members select/move/delete as one.
     #[serde(default)]
     pub feature_groups: Vec<(u32, u32)>,
+    /// The Factory's WORKING UNIT — metres per unit, e.g. `0.001` for millimetres.
+    ///
+    /// A display and input preference, not a property of the geometry: the model is stored in
+    /// metres whatever this says. Persisted so a project reopens showing the numbers it was
+    /// authored with. `0.0` (an older sidecar, or a missing field) means "not recorded" and the
+    /// loader keeps its own default rather than reinterpreting anything.
+    #[serde(default)]
+    pub working_unit_m: f64,
 }
 
 /// One pasted texture as persisted: PNG bytes, base64-encoded. Mirrors `factory::TextureAsset`.
