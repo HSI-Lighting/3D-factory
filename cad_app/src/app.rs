@@ -9695,6 +9695,57 @@ impl CadApp {
                                  calc needs.\nOn: cut through the top for a court / atrium \
                                  open above.",
                             );
+                        // THE ARITHMETIC, SHOWN.
+                        //
+                        // "Room height" is the CLEAR height — floor top to ceiling underside,
+                        // which is what the term means in a drawing. The slab below and the slab
+                        // above are extra, so a 3900 room inside a 4000 building is 4250 overall
+                        // and pokes 250 out of the top. That is correct and it is invisible: two
+                        // numbers interact and the only evidence is a picture that looks wrong.
+                        // Reported exactly that way — "I made the building 4 m tall and gave the
+                        // room 3900, why is the room taller?".
+                        {
+                            let f = &self.factory;
+                            let u = f.units;
+                            let ct = if f.room_open_top { 0.0 } else { f.ceiling_thickness.max(0.02) };
+                            let overall = f.room_floor.max(0.02) + f.room_height.max(0.05) + ct;
+                            let fits = overall <= f.building_height + 1e-4;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  overall {}  =  {} floor + {} clear{}",
+                                    crate::factory::length_str(u, overall),
+                                    crate::factory::length_str(u, f.room_floor.max(0.02)),
+                                    crate::factory::length_str(u, f.room_height.max(0.05)),
+                                    if ct > 0.0 {
+                                        format!(" + {} ceiling", crate::factory::length_str(u, ct))
+                                    } else {
+                                        String::new()
+                                    },
+                                ))
+                                .small()
+                                .color(if fits {
+                                    egui::Color32::from_rgb(150, 200, 150)
+                                } else {
+                                    egui::Color32::from_rgb(230, 170, 90)
+                                }),
+                            )
+                            .on_hover_text(
+                                "Room height is the CLEAR height — floor top to ceiling underside. \
+                                 The slabs above and below are additional, so the structure is \
+                                 always taller than the number you type.",
+                            );
+                            if !fits {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "  ⚠ {} taller than the {} building — it will stand proud of the top",
+                                        crate::factory::length_str(u, overall - f.building_height),
+                                        crate::factory::length_str(u, f.building_height),
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                                );
+                            }
+                        }
                         ui.separator();
                         if ui
                             .button("⬚  Make room (from outline)")

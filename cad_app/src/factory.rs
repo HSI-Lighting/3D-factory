@@ -4885,6 +4885,33 @@ impl FactoryState {
 
         self.selection = vec![floor_id];
         self.dirty = true;
+        // What the room actually occupies, versus the number that was typed.
+        //
+        // `room_height` is the CLEAR height, so the structure is always taller than it by the two
+        // slabs. When that overruns the building the ceiling stands proud of the top, and the only
+        // evidence is a picture that looks wrong — which is exactly how it was reported. Stated
+        // here so the answer is in the status line and the history, not only in a menu that has
+        // since been closed.
+        let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
+        let overall = floor_t + h + ct;
+        self.status = format!(
+            "Room: {} clear, {} overall ({} floor + {} clear{}).{}",
+            length_str(self.units, h),
+            length_str(self.units, overall),
+            length_str(self.units, floor_t),
+            length_str(self.units, h),
+            if ct > 0.0 { format!(" + {} ceiling", length_str(self.units, ct)) } else { String::new() },
+            if overall > self.building_height + 1e-4 {
+                format!(
+                    "  ⚠ {} taller than the {} building — the room stands proud of the top. \
+                     Room height is the CLEAR height; the slabs are extra.",
+                    length_str(self.units, overall - self.building_height),
+                    length_str(self.units, self.building_height),
+                )
+            } else {
+                String::new()
+            },
+        );
         Ok(floor_id)
     }
 
@@ -11458,5 +11485,100 @@ mod working_unit {
             (f.units.metres_per_unit - DocUnits::FOOT).abs() < 1e-12,
             "an unrecorded unit must not silently reset the one in use"
         );
+    }
+}
+
+/// What a room's height number actually buys you.
+///
+/// Reported as "I made the building 4 m tall and gave the room 3900 mm — why is the room taller?".
+/// It is not an arithmetic error: `room_height` is the CLEAR height, floor top to ceiling
+/// underside, which is what the term means on a drawing. The two slabs are additional, so the
+/// structure always stands taller than the number typed. The failure was that nothing said so.
+#[cfg(test)]
+mod room_height_meaning {
+    use super::*;
+
+    fn square(m: f32) -> Vec<Vec2> {
+        vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(m, 0.0),
+            Vec2::new(m, m),
+            Vec2::new(0.0, m),
+            Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    /// The reported numbers, to the millimetre: 200 floor + 3900 clear + 150 ceiling = 4250.
+    #[test]
+    fn a_room_is_taller_than_its_clear_height_by_both_slabs() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.20;
+        f.room_height = 3.90;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = false;
+        f.building_height = 4.0;
+        f.add_room(&square(4.4)).expect("the room builds");
+        f.recompute();
+
+        let (mn, mx) = f.cached.bounds().expect("the room has bounds");
+        let overall = mx[2] - mn[2];
+        assert!(
+            (overall - 4.25).abs() < 1e-3,
+            "0.20 + 3.90 + 0.15 = 4.25 m overall, got {overall}",
+        );
+        assert!(overall > f.building_height, "which is taller than the 4 m building");
+    }
+
+    /// …and the app SAYS so, with the arithmetic and the overrun. The geometry was always right;
+    /// the silence was the bug.
+    #[test]
+    fn the_overrun_is_reported_rather_than_left_to_be_noticed() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.20;
+        f.room_height = 3.90;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = false;
+        f.building_height = 4.0;
+        f.add_room(&square(4.4)).expect("the room builds");
+
+        let s = &f.status;
+        assert!(s.contains("4250 mm"), "the overall height must be stated: {s}");
+        assert!(s.contains("3900 mm"), "beside the clear height that was typed: {s}");
+        assert!(s.contains("taller than"), "and the overrun called out: {s}");
+        assert!(s.contains("250 mm"), "by how much: {s}");
+    }
+
+    /// A room that FITS says so without crying wolf — a warning that appears every time is one
+    /// nobody reads.
+    #[test]
+    fn a_room_that_fits_carries_no_warning() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.20;
+        f.room_height = 3.60;
+        f.ceiling_thickness = 0.15;
+        f.room_open_top = false;
+        f.building_height = 4.0; // 3.95 overall — fits
+        f.add_room(&square(4.4)).expect("the room builds");
+        assert!(!f.status.contains("taller than"), "no warning when it fits: {}", f.status);
+        assert!(f.status.contains("3950 mm"), "but the overall is still stated: {}", f.status);
+    }
+
+    /// Open to sky: no ceiling slab, so only the floor is added to the clear height.
+    #[test]
+    fn an_open_topped_room_only_adds_its_floor() {
+        let mut f = FactoryState::default();
+        f.room_floor = 0.20;
+        f.room_height = 3.90;
+        f.room_open_top = true;
+        f.building_height = 4.2;
+        f.add_room(&square(4.4)).expect("the room builds");
+        f.recompute();
+        let (mn, mx) = f.cached.bounds().expect("bounds");
+        assert!(
+            (mx[2] - mn[2] - 4.10).abs() < 1e-3,
+            "0.20 + 3.90 with no ceiling = 4.10 m, got {}",
+            mx[2] - mn[2],
+        );
+        assert!(!f.status.contains("ceiling"), "and no ceiling in the breakdown: {}", f.status);
     }
 }
