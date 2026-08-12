@@ -2307,6 +2307,11 @@ pub struct FactorySnap {
     surface_texture: std::collections::HashMap<crate::factory::SurfaceKey, usize>,
     /// Feature groups (`feature_id → group_id`) so Group / Explode are undoable.
     feature_group: std::collections::HashMap<u32, u32>,
+    /// ROOM records. Undo restored the model but left the room list behind, so undoing a room
+    /// removed its geometry and left a phantom entry in the Rooms menu — pointing at features that
+    /// no longer existed, which is why renaming or re-heighting it then changed nothing.
+    rooms: Vec<crate::factory::RoomInst>,
+    next_room_id: u32,
     /// Per-texture (tiling, move, rotate, opacity, reflect) — the LIGHT parts, so those edits are
     /// undoable WITHOUT cloning every texture's pixels into every 3D-edit snapshot.
     texture_xforms: Vec<(f32, [f32; 2], f32, f32, f32)>,
@@ -9272,21 +9277,63 @@ impl CadApp {
         //
         // Whether the ray began inside is not assumed: it is read from the first crossing —
         // a face the ray is LEAVING can only have been entered before the march started.
-        let mut depth = 0.0_f32;
-        let mut prev = 0.0_f32;
-        let mut ids: Vec<u32> = Vec::new();
-        let mut inside: Option<bool> = None;
-        for (t, id, exiting) in hits {
-            let was_inside = inside.unwrap_or(exiting);
-            if !was_inside && t - prev > GAP {
-                break;
+        // The march, shared by both passes below.
+        let march = |hits: Vec<(f32, u32, bool)>| -> (f32, Vec<u32>) {
+            let mut depth = 0.0_f32;
+            let mut prev = 0.0_f32;
+            let mut ids: Vec<u32> = Vec::new();
+            let mut inside: Option<bool> = None;
+            for (t, id, exiting) in hits {
+                let was_inside = inside.unwrap_or(exiting);
+                if !was_inside && t - prev > GAP {
+                    break;
+                }
+                prev = t;
+                depth = t;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                inside = Some(!exiting);
             }
-            prev = t;
-            depth = t;
-            if !ids.contains(&id) { ids.push(id); }
-            inside = Some(!exiting);
+            (depth, ids)
+        };
+        // IDS come from the feature walk above — which bodies lie along the ray is what the
+        // cutter needs in order to target them.
+        let (feature_depth, ids) = march(hits);
+
+        // DEPTH comes from the EVALUATED solid, not from the raw Union features.
+        //
+        // Walking Unions alone measures geometry as it was BEFORE any Difference was applied, so a
+        // room carved out of a building is invisible to it: the probe crossed the building's
+        // un-carved 4.4 m box and reported a 4.4 m wall, and the window fitted to that was stretched
+        // 36x in depth — right across the building, which is how this was reported.
+        //
+        // It only ever worked by accident. A room used to build its own 200 mm wall boxes, and the
+        // probe hit one of those first; the moment a carved room stopped adding them, the reading
+        // was the whole building. The evaluated mesh is the material that is actually there, voids
+        // and all, so it answers the question that was being asked all along.
+        let mut solid: Vec<(f32, u32, bool)> = Vec::new();
+        for c in self.factory.cached.positions.chunks_exact(3) {
+            let (a, b, cc) = (
+                glam::Vec3::from(c[0]),
+                glam::Vec3::from(c[1]),
+                glam::Vec3::from(c[2]),
+            );
+            if let Some(t) = cad_solid::ray_triangle(start, dir, a, b, cc) {
+                if t > 1e-4 {
+                    let exiting = (b - a).cross(cc - a).dot(dir) > 0.0;
+                    solid.push((t, 0, exiting));
+                }
+            }
         }
-        (depth, ids)
+        if solid.is_empty() {
+            // Nothing evaluated yet — the mesh is rebuilt lazily. Fall back to the feature reading
+            // rather than reporting a wall of zero thickness, which reads as "no wall here" and
+            // makes the cutter give up entirely.
+            return (feature_depth, ids);
+        }
+        solid.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        (march(solid).0, ids)
     }
 
     /// DRAW3D dialog — the controllers for the primitive being created.
@@ -27103,6 +27150,8 @@ impl CadApp {
             feature_texture: self.factory.feature_texture.clone(),
             surface_texture: self.factory.surface_texture.clone(),
             feature_group: self.factory.feature_group.clone(),
+            rooms: self.factory.rooms.clone(),
+            next_room_id: self.factory.next_room_id,
             texture_xforms: self.factory.textures.iter().map(|t| (t.scale, t.offset, t.rot_deg, t.opacity, t.reflect)).collect(),
         }));
         self.redo_stack.clear();
@@ -27139,6 +27188,8 @@ impl CadApp {
                 feature_texture: self.factory.feature_texture.clone(),
                 surface_texture: self.factory.surface_texture.clone(),
                 feature_group: self.factory.feature_group.clone(),
+            rooms: self.factory.rooms.clone(),
+            next_room_id: self.factory.next_room_id,
                 texture_xforms: self.factory.textures.iter().map(|t| (t.scale, t.offset, t.rot_deg, t.opacity, t.reflect)).collect(),
             }),
         }
@@ -27168,6 +27219,8 @@ impl CadApp {
                 self.factory.feature_texture = snap.feature_texture;
                 self.factory.surface_texture = snap.surface_texture;
                 self.factory.feature_group = snap.feature_group;
+                self.factory.rooms = snap.rooms;
+                self.factory.next_room_id = snap.next_room_id;
                 // Restore per-texture tiling/move/rotate onto the existing texture assets (their
                 // pixels are unchanged, so only the transforms roll back).
                 for (i, (s, o, r, op, rf)) in snap.texture_xforms.into_iter().enumerate() {
@@ -50938,5 +50991,92 @@ mod keystroke_ownership {
             }
         }
         assert_eq!(app.doc.dobjects.len(), 0, "at the command prompt, Enter still repeats `clear`");
+    }
+}
+
+/// Two regressions from making rooms objects, both reported together.
+#[cfg(test)]
+mod room_regressions {
+    use super::*;
+
+    fn square(m: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(m, 0.0),
+            glam::Vec2::new(m, m),
+            glam::Vec2::new(0.0, m),
+            glam::Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    /// **Undo must take the room record with the geometry.**
+    ///
+    /// It restored the model and left the list, so undoing a room removed its walls and left a
+    /// phantom entry in the Rooms menu — pointing at features that no longer existed, which is why
+    /// renaming or re-heighting it afterwards changed nothing.
+    #[test]
+    fn undoing_a_room_removes_it_from_the_rooms_list() {
+        let mut app = CadApp::default();
+        app.snapshot_factory();
+        app.factory.add_room(&square(5.0)).expect("room");
+        assert_eq!(app.factory.rooms.len(), 1, "built");
+
+        app.do_undo();
+        assert!(
+            app.factory.rooms.is_empty(),
+            "the record must go with the geometry, not linger in the menu",
+        );
+    }
+
+    /// …and redo brings it back, so the pair stay in step.
+    #[test]
+    fn redo_brings_the_room_back() {
+        let mut app = CadApp::default();
+        app.snapshot_factory();
+        app.factory.add_room(&square(5.0)).expect("room");
+        let name = app.factory.rooms[0].name.clone();
+        app.do_undo();
+        app.do_redo();
+        assert_eq!(app.factory.rooms.len(), 1);
+        assert_eq!(app.factory.rooms[0].name, name);
+    }
+
+    /// **The wall a window is fitted to is the material actually there.**
+    ///
+    /// `assembly_span` walked only Union features, so a Difference was invisible to it: probing a
+    /// building with a room carved out measured the un-carved 4.4 m box and reported a 4.4 m wall.
+    /// The window fitted to that was stretched 36x in depth, right across the building.
+    ///
+    /// It had only ever worked because a room used to build its own 200 mm wall boxes for the
+    /// probe to hit first.
+    #[test]
+    fn a_carved_wall_measures_its_own_thickness_not_the_whole_building() {
+        let mut app = CadApp::default();
+        app.factory.building_height = 3.0;
+        app.factory.room_floor = 0.1;
+        app.factory.room_height = 2.7;
+        app.factory.ceiling_thickness = 0.1;
+        // A 4.4 m building with a 4.0 m room in it — 200 mm of wall all round.
+        app.factory.add_building_outline(&square(4.4), 3.0).expect("building");
+        app.factory
+            .add_room(&vec![
+                glam::Vec2::new(0.2, 0.2),
+                glam::Vec2::new(4.2, 0.2),
+                glam::Vec2::new(4.2, 4.2),
+                glam::Vec2::new(0.2, 4.2),
+                glam::Vec2::new(0.2, 0.2),
+            ])
+            .expect("room");
+        app.factory.recompute();
+
+        // Probe inward from the middle of the +X face, at mid height.
+        let from = glam::Vec3::new(4.4, 2.2, 1.5);
+        let depth = app.assembly_span(from, glam::Vec3::new(-1.0, 0.0, 0.0)).0;
+        assert!(
+            depth < 0.5,
+            "the wall is 200 mm; measuring {depth:.3} m means the void was ignored and the probe \
+             crossed the whole building",
+        );
+        assert!(depth > 0.05, "and it is not zero either — there IS a wall here, got {depth:.3}");
     }
 }
