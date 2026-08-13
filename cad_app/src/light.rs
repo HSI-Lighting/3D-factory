@@ -1377,7 +1377,16 @@ impl LightState {
     ///   Display — how the result is drawn
     pub fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
         let mut action = LightAction::default();
-        ui.horizontal_wrapped(|ui| {
+        // ONE ROW, SCROLLED — never wrapped. A wrapped bar puts menu buttons on the rows
+        // BENEATH the one you opened; an open dropdown covers them, and egui switches menus on
+        // hover of a sibling button without knowing a popup is in front of it. Moving the cursor
+        // down through the open panel then swapped the menu out from under the click. Nothing is
+        // below the bar when the bar is one row.
+        egui::ScrollArea::horizontal()
+            .id_salt("simlux_toolbar_scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+        ui.horizontal(|ui| {
             // ---- ① the LIBRARY of imported fittings -------------------------------------
             //
             // First on the bar because it is first in the workflow, and because a photometric
@@ -1685,6 +1694,7 @@ impl LightState {
             {
                 action.calculate = true;
             }
+        });
         });
 
         // The state line, exactly as the Factory reports features/tris/selection: what is loaded,

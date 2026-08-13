@@ -2017,6 +2017,8 @@ pub struct CadApp {
     materials: MaterialsFactoryState,
     /// The ⏺ Render (path tracer) window is open.
     render_modal_open: bool,
+    /// The Help ▸ Keyboard shortcuts window.
+    shortcuts_open: bool,
     /// Was the SIMLUX workspace split on LAST frame? Only the transition matters: the panel's
     /// width is forced to half the window on the frame the split is entered, and left alone (drag
     /// handle and all) every frame after.
@@ -3752,6 +3754,7 @@ impl Default for CadApp {
             materials_open: false,
             materials: MaterialsFactoryState::default(),
             render_modal_open: false,
+            shortcuts_open: false,
             simlux_split_prev: false,
             pt_job: None,
             pt_gpu: None,
@@ -4706,6 +4709,21 @@ impl CadApp {
         let m = cad_solid::modify::Modify::new(op, self.factory.selection.clone());
         self.factory.status = m.prompt();
         self.factory.queued = None;
+        // THE GIZMO HAS TO AGREE WITH THE COMMAND. Reported as: "once i switched to move after
+        // selecting rotate via commands i see the rotate gizmos still."
+        //
+        // `gizmo_mode` was a toolbar toggle that nothing else touched, so typing MOVE started a
+        // move while three rotation rings stayed on screen — showing the user a control for an
+        // operation they had just left. The command is the more specific statement of intent, so
+        // it wins: the same verb, whichever way it was reached, leaves the same handles on screen.
+        use cad_solid::modify::ModifyOp as Op;
+        match op {
+            Op::Rotate => self.factory.gizmo_mode = crate::factory::GizmoMode::Rotate,
+            Op::Move | Op::Copy => self.factory.gizmo_mode = crate::factory::GizmoMode::Move,
+            // Scale and Mirror have no gizmo of their own; leaving the rings up would suggest
+            // they do, and the move arms at least point at what the op is about to change.
+            Op::Scale | Op::Mirror => self.factory.gizmo_mode = crate::factory::GizmoMode::Move,
+        }
         self.factory_note(format!(
             "3D begin {} on {} solid(s) — sel={:?}",
             op.label(), self.factory.selection.len(), self.factory.selection
@@ -10061,7 +10079,23 @@ impl CadApp {
                 //   Building   — the plan→3D actions (walls / building / slabs)
                 // plus Frame and Clear. Both dropdowns drive the SAME code the main-menu
                 // rows do, so there is one implementation, not two.
-                ui.horizontal_wrapped(|ui| {
+                // ONE ROW, SCROLLED — never wrapped.
+                //
+                // Reported as: "while selecting something from the drop down menu, when i move
+                // the cursor it opens the menu of whatever is below it". A wrapped bar puts menu
+                // buttons on the rows BENEATH the one you opened, an open dropdown covers them,
+                // and egui switches menus on hover of a sibling button without knowing that a
+                // popup is in front of it. So moving the cursor down through the open panel ran
+                // it over the buttons underneath and swapped the menu out from under the click.
+                //
+                // Nothing sits below the bar when the bar is one row, so a downward popup cannot
+                // cover a button. Scrolling is the honest cost: a narrow panel now scrolls its
+                // toolbar instead of silently rearranging it into a trap.
+                egui::ScrollArea::horizontal()
+                    .id_salt("factory_toolbar_scroll")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                ui.horizontal(|ui| {
                     // WORKING UNIT — what every length in the Factory is typed and shown in.
                     //
                     // First on the bar because it is the first decision: a building is dimensioned
@@ -10754,6 +10788,7 @@ impl CadApp {
                         self.factory.clear();
                     }
                 });
+                });
                 // ---- ACTIVE STOREY — where new geometry is placed -----------
                 // The build tools live in this panel, but the storey list is in the main
                 // menu — so without this line it is not obvious which level you are
@@ -10991,36 +11026,61 @@ impl CadApp {
                     && !typing
                     && self.factory.session.is_none()
                 {
-                    use crate::factory::GizmoMode as GM;
+                    use crate::factory::{GizmoMode as GM, StdView};
                     let n = egui::Modifiers::NONE;
-                    let (k_move, k_rot, k_fit, k_grid, k_ceil, k_esc) = ui.input_mut(|i| {
-                        (
-                            i.consume_key(n, egui::Key::M),
-                            i.consume_key(n, egui::Key::R),
-                            i.consume_key(n, egui::Key::F),
-                            i.consume_key(n, egui::Key::G),
-                            i.consume_key(n, egui::Key::H),
-                            i.consume_key(n, egui::Key::Escape),
-                        )
+                    let sh = egui::Modifiers::SHIFT;
+                    let alt_m = egui::Modifiers::ALT;
+                    let cmd = egui::Modifiers::COMMAND;
+                    let k = ui.input_mut(|i| {
+                        [
+                            i.consume_key(n, egui::Key::M),        // 0 move gizmo
+                            i.consume_key(n, egui::Key::R),        // 1 rotate gizmo
+                            i.consume_key(n, egui::Key::F),        // 2 frame
+                            i.consume_key(n, egui::Key::G),        // 3 grid
+                            i.consume_key(n, egui::Key::H),        // 4 hide ceilings
+                            i.consume_key(n, egui::Key::Escape),   // 5 clear selection
+                            i.consume_key(n, egui::Key::Tab),      // 6 cycle gizmo
+                            i.consume_key(cmd, egui::Key::D),      // 7 duplicate
+                            i.consume_key(n, egui::Key::A),        // 8 select all
+                            i.consume_key(alt_m, egui::Key::A),    // 9 deselect all
+                            i.consume_key(n, egui::Key::Num1),     // 10 front
+                            i.consume_key(n, egui::Key::Num2),     // 11 right
+                            i.consume_key(n, egui::Key::Num3),     // 12 top
+                            i.consume_key(n, egui::Key::Num0),     // 13 iso
+                            i.consume_key(n, egui::Key::X),        // 14 x-ray
+                            i.consume_key(sh, egui::Key::X),       // 15 cutaway
+                            i.consume_key(n, egui::Key::S),        // 16 snapping
+                            i.consume_key(n, egui::Key::OpenBracket),  // 17 storey down
+                            i.consume_key(n, egui::Key::CloseBracket), // 18 storey up
+                        ]
                     });
-                    if k_move {
+                    let on = |b: bool| if b { "on" } else { "off" };
+                    if k[0] {
                         self.factory.gizmo_mode = GM::Move;
                         self.factory.status = "move gizmo — drag an arrow to constrain, the centre to slide".into();
                     }
-                    if k_rot {
+                    if k[1] {
                         self.factory.gizmo_mode = GM::Rotate;
                         self.factory.status = "rotate gizmo — drag a ring to spin about that axis".into();
                     }
-                    if k_fit {
+                    if k[6] {
+                        // One key for the whole gizmo, for the hand that never leaves the mouse.
+                        self.factory.gizmo_mode =
+                            if self.factory.gizmo_mode == GM::Move { GM::Rotate } else { GM::Move };
+                        self.factory.status = format!(
+                            "{} gizmo",
+                            if self.factory.gizmo_mode == GM::Move { "move" } else { "rotate" }
+                        );
+                    }
+                    if k[2] {
                         self.factory.fit_all();
                         self.factory.status = "framed the model".into();
                     }
-                    if k_grid {
+                    if k[3] {
                         self.factory.show_grid = !self.factory.show_grid;
-                        self.factory.status =
-                            format!("grid {}", if self.factory.show_grid { "on" } else { "off" });
+                        self.factory.status = format!("grid {}", on(self.factory.show_grid));
                     }
-                    if k_ceil {
+                    if k[4] {
                         self.factory.hide_ceilings = !self.factory.hide_ceilings;
                         self.factory.recompute();
                         self.factory.status = format!(
@@ -11028,12 +11088,91 @@ impl CadApp {
                             if self.factory.hide_ceilings { "hidden" } else { "shown" }
                         );
                     }
-                    if k_esc {
+                    if k[5] {
                         self.factory.clear_selection();
                         self.selection.clear();
                         self.factory.status = "selection cleared".into();
                     }
-                    if k_move || k_rot || k_fit || k_grid || k_ceil || k_esc {
+                    if k[7] {
+                        // Duplicate in place — copy + paste in one gesture, which is the pair of
+                        // keys anybody actually wanted when they pressed Ctrl+C in a 3D view.
+                        if self.factory.copy_selection() {
+                            self.snapshot_factory();
+                            match self.factory.paste_clipboard() {
+                                Some(is_feature) => {
+                                    if is_feature {
+                                        self.factory.recompute();
+                                    }
+                                    self.factory.status =
+                                        "duplicated (offset 0.3 m) — drag or arrow-nudge to place".into();
+                                }
+                                None => {
+                                    self.undo_stack.pop();
+                                    self.factory.status = "nothing to duplicate".into();
+                                }
+                            }
+                        } else {
+                            self.factory.status = "select a 3D object first, then Ctrl+D".into();
+                        }
+                    }
+                    if k[8] {
+                        self.factory.select_all();
+                        self.factory.status = format!(
+                            "{} solid(s), {} piece(s) selected",
+                            self.factory.selection.len(),
+                            self.factory.sel_furniture.len(),
+                        );
+                    }
+                    if k[9] {
+                        self.factory.clear_selection();
+                        self.selection.clear();
+                        self.factory.status = "deselected".into();
+                    }
+                    for (hit, view, name) in [
+                        (k[10], StdView::Front, "front"),
+                        (k[11], StdView::Right, "right"),
+                        (k[12], StdView::Top, "top"),
+                        (k[13], StdView::Iso, "iso"),
+                    ] {
+                        if hit {
+                            self.factory.set_view(view);
+                            self.factory.status = format!("{name} view");
+                        }
+                    }
+                    if k[14] {
+                        self.factory.plan_xray = !self.factory.plan_xray;
+                        self.factory.status = format!("x-ray {}", on(self.factory.plan_xray));
+                    }
+                    if k[15] {
+                        self.factory.cutaway = !self.factory.cutaway;
+                        self.factory.status = format!("cutaway {}", on(self.factory.cutaway));
+                    }
+                    if k[16] {
+                        self.factory.snap_3d = !self.factory.snap_3d;
+                        self.factory.status = format!("3D snapping {}", on(self.factory.snap_3d));
+                    }
+                    if k[17] || k[18] {
+                        let n_st = self.factory.storeys.len().max(1);
+                        let cur = self.factory.active_storey;
+                        let next = if k[18] {
+                            (cur + 1).min(n_st - 1)
+                        } else {
+                            cur.saturating_sub(1)
+                        };
+                        if next != cur {
+                            self.factory.active_storey = next;
+                            self.factory.status = format!(
+                                "storey {} of {n_st}{}",
+                                next + 1,
+                                self.factory
+                                    .storeys
+                                    .get(next)
+                                    .map(|s| format!(" — {}", s.name))
+                                    .unwrap_or_default(),
+                            );
+                        }
+                    }
+                    if k.iter().any(|b| *b) {
                         ui.ctx().request_repaint();
                     }
                 }
@@ -11309,7 +11448,12 @@ impl CadApp {
                     && !panning
                     && self.factory.zoom_mode == crate::factory::ZoomMode::Off
                     && self.factory.selected_wall().is_none()
-                    && self.factory.has_any_selection();
+                    && self.factory.has_any_selection()
+                    // A RUNNING COMMAND OWNS THE CLICKS. While MOVE is asking for its base point,
+                    // a drag that started on a gizmo arm would begin a gizmo drag instead of
+                    // answering the prompt — two ways to move the same object, fighting over one
+                    // gesture. The command was asked for explicitly, so it wins until it is done.
+                    && self.factory.modify.is_none();
                 let rotate_mode = self.factory.gizmo_mode == crate::factory::GizmoMode::Rotate;
                 if gizmo_active && !rotate_mode {
                     // Begin a drag: pick a handle under the cursor.
@@ -12744,6 +12888,52 @@ impl CadApp {
             self.active_view = ActiveView::TwoD; // the 3D view is gone → 2D is active
         }
         self.factory.open = open;
+    }
+
+    /// Help ▸ Keyboard shortcuts — the whole table, grouped by where each key applies.
+    ///
+    /// Generated from [`SHORTCUTS`] rather than written out here, so a key that moves in the code
+    /// cannot leave a stale line on a help page. Each group states its SCOPE, because the common
+    /// way for a shortcut to look broken is being pressed in the wrong view.
+    fn render_shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(600.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (i, g) in SHORTCUTS.iter().enumerate() {
+                        if i > 0 {
+                            ui.add_space(10.0);
+                        }
+                        ui.heading(g.title);
+                        ui.label(egui::RichText::new(g.scope).small().weak());
+                        ui.add_space(4.0);
+                        egui::Grid::new(("shortcut_grid", i))
+                            .num_columns(2)
+                            .spacing([18.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for row in g.rows {
+                                    ui.label(
+                                        egui::RichText::new(row.keys)
+                                            .monospace()
+                                            .strong()
+                                            .color(crate::theme::color::ACCENT),
+                                    );
+                                    ui.label(row.what);
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                });
+            });
+        self.shortcuts_open = open;
     }
 
     fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
@@ -38879,10 +39069,15 @@ impl eframe::App for CadApp {
                 custom_menu(ui, "Help", |ui| {
                     let nc = PP_TEXT;
                     let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Keyboard shortcuts", RowT::Plain),
                         ("Command help", RowT::Plain),
                         ("About RUST_CAD", RowT::Plain),
                     ]);
                     ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Keyboard shortcuts", nc, RowT::Plain).0 {
+                        self.shortcuts_open = true;
+                        ui.close_menu();
+                    }
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command help", nc, RowT::Plain).0
                         { self.run_command("help"); ui.close_menu(); }
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "About RUST_CAD", nc, RowT::Plain).0 {
@@ -39538,6 +39733,7 @@ impl eframe::App for CadApp {
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
+        self.render_shortcuts_window(ctx);
         self.render_light_3d_panel(ctx);
         // 3D FACTORY viewport (docked right, like the SIMLUX 3D view).
         self.render_factory_panel(ctx);
@@ -54283,5 +54479,150 @@ mod the_simlux_split_opens_at_half {
             body.contains("self.simlux_split_prev = split;"),
             "the previous-state flag must be written each frame, unconditionally",
         );
+    }
+}
+
+/// EVERY SHORTCUT, IN ONE TABLE.
+///
+/// Asked for as: "in the help menu add hot keys and categorize them by 2d factory and 3d factory
+/// so the user could see them."
+///
+/// One table rather than a hand-written help page, because a help page written beside the code is
+/// a help page that drifts from it: the shortcut moves, the page does not, and the user is now
+/// being lied to by their own documentation. Everything on screen is generated from here.
+pub struct ShortcutRow {
+    pub keys: &'static str,
+    pub what: &'static str,
+}
+
+pub struct ShortcutGroup {
+    pub title: &'static str,
+    /// When it applies — the gate, stated, because a key that does nothing looks broken.
+    pub scope: &'static str,
+    pub rows: &'static [ShortcutRow],
+}
+
+const fn r(keys: &'static str, what: &'static str) -> ShortcutRow {
+    ShortcutRow { keys, what }
+}
+
+pub const SHORTCUTS: &[ShortcutGroup] = &[
+    ShortcutGroup {
+        title: "Everywhere",
+        scope: "any view",
+        rows: &[
+            r("Ctrl + Z", "Undo — always the drawing, never the command line's own text"),
+            r("Ctrl + Y", "Redo"),
+            r("Esc", "Cancel the running command, prompt or pick"),
+            r("Delete", "Delete the selection"),
+        ],
+    },
+    ShortcutGroup {
+        title: "2D drafting",
+        scope: "the 2D canvas",
+        rows: &[
+            r("F7", "Grid on / off"),
+            r("F8", "Cardinal lock — constrain to horizontal or vertical from the anchor"),
+            r("F9", "Grid snap on / off"),
+            r("Ctrl + C / Ctrl + V", "Copy / paste"),
+            r("Arrows", "Nudge the selection"),
+            r("Type a command", "l, c, m, ro, … — the command line is the primary interface"),
+        ],
+    },
+    ShortcutGroup {
+        title: "3D Factory",
+        scope: "the 3D viewport must be ACTIVE — click in it first. These never fire while a \
+                sketch is open, or while anything has keyboard focus, so they cannot take a \
+                letter out of the command line.",
+        rows: &[
+            r("M", "Move gizmo"),
+            r("R", "Rotate gizmo"),
+            r("Tab", "Cycle the gizmo — move ↔ rotate"),
+            r("F", "Frame the model"),
+            r("1 / 2 / 3 / 0", "Front / Right / Top / Iso view"),
+            r("G", "Grid on / off"),
+            r("H", "Hide ceilings"),
+            r("X", "X-ray"),
+            r("Shift + X", "Cutaway"),
+            r("S", "3D snapping on / off"),
+            r("[ / ]", "Storey down / up"),
+            r("A", "Select all"),
+            r("Alt + A", "Deselect all"),
+            r("Esc", "Clear the selection"),
+            r("Ctrl + D", "Duplicate in place"),
+            r("Ctrl + C / Ctrl + V", "Copy / paste"),
+            r("Arrows", "Nudge the selection"),
+        ],
+    },
+    ShortcutGroup {
+        title: "3D Factory — mouse",
+        scope: "the 3D viewport",
+        rows: &[
+            r("Left drag", "Select, or drag a gizmo handle — never the camera"),
+            r("Middle drag", "Orbit"),
+            r("Alt + Right drag", "Orbit (for mice with no middle button)"),
+            r("Shift + Left drag", "Pan"),
+            r("Scroll", "Zoom"),
+            r("Right click a face", "Sketch on that face"),
+        ],
+    },
+    ShortcutGroup {
+        title: "SIMLUX 3D view",
+        scope: "the SIMLUX viewport",
+        rows: &[
+            r("Left drag", "Orbit"),
+            r("Shift or Middle drag", "Pan"),
+            r("Scroll", "Zoom"),
+        ],
+    },
+];
+
+#[cfg(test)]
+mod the_shortcut_table_is_honest {
+    use super::*;
+
+    /// A help page that lists a key the code does not bind is worse than no help page. These are
+    /// the ones this session added, checked against the handler that binds them.
+    #[test]
+    fn the_3d_keys_listed_are_the_3d_keys_bound() {
+        let src = include_str!("app.rs");
+        let a = src.find("// ---- 3D VIEWPORT HOTKEYS").expect("the handler");
+        let b = src[a..].find("\n                if (self.active_view").map(|e| a + e).unwrap();
+        let body = &src[a..b];
+        let group = SHORTCUTS.iter().find(|g| g.title == "3D Factory").expect("the group");
+        for (listed, key) in [
+            ("M", "Key::M"), ("R", "Key::R"), ("Tab", "Key::Tab"), ("F", "Key::F"),
+            ("G", "Key::G"), ("H", "Key::H"), ("S", "Key::S"), ("A", "Key::A"),
+        ] {
+            assert!(
+                group.rows.iter().any(|r| r.keys == listed || r.keys.starts_with(listed)),
+                "{listed} is bound but not listed",
+            );
+            assert!(body.contains(key), "{listed} is listed but {key} is not bound");
+        }
+    }
+
+    /// No blanks, and no duplicated key within one group — two rows claiming the same key is the
+    /// shape of a shortcut that was moved and half-updated.
+    #[test]
+    fn every_row_is_filled_in_and_unique_within_its_group() {
+        for g in SHORTCUTS {
+            assert!(!g.title.is_empty() && !g.scope.is_empty(), "a group needs a title and a scope");
+            assert!(!g.rows.is_empty(), "{} lists nothing", g.title);
+            let mut seen: Vec<&str> = Vec::new();
+            for row in g.rows {
+                assert!(!row.keys.is_empty() && !row.what.is_empty(), "{}: a blank row", g.title);
+                assert!(!seen.contains(&row.keys), "{}: '{}' listed twice", g.title, row.keys);
+                seen.push(row.keys);
+            }
+        }
+    }
+
+    /// The 3D group must say it needs the viewport to be active. A key that silently does nothing
+    /// because you have not clicked into the view yet reads as a broken key.
+    #[test]
+    fn the_3d_group_states_its_gate() {
+        let g = SHORTCUTS.iter().find(|g| g.title == "3D Factory").unwrap();
+        assert!(g.scope.contains("ACTIVE"), "the gate has to be stated: {}", g.scope);
     }
 }

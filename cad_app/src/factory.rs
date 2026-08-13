@@ -5798,6 +5798,13 @@ impl FactoryState {
         self.sel_key.clear();
     }
 
+    /// Select everything in the model — every solid feature and every placed piece.
+    pub fn select_all(&mut self) {
+        self.selection = self.model.features.iter().map(|f| f.id).collect();
+        self.sel_furniture = (0..self.furniture.len()).collect();
+        self.sel_key.clear();
+    }
+
     /// PERSISTENCE: capture the 3D model for the sidecar. Camera, selection and any live
     /// sketch session are deliberately NOT captured — they are view state, not the
     /// building.
