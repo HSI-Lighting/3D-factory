@@ -43390,10 +43390,23 @@ impl eframe::App for CadApp {
                 let mut want: Option<Option<usize>> = None; // Some(None) = the global view
                 let mut rename: Option<usize> = None;
                 let mut delete: Option<usize> = None;
-                egui::Area::new(egui::Id::new("plan_view_toggle"))
-                    .fixed_pos(rect.left_top() + egui::vec2(10.0, 6.0))
-                    .order(egui::Order::Middle)
-                    .show(ctx, |ui| {
+                // INSIDE THE CANVAS, not floating over the window.
+                //
+                // Reported as: "the views menu should be visible in the 2d cad window … now it
+                // overflows into other windows when 2d cad is moved". An `egui::Area` is a
+                // TOP-LEVEL layer: it is positioned in screen coordinates and clipped by nothing,
+                // so as soon as the canvas narrowed — which is exactly what the SIMLUX split does —
+                // the button and its dropdown spilled across the panels beside it.
+                //
+                // A child UI of the canvas is clipped to the canvas. It belongs to the 2D window
+                // because it is a control OF the 2D window.
+                let toggle_rect = egui::Rect::from_min_size(
+                    rect.left_top() + egui::vec2(10.0, 6.0),
+                    egui::vec2((rect.width() - 20.0).max(60.0), 30.0),
+                );
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(toggle_rect).layout(egui::Layout::left_to_right(egui::Align::Min)),
+                    |ui| {
                         // An `Area` takes its width from its content, and a menu button's label
                         // will WRAP to fit rather than push the button wider — so "Global view"
                         // came out stacked three lines tall in a button barely wider than the
@@ -43452,7 +43465,8 @@ impl eframe::App for CadApp {
                                     }
                                 });
                             });
-                    });
+                    },
+                );
                 if let Some(w) = want {
                     self.factory_open_plane(w);
                 }
