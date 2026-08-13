@@ -39010,6 +39010,16 @@ impl eframe::App for CadApp {
                         {
                             self.factory.show_furniture_outlines_2d = !self.factory.show_furniture_outlines_2d;
                         }
+                        // The 3D view's own ground grid. Gated on the PANEL being open rather than
+                        // on there being a model: an empty scene is exactly when the grid is the
+                        // only thing saying where the ground is.
+                        if self.factory.open
+                            && drafting_badge(ui, "GRID3D", self.factory.show_grid,
+                                "Ground grid in the 3D view. Follows the camera and steps its \
+                                 spacing with the zoom, so it covers the whole view at any scale.")
+                        {
+                            self.factory.show_grid = !self.factory.show_grid;
+                        }
                         ui.separator();
                         // Snap badges — click any letter to toggle.
                         for k in SnapKind::ALL {

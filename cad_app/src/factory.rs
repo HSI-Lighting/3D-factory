@@ -748,6 +748,29 @@ fn corners_of(mn: Vec3, mx: Vec3) -> [Vec3; 8] {
     o
 }
 
+/// Round `want` UP to the next 1-2-5 decade step: 0.1, 0.2, 0.5, 1, 2, 5, 10, 20 …
+///
+/// The ladder every ruler and every CAD grid uses, and for the same reason: the steps are numbers a
+/// person can count in, and rounding UP means the resulting line count is never more than asked
+/// for — which is what bounds the grid's cost at any zoom.
+fn nice_step(want: f32) -> f32 {
+    if !(want.is_finite() && want > 0.0) {
+        return 1.0;
+    }
+    let decade = 10.0_f32.powf(want.log10().floor());
+    let m = want / decade; // 1.0 ..< 10.0
+    let mult = if m <= 1.0 {
+        1.0
+    } else if m <= 2.0 {
+        2.0
+    } else if m <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    decade * mult
+}
+
 fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
     out.push(v(a, ui(c)));
     out.push(v(b, ui(c)));
@@ -977,6 +1000,8 @@ pub struct FactoryState {
     /// Has this project been asked what unit it is built in? Persisted, so the question is asked
     /// ONCE — a modal on every visit gets dismissed unread, which is how a unit warning stops
     /// warning anybody.
+    /// Draw the ground grid in the 3D view. Toggled by the GRID badge on the drafting bar.
+    pub show_grid: bool,
     pub unit_asked: bool,
     /// The unit question is on screen right now.
     pub ask_unit: bool,
@@ -2934,6 +2959,7 @@ impl Default for FactoryState {
             // CLICK by default. The complaint was that everything landed at the origin with no say
             // in it; the fix is not a better default position, it is being ASKED. Switch it to
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
+            show_grid: true,
             unit_asked: false,
             ask_unit: false,
             place_mode: PlaceMode::Click,
@@ -7945,17 +7971,72 @@ impl FactoryState {
     }
 
     /// Grid on the construction plane + a cyan AABB around each selected feature.
+    /// THE GROUND GRID — as far as you can see, at a spacing you can read.
+    ///
+    /// Reported as: "the grid now just shows for a small area on the canvas. lets have it for the
+    /// whole visible canvas on 3d factory."
+    ///
+    /// It was a fixed ±10 m patch of 1 m squares sitting at the world origin. Zoom out past it, or
+    /// pan away from the origin — which an imported drawing does immediately, since a DXF puts a
+    /// building at coordinates like (−232, −58) — and the grid is a small rug on an empty floor,
+    /// nowhere near the model.
+    ///
+    /// Two things fix that, and both are needed:
+    ///
+    ///   * it FOLLOWS THE CAMERA, sized from `cam_dist` so it always reaches past the edges of the
+    ///     view, and snapped to its own spacing so the lines do not crawl while you pan;
+    ///   * the SPACING STEPS with the zoom, on a 1-2-5 decade ladder. A fixed 1 m spacing is a
+    ///     solid wall of lines across a 145 m building and invisibly fine on a door handle. The
+    ///     ladder keeps the count bounded — about 80 lines per axis at any zoom, so this stays a
+    ///     few hundred vertices whether you are looking at a city or a screw.
+    ///
+    /// Majors every tenth line, brighter, so the scale is readable without a ruler.
+    pub fn grid_lines(&self) -> Vec<V3> {
+        let mut out = Vec::new();
+        if !self.show_grid {
+            return out;
+        }
+        // How far the ground plane is visible. `cam_dist` is the ortho half-height as well as the
+        // perspective distance, and 1.6× covers the corners of a wide viewport and the extra reach
+        // a shallow pitch gives — cheap insurance against a visible edge, at ~40 more lines.
+        let reach = (self.cam_dist * 1.6).clamp(1.0, 1.0e6);
+        // ~40 divisions each side of centre. `nice_step` rounds UP the ladder, so the real count is
+        // between 16 and 40 — never more, which is what bounds the cost.
+        let step = nice_step(reach / 40.0);
+        let major = step * 10.0;
+
+        const MINOR: [f32; 3] = [0.17, 0.20, 0.25];
+        const MAJOR: [f32; 3] = [0.28, 0.33, 0.40];
+        // The world axes stay legible whatever the spacing — they are the only two lines that say
+        // where the origin is once the grid has walked off with the camera.
+        const AXIS_X: [f32; 3] = [0.45, 0.25, 0.25];
+        const AXIS_Y: [f32; 3] = [0.25, 0.45, 0.28];
+
+        // SNAP THE CENTRE to the spacing. Without this every line moves with the camera and the
+        // grid shimmers instead of standing still under the model.
+        let cx = (self.cam_target[0] / step).round() * step;
+        let cy = (self.cam_target[1] / step).round() * step;
+        let n = (reach / step).ceil() as i32;
+
+        for i in -n..=n {
+            let t = i as f32 * step;
+            let (x, y) = (cx + t, cy + t);
+            let is_major = |v: f32| (v / major - (v / major).round()).abs() < 1.0e-4;
+
+            let cxl = if x.abs() < step * 0.5 { AXIS_Y } // the line x = 0 runs along +Y
+            else if is_major(x) { MAJOR } else { MINOR };
+            let cyl = if y.abs() < step * 0.5 { AXIS_X }
+            else if is_major(y) { MAJOR } else { MINOR };
+
+            seg(&mut out, Vec3::new(x, cy - reach, 0.0), Vec3::new(x, cy + reach, 0.0), cxl);
+            seg(&mut out, Vec3::new(cx - reach, y, 0.0), Vec3::new(cx + reach, y, 0.0), cyl);
+        }
+        out
+    }
+
     pub fn overlay_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
-        let g = [0.22, 0.25, 0.30];
-        let n = 10i32;
-        let s = 1.0f32;
-        for i in -n..=n {
-            let t = i as f32 * s;
-            let e = n as f32 * s;
-            seg(&mut out, Vec3::new(t, -e, 0.0), Vec3::new(t, e, 0.0), g);
-            seg(&mut out, Vec3::new(-e, t, 0.0), Vec3::new(e, t, 0.0), g);
-        }
+        out.extend(self.grid_lines());
         for id in &self.selection {
             if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
                 let (mn, mx) = f.world_aabb();
@@ -13709,5 +13790,189 @@ mod solids_follow_the_mode {
             "z = {}",
             st.furniture[0].pos[2],
         );
+    }
+}
+
+/// THE GROUND GRID — as far as you can see, at a spacing you can read.
+///
+/// Reported as: "the grid now just shows for a small area on the canvas. lets have it for the whole
+/// visible canvas on 3d factory, see if the zoom is infinite. there should be an option to turn the
+/// grid on or off."
+///
+/// It was a fixed ±10 m patch of 1 m squares nailed to the world origin.
+#[cfg(test)]
+mod ground_grid {
+    use super::*;
+
+    /// The grid's reach on each axis, and how many lines it took to get there.
+    fn extent(st: &FactoryState) -> (f32, usize) {
+        let g = st.grid_lines();
+        let mut reach = 0.0_f32;
+        for v in &g {
+            reach = reach
+                .max((v.x - st.cam_target[0]).abs())
+                .max((v.y - st.cam_target[1]).abs());
+        }
+        (reach, g.len() / 2)
+    }
+
+    /// THE BUG. Zoomed out, the grid has to still reach the edges of the view.
+    #[test]
+    fn the_grid_covers_the_view_at_any_zoom() {
+        let mut st = FactoryState::default();
+        for dist in [2.0_f32, 20.0, 200.0, 2000.0, 50_000.0] {
+            st.cam_dist = dist;
+            let (reach, _) = extent(&st);
+            assert!(
+                reach >= dist,
+                "at cam_dist {dist} the grid reaches only {reach:.1} m — the view runs off it",
+            );
+        }
+    }
+
+    /// …without becoming a solid block of lines doing it. A fixed 1 m spacing at 50 km would be
+    /// 100 000 lines; the 1-2-5 ladder keeps it in the low hundreds at every zoom.
+    #[test]
+    fn the_line_count_stays_bounded_at_any_zoom() {
+        let mut st = FactoryState::default();
+        for dist in [0.5_f32, 2.0, 20.0, 200.0, 2000.0, 50_000.0] {
+            st.cam_dist = dist;
+            let (_, segs) = extent(&st);
+            assert!(
+                (20..=260).contains(&segs),
+                "cam_dist {dist} drew {segs} segments — the spacing ladder is not holding",
+            );
+        }
+    }
+
+    /// It FOLLOWS THE CAMERA. An imported DXF puts a building at coordinates like (−232, −58), and
+    /// a grid pinned to the world origin is a rug on an empty floor nowhere near the model.
+    #[test]
+    fn the_grid_follows_the_camera() {
+        let mut st = FactoryState::default();
+        st.cam_dist = 50.0;
+        st.cam_target = [-232.0, -58.0, 0.0];
+        let g = st.grid_lines();
+        assert!(!g.is_empty());
+        // The grid's BOUNDING BOX has to be centred on the camera. Counting vertices near the
+        // centre would find none however well this worked — every vertex is at the END of a line,
+        // and the ends sit at the extremes by construction. The box is the honest measure.
+        let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
+        let (mut mny, mut mxy) = (f32::MAX, f32::MIN);
+        for v in &g {
+            mnx = mnx.min(v.x);
+            mxx = mxx.max(v.x);
+            mny = mny.min(v.y);
+            mxy = mxy.max(v.y);
+        }
+        let (cx, cy) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5);
+        assert!(
+            (cx + 232.0).abs() < 5.0 && (cy + 58.0).abs() < 5.0,
+            "the grid is centred on ({cx:.1}, {cy:.1}), not on the camera at (-232, -58)",
+        );
+    }
+
+    /// The spacing STEPS with the zoom rather than being fixed: 1 m squares are a wall of lines
+    /// across a 145 m building and invisibly fine on a door handle.
+    #[test]
+    fn the_spacing_steps_with_the_zoom() {
+        let spacing = |dist: f32| {
+            let mut st = FactoryState::default();
+            st.cam_dist = dist;
+            // The two smallest distinct x values apart is one step.
+            let mut xs: Vec<f32> = st.grid_lines().iter().map(|v| v.x).collect();
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            xs.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            xs.windows(2).map(|w| w[1] - w[0]).fold(f32::MAX, f32::min)
+        };
+        let close = spacing(2.0);
+        let far = spacing(2000.0);
+        assert!(far > close * 50.0, "close {close}, far {far} — the spacing did not step");
+    }
+
+    /// Snapped to its own spacing, so the lines stand still under the model instead of crawling
+    /// with the camera.
+    #[test]
+    fn the_lines_are_snapped_to_the_spacing() {
+        let mut st = FactoryState::default();
+        st.cam_dist = 20.0;
+        st.cam_target = [3.7, -8.3, 0.0]; // deliberately off-grid
+        let step = {
+            let mut xs: Vec<f32> = st.grid_lines().iter().map(|v| v.x).collect();
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            xs.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            xs.windows(2).map(|w| w[1] - w[0]).fold(f32::MAX, f32::min)
+        };
+        for v in st.grid_lines() {
+            let off = v.x / step - (v.x / step).round();
+            assert!(off.abs() < 1e-3, "a line at x = {} is not on the {step} m grid", v.x);
+        }
+    }
+
+    /// The toggle.
+    #[test]
+    fn the_grid_can_be_turned_off() {
+        let mut st = FactoryState::default();
+        assert!(st.show_grid, "on by default");
+        assert!(!st.grid_lines().is_empty());
+        st.show_grid = false;
+        assert!(st.grid_lines().is_empty(), "off must mean off");
+        // …and the rest of the overlay (selection boxes, axes) is untouched by it.
+        st.add_box();
+        st.recompute();
+        assert!(!st.overlay_lines().is_empty(), "turning the grid off must not blank the overlay");
+    }
+
+    /// The 1-2-5 ladder itself: rounds UP, which is what bounds the line count.
+    #[test]
+    fn nice_step_climbs_the_1_2_5_ladder() {
+        for (want, expect) in [
+            (0.09_f32, 0.1_f32),
+            (0.15, 0.2),
+            (0.3, 0.5),
+            (0.7, 1.0),
+            (1.0, 1.0),
+            (1.5, 2.0),
+            (4.9, 5.0),
+            (6.0, 10.0),
+            (250.0, 500.0),
+        ] {
+            let got = nice_step(want);
+            assert!((got - expect).abs() < 1e-4, "nice_step({want}) = {got}, want {expect}");
+            assert!(got >= want, "it must round UP, or the line count is not bounded");
+        }
+        // Nonsense in, something usable out — a zero or NaN reach must not divide by zero.
+        assert_eq!(nice_step(0.0), 1.0);
+        assert_eq!(nice_step(f32::NAN), 1.0);
+        assert_eq!(nice_step(-5.0), 1.0);
+    }
+
+    /// ZOOM RANGE — asked as "see if the zoom is infinite". It is NOT: `max_cam_dist` caps the
+    /// dolly at 20× the model's largest span, never below 400 m. That is deliberate (an unbounded
+    /// ortho zoom runs out of f32 and the depth range collapses), and this records the actual
+    /// numbers so the answer is not a guess.
+    #[test]
+    fn the_zoom_out_limit_scales_with_the_model() {
+        let mut st = FactoryState::default();
+        assert!((st.max_cam_dist() - 400.0).abs() < 1e-3, "an empty scene gets the 400 m floor");
+
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box { w: 1000.0, d: 10.0, h: 10.0 },
+        );
+        st.recompute();
+        assert!(
+            (st.max_cam_dist() - 20_000.0).abs() < 1.0,
+            "a 1 km model gets 20 km of dolly, got {}",
+            st.max_cam_dist(),
+        );
+
+        // …and the grid keeps up all the way out to that limit.
+        st.cam_dist = st.max_cam_dist();
+        let (reach, segs) = extent(&st);
+        assert!(reach >= st.cam_dist, "the grid stops short at full zoom-out");
+        assert!(segs < 300, "…and does not explode getting there: {segs} segments");
     }
 }
