@@ -149,7 +149,87 @@ pub struct CalcPlane {
     pub rows: u32,
 }
 
+/// EN 12464-1's MAXIMUM GRID SPACING for an area whose relevant dimension is `d` metres:
+/// `p = 0.2 · 5^log₁₀(d)`, rounded DOWN to the next value in the series the standard tabulates.
+///
+/// Uniformity is not a property of a room. It is a property of a room AND the grid it was measured
+/// on, and a coarse grid always reports it too high. Comparing SIMLUX against DIALux on three fully
+/// specified rooms made that concrete: the averages agreed to half a per cent while U₀ disagreed by
+/// a third, entirely because of where the minimum was sampled — see
+/// `cad_light/tests/identical_dialux.rs`.
+///
+/// So the grid has to be a STATED CHOICE rather than a side effect of how many cells someone wanted
+/// drawn. This is that choice, and it is the one the standard makes.
+pub fn en12464_spacing(d: f32) -> f32 {
+    if !(d.is_finite() && d > 0.0) {
+        return 0.2;
+    }
+    // The formula is continuous; the standard's table is not. Rounding DOWN to the next tabulated
+    // value keeps the grid at least as fine as the formula asks for — erring toward more samples,
+    // which is the safe direction for a minimum.
+    const SERIES: [f32; 9] = [0.2, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0];
+    let p = 0.2 * 5.0_f32.powf(d.log10());
+    let mut out = SERIES[0];
+    for s in SERIES {
+        if s <= p + 1e-6 {
+            out = s;
+        }
+    }
+    out
+}
+
+/// Cell counts for a `width × depth` area on the EN 12464-1 grid.
+///
+/// The standard also asks that a cell stay roughly square — it caps the ratio of the two spacings
+/// at 2:1 — so a long thin room is not sampled finely along one axis and coarsely along the other.
+pub fn en12464_cells(width: f32, depth: f32) -> (u32, u32) {
+    let cells = |extent: f32, spacing: f32| ((extent / spacing).ceil() as u32).max(1);
+    // The spacing is set by the LONGER dimension: that is the "relevant dimension" the formula
+    // takes, and it keeps a 12 × 2 m corridor on one grid rather than two.
+    let p = en12464_spacing(width.max(depth));
+    let (mut c, mut r) = (cells(width, p), cells(depth, p));
+    // …then refine the coarser axis until the cells are no worse than 2:1.
+    let (mut dx, mut dy) = (width / c as f32, depth / r as f32);
+    let mut guard = 0;
+    while (dx / dy).max(dy / dx) > 2.0 && guard < 16 {
+        if dx > dy {
+            c += 1;
+        } else {
+            r += 1;
+        }
+        dx = width / c as f32;
+        dy = depth / r as f32;
+        guard += 1;
+    }
+    (c, r)
+}
+
 impl CalcPlane {
+    /// The same plane, re-gridded to EN 12464-1 — the basis uniformity should be quoted on.
+    ///
+    /// Deliberately SEPARATE from the plane you display. A report wants a readable number of cells;
+    /// a compliance figure wants the standard's. Tying the two together is what made our U₀
+    /// optimistic, and optimism here is the direction that passes an installation which should fail.
+    pub fn on_standard_grid(&self) -> CalcPlane {
+        let (cols, rows) = en12464_cells(self.width, self.depth);
+        CalcPlane { cols, rows, ..*self }
+    }
+
+    /// A human note for the report: "8 × 8 cells, 0.50 m spacing".
+    ///
+    /// A uniformity figure without its grid is not reproducible — which is the whole lesson of the
+    /// DIALux comparison, where their U₀ could not be reproduced because the grid behind it is
+    /// stated nowhere in the report.
+    pub fn grid_note(&self) -> String {
+        let dx = self.width / self.cols.max(1) as f32;
+        let dy = self.depth / self.rows.max(1) as f32;
+        if (dx - dy).abs() < 5e-3 {
+            format!("{} × {} cells, {:.2} m spacing", self.cols, self.rows, dx)
+        } else {
+            format!("{} × {} cells, {:.2} × {:.2} m spacing", self.cols, self.rows, dx, dy)
+        }
+    }
+
     /// World position of the sensor at cell `(col, row)`, taken at its centre.
     pub fn sample_point(&self, col: u32, row: u32) -> Vertex {
         let dx = self.width / self.cols.max(1) as f32;
@@ -494,5 +574,121 @@ mod metric_tests {
         let s = installation_summary(&lums, &profiles, 10.0);
         assert_eq!(s.count, 1);
         assert!((s.total_watts - 30.0).abs() < 1e-9);
+    }
+}
+
+/// THE UNIFORMITY GRID.
+///
+/// Comparing against DIALux on three fully specified rooms showed the averages agreeing to half a
+/// per cent while U₀ disagreed by a third — entirely because of where the minimum was sampled. A
+/// coarse grid never samples a corner, always reports the minimum too high, and therefore always
+/// reports uniformity too GOOD: the direction that passes an installation which should fail.
+///
+/// The fix is not to tune a refinement until it matches DIALux (whose grid is stated nowhere, and
+/// which no single refinement reproduces across the three cases). It is to sample on a DOCUMENTED
+/// grid and say which one.
+#[cfg(test)]
+mod uniformity_grid {
+    use super::*;
+
+    /// The standard's formula, p = 0.2 · 5^log₁₀(d), snapped down to its tabulated series.
+    #[test]
+    fn spacing_follows_the_standards_formula() {
+        // 4 m room: 0.2 · 5^0.602 = 0.527 -> the 0.5 m step.
+        assert!((en12464_spacing(4.0) - 0.5).abs() < 1e-6, "got {}", en12464_spacing(4.0));
+        // 1 m: 0.2 · 5^0 = 0.2 exactly, the finest step in the table.
+        assert!((en12464_spacing(1.0) - 0.2).abs() < 1e-6);
+        // 10 m: 0.2 · 5 = 1.0.
+        assert!((en12464_spacing(10.0) - 1.0).abs() < 1e-6, "got {}", en12464_spacing(10.0));
+        // 100 m: 0.2 · 25 = 5.0.
+        assert!((en12464_spacing(100.0) - 5.0).abs() < 1e-6, "got {}", en12464_spacing(100.0));
+        // It only ever rounds DOWN — a finer grid than asked for is safe, a coarser one is not.
+        for d in [2.0_f32, 3.7, 7.5, 12.0, 45.0, 200.0] {
+            let p = en12464_spacing(d);
+            assert!(p <= 0.2 * 5.0_f32.powf(d.log10()) + 1e-6, "d = {d} rounded UP to {p}");
+        }
+        // …except below about 1 m, where the formula asks for finer than the standard tabulates
+        // (0.5 m wants 0.115) and 0.2 m is the floor. Sampling a half-metre task area on 0.2 m is
+        // 3 cells, which is all the standard offers; going finer than its table is inventing one.
+        assert!((en12464_spacing(0.5) - 0.2).abs() < 1e-6);
+        assert!((en12464_spacing(0.1) - 0.2).abs() < 1e-6);
+    }
+
+    /// Nonsense in, something usable out — a zero or NaN extent must not divide by zero downstream.
+    #[test]
+    fn a_degenerate_extent_is_survivable() {
+        for d in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            let p = en12464_spacing(d);
+            assert!(p.is_finite() && p > 0.0, "d = {d} gave spacing {p}");
+        }
+        let (c, r) = en12464_cells(0.0, 0.0);
+        assert!(c >= 1 && r >= 1);
+    }
+
+    /// THE ROOM FROM THE DIALUX COMPARISON. 4 × 4 m on 0.5 m spacing is 8 × 8 — which is exactly
+    /// the grid DIALux printed, so the standard and DIALux agree about the DISPLAY grid even though
+    /// they disagree about the minimum.
+    #[test]
+    fn the_dialux_test_room_lands_on_eight_by_eight() {
+        assert_eq!(en12464_cells(4.0, 4.0), (8, 8));
+    }
+
+    /// A long thin space keeps roughly square cells: the standard caps the two spacings at 2:1, so
+    /// a corridor is not sampled finely along its length and coarsely across it.
+    #[test]
+    fn cells_stay_within_two_to_one() {
+        for (w, d) in [(12.0_f32, 2.0_f32), (11.74, 5.644), (30.0, 3.0), (2.0, 9.0)] {
+            let (c, r) = en12464_cells(w, d);
+            let (dx, dy) = (w / c as f32, d / r as f32);
+            let aspect = (dx / dy).max(dy / dx);
+            assert!(aspect <= 2.0 + 1e-3, "{w} x {d} gave cells {dx:.3} x {dy:.3} — {aspect:.2}:1");
+        }
+    }
+
+    /// The spacing comes from the LONGER dimension, so one grid covers the whole area rather than
+    /// each axis choosing its own.
+    #[test]
+    fn the_longer_dimension_sets_the_spacing() {
+        // 12 m sets p = 1.0; the 2 m axis then refines only to satisfy the aspect cap.
+        let (c, _) = en12464_cells(12.0, 2.0);
+        assert_eq!(c, 12, "the long axis should be on 1.0 m spacing, got {c} cells");
+    }
+
+    /// THE POINT OF ALL THIS: the grid uniformity is quoted on is INDEPENDENT of the grid drawn.
+    #[test]
+    fn the_standard_grid_is_independent_of_the_display_grid() {
+        let base = CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols: 3, // …someone wanted a coarse picture
+            rows: 40, // …or a fine one
+        };
+        let std = base.on_standard_grid();
+        assert_eq!((std.cols, std.rows), (8, 8), "the display grid must not leak into the standard");
+        // …and everything else about the plane is untouched: same place, same size, same height.
+        assert_eq!(std.width, base.width);
+        assert_eq!(std.depth, base.depth);
+        assert_eq!(std.origin.z, base.origin.z);
+    }
+
+    /// A uniformity figure without its grid is not reproducible — the whole lesson of the DIALux
+    /// comparison, where their U₀ could not be reproduced because the grid behind it is stated
+    /// nowhere.
+    #[test]
+    fn the_grid_reports_itself() {
+        let p = CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols: 8,
+            rows: 8,
+        };
+        let note = p.grid_note();
+        assert!(note.contains('8'), "got {note:?}");
+        assert!(note.contains("0.50"), "the spacing has to be in it: {note:?}");
+        // Non-square cells say so rather than quietly quoting one number.
+        let oblong = CalcPlane { width: 12.0, depth: 2.0, cols: 12, rows: 2, ..p };
+        assert!(oblong.grid_note().contains('×'), "got {:?}", oblong.grid_note());
     }
 }

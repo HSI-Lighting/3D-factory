@@ -1737,6 +1737,25 @@ impl LightState {
                 row(ui, "10th / 90th pct", format!("{:.0} / {:.0} lx", g.percentile(10.0), g.percentile(90.0)));
                 row(ui, "Uniformity  U₀ = Emin/Eavg", format!("{:.2}", g.u0()));
                 row(ui, "Diversity  U₁ = Emin/Emax", format!("{:.2}", g.u1()));
+                // WHICH GRID THE UNIFORMITY IS ON.
+                //
+                // U₀ is not a property of a room — it is a property of a room AND the grid it was
+                // sampled on, and a coarse grid always reports it too HIGH. Comparing against
+                // DIALux on three fully specified rooms showed the averages agreeing to 0.5 % while
+                // U₀ differed by a third, entirely from where the minimum was taken; and their
+                // figure could not be reproduced because the grid behind it is stated nowhere in
+                // their report. A uniformity quoted without its grid is not reproducible, so this
+                // says it — and flags a grid coarser than EN 12464-1 asks for, which is exactly the
+                // case where U₀ flatters the design.
+                if let Some(p) = self.plane.as_ref() {
+                    let (wc, wr) = cad_light::en12464_cells(p.width, p.depth);
+                    let note = if p.cols < wc || p.rows < wr {
+                        format!("{}  ⚠ EN 12464-1 asks {wc} × {wr}", p.grid_note())
+                    } else {
+                        p.grid_note()
+                    };
+                    row(ui, "…measured on", note);
+                }
                 if let Some(f) = g.direct_fraction() {
                     row(ui, "Direct / indirect", format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0));
                 }
