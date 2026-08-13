@@ -4943,49 +4943,18 @@ impl CadApp {
         }
     }
 
-    /// Draw the colour palette (preset swatches + a custom picker) and return the colour
-    /// the user clicked, if any. Shared by the Textures menu and the inline properties
-    /// panel so there is one palette, not two.
-    fn factory_color_palette(&mut self, ui: &mut egui::Ui) -> Option<[f32; 3]> {
-        const SWATCHES: [[u8; 3]; 12] = [
-            [230, 230, 230], [180, 180, 185], [120, 125, 130], [60, 62, 68],
-            [200, 120, 90], [150, 95, 60], [90, 130, 200], [70, 160, 150],
-            [120, 180, 90], [220, 200, 120], [200, 150, 180], [40, 40, 45],
-        ];
-        let mut pick: Option<[f32; 3]> = None;
-        ui.horizontal_wrapped(|ui| {
-            for s in SWATCHES {
-                let col = egui::Color32::from_rgb(s[0], s[1], s[2]);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
-                ui.painter().rect_filled(rect, 3.0, col);
-                ui.painter().rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
-                if resp.on_hover_text("Apply to the selected object").clicked() {
-                    pick = Some([s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0]);
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            let mut custom = self.factory.last_pick_color;
-            if ui.color_edit_button_rgb(&mut custom).changed() {
-                self.factory.last_pick_color = custom;
-            }
-            if ui.small_button("Apply custom").clicked() {
-                pick = Some(self.factory.last_pick_color);
-            }
-        });
-        if let Some(c) = pick {
-            self.factory.last_pick_color = c;
-        }
-        pick
-    }
 
-    /// Inline colour section for the properties panel — select an object, click a swatch,
-    /// done. This is the obvious place to "apply a colour to this surface".
+    /// The material section of the properties panel: what this surface IS, and the way through to
+    /// the one place that changes it.
+    ///
+    /// It used to APPLY colour and texture here — a swatch row, a paste/load/procedural row and the
+    /// whole texture library, duplicated again in the ▼ Textures menu. Three routes to one property
+    /// meant three sets of scoping rules, and the bug the user hit came straight out of that: a
+    /// colour applied from the panel went to the whole feature, so painting one wall painted every
+    /// wall in the building. Material editing now lives in the Materials Factory, on the user's own
+    /// recommendation, and this shows the material and opens it there.
     fn factory_color_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("Colour").small().weak());
-        if let Some(c) = self.factory_color_palette(ui) {
-            self.apply_color_to_selection(c);
-        }
+        ui.label(egui::RichText::new("Material").small().weak());
         self.factory_texture_section(ui);
     }
 
@@ -5046,46 +5015,11 @@ impl CadApp {
 
         self.factory_cuts_panel(ui);
 
-        // Inline texture picker — apply or CHANGE a texture RIGHT HERE on the object (not only via
-        // the ▼ Textures menu). Colour and texture are the same surface property, so they sit
-        // together: pick a colour swatch above, or a texture here.
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new("Texture").small().weak());
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .small_button("📂 Load…")
-                .on_hover_text("Apply an image file (PNG/JPG) to the selection — e.g. the bundled CC0 textures")
-                .clicked()
-            {
-                let cc0 = crate::assets::path("assets/cc0/textures");
-                if cc0.is_dir() {
-                    self.file_dialog_dir = Some(cc0.to_path_buf());
-                }
-                self.open_file_dialog(FileDialogMode::ImportTexture, "");
-            }
-            if ui
-                .small_button("🖼 Paste")
-                .on_hover_text("Apply the image currently on the clipboard")
-                .clicked()
-            {
-                self.paste_texture_onto_selection();
-            }
-            if ui
-                .small_button("🌫 Procedural…")
-                .on_hover_text("Apply a shader-evaluated material (wood grain, marble, noise, checker) — no image needed, and it runs continuously across every piece. Edit its pattern/colours below.")
-                .clicked()
-            {
-                let i = self.factory.add_procedural_texture("Procedural wood".into(), crate::factory::ProcDef::oak());
-                self.apply_texture_index_to_selection(i, "Procedural wood", 1, 1);
-            }
-        });
-        // The library of every texture captured so far — click one to apply or CHANGE the texture.
-        if let Some(i) = self.factory_texture_library(ui) {
-            if let Some(t) = self.factory.textures.get(i) {
-                let (name, w, h) = (t.name.clone(), t.w, t.h);
-                self.apply_texture_index_to_selection(i, &name, w, h);
-            }
-        }
+        // NO APPLY UI HERE. The swatch row, the paste/load/procedural row and the texture library
+        // all lived at this point and all wrote through a DIFFERENT scoping rule from the Materials
+        // Factory's — which is how a colour meant for one wall reached every wall in the building.
+        // Picking and applying a material happens in the Materials Factory now; what stays here is
+        // the target (which surface) and the way in.
 
         // WHAT are we tuning? A selected face/piece has its OWN material (so opacity/reflection/
         // tiling land on JUST that piece); otherwise the whole object / feature. `face_sel` is the
@@ -5120,9 +5054,36 @@ impl CadApp {
         } else {
             None
         };
-        // A selected piece/solid can ALWAYS be tuned (its material is minted on first change);
-        // otherwise there must be a texture to tune. If none, the picker above is all there is.
+        // A selected piece/solid can ALWAYS be tuned (its material is minted on first change).
+        // An object with no material yet used to fall through to the picker that sat above; with
+        // the picker gone that would be a dead end — selected, and no way to give it a material at
+        // all. So it gets one minted on the spot, which is what the Materials Factory would have
+        // done on the first edit anyway.
         if tex_idx.is_none() && face_sel.is_none() && feat_sel.is_none() {
+            if self.factory.has_any_selection()
+                && ui
+                    .button("🎨  Give it a material…")
+                    .on_hover_text("Create a material for this object and open it in the Materials Factory.")
+                    .clicked()
+            {
+                self.snapshot_factory();
+                let n = self.factory.textures.len() + 1;
+                let base = self
+                    .factory
+                    .sel_furn_primary()
+                    .and_then(|fi| self.factory.furniture.get(fi))
+                    .map(|f| f.color)
+                    .unwrap_or([0.75, 0.75, 0.75]);
+                let i = self.factory.add_procedural_texture(
+                    format!("Material {n}"),
+                    crate::factory::ProcDef::solid(base),
+                );
+                self.apply_texture_index_to_selection(i, &format!("Material {n}"), 1, 1);
+                self.materials.graphs.remove(&i);
+                self.materials.sel = Some(i);
+                self.materials.sel_node = None;
+                self.materials_open = true;
+            }
             return;
         }
 
@@ -5859,115 +5820,22 @@ impl CadApp {
         } else {
             ui.label(egui::RichText::new("  Select an object first").small().weak());
         }
-        if let Some(c) = self.factory_color_palette(ui) {
-            if self.factory.paint_surface_mode {
-                // Picking a colour in paint mode switches the brush back to colour.
-                self.factory.surface_tex_brush = None;
-            } else {
-                self.apply_color_to_selection(c);
-                ui.close_menu();
-            }
-        }
         ui.separator();
-        // Texture from a clipboard image: copy a picture (or screenshot region) to the
-        // clipboard, select an object, then click this. Phase 1 applies the image's
-        // average colour as a tint and stores the bitmap; the UV-mapped render pass that
-        // shows the actual picture on the faces is the next phase.
-        // In paint mode a texture arms the face brush, so no selection is required.
-        let can_paste = self.factory.has_any_selection() || self.factory.paint_surface_mode;
-        let btn = ui.add_enabled(
-            can_paste,
-            egui::Button::new("  🖼 Paste texture from clipboard"),
-        );
-        if !can_paste {
-            btn.clone().on_disabled_hover_text("Select an object first, then paste.");
-        }
-        if btn
+        // ONE PLACE TO PICK AND APPLY. This menu used to carry its own colour palette, its own
+        // paste/load buttons and its own copy of the texture library — a third route to the same
+        // property, each with its own idea of what "the selection" meant. What stays here is the
+        // brush TARGET above, which is a mode of the 3D view rather than a material.
+        if ui
+            .button("  🎨 Open Materials Factory…")
             .on_hover_text(
-                "Reads the image currently on the clipboard and maps it onto the selected object.",
+                "Materials — colours, images from the clipboard or disk, procedural patterns, \
+                 opacity and PBR — are created and applied there. Click a surface in the 3D view \
+                 and it opens that surface's own material.",
             )
             .clicked()
         {
-            self.paste_texture_onto_selection();
+            self.materials_open = true;
             ui.close_menu();
-        }
-        // Load a texture image from disk — feeds the bundled CC0 library in
-        // assets/cc0/textures (wood, brick, marble, fabric, …).
-        let file_btn = ui.add_enabled(can_paste, egui::Button::new("  📂 Load texture from file…"));
-        if !can_paste {
-            file_btn.clone().on_disabled_hover_text("Select an object first, then load.");
-        }
-        if file_btn
-            .on_hover_text("Apply a PNG/JPG image (e.g. the bundled CC0 textures) to the selected object.")
-            .clicked()
-        {
-            // Default the picker to the bundled CC0 texture folder when it exists.
-            let cc0 = crate::assets::path("assets/cc0/textures");
-            if cc0.is_dir() {
-                self.file_dialog_dir = Some(cc0.to_path_buf());
-            }
-            self.open_file_dialog(FileDialogMode::ImportTexture, "");
-            ui.close_menu();
-        }
-        // TEXTURE LIBRARY — every texture loaded/pasted so far, clickable to (re)apply. Without
-        // this there was no way to CHANGE a texture once applied or reuse one across objects; the
-        // only entry points were Paste/Load, which each need a fresh clipboard image or file.
-        if let Some(i) = self.factory_texture_library(ui) {
-            if let Some(t) = self.factory.textures.get(i) {
-                let (name, w, h) = (t.name.clone(), t.w, t.h);
-                self.apply_texture_index_to_selection(i, &name, w, h);
-            }
-            ui.close_menu();
-        }
-    }
-
-    /// Clickable list of every captured/loaded texture — pick one to (re)apply to the selection
-    /// (or, in paint-single-surface mode, to arm the face brush). This is how a texture is
-    /// CHANGED or reused without re-loading it. Returns the chosen index. Each row shows the
-    /// texture's average-colour chip + name/size, and the current one is highlighted.
-    fn factory_texture_library(&mut self, ui: &mut egui::Ui) -> Option<usize> {
-        if self.factory.textures.is_empty() {
-            return None;
-        }
-        let current = self.factory_selected_texture();
-        let mut chosen = None;
-        ui.separator();
-        ui.label(egui::RichText::new("  Textures — click to apply").small().weak());
-        // Snapshot the rows first so the loop doesn't borrow `self.factory.textures` while the
-        // click handler needs `self`.
-        let rows: Vec<(usize, String, u32, u32, [f32; 3])> = self
-            .factory
-            .textures
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (i, t.name.clone(), t.w, t.h, t.avg))
-            .collect();
-        for (i, name, w, h, avg) in rows {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                let col = egui::Color32::from_rgb(
-                    (avg[0] * 255.0) as u8, (avg[1] * 255.0) as u8, (avg[2] * 255.0) as u8);
-                ui.painter().rect_filled(rect, 3.0, col);
-                ui.painter().rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
-                if ui
-                    .selectable_label(current == Some(i), format!("{name}  ({w}×{h})"))
-                    .clicked()
-                {
-                    chosen = Some(i);
-                }
-            });
-        }
-        chosen
-    }
-
-    /// The texture index currently on the selection (furniture instance or single feature), if any.
-    fn factory_selected_texture(&self) -> Option<usize> {
-        if let Some(fi) = self.factory.sel_furn_primary() {
-            self.factory.furniture.get(fi).and_then(|f| f.texture)
-        } else if self.factory.paint_surface_mode {
-            self.factory.surface_tex_brush
-        } else {
-            self.factory.selected_single().and_then(|id| self.factory.feature_texture.get(&id).copied())
         }
     }
 
@@ -5979,34 +5847,46 @@ impl CadApp {
             self.factory.status = "select an object first, then paste a texture".into();
             return;
         }
+        if let Some((idx, name, w, h)) = self.paste_texture_as_material() {
+            self.apply_texture_index_to_selection(idx, &name, w, h);
+        }
+    }
+
+    /// Capture the clipboard image as a MATERIAL and return it — without touching any selection.
+    ///
+    /// Split out because the Materials Factory's job is to build a library, and a library entry
+    /// does not need a surface to live on. Requiring one made "paste a texture" fail silently
+    /// whenever nothing happened to be selected, which mattered little while the properties panel
+    /// carried a second paste button and matters a great deal now that it does not.
+    fn paste_texture_as_material(&mut self) -> Option<(usize, String, u32, u32)> {
         let img = match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
             Ok(img) => img,
             Err(e) => {
                 self.factory.status =
                     format!("no image on the clipboard — copy a picture first ({e})");
                 self.history.push(format!("  ! paste texture: {e}"));
-                return;
+                return None;
             }
         };
         let (w, h) = (img.width as u32, img.height as u32);
         let rgba = img.bytes.into_owned(); // arboard hands over RGBA8, top row first
         if w == 0 || h == 0 || rgba.len() < (w as usize * h as usize * 4) {
             self.factory.status = "clipboard image was empty or malformed".into();
-            return;
+            return None;
         }
         let name = format!("clip-{}x{}-#{}", w, h, self.factory.textures.len() + 1);
         let idx = self.factory.add_texture(name.clone(), w, h, rgba);
-        self.apply_texture_index_to_selection(idx, &name, w, h);
+        Some((idx, name, w, h))
     }
 
-    /// Load an image FILE (PNG/JPG/…), store it as a texture asset, and apply it to the
-    /// current selection — the on-disk counterpart of the clipboard paste. Feeds the bundled
-    /// CC0 texture library (`assets/cc0/textures`).
+    /// Load an image FILE (PNG/JPG/…) as a MATERIAL, and apply it if something is selected — the
+    /// on-disk counterpart of the clipboard paste. Feeds the bundled CC0 texture library
+    /// (`assets/cc0/textures`).
+    ///
+    /// A selection is NOT required. This is reached from the Materials Factory, whose job is to
+    /// build the library; refusing to load an image because no surface happened to be selected
+    /// made the only remaining route to a file texture fail for no reason.
     fn load_texture_from_file(&mut self, path: &str) {
-        if !self.factory.has_any_selection() && !self.factory.paint_surface_mode {
-            self.factory.status = "select an object first, then load a texture".into();
-            return;
-        }
         let img = match image::open(path) {
             Ok(i) => i.to_rgba8(),
             Err(e) => {
@@ -6026,7 +5906,13 @@ impl CadApp {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "texture".into());
         let idx = self.factory.add_texture(name.clone(), w, h, rgba);
-        self.apply_texture_index_to_selection(idx, &name, w, h);
+        self.materials.sel = Some(idx);
+        self.materials.sel_node = None;
+        if self.factory.has_any_selection() || self.factory.paint_surface_mode {
+            self.apply_texture_index_to_selection(idx, &name, w, h);
+        } else {
+            self.factory.status = format!("material '{name}' ({w}×{h}) loaded — select a surface and Apply");
+        }
     }
 
     /// Assign stored texture `idx` to the current selection (furniture instance or feature[s])
@@ -23210,11 +23096,12 @@ impl CadApp {
                     self.materials.sel_node = None;
                 }
                 if ui.small_button("🖼").on_hover_text("Paste an image from the clipboard as a new material").clicked() {
-                    let before = self.factory.textures.len();
-                    self.paste_texture_onto_selection();
-                    if self.factory.textures.len() > before {
-                        self.materials.sel = Some(before);
+                    // As a MATERIAL, with no selection required — the library is built here, and
+                    // "Apply to" below is what puts one on a surface.
+                    if let Some((idx, name, w, h)) = self.paste_texture_as_material() {
+                        self.materials.sel = Some(idx);
                         self.materials.sel_node = None;
+                        self.factory.status = format!("material '{name}' ({w}×{h}) pasted from the clipboard");
                     }
                 }
                 if ui.small_button("📂").on_hover_text("Load an image file (PNG/JPG) as a new material").clicked() {
@@ -50558,10 +50445,9 @@ mod factory_texture_tests {
         let b = app.factory.add_texture("b".into(), 2, 2, [0u8,0,255,255].repeat(4));
         app.apply_texture_index_to_selection(a, "a", 2, 2);
         assert_eq!(app.factory.furniture[0].texture, Some(a), "first texture applied");
-        // Change it — this is what the library picker does.
+        // Change it — this is what applying a second material from the Materials Factory does.
         app.apply_texture_index_to_selection(b, "b", 2, 2);
         assert_eq!(app.factory.furniture[0].texture, Some(b), "texture changed to the second");
-        assert_eq!(app.factory_selected_texture(), Some(b), "picker reports the current texture");
     }
 
     /// Picking a COLOUR on a textured piece must clear the texture (else the colour stays masked
@@ -53903,5 +53789,82 @@ mod colour_targets_a_surface {
 
         app.apply_color_to_selection([0.4, 0.5, 0.6]);
         assert_eq!(app.factory.feature_color.get(&id).copied(), Some([0.4, 0.5, 0.6]));
+    }
+}
+
+/// MATERIALS ARE MADE IN ONE PLACE.
+///
+/// The colour swatches, the paste/load buttons and the texture library all appeared twice — once in
+/// the properties panel and once in the ▼ Textures menu — and each wrote through its own idea of
+/// what "the selection" meant. That duplication is what produced "it applied for the entire
+/// building except the floor": the panel's swatch went to the whole FEATURE, and a building is one
+/// extrusion. The user's own call was to remove application from the parameters area and keep it
+/// exclusively in the Materials Factory.
+///
+/// The UI itself cannot be asserted on here. What CAN be, and is what the change turns on, is that
+/// the Materials Factory's own two entry points build a library entry WITHOUT needing a surface
+/// selected — which they previously refused to do, harmlessly while a second button existed and
+/// not harmlessly once it was the only one.
+#[cfg(test)]
+mod materials_are_made_in_one_place {
+    use super::*;
+
+    /// Loading an image file with nothing selected must still produce a material.
+    #[test]
+    fn a_file_becomes_a_material_with_nothing_selected() {
+        let mut app = CadApp::default();
+        assert!(!app.factory.has_any_selection(), "precondition: nothing is selected");
+
+        // A 2×2 PNG written to the scratch dir — the loader takes a path, not bytes.
+        let dir = std::env::temp_dir().join("simlux_material_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("swatch.png");
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 40, 40, 255]));
+        img.save(&path).expect("write the test image");
+
+        let before = app.factory.textures.len();
+        app.load_texture_from_file(&path.to_string_lossy());
+        assert_eq!(
+            app.factory.textures.len(),
+            before + 1,
+            "the material must be created even with no surface to put it on: {}",
+            app.factory.status,
+        );
+        assert_eq!(app.materials.sel, Some(before), "and be selected in the Materials Factory");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// …and with something selected it still lands on it, which is the older behaviour that must
+    /// not have been traded away for the above.
+    #[test]
+    fn and_still_applies_when_a_surface_is_selected() {
+        let mut app = CadApp::default();
+        let idx = app.factory.add_furniture_asset(
+            "block".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                normals: vec![[0.0, 0.0, 1.0]; 3],
+                color: Some([0.5, 0.5, 0.5]),
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::ZERO); // selects it
+        app.factory.paint_surface_mode = false; // whole-object, the subject here
+
+        let dir = std::env::temp_dir().join("simlux_material_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("swatch2.png");
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([40, 200, 40, 255]))
+            .save(&path)
+            .expect("write the test image");
+
+        app.load_texture_from_file(&path.to_string_lossy());
+        assert_eq!(
+            app.factory.furniture[0].texture,
+            Some(0),
+            "a selected object must still receive it: {}",
+            app.factory.status,
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
