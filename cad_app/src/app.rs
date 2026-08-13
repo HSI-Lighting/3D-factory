@@ -4111,6 +4111,24 @@ impl CadApp {
                 self.set_place_coord_prompt();
                 return true;
             }
+            // CLICK MODE RE-PLACES WHAT IS ALREADY SELECTED.
+            //
+            // Reported as "when a furniture is placed inside a building the placement mechanism
+            // isn't working", and the session shows exactly why: a cupboard was built at 2.5 s
+            // (landing on the origin), `place` was typed at 5.3 s, and the click at 7.1 s went
+            // through the SELECTION path — `3D pick → feature#3` — because nothing was waiting.
+            //
+            // The mode only ever governed the NEXT object added, so choosing "click to place"
+            // after building something did nothing you could see. Arming the selection is what
+            // the user is asking for by that sequence, and it is what `place` used to do before
+            // it became a mode question.
+            if m == PlaceMode::Click && self.factory_arm_selection_placement() {
+                let msg = "Click the 2D or 3D window to place the selection  [Esc leaves it]";
+                self.history.push(format!("  {msg}"));
+                self.factory.status = msg.into();
+                self.clear_prompt();
+                return true;
+            }
             let msg = m.hint().to_string();
             self.history.push(format!("  {msg}"));
             self.factory.status = msg;
@@ -4147,6 +4165,23 @@ impl CadApp {
 
         if lc == "place" || lc == "pl" {
             self.set_place_prompt();
+            return true;
+        }
+        false
+    }
+
+    /// Hand the current 3D selection to a placing click. False when nothing is selected.
+    ///
+    /// Furniture first: it is the thing most often being repositioned, and when a furniture piece
+    /// and the solid behind it are both in the selection, the piece is what the click was aimed at.
+    fn factory_arm_selection_placement(&mut self) -> bool {
+        use crate::factory::AwaitingPlace;
+        if let Some(i) = self.factory.sel_furn_primary() {
+            self.factory.awaiting_place = Some(AwaitingPlace::Furniture(i));
+            return true;
+        }
+        if let Some(&id) = self.factory.selection.first() {
+            self.factory.awaiting_place = Some(AwaitingPlace::Feature(id));
             return true;
         }
         false
@@ -39118,6 +39153,16 @@ impl eframe::App for CadApp {
                         {
                             self.factory.show_origin = !self.factory.show_origin;
                         }
+                        // 3D object snap. The 2D snap badges to the right drive `snap_enabled`,
+                        // which the 3D side has never read — it has its own, and until now no way
+                        // to turn it off.
+                        if self.factory.open
+                            && drafting_badge(ui, "SNAP3D", self.factory.snap_3d,
+                                "3D object snap: clicks in the 3D view land on the nearest solid \
+                                 CORNER within 12 px. Off = the raw point under the cursor.")
+                        {
+                            self.factory.snap_3d = !self.factory.snap_3d;
+                        }
                         ui.separator();
                         // Snap badges — click any letter to toggle.
                         for k in SnapKind::ALL {
@@ -53147,5 +53192,185 @@ mod origin_and_prompt {
         app.current_prompt = "something nobody owns".into();
         app.sweep_stale_prompt();
         assert!(app.current_prompt.is_empty(), "the sweep must still do its job");
+    }
+}
+
+/// 3D SNAP, and re-placing something that already exists.
+///
+/// Reported as: "when a furniture is placed inside a building the placement mechanism isnt working
+/// … how is the snapping affecting a furniture when being placed[?] where is the option to turn
+/// on/off[?]"
+#[cfg(test)]
+mod snap_and_replace {
+    use super::*;
+
+    use crate::factory::{FactoryState};
+    use cad_solid::{BoolOp, Placement, Plane, Primitive};
+    use glam::{Mat4, Vec3};
+
+    fn app_in_3d() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.active_view = ActiveView::ThreeD;
+        app
+    }
+
+    /// THE BUG IN THE SESSION. A cupboard was built (landing on the origin), `place` was typed to
+    /// switch to click-placement, and the click went through the SELECTION path because nothing was
+    /// waiting — the mode only ever governed the NEXT object added.
+    #[test]
+    fn choosing_click_re_places_what_is_already_selected() {
+        let mut app = app_in_3d();
+        app.factory.place_mode = crate::factory::PlaceMode::Origin; // so the add does not arm
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            color: None,
+            alpha: Vec::new(),
+        };
+        let idx = app.factory.add_furniture_asset("Cupboard".into(), mesh);
+        let at = app.factory.place_at();
+        app.factory.place_furniture(idx, at);
+        assert!(app.factory.awaiting_place.is_none(), "precondition: nothing is waiting");
+
+        app.run_command("place");
+        app.run_command("click");
+        assert_eq!(
+            app.factory.awaiting_place,
+            Some(crate::factory::AwaitingPlace::Furniture(0)),
+            "the selected piece must now be waiting for a click",
+        );
+    }
+
+    /// With nothing selected it just sets the mode, as before — the re-place is a convenience, not
+    /// a precondition.
+    #[test]
+    fn choosing_click_with_nothing_selected_only_sets_the_mode() {
+        let mut app = app_in_3d();
+        app.factory.place_mode = crate::factory::PlaceMode::Origin;
+        app.run_command("place");
+        app.run_command("click");
+        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Click);
+        assert!(app.factory.awaiting_place.is_none());
+    }
+
+    // ---- the snap ------------------------------------------------------------------------
+
+    fn a_building() -> FactoryState {
+        let mut st = FactoryState::default();
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+        );
+        st.recompute();
+        st.cam_dist = 20.0;
+        st
+    }
+
+    fn mvp_of(st: &FactoryState, rect: egui::Rect) -> [f32; 16] {
+        crate::light3d::mvp(
+            st.cam_yaw,
+            st.cam_pitch,
+            st.cam_dist,
+            st.cam_target,
+            rect.width() / rect.height(),
+            st.ortho,
+        )
+    }
+
+    /// Screen position of a world point under `mvp`.
+    fn to_screen(w: Vec3, mvp: &[f32; 16], rect: egui::Rect) -> egui::Pos2 {
+        let n = Mat4::from_cols_array(mvp).project_point3(w);
+        egui::pos2(
+            rect.left() + (n.x * 0.5 + 0.5) * rect.width(),
+            rect.top() + (0.5 - n.y * 0.5) * rect.height(),
+        )
+    }
+
+    /// THE TOGGLE — "where is the option to turn on/off".
+    #[test]
+    fn the_snap_can_be_turned_off() {
+        let mut st = a_building();
+        assert!(st.snap_3d, "on by default");
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = mvp_of(&st, rect);
+        // A corner of the box, aimed at exactly.
+        let corner = Vec3::new(5.0, 5.0, 3.0);
+        let at = to_screen(corner, &mvp, rect);
+        assert!(st.snap_vertex(at, rect, &mvp).is_some(), "it must catch its own corner");
+
+        st.snap_3d = false;
+        assert!(st.snap_vertex(at, rect, &mvp).is_none(), "off must mean off");
+    }
+
+    /// IT NEVER SNAPS TO SOMETHING YOU CANNOT SEE. Working inside a building means "hide ceilings"
+    /// is on — and the roof slab is still in the mesh, so a click in the middle of a room could
+    /// jump to a ceiling corner floating above it with nothing on screen to explain why.
+    #[test]
+    fn a_hidden_ceiling_is_not_snappable() {
+        let mut st = FactoryState::default();
+        // A room-sized box with a thin slab capping it: the slab is what `hide_ceilings` hides.
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+        );
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { lift: 3.0, ..Placement::default() },
+            Primitive::Box { w: 10.0, d: 10.0, h: 0.2 },
+        );
+        st.recompute();
+        st.cam_dist = 20.0;
+        let caps: Vec<u32> = st.model.features.iter().map(|f| f.id).filter(|id| st.is_hidden_ceiling(*id)).collect();
+        assert!(!caps.is_empty(), "precondition: the slab is detected as a ceiling cap");
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = mvp_of(&st, rect);
+        // A corner of the CAP — the highest geometry there is.
+        let cap_corner = Vec3::new(5.0, 5.0, 3.2);
+        let at = to_screen(cap_corner, &mvp, rect);
+
+        st.hide_ceilings = false;
+        let visible = st.snap_vertex(at, rect, &mvp);
+        assert!(visible.is_some(), "with the ceiling shown it is a legitimate target");
+
+        st.hide_ceilings = true;
+        if let Some((w, _)) = st.snap_vertex(at, rect, &mvp) {
+            assert!(
+                w.z < 3.15,
+                "snapped to the hidden ceiling at z = {:.2} — invisible geometry must not catch",
+                w.z,
+            );
+        }
+    }
+
+    /// A click's Z is NOT used for furniture: the piece sits on the storey floor whatever the snap
+    /// caught. Snapping to a vertex 3 m up a wall moves it in plan, not into the air.
+    #[test]
+    fn a_placing_click_never_lifts_furniture_off_the_floor() {
+        let mut st = a_building();
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            color: None,
+            alpha: Vec::new(),
+        };
+        let idx = st.add_furniture_asset("Cupboard".into(), mesh);
+        st.place_furniture(idx, Vec3::ZERO);
+        st.awaiting_place = Some(crate::factory::AwaitingPlace::Furniture(0));
+
+        // A point 3 m up — what snapping to a wall-top corner would hand us.
+        st.place_awaiting_at(Vec3::new(4.0, 4.0, 3.0));
+        assert!(
+            (st.furniture[0].pos[2] - st.active_base_z()).abs() < 1e-6,
+            "the piece left the floor: z = {}",
+            st.furniture[0].pos[2],
+        );
+        assert!((st.furniture[0].pos[0] - 4.0).abs() < 1e-6, "…but it did move in plan");
     }
 }

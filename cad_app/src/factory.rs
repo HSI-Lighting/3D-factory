@@ -1004,6 +1004,9 @@ pub struct FactoryState {
     pub show_grid: bool,
     /// Draw the three-axis gizmo at the world origin. OFF by default — see `origin_gizmo_lines`.
     pub show_origin: bool,
+    /// 3D object snap: a click in the 3D view lands on the nearest solid VERTEX within the
+    /// aperture. On by default; the SNAP3D badge turns it off. See `snap_vertex`.
+    pub snap_3d: bool,
     pub unit_asked: bool,
     /// The unit question is on screen right now.
     pub ask_unit: bool,
@@ -2963,6 +2966,7 @@ impl Default for FactoryState {
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
             show_grid: true,
             show_origin: false,
+            snap_3d: true,
             unit_asked: false,
             ask_unit: false,
             place_mode: PlaceMode::Click,
@@ -8340,10 +8344,24 @@ impl FactoryState {
         rect: egui::Rect,
         mvp: &[f32; 16],
     ) -> Option<(Vec3, egui::Pos2)> {
+        if !self.snap_3d {
+            return None;
+        }
         let m = Mat4::from_cols_array(mvp);
         let aperture = 12.0f32;
         let mut best: Option<(f32, Vec3, egui::Pos2)> = None;
-        for p in &self.cached.positions {
+        for (i, p) in self.cached.positions.iter().enumerate() {
+            // NEVER SNAP TO SOMETHING YOU CANNOT SEE. With "hide ceilings" on — the normal way to
+            // work inside a building — the roof slab is still in the mesh, so a click in the middle
+            // of a room could jump to a ceiling corner floating above it with nothing on screen to
+            // explain why. `face_ids` is per TRIANGLE; three positions share one.
+            if self.hide_ceilings {
+                if let Some(&fid) = self.cached.face_ids.get(i / 3) {
+                    if self.is_hidden_ceiling(fid) {
+                        continue;
+                    }
+                }
+            }
             let w = Vec3::from(*p);
             let ndc = m.project_point3(w);
             if !(-1.0..=1.0).contains(&ndc.z) {
