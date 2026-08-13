@@ -146,6 +146,31 @@ pub struct FactoryDoc {
     /// The distance from the origin used by `PlaceMode::Offset`, in METRES.
     #[serde(default)]
     pub place_offset: Option<[f32; 3]>,
+    /// FACE PLANES and the drawings on them — see [`SketchRec`].
+    #[serde(default)]
+    pub sketches: Vec<SketchRec>,
+}
+
+/// One face plane as persisted: where it stands, what it is called, and the drawing on it.
+///
+/// `cad_solid::Model::sketches` is `#[serde(skip)]` and always was, so face sketches lived only as
+/// long as the app was open. That was survivable while a plane was something you re-picked off the
+/// model every time; it is not survivable now that planes are a NAMED LIST you go back to — a view
+/// called "Kitchen elevation" that is gone after a save is worse than no list at all.
+///
+/// The drawing is stored as RSM, the app's own 2D format, rather than a bespoke serialization of
+/// `cad_kernel::Document` (which derives no serde at all). That reuses the reader and writer the
+/// file menu already depends on, so a sketch cannot drift into a format nothing else can read.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SketchRec {
+    /// What the plane is called in the 2D view list.
+    pub name: String,
+    /// The frame: origin and the two in-plane axes. The normal is `u × v` and is not stored.
+    pub origin: [f32; 3],
+    pub u: [f32; 3],
+    pub v: [f32; 3],
+    /// The drawing, as base64 of the RSM bytes.
+    pub rsm_b64: String,
 }
 
 /// One pasted texture as persisted: PNG bytes, base64-encoded. Mirrors `factory::TextureAsset`.

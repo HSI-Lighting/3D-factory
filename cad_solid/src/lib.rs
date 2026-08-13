@@ -810,11 +810,26 @@ pub struct Sketch {
     /// the user sees WHERE they're drawing, and offered as osnap targets. Not part
     /// of the drawing itself.
     pub reference: Vec<cad_kernel::Geom>,
+    /// What this plane is CALLED in the 2D view list.
+    ///
+    /// The 2D canvas used to offer fixed Top / Front / Back / Left / Right views of the whole
+    /// model. It now offers the faces that have actually been drawn on, which is what a person is
+    /// looking for when they go back to a drawing — so each one needs a name. Auto-given from the
+    /// object the face belongs to, and renameable to whatever the drawing is of.
+    ///
+    /// EMPTY means "not named yet"; the caller supplies one. That is also what a model loaded from
+    /// a file written before this field existed carries.
+    pub name: String,
 }
 
 impl Sketch {
     pub fn new(frame: Frame) -> Self {
-        Self { frame, doc: cad_kernel::Document::default(), reference: Vec::new() }
+        Self {
+            frame,
+            doc: cad_kernel::Document::default(),
+            reference: Vec::new(),
+            name: String::new(),
+        }
     }
 }
 

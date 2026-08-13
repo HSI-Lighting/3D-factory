@@ -94,59 +94,6 @@ pub enum AwaitingPlace {
     Feature(u32),
 }
 
-/// Which plane the 2D CANVAS draws on — the orthographic view the drafting side is looking along.
-/// Distinct from [`StdView`], which aims the 3D camera; this decides what the 2D tools edit.
-///
-/// `Global` is the drawing's own plan: the document every 2D tool has always worked on, and the
-/// only one of these that is not a sketch plane. The other five are planes standing in the MODEL,
-/// opened by the same route as "draw on this face" — which is why every 2D tool works in them
-/// without learning anything new, and why a drawing made on one is still there when you return.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum PlanView {
-    #[default]
-    Global,
-    Top,
-    Front,
-    Back,
-    Left,
-    Right,
-}
-
-impl PlanView {
-    pub const ALL: [PlanView; 6] = [
-        PlanView::Global,
-        PlanView::Top,
-        PlanView::Front,
-        PlanView::Back,
-        PlanView::Left,
-        PlanView::Right,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            PlanView::Global => "Global",
-            PlanView::Top => "Top",
-            PlanView::Front => "Front",
-            PlanView::Back => "Back",
-            PlanView::Left => "Left",
-            PlanView::Right => "Right",
-        }
-    }
-
-    pub fn hint(self) -> &'static str {
-        match self {
-            PlanView::Global => {
-                "The drawing's own plan — the ground plane. Sketches on other planes are hidden."
-            }
-            PlanView::Top => "A sketch plane looking down on the model",
-            PlanView::Front => "A sketch plane on the front face",
-            PlanView::Back => "A sketch plane on the back face",
-            PlanView::Left => "A sketch plane on the left face",
-            PlanView::Right => "A sketch plane on the right face",
-        }
-    }
-}
-
 /// The 3D-Factory zoom mode — mirrors the 2D zoom command. Bare `z` → `Window` (the 2D
 /// default: DRAG a box, or click two corners, with an amber "zoom window" rubber-band);
 /// `z r` → `RealTime` (drag up/down dollies). `Off` = idle.
@@ -1028,6 +975,8 @@ pub struct FactoryState {
 
     /// WHERE a newly added object lands. See [`PlaceMode`] and [`FactoryState::place_at`].
     pub place_mode: PlaceMode,
+    /// A face plane being renamed: its index and the text being typed. `None` = no dialog open.
+    pub rename_plane: Option<(usize, String)>,
     /// The distance from the world origin used by [`PlaceMode::Offset`], in metres.
     pub place_offset: [f32; 3],
     /// The object that was just added and is waiting for a click — in EITHER window — to say
@@ -1085,7 +1034,6 @@ pub struct FactoryState {
     /// still contains them.
     pub ceilings: std::collections::HashSet<u32>,
     /// Which plane the 2D canvas is drawing on. See [`PlanView`].
-    pub plan_view: PlanView,
     /// Every ROOM built, as an editable record. See [`RoomInst`].
     pub rooms: Vec<RoomInst>,
     /// Monotonic room id. Never reused, so a rename or a delete cannot be confused with the room
@@ -2981,6 +2929,7 @@ impl Default for FactoryState {
             // in it; the fix is not a better default position, it is being ASKED. Switch it to
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
             place_mode: PlaceMode::Click,
+            rename_plane: None,
             place_offset: [0.0, 0.0, 0.0],
             awaiting_place: None,
             wall_height: 2.7,
@@ -3005,7 +2954,6 @@ impl Default for FactoryState {
             dim_edit_active: false,
             show_plan: true,
             ceilings: std::collections::HashSet::new(),
-            plan_view: PlanView::Global,
             rooms: Vec::new(),
             next_room_id: 1,
             ceiling_caps: std::collections::HashSet::new(),
@@ -5847,6 +5795,29 @@ impl FactoryState {
             working_unit_m: self.units.metres_per_unit,
             place_mode: Some(self.place_mode),
             place_offset: Some(self.place_offset),
+            // FACE PLANES. `Model::sketches` is `#[serde(skip)]`, so without this a named view and
+            // everything drawn on it is gone the moment the project is reopened — which would make
+            // a list you go back to worse than no list at all.
+            //
+            // The drawing goes out as RSM, the app's own 2D format, rather than a bespoke
+            // serialization of `cad_kernel::Document` (which derives no serde at all). That reuses
+            // the reader and writer the File menu already depends on.
+            sketches: self
+                .model
+                .sketches
+                .iter()
+                .map(|s| crate::simlux_io::SketchRec {
+                    name: s.name.clone(),
+                    origin: s.frame.origin.to_array(),
+                    u: s.frame.u.to_array(),
+                    v: s.frame.v.to_array(),
+                    rsm_b64: {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD
+                            .encode(cad_io::rsm::write_rsm(&s.doc))
+                    },
+                })
+                .collect(),
         }
     }
 
@@ -6028,6 +5999,30 @@ impl FactoryState {
         if let Some(o) = d.place_offset {
             self.place_offset = o;
         }
+        // FACE PLANES and their drawings. A file written before these were saved carries none, and
+        // then the model simply has no planes yet — which is exactly what it had before.
+        self.model.sketches = d
+            .sketches
+            .iter()
+            .map(|r| {
+                let mut sk = cad_solid::Sketch::new(Frame {
+                    origin: Vec3::from(r.origin),
+                    u: Vec3::from(r.u),
+                    v: Vec3::from(r.v),
+                });
+                sk.name = r.name.clone();
+                // An unreadable drawing costs the DRAWING, not the plane: a named face with
+                // nothing on it can be drawn on again, where a dropped plane is a view that
+                // silently went missing.
+                use base64::Engine;
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&r.rsm_b64) {
+                    if let Ok(doc) = cad_io::rsm::read_rsm(&bytes) {
+                        sk.doc = doc;
+                    }
+                }
+                sk
+            })
+            .collect();
         // ROOMS. A feature the model no longer holds is dropped from the room rather than left
         // dangling — a room pointing at geometry that is not there would resize nothing and
         // delete nothing, which is worse than a room that knows it has lost a wall.
@@ -6547,6 +6542,92 @@ impl FactoryState {
             Vec2::new(mx.x, mx.y),
             Vec2::new(mn.x, mx.y),
         ]
+    }
+
+    /// The feature a point on a face belongs to — the Union whose world AABB it sits on or in.
+    ///
+    /// Used to name a sketch plane after the thing it was drawn on. Deliberately AABB-based rather
+    /// than an exact surface test: a name is a label, and the nearest enclosing box is right often
+    /// enough that being wrong costs a rename rather than a wrong drawing.
+    pub fn feature_at(&self, p: Vec3) -> Option<u32> {
+        const SLACK: f32 = 1e-2; // a face point sits exactly ON the bound, so allow for rounding
+        let mut best: Option<(u32, f32)> = None;
+        for f in &self.model.features {
+            if f.op != cad_solid::BoolOp::Union {
+                continue;
+            }
+            let (mn, mx) = f.world_aabb();
+            let inside = p.x >= mn.x - SLACK
+                && p.x <= mx.x + SLACK
+                && p.y >= mn.y - SLACK
+                && p.y <= mx.y + SLACK
+                && p.z >= mn.z - SLACK
+                && p.z <= mx.z + SLACK;
+            if !inside {
+                continue;
+            }
+            // The SMALLEST box wins: a cupboard standing inside a building is inside both, and the
+            // useful name is the cupboard.
+            let vol = (mx.x - mn.x) * (mx.y - mn.y) * (mx.z - mn.z);
+            if best.is_none_or(|(_, b)| vol < b) {
+                best = Some((f.id, vol));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// A human name for one feature — "Building 2", "Box 1" — numbered within its own kind so the
+    /// number means something to look for.
+    pub fn feature_display_name(&self, id: u32) -> String {
+        let Some(f) = self.model.features.iter().find(|f| f.id == id) else {
+            return "Object".into();
+        };
+        let kind = f.primitive.kind_label();
+        // An Extrusion is what a building outline is, and "Extrusion 1" is not what anyone calls it.
+        let kind = if kind == "Extrusion" { "Building" } else { kind };
+        let n = self
+            .model
+            .features
+            .iter()
+            .filter(|o| o.op == cad_solid::BoolOp::Union)
+            .filter(|o| {
+                let k = o.primitive.kind_label();
+                (if k == "Extrusion" { "Building" } else { k }) == kind
+            })
+            .position(|o| o.id == id)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        format!("{kind} {n}")
+    }
+
+    /// The name a NEW sketch plane gets: the object the face belongs to, and which face of it.
+    ///
+    /// Asked for as "named after the object the face belongs to". A room wins over the solid it was
+    /// carved from — the room is the thing with a name the user chose, and that is what they are
+    /// looking for in the list.
+    pub fn sketch_auto_name(&self, frame: &Frame) -> String {
+        let o = frame.origin;
+        // The ground plan is not a face of anything.
+        if frame.normal().z.abs() > 0.999 && o.z.abs() < 1e-3 {
+            return "Ground plan".into();
+        }
+        let owner = self
+            .rooms
+            .iter()
+            .find(|r| r.contains(Vec2::new(o.x, o.y)))
+            .map(|r| r.name.clone())
+            .or_else(|| self.feature_at(o).map(|id| self.feature_display_name(id)))
+            .unwrap_or_else(|| "Plane".into());
+        // "Cupboard 1 — face 2": the face number counts only the planes already on THIS object, so
+        // it stays meaningful when other objects come and go.
+        let n = self
+            .model
+            .sketches
+            .iter()
+            .filter(|s| s.name.starts_with(&format!("{owner} — face ")))
+            .count()
+            + 1;
+        format!("{owner} — face {n}")
     }
 
     fn detect_ceiling_caps(&self) -> std::collections::HashSet<u32> {

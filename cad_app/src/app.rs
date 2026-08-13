@@ -1354,6 +1354,9 @@ pub struct CadApp {
     /// notice shown, 2 = next Enter cancels. Resets on any state
     /// transition or any cmd input.
     empty_enter_count_in_select: u8,
+    /// The `Placement [Click/Centre/Origin/Offset] <x>:` prompt is open and the next line is its
+    /// answer. Replaces the toolbar dropdown that used to ask this.
+    place_prompt_open: bool,
     /// Grip drag — Some(GripDrag) while the user is dragging a grip
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
@@ -3527,6 +3530,7 @@ impl Default for CadApp {
             last_command:       None,
             focus_at_frame_start: None,
             empty_enter_count_in_select: 0,
+            place_prompt_open: false,
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
             screen_stats_open:   false,
@@ -3992,110 +3996,140 @@ impl CadApp {
     fn is_factory_only_command(raw: &str) -> bool {
         let w = raw.trim().to_ascii_lowercase();
         let head = w.split_whitespace().next().unwrap_or("");
-        matches!(head, "place" | "placeat" | "at" | "centre" | "center" | "click" | "offset")
+        raw.trim_start().starts_with('@')
+            || matches!(head, "place" | "centre" | "center" | "click" | "offset")
+    }
+
+    /// Parse a typed coordinate — `@900,0,0`, `@(900, 0, 0)`, `@900 0 0` — into METRES.
+    ///
+    /// `@` is the whole placement UI now. Asked for as: "instead of having a slider to cho[o]se the
+    /// co ordinates i want the user to type in the co ordinate. once they cho[o]se they want to
+    /// have the origin offset they will type @(their coordinates). this will be the system."
+    ///
+    /// The parentheses are optional because both forms were described and neither is wrong; the
+    /// separator may be a comma or a space for the same reason. Numbers are in the FACTORY's
+    /// working unit — reading a typed length as metres is the class of bug that built a 4.4 km
+    /// building.
+    fn parse_at_coords(raw: &str, u: cad_kernel::DocUnits) -> Option<[f32; 3]> {
+        let s = raw.trim();
+        let s = s.strip_prefix('@')?.trim();
+        // `(x,y,z)` and `x,y,z` are the same thing said two ways.
+        let s = s.strip_prefix('(').map(|t| t.trim_end().strip_suffix(')').unwrap_or(t)).unwrap_or(s);
+        let parts: Vec<f64> = s
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.parse::<f64>())
+            .collect::<Result<_, _>>()
+            .ok()?;
+        if parts.len() < 2 || parts.len() > 3 {
+            return None;
+        }
+        let k = u.metres_per_unit;
+        Some([
+            (parts[0] * k) as f32,
+            (parts[1] * k) as f32,
+            (parts.get(2).copied().unwrap_or(0.0) * k) as f32,
+        ])
     }
 
     /// The 3D command line's PLACEMENT vocabulary. Returns true when the line was one of these.
     ///
-    /// This is the typed half of the answer to "the user has no control, it gets added at the
-    /// origin": the menu sets the mode, and these set it and act on it without leaving the keyboard.
+    /// There is no menu for this any more — the toolbar dropdown was replaced by an AutoCAD-style
+    /// bracketed prompt in the command box, which is where the rest of this app already asks
+    /// questions ("Specify center point for circle or [3P/2P/Ttr]:"):
     ///
-    ///   `click` / `centre` / `origin`      — set where new objects land
-    ///   `offset X Y [Z]`                   — set the mode AND the distance in one line
-    ///   `at X Y [Z]`                       — put the waiting object (or the selection) there now
-    ///   `place`                            — hand the SELECTION back to a placing click
+    ///   `place`            — Placement [Click/Centre/Origin/Offset] <current>:
+    ///   `@X,Y,Z`           — set the offset distance, in the working unit
+    ///
+    /// The mode words are still accepted on their own line, because a prompt you have to walk
+    /// through every time is slower than the thing it replaced.
     fn factory_place_command(&mut self, raw: &str) -> bool {
-        use crate::factory::{AwaitingPlace, PlaceMode};
+        use crate::factory::PlaceMode;
         let lc = raw.trim().to_ascii_lowercase();
-        let mut it = lc.split_whitespace();
-        let Some(head) = it.next() else { return false };
-        // Lengths are typed in the FACTORY's working unit, like every other 3D number.
-        let nums: Vec<f32> = it.filter_map(|t| t.parse::<f64>().ok()).map(|v| {
-            (v * self.factory.units.metres_per_unit) as f32
-        }).collect();
 
-        let set_mode = |app: &mut Self, m: PlaceMode| {
-            app.factory.place_mode = m;
-            if m != PlaceMode::Click {
-                app.factory.awaiting_place = None;
-            }
-            app.factory.status = m.hint().into();
-            app.history.push(format!("  place mode: {}", m.label()));
+        // `@X,Y,Z` — the coordinate. It sets the OFFSET and nothing else: an object already waiting
+        // for its click keeps waiting, which is what was asked for. Typing a distance from the
+        // origin and placing the thing in front of you are two different intentions.
+        if lc.starts_with('@') {
+            let Some(o) = Self::parse_at_coords(&lc, self.factory.units) else {
+                self.factory.status = "@X,Y,Z — two or three numbers, e.g. @900,0,0".into();
+                self.history.push("  @: expected @X,Y,Z".into());
+                return true;
+            };
+            self.factory.place_offset = o;
+            self.factory.place_mode = PlaceMode::Offset;
+            self.factory.awaiting_place = None;
+            let u = self.factory.units;
+            let msg = format!(
+                "New objects land at {}, {}, {} from the origin",
+                crate::factory::length_str(u, o[0]),
+                crate::factory::length_str(u, o[1]),
+                crate::factory::length_str(u, o[2]),
+            );
+            self.history.push(format!("  {msg}"));
+            self.factory.status = msg;
+            self.clear_prompt();
+            return true;
+        }
+
+        // An answer to the prompt below — or the same word typed cold, which does the same thing.
+        let answered = match lc.as_str() {
+            "click" => Some(PlaceMode::Click),
+            "centre" | "center" => Some(PlaceMode::Centre),
+            "origin" => Some(PlaceMode::Origin),
+            "offset" => Some(PlaceMode::Offset),
+            // Bare Enter at the prompt keeps what is already set — the AutoCAD <default>.
+            "" if self.place_prompt_open => Some(self.factory.place_mode),
+            _ => None,
         };
-
-        match head {
-            "click" => set_mode(self, PlaceMode::Click),
-            "centre" | "center" => set_mode(self, PlaceMode::Centre),
-            "origin" => set_mode(self, PlaceMode::Origin),
-            "offset" => {
-                // A bare `offset` selects the mode and keeps the distance already set; with numbers
-                // it sets both, because typing the distance is the whole reason to type this.
-                if nums.len() >= 2 {
-                    self.factory.place_offset =
-                        [nums[0], nums[1], nums.get(2).copied().unwrap_or(0.0)];
-                }
-                set_mode(self, PlaceMode::Offset);
+        if let Some(m) = answered {
+            self.place_prompt_open = false;
+            self.factory.place_mode = m;
+            // Switching AWAY from Click while something waits would strand it: armed forever, with
+            // no click coming for it.
+            if m != PlaceMode::Click {
+                self.factory.awaiting_place = None;
+            }
+            let msg = if m == PlaceMode::Offset {
                 let u = self.factory.units;
                 let o = self.factory.place_offset;
-                self.factory.status = format!(
-                    "New objects land at {}, {}, {} from the origin",
+                format!(
+                    "Offset from origin — type @X,Y,Z  (now {}, {}, {})",
                     crate::factory::length_str(u, o[0]),
                     crate::factory::length_str(u, o[1]),
                     crate::factory::length_str(u, o[2]),
-                );
-            }
-            "at" | "placeat" => {
-                if nums.len() < 2 {
-                    self.factory.status =
-                        "at X Y — the point to put it at, in the working unit".into();
-                    self.history.push("  at: needs X and Y".into());
-                    return true;
-                }
-                let p = glam::Vec3::new(nums[0], nums[1], 0.0);
-                // Nothing waiting? Then this is "move what is selected there" — the same question
-                // with the same answer, and refusing it would be pedantry.
-                if self.factory.awaiting_place.is_none() && !self.factory_arm_selection_placement() {
-                    self.factory.status = "at: nothing selected and nothing waiting".into();
-                    self.history.push("  at: nothing to place".into());
-                    return true;
-                }
-                self.factory_finish_awaited_placement(p);
-            }
-            "place" => {
-                if self.factory.awaiting_place.is_some() {
-                    self.factory.status = "Already waiting — click the 2D or 3D window".into();
-                    return true;
-                }
-                if !self.factory_arm_selection_placement() {
-                    self.factory.status = "place: select a solid or a furniture piece first".into();
-                    self.history.push("  place: nothing selected".into());
-                    return true;
-                }
-                let what = match self.factory.awaiting_place {
-                    Some(AwaitingPlace::Furniture(_)) => "furniture",
-                    _ => "solid",
-                };
-                self.factory.status =
-                    format!("Click the 2D or 3D window to place the {what}  [Esc leaves it]");
-                self.history.push(format!("  place: {what} — click either window"));
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    /// Hand the current 3D selection to a placing click. False when nothing is selected.
-    fn factory_arm_selection_placement(&mut self) -> bool {
-        use crate::factory::AwaitingPlace;
-        if let Some(i) = self.factory.sel_furn_primary() {
-            self.factory.awaiting_place = Some(AwaitingPlace::Furniture(i));
+                )
+            } else {
+                m.hint().to_string()
+            };
+            self.history.push(format!("  {msg}"));
+            self.factory.status = msg;
+            self.clear_prompt();
             return true;
         }
-        if let Some(&id) = self.factory.selection.first() {
-            self.factory.awaiting_place = Some(AwaitingPlace::Feature(id));
+        // An unrecognised reply to an open prompt is a typo, not a new command — say what was
+        // expected and keep asking, exactly as the 2D prompts do.
+        if self.place_prompt_open && !lc.is_empty() {
+            self.history.push(format!("  '{lc}' is not one of the options"));
+            self.set_place_prompt();
+            return true;
+        }
+
+        if lc == "place" || lc == "pl" {
+            self.set_place_prompt();
             return true;
         }
         false
+    }
+
+    /// Ask the placement question, AutoCAD-style: the options in brackets, the current setting as
+    /// the `<default>` that bare Enter accepts.
+    fn set_place_prompt(&mut self) {
+        self.place_prompt_open = true;
+        self.current_prompt = format!(
+            "Placement [Click/Centre/Origin/Offset] <{}>:",
+            self.factory.place_mode.keyword(),
+        );
     }
 
     /// Paint the computed lux grid as a 2D false-colour overlay on the plan,
@@ -7612,62 +7646,58 @@ impl CadApp {
         Some((Vec2::new(mnx, mny), Vec2::new(mxx, mxy)))
     }
 
-    /// The plane a standard view puts the 2D canvas on.
+    /// Put the 2D canvas on a plane from the view list. `None` = the ground plan.
     ///
-    /// ANCHORED on the SELECTION when there is one, else on the whole model — "show me this thing
-    /// from the front" and "show me the building from the front" are the same request with a
-    /// different subject, so they are the same control.
-    ///
-    /// The plane sits at the FAR side of the subject looking back through it, so the whole object
-    /// is in front of the drawing plane rather than half behind it.
-    fn factory_plan_view_frame(&self, view: crate::factory::PlanView) -> Option<cad_solid::Frame> {
-        use crate::factory::PlanView as PV;
-        use glam::Vec3;
-        if view == PV::Global {
-            return None;
+    /// It opens the sketch BY INDEX rather than by rebuilding a frame, which is what makes picking
+    /// a name out of the list and right-clicking the face itself land in the same place with the
+    /// same drawing on it.
+    fn factory_open_plane(&mut self, which: Option<usize>) {
+        match which {
+            None => {
+                self.factory_exit_sketch();
+                self.factory.status =
+                    "Ground plan — the drawing itself. Face planes are hidden here.".into();
+            }
+            Some(i) => {
+                let Some(frame) = self.factory.model.sketches.get(i).map(|s| s.frame) else {
+                    self.factory.status = "That plane is gone.".into();
+                    return;
+                };
+                let name = self.factory.model.sketches[i].name.clone();
+                self.factory_enter_sketch(frame);
+                self.factory.status =
+                    format!("{name} — every 2D tool draws on this plane, and stays on it.");
+            }
         }
-        let (mn, mx) = self
-            .factory
-            .selection_aabb()
-            .or_else(|| self.factory.features_aabb())?;
-        let c = (mn + mx) * 0.5;
-        let (origin, normal) = match view {
-            PV::Global => unreachable!(),
-            PV::Top => (Vec3::new(c.x, c.y, mx.z), Vec3::Z),
-            PV::Front => (Vec3::new(c.x, mn.y, c.z), -Vec3::Y),
-            PV::Back => (Vec3::new(c.x, mx.y, c.z), Vec3::Y),
-            PV::Left => (Vec3::new(mn.x, c.y, c.z), -Vec3::X),
-            PV::Right => (Vec3::new(mx.x, c.y, c.z), Vec3::X),
-        };
-        Some(cad_solid::Frame::from_point_normal(origin, normal))
     }
 
-    /// Switch the 2D canvas to a standard view.
+    /// Delete a face plane AND the drawing on it. Asked for as "there should be an option to delete
+    /// the face".
     ///
-    /// GLOBAL leaves any sketch and returns to the drawing. The others open — or REOPEN — a sketch
-    /// on that plane: `factory_enter_sketch` already reuses a coplanar sketch rather than starting
-    /// a blank one, so work drawn on a face before is still there when you come back to it.
-    fn factory_set_plan_view(&mut self, view: crate::factory::PlanView) {
-        use crate::factory::PlanView as PV;
-        if view == PV::Global {
+    /// Snapshotted, so it is one Ctrl+Z away: this throws work away, and the only safe way to offer
+    /// that in a single click is to make it reversible.
+    fn factory_delete_plane(&mut self, i: usize) {
+        let Some(sk) = self.factory.model.sketches.get(i) else { return };
+        let name = sk.name.clone();
+        let n = sk.doc.dobjects.len();
+        self.snapshot_factory();
+        // LEAVE IT FIRST if it is the one open, or the session would be left holding an index into
+        // a vector that no longer has that entry — and it would write its drawing back on the way
+        // out, into whichever plane had slid into the gap.
+        if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
             self.factory_exit_sketch();
-            self.factory.plan_view = PV::Global;
-            self.factory.status =
-                "Global view — the drawing's own plan. Sketches on other planes are hidden.".into();
-            return;
         }
-        let subject = if self.factory.selection_aabb().is_some() { "selection" } else { "model" };
-        let Some(frame) = self.factory_plan_view_frame(view) else {
-            self.factory.status =
-                "Nothing built yet — a standard view needs a model to look at.".into();
-            return;
-        };
-        self.factory_enter_sketch(frame);
-        self.factory.plan_view = view;
-        self.factory.status = format!(
-            "{} view of the {subject} — every 2D tool draws on this plane, and stays on it.",
-            view.label(),
-        );
+        self.factory.model.sketches.remove(i);
+        // Everything after the removed one moved down by one; a session pointing past it must
+        // follow, for the same reason.
+        if let Some(s) = self.factory.session.as_mut() {
+            if s.idx > i {
+                s.idx -= 1;
+            }
+        }
+        self.factory.dirty = true;
+        self.factory.status = format!("Deleted {name} and the {n} object(s) drawn on it — Ctrl+Z");
+        self.history.push(format!("  - plane '{name}' deleted ({n} object(s))"));
     }
 
     fn factory_enter_sketch(&mut self, frame: cad_solid::Frame) {
@@ -7676,7 +7706,9 @@ impl CadApp {
         }
         // REOPEN an existing sketch on this same plane rather than starting a blank new one,
         // so returning to a face shows the work already drawn there — otherwise every visit
-        // makes a fresh empty sketch and the previous drawing seems to vanish.
+        // makes a fresh empty sketch and the previous drawing seems to vanish. This is also what
+        // makes "when i click on the face again to sketch it should show the same plane" true:
+        // clicking a face and picking its name out of the view list land in the SAME sketch.
         let idx = match self
             .factory
             .model
@@ -7686,10 +7718,19 @@ impl CadApp {
         {
             Some(i) => i,
             None => {
-                self.factory.model.sketches.push(cad_solid::Sketch::new(frame));
+                // Name it after the object it is a face of, so it is findable in the view list
+                // before anyone gets round to renaming it.
+                let mut sk = cad_solid::Sketch::new(frame);
+                sk.name = self.factory.sketch_auto_name(&frame);
+                self.factory.model.sketches.push(sk);
                 self.factory.model.sketches.len() - 1
             }
         };
+        // A model loaded from a file written before planes had names carries blanks. Fill them in
+        // on the way past rather than showing an empty row in the list.
+        if self.factory.model.sketches[idx].name.is_empty() {
+            self.factory.model.sketches[idx].name = self.factory.sketch_auto_name(&frame);
+        }
         // Project the 3D object onto THIS sketch's plane so the 2D canvas shows it as a
         // reference (a "2D view of the object") rather than a blank void.
         self.factory.sketch_ref =
@@ -7725,9 +7766,6 @@ impl CadApp {
     /// Close the sketch: put the drawn document back into the model and restore the
     /// model-space document + its undo history.
     fn factory_exit_sketch(&mut self) {
-        // Back on the drawing, so the view toggle must say so. Leaving it reading "Front" while
-        // the canvas is the plan would make the control a label that lies.
-        self.factory.plan_view = crate::factory::PlanView::Global;
         self.factory.sketch_ref.clear();
         self.factory.editing_cutout = false; // any cutout-edit ends when the sketch closes
         if let Some(s) = self.factory.session.take() {
@@ -9997,61 +10035,6 @@ impl CadApp {
                     .response
                     .on_hover_text("The unit every length in the 3D Factory is typed and shown in");
 
-                    // WHERE new objects land. Beside the unit for the same reason: it is a decision
-                    // that applies to everything you are about to add, not a property of any one
-                    // thing. Reported as "the user has no control, it gets added at the origin".
-                    let pm = self.factory.place_mode;
-                    ui.menu_button(format!("▼ {}", pm.label()), |ui| {
-                        ui.label(
-                            egui::RichText::new("where new objects land").small().weak(),
-                        );
-                        for m in crate::factory::PlaceMode::ALL {
-                            if ui
-                                .selectable_label(m == pm, m.label())
-                                .on_hover_text(m.hint())
-                                .clicked()
-                            {
-                                self.factory.place_mode = m;
-                                // Switching AWAY from Click while something waits would leave it
-                                // stranded, armed forever with no click coming for it.
-                                if m != crate::factory::PlaceMode::Click {
-                                    self.factory.awaiting_place = None;
-                                }
-                                self.factory.status = m.hint().into();
-                                ui.close_menu();
-                            }
-                        }
-                        if self.factory.place_mode == crate::factory::PlaceMode::Offset {
-                            ui.separator();
-                            ui.label(egui::RichText::new("distance from origin").small().weak());
-                            let u = self.factory.units;
-                            for (axis, i) in [("X", 0usize), ("Y", 1), ("Z", 2)] {
-                                ui.horizontal(|ui| {
-                                    ui.label(axis);
-                                    crate::factory::length_ui(
-                                        ui,
-                                        u,
-                                        &mut self.factory.place_offset[i],
-                                        0.05,
-                                        -10_000.0,
-                                        10_000.0,
-                                    );
-                                });
-                            }
-                        }
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(
-                                "Applies to 3D solids, furniture, apertures and architecture.\n\
-                                 A door or window drawn on a wall is unaffected — it already\n\
-                                 goes exactly where you drew it.",
-                            )
-                            .small()
-                            .weak(),
-                        );
-                    })
-                    .response
-                    .on_hover_text(pm.hint());
 
                     ui.separator();
                     ui.menu_button("▼ 3D solids", |ui| {
@@ -24223,6 +24206,63 @@ impl CadApp {
 
     /// The "Radiance — offline render" window: progress while the pipeline runs, then the result
     /// image (or the log when it failed). Shown whenever a job exists; ✕ clears it.
+    /// Rename a face plane. Asked for as "the user can even rename these view[s] so they can
+    /// instantly look at a sketch they made" — the auto-name says what the face is ON, and this is
+    /// where it becomes what the drawing is OF.
+    fn render_rename_plane_dialog(&mut self, ctx: &egui::Context) {
+        let Some((i, mut text)) = self.factory.rename_plane.clone() else { return };
+        let mut open = true;
+        let mut commit = false;
+        egui::Window::new("Rename plane")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new("What is drawn on this face?").small().weak(),
+                );
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(240.0)
+                        .hint_text("Kitchen elevation"),
+                );
+                r.request_focus();
+                if r.lost_focus() && ui.input(|k| k.key_pressed(egui::Key::Enter)) {
+                    commit = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Rename").clicked() {
+                        commit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.factory.rename_plane = None;
+                    }
+                });
+            });
+        if !open {
+            self.factory.rename_plane = None;
+            return;
+        }
+        if commit {
+            let t = text.trim().to_string();
+            // An empty name would leave a blank row in the list. Refuse it by keeping the old one
+            // rather than by arguing about it.
+            if !t.is_empty() {
+                if let Some(sk) = self.factory.model.sketches.get_mut(i) {
+                    self.history.push(format!("  plane '{}' renamed to '{t}'", sk.name));
+                    sk.name = t;
+                    self.factory.dirty = true;
+                }
+            }
+            self.factory.rename_plane = None;
+            return;
+        }
+        // Keep the in-progress text between frames.
+        if let Some(s) = self.factory.rename_plane.as_mut() {
+            s.1 = text;
+        }
+    }
+
     fn render_radiance_dialog(&mut self, ctx: &egui::Context) {
         let Some(shared) = self.rad_job.clone() else { return };
         let mut close = false;
@@ -26381,7 +26421,23 @@ impl CadApp {
     fn build_simlux_config(&self) -> crate::simlux_io::SimluxConfig {
         let mut cfg = self.build_simlux_config_common();
         cfg.factory = self.factory.to_persist();
+        self.patch_open_sketch_into(&mut cfg);
         cfg
+    }
+
+    /// Put the OPEN sketch's live drawing into the record about to be written.
+    ///
+    /// Entering a sketch MOVES its document into `self.doc` for editing and leaves an empty shell
+    /// behind in `model.sketches` (see `factory_enter_sketch`). Saving while a face is open would
+    /// otherwise persist that empty shell — the drawing on screen would be the one thing missing
+    /// from the file. Same reasoning as `plan_doc`, which already picks the parked model-space
+    /// document for the main save.
+    fn patch_open_sketch_into(&self, cfg: &mut crate::simlux_io::SimluxConfig) {
+        let Some(i) = self.factory.session.as_ref().map(|s| s.idx) else { return };
+        let Some(rec) = cfg.factory.sketches.get_mut(i) else { return };
+        use base64::Engine;
+        rec.rsm_b64 =
+            base64::engine::general_purpose::STANDARD.encode(cad_io::rsm::write_rsm(&self.doc));
     }
 
     /// Config with furniture geometry LEFT OUT (empty blobs) — pair with
@@ -26389,6 +26445,7 @@ impl CadApp {
     fn build_simlux_config_lite(&self) -> crate::simlux_io::SimluxConfig {
         let mut cfg = self.build_simlux_config_common();
         cfg.factory = self.factory.to_persist_lite();
+        self.patch_open_sketch_into(&mut cfg);
         cfg
     }
 
@@ -37190,6 +37247,20 @@ impl eframe::App for CadApp {
         }
         let trigger = enter_now
             || (space_now && cmd_is_empty && !in_text_body);
+        // The placement prompt's `<default>`. AutoCAD's bare Enter accepts what is in the angle
+        // brackets, and the command-line TextEdit never forwards an empty line to the dispatcher —
+        // so the default has to be taken here or the brackets would be a lie.
+        if trigger && cmd_is_empty && self.place_prompt_open {
+            self.place_prompt_open = false;
+            let m = self.factory.place_mode;
+            self.history.push(format!("  {}", m.label()));
+            self.factory.status = m.hint().into();
+            self.clear_prompt();
+            if space_now {
+                self.cmd.clear();
+            }
+            return;
+        }
         // Persistent hatch pick-point — Enter ends the session.
         // Sits at the top of the cascade so it consumes Enter before
         // any of the other handlers (which might re-run the last
@@ -38882,6 +38953,7 @@ impl eframe::App for CadApp {
             self.render_pathtrace_dialog(ctx);
         }
         self.render_radiance_dialog(ctx); // shown only while a Radiance run exists
+        self.render_rename_plane_dialog(ctx); // shown only while a plane is being renamed
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
@@ -42859,20 +42931,41 @@ impl eframe::App for CadApp {
                 }
             }
 
-            // ---- VIEW TOGGLE — which plane the 2D canvas is drawing on -----------------------
+            // ---- VIEW LIST — which plane the 2D canvas is drawing on -------------------------
             //
-            // GLOBAL is the drawing itself: the ground plan, and the only one of these that is not
-            // a sketch plane. The other five stand IN THE MODEL and are opened through the same
-            // route as "draw on this face" — so every 2D tool works there unchanged, and anything
-            // drawn on a plane is still there when you come back to it.
+            // This used to be a fixed row of Top / Front / Back / Left / Right views of the whole
+            // model. It is now the FACES ACTUALLY DRAWN ON, because that is what someone is looking
+            // for when they come back to a drawing:
             //
-            // The subject follows the SELECTION: pick an object and the views are of that object;
-            // pick nothing and they are of the whole model. One control, because it is one request.
+            //   "instead of showing the planes like top, left right etc, lets get rid of it. now it
+            //    will show only faces as planes the user draws on, the user can even rename these
+            //    view[s] so they can instantly look at a sketch they made. instead of showing the
+            //    whole side view, it will only show whatever face as a plane the user is drawing
+            //    on."
+            //
+            // GROUND PLAN stays, and is the only entry that is not a sketch plane: it is the drawing
+            // itself, the document every 2D tool has always worked on.
+            //
+            // The list IS `model.sketches`, so a face reached by right-clicking it in 3D and a face
+            // picked by name here are the same plane with the same drawing on it — there is no
+            // second record to fall out of step.
             {
-                let cur = self.factory.plan_view;
-                let has_model = self.factory.features_aabb().is_some();
-                let subject = if self.factory.selection_aabb().is_some() { "selection" } else { "model" };
-                let mut want: Option<crate::factory::PlanView> = None;
+                let open = self.factory.session.as_ref().map(|s| s.idx);
+                let names: Vec<(usize, String)> = self
+                    .factory
+                    .model
+                    .sketches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.name.clone()))
+                    .collect();
+                let cur_label = match open {
+                    Some(i) => names.get(i).map(|(_, n)| n.clone()).unwrap_or_else(|| "Plane".into()),
+                    None => "Ground plan".to_string(),
+                };
+                let mut want: Option<Option<usize>> = None; // Some(None) = ground plan
+                let mut rename: Option<usize> = None;
+                let mut delete: Option<usize> = None;
                 egui::Area::new(egui::Id::new("plan_view_toggle"))
                     .fixed_pos(rect.left_top() + egui::vec2(10.0, 6.0))
                     .order(egui::Order::Middle)
@@ -42880,34 +42973,60 @@ impl eframe::App for CadApp {
                         egui::Frame::popup(ui.style())
                             .inner_margin(egui::Margin::symmetric(6.0, 3.0))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    for v in crate::factory::PlanView::ALL {
-                                        // Only GLOBAL is reachable with nothing built — the rest
-                                        // need something to stand a plane against.
-                                        let usable = v == crate::factory::PlanView::Global || has_model;
-                                        let hint = if usable {
-                                            format!("{} — of the {subject}", v.hint())
-                                        } else {
-                                            "Build something first — a view needs a model to look at".into()
-                                        };
-                                        if ui
-                                            .add_enabled(
-                                                usable,
-                                                egui::SelectableLabel::new(cur == v, v.label()),
+                                ui.menu_button(format!("▼ {cur_label}"), |ui| {
+                                    ui.set_min_width(200.0);
+                                    if ui
+                                        .selectable_label(open.is_none(), "Ground plan")
+                                        .on_hover_text("The drawing itself — the plan every 2D tool has always worked on")
+                                        .clicked()
+                                    {
+                                        want = Some(None);
+                                        ui.close_menu();
+                                    }
+                                    if names.is_empty() {
+                                        ui.separator();
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "No face planes yet.\nRight-click a face in 3D and\nchoose \"draw on this face\".",
                                             )
-                                            .on_hover_text(hint)
-                                            .clicked()
-                                        {
-                                            want = Some(v);
-                                        }
+                                            .small()
+                                            .weak(),
+                                        );
+                                        return;
+                                    }
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("faces drawn on").small().weak());
+                                    for (i, name) in &names {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .selectable_label(open == Some(*i), name)
+                                                .clicked()
+                                            {
+                                                want = Some(Some(*i));
+                                                ui.close_menu();
+                                            }
+                                            if ui.small_button("✎").on_hover_text("Rename").clicked() {
+                                                rename = Some(*i);
+                                                ui.close_menu();
+                                            }
+                                            if ui.small_button("🗑").on_hover_text("Delete this plane and the drawing on it").clicked() {
+                                                delete = Some(*i);
+                                                ui.close_menu();
+                                            }
+                                        });
                                     }
                                 });
                             });
                     });
-                if let Some(v) = want {
-                    if v != cur {
-                        self.factory_set_plan_view(v);
-                    }
+                if let Some(w) = want {
+                    self.factory_open_plane(w);
+                }
+                if let Some(i) = rename {
+                    self.factory.rename_plane =
+                        Some((i, names.get(i).map(|(_, n)| n.clone()).unwrap_or_default()));
+                }
+                if let Some(i) = delete {
+                    self.factory_delete_plane(i);
                 }
             }
 
@@ -46352,7 +46471,9 @@ impl CadApp {
         //
         // In any other view the canvas IS a sketch on that plane, so the same rule holds by
         // construction: you see the plane you are on.
-        let ground_only = self.factory.plan_view == crate::factory::PlanView::Global;
+        // The GROUND PLAN shows only what is drawn on it. A face plane is its own drawing, and
+        // stacking every plane on the plan is what "global view" was invented to stop.
+        let ground_only = self.factory.session.is_none();
         for (i, sk) in self.factory.model.sketches.iter().enumerate() {
             if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
                 continue; // the active sketch is the live canvas — don't double-draw it
@@ -51686,136 +51807,6 @@ mod room_regressions {
     }
 }
 
-/// Standard orthographic views for the 2D canvas.
-///
-/// Asked for as: the 2D side only ever shows the ground plan, and other planes are reachable only
-/// by right-clicking a face. There should be a toggle for Top / Front / Back / Left / Right — of
-/// the selected object if one is selected, of the whole model if not — and the global view should
-/// show only what is drawn on the ground plane.
-#[cfg(test)]
-mod plan_views {
-    use super::*;
-    use crate::factory::PlanView as PV;
-
-    fn square(m: f32) -> Vec<glam::Vec2> {
-        vec![
-            glam::Vec2::new(0.0, 0.0),
-            glam::Vec2::new(m, 0.0),
-            glam::Vec2::new(m, m),
-            glam::Vec2::new(0.0, m),
-            glam::Vec2::new(0.0, 0.0),
-        ]
-    }
-
-    fn with_building() -> CadApp {
-        let mut app = CadApp::default();
-        app.factory.add_building_outline(&square(10.0), 4.0).expect("building");
-        app.factory.recompute();
-        app
-    }
-
-    /// Each view faces the axis its name implies, and the five model views are real planes.
-    #[test]
-    fn every_view_faces_the_direction_it_is_named_after() {
-        let app = with_building();
-        for (v, want) in [
-            (PV::Top, glam::Vec3::Z),
-            (PV::Front, -glam::Vec3::Y),
-            (PV::Back, glam::Vec3::Y),
-            (PV::Left, -glam::Vec3::X),
-            (PV::Right, glam::Vec3::X),
-        ] {
-            let f = app.factory_plan_view_frame(v).expect("a model exists");
-            assert!(
-                f.normal().dot(want) > 0.999,
-                "{} should look along {want:?}, got {:?}",
-                v.label(),
-                f.normal(),
-            );
-        }
-        assert!(app.factory_plan_view_frame(PV::Global).is_none(), "Global is the drawing, not a plane");
-    }
-
-    /// The plane sits at the FAR side of the subject, so the whole thing is in front of it rather
-    /// than half behind the drawing plane.
-    #[test]
-    fn the_plane_stands_clear_of_the_subject() {
-        let app = with_building();
-        let (mn, mx) = app.factory.features_aabb().expect("bounds");
-        assert!((app.factory_plan_view_frame(PV::Front).unwrap().origin.y - mn.y).abs() < 1e-3);
-        assert!((app.factory_plan_view_frame(PV::Back).unwrap().origin.y - mx.y).abs() < 1e-3);
-        assert!((app.factory_plan_view_frame(PV::Left).unwrap().origin.x - mn.x).abs() < 1e-3);
-        assert!((app.factory_plan_view_frame(PV::Right).unwrap().origin.x - mx.x).abs() < 1e-3);
-        assert!((app.factory_plan_view_frame(PV::Top).unwrap().origin.z - mx.z).abs() < 1e-3);
-    }
-
-    /// **The subject follows the selection.** Nothing selected → the whole model. Something
-    /// selected → that object. One control, because it is one request with a different subject.
-    #[test]
-    fn the_view_is_of_the_selection_when_there_is_one() {
-        let mut app = with_building();
-        let whole = app.factory_plan_view_frame(PV::Front).unwrap().origin;
-
-        // A small solid off to one side, selected.
-        let id = app.factory.model.push(
-            cad_solid::BoolOp::Union,
-            cad_solid::Plane::default(),
-            cad_solid::Placement { u: 30.0, v: 30.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
-            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
-        );
-        app.factory.selection = vec![id];
-        let picked = app.factory_plan_view_frame(PV::Front).unwrap().origin;
-        assert!(
-            (picked - whole).length() > 5.0,
-            "the view should re-anchor on the selection, moved only {:.2} m",
-            (picked - whole).length(),
-        );
-    }
-
-    /// With nothing built there is no plane to stand, and the app says so rather than silently
-    /// doing nothing.
-    #[test]
-    fn a_view_needs_something_to_look_at() {
-        let mut app = CadApp::default();
-        assert!(app.factory_plan_view_frame(PV::Front).is_none());
-        app.factory_set_plan_view(PV::Front);
-        assert_eq!(app.factory.plan_view, PV::Global, "it stays where it was");
-        assert!(app.factory.status.contains("Nothing built"), "and explains: {}", app.factory.status);
-    }
-
-    /// Switching to a view opens a sketch on that plane; returning to Global leaves it. Coming
-    /// BACK to the same view reopens the same sketch, so work drawn there is still there.
-    #[test]
-    fn a_view_is_a_sketch_plane_and_returning_reopens_it() {
-        let mut app = with_building();
-        app.factory_set_plan_view(PV::Front);
-        assert_eq!(app.factory.plan_view, PV::Front);
-        assert!(app.factory.session.is_some(), "the canvas is now a sketch on that plane");
-        let n = app.factory.model.sketches.len();
-
-        app.factory_set_plan_view(PV::Global);
-        assert_eq!(app.factory.plan_view, PV::Global);
-        assert!(app.factory.session.is_none(), "back on the drawing");
-
-        app.factory_set_plan_view(PV::Front);
-        assert_eq!(
-            app.factory.model.sketches.len(),
-            n,
-            "returning REOPENS the same sketch rather than starting a blank one",
-        );
-    }
-
-    /// Leaving a sketch by any route puts the toggle back to Global — a control that says "Front"
-    /// while the canvas is the plan is a label that lies.
-    #[test]
-    fn leaving_a_sketch_resets_the_toggle() {
-        let mut app = with_building();
-        app.factory_set_plan_view(PV::Left);
-        assert_eq!(app.factory.plan_view, PV::Left);
-        app.factory_exit_sketch();
-        assert_eq!(app.factory.plan_view, PV::Global);
-    }
-}
 
 /// The 2D overlay of the 3D model.
 ///
@@ -52038,20 +52029,69 @@ mod command_target {
         }
     }
 
-    /// `offset 2000 500` in millimetres is 2 m, 0.5 m — typed lengths go through the FACTORY's
-    /// working unit like every other 3D number. Reading them as metres is the class of bug that
-    /// built a 4.4 km building.
+    /// `@900,0,0` in millimetres is 0.9 m — typed lengths go through the FACTORY's working unit
+    /// like every other 3D number. Reading them as metres is the class of bug that built a 4.4 km
+    /// building.
     #[test]
-    fn offset_is_typed_in_the_working_unit() {
+    fn at_coordinates_are_typed_in_the_working_unit() {
         let mut app = app_in_3d();
         app.factory.units = cad_kernel::DocUnits::new(
             cad_kernel::DocUnits::MM,
             cad_kernel::UnitSource::User,
         );
-        app.run_command("offset 2000 500");
+        app.run_command("@900,0,0");
         assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Offset);
-        assert!((app.factory.place_offset[0] - 2.0).abs() < 1e-6, "{:?}", app.factory.place_offset);
-        assert!((app.factory.place_offset[1] - 0.5).abs() < 1e-6, "{:?}", app.factory.place_offset);
+        assert!((app.factory.place_offset[0] - 0.9).abs() < 1e-6, "{:?}", app.factory.place_offset);
+    }
+
+    /// Both forms were described — "they will type @(their coordinates)" — and neither is wrong, so
+    /// both parse, with a comma or a space between the numbers.
+    #[test]
+    fn the_coordinate_may_be_written_several_ways() {
+        let u = cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        for form in ["@900,0,0", "@(900,0,0)", "@(900, 0, 0)", "@900 0 0", "@900,0"] {
+            let got = CadApp::parse_at_coords(form, u)
+                .unwrap_or_else(|| panic!("{form} must parse"));
+            assert!((got[0] - 900.0).abs() < 1e-3, "{form} → {got:?}");
+            assert!(got[1].abs() < 1e-6 && got[2].abs() < 1e-6, "{form} → {got:?}");
+        }
+        // …and nonsense is refused rather than silently read as zero.
+        for bad in ["@", "@abc", "@1", "@1,2,3,4", "900,0,0"] {
+            assert!(CadApp::parse_at_coords(bad, u).is_none(), "{bad} must not parse");
+        }
+    }
+
+    /// The coordinate sets the OFFSET and nothing else. An object already waiting for its click
+    /// keeps waiting — typing a distance from the origin and placing the thing in front of you are
+    /// two different intentions.
+    #[test]
+    fn a_typed_coordinate_leaves_a_waiting_object_waiting() {
+        let mut app = app_in_3d();
+        app.factory.units = cad_kernel::DocUnits::new(
+            cad_kernel::DocUnits::M,
+            cad_kernel::UnitSource::User,
+        );
+        app.factory.add_box();
+        let id = *app.factory.selection.first().unwrap();
+        let before = app
+            .factory
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| (f.placement.u, f.placement.v))
+            .unwrap();
+        app.run_command("@12,34");
+        let after = app
+            .factory
+            .model
+            .features
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| (f.placement.u, f.placement.v))
+            .unwrap();
+        assert_eq!(before, after, "the waiting box must not move");
+        assert!((app.factory.place_offset[0] - 12.0).abs() < 1e-6, "…but the offset is set");
     }
 
     /// Switching away from Click while something waits would strand it: armed forever, with no
@@ -52065,49 +52105,341 @@ mod command_target {
         assert!(app.factory.awaiting_place.is_none(), "nothing may be left waiting");
     }
 
-    /// `at X Y` is the typed half of the placing click — the same point, from the keyboard.
+    /// `place` ASKS, in brackets, the way every other command in this app asks — "Specify center
+    /// point for circle or [3P/2P/Ttr]:". The dropdown that used to ask this is gone.
     #[test]
-    fn at_places_the_waiting_object_without_a_click() {
+    fn place_opens_a_bracketed_prompt() {
         let mut app = app_in_3d();
-        app.factory.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::M,
-            cad_kernel::UnitSource::User,
-        );
-        app.factory.add_box();
-        let id = *app.factory.selection.first().unwrap();
-        app.run_command("at 12 34");
-        assert!(app.factory.awaiting_place.is_none(), "the wait is over");
-        let f = app.factory.model.features.iter().find(|f| f.id == id).unwrap();
-        let (w, d) = match f.primitive {
-            cad_solid::Primitive::Box { w, d, .. } => (w, d),
-            _ => panic!("a box"),
-        };
-        assert!((f.placement.u - (12.0 + w * 0.5)).abs() < 1e-4, "u = {}", f.placement.u);
-        assert!((f.placement.v - (34.0 + d * 0.5)).abs() < 1e-4, "v = {}", f.placement.v);
+        app.run_command("place");
+        assert!(app.place_prompt_open, "the prompt must be waiting for an answer");
+        let p = app.current_prompt.clone();
+        for want in ["Placement", "Click", "Centre", "Origin", "Offset"] {
+            assert!(p.contains(want), "the options must be visible: {p:?} is missing {want}");
+        }
+        assert!(p.contains("<click>"), "and the current setting is the default: {p:?}");
     }
 
-    /// `place` re-arms something already built, so a piece can be repositioned by the same gesture
-    /// that put it down.
+    /// The next line answers it.
     #[test]
-    fn place_hands_the_selection_back_to_a_click() {
+    fn answering_the_prompt_sets_the_mode() {
         let mut app = app_in_3d();
-        app.factory.place_mode = crate::factory::PlaceMode::Centre; // nothing waiting
-        app.factory.add_box();
-        assert!(app.factory.awaiting_place.is_none());
         app.run_command("place");
-        let id = *app.factory.selection.first().unwrap();
+        app.run_command("origin");
+        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Origin);
+        assert!(!app.place_prompt_open, "…and the prompt closes");
+        assert!(app.current_prompt.is_empty());
+    }
+
+    /// A typo at an open prompt is a typo, not a new command: say what was expected and keep
+    /// asking, exactly as the 2D prompts do.
+    #[test]
+    fn a_bad_answer_keeps_asking() {
+        let mut app = app_in_3d();
+        app.run_command("place");
+        app.run_command("banana");
+        assert!(app.place_prompt_open, "the question is still open");
+        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Click, "nothing changed");
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(last.contains("not one of the options"), "got {last:?}");
+    }
+
+    /// Choosing Offset points at the coordinate, because that is the next thing to type.
+    #[test]
+    fn choosing_offset_asks_for_the_coordinate() {
+        let mut app = app_in_3d();
+        app.run_command("place");
+        app.run_command("offset");
+        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Offset);
+        assert!(app.factory.status.contains("@X,Y,Z"), "got {:?}", app.factory.status);
+    }
+}
+
+/// THE VIEW LIST — the faces actually drawn on, instead of fixed orthographic views.
+///
+/// Asked for as: "the views in cad[,] lets overhaul it. instead of showing the planes like top,
+/// left right etc, lets get rid of it. now it will show only faces as planes the user draws on, the
+/// user can even rename these view[s] so they can instantly look at a sketch they made. instead of
+/// showing the whole side view, it will only show whatever face as a plane the user is drawing on."
+/// Plus: "when i click on the face again to sketch it should show the same plane. there should be
+/// an option to delete the face."
+#[cfg(test)]
+mod view_planes {
+    use super::*;
+
+    fn a_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.building_height = 3.0;
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(6.0, 0.0),
+                    glam::Vec2::new(6.0, 6.0),
+                    glam::Vec2::new(0.0, 6.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    fn wall_face() -> cad_solid::Frame {
+        // A point on the +X wall, looking at it.
+        cad_solid::Frame::from_point_normal(glam::Vec3::new(6.0, 3.0, 1.5), glam::Vec3::X)
+    }
+
+    /// A plane only exists once it has been DRAWN ON. Nothing is offered up front.
+    #[test]
+    fn the_list_starts_with_nothing_but_the_ground_plan() {
+        let app = a_building();
+        assert!(app.factory.model.sketches.is_empty(), "no faces until one is drawn on");
+        assert!(app.factory.session.is_none(), "…and the canvas is the ground plan");
+    }
+
+    /// THE KEY BEHAVIOUR. Clicking the same face twice must land in the same plane with the same
+    /// drawing on it — not a second, empty plane that looks like the work vanished.
+    #[test]
+    fn returning_to_a_face_returns_to_the_same_plane() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        let first = app.factory.session.as_ref().expect("in a sketch").idx;
+        app.factory_exit_sketch();
+
+        app.factory_enter_sketch(wall_face());
+        let again = app.factory.session.as_ref().expect("in a sketch").idx;
+        assert_eq!(first, again, "the same face must reopen the same plane");
+        assert_eq!(app.factory.model.sketches.len(), 1, "and must NOT make a second one");
+    }
+
+    /// …and so must picking it by name out of the list.
+    #[test]
+    fn opening_a_plane_by_name_is_the_same_plane() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        let idx = app.factory.session.as_ref().unwrap().idx;
+        app.factory_open_plane(None); // back to the ground plan
+        assert!(app.factory.session.is_none());
+
+        app.factory_open_plane(Some(idx));
+        assert_eq!(app.factory.session.as_ref().map(|s| s.idx), Some(idx));
+    }
+
+    /// Named after the object the face belongs to, so an unrenamed plane is still findable.
+    #[test]
+    fn a_new_plane_is_named_after_what_it_is_a_face_of() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        let name = app.factory.model.sketches[0].name.clone();
+        assert!(name.starts_with("Building 1"), "got {name:?}");
+        assert!(name.contains("face 1"), "and says which face: {name:?}");
+
+        // A second face of the same object counts on.
+        app.factory_exit_sketch();
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(
+            glam::Vec3::new(3.0, 0.0, 1.5),
+            glam::Vec3::Y,
+        ));
+        let second = app.factory.model.sketches[1].name.clone();
+        assert!(second.contains("face 2"), "got {second:?}");
+    }
+
+    /// A room is the thing with a name the USER chose, so it wins over the solid it was carved out
+    /// of — that is the name they will look for.
+    #[test]
+    fn a_face_inside_a_named_room_takes_the_rooms_name() {
+        let mut app = a_building();
+        app.factory
+            .add_room(&vec![
+                glam::Vec2::new(1.0, 1.0),
+                glam::Vec2::new(5.0, 1.0),
+                glam::Vec2::new(5.0, 5.0),
+                glam::Vec2::new(1.0, 5.0),
+                glam::Vec2::new(1.0, 1.0),
+            ])
+            .expect("room");
+        app.factory.rooms[0].name = "Kitchen".into();
+        app.factory.recompute();
+
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(
+            glam::Vec3::new(3.0, 3.0, 1.2),
+            glam::Vec3::X,
+        ));
+        let name = app.factory.model.sketches[0].name.clone();
+        assert!(name.starts_with("Kitchen"), "got {name:?}");
+    }
+
+    /// Renaming is the whole point — "so they can instantly look at a sketch they made".
+    #[test]
+    fn a_plane_can_be_renamed() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.factory.model.sketches[0].name = "Kitchen elevation".into();
+        assert_eq!(app.factory.model.sketches[0].name, "Kitchen elevation");
+    }
+
+    /// Deleting a face takes its drawing with it, and is one Ctrl+Z away.
+    #[test]
+    fn a_plane_can_be_deleted() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.factory_exit_sketch();
+        assert_eq!(app.factory.model.sketches.len(), 1);
+
+        app.factory_delete_plane(0);
+        assert!(app.factory.model.sketches.is_empty(), "the plane is gone");
+        app.run_command("undo");
+        assert_eq!(app.factory.model.sketches.len(), 1, "…and undo brings it back");
+    }
+
+    /// Deleting the plane you are STANDING ON must leave it first. Otherwise the session keeps an
+    /// index into a vector that no longer has that entry, and writes its drawing back on the way
+    /// out — into whichever plane slid into the gap.
+    #[test]
+    fn deleting_the_open_plane_leaves_it_first() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        assert!(app.factory.session.is_some());
+        app.factory_delete_plane(0);
+        assert!(app.factory.session.is_none(), "it must not still be open");
+        assert!(app.factory.model.sketches.is_empty());
+    }
+
+    /// Deleting an EARLIER plane shifts every index after it. A session that does not follow would
+    /// save its drawing into the wrong plane on the way out.
+    #[test]
+    fn deleting_an_earlier_plane_keeps_the_open_one_open() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face()); // sketch 0
+        app.factory_exit_sketch();
+        let second = cad_solid::Frame::from_point_normal(
+            glam::Vec3::new(3.0, 0.0, 1.5),
+            glam::Vec3::Y,
+        );
+        app.factory_enter_sketch(second); // sketch 1 — and stay in it
+        assert_eq!(app.factory.session.as_ref().unwrap().idx, 1);
+        let open_name = app.factory.model.sketches[1].name.clone();
+
+        app.factory_delete_plane(0);
+        assert_eq!(app.factory.session.as_ref().map(|s| s.idx), Some(0), "index must follow");
         assert_eq!(
-            app.factory.awaiting_place,
-            Some(crate::factory::AwaitingPlace::Feature(id)),
+            app.factory.model.sketches[0].name, open_name,
+            "and it is still the SAME plane, not the one that was deleted",
         );
+    }
+}
+
+/// FACE PLANES SURVIVE A SAVE.
+///
+/// `cad_solid::Model::sketches` is `#[serde(skip)]` and always was, so a face sketch lived only as
+/// long as the app was open. That was survivable while a plane was something you re-picked off the
+/// model each time. It is not survivable now that planes are a NAMED LIST you go back to — "so they
+/// can instantly look at a sketch they made" is not true of a view that is gone after a save.
+#[cfg(test)]
+mod sketch_persistence {
+    use super::*;
+
+    fn a_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(6.0, 0.0),
+                    glam::Vec2::new(6.0, 6.0),
+                    glam::Vec2::new(0.0, 6.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    fn wall_face() -> cad_solid::Frame {
+        cad_solid::Frame::from_point_normal(glam::Vec3::new(6.0, 3.0, 1.5), glam::Vec3::X)
+    }
+
+    fn a_line() -> cad_kernel::Geom {
+        cad_kernel::Geom::Line(cad_kernel::geom::Line {
+            a: cad_kernel::math::Vec2::new(0.0, 0.0),
+            b: cad_kernel::math::Vec2::new(1.0, 2.0),
+        })
     }
 
     #[test]
-    fn place_with_nothing_selected_says_so() {
-        let mut app = app_in_3d();
-        app.factory.place_mode = crate::factory::PlaceMode::Centre;
-        app.run_command("place");
-        assert!(app.factory.awaiting_place.is_none());
-        assert!(app.factory.status.contains("select"), "got {:?}", app.factory.status);
+    fn a_named_plane_and_its_drawing_come_back() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.doc.push(cad_kernel::DObject::new(a_line()));
+        app.factory_exit_sketch(); // the drawing goes back into the sketch
+        app.factory.model.sketches[0].name = "Kitchen elevation".into();
+        let frame = app.factory.model.sketches[0].frame;
+
+        let doc = app.factory.to_persist();
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(doc);
+
+        assert_eq!(back.model.sketches.len(), 1, "the plane must survive");
+        assert_eq!(back.model.sketches[0].name, "Kitchen elevation", "…with its name");
+        assert_eq!(back.model.sketches[0].doc.dobjects.len(), 1, "…and its drawing");
+        // The plane must stand where it stood, or a reopened view looks at the wrong face.
+        let f = back.model.sketches[0].frame;
+        assert!((f.origin - frame.origin).length() < 1e-4, "{:?} vs {:?}", f.origin, frame.origin);
+        assert!((f.normal() - frame.normal()).length() < 1e-4, "the plane must face the same way");
+    }
+
+    /// THE TRAP. Entering a sketch MOVES its document into `CadApp::doc` and leaves an empty shell
+    /// in the model, so a save taken while a face is OPEN would write that shell — the drawing on
+    /// screen would be the one thing missing from the file.
+    #[test]
+    fn saving_while_a_face_is_open_saves_what_is_on_screen() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.doc.push(cad_kernel::DObject::new(a_line()));
+        app.doc.push(cad_kernel::DObject::new(a_line()));
+        assert!(
+            app.factory.model.sketches[0].doc.dobjects.is_empty(),
+            "precondition: the model's copy IS the empty shell while the sketch is open",
+        );
+
+        let cfg = app.build_simlux_config();
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(cfg.factory);
+        assert_eq!(
+            back.model.sketches[0].doc.dobjects.len(),
+            2,
+            "the live drawing must be what was written, not the shell left behind",
+        );
+    }
+
+    /// A project written before planes were saved carries none, and then the model has no planes —
+    /// which is exactly what it had before. It must not fail to load.
+    #[test]
+    fn an_older_project_loads_with_no_planes() {
+        let app = a_building();
+        let mut doc = app.factory.to_persist();
+        doc.sketches.clear();
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(doc);
+        assert!(back.model.sketches.is_empty());
+    }
+
+    /// A drawing that will not decode costs the DRAWING, not the plane: a named face with nothing
+    /// on it can be drawn on again, where a dropped plane is a view that silently went missing.
+    #[test]
+    fn a_corrupt_drawing_still_leaves_the_plane() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.factory_exit_sketch();
+        let mut doc = app.factory.to_persist();
+        doc.sketches[0].rsm_b64 = "!!! not base64 !!!".into();
+
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(doc);
+        assert_eq!(back.model.sketches.len(), 1, "the plane must still be there");
+        assert!(back.model.sketches[0].doc.dobjects.is_empty());
     }
 }
