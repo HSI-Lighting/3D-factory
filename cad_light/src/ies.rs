@@ -31,7 +31,18 @@ pub struct IesProfile {
     /// four times brighter than its outline suggests. Using the outline under-states luminance and
     /// therefore under-states UGR — the direction that passes a design which should fail. Falls
     /// back to the outline when the file declares no separate aperture.
+    ///
+    /// `#[serde(default)]` because these arrived AFTER projects were already being saved, and
+    /// without it every one of those projects stopped opening: serde refuses a missing field, so a
+    /// whole scheme became unreadable because its photometry predated a glare calculation it had
+    /// never used. Found by loading the user's own `testfiles.simlux.json` through the real loader
+    /// — nothing else exercised that path, because everything else builds its scenes in code.
+    ///
+    /// Zero is also the honest default. It means "no aperture declared", which excludes the fitting
+    /// from UGR rather than inventing an area for it.
+    #[serde(default)]
     pub luminous_length: f64,
+    #[serde(default)]
     pub luminous_width: f64,
 }
 

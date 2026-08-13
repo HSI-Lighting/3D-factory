@@ -2919,3 +2919,128 @@ mod curved_lights_are_real_lights {
         assert!(warm[2] < mid[2] && mid[2] < cool[2], "blue must rise with CCT: {warm:?} {mid:?} {cool:?}");
     }
 }
+
+/// THE REBUILT PROJECT FILES, END TO END.
+///
+/// `identical_dialux_furniture.rs` proves the ENGINE against DIALux by assembling the scene in
+/// code. That leaves a gap wide enough to drive a project through: the app does not assemble
+/// scenes in code, it loads them from a `.simlux.json` and derives the meshes from a CSG feature
+/// tree. A room that is right in the test and wrong in the file — a ceiling slab at the wrong
+/// height, furniture floating, a fitting 150 mm low — reads as a correct engine and a wrong answer.
+///
+/// The user's own `testfiles.simlux.json` was exactly that: its ceiling slab sat at 0.52 m, so the
+/// room's clear height was 0.37 m rather than 4.000, and the bike stood on top of the misplaced
+/// slab. This loads the corrected files through the app's REAL loader and checks the room they
+/// describe against DIALux, so the geometry is verified rather than asserted.
+#[cfg(test)]
+mod the_project_file_describes_the_dialux_room {
+    use super::*;
+
+    /// Where the files are. Skipped, loudly, when it is not set.
+    fn dir() -> Option<String> {
+        std::env::var("IDENTICAL_PROJECTS").ok()
+    }
+
+    struct Case {
+        file: &'static str,
+        /// Ē as the matching DIALux report states it (t3's summary is stale, so it has none).
+        dialux: Option<f64>,
+    }
+    const CASES: [Case; 3] = [
+        Case { file: "t1 with furniture.simlux.json", dialux: Some(199.0) },
+        Case { file: "t2 with furniture.simlux.json", dialux: Some(336.0) },
+        Case { file: "t3 with furniture.simlux.json", dialux: None },
+    ];
+
+    #[test]
+    #[ignore = "needs IDENTICAL_PROJECTS=<folder of rebuilt .simlux.json files>"]
+    fn the_rebuilt_files_reproduce_dialux() {
+        let Some(dir) = dir() else {
+            println!("set IDENTICAL_PROJECTS to the folder holding the rebuilt project files");
+            return;
+        };
+        for case in &CASES {
+            let path = format!("{dir}/{}", case.file);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let cfg: crate::simlux_io::SimluxConfig =
+                serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
+
+            // Through the app's own loader, not a hand-built FactoryState.
+            let mut f = crate::factory::FactoryState::default();
+            f.apply_persist(cfg.factory.clone());
+            f.recompute();
+            let meshes = meshes_from_factory(&f);
+            assert!(!meshes.is_empty(), "{}: the file produced no geometry at all", case.file);
+
+            // THE GEOMETRY THE FILE DESCRIBES. Check it before checking the light, so a wrong
+            // answer says WHICH thing is wrong.
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for m in &meshes {
+                for v in &m.vertices {
+                    for (k, c) in [v.x, v.y, v.z].into_iter().enumerate() {
+                        lo[k] = lo[k].min(c);
+                        hi[k] = hi[k].max(c);
+                    }
+                }
+            }
+            println!("\n=== {} ===", case.file);
+            println!("  model z {:.3} .. {:.3} m   ({} meshes)", lo[2], hi[2], meshes.len());
+            let furn = meshes.iter().find(|m| m.material == cad_light::MATERIAL_FURNITURE);
+            let fz = furn.map(|m| m.vertices.iter().fold(f32::MAX, |a, v| a.min(v.z)));
+            println!("  furniture base z {:?}   luminaires {}", fz, cfg.luminaires.len());
+            assert!(
+                fz.is_some_and(|z| z.abs() < 0.02),
+                "{}: the furniture must stand ON the floor, base at z = {:?}",
+                case.file,
+                fz,
+            );
+            assert!(
+                cfg.luminaires.iter().all(|l| (l.position.z - 4.0).abs() < 1e-3),
+                "{}: DIALux mounts at 4.000 m",
+                case.file,
+            );
+
+            // The room's own footprint, so the grid can be laid on it the way DIALux lays it.
+            let room = f.rooms.first().expect("the file carries a room");
+            let (rx, ry) = (
+                room.footprint.iter().fold(f32::MAX, |a, p| a.min(p[0])),
+                room.footprint.iter().fold(f32::MAX, |a, p| a.min(p[1])),
+            );
+            const WALL_ZONE: f32 = 0.010;
+            let plane = cad_light::CalcPlane {
+                origin: cad_light::Vertex::new(rx + WALL_ZONE, ry + WALL_ZONE, cfg.plane_height),
+                width: 4.0 - 2.0 * WALL_ZONE,
+                depth: 4.0 - 2.0 * WALL_ZONE,
+                cols: 8,
+                rows: 8,
+            };
+            let profiles: HashMap<String, IesProfile> =
+                cfg.ies_library.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let settings = RaySettings { rays_per_point: 4096, max_bounces: 8, shadows: true };
+            let grid = cad_light::calculate_maintained(
+                &meshes,
+                &cfg.luminaires,
+                &profiles,
+                &cfg.materials,
+                &plane,
+                &settings,
+                cfg.maintenance.expect("the file states its maintenance factor"),
+            );
+            let avg = grid.values.iter().sum::<f64>() / grid.values.len() as f64;
+            for r in 0..8 {
+                println!(
+                    "  r{r}  {}",
+                    (0..8).map(|c| format!("{:>6.0}", grid.values[r * 8 + c])).collect::<Vec<_>>().join(""),
+                );
+            }
+            match case.dialux {
+                Some(want) => {
+                    let err = (avg - want) / want * 100.0;
+                    println!("  E average {avg:>8.1} lx   DIALux {want:>6.0}   {err:>+6.2}%");
+                    assert!(err.abs() < 3.0, "{}: {avg:.1} lx against DIALux's {want:.0}", case.file);
+                }
+                None => println!("  E average {avg:>8.1} lx   (that report's summary is stale)"),
+            }
+        }
+    }
+}
