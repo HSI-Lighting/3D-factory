@@ -797,3 +797,275 @@ mod tests {
         assert!(g.u0() > 0.0 && g.u0() <= 1.0);
     }
 }
+
+/// What one room surface receives, and gives back.
+///
+/// EN 12464-1 does not stop at the work plane: it sets maintained illuminance and uniformity for
+/// WALLS and CEILINGS too — an office wants roughly 50 lx on walls and 30 lx on the ceiling, each
+/// at U₀ ≥ 0.10 — and a scheme that passes on the desk can still fail on those. Luminance is the
+/// quantity the appearance clauses are written in, and for a Lambertian surface it is `ρE/π`.
+#[derive(Debug, Clone)]
+pub struct SurfaceResult {
+    pub material: crate::types::MaterialId,
+    pub name: String,
+    /// Total area of the surfaces sharing this material (m²).
+    pub area_m2: f64,
+    /// Area-weighted mean illuminance ON the surface (lx).
+    pub e_avg: f64,
+    pub e_min: f64,
+    pub e_max: f64,
+    /// Area-weighted mean luminance, `ρ·E/π` (cd/m²).
+    pub l_avg: f64,
+    /// `E_min / E_avg` over the samples taken on this surface.
+    pub u0: f64,
+    /// Samples taken. Reported because a coarse sample makes a minimum look too high here for
+    /// exactly the reason it does on the work plane.
+    pub samples: usize,
+}
+
+/// Illuminance and luminance on every room surface, grouped by material.
+///
+/// `samples_per_m2` sets the density; every triangle gets at least one point. Points are placed on
+/// a stratified barycentric pattern rather than at centroids — a centroid-only sample of a large
+/// wall reports the middle of it and calls that the minimum.
+pub fn surface_report(
+    meshes: &[Mesh],
+    luminaires: &[Luminaire],
+    profiles: &HashMap<String, IesProfile>,
+    materials: &[Material],
+    settings: &RaySettings,
+    maintenance: Maintenance,
+    samples_per_m2: f64,
+) -> Vec<SurfaceResult> {
+    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    // material id -> (area, sum of E*area, min, max, samples)
+    let mut acc: std::collections::BTreeMap<u32, (f64, f64, f64, f64, usize)> = Default::default();
+
+    for mesh in meshes {
+        for tri in &mesh.triangles {
+            let (a, b, c) = (
+                v3(mesh.vertices[tri.a as usize]),
+                v3(mesh.vertices[tri.b as usize]),
+                v3(mesh.vertices[tri.c as usize]),
+            );
+            let cross = (b - a).cross(c - a);
+            let area = 0.5 * cross.length() as f64;
+            if area <= 1e-9 {
+                continue;
+            }
+            // The INWARD normal — the side facing the room, and so the side that receives light. A
+            // surface sampled on its back reads zero and would quietly drag a wall's average down.
+            let mut n = cross.normalize_or_zero();
+            if let Some(l) = luminaires.first() {
+                let centroid = (a + b + c) / 3.0;
+                if (v3(l.position) - centroid).dot(n) < 0.0 {
+                    n = -n;
+                }
+            }
+
+            let want = ((area * samples_per_m2).ceil() as usize).clamp(1, 64);
+            let e = acc.entry(mesh.material).or_insert((0.0, 0.0, f64::MAX, 0.0, 0));
+            for k in 0..want {
+                // Stratified barycentric: spread over the triangle rather than clustered.
+                let t = (k as f64 + 0.5) / want as f64;
+                let s = ((k as f64 + 0.5) * 0.618_033_988_75).fract(); // golden ratio, low discrepancy
+                let (mut u, mut v) = (t.sqrt(), s);
+                if u + v > 1.0 {
+                    u = 1.0 - u;
+                    v = 1.0 - v;
+                }
+                let p = a + (b - a) * u as f32 + (c - a) * v as f32;
+                // Lifted off the surface, or the point is shadowed by the triangle it sits on.
+                let lx = ev.illuminance(p + n * 1.0e-3, n);
+                let share = area / want as f64;
+                e.0 += share;
+                e.1 += lx * share;
+                e.2 = e.2.min(lx);
+                e.3 = e.3.max(lx);
+                e.4 += 1;
+            }
+        }
+    }
+
+    acc.into_iter()
+        .map(|(id, (area, sum, min, max, samples))| {
+            let mat = materials.iter().find(|m| m.id == id);
+            let rho = mat.map(|m| m.reflectance as f64).unwrap_or(0.0);
+            let e_avg = if area > 0.0 { sum / area } else { 0.0 };
+            SurfaceResult {
+                material: id,
+                name: mat.map(|m| m.name.clone()).unwrap_or_else(|| format!("material {id}")),
+                area_m2: area,
+                e_avg,
+                e_min: if min.is_finite() { min } else { 0.0 },
+                e_max: max,
+                l_avg: rho * e_avg / PI,
+                u0: if e_avg > 0.0 { min / e_avg } else { 0.0 },
+                samples,
+            }
+        })
+        .collect()
+}
+
+/// SURFACE ILLUMINANCE AND LUMINANCE.
+///
+/// EN 12464-1 sets maintained levels for walls and ceilings, not only the work plane, and a scheme
+/// that passes on the desk can still fail on those. The engine could already answer this one point
+/// at a time; a report needs the surface.
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+    use crate::extrude::box_room;
+    use crate::types::default_materials;
+
+    fn isotropic(cd: f64) -> IesProfile {
+        IesProfile {
+            name: "iso".into(),
+            photometry: crate::ies::PhotometryType::C,
+            lumens: 4.0 * PI * cd,
+            multiplier: 1.0,
+            vertical_angles: vec![0.0, 90.0, 180.0],
+            horizontal_angles: vec![0.0, 360.0],
+            candela: vec![vec![cd, cd, cd], vec![cd, cd, cd]],
+            watts: 1.0,
+            width: 0.0,
+            length: 0.0,
+            height: 0.0,
+            luminous_length: 0.0,
+            luminous_width: 0.0,
+        }
+    }
+
+    fn lamp(x: f32, y: f32, z: f32) -> Vec<Luminaire> {
+        vec![Luminaire {
+            id: 1,
+            profile: "iso".into(),
+            position: Vertex::new(x, y, z),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        }]
+    }
+
+    fn prof(cd: f64) -> HashMap<String, IesProfile> {
+        let mut m = HashMap::new();
+        m.insert("iso".to_string(), isotropic(cd));
+        m
+    }
+
+    /// THE CLOSED-FORM CHECK. In a closed enclosure of total area `A` and UNIFORM reflectance `ρ`,
+    /// a flux `Φ` produces an area-weighted mean surface illuminance of `Φ / (A(1−ρ))` — every
+    /// photon lands eventually, having bounced `1/(1−ρ)` times on average.
+    ///
+    /// Independent of the engine: it follows from conservation of energy, not from any part of the
+    /// code under test. Agreement means the sampling, the areas and the interreflection are all
+    /// right together.
+    #[test]
+    fn surface_illuminance_matches_the_radiosity_closed_form() {
+        const S: f32 = 4.0;
+        const RHO: f32 = 0.5;
+        let cd = 100.0;
+        let flux = 4.0 * PI * cd; // isotropic
+        let area = 6.0 * (S as f64).powi(2);
+        let expected = flux / (area * (1.0 - RHO as f64));
+
+        let meshes = box_room(S, S, S);
+        let materials: Vec<Material> =
+            default_materials().into_iter().map(|m| Material { reflectance: RHO, ..m }).collect();
+        // Enough bounces for a rho = 0.5 room to converge (mean path is 1/(1-rho) = 2), and enough
+        // rays to average out; more of either only costs seconds.
+        let settings = RaySettings { rays_per_point: 384, max_bounces: 14, shadows: true };
+        let rows = surface_report(
+            &meshes,
+            &lamp(S * 0.5, S * 0.5, S * 0.5),
+            &prof(cd),
+            &materials,
+            &settings,
+            Maintenance::INITIAL,
+            2.0,
+        );
+
+        let total_area: f64 = rows.iter().map(|r| r.area_m2).sum();
+        let weighted =
+            rows.iter().map(|r| r.e_avg * r.area_m2).sum::<f64>() / total_area;
+        assert!(
+            (total_area - area).abs() < 1e-3,
+            "the six faces should total {area} m2, got {total_area}",
+        );
+        assert!(
+            (weighted - expected).abs() / expected < 0.05,
+            "mean surface illuminance {weighted:.1} lx against the closed form {expected:.1}",
+        );
+    }
+
+    /// Luminance is `ρE/π`, and surfaces differ in ρ — so the BRIGHTEST surface need not be the
+    /// most lit one. A ceiling at 0.70 outshines a floor at 0.20 receiving comparable light.
+    #[test]
+    fn luminance_follows_reflectance_not_just_illuminance() {
+        let meshes = box_room(4.0, 4.0, 3.0);
+        let materials = default_materials(); // floor 0.20, wall 0.50, ceiling 0.70
+        let settings = RaySettings { rays_per_point: 512, max_bounces: 6, shadows: true };
+        let rows = surface_report(
+            &meshes,
+            &lamp(2.0, 2.0, 1.5),
+            &prof(100.0),
+            &materials,
+            &settings,
+            Maintenance::INITIAL,
+            2.0,
+        );
+
+        let get = |n: &str| rows.iter().find(|r| r.name == n).expect(n).clone();
+        let (floor, ceil) = (get("Floor"), get("Ceiling"));
+        // The source is centred, so floor and ceiling receive comparable illuminance...
+        assert!(
+            (floor.e_avg - ceil.e_avg).abs() / floor.e_avg < 0.35,
+            "floor {:.0} lx vs ceiling {:.0} lx",
+            floor.e_avg,
+            ceil.e_avg,
+        );
+        // ...but the ceiling is far brighter to look at.
+        assert!(
+            ceil.l_avg > floor.l_avg * 2.0,
+            "ceiling {:.1} cd/m2 should outshine floor {:.1}",
+            ceil.l_avg,
+            floor.l_avg,
+        );
+        // And every row carries the identity it claims.
+        for r in &rows {
+            let rho = materials.iter().find(|m| m.id == r.material).unwrap().reflectance as f64;
+            assert!((r.l_avg - rho * r.e_avg / PI).abs() < 1e-9, "{} broke L = rho E / pi", r.name);
+        }
+    }
+
+    /// Every surface is reported, with its real area. A wall silently missing would look like a
+    /// compliant room.
+    #[test]
+    fn every_surface_is_accounted_for() {
+        let meshes = box_room(4.0, 5.0, 3.0);
+        let materials = default_materials();
+        let settings = RaySettings { rays_per_point: 128, max_bounces: 2, shadows: true };
+        let rows = surface_report(
+            &meshes,
+            &lamp(2.0, 2.5, 1.5),
+            &prof(50.0),
+            &materials,
+            &settings,
+            Maintenance::INITIAL,
+            1.0,
+        );
+        assert_eq!(rows.len(), 3, "floor, walls and ceiling");
+        let get = |n: &str| rows.iter().find(|r| r.name == n).expect(n).clone();
+        assert!((get("Floor").area_m2 - 20.0).abs() < 1e-3);
+        assert!((get("Ceiling").area_m2 - 20.0).abs() < 1e-3);
+        // Four walls: 2*(4*3) + 2*(5*3) = 54 m2.
+        assert!((get("Wall").area_m2 - 54.0).abs() < 1e-3, "got {}", get("Wall").area_m2);
+        for r in &rows {
+            assert!(r.samples > 0 && r.e_avg > 0.0, "{} was never sampled", r.name);
+            assert!(
+                r.e_min <= r.e_avg && r.e_avg <= r.e_max,
+                "{}: min/avg/max out of order",
+                r.name
+            );
+        }
+    }
+}

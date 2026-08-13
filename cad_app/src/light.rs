@@ -271,6 +271,9 @@ pub struct LightState {
     /// the desks and still read as flat and cave-like, and this is the only number that says so —
     /// EN 12464-1 asks for at least 50 lx in most occupied spaces, and more where faces matter.
     pub cylindrical_avg: Option<f64>,
+    /// Per-surface illuminance and luminance from the last calculation — walls and ceiling, which
+    /// EN 12464-1 sets levels for and the work plane says nothing about.
+    pub surfaces: Vec<cad_light::SurfaceResult>,
     /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
     pub luminaires: Vec<Luminaire>,
     pub auto_center_light: bool,
@@ -356,6 +359,7 @@ impl LightState {
             installation: None,
             eye_height: 1.2,
             cylindrical_avg: None,
+            surfaces: Vec::new(),
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
@@ -957,6 +961,21 @@ impl LightState {
             }
             Some(sum / (N * N) as f64)
         };
+        // ROOM SURFACES — walls and ceiling, which EN 12464-1 sets levels for and which the work
+        // plane says nothing about.
+        //
+        // 1 sample/m² and the same ray settings: this is a room-average figure per surface, and the
+        // cost scales with the room's whole surface area rather than the grid, so a fine sample
+        // here would dominate the calculation to refine a number quoted to the nearest lux.
+        self.surfaces = cad_light::surface_report(
+            &meshes,
+            &lums,
+            &self.profiles,
+            &self.materials,
+            &self.settings,
+            self.maintenance,
+            1.0,
+        );
         // What the scheme costs to run, over the area actually assessed. The calculation plane's
         // extent, not the true floor area — for an L-shaped room those differ, and the honest thing
         // is to say which one the density is per, which the UI does.
@@ -1771,6 +1790,26 @@ impl LightState {
                         &format!("Cylindrical  Ez @ {:.1} m", self.eye_height),
                         format!("{ez:.0} lx"),
                     );
+                }
+                // ROOM SURFACES. EN 12464-1 does not stop at the work plane — it sets maintained
+                // levels for walls and ceilings too (an office wants roughly 50 lx on walls and
+                // 30 lx on the ceiling, each at U₀ ≥ 0.10), and a scheme that passes on the desk
+                // can still fail on those. Luminance is the quantity the appearance clauses are
+                // written in, and for a diffuse surface it is ρE/π — so a bright ceiling and a
+                // dark floor can receive the same light and look nothing alike.
+                if !self.surfaces.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("room surfaces").small().weak());
+                    for s in &self.surfaces {
+                        row(
+                            ui,
+                            &format!("{}  ({:.0} m²)", s.name, s.area_m2),
+                            format!(
+                                "{:.0} lx   {:.0} cd/m²   U₀ {:.2}",
+                                s.e_avg, s.l_avg, s.u0
+                            ),
+                        );
+                    }
                 }
             });
             // Ez is the one number that says whether the space renders faces. A room can hold its
