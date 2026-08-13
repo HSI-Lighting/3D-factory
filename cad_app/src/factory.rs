@@ -974,6 +974,12 @@ pub struct FactoryState {
     pub place_pending: Option<Primitive>,
 
     /// WHERE a newly added object lands. See [`PlaceMode`] and [`FactoryState::place_at`].
+    /// Has this project been asked what unit it is built in? Persisted, so the question is asked
+    /// ONCE — a modal on every visit gets dismissed unread, which is how a unit warning stops
+    /// warning anybody.
+    pub unit_asked: bool,
+    /// The unit question is on screen right now.
+    pub ask_unit: bool,
     pub place_mode: PlaceMode,
     /// A face plane being renamed: its index and the text being typed. `None` = no dialog open.
     pub rename_plane: Option<(usize, String)>,
@@ -2928,6 +2934,8 @@ impl Default for FactoryState {
             // CLICK by default. The complaint was that everything landed at the origin with no say
             // in it; the fix is not a better default position, it is being ASKED. Switch it to
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
+            unit_asked: false,
+            ask_unit: false,
             place_mode: PlaceMode::Click,
             rename_plane: None,
             place_offset: [0.0, 0.0, 0.0],
@@ -5822,6 +5830,7 @@ impl FactoryState {
             working_unit_m: self.units.metres_per_unit,
             place_mode: Some(self.place_mode),
             place_offset: Some(self.place_offset),
+            unit_asked: Some(self.unit_asked),
             // FACE PLANES. `Model::sketches` is `#[serde(skip)]`, so without this a named view and
             // everything drawn on it is gone the moment the project is reopened — which would make
             // a list you go back to worse than no list at all.
@@ -6023,6 +6032,10 @@ impl FactoryState {
         if let Some(m) = d.place_mode {
             self.place_mode = m;
         }
+        // A project that RECORDS a unit has answered the question, whether or not the flag exists:
+        // every file written before the flag did carries `working_unit_m`, and re-asking someone who
+        // already told us is exactly the "shows every time" the dialog is meant to avoid.
+        self.unit_asked = d.unit_asked.unwrap_or(d.working_unit_m > 0.0);
         if let Some(o) = d.place_offset {
             self.place_offset = o;
         }

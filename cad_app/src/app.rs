@@ -1466,6 +1466,9 @@ pub struct CadApp {
     /// Open/closed state for each dockable Window panel. Default true
     /// for the most-used panels. Toggled from the Tools menu.
     cmd_window_open:     bool,
+    /// Was the 3D Factory on screen LAST frame? The rising edge is what `on_factory_opened`
+    /// fires on -- thirty places set `factory.open`, and none of them has to know.
+    factory_was_open:    bool,
     /// Screen rect of the top menu-bar panel (updated each frame). Used to
     /// keep a hover-opened category menu open while the pointer is still over
     /// its button, and close it once the pointer leaves both bar and popup.
@@ -3546,6 +3549,7 @@ impl Default for CadApp {
             press_time:          None,
             press_pos:           None,
             cmd_window_open:     true,
+            factory_was_open:    false,
             menubar_rect:        egui::Rect::NOTHING,
             cmd_dock_state:      crate::dock::DockState::Floating(egui::pos2(360.0, 560.0)),
             layers_window_open:  false,
@@ -24225,6 +24229,88 @@ impl CadApp {
 
     /// The "Radiance — offline render" window: progress while the pipeline runs, then the result
     /// image (or the log when it failed). Shown whenever a job exists; ✕ clears it.
+    /// Everything that happens the moment the 3D Factory comes on screen.
+    ///
+    /// Asked for as: "theres a chance a user can miss it and draw with the wrong units. lets add a
+    /// pop up dialogue box when the user opens 3d factory for the 1st time. this shouldn't show
+    /// every time … but make sure a command window opens everytime the user opens 3d factory."
+    ///
+    /// Two different frequencies, on purpose. The DIALOG is a one-off — a question already answered
+    /// is not worth asking again, and a modal on every visit gets dismissed unread, which is how a
+    /// unit warning stops warning anybody. The COMMAND WINDOW opens every single time, with the
+    /// working unit on its first line: unmissable, and costing nothing to ignore.
+    fn on_factory_opened(&mut self) {
+        // Unmissable. `3D command:` already carries the unit and the placement mode as a live
+        // readout (see `command_bar_body`), so this makes sure it is on screen to be read.
+        self.cmd_window_open = true;
+        let u = self.factory.units;
+        self.history.push(format!(
+            "  3D Factory — working unit: {}. Everything you type is in {}.",
+            u.label(),
+            u.label(),
+        ));
+        // Never asked on this project, and the project did not arrive carrying an answer.
+        if !self.factory.unit_asked {
+            self.factory.ask_unit = true;
+        }
+    }
+
+    /// Ask, ONCE, what unit this project is built in.
+    ///
+    /// The unit selector is the first control on the Factory toolbar and it is still easy to walk
+    /// straight past — and drawing a building at 1000× is not a mistake you notice until the model
+    /// is a 4.4 km sheet. Every option is a valid answer, so there is no Cancel: whatever is
+    /// clicked IS the answer, and the question is not asked again.
+    fn render_unit_prompt_dialog(&mut self, ctx: &egui::Context) {
+        if !self.factory.ask_unit {
+            return;
+        }
+        let cur = self.factory.units;
+        let mut chosen: Option<f64> = None;
+        egui::Window::new("What unit are you building in?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    "Every length you type in the 3D Factory — wall heights, room sizes, \
+                     offsets — is read in this unit.",
+                );
+                ui.add_space(6.0);
+                for (label, m) in [
+                    ("Millimetres   mm", cad_kernel::DocUnits::MM),
+                    ("Centimetres   cm", cad_kernel::DocUnits::CM),
+                    ("Metres   m", cad_kernel::DocUnits::M),
+                    ("Inches   in", cad_kernel::DocUnits::INCH),
+                    ("Feet   ft", cad_kernel::DocUnits::FOOT),
+                ] {
+                    let on = (cur.metres_per_unit - m).abs() < 1e-9;
+                    if ui.add_sized([340.0, 26.0], egui::SelectableLabel::new(on, label)).clicked() {
+                        chosen = Some(m);
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Geometry is always stored in metres, so this never moves anything and \
+                         you can change it later from the first menu on the Factory toolbar. \
+                         Asked once per project.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        if let Some(m) = chosen {
+            self.factory.units = cad_kernel::DocUnits::new(m, cad_kernel::UnitSource::User);
+            self.factory.unit_asked = true;
+            self.factory.ask_unit = false;
+            let l = self.factory.units.label();
+            self.factory.status = format!("Working unit: {l}. Nothing moved.");
+            self.history.push(format!("  working unit set to {l}"));
+        }
+    }
+
     /// Rename a face plane. Asked for as "the user can even rename these view[s] so they can
     /// instantly look at a sketch they made" — the auto-name says what the face is ON, and this is
     /// where it becomes what the drawing is OF.
@@ -36674,6 +36760,13 @@ impl eframe::App for CadApp {
         // still the truth about the keystroke.
         self.focus_at_frame_start = ctx.memory(|m| m.focused());
 
+        // THE 3D FACTORY JUST OPENED. Detected as a TRANSITION rather than hooked into the thirty
+        // places that set `factory.open = true` — the menu, the toolbar, every architecture
+        // generator, every import. One hook cannot be forgotten by the thirty-first.
+        if self.factory.open && !self.factory_was_open {
+            self.on_factory_opened();
+        }
+        self.factory_was_open = self.factory.open;
 
         // Install the global design-token Visuals so every default-styled widget
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
@@ -38973,6 +39066,7 @@ impl eframe::App for CadApp {
         }
         self.render_radiance_dialog(ctx); // shown only while a Radiance run exists
         self.render_rename_plane_dialog(ctx); // shown only while a plane is being renamed
+        self.render_unit_prompt_dialog(ctx);  // once per project, the first time the Factory opens
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
@@ -52471,5 +52565,147 @@ mod sketch_persistence {
         back.apply_persist(doc);
         assert_eq!(back.model.sketches.len(), 1, "the plane must still be there");
         assert!(back.model.sketches[0].doc.dobjects.is_empty());
+    }
+}
+
+/// ASK WHAT UNIT THIS IS, ONCE.
+///
+/// Asked for as: "theres a chance a user can miss it and draw with the wrong units. lets add a pop
+/// up dialogue box when the user opens 3d factory for the 1st time. this shouldn't show every time
+/// the user opens 3d factory. once set they can go in the place to change units but make sure a
+/// command window opens everytime the user opens 3d factory."
+///
+/// Two frequencies on purpose: the dialog once, the command window every time.
+#[cfg(test)]
+mod unit_prompt {
+    use super::*;
+
+    /// One frame's worth of the open-transition check, which is all `update` does for this.
+    fn tick(app: &mut CadApp) {
+        if app.factory.open && !app.factory_was_open {
+            app.on_factory_opened();
+        }
+        app.factory_was_open = app.factory.open;
+    }
+
+    #[test]
+    fn opening_the_factory_the_first_time_asks() {
+        let mut app = CadApp::default();
+        assert!(!app.factory.ask_unit, "nothing is asked before the Factory is opened");
+        app.factory.open = true;
+        tick(&mut app);
+        assert!(app.factory.ask_unit, "the first open must ask");
+    }
+
+    /// THE POINT OF "once". A modal on every visit gets dismissed unread.
+    #[test]
+    fn it_does_not_ask_again_once_answered() {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        tick(&mut app);
+        // Answer it, the way the dialog does.
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::CM, cad_kernel::UnitSource::User);
+        app.factory.unit_asked = true;
+        app.factory.ask_unit = false;
+
+        // Close and reopen, twice.
+        for _ in 0..2 {
+            app.factory.open = false;
+            tick(&mut app);
+            app.factory.open = true;
+            tick(&mut app);
+            assert!(!app.factory.ask_unit, "asked again after it had been answered");
+        }
+        assert!(
+            (app.factory.units.metres_per_unit - cad_kernel::DocUnits::CM).abs() < 1e-12,
+            "…and the answer stands",
+        );
+    }
+
+    /// The command window opens EVERY time — that is the half that is meant to be unmissable.
+    #[test]
+    fn the_command_window_opens_every_time() {
+        let mut app = CadApp::default();
+        app.factory.unit_asked = true; // already answered; only the window behaviour is under test
+        for _ in 0..3 {
+            app.cmd_window_open = false; // …the user closed it
+            app.factory.open = false;
+            tick(&mut app);
+            app.factory.open = true;
+            tick(&mut app);
+            assert!(app.cmd_window_open, "the command window must come back every time");
+        }
+    }
+
+    /// …and it says which unit, because a window that opens and says nothing warns nobody.
+    #[test]
+    fn it_states_the_working_unit_on_opening() {
+        let mut app = CadApp::default();
+        app.factory.unit_asked = true;
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::FOOT, cad_kernel::UnitSource::User);
+        app.factory.open = true;
+        tick(&mut app);
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(last.contains("working unit"), "got {last:?}");
+        assert!(last.contains(&app.factory.units.label()), "…and names it: {last:?}");
+    }
+
+    /// Staying open is not re-opening. The transition is the rising edge, or every frame would
+    /// re-open the command window and the user could never close it.
+    #[test]
+    fn a_factory_that_stays_open_does_not_re_fire() {
+        let mut app = CadApp::default();
+        app.factory.unit_asked = true;
+        app.factory.open = true;
+        tick(&mut app);
+        let n = app.history.len();
+        app.cmd_window_open = false; // the user closes it while the Factory is still open
+        for _ in 0..5 {
+            tick(&mut app);
+        }
+        assert_eq!(app.history.len(), n, "it announced itself again without being reopened");
+        assert!(!app.cmd_window_open, "…and forced the window back open");
+    }
+
+    /// The answer belongs to the PROJECT, and travels with it.
+    #[test]
+    fn the_answer_survives_a_save() {
+        let mut st = crate::factory::FactoryState::default();
+        st.unit_asked = true;
+        let doc = st.to_persist();
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(doc);
+        assert!(back.unit_asked, "a reopened project must not be asked again");
+    }
+
+    /// A project written before the flag existed still RECORDS its unit, and a recorded unit is an
+    /// answer. Re-asking someone who already told us is exactly the "shows every time" this is
+    /// meant to avoid.
+    #[test]
+    fn an_older_project_that_declares_a_unit_is_not_asked() {
+        let mut st = crate::factory::FactoryState::default();
+        st.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        let mut doc = st.to_persist();
+        doc.unit_asked = None; // as written by a build that predates the flag
+        assert!(doc.working_unit_m > 0.0, "precondition: it does record a unit");
+
+        let mut back = crate::factory::FactoryState::default();
+        back.apply_persist(doc);
+        assert!(back.unit_asked, "a declared unit IS the answer");
+    }
+
+    /// A brand-new project has nothing recorded, so it IS asked.
+    #[test]
+    fn a_project_with_no_unit_recorded_is_asked() {
+        let mut doc = crate::factory::FactoryState::default().to_persist();
+        doc.unit_asked = None;
+        doc.working_unit_m = 0.0;
+        let mut back = crate::factory::FactoryState::default();
+        back.unit_asked = true; // …even if this session had already answered for another project
+        back.apply_persist(doc);
+        assert!(!back.unit_asked);
     }
 }

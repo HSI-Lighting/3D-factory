@@ -149,6 +149,11 @@ pub struct FactoryDoc {
     /// FACE PLANES and the drawings on them — see [`SketchRec`].
     #[serde(default)]
     pub sketches: Vec<SketchRec>,
+    /// Has this project been asked what unit it is built in? Absent in a file written before the
+    /// question existed — and such a file already declares `working_unit_m`, which IS an answer,
+    /// so the loader treats a recorded unit as consent and does not re-ask.
+    #[serde(default)]
+    pub unit_asked: Option<bool>,
 }
 
 /// One face plane as persisted: where it stands, what it is called, and the drawing on it.
