@@ -1997,6 +1997,10 @@ pub struct CadApp {
     materials: MaterialsFactoryState,
     /// The ⏺ Render (path tracer) window is open.
     render_modal_open: bool,
+    /// Was the SIMLUX workspace split on LAST frame? Only the transition matters: the panel's
+    /// width is forced to half the window on the frame the split is entered, and left alone (drag
+    /// handle and all) every frame after.
+    simlux_split_prev: bool,
     /// The running/finished path-trace job, its live preview texture, and the last pass uploaded.
     pt_job: Option<crate::pathtrace::RenderJob>,
     /// The GPU render job (fragment-shader tracer), stepped from the UI thread each frame.
@@ -3728,6 +3732,7 @@ impl Default for CadApp {
             materials_open: false,
             materials: MaterialsFactoryState::default(),
             render_modal_open: false,
+            simlux_split_prev: false,
             pt_job: None,
             pt_gpu: None,
             pt_gl: None,
@@ -12663,16 +12668,34 @@ impl CadApp {
         // you were doing. Half is a sensible place to START; it is not a sensible place to be
         // stuck, since the whole point of the split is to work in BOTH halves.
         //
-        // `default_width` applies on first use and egui remembers the drag afterwards, per panel
-        // id — so it opens where it always did and then stays where you put it.
+        // …but `default_width` is NOT a substitute for it, and swapping one for the other broke
+        // entering the workspace. egui stores a panel's width per id and `default_width` applies
+        // only the FIRST time that id is ever shown — so on any installation that had already
+        // opened the SIMLUX panel, entering the split reused whatever width was remembered from
+        // the 360-wide toggled panel instead of taking half the window. The split then opened
+        // wrong, and the 3D Factory panel beside it took the space, which is how "the simlux
+        // window is completely broken" looks.
+        //
+        // So force the width on the frame the workspace is ENTERED — which is what half-the-window
+        // always meant, a starting position — and leave it freely resizable every frame after.
         let max = (ctx.screen_rect().width() - 260.0).max(260.0);
+        let entering_split = split && !self.simlux_split_prev;
+        self.simlux_split_prev = split;
         let base = egui::SidePanel::right("simlux_3d_panel")
             .resizable(true)
             .min_width(220.0)
             // Never let it swallow the window: the half it is paired with has to stay usable, and a
             // panel dragged past the far edge cannot be dragged back.
             .max_width(max);
-        let base = if split { base.default_width(half) } else { base.default_width(360.0) };
+        let base = if entering_split {
+            // One frame of exact_width pins the STORED width to half; from the next frame on the
+            // drag handle is back and it stays wherever the user puts it.
+            base.exact_width(half)
+        } else if split {
+            base.default_width(half)
+        } else {
+            base.default_width(360.0)
+        };
         base
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -54030,6 +54053,73 @@ mod only_the_materials_factory_paints {
         assert!(
             app.factory.surface_texture.is_empty(),
             "arming must not paint anything on its own",
+        );
+    }
+}
+
+/// ENTERING THE SIMLUX WORKSPACE PUTS THE PANEL AT HALF THE WINDOW.
+///
+/// The split used `exact_width(half)`, which is a LOCK — no drag handle, exactly 50 % whatever you
+/// were doing — and the user asked for it to be adjustable like the other windows. Replacing it
+/// with `default_width(half)` made it adjustable and broke entering the workspace, because egui
+/// stores a panel's width per id and `default_width` applies only the first time that id is EVER
+/// shown. On any installation that had already opened the SIMLUX panel once, entering the split
+/// silently reused the remembered width of the 360-wide toggled panel.
+///
+/// Both properties are required: it must OPEN at half, and it must then be draggable. The transition
+/// is what carries the first, so the panel width is forced on the frame the split is entered and
+/// left alone every frame after.
+#[cfg(test)]
+mod the_simlux_split_opens_at_half {
+    use super::*;
+
+    fn panel_source() -> &'static str {
+        let src = include_str!("app.rs");
+        let a = src.find("fn render_light_3d_panel").expect("the panel exists");
+        let b = src[a..].find("\n    fn ").map(|e| a + e).unwrap_or(src.len());
+        &src[a..b]
+    }
+
+    /// It must still be resizable — the original report.
+    #[test]
+    fn it_is_resizable() {
+        let body = panel_source();
+        assert!(body.contains(".resizable(true)"), "the panel must have a drag handle");
+        assert!(
+            body.contains(".min_width(") && body.contains(".max_width("),
+            "…and bounds, so it cannot be dragged somewhere it cannot be dragged back from",
+        );
+    }
+
+    /// And entering the split must FORCE the width, not merely suggest it.
+    #[test]
+    fn entering_the_split_forces_the_width() {
+        let body = panel_source();
+        assert!(
+            body.contains("entering_split"),
+            "the transition into the workspace has to be detected — default_width alone is \
+             ignored once egui has remembered a width for this panel id",
+        );
+        // Look at the BRANCH, not at raw file positions: `exact_width` is named in the comment
+        // above it, explaining what it replaced, so "which comes first" proves nothing.
+        let e = body.find("if entering_split {").expect("the entering-split branch");
+        let arm = &body[e..];
+        let end = arm.find("} else").unwrap_or(arm.len());
+        assert!(
+            arm[..end].contains("exact_width"),
+            "the entering-split arm must PIN the width, not suggest it: {}",
+            &arm[..end.min(300)],
+        );
+    }
+
+    /// The flag has to be updated every frame the panel runs, or "entering" would latch on
+    /// forever and the panel would be pinned to half — the very lock this replaced.
+    #[test]
+    fn the_transition_flag_is_cleared() {
+        let body = panel_source();
+        assert!(
+            body.contains("self.simlux_split_prev = split;"),
+            "the previous-state flag must be written each frame, unconditionally",
         );
     }
 }
