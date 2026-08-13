@@ -22,6 +22,7 @@ pub use ugr::{background_from_indirect, position_index, ugr_at, GlareSource, Obs
 
 pub use types::{
     default_materials, en12464_cells, en12464_spacing, installation_summary, CalcPlane, Installation,
+    MATERIAL_FURNITURE,
     LuxGrid, Luminaire,
     Maintenance, Material, MaterialId, Mesh, RaySettings, Triangle, Vertex,
 };

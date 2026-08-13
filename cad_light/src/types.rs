@@ -59,8 +59,18 @@ pub fn default_materials() -> Vec<Material> {
         Material { id: 0, name: "Floor".into(), reflectance: 0.20, color: [0.6, 0.6, 0.6] },
         Material { id: 1, name: "Wall".into(), reflectance: 0.50, color: [0.8, 0.8, 0.8] },
         Material { id: 2, name: "Ceiling".into(), reflectance: 0.70, color: [0.9, 0.9, 0.9] },
+        // FURNITURE — its own material, not bucketed by orientation like the building.
+        //
+        // A desk top is not a floor and a cupboard side is not a wall; giving a shop's stock the
+        // ceiling's 0.70 would recreate the empty-box error that including furniture exists to fix.
+        // 0.35 is the middle of the range CIE 97 gives for furnished contents, and it is a stated
+        // default the user can change rather than a number smuggled in from a texture.
+        Material { id: MATERIAL_FURNITURE, name: "Furniture".into(), reflectance: 0.35, color: [0.7, 0.65, 0.6] },
     ]
 }
+
+/// Material id furniture is traced under. Named because two crates have to agree on it.
+pub const MATERIAL_FURNITURE: MaterialId = 3;
 
 /// A luminaire placed in the scene: an IES profile at a pose.
 #[derive(Debug, Clone, Serialize, Deserialize)]

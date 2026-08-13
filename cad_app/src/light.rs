@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use cad_light::{
+    MATERIAL_FURNITURE,
     bbox, calculate_maintained as calc_lux, default_materials, extrude, extrude_handles,
     installation_summary, parse_ies, parse_ldt, CalcPlane, IesProfile, Installation, LuxGrid,
     Luminaire, Maintenance, Material, Mesh, PhotometryType, RaySettings, Vertex,
@@ -68,11 +69,11 @@ pub struct LumDrag {
 /// 2D-only project keeps working exactly as before.
 pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
     let pos = &f.cached.positions;
-    if pos.len() < 3 {
+    if pos.len() < 3 && f.furniture.is_empty() {
         return Vec::new();
     }
-    // One bucket per material, so the engine sees three meshes and not thousands.
-    let mut buckets: [Vec<Vertex>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    // One bucket per material, so the engine sees four meshes and not thousands.
+    let mut buckets: [Vec<Vertex>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for tri in pos.chunks_exact(3) {
         let (a, b, c) = (
             glam::Vec3::from(tri[0]),
@@ -90,6 +91,31 @@ pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
             buckets[id].push(Vertex::new(p.x, p.y, p.z));
         }
     }
+    // ---- FURNITURE ---------------------------------------------------------------------------
+    //
+    // Until now the light engine could not see furniture AT ALL: this function read
+    // `cached.positions`, which is the CSG solid mesh, and furniture lives separately as instanced
+    // assets. So every cupboard, kitchen and desk placed in the Factory was invisible to the
+    // calculation, and every room was computed as an empty box.
+    //
+    // That is the whole of the +48 % against DIALux on the DISTRICT PEOPLE project. The engine's
+    // interreflection is verified correct against the radiosity closed form, and an empty box at
+    // the reported 0.70 / 0.82 / 0.72 really does produce that much light — a real shop full of
+    // racks and stock does not, and its measured uniformity (U₀ 0.17 against our 0.59) says so.
+    //
+    // Furniture goes in under its OWN material rather than being bucketed by orientation like the
+    // building: a desk top is not a floor and a cupboard side is not a wall, and giving a shop's
+    // stock the ceiling's 0.70 would recreate the very error this fixes.
+    for (i, inst) in f.furniture.iter().enumerate() {
+        let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
+        let Some(m) = f.furniture_model_matrix(i) else { continue };
+        let m = glam::Mat4::from_cols_array(&m);
+        for p in &asset.positions {
+            let w = m.transform_point3(glam::Vec3::from(*p));
+            buckets[MATERIAL_FURNITURE as usize].push(Vertex::new(w.x, w.y, w.z));
+        }
+    }
+
     let mut out = Vec::new();
     for (id, verts) in buckets.into_iter().enumerate() {
         if verts.is_empty() {
@@ -1118,6 +1144,17 @@ impl LightState {
         }
         if !cfg.materials.is_empty() {
             self.materials = cfg.materials;
+            // A project saved before furniture was traced carries only floor, wall and ceiling.
+            // Furniture triangles would then reference a material that is not there and be traced
+            // as a PERFECT ABSORBER — every piece a black hole, which is a worse answer than the
+            // empty box it replaced. Add the default rather than leave the gap.
+            if !self.materials.iter().any(|m| m.id == MATERIAL_FURNITURE) {
+                if let Some(f) =
+                    default_materials().into_iter().find(|m| m.id == MATERIAL_FURNITURE)
+                {
+                    self.materials.push(f);
+                }
+            }
         }
         self.settings = cfg.settings;
         // A project saved before maintenance existed was quoted at the INITIAL condition. Restore
@@ -2467,5 +2504,171 @@ mod placement_tests {
         let mut reopened = LightState::new();
         reopened.apply_config(cfg, &doc);
         assert_eq!(reopened.unassigned_count(), 1);
+    }
+}
+
+/// FURNITURE IS PART OF THE LIGHTING SCENE.
+///
+/// It was not. `meshes_from_factory` read `cached.positions` — the CSG solid mesh — and furniture
+/// lives separately as instanced assets, so every cupboard, kitchen and desk placed in the Factory
+/// was INVISIBLE to the calculation and every room was computed as an empty box.
+///
+/// That is the whole of the +48 % against DIALux on the DISTRICT PEOPLE project: the engine's
+/// interreflection is verified correct against the radiosity closed form, and an empty box at the
+/// reported 0.70 / 0.82 / 0.72 really does produce that much light. A shop full of racks does not,
+/// and its measured uniformity — U₀ 0.17 against our 0.59 — says so.
+#[cfg(test)]
+mod furniture_in_the_light_scene {
+    use super::*;
+
+    /// A slab asset: one square metre of horizontal surface, `n` metres up in its own local space.
+    fn slab_asset(f: &mut crate::factory::FactoryState, half: f32, z: f32) -> usize {
+        let v = |x: f32, y: f32| [x, y, z];
+        let positions = vec![
+            v(-half, -half),
+            v(half, -half),
+            v(half, half),
+            v(-half, -half),
+            v(half, half),
+            v(-half, half),
+        ];
+        let normals = vec![[0.0, 0.0, 1.0]; 6];
+        f.add_furniture_asset(
+            "slab".into(),
+            crate::mesh_io::ObjMesh { positions, normals, color: None, alpha: Vec::new() },
+        )
+    }
+
+    fn a_room() -> crate::factory::FactoryState {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(
+            &vec![
+                glam::Vec2::new(0.0, 0.0),
+                glam::Vec2::new(6.0, 0.0),
+                glam::Vec2::new(6.0, 6.0),
+                glam::Vec2::new(0.0, 6.0),
+                glam::Vec2::new(0.0, 0.0),
+            ],
+            3.0,
+        )
+        .expect("building");
+        f.recompute();
+        f
+    }
+
+    /// THE BUG. A room with furniture in it must hand the engine more geometry than the same room
+    /// without — that is the whole of what was missing.
+    #[test]
+    fn furniture_reaches_the_engine_at_all() {
+        let mut f = a_room();
+        let bare = meshes_from_factory(&f).iter().map(|m| m.triangles.len()).sum::<usize>();
+        assert!(bare > 0, "the building itself should be there");
+
+        let a = slab_asset(&mut f, 0.5, 0.0);
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(a, glam::Vec3::new(3.0, 3.0, 0.0));
+        let with = meshes_from_factory(&f).iter().map(|m| m.triangles.len()).sum::<usize>();
+        assert_eq!(with, bare + 2, "the slab's two triangles must reach the engine");
+    }
+
+    /// …under its OWN material, not bucketed by orientation with the building. A desk top is not a
+    /// floor; giving a shop's stock the ceiling's 0.70 would recreate the error this fixes.
+    #[test]
+    fn furniture_gets_its_own_material() {
+        let mut f = a_room();
+        let a = slab_asset(&mut f, 0.5, 0.0);
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(a, glam::Vec3::new(3.0, 3.0, 0.0));
+        let meshes = meshes_from_factory(&f);
+        let furn = meshes.iter().find(|m| m.material == MATERIAL_FURNITURE);
+        assert!(furn.is_some(), "furniture must be its own mesh");
+        assert_eq!(furn.unwrap().triangles.len(), 2);
+        // The slab faces UP, so a bucket-by-orientation pass would have filed it as floor.
+        let floor = meshes.iter().find(|m| m.material == 0).map(|m| m.triangles.len()).unwrap_or(0);
+        let bare_floor = {
+            let mut g = a_room();
+            let _ = &mut g;
+            meshes_from_factory(&g).iter().find(|m| m.material == 0).map(|m| m.triangles.len()).unwrap_or(0)
+        };
+        assert_eq!(floor, bare_floor, "the slab was filed as floor instead of furniture");
+    }
+
+    /// Its POSE is applied. A piece is placed somewhere, and the engine has to see it there —
+    /// geometry delivered at the asset's local origin would shade the wrong part of the room.
+    #[test]
+    fn the_instance_transform_is_applied() {
+        let mut f = a_room();
+        let a = slab_asset(&mut f, 0.5, 0.0);
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(a, glam::Vec3::new(4.5, 1.5, 0.0));
+        let meshes = meshes_from_factory(&f);
+        let m = meshes.iter().find(|m| m.material == MATERIAL_FURNITURE).unwrap();
+        let cx = m.vertices.iter().map(|v| v.x).sum::<f32>() / m.vertices.len() as f32;
+        let cy = m.vertices.iter().map(|v| v.y).sum::<f32>() / m.vertices.len() as f32;
+        assert!((cx - 4.5).abs() < 1e-3, "x = {cx}, expected 4.5");
+        assert!((cy - 1.5).abs() < 1e-3, "y = {cy}, expected 1.5");
+    }
+
+    /// AND IT ACTUALLY SHADES. The point of all of it: a slab between the fitting and the work
+    /// plane must darken the point beneath it.
+    #[test]
+    fn furniture_casts_a_shadow_on_the_work_plane() {
+        use cad_light::{calculate, CalcPlane, Luminaire, RaySettings, Vertex};
+        use std::collections::HashMap;
+
+        let mut f = a_room();
+        // A 2 m square panel, hung at 2 m by its INSTANCE rather than by its geometry: assets are
+        // rebased to z = 0 on import (`add_furniture_asset`), so a slab authored at z = 2 lands on
+        // the floor and shades nothing. Height belongs to the placement.
+        let a = slab_asset(&mut f, 1.0, 0.0);
+
+        let mut profiles = HashMap::new();
+        profiles.insert("p".to_string(), builtin_downlight());
+        let lums = vec![Luminaire {
+            id: 1,
+            profile: "p".into(),
+            position: Vertex::new(3.0, 3.0, 2.9),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        }];
+        // One cell, directly under the fitting.
+        let plane = CalcPlane {
+            origin: Vertex::new(2.9, 2.9, 0.8),
+            width: 0.2,
+            depth: 0.2,
+            cols: 1,
+            rows: 1,
+        };
+        // DIRECT ONLY: the shadow is the thing under test, and bounced light would fill it in and
+        // blur exactly the effect being measured.
+        let settings = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: true };
+        let materials = cad_light::default_materials();
+
+        let open = calculate(
+            &meshes_from_factory(&f),
+            &lums,
+            &profiles,
+            &materials,
+            &plane,
+            &settings,
+        );
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(a, glam::Vec3::new(3.0, 3.0, 2.0));
+        let shaded = calculate(
+            &meshes_from_factory(&f),
+            &lums,
+            &profiles,
+            &materials,
+            &plane,
+            &settings,
+        );
+
+        assert!(open.avg > 1.0, "precondition: the point is lit with nothing in the way");
+        assert!(
+            shaded.avg < open.avg * 0.05,
+            "the panel should block the fitting: {:.1} lx open, {:.1} lx shaded",
+            open.avg,
+            shaded.avg,
+        );
     }
 }
