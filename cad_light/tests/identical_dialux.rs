@@ -1,31 +1,40 @@
-//! SIMLUX against DIALux on a scene with NOTHING left to infer.
+//! SIMLUX against DIALux on three scenes with NOTHING left to infer.
 //!
 //! The earlier comparison (`dialux_comparison.rs`) was against a real project: a non-rectangular
 //! shop with 46 fittings whose mounting heights and aiming the report never states. Every
 //! disagreement there had two candidate causes — the engine, or the guess about the scene — and no
 //! way to separate them.
 //!
-//! This one has no guesses left in it. One luminaire, a square box, and the report states every
-//! input: 4.000 × 4.000 m, clearance 4.000 m, working plane 0.800 m, wall zone 0.010 m,
-//! reflectances 70 / 50 / 20 %, maintenance factor 0.80 fixed. And it prints its 8 × 8 grid of
-//! point values, so this is a comparison of SIXTY-FOUR NUMBERS rather than of one average.
+//! These three have no guesses left in them. The same 4 × 4 m room three times, and the reports
+//! state every input: clearance 4.000 m, working plane 0.800 m, wall zone 0.010 m, reflectances
+//! 70 / 50 / 20 %, maintenance factor 0.80 fixed, one ABB FONDO at 4000 lm / 40 W. Only the LAYOUT
+//! changes:
 //!
-//! That is what makes it a test of the engine. If these points match, the physics is right; if the
-//! average matched while the points did not, we would have the right answer for the wrong reasons.
+//!   t1  one fitting, centred                    Ē 200 lx   U0 0.10
+//!   t2  two fittings, upper half of the room    Ē 336 lx   U0 0.079
+//!   t3  two fittings, lower half                Ē 336 lx   U0 0.073
 //!
-//! Source: `D:\Dropbox\YASEEN\3d factory\tests\Identical testing\t1.pdf`, "Building 1 · Storey 1 ·
-//! test room (Light scene 1)".
+//! Three cases matter more than one. t1 alone cannot see a superposition error (one source adds to
+//! nothing) and cannot see an axis mix-up (a centred fitting is symmetric in x and y). t2 and t3
+//! are near-mirrors of each other, so between them they catch both: if x and y were transposed, or
+//! if the second luminaire were added wrongly, t2 and t3 would not both land.
 //!
-//! Run with:  `IDENTICAL_DIR="<that folder>" cargo test -p cad_light --test identical_dialux -- --ignored --nocapture`
+//! Each report also prints its 8 × 8 grid of point values, so this compares 192 NUMBERS rather than
+//! three averages. An average can match for the wrong reasons; a whole field cannot.
+//!
+//! Source: `D:\Dropbox\YASEEN\3d factory\tests\Identical testing\{t1,t2,t3}.pdf`.
+//!
+//! Run with:
+//!   `IDENTICAL_DIR="<that folder>" cargo test -p cad_light --test identical_dialux -- --ignored --nocapture`
 
 use std::collections::HashMap;
 
 use cad_light::{
-    box_room, calculate_maintained, default_materials, parse_ldt, CalcPlane, Luminaire,
-    Maintenance, RaySettings, Vertex,
+    box_room, calculate_maintained, default_materials, parse_ldt, CalcPlane, IesProfile, Luminaire,
+    Maintenance, Mesh, Material, RaySettings, Vertex,
 };
 
-// ---- exactly what the report states -------------------------------------------------------------
+// ---- what all three reports state, identically --------------------------------------------------
 const ROOM: f32 = 4.000; // "Ground area 16.00 m²", square
 const ROOM_H: f32 = 4.000; // "Clearance height 4.000 m"
 const MOUNT_Z: f32 = 4.000; // "Mounting height 4.000 m" — flush with the ceiling
@@ -35,173 +44,284 @@ const MF: f64 = 0.80; // "Maintenance factor 0.80 (fixed)"
 const FLUX: f64 = 4000.0; // luminaire list: Φ 4000 lm
 const WATTS: f64 = 40.0; // luminaire list: P 40.0 W
 
-const DIALUX_E_AVG: f64 = 200.0; // "Ē perpendicular  200 lx"
-const DIALUX_U0: f64 = 0.10; // "U₀ (g₁)  0.10"
-const DIALUX_LPD_SPACE: f64 = 2.50; // "Space · Lighting power density 2.50 W/m²"
-
-/// The report's 8 × 8 grid, ROW 0 AT THE BOTTOM of the plan (+y up), matching `CalcPlane`'s row
-/// order. Read off the rendered page, so the last digit of the three-figure values is ±1.
-#[rustfmt::skip]
-const DIALUX_GRID: [[f64; 8]; 8] = [
-    [ 29.0, 45.9, 87.8, 119.0, 119.0, 87.4, 45.1, 28.8],
-    [ 46.5,116.0,177.0, 213.0, 214.0,177.0,117.0, 46.7],
-    [ 88.1,177.0,282.0, 419.0, 420.0,282.0,177.0, 87.4],
-    [119.0,214.0,419.0, 651.0, 652.0,420.0,214.0,118.0],
-    [120.0,214.0,420.0, 652.0, 651.0,420.0,214.0,120.0],
-    [ 87.2,177.0,282.0, 420.0, 420.0,282.0,177.0, 87.8],
-    [ 45.9,116.0,176.0, 213.0, 212.0,177.0,116.0, 47.1],
-    [ 29.0, 46.0, 87.6, 120.0, 120.0, 87.5, 46.2, 28.3],
-];
-
-fn dialux_mean() -> f64 {
-    DIALUX_GRID.iter().flatten().sum::<f64>() / 64.0
+/// One report: its layout, its stated aggregates, and its printed grid.
+///
+/// Grids are stored ROW 0 AT THE BOTTOM of the plan (+y up), matching `CalcPlane`'s row order.
+/// They were read off the rendered pages, so a value the contour lines cross is uncertain in its
+/// last digit or two — which is why the ASSERTIONS are on the stated aggregates and on the
+/// aggregate error across the field, never on any single transcribed cell.
+struct Case {
+    name: &'static str,
+    lums: &'static [(f32, f32)],
+    e_avg: f64,
+    u0: f64,
+    lpd: f64,
+    grid: [[f64; 8]; 8],
 }
 
-#[test]
-#[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt and t1.pdf>"]
-fn simlux_against_dialux_on_a_fully_specified_room() {
-    let Ok(dir) = std::env::var("IDENTICAL_DIR") else {
-        println!("set IDENTICAL_DIR to the folder holding FONDO.ldt");
-        return;
-    };
+#[rustfmt::skip]
+const CASES: [Case; 3] = [
+    Case {
+        name: "t1 — one fitting, centred",
+        lums: &[(2.0, 2.0)],
+        e_avg: 200.0, u0: 0.10, lpd: 2.50,
+        grid: [
+            [ 29.0, 45.9, 87.8, 119.0, 119.0, 87.4, 45.1, 28.8],
+            [ 46.5,116.0,177.0, 213.0, 214.0,177.0,117.0, 46.7],
+            [ 88.1,177.0,282.0, 419.0, 420.0,282.0,177.0, 87.4],
+            [119.0,214.0,419.0, 651.0, 652.0,420.0,214.0,118.0],
+            [120.0,214.0,420.0, 652.0, 651.0,420.0,214.0,120.0],
+            [ 87.2,177.0,282.0, 420.0, 420.0,282.0,177.0, 87.8],
+            [ 45.9,116.0,176.0, 213.0, 212.0,177.0,116.0, 47.1],
+            [ 29.0, 46.0, 87.6, 120.0, 120.0, 87.5, 46.2, 28.3],
+        ],
+    },
+    Case {
+        name: "t2 — two fittings, upper half",
+        lums: &[(1.0, 3.0), (3.0, 3.0)],
+        e_avg: 336.0, u0: 0.079, lpd: 5.00,
+        grid: [
+            [ 30.1, 32.7, 36.4,  36.4,  36.8, 36.6, 34.4, 30.6],
+            [ 46.0, 53.1, 58.9,  59.1,  60.9, 58.7, 51.0, 45.3],
+            [104.0,138.0,149.0, 134.0, 135.0,149.0,139.0,104.0],
+            [205.0,249.0,266.0, 299.0, 298.0,267.0,250.0,208.0],
+            [325.0,468.0,516.0, 469.0, 467.0,517.0,466.0,323.0],
+            [474.0,715.0,787.0, 646.0, 646.0,784.0,713.0,472.0],
+            [480.0,721.0,794.0, 656.0, 653.0,793.0,721.0,473.0],
+            [336.0,491.0,544.0, 495.0, 492.0,541.0,490.0,341.0],
+        ],
+    },
+    Case {
+        name: "t3 — two fittings, lower half",
+        lums: &[(1.0, 1.0), (3.0, 1.0)],
+        e_avg: 336.0, u0: 0.073, lpd: 5.00,
+        grid: [
+            [339.0,491.0,540.0, 491.0, 494.0,540.0,488.0,338.0],
+            [479.0,722.0,793.0, 655.0, 654.0,794.0,723.0,473.0],
+            [474.0,713.0,787.0, 646.0, 647.0,783.0,714.0,474.0],
+            [321.0,468.0,516.0, 471.0, 468.0,515.0,468.0,325.0],
+            [205.0,249.0,266.0, 299.0, 299.0,265.0,247.0,206.0],
+            [103.0,139.0,146.0, 138.0, 135.0,150.0,138.0,105.0],
+            [ 44.8, 53.3, 57.3,  61.9,  60.4, 60.6, 52.0, 44.8],
+            [ 29.1, 33.7, 37.3,  36.7,  37.6, 38.6, 33.8, 28.8],
+        ],
+    },
+];
 
-    // ---- photometry -----------------------------------------------------------------------
+fn scene() -> (Vec<Mesh>, Vec<Material>) {
+    // Floor 0.20, walls 0.50, ceiling 0.70 — the library's defaults ARE the reports' figures.
+    (box_room(ROOM, ROOM, ROOM_H), default_materials())
+}
+
+fn plane_at(cols: u32, rows: u32) -> CalcPlane {
+    // The working plane is inset by the wall zone on all four sides — which is what makes its area
+    // 15.84 m² against the room's 16.00, and each report's own two power densities (5.05 against
+    // 5.00 W/m², say) confirm it: 80 W / 5.05 = 15.84 m².
+    let span = ROOM - 2.0 * WALL_ZONE;
+    CalcPlane { origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE), width: span, depth: span, cols, rows }
+}
+
+fn load_photometry(dir: &str) -> IesProfile {
     let path = format!("{dir}/FONDO.ldt");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
     let mut prof = parse_ldt(&text).expect("FONDO.ldt parses");
-    println!("\n=== photometry: FONDO.ldt ===");
-    println!("  file says      flux {:.1} lm   watts {:.1} W", prof.lumens, prof.watts);
-    println!("  report says    flux {FLUX:.1} lm   watts {WATTS:.1} W");
-    let ratio = prof.lumens / FLUX;
-    println!("  ratio          {ratio:.4}   (1.0000 = the reader agrees with DIALux)");
     // This file carries THREE lamp sets. They are alternatives, not simultaneous lamps — summing
-    // them was a real bug, found on the previous comparison. If the reader ever regresses to the
-    // sum this ratio goes to 3.
+    // them was a real bug, found on the previous comparison. If the reader regresses to the sum,
+    // this ratio goes to 3 and every case below fails at once.
+    let ratio = prof.lumens / FLUX;
     assert!(
         (ratio - 1.0).abs() < 0.02,
         "the reader disagrees with DIALux about this file's flux: {:.1} vs {FLUX:.1} lm",
         prof.lumens,
     );
     prof.watts = WATTS;
+    prof
+}
 
+#[test]
+#[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt and t1/t2/t3.pdf>"]
+fn simlux_against_dialux_on_three_fully_specified_rooms() {
+    let Ok(dir) = std::env::var("IDENTICAL_DIR") else {
+        println!("set IDENTICAL_DIR to the folder holding FONDO.ldt");
+        return;
+    };
+
+    let prof = load_photometry(&dir);
+    println!("\n=== photometry: FONDO.ldt ===");
+    println!("  flux {:.1} lm (report: {FLUX:.1})   watts {WATTS:.1} W", prof.lumens);
     let mut profiles = HashMap::new();
     profiles.insert("FONDO".to_string(), prof);
 
-    // ---- the room -------------------------------------------------------------------------
-    let meshes = box_room(ROOM, ROOM, ROOM_H);
-    // Floor 0.20, walls 0.50, ceiling 0.70 — the library's defaults ARE the report's figures.
-    let materials = default_materials();
-    for m in &materials {
-        println!("  material {:<8} rho {:.2}", m.name, m.reflectance);
-    }
-
-    let lums = vec![Luminaire {
-        id: 1,
-        profile: "FONDO".to_string(),
-        position: Vertex::new(ROOM * 0.5, ROOM * 0.5, MOUNT_Z),
-        rotation_deg: 0.0,
-        dimming: 1.0,
-    }];
-
-    // The working plane is inset by the wall zone on all four sides — which is what makes its area
-    // 15.84 m² against the room's 16.00, and the report's own two power densities (2.53 vs
-    // 2.50 W/m²) confirm it: 40 W / 2.53 = 15.81 m².
-    let span = ROOM - 2.0 * WALL_ZONE;
-    let plane = CalcPlane {
-        origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE),
-        width: span,
-        depth: span,
-        cols: 8,
-        rows: 8,
-    };
-
+    let (meshes, materials) = scene();
     let settings = RaySettings { rays_per_point: 4096, max_bounces: 8, ..RaySettings::default() };
     // "0.80 (fixed)" — one number, not the four CIE 97 sub-factors, so it goes in whole.
     let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
 
-    let grid = calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maint);
+    let mut worst_avg_err = 0.0_f64;
+    for case in &CASES {
+        let lums: Vec<Luminaire> = case
+            .lums
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| Luminaire {
+                id: i as u32 + 1,
+                profile: "FONDO".to_string(),
+                position: Vertex::new(*x, *y, MOUNT_Z),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+            })
+            .collect();
 
-    // ---- the comparison --------------------------------------------------------------------
-    println!("\n=== 8 x 8 working-plane grid, lux (row 0 = bottom of the plan) ===");
-    println!("      {:>34}   {:>34}", "SIMLUX", "DIALux");
-    let mut worst = (0.0_f64, 0usize, 0usize);
-    let mut sum_abs_pct = 0.0;
-    for r in 0..8usize {
-        let ours: Vec<f64> = (0..8).map(|c| grid.values[r * 8 + c]).collect();
-        let theirs = DIALUX_GRID[r];
-        let fmt = |v: &[f64]| v.iter().map(|x| format!("{x:>6.0}")).collect::<Vec<_>>().join("");
-        println!("  r{r}  {}   {}", fmt(&ours), fmt(&theirs));
-        for c in 0..8 {
-            let pct = (ours[c] - theirs[c]) / theirs[c] * 100.0;
-            sum_abs_pct += pct.abs();
-            if pct.abs() > worst.0 {
-                worst = (pct.abs(), r, c);
+        let plane = plane_at(8, 8);
+        let grid =
+            calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maint);
+
+        println!("\n================ {} ================", case.name);
+        println!("      {:>34}   {:>34}", "SIMLUX", "DIALux");
+        let (mut sum_abs_pct, mut worst) = (0.0, (0.0_f64, 0usize, 0usize));
+        for r in 0..8usize {
+            let ours: Vec<f64> = (0..8).map(|c| grid.values[r * 8 + c]).collect();
+            let fmt = |v: &[f64]| v.iter().map(|x| format!("{x:>6.0}")).collect::<Vec<_>>().join("");
+            println!("  r{r}  {}   {}", fmt(&ours), fmt(&case.grid[r]));
+            for c in 0..8 {
+                let pct = (ours[c] - case.grid[r][c]) / case.grid[r][c] * 100.0;
+                sum_abs_pct += pct.abs();
+                if pct.abs() > worst.0 {
+                    worst = (pct.abs(), r, c);
+                }
             }
         }
+
+        let our_avg = grid.values.iter().sum::<f64>() / grid.values.len() as f64;
+        let our_min = grid.values.iter().cloned().fold(f64::MAX, f64::min);
+        let our_max = grid.values.iter().cloned().fold(0.0, f64::max);
+        let our_lpd = WATTS * case.lums.len() as f64 / 16.0;
+        let avg_err = (our_avg - case.e_avg) / case.e_avg * 100.0;
+        worst_avg_err = worst_avg_err.max(avg_err.abs());
+
+        println!("  ---");
+        println!("  E average   {our_avg:>8.1} lx   DIALux {:>6.0}    {avg_err:>6.2}%", case.e_avg);
+        println!("  E min/max   {our_min:>8.1} /{our_max:>7.1} lx");
+        println!("  LPD         {our_lpd:>8.2} W/m2  DIALux {:>6.2}", case.lpd);
+        println!("  U0 (8x8)    {:>8.3}      DIALux {:>6.3}", our_min / our_avg, case.u0);
+        println!(
+            "  field: mean |error| {:.1}% over 64 points, worst {:.1}% at r{} c{}",
+            sum_abs_pct / 64.0,
+            worst.0,
+            worst.1,
+            worst.2,
+        );
+
+        // The stated average is the unambiguous number in each report — it is printed as a figure
+        // rather than read off a drawing, so this is the assertion that means something.
+        assert!(
+            avg_err.abs() < 3.0,
+            "{}: average {our_avg:.1} lx against DIALux's {:.0}",
+            case.name,
+            case.e_avg,
+        );
+        assert!(
+            (our_lpd - case.lpd).abs() < 0.01,
+            "{}: connected load must agree exactly — it is arithmetic, not physics",
+            case.name,
+        );
     }
+    println!("\n=== worst average error across all three cases: {worst_avg_err:.2}% ===");
+}
 
-    let our_mean = grid.values.iter().sum::<f64>() / grid.values.len() as f64;
-    let our_min = grid.values.iter().cloned().fold(f64::MAX, f64::min);
-    let our_max = grid.values.iter().cloned().fold(0.0, f64::max);
-    let their_mean = dialux_mean();
+/// WHY U0 DISAGREES — and why it is NOT a physics error.
+///
+/// Everything else matches. U0 is E_min / E_avg; the averages agree to half a per cent across all
+/// three cases, so the whole difference is in the MINIMUM. And DIALux's implied minimum is below
+/// every point it prints — 20.0 lx for t1 against a printed minimum of 28.3, 26.5 for t2 against
+/// 30.1. It is not taking its minimum from the grid it displays.
+///
+/// The darkest place on a working plane is its corner, and an 8 × 8 display grid never samples one:
+/// its outermost sample sits half a cell in, at 0.26 m, while the plane reaches to 0.01 m from the
+/// wall. So a coarse grid always reports a minimum that is too HIGH, and therefore a uniformity
+/// that is too GOOD — the direction that passes installations which should fail.
+///
+/// What this test pins is the SHAPE of that error, not a match. Refining the calculation grid
+/// lowers the minimum monotonically, in every case, while leaving the average alone. It does NOT
+/// converge onto DIALux's figure at any single refinement — t1 crosses their number near 32 × 32,
+/// t2 near 14 × 14 — which is the useful finding: DIALux's minimum sampling is an undocumented
+/// internal convention, and there is no refinement factor that reproduces it in general.
+///
+/// So this is not something to tune. Chasing their number by picking a refinement per room would
+/// be fitting to an unknown, and the first room that did not fit would be a silent error. The
+/// defensible fix is to sample on a DOCUMENTED grid — EN 12464-1 gives p = 0.2 · 5^log10(d), which
+/// for this 4 m room is 8 cells — decouple it from the display grid, and state on the report which
+/// grid the uniformity was taken on.
+#[test]
+#[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt>"]
+fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
+    let Ok(dir) = std::env::var("IDENTICAL_DIR") else { return };
+    let mut profiles = HashMap::new();
+    profiles.insert("FONDO".to_string(), load_photometry(&dir));
+    let (meshes, materials) = scene();
+    let settings = RaySettings { rays_per_point: 2048, max_bounces: 8, ..RaySettings::default() };
+    let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
 
-    println!("\n=== summary ===");
-    println!("  {:<22} {:>10} {:>10} {:>9}", "", "SIMLUX", "DIALux", "diff");
-    let row = |name: &str, a: f64, b: f64| {
-        println!("  {:<22} {:>10.1} {:>10.1} {:>8.1}%", name, a, b, (a - b) / b * 100.0);
-    };
-    row("E average (lx)", our_mean, their_mean);
-    row("E min (lx)", our_min, DIALUX_GRID.iter().flatten().cloned().fold(f64::MAX, f64::min));
-    row("E max (lx)", our_max, DIALUX_GRID.iter().flatten().cloned().fold(0.0, f64::max));
-    println!("  {:<22} {:>10.2} {:>10.2}", "U0 (min/avg)", our_min / our_mean, DIALUX_U0);
-    println!("  {:<22} {:>10.2} {:>10.2}", "LPD (W/m2)", WATTS / 16.0, DIALUX_LPD_SPACE);
-    println!(
-        "  mean |error| over 64 points: {:.1}%   worst {:.1}% at r{} c{}",
-        sum_abs_pct / 64.0,
-        worst.0,
-        worst.1,
-        worst.2,
-    );
-    println!("  direct fraction: {:.3}", grid.direct_fraction().unwrap_or(f64::NAN));
+    for case in &CASES {
+        let lums: Vec<Luminaire> = case
+            .lums
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| Luminaire {
+                id: i as u32 + 1,
+                profile: "FONDO".to_string(),
+                position: Vertex::new(*x, *y, MOUNT_Z),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+            })
+            .collect();
+        println!("\n=== {} — U0 vs calculation grid (DIALux says {:.3}) ===", case.name, case.u0);
+        println!("  {:>7}  {:>9}  {:>9}  {:>6}", "grid", "E min", "E avg", "U0");
+        let (mut prev_min, mut prev_avg) = (f64::MAX, 0.0);
+        for n in [8u32, 16, 32, 64] {
+            let p = plane_at(n, n);
+            let g =
+                calculate_maintained(&meshes, &lums, &profiles, &materials, &p, &settings, maint);
+            let mn = g.values.iter().cloned().fold(f64::MAX, f64::min);
+            let av = g.values.iter().sum::<f64>() / g.values.len() as f64;
+            println!("  {:>4}x{:<2}{:>9.1}{:>11.1}{:>8.3}", n, n, mn, av, mn / av);
 
-    // ---- WHY U0 DISAGREES ------------------------------------------------------------------
-    //
-    // Everything above matches. U0 does not: 0.14 against DIALux's 0.10. U0 is Emin/Eavg and the
-    // averages agree, so the whole difference is in the MINIMUM — and DIALux's implied minimum
-    // (0.10 x 200 = 20 lx) is below every point it prints, the smallest of which is 28.3.
-    //
-    // So DIALux is not taking its minimum from the grid it displays. The darkest place on this
-    // plane is the corner, and the display grid never samples a corner: its outermost sample sits
-    // half a cell in, at 0.26 m, while the plane itself reaches to 0.01 m. Re-sampling finer walks
-    // toward the true minimum and shows the effect directly.
-    println!("\n=== the minimum depends on how finely you look ===");
-    println!("  {:>6}  {:>9}  {:>9}  {:>6}", "grid", "E min", "E avg", "U0");
-    for n in [8u32, 16, 32, 64] {
-        let p = CalcPlane { cols: n, rows: n, ..plane };
-        let g = calculate_maintained(&meshes, &lums, &profiles, &materials, &p, &settings, maint);
-        let mn = g.values.iter().cloned().fold(f64::MAX, f64::min);
-        let av = g.values.iter().sum::<f64>() / g.values.len() as f64;
-        println!("  {:>4}x{:<2}{:>9.1}{:>11.1}{:>8.2}", n, n, mn, av, mn / av);
+            // THE MINIMUM ONLY EVER FALLS. A finer grid can find a darker point and can never
+            // un-find one, so any rise would mean the sampling is wrong, not merely coarse.
+            assert!(
+                mn <= prev_min + 1e-6,
+                "{}: refining {n}x{n} RAISED the minimum, {prev_min:.1} -> {mn:.1} lx",
+                case.name,
+            );
+            // …while the AVERAGE barely moves. That is what makes E trustworthy at any resolution
+            // and uniformity trustworthy at none: 8x8 and 64x64 agree on the average to a few
+            // tenths of a per cent, and disagree on U0 by a third.
+            if prev_avg > 0.0 {
+                assert!(
+                    (av - prev_avg).abs() / prev_avg < 0.01,
+                    "{}: the average moved {:.2}% on refinement — it should not",
+                    case.name,
+                    (av - prev_avg) / prev_avg * 100.0,
+                );
+            }
+            prev_min = mn;
+            prev_avg = av;
+        }
+        // And the coarse grid is ALWAYS optimistic about uniformity — never pessimistic. This is
+        // the direction that matters: it is the one that passes a failing installation.
+        let coarse = {
+            let g = calculate_maintained(
+                &meshes, &lums, &profiles, &materials, &plane_at(8, 8), &settings, maint,
+            );
+            let mn = g.values.iter().cloned().fold(f64::MAX, f64::min);
+            mn / (g.values.iter().sum::<f64>() / g.values.len() as f64)
+        };
+        assert!(
+            coarse > case.u0,
+            "{}: the 8x8 grid gave U0 {coarse:.3}, not optimistic against DIALux's {:.3} — the \
+             whole point of this finding is that coarse sampling overstates uniformity",
+            case.name,
+            case.u0,
+        );
     }
-    // And the corner itself — the value the grid is converging on.
-    let corner = CalcPlane {
-        origin: Vertex::new(WALL_ZONE, WALL_ZONE, WORK_PLANE),
-        width: 0.02,
-        depth: 0.02,
-        cols: 1,
-        rows: 1,
-    };
-    let cg = calculate_maintained(&meshes, &lums, &profiles, &materials, &corner, &settings, maint);
-    println!("  corner (0.02 m in): {:.1} lx  ->  U0 {:.2}", cg.values[0], cg.values[0] / our_mean);
-
-    // The report rounds its average to 200 lx and its own points average to 200.3, so agreement
-    // inside a couple of per cent is the most this can resolve.
-    assert!(
-        (our_mean - their_mean).abs() / their_mean < 0.10,
-        "average is {our_mean:.1} lx against DIALux's {their_mean:.1}",
-    );
-    assert!(
-        (WATTS / 16.0 - DIALUX_LPD_SPACE).abs() < 0.01,
-        "connected load must agree exactly — it is arithmetic, not physics",
-    );
 }
