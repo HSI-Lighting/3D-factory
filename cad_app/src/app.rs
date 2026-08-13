@@ -12734,6 +12734,9 @@ impl CadApp {
                 if act.calculate {
                     self.light.calculate(&self.doc, Some(&self.factory));
                 }
+                if act.export_report {
+                    self.export_light_report();
+                }
                 if self.light.grid.is_some() {
                     crate::light::legend_bar(ui, self.light.scale_ceiling());
                 }
@@ -24411,6 +24414,66 @@ impl CadApp {
             let l = self.factory.units.label();
             self.factory.status = format!("Working unit: {l}. Nothing moved.");
             self.history.push(format!("  working unit set to {l}"));
+        }
+    }
+
+    /// Write the SIMLUX calculation out as a standalone HTML report.
+    ///
+    /// Beside the drawing when there is one, so the report files itself with the project it belongs
+    /// to; on the Desktop otherwise, because a report written somewhere the user cannot find is the
+    /// same as no report.
+    fn export_light_report(&mut self) {
+        let Some(grid) = self.light.grid.as_ref() else {
+            self.light.last_msg = "Nothing to report — press Calculate first.".into();
+            return;
+        };
+        let Some(plane) = self.light.plane.as_ref() else { return };
+
+        let title = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+
+        let html = crate::light_report::render(&crate::light_report::ReportInput {
+            title: title.clone(),
+            grid,
+            plane,
+            maintenance: self.light.maintenance,
+            installation: self.light.installation.as_ref(),
+            surfaces: &self.light.surfaces,
+            cylindrical_avg: self.light.cylindrical_avg,
+            eye_height: self.light.eye_height,
+            room_height: self.light.room_height,
+            materials: self
+                .light
+                .materials
+                .iter()
+                .map(|m| (m.name.clone(), m.reflectance))
+                .collect(),
+            unassigned: self.light.unassigned_count(),
+        });
+
+        let out = match self.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            Some(dir) => dir.join(format!("{title}-simlux-report.html")),
+            None => {
+                let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
+                std::path::PathBuf::from(home).join("Desktop").join("simlux-report.html")
+            }
+        };
+        match std::fs::write(&out, html) {
+            Ok(()) => {
+                let msg = format!("Report written to {}", out.display());
+                self.history.push(format!("  {msg}"));
+                self.light.last_msg = msg;
+            }
+            Err(e) => {
+                let msg = format!("Could not write {}: {e}", out.display());
+                self.history.push(format!("  ! {msg}"));
+                self.light.last_msg = msg;
+            }
         }
     }
 

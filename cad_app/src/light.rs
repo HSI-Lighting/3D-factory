@@ -219,6 +219,9 @@ pub struct LightAction {
     /// Open the file browser to import a photometric file — the same gesture as importing
     /// furniture, because it is the same kind of act: bringing a manufacturer's product in.
     pub import_photometry: bool,
+    /// Write the calculation out as a standalone HTML report. A result that lives only in a panel
+    /// cannot be sent to a client or filed against a project.
+    pub export_report: bool,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -1378,6 +1381,21 @@ impl LightState {
                     .weak(),
                 );
             });
+
+            // EXPORT. A result that lives only in a panel cannot be sent to a client, checked by a
+            // colleague, or filed against a project. Enabled only once there IS a result — an empty
+            // report is worse than none, because it looks like a finished one.
+            if ui
+                .add_enabled(self.grid.is_some(), egui::Button::new("📄 Report"))
+                .on_hover_text(
+                    "Write this calculation out as a standalone HTML report — conditions, results, \
+                     the full grid, room surfaces and connected load.",
+                )
+                .on_disabled_hover_text("Press Calculate first")
+                .clicked()
+            {
+                action.export_report = true;
+            }
 
             ui.menu_button("▼ Surfaces", |ui| {
                 ui.label(egui::RichText::new("reflectance — how much light a surface returns").small().weak());
