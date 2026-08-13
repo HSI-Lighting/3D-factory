@@ -440,6 +440,14 @@ pub struct LightState {
     pub cam_target: [f32; 3],
     /// Paint the lux heatmap on the 3D floor (P3) rather than the floor material.
     pub floor_heatmap: bool,
+    /// Which false-colour palette the scale is read through.
+    pub ramp: LuxRamp,
+    /// Drop the ceiling out of the SIMLUX 3D view, so the room can be seen into from above.
+    ///
+    /// The same need the 3D Factory's own hide-ceilings answers, and for a stronger reason here:
+    /// the result being looked at is painted on the FLOOR, and a closed box hides exactly the
+    /// surface the view exists to show.
+    pub hide_ceilings: bool,
 }
 
 impl Default for LightState {
@@ -500,6 +508,8 @@ impl LightState {
             cam_dist: 10.0,
             cam_target: [0.0, 0.0, 1.5],
             floor_heatmap: true,
+            ramp: LuxRamp::default(),
+            hide_ceilings: true,
         }
     }
 
@@ -1007,6 +1017,24 @@ impl LightState {
     ///
     /// Registers a synthesised photometry per asset as a side effect, which is why this takes
     /// `&mut self`.
+    /// Slide the view: move the camera TARGET across the screen plane by a drag of `(dx, dy)`
+    /// pixels.
+    ///
+    /// Orbit and zoom alone cannot get you to a corner of a large plan — the pivot stays put and
+    /// the room swings around it. Scaled by distance so the scene keeps up with the cursor at any
+    /// zoom, which is what makes a pan feel like dragging the model rather than nudging it.
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        let (cy, sy) = (self.cam_yaw.cos(), self.cam_yaw.sin());
+        let (cp, sp) = (self.cam_pitch.cos(), self.cam_pitch.sin());
+        // The camera's own basis: forward is the eye→target direction used by `light3d::mvp`.
+        let fwd = glam::Vec3::new(-cp * cy, -cp * sy, -sp);
+        let right = fwd.cross(glam::Vec3::Z).normalize_or_zero();
+        let up = right.cross(fwd).normalize_or_zero();
+        let k = self.cam_dist * 0.0022;
+        let t = glam::Vec3::from(self.cam_target) - right * dx * k + up * dy * k;
+        self.cam_target = [t.x, t.y, t.z];
+    }
+
     /// Count the model-carried luminaires for the status strip, without building them.
     ///
     /// The MERGED count, so the strip agrees with what Calculate will actually run.
@@ -1598,7 +1626,55 @@ impl LightState {
             });
 
             ui.menu_button("▼ Display", |ui| {
-                ui.checkbox(&mut self.floor_heatmap, "false-colour on the floor");
+                ui.checkbox(&mut self.floor_heatmap, "false-colour on the floor")
+                    .on_hover_text("Paint the calculated illuminance onto the floor of the 3D view.");
+                ui.checkbox(&mut self.hide_ceilings, "hide ceilings")
+                    .on_hover_text(
+                        "Drop the ceiling so the room can be seen into from above. The result is \
+                         painted on the FLOOR, and a closed box hides the surface this view exists \
+                         to show.",
+                    );
+                ui.separator();
+                // ---- THE SCALE ITSELF ----------------------------------------------------
+                // A false-colour picture is unreadable without knowing what it is scaled to, and
+                // two rooms cannot be compared at all unless they are on the SAME scale — which is
+                // what the manual setting is for. Auto is per-room and re-scales every calculation.
+                ui.label(egui::RichText::new("Scale").small().weak());
+                let mut auto = self.scale_max.is_none();
+                if ui
+                    .checkbox(&mut auto, "auto (to this room's maximum)")
+                    .on_hover_text("Off: pin the top of the scale, so two rooms can be compared.")
+                    .changed()
+                {
+                    self.scale_max = if auto {
+                        None
+                    } else {
+                        Some(self.grid.as_ref().map(|g| g.max).unwrap_or(500.0).max(1.0))
+                    };
+                }
+                if let Some(m) = &mut self.scale_max {
+                    ui.add(
+                        egui::DragValue::new(m)
+                            .speed(10.0)
+                            .prefix("top of scale  ")
+                            .suffix(" lx")
+                            .range(1.0..=100_000.0),
+                    );
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Colours").small().weak());
+                let cur = self.ramp;
+                egui::ComboBox::from_id_salt("lux_ramp")
+                    .width(190.0)
+                    .selected_text(cur.label())
+                    .show_ui(ui, |ui| {
+                        for r in LuxRamp::ALL {
+                            ui.selectable_value(&mut self.ramp, r, r.label());
+                        }
+                    });
+                // A live sample of the chosen ramp, so the choice can be made by looking rather
+                // than by reading four names.
+                legend_bar_with(ui, self.scale_ceiling(), self.ramp);
             });
 
             ui.separator();
@@ -2096,28 +2172,105 @@ impl LightState {
     }
 }
 
-/// Five-stop false-colour ramp (low→high). `t` is clamped to 0..1.
-pub fn lux_color(t: f32) -> egui::Color32 {
-    const STOPS: [(f32, [u8; 3]); 5] = [
-        (0.00, [20, 24, 82]),    // deep blue
-        (0.25, [34, 116, 204]),  // blue
-        (0.50, [40, 190, 120]),  // green
-        (0.75, [240, 214, 72]),  // yellow
-        (1.00, [226, 72, 46]),   // red
-    ];
-    let t = t.clamp(0.0, 1.0);
-    let (mut lo, mut hi) = (STOPS[0], STOPS[STOPS.len() - 1]);
-    for w in STOPS.windows(2) {
-        if t >= w[0].0 && t <= w[1].0 {
-            lo = w[0];
-            hi = w[1];
-            break;
+/// The false-colour palettes the lux scale can be read through.
+///
+/// A false-colour scale is a READING INSTRUMENT, not decoration, and which palette it uses changes
+/// what a person can see in it. The classic blue→red ramp is what lighting reports have always
+/// used and is the one to hand a client. It is also not perceptually uniform, and is close to
+/// unusable for the ~8 % of men with red-green colour blindness — which is why Viridis is here.
+/// Greyscale prints and photocopies without the reader having to guess which grey was which colour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum LuxRamp {
+    /// Blue → green → yellow → red. The lighting-industry convention.
+    #[default]
+    Classic,
+    /// Perceptually uniform and colour-blind safe: equal steps in lux look like equal steps.
+    Viridis,
+    /// Black → red → orange → white. High contrast at the top of the scale.
+    Fire,
+    /// Greyscale, for print.
+    Grey,
+}
+
+impl LuxRamp {
+    pub const ALL: [LuxRamp; 4] = [LuxRamp::Classic, LuxRamp::Viridis, LuxRamp::Fire, LuxRamp::Grey];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LuxRamp::Classic => "Classic (blue→red)",
+            LuxRamp::Viridis => "Viridis (colour-blind safe)",
+            LuxRamp::Fire => "Fire",
+            LuxRamp::Grey => "Greyscale (for print)",
         }
     }
-    let span = (hi.0 - lo.0).max(1e-6);
-    let f = (t - lo.0) / span;
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
-    egui::Color32::from_rgb(lerp(lo.1[0], hi.1[0]), lerp(lo.1[1], hi.1[1]), lerp(lo.1[2], hi.1[2]))
+
+    /// Its stops, low→high. The first is at 0.0 and the last at 1.0.
+    fn stops(self) -> &'static [(f32, [u8; 3])] {
+        match self {
+            LuxRamp::Classic => &[
+                (0.00, [20, 24, 82]),   // deep blue
+                (0.25, [34, 116, 204]), // blue
+                (0.50, [40, 190, 120]), // green
+                (0.75, [240, 214, 72]), // yellow
+                (1.00, [226, 72, 46]),  // red
+            ],
+            LuxRamp::Viridis => &[
+                (0.00, [68, 1, 84]),
+                (0.25, [59, 82, 139]),
+                (0.50, [33, 145, 140]),
+                (0.75, [94, 201, 98]),
+                (1.00, [253, 231, 37]),
+            ],
+            LuxRamp::Fire => &[
+                (0.00, [0, 0, 0]),
+                (0.33, [153, 26, 12]),
+                (0.66, [237, 139, 22]),
+                (1.00, [255, 255, 224]),
+            ],
+            LuxRamp::Grey => &[(0.00, [12, 12, 12]), (1.00, [245, 245, 245])],
+        }
+    }
+
+    /// The colour at `t`, clamped to 0..1.
+    pub fn color(self, t: f32) -> egui::Color32 {
+        let stops = self.stops();
+        let t = t.clamp(0.0, 1.0);
+        let (mut lo, mut hi) = (stops[0], stops[stops.len() - 1]);
+        for w in stops.windows(2) {
+            if t >= w[0].0 && t <= w[1].0 {
+                lo = w[0];
+                hi = w[1];
+                break;
+            }
+        }
+        let span = (hi.0 - lo.0).max(1e-6);
+        let f = (t - lo.0) / span;
+        let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+        egui::Color32::from_rgb(lerp(lo.1[0], hi.1[0]), lerp(lo.1[1], hi.1[1]), lerp(lo.1[2], hi.1[2]))
+    }
+
+    /// The same, as float RGB (0..1) for the 3D floor heatmap.
+    ///
+    /// Handed back as a plain `fn` POINTER because the vertex builder takes one — it cannot carry
+    /// a closure that borrows `self`.
+    pub fn rgb_fn(self) -> fn(f32) -> (f32, f32, f32) {
+        fn conv(r: LuxRamp, t: f32) -> (f32, f32, f32) {
+            let c = r.color(t);
+            (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
+        }
+        match self {
+            LuxRamp::Classic => |t| conv(LuxRamp::Classic, t),
+            LuxRamp::Viridis => |t| conv(LuxRamp::Viridis, t),
+            LuxRamp::Fire => |t| conv(LuxRamp::Fire, t),
+            LuxRamp::Grey => |t| conv(LuxRamp::Grey, t),
+        }
+    }
+}
+
+/// Five-stop false-colour ramp (low→high). `t` is clamped to 0..1. The industry-standard palette,
+/// kept as a free function for callers that have no `LightState` to ask.
+pub fn lux_color(t: f32) -> egui::Color32 {
+    LuxRamp::Classic.color(t)
 }
 
 /// The same false-colour ramp as [`lux_color`], as float RGB (0..1) for the
@@ -2128,8 +2281,13 @@ pub fn lux_rgb(t: f32) -> (f32, f32, f32) {
     (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
 }
 
-/// A horizontal gradient legend from 0 to `max` lux.
+/// A horizontal gradient legend from 0 to `max` lux, in the standard palette.
 pub fn legend_bar(ui: &mut egui::Ui, max: f64) {
+    legend_bar_with(ui, max, LuxRamp::Classic)
+}
+
+/// A horizontal gradient legend from 0 to `max` lux, in `ramp`.
+pub fn legend_bar_with(ui: &mut egui::Ui, max: f64, ramp: LuxRamp) {
     let (resp, painter) = ui.allocate_painter(egui::vec2(240.0, 16.0), egui::Sense::hover());
     let rect = resp.rect;
     let n = 64;
@@ -2140,7 +2298,7 @@ pub fn legend_bar(ui: &mut egui::Ui, max: f64) {
         painter.rect_filled(
             egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
             0.0,
-            lux_color(t),
+            ramp.color(t),
         );
     }
     ui.horizontal(|ui| {
@@ -3221,5 +3379,112 @@ mod a_fitting_is_bounded_work {
         let built = s.generated_luminaires(&f).len();
         assert_eq!(s.model_fixtures, built, "the strip said {} and Calculate runs {built}", s.model_fixtures);
         assert!(built <= crate::app::MAX_EMITTERS_PER_FIXTURE);
+    }
+}
+
+/// THE SIMLUX VIEW HAS TO BE USABLE ON A REAL PLAN.
+///
+/// Orbit and zoom alone cannot reach the corner of a large building: the pivot stays put and the
+/// room swings around it. And the result is painted on the FLOOR, so a closed box hides the one
+/// surface the view exists to show.
+#[cfg(test)]
+mod the_simlux_view_can_be_read {
+    use super::*;
+
+    /// Panning moves the camera TARGET across the screen plane, not along one world axis — a pan
+    /// that ignored the yaw would slide sideways in the wrong direction as soon as you orbited.
+    #[test]
+    fn a_pan_follows_the_camera_not_the_world() {
+        let mut s = LightState::new();
+        s.cam_target = [0.0, 0.0, 0.0];
+        s.cam_pitch = 0.0;
+        s.cam_dist = 10.0;
+
+        s.cam_yaw = 0.0;
+        s.pan(100.0, 0.0);
+        let a = s.cam_target;
+        assert!(a[0].abs() < 1e-4, "at yaw 0 a horizontal drag must not move x: {a:?}");
+        assert!(a[1].abs() > 1e-3, "…it must move y: {a:?}");
+
+        // Turn a quarter turn and the SAME drag has to move the other axis.
+        let mut s = LightState::new();
+        s.cam_target = [0.0, 0.0, 0.0];
+        s.cam_pitch = 0.0;
+        s.cam_dist = 10.0;
+        s.cam_yaw = std::f32::consts::FRAC_PI_2;
+        s.pan(100.0, 0.0);
+        let b = s.cam_target;
+        assert!(b[1].abs() < 1e-4, "at yaw 90° the same drag must not move y: {b:?}");
+        assert!(b[0].abs() > 1e-3, "…it must move x: {b:?}");
+    }
+
+    /// It has to keep up with the cursor: the same drag covers more ground zoomed out.
+    #[test]
+    fn a_pan_scales_with_the_zoom() {
+        let far = {
+            let mut s = LightState::new();
+            s.cam_target = [0.0; 3];
+            s.cam_dist = 100.0;
+            s.pan(50.0, 0.0);
+            glam::Vec3::from(s.cam_target).length()
+        };
+        let near = {
+            let mut s = LightState::new();
+            s.cam_target = [0.0; 3];
+            s.cam_dist = 5.0;
+            s.pan(50.0, 0.0);
+            glam::Vec3::from(s.cam_target).length()
+        };
+        assert!(far > near * 10.0, "zoomed out: {far}, zoomed in: {near}");
+    }
+
+    /// Every palette must span its full range and stay inside it.
+    #[test]
+    fn every_ramp_is_a_complete_scale() {
+        for r in LuxRamp::ALL {
+            let lo = r.color(0.0);
+            let hi = r.color(1.0);
+            assert_ne!(lo, hi, "{:?} has no range at all", r);
+            // Clamped, not wrapped: out-of-range readings must not come back as a mid-scale colour.
+            assert_eq!(r.color(-5.0), lo, "{:?} does not clamp below", r);
+            assert_eq!(r.color(9.0), hi, "{:?} does not clamp above", r);
+            // …and monotone in brightness, or "brighter patch" stops meaning "more light".
+            let lum = |c: egui::Color32| c.r() as f32 * 0.299 + c.g() as f32 * 0.587 + c.b() as f32 * 0.114;
+            assert!(lum(hi) > lum(lo), "{:?} runs dark at the top of the scale", r);
+        }
+    }
+
+    /// The `fn` pointer form must agree with the colour form — they are two routes to one scale,
+    /// and the 3D floor uses one while the legend beside it uses the other.
+    #[test]
+    fn the_heatmap_and_the_legend_read_the_same_scale() {
+        for r in LuxRamp::ALL {
+            let f = r.rgb_fn();
+            for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+                let (a, b, c) = f(t);
+                let want = r.color(t);
+                assert!((a - want.r() as f32 / 255.0).abs() < 1e-6, "{r:?} at {t}");
+                assert!((b - want.g() as f32 / 255.0).abs() < 1e-6, "{r:?} at {t}");
+                assert!((c - want.b() as f32 / 255.0).abs() < 1e-6, "{r:?} at {t}");
+            }
+        }
+    }
+
+    /// HIDING THE CEILING MUST NOT CHANGE THE ANSWER. It is a view option, and the ceiling is
+    /// 70 % of the interreflection — if the calculation stopped seeing it, the room would read
+    /// far darker and nothing on screen would say why.
+    #[test]
+    fn hiding_the_ceiling_is_a_view_option_only() {
+        let src = include_str!("app.rs");
+        let a = src.find("fn build_scene3d_verts").expect("the SIMLUX vertex builder");
+        let b = src[a..].find("\n    /// SIMLUX 3D viewport").map(|e| a + e).unwrap_or(src.len());
+        let body = &src[a..b];
+        assert!(body.contains("hide_ceilings"), "the view filters the ceiling out");
+        // The filter has to be on a COPY for drawing. If `self.light.meshes` itself were pruned,
+        // the next Calculate would run on a room with no ceiling.
+        assert!(
+            !body.contains("self.light.meshes.retain") && !body.contains("meshes.retain"),
+            "the scene meshes must not be pruned in place — Calculate reads them",
+        );
     }
 }

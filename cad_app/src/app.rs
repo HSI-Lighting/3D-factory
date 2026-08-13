@@ -4579,18 +4579,31 @@ impl CadApp {
         }
         let floor = if self.light.floor_heatmap {
             match (self.light.grid.as_ref(), self.light.plane.as_ref()) {
-                (Some(g), Some(p)) => Some((
-                    g,
-                    p,
-                    self.light.scale_ceiling(),
-                    crate::light::lux_rgb as fn(f32) -> (f32, f32, f32),
-                )),
+                // The chosen palette, not the fixed one — the false-colour scale is a reading
+                // instrument and the person reading it picks how to read it.
+                (Some(g), Some(p)) => {
+                    Some((g, p, self.light.scale_ceiling(), self.light.ramp.rgb_fn()))
+                }
                 _ => None,
             }
         } else {
             None
         };
-        let mut verts = crate::light3d::build_scene_verts(&self.light.meshes, &self.light.materials, floor);
+        // HIDE CEILINGS. The result is painted on the FLOOR, and a closed box hides the one
+        // surface this view exists to show. Filtered here rather than in the mesh build so the
+        // CALCULATION still sees the ceiling — it is 70 % of the interreflection, and a view
+        // option that changed the answer would be a trap.
+        let shown: Vec<cad_light::Mesh> = if self.light.hide_ceilings {
+            self.light
+                .meshes
+                .iter()
+                .filter(|m| m.material != 2)
+                .cloned()
+                .collect()
+        } else {
+            self.light.meshes.clone()
+        };
+        let mut verts = crate::light3d::build_scene_verts(&shown, &self.light.materials, floor);
         let s = (self.light.cam_dist * 0.02).clamp(0.05, 0.3);
         for l in &self.light.luminaires {
             crate::light3d::push_luminaire_marker(&mut verts, l.position.x, l.position.y, l.position.z, s);
@@ -12725,7 +12738,11 @@ impl CadApp {
                         if ui.button("✕").on_hover_text(tip).clicked() {
                             if split { leave_workspace = true; } else { open = false; }
                         }
-                        ui.label(egui::RichText::new("drag: orbit · scroll: zoom").small().weak());
+                        ui.label(
+                            egui::RichText::new("drag: orbit · shift/mid: pan · scroll: zoom")
+                                .small()
+                                .weak(),
+                        );
                     });
                 });
                 ui.separator();
@@ -12744,7 +12761,11 @@ impl CadApp {
                     self.export_light_report();
                 }
                 if self.light.grid.is_some() {
-                    crate::light::legend_bar(ui, self.light.scale_ceiling());
+                    crate::light::legend_bar_with(
+                        ui,
+                        self.light.scale_ceiling(),
+                        self.light.ramp,
+                    );
                 }
                 ui.separator();
 
@@ -12752,8 +12773,20 @@ impl CadApp {
                 let (resp, painter) = ui.allocate_painter(size, egui::Sense::drag());
                 let rect = resp.rect;
 
-                // ---- orbit + zoom ------------------------------------------
-                if resp.dragged() {
+                // ---- orbit + PAN + zoom ------------------------------------
+                //
+                // Orbit and zoom alone cannot reach the corner of a large plan: the pivot stays put
+                // and the room swings around it. Pan is on the same gestures the 3D Factory uses —
+                // Shift + drag, or the middle button — so the two viewports do not need separate
+                // muscle memory. Middle-drag ALSO pans here (rather than orbiting as it does in the
+                // Factory) because left-drag already orbits in this view and nothing else is on it.
+                let shift = ui.input(|i| i.modifiers.shift);
+                let panning = resp.dragged()
+                    && (shift || resp.dragged_by(egui::PointerButton::Middle));
+                if panning {
+                    let d = resp.drag_delta();
+                    self.light.pan(d.x, d.y);
+                } else if resp.dragged() {
                     let d = resp.drag_delta();
                     self.light.cam_yaw -= d.x * 0.01;
                     self.light.cam_pitch = (self.light.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
