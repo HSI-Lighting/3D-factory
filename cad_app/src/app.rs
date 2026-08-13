@@ -12692,12 +12692,24 @@ impl CadApp {
         // Opening the picker mutates `self.file_dialog`, and the panel closure already holds
         // `self` — so the request is carried out after the panel is drawn.
         let mut open_ies_picker = false;
-        let base = egui::SidePanel::right("simlux_3d_panel").min_width(220.0);
-        let base = if split {
-            base.exact_width(half)
-        } else {
-            base.resizable(true).default_width(360.0)
-        };
+        // RESIZABLE IN BOTH MODES.
+        //
+        // Reported as: "the window of simlux isnt adjustable like we can do for 3d factory or 2d
+        // cad." The workspace ("live") mode used `exact_width(half)`, which is not a default but a
+        // LOCK — the panel had no drag handle at all and sat on exactly 50% of the screen whatever
+        // you were doing. Half is a sensible place to START; it is not a sensible place to be
+        // stuck, since the whole point of the split is to work in BOTH halves.
+        //
+        // `default_width` applies on first use and egui remembers the drag afterwards, per panel
+        // id — so it opens where it always did and then stays where you put it.
+        let max = (ctx.screen_rect().width() - 260.0).max(260.0);
+        let base = egui::SidePanel::right("simlux_3d_panel")
+            .resizable(true)
+            .min_width(220.0)
+            // Never let it swallow the window: the half it is paired with has to stay usable, and a
+            // panel dragged past the far edge cannot be dragged back.
+            .max_width(max);
+        let base = if split { base.default_width(half) } else { base.default_width(360.0) };
         base
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
