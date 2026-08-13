@@ -337,6 +337,12 @@ pub struct LightState {
     /// the desks and still read as flat and cave-like, and this is the only number that says so —
     /// EN 12464-1 asks for at least 50 lx in most occupied spaces, and more where faces matter.
     pub cylindrical_avg: Option<f64>,
+    /// How many luminaires the MODEL is carrying — curved lights, counted for the status strip.
+    ///
+    /// Kept as a number rather than derived on the spot because the strip is drawn inside the
+    /// panel closure, which already holds `self` and cannot reach the factory. Refreshed by
+    /// [`Self::refresh_model_fixtures`] each frame the panel is shown.
+    pub model_fixtures: usize,
     /// Per-surface illuminance and luminance from the last calculation — walls and ceiling, which
     /// EN 12464-1 sets levels for and the work plane says nothing about.
     pub surfaces: Vec<cad_light::SurfaceResult>,
@@ -425,6 +431,7 @@ impl LightState {
             installation: None,
             eye_height: 1.2,
             cylindrical_avg: None,
+            model_fixtures: 0,
             surfaces: Vec::new(),
             luminaires: Vec::new(),
             auto_center_light: true,
@@ -961,6 +968,16 @@ impl LightState {
     ///
     /// Registers a synthesised photometry per asset as a side effect, which is why this takes
     /// `&mut self`.
+    /// Count the model-carried luminaires for the status strip, without building them.
+    pub fn refresh_model_fixtures(&mut self, f: &crate::factory::FactoryState) {
+        self.model_fixtures = f
+            .furniture
+            .iter()
+            .filter_map(|inst| f.furniture_lib.get(inst.asset))
+            .map(|a| a.emitters.len())
+            .sum();
+    }
+
     fn generated_luminaires(&mut self, f: &crate::factory::FactoryState) -> Vec<Luminaire> {
         let mut out = Vec::new();
         // A range placed lights never reach, so a generated id can never collide with a user's.
@@ -1561,6 +1578,23 @@ impl LightState {
                     .small()
                     .strong(),
             );
+            // …AND THE LIGHTS THE MODEL CARRIES. A curved light is a real fitting now, but it is
+            // DERIVED from the placed object at calculation time rather than living in
+            // `luminaires` — so a room holding two of them and no hand-placed points read
+            // "0 fixture(s)", which says the scheme is empty when it is not.
+            if self.model_fixtures > 0 {
+                ui.label(
+                    egui::RichText::new(format!("+ {} from the model", self.model_fixtures))
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(120, 190, 255)),
+                )
+                .on_hover_text(
+                    "Luminaires built into the 3D model — curved lights. They carry their own \
+                     photometry and are included in Calculate; move or delete the fitting and its \
+                     light goes with it.",
+                );
+            }
             if !self.selected.is_empty() {
                 ui.label(
                     egui::RichText::new(format!("· {} selected", self.selected.len()))

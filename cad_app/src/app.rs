@@ -12630,6 +12630,9 @@ impl CadApp {
     }
 
     fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
+        // The strip says how many fittings there are, and the model's own lights have to be in
+        // that count — otherwise a room lit entirely by curved lights reports "0 fixture(s)".
+        self.light.refresh_model_fixtures(&self.factory);
         // SIMLUX workspace mode force-shows this as the right HALF of the window
         // and keeps it in sync with the 2D drawing; else it's the toggled panel.
         let split = self.light.simlux_mode;
