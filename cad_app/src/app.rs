@@ -130,6 +130,14 @@ mod pedit;
 // 5 million pairs is roughly half a second on this CPU.
 const PAIR_LIMIT: usize = 5_000_000;
 
+/// Spacing of the point sources a linear fitting is represented by, metres.
+///
+/// A curved light is a LINE of light and the engine's luminaire is a point with a distribution, so
+/// the run is sampled into points that share its flux. 0.25 m is well under any real mounting
+/// height, and the error of the approximation only shows closer to the fitting than the spacing
+/// itself — at which distance a real diffuser is not a line source either.
+const EMITTER_SPACING_M: f32 = 0.25;
+
 // ── Properties-panel chrome ────────────────────────────────────────────────
 // These now ALIAS the design-token module (`crate::theme`) — the single source
 // of truth (THEME_SYSTEM.md §5). Do not put raw hex here; change values in
@@ -25570,6 +25578,36 @@ impl CadApp {
                 }
                 num(ui, u, "Hanger spacing", &mut s.spacing, 0.02, 0.3, 3.0);
 
+                // ---- OUTPUT: what makes this a light rather than a glowing shape ----------------
+                //
+                // Until these existed a curved light was furniture with an emissive texture: it
+                // glowed in the render and contributed NOTHING to a calculation, which is the most
+                // misleading state a lighting tool can be in — it looks lit and computes dark.
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Output").strong());
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Load").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.watts_per_m).speed(0.1).range(0.0..=100.0).suffix(" W/m"));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Efficacy").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.efficacy_lm_per_w).speed(1.0).range(0.0..=250.0).suffix(" lm/W"));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([150.0, 18.0], egui::Label::new("Colour temperature").selectable(false));
+                    ui.add(egui::DragValue::new(&mut s.cct_k).speed(50.0).range(1800..=8000).suffix(" K"));
+                });
+                // CCT is deliberately NOT in the lux maths, and the UI has to say so or someone
+                // will change it expecting the numbers to move. Lux and candela are already
+                // V(λ)-weighted: 3000 K and 6000 K at the same flux give the same illuminance.
+                ui.label(
+                    egui::RichText::new(
+                        "Colour temperature sets the lens tint and is reported — it does not change the lux, because photometric units are already eye-weighted.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
                 // Live feedback: run the builder for its metrics/validation (fast — a few k tris).
                 match cad_solid::sweeplight::build(s) {
                     Ok((m, _, _)) => {
@@ -25577,6 +25615,17 @@ impl CadApp {
                             "path {:.2} m · {} hangers at {:.2} m (asked {:.2}) · min radius {:.0} mm · {} tris",
                             m.path_len, m.droppers, m.achieved_spacing, s.spacing, m.min_radius * 1000.0, m.tris,
                         ));
+                        // What it will contribute to the CALCULATION, quoted before the build so a
+                        // fitting specified with no output is visible as such rather than silently
+                        // producing a shape that lights nothing.
+                        let em = cad_solid::sweeplight::emitters(s, EMITTER_SPACING_M);
+                        let lm: f64 = em.iter().map(|e| e.lumens).sum();
+                        let w: f64 = em.iter().map(|e| e.watts).sum();
+                        feedback(ui, if em.is_empty() {
+                            "no light output — set a load and an efficacy above zero".to_string()
+                        } else {
+                            format!("{lm:.0} lm · {w:.1} W · {} emitting points at {EMITTER_SPACING_M:.2} m", em.len())
+                        });
                         for w in m.warnings.iter().take(3) {
                             ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
                         }
@@ -26241,6 +26290,10 @@ impl CadApp {
             }
         };
         let part_ids = mesh.face_ids.clone();
+        // The emitting points, in the SAME frame the mesh arrives in — so they survive the
+        // recentre/rebase the asset library applies to it, below.
+        let emitters = cad_solid::sweeplight::emitters(inp, EMITTER_SPACING_M);
+        let rebase = crate::factory::FactoryState::asset_rebase(&mesh.positions);
         let obj = crate::mesh_io::ObjMesh {
             positions: mesh.positions,
             normals: mesh.normals,
@@ -26248,17 +26301,46 @@ impl CadApp {
             alpha: Vec::new(),
         };
         self.snapshot_factory();
-        let idx = self.factory.add_furniture_asset("Curved light".to_string(), obj);
+        // A unique name per fitting: each run has its own flux per point, so each needs its own
+        // synthesised photometry, and the profile is keyed by this name.
+        let n = self.factory.furniture_lib.iter().filter(|a| a.name.starts_with("Curved light")).count() + 1;
+        let idx = self.factory.add_furniture_asset(format!("Curved light {n}"), obj);
+        let total_lm: f64 = emitters.iter().map(|e| e.lumens).sum();
+        let total_w: f64 = emitters.iter().map(|e| e.watts).sum();
+        let n_em = emitters.len();
         if let Some(a) = self.factory.furniture_lib.get_mut(idx) {
             a.alpha_resolved = true;
             if part_ids.len() == a.positions.len() / 3 {
                 a.part_ids = part_ids;
             }
+            let (off, k) = rebase.unwrap_or(([0.0; 3], 1.0));
+            a.emitters = emitters
+                .iter()
+                .map(|e| crate::factory::FurnEmitter {
+                    pos: [
+                        (e.pos[0] - off[0]) * k,
+                        (e.pos[1] - off[1]) * k,
+                        (e.pos[2] - off[2]) * k,
+                    ],
+                    lumens: e.lumens,
+                    watts: e.watts,
+                })
+                .collect();
+            a.cct_k = inp.cct_k;
         }
-        // Lens: warm-white EMISSIVE material — the part that actually lights in the raytrace.
-        let lens = self.factory.add_texture("Light lens (emissive)".into(), 1, 1, vec![255, 236, 200, 255]);
+        // Lens: EMISSIVE material — the part that glows in the raytraced render. Its colour is the
+        // chosen CCT rather than a fixed warm tint, so a 4000 K fitting no longer renders as 2700 K
+        // while its own dialog says otherwise.
+        let tint = crate::factory::cct_to_linear_rgb(inp.cct_k);
+        let srgb = |v: f32| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+        let lens = self.factory.add_texture(
+            format!("Light lens {}K (emissive)", inp.cct_k),
+            1,
+            1,
+            vec![srgb(tint[0]), srgb(tint[1]), srgb(tint[2]), 255],
+        );
         if let Some(t) = self.factory.textures.get_mut(lens) {
-            t.emission = [1.0, 0.86, 0.62];
+            t.emission = tint;
             t.emission_strength = 6.0;
             t.roughness = 0.35;
         }
@@ -26294,10 +26376,17 @@ impl CadApp {
                 inst.surface_texture = fg_tex;
             }
         }
-        self.factory.status = format!(
-            "Curved light: {:.2} m path · {} hangers at {:.2} m · {} tris — the lens glows in ⏺ Render",
-            m.path_len, m.droppers, m.achieved_spacing, m.tris,
-        );
+        self.factory.status = if n_em == 0 {
+            format!(
+                "Curved light: {:.2} m path · {} hangers at {:.2} m · {} tris — NO LIGHT OUTPUT (set a load and an efficacy above zero)",
+                m.path_len, m.droppers, m.achieved_spacing, m.tris,
+            )
+        } else {
+            format!(
+                "Curved light: {:.2} m path · {} hangers at {:.2} m · {} tris · {total_lm:.0} lm / {total_w:.1} W over {n_em} emitters at {} K — counted in ⚡ Calculate",
+                m.path_len, m.droppers, m.achieved_spacing, m.tris, inp.cct_k,
+            )
+        };
         self.history.push(format!("  built curved light ({:.2} m, {} hangers)", m.path_len, m.droppers));
         self.factory.open = true;
         self.active_view = ActiveView::ThreeD;

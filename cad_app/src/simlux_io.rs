@@ -309,6 +309,19 @@ pub struct FurnitureAssetRec {
     /// staircase keeps its per-piece selection. Empty for imported meshes. Small (one u32/tri).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub part_ids: Vec<u32>,
+    /// EMITTING POINTS of a generated luminaire (a curved light), in the asset's local frame:
+    /// `[x, y, z, lumens, watts]` per point. Flat rather than a struct because there are a few
+    /// hundred numbers here, not a few million, and a flat list still reads in a text editor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emitters: Vec<[f64; 5]>,
+    /// Colour temperature of those emitters, kelvin. Reported, and used for the lens tint; it does
+    /// NOT enter the lux calculation.
+    #[serde(default, skip_serializing_if = "crate::simlux_io::is_zero_u32")]
+    pub cct_k: u32,
+}
+
+pub(crate) fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A placed furniture instance. Mirrors `factory::FurnitureInst`.

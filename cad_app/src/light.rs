@@ -204,6 +204,43 @@ pub fn mesh_height(meshes: &[Mesh]) -> Option<f32> {
     (hi > lo).then(|| hi - lo)
 }
 
+/// Photometry for one emitting point of a diffused linear fitting, carrying `lumens` and `watts`.
+///
+/// LAMBERTIAN, and that is a decision worth stating rather than a default that fell out. A curved
+/// light is an extrusion behind an opal diffuser, and a diffuser is the textbook Lambertian
+/// emitter: its luminance is the same from every direction, which is exactly `I(γ) = I₀ cos γ`.
+/// For that distribution `Φ = π·I₀`, so `I₀ = Φ/π` is forced — there is no free constant to pick.
+///
+/// It is an APPROXIMATION, and it is the honest one to make in the absence of a measurement. A real
+/// product's LDT will differ, most where the fitting is deep and its side walls cut the beam off
+/// below some angle. When one is available, import the LDT and use it; this is what the geometry
+/// alone can justify, not a stand-in for having measured.
+fn lambertian_profile(name: &str, lumens: f64, watts: f64) -> IesProfile {
+    let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
+    let peak = lumens / std::f64::consts::PI;
+    let candela: Vec<f64> =
+        vertical_angles.iter().map(|g| peak * g.to_radians().cos().max(0.0)).collect();
+    IesProfile {
+        name: name.to_string(),
+        photometry: PhotometryType::C,
+        lumens,
+        multiplier: 1.0,
+        vertical_angles,
+        horizontal_angles: vec![0.0],
+        candela: vec![candela],
+        watts,
+        width: 0.0,
+        length: 0.0,
+        height: 0.0,
+        // No aperture: one sampling point of a continuous run has no meaningful area of its own,
+        // and UGR from a line source is not the sum of UGRs from the points it was sliced into.
+        // Declaring zero excludes it from the glare figure — see `UgrResult::skipped_no_area` —
+        // which is right, because a fabricated area here would produce a fabricated UGR.
+        luminous_length: 0.0,
+        luminous_width: 0.0,
+    }
+}
+
 /// A cosine (Lambertian) downlight: I(γ) = 1000·cos γ cd, axially symmetric.
 fn builtin_downlight() -> IesProfile {
     let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
@@ -914,6 +951,50 @@ impl LightState {
         }
     }
 
+    /// Luminaires the MODEL carries: every placed fitting that was generated with emitting points.
+    ///
+    /// DERIVED, never stored. The emitters live on the asset in its own local frame, so the
+    /// instance transform puts them where the fixture actually is — move it, copy it, rotate it or
+    /// delete it and its light does the same thing for free. A luminaire list written once at build
+    /// time strands behind the fixture the first time anybody drags it, and nothing on screen says
+    /// so; that failure is silent and produces a plausible wrong answer, which is the worst kind.
+    ///
+    /// Registers a synthesised photometry per asset as a side effect, which is why this takes
+    /// `&mut self`.
+    fn generated_luminaires(&mut self, f: &crate::factory::FactoryState) -> Vec<Luminaire> {
+        let mut out = Vec::new();
+        // A range placed lights never reach, so a generated id can never collide with a user's.
+        let mut id = 1_000_000_u32;
+        for (i, inst) in f.furniture.iter().enumerate() {
+            let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
+            if asset.emitters.is_empty() {
+                continue;
+            }
+            let Some(m) = f.furniture_model_matrix(i) else { continue };
+            let m = glam::Mat4::from_cols_array(&m);
+            // One profile per ASSET: every point on a run carries the same share of its flux, so
+            // they share a distribution, while two different fittings do not.
+            let profile = format!("{} · {} K", asset.name, asset.cct_k);
+            if !self.profiles.contains_key(&profile) {
+                let per_lm = asset.emitters[0].lumens;
+                let per_w = asset.emitters[0].watts;
+                self.profiles.insert(profile.clone(), lambertian_profile(&profile, per_lm, per_w));
+            }
+            for e in &asset.emitters {
+                let p = m.transform_point3(glam::Vec3::from(e.pos));
+                out.push(Luminaire {
+                    id,
+                    profile: profile.clone(),
+                    position: Vertex::new(p.x, p.y, p.z),
+                    rotation_deg: 0.0,
+                    dimming: 1.0,
+                });
+                id += 1;
+            }
+        }
+        out
+    }
+
     pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
         let meshes = self.scene_meshes(doc, factory);
         // The calculation plane must cover whatever is actually being lit. With a 3D model that is
@@ -938,7 +1019,13 @@ impl LightState {
             cols,
             rows,
         };
-        let lums = if self.luminaires.is_empty() && self.auto_center_light {
+        // Lights the MODEL carries — a curved light is a real fitting, not a glowing texture.
+        // Derived here rather than stored, so moving or deleting the fixture takes its light along.
+        let generated = match factory {
+            Some(f) => self.generated_luminaires(f),
+            None => Vec::new(),
+        };
+        let lums = if self.luminaires.is_empty() && generated.is_empty() && self.auto_center_light {
             vec![Luminaire {
                 id: 1,
                 // A stand-in light needs a real profile behind it or the "first look" it exists to
@@ -953,7 +1040,9 @@ impl LightState {
                 dimming: 1.0,
             }]
         } else {
-            self.luminaires.clone()
+            let mut v = self.luminaires.clone();
+            v.extend(generated);
+            v
         };
         let grid = calc_lux(
             &meshes,
@@ -2670,5 +2759,163 @@ mod furniture_in_the_light_scene {
             open.avg,
             shaded.avg,
         );
+    }
+}
+
+/// A CURVED LIGHT IS A LIGHT.
+///
+/// It was not. `factory_build_sweeplight` produced furniture with an emissive lens texture: it
+/// glowed in the raytraced render and contributed exactly nothing to a calculation. That is the
+/// most misleading state a lighting tool can be in — the picture is lit and the numbers are dark,
+/// and neither one says the other is wrong.
+#[cfg(test)]
+mod curved_lights_are_real_lights {
+    use super::*;
+
+    /// A fitting whose emitters are attached, placed somewhere specific.
+    fn a_room_with_a_curved_light(at: glam::Vec3) -> crate::factory::FactoryState {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(
+            &vec![
+                glam::Vec2::new(0.0, 0.0),
+                glam::Vec2::new(6.0, 0.0),
+                glam::Vec2::new(6.0, 6.0),
+                glam::Vec2::new(0.0, 6.0),
+                glam::Vec2::new(0.0, 0.0),
+            ],
+            3.0,
+        )
+        .expect("building");
+        // A minimal body for the fixture: the asset needs geometry, and the rebase is applied to
+        // the emitters through the SAME bounds, so this stands in for the real extrusion.
+        let v = |x: f32, z: f32| [x, 0.0, z];
+        let positions = vec![v(-0.5, 0.0), v(0.5, 0.0), v(0.5, 0.1), v(-0.5, 0.0), v(0.5, 0.1), v(-0.5, 0.1)];
+        let idx = f.add_furniture_asset(
+            "Curved light 1".into(),
+            crate::mesh_io::ObjMesh { positions, normals: vec![[0.0, -1.0, 0.0]; 6], color: None, alpha: Vec::new() },
+        );
+        if let Some(a) = f.furniture_lib.get_mut(idx) {
+            a.cct_k = 3000;
+            a.emitters = vec![
+                crate::factory::FurnEmitter { pos: [-0.25, 0.0, 0.0], lumens: 1000.0, watts: 10.0 },
+                crate::factory::FurnEmitter { pos: [0.25, 0.0, 0.0], lumens: 1000.0, watts: 10.0 },
+            ];
+        }
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(idx, at);
+        f.recompute();
+        f
+    }
+
+    /// THE BUG: a placed curved light must appear in the luminaire list the calculation runs on.
+    #[test]
+    fn its_emitters_become_luminaires() {
+        let f = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.5));
+        let mut s = LightState::new();
+        assert!(s.luminaires.is_empty(), "nothing was placed by hand");
+        let lums = s.generated_luminaires(&f);
+        assert_eq!(lums.len(), 2, "both emitting points must reach the engine");
+    }
+
+    /// …with photometry behind them. A luminaire naming a profile that is not in the table
+    /// contributes nothing, and would look exactly like the bug being fixed.
+    #[test]
+    fn a_photometry_is_registered_for_them() {
+        let f = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.5));
+        let mut s = LightState::new();
+        let lums = s.generated_luminaires(&f);
+        let p = s.profiles.get(&lums[0].profile).expect("its profile must be in the table");
+        // Lambertian: Phi = pi * I0, so a 1000 lm point peaks at 1000/pi cd straight down.
+        assert!((p.candela[0][0] - 1000.0 / std::f64::consts::PI).abs() < 1e-6, "I0 = {}", p.candela[0][0]);
+        assert!(p.candela[0][18] < 1e-9, "and nothing at the horizon");
+        assert_eq!(p.watts, 10.0, "its share of the connected load, for the power density");
+    }
+
+    /// THE POINT OF DERIVING THEM. Move the fixture and its light moves — this is why the emitters
+    /// live on the asset rather than being written into the luminaire list once at build time.
+    #[test]
+    fn the_light_follows_the_fixture() {
+        let mut s = LightState::new();
+        let here = s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(1.0, 1.0, 2.5)));
+        let there = s.generated_luminaires(&a_room_with_a_curved_light(glam::Vec3::new(4.0, 2.0, 2.0)));
+        let mid = |v: &[Luminaire]| {
+            let n = v.len() as f32;
+            (v.iter().map(|l| l.position.x).sum::<f32>() / n, v.iter().map(|l| l.position.y).sum::<f32>() / n,
+             v.iter().map(|l| l.position.z).sum::<f32>() / n)
+        };
+        let (ax, ay, az) = mid(&here);
+        let (bx, by, bz) = mid(&there);
+        assert!((ax - 1.0).abs() < 1e-3 && (ay - 1.0).abs() < 1e-3, "first at ({ax}, {ay})");
+        assert!((bx - 4.0).abs() < 1e-3 && (by - 2.0).abs() < 1e-3, "second at ({bx}, {by})");
+        assert!((az - bz).abs() > 0.4, "and it carried its mounting height with it: {az} vs {bz}");
+    }
+
+    /// Ordinary furniture is not a light. A chair with an emissive-looking texture must not start
+    /// emitting because this path exists.
+    #[test]
+    fn ordinary_furniture_emits_nothing() {
+        let mut f = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.5));
+        for a in &mut f.furniture_lib {
+            a.emitters.clear();
+        }
+        let mut s = LightState::new();
+        assert!(s.generated_luminaires(&f).is_empty());
+    }
+
+    /// AND IT ACTUALLY LIGHTS THE ROOM. Everything above could pass with the luminaires assembled
+    /// correctly and still handed to nothing.
+    #[test]
+    fn the_room_is_brighter_with_it_than_without() {
+        let doc = cad_kernel::Document::default();
+        let lit = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.9));
+        let mut dark = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.9));
+        for a in &mut dark.furniture_lib {
+            a.emitters.clear();
+        }
+
+        let avg = |f: &crate::factory::FactoryState| {
+            let mut s = LightState::new();
+            s.auto_center_light = false; // or the stand-in light would supply the difference
+            s.calculate(&doc, Some(f));
+            s.grid.as_ref().map(|g| g.avg).unwrap_or(0.0)
+        };
+        let (on, off) = (avg(&lit), avg(&dark));
+        assert!(off < 1e-6, "precondition: with no emitters the room is dark, got {off:.3} lx");
+        assert!(on > 1.0, "the curved light must light the room: {on:.1} lx");
+    }
+
+    /// COLOUR TEMPERATURE MUST NOT CHANGE THE LUX. Photometric units are already V(lambda)-
+    /// weighted, so a 2700 K and a 6500 K fitting of the same output give the same illuminance.
+    /// If CCT ever leaks into the flux path — as a tint multiplying lumens, say — this fails.
+    #[test]
+    fn colour_temperature_does_not_change_the_illuminance() {
+        let doc = cad_kernel::Document::default();
+        let avg_at = |cct: u32| {
+            let mut f = a_room_with_a_curved_light(glam::Vec3::new(3.0, 3.0, 2.9));
+            for a in &mut f.furniture_lib {
+                a.cct_k = cct;
+            }
+            let mut s = LightState::new();
+            s.auto_center_light = false;
+            s.calculate(&doc, Some(&f));
+            s.grid.as_ref().map(|g| g.avg).unwrap_or(0.0)
+        };
+        let (warm, cool) = (avg_at(2700), avg_at(6500));
+        assert!(warm > 1.0, "precondition: it is lit");
+        assert!((warm - cool).abs() < 1e-9, "2700 K gave {warm:.4} lx, 6500 K gave {cool:.4} lx");
+    }
+
+    /// The tint it DOES drive has to be the right way round: warm is redder than cool.
+    #[test]
+    fn the_lens_tint_follows_the_colour_temperature() {
+        let warm = crate::factory::cct_to_linear_rgb(2700);
+        let cool = crate::factory::cct_to_linear_rgb(6500);
+        assert!(warm[0] > warm[1] && warm[1] > warm[2], "2700 K must run red > green > blue: {warm:?}");
+        assert!(cool[2] > warm[2], "6500 K must be bluer than 2700 K: {cool:?} vs {warm:?}");
+        // 6500 K is essentially the sRGB white point, so it should come out near neutral.
+        assert!((cool[0] - cool[2]).abs() < 0.05, "6500 K should be close to white: {cool:?}");
+        // A halogen fitting is warmer than a sodium one is not; the ordering has to be monotone.
+        let mid = crate::factory::cct_to_linear_rgb(4000);
+        assert!(warm[2] < mid[2] && mid[2] < cool[2], "blue must rise with CCT: {warm:?} {mid:?} {cool:?}");
     }
 }

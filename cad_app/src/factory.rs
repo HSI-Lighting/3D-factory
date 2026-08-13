@@ -1719,6 +1719,21 @@ pub struct FurnitureAsset {
     /// which is what a geometry-only connected-component grouping would give. Empty for imported
     /// meshes (they fall back to welded connected components).
     pub part_ids: Vec<u32>,
+    /// EMITTING POINTS, in this asset's own local frame — set for a generated LUMINAIRE (a curved
+    /// light), empty for everything else.
+    ///
+    /// Kept on the ASSET rather than as standalone luminaires so that the light follows the object:
+    /// move the fitting and its emitters move with it, copy it and the copy lights, delete it and
+    /// the light goes. A luminaire list written once at build time strands behind the fixture the
+    /// first time anybody drags it, and nothing on screen says so.
+    pub emitters: Vec<FurnEmitter>,
+    /// Correlated colour temperature of those emitters, kelvin (0 = not a luminaire).
+    ///
+    /// It does NOT enter the lux calculation and must not: lux and candela are already V(λ)-
+    /// weighted, so 3000 K and 6000 K at the same lumen output give the same illuminance. It is
+    /// carried because the lens tint is derived from it and because EN 12464-1 asks for it on the
+    /// report beside Ra.
+    pub cct_k: u32,
 }
 
 /// How an applied texture lands on the selected furniture object.
@@ -1731,6 +1746,52 @@ pub enum FurnPaintMode {
     Face,
     /// Arm a brush; the next click textures the whole connected piece clicked.
     Piece,
+}
+
+/// A blackbody colour temperature as a LINEAR RGB tint, normalised so the brightest channel is 1.
+///
+/// For DISPLAY only — the lens glow in the render and the swatch beside it. It must never reach the
+/// lux calculation: photometric units are already V(λ)-weighted, so tinting flux by colour would
+/// double-count the eye's response and make a warm fitting compute dimmer than a cool one of the
+/// same output, which is simply false.
+///
+/// Kim et al.'s piecewise cubic for the Planckian locus in CIE 1931 xy, then xy → XYZ → linear
+/// sRGB. It lands D65 on (0.3135, 0.3238) against the true (0.3127, 0.3290) and 2700 K on
+/// (0.4593, 0.4106) against the tabulated (0.4593, 0.4107) — far finer than a tint needs.
+pub fn cct_to_linear_rgb(cct_k: u32) -> [f32; 3] {
+    let t = (cct_k as f64).clamp(1667.0, 25000.0);
+    let (i, i2, i3) = (1.0 / t, 1.0 / (t * t), 1.0 / (t * t * t));
+    let x = if t < 4000.0 {
+        -0.2661239e9 * i3 - 0.2343589e6 * i2 + 0.8776956e3 * i + 0.179910
+    } else {
+        -3.0258469e9 * i3 + 2.1070379e6 * i2 + 0.2226347e3 * i + 0.240390
+    };
+    let (x2, x3) = (x * x, x * x * x);
+    let y = if t < 2222.0 {
+        -1.1063814 * x3 - 1.34811020 * x2 + 2.18555832 * x - 0.20219683
+    } else if t < 4000.0 {
+        -0.9549476 * x3 - 1.37418593 * x2 + 2.09137015 * x - 0.16748867
+    } else {
+        3.0817580 * x3 - 5.87338670 * x2 + 3.75112997 * x - 0.37001483
+    };
+    let (xx, yy, zz) = (x / y, 1.0, (1.0 - x - y) / y);
+    // CIE XYZ → linear sRGB (sRGB primaries, D65).
+    let r = 3.2406 * xx - 1.5372 * yy - 0.4986 * zz;
+    let g = -0.9689 * xx + 1.8758 * yy + 0.0415 * zz;
+    let b = 0.0557 * xx - 0.2040 * yy + 1.0570 * zz;
+    let m = r.max(g).max(b).max(1e-6);
+    [(r / m).max(0.0) as f32, (g / m).max(0.0) as f32, (b / m).max(0.0) as f32]
+}
+
+/// One emitting point of a GENERATED LUMINAIRE, in the asset's own local frame.
+///
+/// Mirrors `cad_solid::sweeplight::Emitter`, so `factory` does not have to know how the fixture was
+/// generated — a curved light today, anything else that emits tomorrow.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FurnEmitter {
+    pub pos: [f32; 3],
+    pub lumens: f64,
+    pub watts: f64,
 }
 
 /// Per-triangle grouping of a furniture asset for per-surface texturing (one id per triangle).
@@ -1784,7 +1845,7 @@ impl FurnitureAsset {
             mn = [0.0; 3];
             mx = [0.0; 3];
         }
-        Self { name, positions, normals, color, local_min: mn, local_max: mx, import_scale: 1.0, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new() }
+        Self { name, positions, normals, color, local_min: mn, local_max: mx, import_scale: 1.0, uvs: Vec::new(), alpha: Vec::new(), source_path: None, alpha_resolved: false, lod: std::cell::RefCell::new(None), groups: std::cell::RefCell::new(None), part_ids: Vec::new(), emitters: Vec::new(), cct_k: 0 }
     }
 
     /// The per-triangle face/body grouping, built once and cached. Used for per-surface texturing.
@@ -3268,30 +3329,45 @@ impl FactoryState {
     /// Add a parsed OBJ mesh to the project library. Auto-normalises very large or very
     /// small meshes toward a ~1 m size (many OBJ exports use cm or mm), and re-seats it so
     /// its base sits on z = 0. Returns the library index.
+    /// The rebasing [`Self::add_furniture_asset`] applies to an incoming mesh, as `(offset, k)`:
+    /// every point becomes `(p - offset) * k`, which centres it in x/y, sets its base on z = 0 and
+    /// rescales a wildly-off unit system toward a ~1.5 m object.
+    ///
+    /// Exposed as its own function because a mesh can arrive carrying data in the SAME frame that
+    /// is not part of the mesh — a generated luminaire's emitting points — and that data has to
+    /// move with it. Two copies of this rule would silently drift apart and put a curved light's
+    /// light somewhere its lens is not.
+    pub fn asset_rebase(positions: &[[f32; 3]]) -> Option<([f32; 3], f32)> {
+        let mut mn = [f32::INFINITY; 3];
+        let mut mx = [f32::NEG_INFINITY; 3];
+        for p in positions {
+            for k in 0..3 {
+                mn[k] = mn[k].min(p[k]);
+                mx[k] = mx[k].max(p[k]);
+            }
+        }
+        if !mn[0].is_finite() {
+            return None;
+        }
+        let size = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+        let longest = size[0].max(size[1]).max(size[2]).max(1e-4);
+        // Scale toward ~1.5 m only for wildly off sizes (cm/mm exports, or giant units).
+        let k = if longest > 20.0 || longest < 0.05 { 1.5 / longest } else { 1.0 };
+        Some(([(mn[0] + mx[0]) * 0.5, (mn[1] + mx[1]) * 0.5, mn[2]], k))
+    }
+
     pub fn add_furniture_asset(&mut self, name: String, mesh: crate::mesh_io::ObjMesh) -> usize {
         let asset_color = mesh.color.unwrap_or([0.82, 0.82, 0.84]); // file diffuse, else neutral
         let mut positions = mesh.positions;
         let normals = mesh.normals;
         let alpha = mesh.alpha; // per-vertex opacity (empty ⇒ opaque); recentring below is xyz-only
-        let bounds = {
-            let mut mn = [f32::INFINITY; 3];
-            let mut mx = [f32::NEG_INFINITY; 3];
-            for p in &positions {
-                for k in 0..3 { mn[k] = mn[k].min(p[k]); mx[k] = mx[k].max(p[k]); }
-            }
-            mn[0].is_finite().then_some((mn, mx))
-        };
         let mut import_scale = 1.0f32;
-        if let Some((mn, mx)) = bounds {
-            let size = [(mx[0] - mn[0]), (mx[1] - mn[1]), (mx[2] - mn[2])];
-            let longest = size[0].max(size[1]).max(size[2]).max(1e-4);
-            // Scale toward ~1.5 m only for wildly off sizes (cm/mm exports, or giant units).
-            let k = if longest > 20.0 || longest < 0.05 { 1.5 / longest } else { 1.0 };
+        if let Some((off, k)) = Self::asset_rebase(&positions) {
             import_scale = k;
             for p in &mut positions {
-                p[0] = (p[0] - (mn[0] + mx[0]) * 0.5) * k; // centre X
-                p[1] = (p[1] - (mn[1] + mx[1]) * 0.5) * k; // centre Y
-                p[2] = (p[2] - mn[2]) * k;                  // base on z = 0
+                for c in 0..3 {
+                    p[c] = (p[c] - off[c]) * k;
+                }
             }
         }
         let mut fa = FurnitureAsset::new(name, positions, normals, asset_color);
@@ -5794,6 +5870,12 @@ impl FactoryState {
                     source_path: a.source_path.clone().unwrap_or_default(),
                     alpha_resolved: a.alpha_resolved,
                     part_ids: a.part_ids.clone(),
+                    emitters: a
+                        .emitters
+                        .iter()
+                        .map(|e| [e.pos[0] as f64, e.pos[1] as f64, e.pos[2] as f64, e.lumens, e.watts])
+                        .collect(),
+                    cct_k: a.cct_k,
                 })
                 .collect(),
             furniture: self
@@ -5952,6 +6034,12 @@ impl FactoryState {
                 if a.part_ids.len() == fa.positions.len() / 3 {
                     fa.part_ids = a.part_ids; // keep per-piece grouping across a reload
                 }
+                fa.emitters = a
+                    .emitters
+                    .iter()
+                    .map(|e| FurnEmitter { pos: [e[0] as f32, e[1] as f32, e[2] as f32], lumens: e[3], watts: e[4] })
+                    .collect();
+                fa.cct_k = a.cct_k;
                 fa
             })
             .collect()
