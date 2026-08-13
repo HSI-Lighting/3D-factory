@@ -12356,6 +12356,10 @@ impl CadApp {
                 }
                 let mut lines = self.factory.overlay_lines();
                 lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
+                // LAST of the three, so the yellow face outline is drawn over the sketch geometry
+                // sitting on it rather than under. It is the answer to "is this the right face?",
+                // and an answer half-hidden behind the drawing is no answer.
+                lines.extend(self.factory.picked_face_lines());
                 lines.extend(self.factory.live_sketch_lines(&self.doc)); // active sketch, live
                 // The 2D PLAN goes in with the depth-tested segments UNLESS x-ray is asked
                 // for. `lines` are occluded by the opaque solids, which is what makes a plan
@@ -52707,5 +52711,112 @@ mod unit_prompt {
         back.unit_asked = true; // …even if this session had already answered for another project
         back.apply_persist(doc);
         assert!(!back.unit_asked);
+    }
+}
+
+/// THE PICKED FACE, OUTLINED IN YELLOW IN 3D.
+///
+/// Asked for as: "when a face is selected to sketch, have a yellow outline show up in the 3d view
+/// so the user can know if he selected the right face in 3d." The 2D canvas swings onto the plane
+/// the moment a face is picked, and the 3D view said nothing about WHICH face that was — on a
+/// building with a dozen similar walls the only way to find out was to draw something and see where
+/// it landed.
+#[cfg(test)]
+mod picked_face_outline {
+    use super::*;
+
+    /// A 200 mm wall, 4 m long and 3 m tall: faces at y = -0.1 and y = +0.1.
+    fn a_wall() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+        );
+        app.factory.recompute();
+        app
+    }
+
+    fn near_face() -> cad_solid::Frame {
+        cad_solid::Frame::from_point_normal(glam::Vec3::new(0.0, -0.1, 1.5), -glam::Vec3::Y)
+    }
+
+    #[test]
+    fn nothing_is_outlined_until_a_face_is_picked() {
+        let app = a_wall();
+        assert!(app.factory.picked_face_lines().is_empty(), "no sketch, no outline");
+    }
+
+    #[test]
+    fn picking_a_face_outlines_it_in_yellow() {
+        let mut app = a_wall();
+        app.factory_enter_sketch(near_face());
+        let lines = app.factory.picked_face_lines();
+        assert!(!lines.is_empty(), "the picked face must be outlined");
+        for v in &lines {
+            assert!(
+                v.r > 0.9 && v.g > 0.7 && v.b < 0.3,
+                "not yellow: ({:.2}, {:.2}, {:.2})",
+                v.r,
+                v.g,
+                v.b,
+            );
+        }
+    }
+
+    /// THE WHOLE POINT — it has to be the face that was picked, not the one behind it. A wall has
+    /// two identical faces 200 mm apart, and outlining the wrong one answers the question wrongly,
+    /// which is worse than not answering it.
+    #[test]
+    fn it_outlines_the_face_that_was_picked_not_the_other_side() {
+        let mut app = a_wall();
+        app.factory_enter_sketch(near_face());
+        for v in &app.factory.picked_face_lines() {
+            assert!(
+                (v.y - (-0.1)).abs() < 1e-3,
+                "a vertex at y = {:.3}: that is the FAR side of the wall",
+                v.y,
+            );
+        }
+    }
+
+    /// …and it is the whole face, not a fragment of it: 4 m long and 3 m tall, where it stands.
+    #[test]
+    fn the_outline_covers_the_whole_face() {
+        let mut app = a_wall();
+        app.factory_enter_sketch(near_face());
+        let lines = app.factory.picked_face_lines();
+        let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
+        let (mut mnz, mut mxz) = (f32::MAX, f32::MIN);
+        for v in &lines {
+            mnx = mnx.min(v.x);
+            mxx = mxx.max(v.x);
+            mnz = mnz.min(v.z);
+            mxz = mxz.max(v.z);
+        }
+        assert!((mxx - mnx - 4.0).abs() < 1e-2, "width {:.3}, want 4", mxx - mnx);
+        assert!((mxz - mnz - 3.0).abs() < 1e-2, "height {:.3}, want 3", mxz - mnz);
+    }
+
+    /// Leaving the sketch takes the outline with it — a yellow face still glowing after you have
+    /// gone back to the global view is pointing at nothing.
+    #[test]
+    fn leaving_the_sketch_clears_the_outline() {
+        let mut app = a_wall();
+        app.factory_enter_sketch(near_face());
+        assert!(!app.factory.picked_face_lines().is_empty());
+        app.factory_exit_sketch();
+        assert!(app.factory.picked_face_lines().is_empty());
+    }
+
+    /// It draws the SAME edges the 2D underlay draws, because it is built from the same source.
+    /// Two independent answers to "which face is open?" could disagree; one cannot.
+    #[test]
+    fn it_is_the_same_edges_the_2d_canvas_is_drawing_against() {
+        let mut app = a_wall();
+        app.factory_enter_sketch(near_face());
+        // Two vertices per segment.
+        assert_eq!(app.factory.picked_face_lines().len(), app.factory.sketch_ref.len() * 2);
     }
 }

@@ -8294,6 +8294,33 @@ impl FactoryState {
         out
     }
 
+    /// THE PICKED FACE, outlined in YELLOW in the 3D view.
+    ///
+    /// Asked for as: "when a face is selected to sketch, have a yellow outline show up in the 3d
+    /// view so the user can know if he selected the right face in 3d."
+    ///
+    /// The 2D canvas swings onto the plane the moment a face is picked, and until now the 3D view
+    /// said nothing about WHICH face that was. On a building with a dozen similar walls the only
+    /// way to find out was to draw something and see where it landed.
+    ///
+    /// The outline is [`Self::sketch_ref`] — already exactly this face's in-plane edges, see
+    /// `frame_face_edges` — lifted back out of (u,v) into world space. Same source as the 2D
+    /// underlay ON PURPOSE: the yellow line in 3D and the outline being drawn against in 2D are
+    /// then the same edges by construction, and cannot disagree about which face is open.
+    pub fn picked_face_lines(&self) -> Vec<V3> {
+        let mut out = Vec::new();
+        let Some(sk) = self.session.as_ref().and_then(|s| self.model.sketches.get(s.idx)) else {
+            return out;
+        };
+        // Yellow, and brighter than anything else in the overlay — this answers "did I pick the
+        // right one?", which is only useful if it is the first thing you see.
+        const YELLOW: [f32; 3] = [1.0, 0.85, 0.10];
+        for [a, b] in &self.sketch_ref {
+            seg(&mut out, sk.frame.from_uv(*a), sk.frame.from_uv(*b), YELLOW);
+        }
+        out
+    }
+
     /// Every sketch's geometry, lifted from its frame's `(u,v)` back into world space,
     /// as GL_LINES. This is what makes 2D work drawn on a plane visible in 3D.
     pub fn sketch_lines(&self) -> Vec<V3> {
