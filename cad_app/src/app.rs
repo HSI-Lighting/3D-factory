@@ -36983,6 +36983,15 @@ impl eframe::App for CadApp {
                 self.factory_note("3D place: cancelled".into());
                 return;
             }
+            // The placement question, abandoned. Without this the prompt vanished but
+            // `place_prompt_open` stayed true, and the next word typed was eaten as a bad answer
+            // to a question no longer on screen.
+            if self.place_prompt_open {
+                self.place_prompt_open = false;
+                self.clear_prompt();
+                self.history.push("  place: cancelled".into());
+                return;
+            }
             // An object waiting to be told where it goes: Esc stops the waiting and LEAVES IT
             // WHERE IT IS. It is already a real object — Esc means "here is fine", not "throw it
             // away", which is why nothing is undone here.
@@ -43745,9 +43754,18 @@ impl eframe::App for CadApp {
                 "  📐 menu layout captured ({} elements) — see recorder timeline", n));
         }
 
-        // Item 1 — clear the live status line when no edit phase remains
-        // active (e.g. apply_fillet ended its state). Keeps the cmd area
-        // free of stale prompts.
+        self.sweep_stale_prompt();
+    }
+}
+
+impl CadApp {
+    /// Item 1 — clear the live status line when no edit phase remains active (e.g. `apply_fillet`
+    /// ended its state). Keeps the command area free of stale prompts.
+    ///
+    /// Split out of the end of the frame so it can be tested: the bug it caused ("is it even
+    /// working?") was invisible from anywhere else, because the prompt appeared and was gone again
+    /// before the next frame drew.
+    fn sweep_stale_prompt(&mut self) {
         let any_edit_active =
             self.tool != Tool::None
             || self.select_mode != SelectMode::Off
@@ -43775,7 +43793,19 @@ impl eframe::App for CadApp {
             || self.fillet_state     != FilletState::Off
             || self.chamfer_state    != ChamferState::Off
             || self.picking_source
-            || self.intersect_pending_click;
+            || self.intersect_pending_click
+            // THE 3D PLACEMENT PROMPT COUNTS AS AN ACTIVE EDIT.
+            //
+            // Reported as "the placement is still confusing. is it even working?", with a
+            // screenshot showing `command: place` in the history and the IDLE prompt underneath.
+            // `place` was working perfectly: it set `Placement [Click/Centre/Origin/Offset]
+            // <offset>:` and this sweep wiped it one frame later, because the list above is every
+            // 2D edit state and a 3D one had never needed to be in it.
+            //
+            // Worse than invisible: `place_prompt_open` stayed true with nothing on screen saying
+            // so, and the next word typed was eaten as a bad answer to a question the user could
+            // not see.
+            || self.place_prompt_open;
         if !any_edit_active && !self.current_prompt.is_empty() {
             self.clear_prompt();
         }
@@ -52828,5 +52858,111 @@ mod picked_face_outline {
         app.factory_enter_sketch(near_face());
         // Two vertices per segment.
         assert_eq!(app.factory.picked_face_lines().len(), app.factory.sketch_ref.len() * 2);
+    }
+}
+
+/// THE ORIGIN GIZMO, and the prompt that was being wiped a frame after it opened.
+#[cfg(test)]
+mod origin_and_prompt {
+    use super::*;
+
+    /// "have a gizmo at the origin so the user know where the origin is. it should have x, y and z
+    /// axis." It matters more here than in most 3D apps: three of the four placement modes measure
+    /// from the origin, and `@X,Y,Z` is relative to it.
+    #[test]
+    fn the_origin_has_three_coloured_axes() {
+        let st = crate::factory::FactoryState::default();
+        let g = st.origin_gizmo_lines();
+        assert!(!g.is_empty(), "the origin must be visible");
+
+        // One axis reaching along each of +X, +Y and +Z, from (0,0,0).
+        let reaches = |pick: fn(&crate::light3d::V3) -> f32| {
+            g.iter().fold(0.0_f32, |a, v| a.max(pick(v)))
+        };
+        assert!(reaches(|v| v.x) > 0.0, "no +X axis");
+        assert!(reaches(|v| v.y) > 0.0, "no +Y axis");
+        assert!(reaches(|v| v.z) > 0.0, "no +Z axis");
+
+        // It STARTS at the origin — a gizmo somewhere else is worse than none.
+        assert!(
+            g.iter().any(|v| v.x.abs() < 1e-6 && v.y.abs() < 1e-6 && v.z.abs() < 1e-6),
+            "nothing touches (0, 0, 0)",
+        );
+
+        // RGB = XYZ, the convention every 3D tool uses. The vertex furthest along each axis must
+        // carry that axis's colour.
+        let furthest = |pick: fn(&crate::light3d::V3) -> f32| {
+            g.iter()
+                .max_by(|a, b| pick(a).partial_cmp(&pick(b)).unwrap())
+                .map(|v| (v.r, v.g, v.b))
+                .unwrap()
+        };
+        let (r, gg, b) = furthest(|v| v.x);
+        assert!(r > 0.8 && gg < 0.5 && b < 0.5, "+X is not red: ({r}, {gg}, {b})");
+        let (r, gg, b) = furthest(|v| v.y);
+        assert!(gg > 0.7 && r < 0.5, "+Y is not green: ({r}, {gg}, {b})");
+        let (r, gg, b) = furthest(|v| v.z);
+        assert!(b > 0.8 && r < 0.6, "+Z is not blue: ({r}, {gg}, {b})");
+    }
+
+    /// Sized off the camera, so it is readable at any zoom instead of a dot from far away and a
+    /// wall from close up.
+    #[test]
+    fn the_gizmo_scales_with_the_camera() {
+        let mut st = crate::factory::FactoryState::default();
+        let reach = |st: &crate::factory::FactoryState| {
+            st.origin_gizmo_lines().iter().fold(0.0_f32, |a, v| a.max(v.x.max(v.y).max(v.z)))
+        };
+        st.cam_dist = 10.0;
+        let near = reach(&st);
+        st.cam_dist = 1000.0;
+        let far = reach(&st);
+        assert!(far > near * 10.0, "near {near:.2} m, far {far:.2} m — it did not scale");
+    }
+
+    /// It survives the grid being switched off — the grid is a convenience, the origin is a fact
+    /// about the model that the placement modes are measured from.
+    #[test]
+    fn the_origin_survives_the_grid_being_turned_off() {
+        let mut st = crate::factory::FactoryState::default();
+        st.show_grid = false;
+        assert!(st.grid_lines().is_empty());
+        assert!(!st.overlay_lines().is_empty(), "the origin must still be drawn");
+    }
+
+    // ---- the prompt that was being wiped -------------------------------------------------
+
+    /// THE BUG BEHIND "is it even working?".
+    ///
+    /// `place` worked: it set `Placement [Click/Centre/Origin/Offset] <offset>:`. Then the
+    /// frame-end sweep — which clears any prompt no 2D edit state is claiming — wiped it one frame
+    /// later, and the screenshot showed `command: place` above the IDLE prompt. Worse than
+    /// invisible: `place_prompt_open` stayed true with nothing on screen saying so, so the next
+    /// word typed was eaten as a bad answer to a question the user could not see.
+    #[test]
+    fn the_placement_prompt_survives_the_frame_end_sweep() {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.active_view = ActiveView::ThreeD;
+        app.run_command("place");
+        assert!(app.place_prompt_open);
+        assert!(!app.current_prompt.is_empty(), "precondition: the prompt is up");
+
+        // …the sweep, exactly as the end of the frame runs it.
+        app.sweep_stale_prompt();
+        assert!(
+            !app.current_prompt.is_empty(),
+            "the placement question was wiped a frame after it was asked",
+        );
+        assert!(app.current_prompt.contains("Placement"), "got {:?}", app.current_prompt);
+    }
+
+    /// …and an ordinary stale prompt is still cleared, or the fix would just be a leak.
+    #[test]
+    fn an_unclaimed_prompt_is_still_swept() {
+        let mut app = CadApp::default();
+        app.current_prompt = "something nobody owns".into();
+        app.sweep_stale_prompt();
+        assert!(app.current_prompt.is_empty(), "the sweep must still do its job");
     }
 }

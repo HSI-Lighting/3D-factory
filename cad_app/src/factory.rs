@@ -8052,9 +8052,48 @@ impl FactoryState {
         out
     }
 
+    /// THE ORIGIN — three axes standing at (0, 0, 0), so world zero is a place you can see.
+    ///
+    /// Asked for as: "have a gizmo at the origin so the user know where the origin is. it should
+    /// have x, y and z axis."
+    ///
+    /// It matters more here than in most 3D apps, because the origin is where three of the four
+    /// placement modes measure from: `origin` puts an object exactly here, and `@X,Y,Z` measures
+    /// from here. Being unable to see the thing your coordinates are relative to is most of why
+    /// "the placement is still confusing".
+    ///
+    /// Sized off the camera so it is a readable size at any zoom rather than a dot from far away
+    /// and a wall from close up. RGB = XYZ, the convention every 3D tool uses.
+    pub fn origin_gizmo_lines(&self) -> Vec<V3> {
+        let mut out = Vec::new();
+        // A fixed fraction of the view, so it reads the same at 2 m and at 2 km.
+        let len = (self.cam_dist * 0.12).clamp(0.05, 1.0e5);
+        const RED: [f32; 3] = [0.95, 0.25, 0.25]; // +X
+        const GREEN: [f32; 3] = [0.30, 0.90, 0.35]; // +Y
+        const BLUE: [f32; 3] = [0.35, 0.55, 1.00]; // +Z
+        let o = Vec3::ZERO;
+        for (dir, c) in
+            [(Vec3::X, RED), (Vec3::Y, GREEN), (Vec3::Z, BLUE)]
+        {
+            let tip = dir * len;
+            seg(&mut out, o, tip, c);
+            // An ARROWHEAD, so +X and −X are not the same line. Two barbs in the plane the axis is
+            // least aligned with, which keeps them visible from any camera angle.
+            let side = if dir.z.abs() > 0.5 { Vec3::X } else { Vec3::Z };
+            let barb = len * 0.18;
+            let back = tip - dir * barb;
+            seg(&mut out, tip, back + side * barb * 0.5, c);
+            seg(&mut out, tip, back - side * barb * 0.5, c);
+        }
+        out
+    }
+
     pub fn overlay_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
         out.extend(self.grid_lines());
+        // ALWAYS, even with the grid off: the grid is a convenience, the origin is a fact about the
+        // model that the placement modes are measured from.
+        out.extend(self.origin_gizmo_lines());
         for id in &self.selection {
             if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
                 let (mn, mx) = f.world_aabb();
