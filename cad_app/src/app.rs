@@ -7656,7 +7656,7 @@ impl CadApp {
             None => {
                 self.factory_exit_sketch();
                 self.factory.status =
-                    "Ground plan — the drawing itself. Face planes are hidden here.".into();
+                    "Global view — the whole model from above, furniture and all.".into();
             }
             Some(i) => {
                 let Some(frame) = self.factory.model.sketches.get(i).map(|s| s.frame) else {
@@ -7731,10 +7731,12 @@ impl CadApp {
         if self.factory.model.sketches[idx].name.is_empty() {
             self.factory.model.sketches[idx].name = self.factory.sketch_auto_name(&frame);
         }
-        // Project the 3D object onto THIS sketch's plane so the 2D canvas shows it as a
-        // reference (a "2D view of the object") rather than a blank void.
+        // THE FACE, AND ONLY THE FACE. This used to project the WHOLE model onto the plane, which
+        // on a wall of a 139 m building draws every wall, room and opening in it flattened on top
+        // of each other — "now it looks confusing for the user". An edge lying IN the plane is a
+        // boundary of a face standing on that plane, which is what "draw on this face" means.
         self.factory.sketch_ref =
-            self.factory.frame_reference_edges(&self.factory.model.sketches[idx].frame);
+            self.factory.frame_face_edges(&self.factory.model.sketches[idx].frame);
 
         let sketch_doc = std::mem::take(&mut self.factory.model.sketches[idx].doc);
         let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
@@ -21280,10 +21282,27 @@ impl CadApp {
             if self.factory.awaiting_place.is_some() {
                 ui.colored_label(
                     egui::Color32::from_rgb(240, 200, 110),
-                    "click the 2D or 3D window to place it  ·  `at X Y` to type the point  ·  Esc leaves it",
+                    "click the 2D or 3D window to place it  ·  Esc leaves it where it is",
                 );
             } else if self.command_target() == ActiveView::ThreeD {
-                ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "3D command:");
+                // …and it SAYS where the next object will land, with the word that changes it.
+                //
+                // Reported as: "the furniture once placed using a mode[,] it keeps placing it in
+                // the same mode, there is no option to change." The mode was already changeable —
+                // `place` has always done it — but nothing on screen said the setting existed, and
+                // a setting you cannot see is a setting you cannot change. The dropdown that used
+                // to show it was removed by request, so the readout belongs here instead.
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "3D command:");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "new objects → {}   ·   type `place` to change",
+                            self.factory.place_mode.label(),
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
             } else {
                 ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "command:");
             }
@@ -42961,23 +42980,34 @@ impl eframe::App for CadApp {
                     .collect();
                 let cur_label = match open {
                     Some(i) => names.get(i).map(|(_, n)| n.clone()).unwrap_or_else(|| "Plane".into()),
-                    None => "Ground plan".to_string(),
+                    None => "Global view".to_string(),
                 };
-                let mut want: Option<Option<usize>> = None; // Some(None) = ground plan
+                let mut want: Option<Option<usize>> = None; // Some(None) = the global view
                 let mut rename: Option<usize> = None;
                 let mut delete: Option<usize> = None;
                 egui::Area::new(egui::Id::new("plan_view_toggle"))
                     .fixed_pos(rect.left_top() + egui::vec2(10.0, 6.0))
                     .order(egui::Order::Middle)
                     .show(ctx, |ui| {
+                        // An `Area` takes its width from its content, and a menu button's label
+                        // will WRAP to fit rather than push the button wider — so "Global view"
+                        // came out stacked three lines tall in a button barely wider than the
+                        // arrow. Extend, don't wrap, and give the row a floor to sit on.
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         egui::Frame::popup(ui.style())
-                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                             .show(ui, |ui| {
-                                ui.menu_button(format!("▼ {cur_label}"), |ui| {
-                                    ui.set_min_width(200.0);
+                                ui.set_min_width(150.0);
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                                ui.menu_button(format!("▼  {cur_label}"), |ui| {
+                                    ui.set_min_width(230.0);
+                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                     if ui
-                                        .selectable_label(open.is_none(), "Ground plan")
-                                        .on_hover_text("The drawing itself — the plan every 2D tool has always worked on")
+                                        .selectable_label(open.is_none(), "Global view")
+                                        .on_hover_text(
+                                            "The whole model from above — solids, rooms and \
+                                             furniture — and the drawing every 2D tool works on",
+                                        )
                                         .clicked()
                                     {
                                         want = Some(None);

@@ -3016,8 +3016,7 @@ impl Default for FactoryState {
 impl FactoryState {
     pub fn add_box(&mut self) {
         let p = Primitive::Box { w: self.box_w, d: self.box_d, h: self.box_h };
-        // Built on the ACTIVE storey, like every other new solid.
-        let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
+        let placement = self.placement_for(&p);
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
@@ -3320,6 +3319,32 @@ impl FactoryState {
         Some(what)
     }
 
+    /// The [`Placement`] a NEW SOLID gets — [`Self::place_at`] applied, on the active storey.
+    ///
+    /// 3D solids used to be built at `Placement::default()`, i.e. always (0, 0), no matter what the
+    /// placement mode said. Click worked (the object is created and then moved by the click) and
+    /// the other three modes did nothing at all for a solid, which is not "the same placing modes"
+    /// by any reading.
+    ///
+    /// A Box's point is its NEAR CORNER and everything else's is its CENTRE — the same convention
+    /// `place_primitive` and `place_awaiting_at` use, so a box lands in the same spot however it
+    /// got there.
+    pub fn placement_for(&self, p: &Primitive) -> Placement {
+        let at = self.place_at();
+        let (ox, oy) = match p {
+            Primitive::Box { w, d, .. } => (w * 0.5, d * 0.5),
+            _ => (0.0, 0.0),
+        };
+        Placement {
+            u: at.x + ox,
+            v: at.y + oy,
+            // Z is a HEIGHT ABOVE THE STOREY, not a replacement for it: `@0,0,2400` means "2.4 m
+            // up", and on the first floor that is 2.4 m above the first floor.
+            lift: self.active_base_z() + at.z,
+            ..Placement::default()
+        }
+    }
+
     /// Copy the current 3D selection (a furniture instance OR a single CSG feature) into the
     /// paste buffer, with its colour/texture. Returns true if something was captured.
     pub fn copy_selection(&mut self) -> bool {
@@ -3454,7 +3479,9 @@ impl FactoryState {
         let color = self.furniture_lib[asset].color;
         self.furniture.push(FurnitureInst {
             asset,
-            pos: [at.x, at.y, self.active_base_z()],
+            // Z is a HEIGHT ABOVE THE STOREY, not a replacement for it — the same reading
+            // `placement_for` gives a solid, so `@0,0,2400` means the same thing to both.
+            pos: [at.x, at.y, self.active_base_z() + at.z],
             scale: 1.0,
             fit: None,
             rot: [0.0, 0.0, 0.0],
@@ -6065,8 +6092,7 @@ impl FactoryState {
 
     /// DRAW3D: commit the dialog's primitive into the model (at the origin).
     pub fn add_primitive(&mut self, p: Primitive) {
-        // Built on the ACTIVE storey, like every other new solid.
-        let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
+        let placement = self.placement_for(&p);
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
@@ -6095,8 +6121,7 @@ impl FactoryState {
 
     pub fn add_cylinder(&mut self) {
         let p = Primitive::Cylinder { r: self.cyl_r, h: self.cyl_h, sides: self.cyl_sides.max(3) };
-        // Built on the ACTIVE storey, like every other new solid.
-        let placement = Placement { lift: self.active_base_z(), ..Placement::default() };
+        let placement = self.placement_for(&p);
         let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.selection = vec![id];
         self.arm_placement(AwaitingPlace::Feature(id));
@@ -6609,7 +6634,7 @@ impl FactoryState {
         let o = frame.origin;
         // The ground plan is not a face of anything.
         if frame.normal().z.abs() > 0.999 && o.z.abs() < 1e-3 {
-            return "Ground plan".into();
+            return "Global view".into();
         }
         let owner = self
             .rooms
@@ -8180,6 +8205,31 @@ impl FactoryState {
         Frame::from_point_normal(Vec3::ZERO, Vec3::Z)
     }
 
+    /// THE FACE ITSELF — only the edges that LIE IN `frame`'s plane, in its (u,v).
+    ///
+    /// Reported as: "when click draw on this face. show me only that face on the 2d cad. because
+    /// now it looks confusing for the user."
+    ///
+    /// [`Self::frame_reference_edges`] projects the WHOLE model onto the plane, which on a wall face
+    /// of a 139 m building draws every wall, room and opening in the model flattened on top of each
+    /// other — a band of overlapping lines you cannot read, let alone draw on. An edge that lies in
+    /// the plane is a boundary of a face standing ON that plane, and that is what "this face" means.
+    ///
+    /// Coplanar geometry belonging to OTHER objects is kept on purpose: if something else stands in
+    /// exactly this plane it is genuinely part of the surface being drawn on, and hiding it would
+    /// mean drawing blind against it.
+    pub fn frame_face_edges(&self, frame: &Frame) -> Vec<[Vec2; 2]> {
+        // Half a millimetre. Tight enough to reject a wall 200 mm behind this one, loose enough to
+        // survive f32 at the 130 m coordinates an imported DXF puts a building at (the session dump
+        // measures 0.016 mm per ULP out there, so this is ~30 ULP of headroom).
+        const ON_PLANE: f32 = 5.0e-4;
+        let n = frame.normal();
+        let plane_d = n.dot(frame.origin);
+        self.frame_reference_edges_filtered(frame, |a, b| {
+            (n.dot(a) - plane_d).abs() <= ON_PLANE && (n.dot(b) - plane_d).abs() <= ON_PLANE
+        })
+    }
+
     /// The solid's FEATURE EDGES projected onto `frame`'s (u,v) plane — a clean line
     /// drawing of the 3D object for use as a reference underlay when sketching on a face.
     ///
@@ -8188,6 +8238,17 @@ impl FactoryState {
     /// tessellation edges — the diagonals that split a flat quad — are dropped, so what you
     /// get is the object's outline and its hard edges, not a triangle-soup mess.
     pub fn frame_reference_edges(&self, frame: &Frame) -> Vec<[Vec2; 2]> {
+        self.frame_reference_edges_filtered(frame, |_, _| true)
+    }
+
+    /// The shared body of [`Self::frame_reference_edges`] and [`Self::frame_face_edges`]: the same
+    /// feature-edge extraction, with `keep` deciding which world-space edges survive. One
+    /// implementation, so "the whole model" and "just this face" cannot drift apart.
+    fn frame_reference_edges_filtered(
+        &self,
+        frame: &Frame,
+        keep: impl Fn(Vec3, Vec3) -> bool,
+    ) -> Vec<[Vec2; 2]> {
         use std::collections::HashMap;
         // Quantise a world position so the two triangles sharing an edge hash together.
         let q = |p: [f32; 3]| -> (i64, i64, i64) {
@@ -8213,7 +8274,7 @@ impl FactoryState {
                 || normals.iter().enumerate().any(|(i, na)| {
                     normals[i + 1..].iter().any(|nb| na.dot(*nb) < cos_thresh)
                 });
-            if is_feature {
+            if is_feature && keep(Vec3::from(a), Vec3::from(b)) {
                 out.push([frame.to_uv(Vec3::from(a)), frame.to_uv(Vec3::from(b))]);
             }
         }
@@ -13337,5 +13398,276 @@ mod placement_tests {
         back.place_mode = PlaceMode::Centre;
         back.apply_persist(doc);
         assert_eq!(back.place_mode, PlaceMode::Centre, "an absent field must not overwrite");
+    }
+}
+
+/// "SHOW ME ONLY THAT FACE."
+///
+/// Reported as: "when click draw on this face. show me only that face on the 2d cad. because now it
+/// looks confusing for the user." The underlay projected the WHOLE model onto the sketch plane, so
+/// drawing on one wall of a 139 m building put every wall, room and opening in it flattened on top
+/// of each other — a band of overlapping lines you cannot read, let alone draw against.
+#[cfg(test)]
+mod face_only_underlay {
+    use super::*;
+
+    /// Two boxes, the second offset DIAGONALLY. Drawing on the first one's -X face must not bring
+    /// the second along.
+    ///
+    /// Diagonally on purpose. Offsetting only along the frame's normal proves nothing: projection
+    /// collapses that direction, so the two boxes land on top of each other in (u,v) and "the far
+    /// one is not drawn" would pass whatever the filter did — which is exactly how the first
+    /// version of this fixture fooled itself. The in-plane component is what makes the far box land
+    /// somewhere visibly different.
+    fn two_boxes() -> FactoryState {
+        let mut st = FactoryState::default();
+        for k in [0.0_f32, 5.0] {
+            st.model.push(
+                BoolOp::Union,
+                Plane::default(),
+                Placement { u: k, v: k, ..Placement::default() },
+                Primitive::Box { w: 2.0, d: 2.0, h: 2.0 },
+            );
+        }
+        st.recompute();
+        st
+    }
+
+    /// The near box spans x = -1..1 (w=2 centred on u=0), so its -X face is the plane x = -1.
+    fn near_face() -> Frame {
+        Frame::from_point_normal(Vec3::new(-1.0, 0.0, 1.0), -Vec3::X)
+    }
+
+    #[test]
+    fn the_underlay_is_only_the_edges_in_the_plane() {
+        let st = two_boxes();
+        let frame = near_face();
+        let whole = st.frame_reference_edges(&frame);
+        let face = st.frame_face_edges(&frame);
+
+        assert!(!face.is_empty(), "the face itself must still be drawn");
+        assert!(
+            face.len() < whole.len(),
+            "the whole model projected {} edges and the face {} — the filter did nothing",
+            whole.len(),
+            face.len(),
+        );
+
+        // Every surviving edge must lie IN the plane: that is what makes it part of this face.
+        let n = frame.normal();
+        let d = n.dot(frame.origin);
+        for e in &face {
+            for uv in e {
+                let w = frame.from_uv(*uv);
+                assert!(
+                    (n.dot(w) - d).abs() < 1e-3,
+                    "an edge {:.4} m off the plane survived",
+                    (n.dot(w) - d).abs(),
+                );
+            }
+        }
+    }
+
+    /// The specific confusion: the OTHER object, 5 m away, used to be drawn on top of this face.
+    #[test]
+    fn a_solid_somewhere_else_is_not_drawn_on_this_face() {
+        let st = two_boxes();
+        let frame = near_face();
+        // The far box spans u 4..6 in world x; on this frame that is a big |u|. The near box's own
+        // face spans 2 m, so anything beyond that came from somewhere else.
+        let face = st.frame_face_edges(&frame);
+        let widest = face
+            .iter()
+            .flatten()
+            .map(|p| p.x.abs().max(p.y.abs()))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            widest < 3.0,
+            "the underlay reaches {widest:.2} m from the face centre — the far box is in it",
+        );
+    }
+
+    /// A face 200 mm behind this one — the far side of a wall — is a DIFFERENT face. The tolerance
+    /// has to be tight enough to tell them apart, or drawing on a wall shows both of its sides.
+    #[test]
+    fn the_far_side_of_a_wall_is_a_different_face() {
+        let mut st = FactoryState::default();
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement::default(),
+            // A 200 mm-thick wall: faces at y = -0.1 and y = +0.1.
+            Primitive::Box { w: 4.0, d: 0.2, h: 3.0 },
+        );
+        st.recompute();
+        let front = Frame::from_point_normal(Vec3::new(0.0, -0.1, 1.5), -Vec3::Y);
+        let face = st.frame_face_edges(&front);
+        let whole = st.frame_reference_edges(&front);
+        assert!(!face.is_empty(), "the near side must be drawn");
+        // COUNTS, not positions. `from_uv` reconstructs a point ON the plane by definition, so
+        // asserting that the result is on the plane asserts nothing — the first version of this
+        // test did exactly that and passed with the filter disabled. The wall's two faces are
+        // identical rectangles landing on top of each other in (u,v), so the only thing that tells
+        // them apart is how many edges came through.
+        assert!(
+            face.len() < whole.len(),
+            "the far side, 200 mm away, came through: {} of {} edges",
+            face.len(),
+            whole.len(),
+        );
+    }
+
+    /// And the whole-model projection is still available — the sweep flow and the face-pick preview
+    /// want it, and this must not have quietly changed what they get.
+    #[test]
+    fn the_whole_model_projection_still_exists() {
+        let st = two_boxes();
+        let whole = st.frame_reference_edges(&near_face());
+        let widest = whole
+            .iter()
+            .flatten()
+            .map(|p| p.x.abs().max(p.y.abs()))
+            .fold(0.0_f32, f32::max);
+        assert!(widest > 3.0, "it must still reach the far box, got {widest:.2} m");
+    }
+
+    /// The global view is what it is called now — "the ground plan is going to be renamed as global
+    /// view" — and it is not a face of anything.
+    #[test]
+    fn the_ground_plane_is_called_the_global_view() {
+        let st = FactoryState::default();
+        assert_eq!(st.sketch_auto_name(&FactoryState::ground_frame()), "Global view");
+    }
+}
+
+/// SOLIDS OBEY THE PLACEMENT MODE TOO.
+///
+/// Reported as: "the 3d solid also should follow the same placing modes. make sure you include them
+/// as well." They did not. `add_box` / `add_cylinder` / `add_primitive` armed the placing CLICK, so
+/// Click mode appeared to work — but they all built at `Placement::default()`, i.e. always (0, 0),
+/// so Centre, Origin and Offset did nothing at all to a solid.
+#[cfg(test)]
+mod solids_follow_the_mode {
+    use super::*;
+
+    /// A model far from the world origin, so Centre and Origin cannot be confused for each other.
+    fn far_model() -> FactoryState {
+        let mut st = FactoryState::default();
+        st.model.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 100.0, v: 50.0, ..Placement::default() },
+            Primitive::Box { w: 10.0, d: 10.0, h: 3.0 },
+        );
+        st.recompute();
+        st
+    }
+
+    fn newest(st: &FactoryState) -> &Feature {
+        let id = *st.selection.first().expect("the new solid is selected");
+        st.model.features.iter().find(|f| f.id == id).expect("still there")
+    }
+
+    /// A cylinder's point is its CENTRE, so its placement lands on the point exactly.
+    #[test]
+    fn a_cylinder_lands_where_each_mode_says() {
+        for (mode, want) in [
+            (PlaceMode::Origin, (0.0_f32, 0.0_f32)),
+            (PlaceMode::Centre, (100.0, 50.0)),
+            (PlaceMode::Offset, (3.0, -4.0)),
+        ] {
+            let mut st = far_model();
+            st.place_mode = mode;
+            st.place_offset = [3.0, -4.0, 0.0];
+            st.add_cylinder();
+            let f = newest(&st);
+            assert!(
+                (f.placement.u - want.0).abs() < 1e-3 && (f.placement.v - want.1).abs() < 1e-3,
+                "{mode:?}: got ({}, {}), want {want:?}",
+                f.placement.u,
+                f.placement.v,
+            );
+        }
+    }
+
+    /// A Box's point is its NEAR CORNER — the convention `place_primitive` and the placing click
+    /// both use. The same box must land in the same spot however it got there.
+    #[test]
+    fn a_box_uses_the_same_corner_rule_as_the_click() {
+        let mut st = far_model();
+        st.place_mode = PlaceMode::Origin;
+        st.add_box();
+        let f = newest(&st);
+        let (w, d) = match f.primitive {
+            Primitive::Box { w, d, .. } => (w, d),
+            _ => panic!("a box"),
+        };
+        assert!((f.placement.u - w * 0.5).abs() < 1e-4, "u = {}", f.placement.u);
+        assert!((f.placement.v - d * 0.5).abs() < 1e-4, "v = {}", f.placement.v);
+
+        // …and a click to the SAME point puts it in the SAME place.
+        let mut click = far_model();
+        click.place_mode = PlaceMode::Click;
+        click.add_box();
+        click.place_awaiting_at(Vec3::ZERO);
+        let g = newest(&click);
+        assert!((g.placement.u - f.placement.u).abs() < 1e-4);
+        assert!((g.placement.v - f.placement.v).abs() < 1e-4);
+    }
+
+    /// The dialog-built primitives go through `add_primitive`, and they are solids too.
+    #[test]
+    fn a_dialog_primitive_follows_the_mode() {
+        let mut st = far_model();
+        st.place_mode = PlaceMode::Offset;
+        st.place_offset = [7.0, 8.0, 0.0];
+        st.add_primitive(Primitive::Sphere { r: 1.0, segments: 16, stacks: 8 });
+        let f = newest(&st);
+        assert!((f.placement.u - 7.0).abs() < 1e-4, "u = {}", f.placement.u);
+        assert!((f.placement.v - 8.0).abs() < 1e-4, "v = {}", f.placement.v);
+    }
+
+    /// The offset's Z is a HEIGHT ABOVE THE STOREY, not a replacement for it: on the first floor,
+    /// `@0,0,2400` means 2.4 m above the first floor, not 2.4 m above the ground.
+    #[test]
+    fn the_offset_z_lifts_above_the_storey() {
+        let mut st = far_model();
+        st.storeys.push(Storey { name: "First".into(), height: 3.0 });
+        st.active_storey = 1;
+        let base = st.active_base_z();
+        assert!(base > 0.0, "precondition: the active storey is off the ground");
+
+        st.place_mode = PlaceMode::Offset;
+        st.place_offset = [0.0, 0.0, 2.4];
+        st.add_cylinder();
+        assert!(
+            (newest(&st).placement.lift - (base + 2.4)).abs() < 1e-4,
+            "lift = {}, want {}",
+            newest(&st).placement.lift,
+            base + 2.4,
+        );
+    }
+
+    /// Furniture reads the same Z the same way, or `@0,0,2400` would mean two different things
+    /// depending on what you happened to be placing.
+    #[test]
+    fn furniture_reads_the_offset_z_the_same_way() {
+        let mut st = far_model();
+        let mesh = crate::mesh_io::ObjMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 1.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            color: None,
+            alpha: Vec::new(),
+        };
+        let idx = st.add_furniture_asset("lamp".into(), mesh);
+        st.place_mode = PlaceMode::Offset;
+        st.place_offset = [0.0, 0.0, 2.4];
+        let at = st.place_at();
+        st.place_furniture(idx, at);
+        assert!(
+            (st.furniture[0].pos[2] - (st.active_base_z() + 2.4)).abs() < 1e-4,
+            "z = {}",
+            st.furniture[0].pos[2],
+        );
     }
 }
