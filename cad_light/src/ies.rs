@@ -25,6 +25,35 @@ pub struct IesProfile {
     pub width: f64,
     pub length: f64,
     pub height: f64,
+    /// LUMINOUS AREA — the emitting aperture, in metres. NOT the housing.
+    ///
+    /// Glare is computed from luminance, `L = I / A`, so a 600 mm fitting with a 300 mm aperture is
+    /// four times brighter than its outline suggests. Using the outline under-states luminance and
+    /// therefore under-states UGR — the direction that passes a design which should fail. Falls
+    /// back to the outline when the file declares no separate aperture.
+    pub luminous_length: f64,
+    pub luminous_width: f64,
+}
+
+impl IesProfile {
+    /// Projected luminous area (m²) seen at `gamma_deg` from nadir.
+    ///
+    /// A flat aperture foreshortens as `cos γ`; a round one is treated as a disc of the declared
+    /// diameter, a rectangular one as `length × width`. A file with no dimensions at all returns
+    /// `None` rather than zero — an area of zero is an infinite luminance, and a glare figure built
+    /// on it would be nonsense presented as a number.
+    pub fn projected_luminous_area(&self, gamma_deg: f64) -> Option<f64> {
+        let (l, w) = (self.luminous_length, self.luminous_width);
+        if l <= 0.0 {
+            return None;
+        }
+        // EULUMDAT marks a round aperture by leaving the width at zero.
+        let flat = if w <= 0.0 { std::f64::consts::PI * (l * 0.5).powi(2) } else { l * w };
+        let cos = gamma_deg.to_radians().cos().abs();
+        // Below ~5° of grazing the projection collapses and the luminance runs away; the standard
+        // treats such a source as contributing nothing, and so does this.
+        (cos > 0.087).then_some(flat * cos)
+    }
 }
 
 impl IesProfile {
@@ -161,6 +190,11 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         width: width * to_m,
         length: length * to_m,
         height: height * to_m,
+        // LM-63's header dimensions ARE the luminous opening — the format calls them "luminous
+        // width / length / height", unlike EULUMDAT which carries the housing and the aperture
+        // separately. So there is nothing else to read here.
+        luminous_length: length * to_m,
+        luminous_width: width * to_m,
     })
 }
 

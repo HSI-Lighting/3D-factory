@@ -325,3 +325,97 @@ fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
         );
     }
 }
+
+/// UGR on the real scenes — a first look, deliberately not asserted against DIALux.
+///
+/// All three reports quote R_UG,max 15 against a ≤ 19 target, and they say what that figure IS:
+/// "based on a rectangular space of 4.000 m x 4.000 m and SHR of 0.25". That is the CIE UGR TABLE
+/// method — a standard room at a standard spacing-to-height ratio, which characterises the FITTING.
+/// What we compute is the direct CIE 117 calculation for a particular observer in the room as
+/// actually built. The two answer different questions and agree only when the real room happens to
+/// be the standard one, so asserting equality would be asserting a coincidence.
+///
+/// It is printed rather than asserted for exactly that reason. What IS asserted is the physics that
+/// must hold whatever the convention: more fittings glare more, and turning to face away helps.
+#[test]
+#[ignore = "needs IDENTICAL_DIR=<folder holding FONDO.ldt>"]
+fn ugr_from_the_seated_observer() {
+    let Ok(dir) = std::env::var("IDENTICAL_DIR") else { return };
+    let mut profiles = HashMap::new();
+    profiles.insert("FONDO".to_string(), load_photometry(&dir));
+    let prof = &profiles["FONDO"];
+    println!("\n=== FONDO luminous aperture ===");
+    println!(
+        "  housing {:.3} x {:.3} m   aperture {:.3} x {:.3} m   flat area {:.5} m2",
+        prof.length,
+        prof.width,
+        prof.luminous_length,
+        prof.luminous_width,
+        prof.projected_luminous_area(0.0).unwrap_or(0.0),
+    );
+
+    // Seated at the centre of the room, looking toward each wall in turn. EN 12464-1's observer is
+    // at 1.2 m looking horizontally; the worst of the four directions is the one that governs.
+    // A QUARTER POINT, not the centre: in t1 the centre is directly under the only fitting, where
+    // it sits at exactly 90 deg to any horizontal view and is legitimately out of the field of
+    // view. An observer who cannot see the lamp is a poor sample of whether the lamp glares.
+    let eye = Vertex::new(1.0, 1.0, cad_light::Observer::SEATED_EYE_M);
+    let views: [(&str, glam::Vec3); 4] = [
+        ("+X", glam::Vec3::X),
+        ("-X", -glam::Vec3::X),
+        ("+Y", glam::Vec3::Y),
+        ("-Y", -glam::Vec3::Y),
+    ];
+
+    for case in &CASES {
+        let lums: Vec<Luminaire> = case
+            .lums
+            .iter()
+            .enumerate()
+            .map(|(i, (x, y))| Luminaire {
+                id: i as u32 + 1,
+                profile: "FONDO".to_string(),
+                position: Vertex::new(*x, *y, MOUNT_Z),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+            })
+            .collect();
+
+        // Background: the indirect illuminance on a vertical plane at the eye. Taken from the
+        // working-plane result's indirect share, which is the field the fittings are seen against.
+        let plane = plane_at(8, 8);
+        let settings = RaySettings { rays_per_point: 2048, max_bounces: 8, ..RaySettings::default() };
+        let maint = Maintenance { llmf: MF, lsf: 1.0, lmf: 1.0, rsmf: 1.0 };
+        let (meshes, materials) = scene();
+        let g = calculate_maintained(&meshes, &lums, &profiles, &materials, &plane, &settings, maint);
+        let e_ind = g.indirect.iter().sum::<f64>() / g.indirect.len().max(1) as f64;
+        let bg = cad_light::background_from_indirect(e_ind);
+
+        println!("\n=== {} ===", case.name);
+        println!("  background {bg:.1} cd/m2 (from {e_ind:.1} lx indirect)");
+        let mut worst: Option<f64> = None;
+        for (label, v) in views {
+            let obs = cad_light::Observer::looking(eye, v);
+            match cad_light::ugr_at(&obs, &lums, &profiles, bg) {
+                Some(r) => {
+                    println!(
+                        "  looking {label}:  UGR {:>5.1}   from {} source(s), nearest sigma {:.0} deg",
+                        r.ugr,
+                        r.sources.len(),
+                        r.sources.first().map(|s| s.sigma_deg).unwrap_or(0.0),
+                    );
+                    worst = Some(worst.map_or(r.ugr, |w: f64| w.max(r.ugr)));
+                }
+                None => println!("  looking {label}:  no source in view"),
+            }
+        }
+        match worst {
+            Some(w) => println!("  worst direction: UGR {w:.1}   (DIALux table method: 15)"),
+            None => println!("  no direction sees a fitting — nothing to rate"),
+        }
+        // `f64::MIN` is FINITE, so a sentinel would have sailed through a liveness check while
+        // printing 1.8e308 as the answer — which is exactly what the first run of this did. An
+        // Option cannot do that.
+        assert!(worst.is_some(), "{}: no direction produced a rating", case.name);
+    }
+}

@@ -197,6 +197,12 @@ fn builtin_downlight() -> IesProfile {
         width: 0.0,
         length: 0.0,
         height: 0.0,
+        // No aperture declared, so this fitting is excluded from UGR rather than counted with a
+        // made-up area — and `UgrResult::skipped_no_area` says so. The built-in is a placeholder
+        // distribution for a point that has no real photometry yet; inventing a size for it would
+        // put a fabricated glare figure next to the real ones.
+        luminous_length: 0.0,
+        luminous_width: 0.0,
     }
 }
 

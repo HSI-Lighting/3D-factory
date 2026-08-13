@@ -382,6 +382,8 @@ mod tests {
             width: 0.0,
             length: 0.0,
             height: 0.0,
+            luminous_length: 0.0,
+            luminous_width: 0.0,
         }
     }
 
@@ -487,6 +489,8 @@ mod tests {
             width: 0.0,
             length: 0.0,
             height: 0.0,
+            luminous_length: 0.0,
+            luminous_width: 0.0,
         }
     }
 

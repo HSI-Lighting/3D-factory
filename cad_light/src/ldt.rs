@@ -94,6 +94,20 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
     let length_mm = num(12, "luminaire length/diameter").unwrap_or(0.0);
     let height_mm = num(14, "luminaire height").unwrap_or(0.0);
 
+    // Records 16–17: the LUMINOUS AREA — the emitting aperture, which is NOT the housing.
+    //
+    // Glare is computed from luminance, L = I / A, so this is the area that matters. A 600 mm
+    // housing with a 300 mm aperture is four times brighter than its outline suggests, and using
+    // the outline UNDER-states luminance and therefore under-states UGR — the direction that
+    // passes a design which should fail.
+    //
+    // A file leaving these at zero (common) means "same as the outline", so fall back to it rather
+    // than to nothing: an area of zero would divide by zero downstream.
+    let lum_len_mm = num(15, "luminous area length/diameter").unwrap_or(0.0);
+    let lum_wid_mm = num(16, "luminous area width").unwrap_or(0.0);
+    let (lum_len_mm, lum_wid_mm) =
+        if lum_len_mm > 0.0 { (lum_len_mm, lum_wid_mm) } else { (length_mm, width_mm) };
+
     // Record 26 is the number of lamp sets; each set then occupies 6 lines, and record 27's direct
     // ratios (10 values) follow. Everything after that is angles and intensities, so getting this
     // count wrong shifts the entire distribution.
@@ -166,6 +180,8 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         candela,
         watts,
         width: width_mm / 1000.0,
+        luminous_length: lum_len_mm / 1000.0,
+        luminous_width: lum_wid_mm / 1000.0,
         length: length_mm / 1000.0,
         height: height_mm / 1000.0,
     })
