@@ -797,6 +797,43 @@ impl Frame {
     pub fn from_uv(&self, uv: Vec2) -> Vec3 {
         self.origin + self.u * uv.x + self.v * uv.y
     }
+
+    /// The canonical frame for this frame's PLANE — same plane, but with an origin and axes that
+    /// do not depend on where the user happened to click.
+    ///
+    /// Reported as: "i drew the building on the origin yet then i took a face to draw on, and even
+    /// though the face's corner is on the origin the face is shown as if it's in some other place."
+    /// The cause: [`Self::from_point_normal`] takes the HIT POINT as the origin, so a sketch's
+    /// (0, 0) landed wherever the cursor happened to be when the face was picked, and the face's
+    /// own corner appeared at minus that offset. Two clicks a metre apart on the same face gave
+    /// two different coordinate systems for the same plane.
+    ///
+    /// ORIGIN — the point of the plane closest to the world origin, so a sketch's coordinates
+    /// agree with the model's. A floor at z = 0 puts (0, 0) on the world origin; a wall on x = 0
+    /// puts it on that wall's own corner. A dimension read in a sketch then means the same thing
+    /// as a dimension read in the plan, which is the whole reason to prefer a rule to a click.
+    ///
+    /// AXES — for a HORIZONTAL plane, u = +X and v = ±Y, so a sketch on a floor reads exactly like
+    /// the plan. `from_point_normal`'s deterministic-but-arbitrary choice gives u = −Y and v = +X
+    /// there: a quarter turn and a mirror away from the drawing it is standing on. For a VERTICAL
+    /// plane u runs horizontally and v is up, which is what an elevation means.
+    pub fn canonical(&self) -> Self {
+        let n = self.normal();
+        if n.length_squared() < 0.5 {
+            return *self; // degenerate — nothing to canonicalise against
+        }
+        // The projection of the world origin onto this plane.
+        let origin = n * self.origin.dot(n);
+        let (u, v) = if n.z.abs() > 0.999 {
+            // Horizontal: read it like a plan. v flips with the facing so u × v = n stays true.
+            (Vec3::X, Vec3::Y * n.z.signum())
+        } else {
+            // Vertical or tilted: across, then up.
+            let u = Vec3::Z.cross(n).normalize_or_zero();
+            (u, n.cross(u).normalize_or_zero())
+        };
+        Self { origin, u, v }
+    }
 }
 
 /// A 2D sketch on a [`Frame`] (typically a picked solid face). It holds a real
@@ -1563,5 +1600,99 @@ mod profile_tests {
         let (mn, mx) = p.local_aabb();
         assert_eq!(mn, Vec3::new(-2.0, -3.0, 0.0));
         assert_eq!(mx, Vec3::new(2.0, 3.0, 3.0));
+    }
+}
+
+/// THE PLANE DECIDES THE COORDINATES, NOT THE CLICK.
+///
+/// Reported as: "i drew the building on the origin yet then i took a face to draw on, and even
+/// though the face's corner is on the origin the face is shown as if it's in some other place."
+/// `Frame::from_point_normal` takes the HIT POINT as the origin, so a sketch's (0, 0) landed
+/// wherever the cursor happened to be and the face's own corner appeared at minus that offset —
+/// two clicks a metre apart on the same face giving two coordinate systems for the same plane.
+#[cfg(test)]
+mod a_sketch_plane_is_canonical {
+    use super::*;
+
+    /// The reported case: a building whose corner is on the world origin, a face picked by
+    /// clicking somewhere in the middle of it. Its corner must land on the sketch's (0, 0).
+    #[test]
+    fn the_corner_on_the_world_origin_lands_on_the_sketch_origin() {
+        // The wall on y = 0 of a building spanning x 0..9.4, z 0..3.05 — clicked at (4.5, 0, 1.9),
+        // metres away from the corner at the world origin.
+        let clicked = Frame::from_point_normal(Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0));
+        let before = clicked.to_uv(Vec3::ZERO);
+        assert!(before.length() > 4.0, "precondition: the click puts the corner far from (0,0): {before:?}");
+
+        let f = clicked.canonical();
+        let after = f.to_uv(Vec3::ZERO);
+        assert!(after.length() < 1e-5, "the corner must be the sketch origin, got {after:?}");
+    }
+
+    /// …and it must not depend on WHERE on the face you clicked.
+    #[test]
+    fn two_clicks_on_one_face_give_one_frame() {
+        let n = Vec3::new(0.0, -1.0, 0.0);
+        let a = Frame::from_point_normal(Vec3::new(1.0, 0.0, 0.5), n).canonical();
+        let b = Frame::from_point_normal(Vec3::new(8.0, 0.0, 2.9), n).canonical();
+        assert!((a.origin - b.origin).length() < 1e-5, "{:?} vs {:?}", a.origin, b.origin);
+        assert!((a.u - b.u).length() < 1e-5 && (a.v - b.v).length() < 1e-5);
+    }
+
+    /// A sketch on a FLOOR must read like the plan: u = +X, v = +Y. The arbitrary-but-deterministic
+    /// axes gave u = −Y and v = +X there — a quarter turn and a mirror away from the drawing the
+    /// face is standing on.
+    #[test]
+    fn a_horizontal_face_reads_like_the_plan() {
+        let f = Frame::from_point_normal(Vec3::new(3.0, 2.0, 0.0), Vec3::Z).canonical();
+        assert!((f.u - Vec3::X).length() < 1e-5, "u = {:?}", f.u);
+        assert!((f.v - Vec3::Y).length() < 1e-5, "v = {:?}", f.v);
+        // A point 2 m east and 1 m north of the origin reads as (2, 1).
+        let uv = f.to_uv(Vec3::new(2.0, 1.0, 0.0));
+        assert!((uv.x - 2.0).abs() < 1e-5 && (uv.y - 1.0).abs() < 1e-5, "{uv:?}");
+    }
+
+    /// A sketch on a WALL must read like an elevation: across, then UP.
+    #[test]
+    fn a_vertical_face_reads_like_an_elevation() {
+        for n in [Vec3::X, -Vec3::X, Vec3::Y, -Vec3::Y] {
+            let f = Frame::from_point_normal(n * 2.0, n).canonical();
+            assert!(f.u.z.abs() < 1e-5, "u must be horizontal for n = {n:?}, got {:?}", f.u);
+            assert!((f.v - Vec3::Z).length() < 1e-5, "v must be up for n = {n:?}, got {:?}", f.v);
+        }
+    }
+
+    /// Whatever else it does, it must still describe the SAME PLANE — same normal, same offset —
+    /// or a sketch would quietly move the face it is drawn on.
+    #[test]
+    fn it_is_the_same_plane_it_started_as() {
+        for (p, n) in [
+            (Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0)),
+            (Vec3::new(1.0, 2.0, 3.0), Vec3::Z),
+            (Vec3::new(-7.0, 5.0, 2.0), Vec3::new(1.0, 1.0, 0.0).normalize()),
+            (Vec3::new(0.5, 0.5, 4.0), Vec3::new(0.3, -0.2, 0.9).normalize()),
+        ] {
+            let a = Frame::from_point_normal(p, n);
+            let b = a.canonical();
+            assert!(a.normal().dot(b.normal()) > 0.9999, "the normal turned: {:?} → {:?}", a.normal(), b.normal());
+            // The original origin still lies IN the canonical plane.
+            let off = (p - b.origin).dot(b.normal());
+            assert!(off.abs() < 1e-4, "the plane moved by {off} m");
+            // …and the frame is still right-handed and orthonormal.
+            assert!((b.u.length() - 1.0).abs() < 1e-5 && (b.v.length() - 1.0).abs() < 1e-5);
+            assert!(b.u.dot(b.v).abs() < 1e-5, "axes are not perpendicular");
+            assert!(b.u.cross(b.v).dot(b.normal()) > 0.9999, "left-handed — a sketch would mirror");
+        }
+    }
+
+    /// Round-tripping through the canonical frame must be exact, or drawing on a face would
+    /// deposit geometry slightly off it.
+    #[test]
+    fn uv_round_trips() {
+        let f = Frame::from_point_normal(Vec3::new(4.5, 0.0, 1.9), Vec3::new(0.0, -1.0, 0.0)).canonical();
+        for w in [Vec3::new(0.0, 0.0, 0.0), Vec3::new(9.4, 0.0, 3.05), Vec3::new(2.0, 0.0, 1.0)] {
+            let back = f.from_uv(f.to_uv(w));
+            assert!((back - w).length() < 1e-5, "{w:?} → {back:?}");
+        }
     }
 }

@@ -4263,6 +4263,14 @@ impl CadApp {
         if !self.light.show_overlay {
             return;
         }
+        // NOT IN A SKETCH. The grid is a result measured on the WORK PLANE, in world coordinates;
+        // a face sketch puts the canvas on some other plane entirely — a wall, a tilted roof — and
+        // painting a horizontal result across it draws a false-colour field over a surface it was
+        // never measured on. It reads as data and is not. The overlay belongs to the global plan
+        // view, which is where the plane it describes actually is.
+        if self.factory.session.is_some() {
+            return;
+        }
         let (Some(grid), Some(plane)) = (self.light.grid.as_ref(), self.light.plane.as_ref())
         else {
             return;
@@ -7747,6 +7755,18 @@ impl CadApp {
     }
 
     fn factory_enter_sketch(&mut self, frame: cad_solid::Frame) {
+        // THE PLANE DECIDES THE COORDINATES, NOT THE CLICK. `Frame::from_point_normal` takes the
+        // hit point as the origin, so the sketch's (0, 0) landed wherever the cursor happened to
+        // be and the face's own corner appeared at minus that offset — "even though the face's
+        // corner is on the origin the face is shown as if it's in some other place". See
+        // `Frame::canonical` for the rule this replaces it with.
+        //
+        // The PICK is still kept, because naming needs it: a plane is named after the room the
+        // face is in, and that is a question about the point the user touched. The canonical
+        // origin is the plane's nearest point to the world origin, which for a wall is a corner
+        // and can easily be in a different room — or in none.
+        let picked = frame;
+        let frame = frame.canonical();
         if self.factory.session.is_some() {
             self.factory_exit_sketch();
         }
@@ -7767,7 +7787,7 @@ impl CadApp {
                 // Name it after the object it is a face of, so it is findable in the view list
                 // before anyone gets round to renaming it.
                 let mut sk = cad_solid::Sketch::new(frame);
-                sk.name = self.factory.sketch_auto_name(&frame);
+                sk.name = self.factory.sketch_auto_name(&picked);
                 self.factory.model.sketches.push(sk);
                 self.factory.model.sketches.len() - 1
             }
@@ -7775,7 +7795,7 @@ impl CadApp {
         // A model loaded from a file written before planes had names carries blanks. Fill them in
         // on the way past rather than showing an empty row in the list.
         if self.factory.model.sketches[idx].name.is_empty() {
-            self.factory.model.sketches[idx].name = self.factory.sketch_auto_name(&frame);
+            self.factory.model.sketches[idx].name = self.factory.sketch_auto_name(&picked);
         }
         // THE FACE, AND ONLY THE FACE. This used to project the WHOLE model onto the plane, which
         // on a wall of a 139 m building draws every wall, room and opening in it flattened on top
@@ -10958,6 +10978,65 @@ impl CadApp {
                 // ---- COPY / PASTE (Ctrl+C / Ctrl+V) — 3D objects --------------
                 // Gated like the nudge: 3D view active or pointer over the viewport, no sketch
                 // open. Keys are CONSUMED so the 2D canvas's own copy/paste doesn't also fire.
+                // ---- 3D VIEWPORT HOTKEYS ------------------------------------------------
+                //
+                // Gated on the ACTIVE VIEW — never on the panel being open, and never on the mouse
+                // merely hovering. That distinction is the one `established_commands_are_untouchable`
+                // exists to protect: `m` is the 2D MOVE command and a panel being visible says
+                // nothing about what you are editing. Here you must have clicked INTO the 3D
+                // viewport, no sketch may be open, and nothing may hold keyboard focus — so a bare
+                // letter cannot be taken out of the command line or out of a numeric field.
+                let typing = ui.memory(|m| m.focused().is_some());
+                if self.active_view == ActiveView::ThreeD
+                    && !typing
+                    && self.factory.session.is_none()
+                {
+                    use crate::factory::GizmoMode as GM;
+                    let n = egui::Modifiers::NONE;
+                    let (k_move, k_rot, k_fit, k_grid, k_ceil, k_esc) = ui.input_mut(|i| {
+                        (
+                            i.consume_key(n, egui::Key::M),
+                            i.consume_key(n, egui::Key::R),
+                            i.consume_key(n, egui::Key::F),
+                            i.consume_key(n, egui::Key::G),
+                            i.consume_key(n, egui::Key::H),
+                            i.consume_key(n, egui::Key::Escape),
+                        )
+                    });
+                    if k_move {
+                        self.factory.gizmo_mode = GM::Move;
+                        self.factory.status = "move gizmo — drag an arrow to constrain, the centre to slide".into();
+                    }
+                    if k_rot {
+                        self.factory.gizmo_mode = GM::Rotate;
+                        self.factory.status = "rotate gizmo — drag a ring to spin about that axis".into();
+                    }
+                    if k_fit {
+                        self.factory.fit_all();
+                        self.factory.status = "framed the model".into();
+                    }
+                    if k_grid {
+                        self.factory.show_grid = !self.factory.show_grid;
+                        self.factory.status =
+                            format!("grid {}", if self.factory.show_grid { "on" } else { "off" });
+                    }
+                    if k_ceil {
+                        self.factory.hide_ceilings = !self.factory.hide_ceilings;
+                        self.factory.recompute();
+                        self.factory.status = format!(
+                            "ceilings {}",
+                            if self.factory.hide_ceilings { "hidden" } else { "shown" }
+                        );
+                    }
+                    if k_esc {
+                        self.factory.clear_selection();
+                        self.selection.clear();
+                        self.factory.status = "selection cleared".into();
+                    }
+                    if k_move || k_rot || k_fit || k_grid || k_ceil || k_esc {
+                        ui.ctx().request_repaint();
+                    }
+                }
                 if (self.active_view == ActiveView::ThreeD || over_viewport)
                     && self.factory.session.is_none()
                 {
@@ -49790,7 +49869,8 @@ mod factory_sketch_tests {
 
         // A window spanning ±win_half_angle of arc, drawn on the tangent plane.
         let half_w = (radius * win_half_angle.sin()) as f64;
-        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        let (cx, cy) = pick_uv(face, n);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: vec![
                 v(-half_w, -0.7), v(half_w, -0.7), v(half_w, 0.7), v(-half_w, 0.7), v(-half_w, -0.7),
@@ -49805,6 +49885,17 @@ mod factory_sketch_tests {
 
     /// How many solid surfaces a ray crosses going from `from` along `dir` through the model.
     #[cfg(test)]
+    /// Where a picked world point lands in ITS OWN sketch plane's coordinates.
+    ///
+    /// Sketch coordinates come from the PLANE now, not from where the face happened to be clicked
+    /// — see `Frame::canonical`. A test that means "draw a window where I picked" therefore has to
+    /// ask where that point is, exactly as a user reads it off the canvas. Assuming (0, 0) was the
+    /// pick is the assumption that broke.
+    fn pick_uv(face: glam::Vec3, n: glam::Vec3) -> (f64, f64) {
+        let uv = cad_solid::Frame::from_point_normal(face, n).canonical().to_uv(face);
+        (uv.x as f64, uv.y as f64)
+    }
+
     fn surface_crossings(app: &CadApp, from: glam::Vec3, dir: glam::Vec3) -> usize {
         let mut hits = 0;
         for c in app.factory.cached.positions.chunks_exact(3) {
@@ -49862,7 +49953,8 @@ mod factory_sketch_tests {
         );
         app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
         let hw = 1.1_f64;
-        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        let (cx, cy) = pick_uv(face, n);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: vec![v(-hw, -0.7), v(hw, -0.7), v(hw, 0.7), v(-hw, 0.7), v(-hw, -0.7)],
             closed: true,
@@ -49973,7 +50065,8 @@ mod factory_sketch_tests {
         println!("uncut crossings = {}", surface_crossings(&app, face + n * 0.5, -n));
         app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
         let hw = (radius * half_angle.sin()) as f64;
-        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        let (cx, cy) = pick_uv(face, n);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: vec![v(-hw, -0.7), v(hw, -0.7), v(hw, 0.7), v(-hw, 0.7), v(-hw, -0.7)],
             closed: true, widths: Vec::new(),
@@ -50046,7 +50139,8 @@ mod factory_sketch_tests {
         let face = glam::Vec3::new(0.0, -0.3, 1.5);
         assert!(surface_crossings(&app, face + n * 0.5, -n) >= 2, "probe sees the uncut wall");
         app.factory_enter_sketch(cad_solid::Frame::from_point_normal(face, n));
-        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        let (cx, cy) = pick_uv(face, n);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: vec![v(-0.5, -0.5), v(0.5, -0.5), v(0.5, 0.5), v(-0.5, 0.5), v(-0.5, -0.5)],
             closed: true, widths: Vec::new(),
@@ -50135,7 +50229,8 @@ mod factory_sketch_tests {
         let c = (mn + mx) * 0.5;
         // Cut a small square opening straight through the box.
         app.factory_enter_sketch(cad_solid::Frame::from_point_normal(c, glam::Vec3::Z));
-        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+        let (cx, cy) = pick_uv(c, glam::Vec3::Z);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: vec![v(-0.3, -0.3), v(0.3, -0.3), v(0.3, 0.3), v(-0.3, 0.3)],
             closed: true,
