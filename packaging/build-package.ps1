@@ -49,7 +49,11 @@ if ($NewBuild) {
 
 $commit = (& git rev-parse --short HEAD 2>$null)
 if (-not $commit) { $commit = 'unknown' }
-$dirty = (& git status --porcelain 2>$null)
+# `+dirty` means "this binary is one edit ahead of the commit it names". -NewBuild writes
+# build-number.txt seconds earlier, so counting that file marked EVERY cut build dirty by its own
+# doing -- and a warning that always fires is a warning nobody reads. Exclude it, and only it.
+$dirty = (& git status --porcelain 2>$null) |
+    Where-Object { $_ -and ($_ -notmatch 'packaging/build-number\.txt$') }
 if ($dirty) { $commit = "$commit+dirty" }
 
 if (-not $SkipBuild) {

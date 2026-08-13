@@ -22,12 +22,21 @@ fn main() {
 
     // A build with uncommitted edits is NOT the commit it names, and saying so matters: half the
     // confusion this exists to prevent came from running a binary that was one edit ahead.
+    //
+    // EXCEPT build-number.txt. Cutting a release writes it moments before this runs, so counting it
+    // stamped every packaged build "+dirty" by its own doing — and a warning that always fires is a
+    // warning nobody reads. `packaging/build-package.ps1` excludes the same one file.
     let dirty = Command::new("git")
         .args(["status", "--porcelain"])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .is_some_and(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty());
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .any(|l| !l.ends_with("packaging/build-number.txt"))
+        });
 
     println!("cargo:rustc-env=SIMLUX_BUILD={short}{}", if dirty { "+dirty" } else { "" });
 
