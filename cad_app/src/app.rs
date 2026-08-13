@@ -11880,6 +11880,21 @@ impl CadApp {
                 if furn_handled {
                     // consumed by per-surface furniture handling above
                 }
+                // THE MATERIALS FACTORY FOLLOWS THE CLICK. With that window open, clicking a face
+                // is how you choose what to edit — "when the user clicks on a surface the materials
+                // factory will show every parameter related to it". A face with no material of its
+                // own is GIVEN one, so editing it cannot silently repaint every other face that
+                // happens to share the object's material.
+                else if self.materials_open && resp.clicked() && !return_after_click {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(key) = self.factory.pick_surface_key(pos, rect, &mvp) {
+                            self.materials_select_surface(key);
+                        } else {
+                            self.factory.status =
+                                "Materials Factory: click a surface to edit its material".into();
+                        }
+                    }
+                }
                 else if self.factory.paint_surface_mode && resp.clicked() && !return_after_click {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         self.snapshot_factory();
@@ -23075,6 +23090,47 @@ impl CadApp {
     /// Output), and an inspector for the selected node. Compiles the edited graph back onto the
     /// selected material every frame — a plain colour is emitted as a live "solid" procedural, so
     /// every edit shows in the 3D view without a GPU re-upload. See [`crate::material_graph`].
+    /// Point the Materials Factory at the surface that was just clicked.
+    ///
+    /// A face that already carries its own material is simply selected — clicking it again is
+    /// asking to edit what is there. A face with NONE is given one, copied from whatever it looks
+    /// like now, and bound to that face alone.
+    ///
+    /// Giving it its own is the whole point. The alternative — selecting the object's shared
+    /// material — means the first edit repaints every other face using it, which is the bug this
+    /// window is being reorganised to fix, arriving by a different route.
+    fn materials_select_surface(&mut self, key: crate::factory::SurfaceKey) {
+        if let Some(&ti) = self.factory.surface_texture.get(&key) {
+            self.materials.sel = Some(ti);
+            self.factory.status = format!(
+                "Materials Factory: editing '{}'",
+                self.factory.textures.get(ti).map(|t| t.name.as_str()).unwrap_or("material"),
+            );
+            return;
+        }
+        self.snapshot_factory();
+        // Start from what the face looks like TODAY — its own colour, else its feature's, else the
+        // neutral default — so opening a material is not also a visible change.
+        let base = self
+            .factory
+            .surface_color
+            .get(&key)
+            .copied()
+            .or_else(|| self.factory.feature_color.get(&key.0).copied())
+            .unwrap_or([0.82, 0.82, 0.84]);
+        let n = self.factory.textures.len() + 1;
+        let idx = self.factory.add_procedural_texture(
+            format!("Surface {n}"),
+            crate::factory::ProcDef::solid(base),
+        );
+        self.factory.surface_texture.insert(key, idx);
+        self.factory.recompute();
+        self.materials.sel = Some(idx);
+        self.factory.status =
+            format!("Materials Factory: this face now has its own material, 'Surface {n}'");
+        self.history.push(format!("  surface given its own material 'Surface {n}'"));
+    }
+
     fn render_materials_factory(&mut self, ctx: &egui::Context) {
         // Seed a graph for the selected material on first open.
         if let Some(i) = self.materials.sel {
@@ -53542,5 +53598,114 @@ mod paint_targets_a_surface {
             Some(t),
             "with per-face off, the whole solid should take it",
         );
+    }
+}
+
+/// CLICKING A SURFACE GIVES IT ITS OWN MATERIAL.
+///
+/// "when the user clicks on a surface the materials factory will show every parameter related to
+/// it" — and, asked and answered: a face with no material of its own gets a NEW one rather than
+/// borrowing the object's. Borrowing would mean the first edit repaints every other face sharing
+/// it, which is the same "it applied to the entire building" complaint arriving by another route.
+#[cfg(test)]
+mod materials_follow_the_surface {
+    use super::*;
+
+    fn a_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(6.0, 0.0),
+                    glam::Vec2::new(6.0, 6.0),
+                    glam::Vec2::new(0.0, 6.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    fn a_key(app: &CadApp) -> crate::factory::SurfaceKey {
+        let id = app.factory.model.features[0].id;
+        let t = &app.factory.cached.positions;
+        crate::factory::surface_key(id, t[0], t[1], t[2])
+    }
+
+    /// A bare face is GIVEN a material, bound to that face alone.
+    #[test]
+    fn a_face_with_no_material_gets_its_own() {
+        let mut app = a_building();
+        let key = a_key(&app);
+        assert!(app.factory.surface_texture.get(&key).is_none(), "precondition: nothing bound");
+
+        app.materials_select_surface(key);
+        let ti = *app.factory.surface_texture.get(&key).expect("bound to this face");
+        assert_eq!(app.materials.sel, Some(ti), "and the window is showing it");
+        // Bound to THIS face and nothing else — the whole point.
+        assert_eq!(app.factory.surface_texture.len(), 1);
+        assert!(
+            !app.factory.feature_texture.contains_key(&key.0),
+            "it must not have been bound to the feature, which is every wall at once",
+        );
+    }
+
+    /// Opening a material is not itself a visible change: the new one starts from what the face
+    /// already looks like.
+    #[test]
+    fn the_new_material_starts_from_the_faces_current_look() {
+        let mut app = a_building();
+        let key = a_key(&app);
+        app.factory.surface_color.insert(key, [0.9, 0.1, 0.1]);
+
+        app.materials_select_surface(key);
+        let ti = app.materials.sel.expect("selected");
+        let t = &app.factory.textures[ti];
+        let p = t.proc.as_ref().expect("a procedural material");
+        assert!(p.is_solid(), "a plain colour, not a pattern");
+        let c = p.col_a;
+        assert!(
+            (c[0] - 0.9).abs() < 1e-6 && (c[1] - 0.1).abs() < 1e-6,
+            "started from {c:?}, expected the face's own red",
+        );
+    }
+
+    /// Clicking a face that ALREADY has its own material selects it rather than making another —
+    /// otherwise every visit would litter the list with near-duplicates.
+    #[test]
+    fn clicking_the_same_face_again_selects_rather_than_duplicates() {
+        let mut app = a_building();
+        let key = a_key(&app);
+        app.materials_select_surface(key);
+        let first = app.materials.sel.expect("selected");
+        let count = app.factory.textures.len();
+
+        app.materials_select_surface(key);
+        assert_eq!(app.materials.sel, Some(first), "the same material, not a new one");
+        assert_eq!(app.factory.textures.len(), count, "no duplicate was created");
+    }
+
+    /// Two different faces get two different materials, so editing one leaves the other alone.
+    #[test]
+    fn two_faces_get_two_materials() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        let t = &app.factory.cached.positions;
+        let k1 = crate::factory::surface_key(id, t[0], t[1], t[2]);
+        // A triangle well away from the first, so it is a different face.
+        let n = t.len() / 3;
+        let far = (n / 2) * 3;
+        let k2 = crate::factory::surface_key(id, t[far], t[far + 1], t[far + 2]);
+        assert_ne!(k1, k2, "precondition: two distinct faces");
+
+        app.materials_select_surface(k1);
+        app.materials_select_surface(k2);
+        let a = app.factory.surface_texture.get(&k1).copied();
+        let b = app.factory.surface_texture.get(&k2).copied();
+        assert!(a.is_some() && b.is_some());
+        assert_ne!(a, b, "each face must own its material, or editing one changes the other");
     }
 }

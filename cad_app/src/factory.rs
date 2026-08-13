@@ -4171,9 +4171,14 @@ impl FactoryState {
     /// Paint the SURFACE (coplanar face) under the cursor with `color`. Ray-tests the
     /// cached mesh, finds the front-most triangle, and colours every triangle sharing its
     /// surface key. Returns true if a surface was hit.
-    pub fn paint_surface(
-        &mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], color: [f32; 3],
-    ) -> bool {
+    /// The SURFACE under the cursor, as its [`SurfaceKey`] — without painting anything.
+    ///
+    /// Split out of [`Self::paint_surface`] so the Materials Factory can ask "which face did they
+    /// click?" and then edit or create that face's material. One implementation, so the window and
+    /// the brush can never disagree about which face was meant.
+    pub fn pick_surface_key(
+        &self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
+    ) -> Option<SurfaceKey> {
         let (orig, dir) = Self::ray(cursor, rect, mvp);
         let mut best: Option<(f32, SurfaceKey)> = None;
         for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
@@ -4185,7 +4190,13 @@ impl FactoryState {
                 }
             }
         }
-        if let Some((_, key)) = best {
+        best.map(|(_, key)| key)
+    }
+
+    pub fn paint_surface(
+        &mut self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16], color: [f32; 3],
+    ) -> bool {
+        if let Some(key) = self.pick_surface_key(cursor, rect, mvp) {
             self.surface_color.insert(key, color);
             return true;
         }
