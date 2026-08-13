@@ -7996,10 +7996,22 @@ impl FactoryState {
         if !self.show_grid {
             return out;
         }
-        // How far the ground plane is visible. `cam_dist` is the ortho half-height as well as the
-        // perspective distance, and 1.6× covers the corners of a wide viewport and the extra reach
-        // a shallow pitch gives — cheap insurance against a visible edge, at ~40 more lines.
-        let reach = (self.cam_dist * 1.6).clamp(1.0, 1.0e6);
+        // How far the ground plane is visible.
+        //
+        // Straight down, that is about the camera distance and 1.6× covers a wide viewport's
+        // corners. LOOKING ALONG THE GROUND it is far more: the plane runs away to the horizon, and
+        // a grid sized for the overhead case reads as a small rug in the middle of the screen —
+        // which is what the first version of this did in a perspective view.
+        //
+        // 1/sin(pitch) is the honest factor, floored so a dead-level camera does not ask for an
+        // infinite grid, and capped at 10× so a near-horizontal view does not spend its whole
+        // budget on ground that is two pixels tall.
+        let spread = if self.ortho {
+            1.6
+        } else {
+            (1.6 / self.cam_pitch.abs().sin().max(0.16)).min(10.0)
+        };
+        let reach = (self.cam_dist * spread).clamp(1.0, 1.0e6);
         // ~40 divisions each side of centre. `nice_step` rounds UP the ladder, so the real count is
         // between 16 and 40 — never more, which is what bounds the cost.
         let step = nice_step(reach / 40.0);
@@ -8017,6 +8029,12 @@ impl FactoryState {
         let cx = (self.cam_target[0] / step).round() * step;
         let cy = (self.cam_target[1] / step).round() * step;
         let n = (reach / step).ceil() as i32;
+        // The EXTENT is snapped too, not only the line positions. `reach` is rarely a whole number
+        // of steps, so using it directly put every line's two ENDPOINTS off the grid — a ragged
+        // edge on all four sides, and a "snapped to the spacing" claim that was only true of the
+        // coordinate each line happens to run along. `half` makes it a clean rectangle of whole
+        // cells. Caught by the test, not by looking at it.
+        let half = n as f32 * step;
 
         for i in -n..=n {
             let t = i as f32 * step;
@@ -8028,8 +8046,8 @@ impl FactoryState {
             let cyl = if y.abs() < step * 0.5 { AXIS_X }
             else if is_major(y) { MAJOR } else { MINOR };
 
-            seg(&mut out, Vec3::new(x, cy - reach, 0.0), Vec3::new(x, cy + reach, 0.0), cxl);
-            seg(&mut out, Vec3::new(cx - reach, y, 0.0), Vec3::new(cx + reach, y, 0.0), cyl);
+            seg(&mut out, Vec3::new(x, cy - half, 0.0), Vec3::new(x, cy + half, 0.0), cxl);
+            seg(&mut out, Vec3::new(cx - half, y, 0.0), Vec3::new(cx + half, y, 0.0), cyl);
         }
         out
     }
@@ -13974,5 +13992,104 @@ mod ground_grid {
         let (reach, segs) = extent(&st);
         assert!(reach >= st.cam_dist, "the grid stops short at full zoom-out");
         assert!(segs < 300, "…and does not explode getting there: {segs} segments");
+    }
+}
+
+/// THE GRID AT A SHALLOW ANGLE.
+///
+/// Looking straight down, the visible ground is about the camera distance. Looking ALONG it, the
+/// plane runs away to the horizon — and a grid sized for the overhead case reads as a small rug in
+/// the middle of the screen, which is what the first version of this did in a perspective view.
+#[cfg(test)]
+mod grid_pitch {
+    use super::*;
+
+    fn reach_of(st: &FactoryState) -> f32 {
+        st.grid_lines()
+            .iter()
+            .fold(0.0_f32, |a, v| {
+                a.max((v.x - st.cam_target[0]).abs()).max((v.y - st.cam_target[1]).abs())
+            })
+    }
+
+    #[test]
+    fn a_shallow_perspective_view_gets_a_wider_grid() {
+        let mut st = FactoryState::default();
+        st.ortho = false;
+        st.cam_dist = 50.0;
+
+        st.cam_pitch = std::f32::consts::FRAC_PI_2; // straight down
+        let overhead = reach_of(&st);
+
+        st.cam_pitch = 0.15; // nearly along the ground
+        let shallow = reach_of(&st);
+
+        assert!(
+            shallow > overhead * 3.0,
+            "overhead {overhead:.0} m vs shallow {shallow:.0} m — the grid did not open out",
+        );
+    }
+
+    /// …but not without bound. A near-horizontal view must not spend the whole budget on ground
+    /// that is two pixels tall.
+    #[test]
+    fn the_widening_is_capped() {
+        let mut st = FactoryState::default();
+        st.ortho = false;
+        st.cam_dist = 50.0;
+        for pitch in [0.0_f32, 0.001, 0.05, 0.16] {
+            st.cam_pitch = pitch;
+            let r = reach_of(&st);
+            assert!(r <= 50.0 * 10.0 + 1.0, "pitch {pitch}: reach {r:.0} m is past the cap");
+            assert!(r.is_finite(), "pitch {pitch} produced a non-finite reach");
+        }
+    }
+
+    /// A LEVEL camera must not ask for an infinite grid — sin(0) is zero and the floor is what
+    /// stops the division.
+    #[test]
+    fn a_level_camera_is_survivable() {
+        let mut st = FactoryState::default();
+        st.ortho = false;
+        st.cam_dist = 50.0;
+        st.cam_pitch = 0.0;
+        let g = st.grid_lines();
+        assert!(!g.is_empty(), "a level camera must still get a grid");
+        assert!(g.len() / 2 <= 260, "…and a bounded one: {} segments", g.len() / 2);
+        for v in &g {
+            assert!(v.x.is_finite() && v.y.is_finite(), "non-finite vertex");
+        }
+    }
+
+    /// Orthographic has no horizon, so it keeps the tight overhead sizing whatever the pitch says.
+    #[test]
+    fn orthographic_ignores_the_pitch() {
+        let mut st = FactoryState::default();
+        st.ortho = true;
+        st.cam_dist = 50.0;
+        st.cam_pitch = std::f32::consts::FRAC_PI_2;
+        let a = reach_of(&st);
+        st.cam_pitch = 0.05;
+        let b = reach_of(&st);
+        assert!((a - b).abs() < 1e-3, "ortho reach moved with pitch: {a} vs {b}");
+    }
+
+    /// And the count stays bounded through all of it — the spacing ladder scales with the reach, so
+    /// a 10× wider grid is not 10× the lines.
+    #[test]
+    fn the_count_stays_bounded_however_wide_it_opens() {
+        let mut st = FactoryState::default();
+        st.ortho = false;
+        for dist in [5.0_f32, 500.0, 20_000.0] {
+            for pitch in [0.0_f32, 0.3, 1.2, std::f32::consts::FRAC_PI_2] {
+                st.cam_dist = dist;
+                st.cam_pitch = pitch;
+                let segs = st.grid_lines().len() / 2;
+                assert!(
+                    (20..=260).contains(&segs),
+                    "dist {dist} pitch {pitch}: {segs} segments",
+                );
+            }
+        }
     }
 }
