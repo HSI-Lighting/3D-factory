@@ -16,6 +16,39 @@
 //! is being asked about. `U₀`, `E_min` and `E_max` depend on the exact layout, which is not in the
 //! report; they are printed for information and deliberately not asserted. Matching those would
 //! need the fixture coordinates.
+//!
+//! # THE VERDICT, now that the engine is independently verified
+//!
+//! When this was first written the +48 % on `E_avg` had two possible causes — the engine, or the
+//! scene — and no way to separate them. `identical_dialux.rs` has since settled that: on three
+//! fully specified rooms the engine matches DIALux to 0.5 % across 192 point-by-point comparisons,
+//! and the surface report matches the radiosity closed form. So the engine is not the cause, and
+//! what remains is the SCENE. Four things in this run say so directly:
+//!
+//!   * **Connected load matches exactly** (26.95 W/m²). The schedule and the floor area are right.
+//!   * **Direct-only comes out 12 % LOW** (1654 against 1886 lx). Our direct calculation is exact
+//!     on the verified rooms, so a shortfall here is the layout: 32 of these 46 fittings are track
+//!     spots, which are AIMED in reality and point straight down in this model, and their mounting
+//!     heights are inferred from a render.
+//!   * **The +48 % is entirely interreflection in an EMPTY BOX** at the report's own 0.70 / 0.82 /
+//!     0.72 reflectances. Our interreflection is verified correct, so an empty box with those
+//!     surfaces genuinely does produce that much light — which makes the empty box the error, not
+//!     the arithmetic.
+//!   * **Uniformity gives it away.** Ours is U₀ 0.59 against DIALux's 0.17. An empty box floods
+//!     every corner with indirect light; a real shop full of racks, stock and people does not. You
+//!     do not get 0.17 in an empty room at ρ = 0.8.
+//!
+//! The sensitivity sweep quantifies it: DIALux's answer corresponds to an EFFECTIVE reflectance of
+//! about 0.33 uniform, against stated surfaces of 0.70–0.82. Furniture, stock and people halving a
+//! retail space's effective reflectance is exactly what they do.
+//!
+//! So the gap is OBSTRUCTIONS, and that is the next thing the engine needs — not a correction
+//! factor. Every case validated so far is an empty rectangular box.
+//!
+//! The fixture coordinates are not recoverable from what is on hand: the report never states them,
+//! and `forSIMLUXtest.dxf` draws the fittings as line-work on `E-LITE-EQPM` (277 lines, 226 solids)
+//! plus six `TRACK_LIGHTS` polylines, rather than as blocks or circles carrying positions. Until a
+//! layout arrives this test can only say what it says here.
 
 use std::collections::HashMap;
 
