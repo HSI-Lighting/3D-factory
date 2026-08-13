@@ -95,6 +95,24 @@ pub struct SweepInput {
     pub drop_end: f32,
     /// Nominal distance between hanging points, metres.
     pub spacing: f32,
+
+    // ---- PHOTOMETRY — what makes this a light rather than a glowing shape --------------------
+    //
+    // Until now a curved luminaire was FURNITURE with an emissive lens: it looked lit and
+    // contributed nothing to any calculation. A linear fitting is specified by the two numbers
+    // below, so they are what the dialog asks for.
+    /// Connected load per metre of run, W/m. A typical architectural LED profile is 8–20.
+    pub watts_per_m: f32,
+    /// Luminous efficacy, lm/W — total flux is `path_len × watts_per_m × efficacy`.
+    pub efficacy_lm_per_w: f32,
+    /// Correlated colour temperature, kelvin.
+    ///
+    /// RECORDED AND REPORTED, NOT CALCULATED WITH. The engine is photometric, not spectral: it
+    /// carries lux and candela, which are already weighted by the eye's luminous efficiency
+    /// function, so 3000 K and 4000 K at the same lumens produce the same lux. CCT changes how a
+    /// room LOOKS and belongs on the schedule; it does not change the numbers, and treating it as
+    /// if it did would be inventing physics this engine does not do.
+    pub cct_k: u32,
 }
 
 impl Default for SweepInput {
@@ -108,6 +126,11 @@ impl Default for SweepInput {
             drop: 0.6,
             drop_end: 0.6,
             spacing: 1.0,
+            // A mid-range architectural LED profile: 12 W/m at 110 lm/W is about 1300 lm/m, and
+            // 3000 K is the usual specification for interiors.
+            watts_per_m: 12.0,
+            efficacy_lm_per_w: 110.0,
+            cct_k: 3000,
         }
     }
 }
@@ -593,6 +616,72 @@ const PART_ROD: u32 = 2;
 
 /// Build the fixture. Errors are ACTIONABLE (md C6): the self-intersection limit names both
 /// numbers and the fix.
+/// One emitting point on the run: where it is, and how much flux it carries.
+///
+/// A linear fitting is a LINE of light, and the lighting engine's luminaire is a point with a
+/// distribution — so the run is represented by points spaced along it, each carrying its share of
+/// the flux. That is the standard treatment and it converges quickly: at a spacing well under the
+/// mounting height the field is indistinguishable from a true line source, and the error only shows
+/// directly beneath, closer than the spacing itself.
+#[derive(Clone, Copy, Debug)]
+pub struct Emitter {
+    /// Position in the fixture's own frame — ceiling at z = 0, fixture hanging below.
+    pub pos: [f32; 3],
+    /// Luminous flux this point carries, lumens.
+    pub lumens: f64,
+    /// Its share of the connected load, watts.
+    pub watts: f64,
+}
+
+/// The run's emitting points, at roughly `spacing_m` apart along the path.
+///
+/// Total flux is `path_len × watts_per_m × efficacy`, split evenly — the run is uniform, so each
+/// point carries the same share. Returns empty when the path is unusable or the fitting is
+/// specified with no output, rather than a list of zero-flux lights that would look like a working
+/// installation contributing nothing.
+///
+/// The points sit on the LENS, not the path centreline: the path is the top of the profile (v = 0,
+/// where the droppers meet), and the light leaves from the diffuser below it. Emitting from the
+/// centreline would place every source `height` too high — small, but wrong in a way that grows as
+/// the fitting gets deeper.
+pub fn emitters(inp: &SweepInput, spacing_m: f32) -> Vec<Emitter> {
+    let (raw, closed) = sample_path(inp);
+    if raw.len() < 3 {
+        return Vec::new();
+    }
+    let (pts, total_len) = resample(&raw, closed);
+    if pts.is_empty() || !(total_len.is_finite() && total_len > 1e-4) {
+        return Vec::new();
+    }
+    let total_w = total_len as f64 * inp.watts_per_m.max(0.0) as f64;
+    let total_lm = total_w * inp.efficacy_lm_per_w.max(0.0) as f64;
+    if total_lm <= 0.0 {
+        return Vec::new();
+    }
+
+    let step = spacing_m.max(0.02);
+    let n = ((total_len / step).round() as usize).max(1);
+    let per_lm = total_lm / n as f64;
+    let per_w = total_w / n as f64;
+    // The lens hangs below the path by the profile height (its face is on the underside for every
+    // profile that points light into the room).
+    let drop_to_lens = inp.height;
+
+    (0..n)
+        .map(|k| {
+            // Sample the resampled path, which is already uniform in arc length.
+            let t = (k as f32 + 0.5) / n as f32;
+            let i = ((t * pts.len() as f32) as usize).min(pts.len() - 1);
+            let p = pts[i];
+            Emitter {
+                pos: [p.x, p.y, p.z - drop_to_lens],
+                lumens: per_lm,
+                watts: per_w,
+            }
+        })
+        .collect()
+}
+
 pub fn build(inp: &SweepInput) -> Result<(SweepMetrics, SolidMesh, Vec<Material>), String> {
     let profile = make_profile(inp.profile, inp.width, inp.height, inp.lens);
     let (raw, closed) = sample_path(inp);
@@ -905,5 +994,107 @@ mod tests {
         let (m, _, _) = build(&inp).unwrap();
         assert!(m.path_len > 4.0 && m.min_radius > 0.2, "len {} minR {}", m.path_len, m.min_radius);
         assert!(m.droppers >= 3);
+    }
+}
+
+/// A CURVED LUMINAIRE IS A LIGHT, not a glowing shape.
+///
+/// "they have a glow which is texture based and its not real light but just a furniture. i want to
+/// make it a real light we can use in calculation… the user can select its efficacy (watt/meter),
+/// and cct."
+#[cfg(test)]
+mod emitter_tests {
+    use super::*;
+
+    fn ring(r: f32) -> SweepInput {
+        SweepInput { path: PathKind::Ring { radius: r }, ..SweepInput::default() }
+    }
+
+    /// THE SPECIFICATION. Flux is `length × W/m × lm/W`, and the emitters must carry all of it —
+    /// splitting a run into points must not lose or invent light.
+    #[test]
+    fn the_run_carries_exactly_the_flux_it_was_specified() {
+        let mut inp = ring(1.0);
+        inp.watts_per_m = 10.0;
+        inp.efficacy_lm_per_w = 100.0;
+        let circumference = 2.0 * std::f32::consts::PI * 1.0;
+        let expect_lm = circumference as f64 * 10.0 * 100.0;
+
+        let em = emitters(&inp, 0.25);
+        assert!(!em.is_empty());
+        let got: f64 = em.iter().map(|e| e.lumens).sum();
+        assert!(
+            (got - expect_lm).abs() / expect_lm < 0.02,
+            "{got:.0} lm against the specified {expect_lm:.0}",
+        );
+        let watts: f64 = em.iter().map(|e| e.watts).sum();
+        assert!((watts - circumference as f64 * 10.0).abs() / (circumference as f64 * 10.0) < 0.02);
+    }
+
+    /// The total does not depend on how finely the run is divided — only the point count does.
+    /// A result that changed with the sampling would be a knob that silently rescales a design.
+    #[test]
+    fn the_total_is_independent_of_the_sampling() {
+        let inp = ring(1.5);
+        let coarse: f64 = emitters(&inp, 0.5).iter().map(|e| e.lumens).sum();
+        let fine: f64 = emitters(&inp, 0.05).iter().map(|e| e.lumens).sum();
+        assert!(
+            (coarse - fine).abs() / fine < 0.02,
+            "coarse {coarse:.0} lm vs fine {fine:.0} lm — the sampling is changing the answer",
+        );
+        assert!(emitters(&inp, 0.05).len() > emitters(&inp, 0.5).len(), "…but the counts differ");
+    }
+
+    /// Longer run, more light — at a fixed W/m that is the whole meaning of the unit.
+    #[test]
+    fn a_longer_run_emits_proportionally_more() {
+        let small: f64 = emitters(&ring(1.0), 0.2).iter().map(|e| e.lumens).sum();
+        let big: f64 = emitters(&ring(2.0), 0.2).iter().map(|e| e.lumens).sum();
+        assert!((big / small - 2.0).abs() < 0.05, "double the radius should double the flux");
+    }
+
+    /// A fitting specified with no output produces NO emitters — not a set of zero-flux lights,
+    /// which would look like a working installation contributing nothing.
+    #[test]
+    fn a_fitting_with_no_output_emits_nothing() {
+        let mut inp = ring(1.0);
+        inp.watts_per_m = 0.0;
+        assert!(emitters(&inp, 0.2).is_empty());
+        inp.watts_per_m = 12.0;
+        inp.efficacy_lm_per_w = 0.0;
+        assert!(emitters(&inp, 0.2).is_empty());
+    }
+
+    /// The emitters sit on the LENS, below the path. The path is the top of the profile — where
+    /// the droppers meet — so emitting from it would put every source a profile-height too high.
+    #[test]
+    fn the_light_leaves_from_the_lens_not_the_centreline() {
+        let mut inp = ring(1.0);
+        inp.height = 0.20;
+        let em = emitters(&inp, 0.25);
+        let (raw, closed) = sample_path(&inp);
+        let (pts, _) = resample(&raw, closed);
+        let path_z = pts[0].z;
+        for e in &em {
+            assert!(
+                (e.pos[2] - (path_z - 0.20)).abs() < 1e-3,
+                "emitter at z {} — expected {}, one profile height below the path",
+                e.pos[2],
+                path_z - 0.20,
+            );
+        }
+    }
+
+    /// They follow the path, so a ring of light is a ring: every emitter on the circle, none at
+    /// its centre.
+    #[test]
+    fn the_emitters_follow_the_path() {
+        let r = 1.2_f32;
+        let em = emitters(&ring(r), 0.15);
+        assert!(em.len() > 20);
+        for e in &em {
+            let d = (e.pos[0] * e.pos[0] + e.pos[1] * e.pos[1]).sqrt();
+            assert!((d - r).abs() < 0.05, "emitter {d:.3} m from centre, ring is {r}");
+        }
     }
 }
