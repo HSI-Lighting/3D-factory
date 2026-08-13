@@ -1,8 +1,59 @@
 SIMLUX -- Lighting Designer
 ==========================
 
-WHAT IS NEW IN THIS BUILD
--------------------------
+WHAT IS NEW IN BUILD 4
+----------------------
+Everything in this section is 3D Factory. The lighting engine is unchanged since build 3, whose
+notes follow below and still apply -- including the two that changed numbers you may have quoted.
+
+  * ROOMS ARE OBJECTS.
+    A Rooms menu lists them; each can be renamed, re-heighted, and given its own floor, ceiling and
+    wall thicknesses. Names appear on the plan. Openings are grouped under the room they are in.
+    Deleting a room fills the hole back in, so the space can be rebuilt. Room height is the CLEAR
+    height -- floor to ceiling -- and the app now says so where you type it.
+
+  * YOU CHOOSE WHERE A NEW OBJECT LANDS.
+    Everything used to appear at one fixed point with no say in it. Type `place` in the 3D command
+    line for:  Placement [Click/Centre/Origin/Offset] <click>:
+    "Click" is the default -- the object waits for a click in EITHER window before it settles, and
+    Esc leaves it where it is. "Offset" then asks for the distance:  X,Y,Z <200 mm, 0, 0>:  and
+    takes it with or without a leading @. Select something and choose "click" to re-place a piece
+    that is already built. Applies to 3D solids, furniture, apertures and architecture; a door or
+    window drawn on a wall is unaffected, since it already goes where you drew it.
+
+  * ONE COMMAND LINE, TWO WINDOWS.
+    Its title reads "3D Command" or "Command" depending on which window you last clicked, and it
+    says which unit new work is in and where objects will land. A 2D drawing command typed at the
+    3D prompt is refused with the reason, and vice versa -- click the window you want.
+
+  * THE 2D VIEWS ARE THE FACES YOU DREW ON.
+    Top/Front/Back/Left/Right are gone. The list is now Global view (the plan, showing the whole
+    model from above -- solids, rooms and furniture) plus every face you have drawn on. Faces are
+    named after the object they belong to, can be renamed to what the drawing is OF, and can be
+    deleted. Clicking a face again reopens the same plane with the same drawing on it -- and those
+    drawings now SURVIVE A SAVE, which they never did before.
+
+  * DRAW ON A FACE AND SEE THAT FACE.
+    The 2D underlay used to project the whole model onto the plane, which on one wall of a large
+    building is every wall and opening flattened on top of each other. It is now the face itself.
+    The picked face is outlined in yellow in the 3D view so you can see which one you are on.
+
+  * A GROUND GRID THAT IS ACTUALLY THERE.
+    It follows the camera and steps its spacing with the zoom, so it covers the view at any scale
+    instead of being a 20 m patch at the world origin. GRID3D toggles it, ORG shows the world-origin
+    axes, SNAP3D turns 3D corner-snapping on and off, and FURN still shows the 3D model on the plan.
+
+  * THE UNIT IS ASKED FOR ONCE.
+    Opening the 3D Factory on a new project asks which unit you are building in, so it cannot be
+    missed. Once answered it is not asked again, and the toolbar still changes it at any time.
+
+Known limitation: 3D snapping catches solid corners only -- not furniture -- and its 12-pixel
+aperture is measured on screen, so it reaches further in world terms the further you zoom out.
+SNAP3D turns it off.
+
+
+WHAT WAS NEW IN BUILD 3
+-----------------------
 Two of these change numbers you may already have quoted. Read those first.
 
   * ILLUMINANCE IS NOW MAINTAINED, NOT INITIAL.
