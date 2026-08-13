@@ -204,6 +204,45 @@ pub fn mesh_height(meshes: &[Mesh]) -> Option<f32> {
     (hi > lo).then(|| hi - lo)
 }
 
+/// Bring a fitting's emitting points down to at most [`MAX_EMITTERS_PER_FIXTURE`], merging
+/// consecutive runs of them into one point each.
+///
+/// WHY THIS EXISTS AT DERIVE TIME AND NOT ONLY AT BUILD TIME. The count is the path length divided
+/// by a spacing, and a curved light swept along a drawn 2D curve has no bound on its path: a ring
+/// of 30 m radius is 188 m around, which at 0.25 m is 753 point sources for ONE fitting. Every
+/// calculation point, every cylindrical sample and every surface sample then fires a shadow ray at
+/// each of them, and Calculate stops responding. Capping at build time fixes fittings built from
+/// now on; a project already carrying 753-point assets would still freeze on open, so the cap has
+/// to hold here, where the luminaire list is actually made.
+///
+/// FLUX IS CONSERVED EXACTLY — the merged point carries the SUM of the points it replaces, at their
+/// centroid. A longer run is therefore sampled more coarsely, not dimmed. What that costs is
+/// accuracy close to the fitting, within about one spacing of it, which is the same approximation
+/// the sampling was always making, just at a larger step.
+fn merge_emitters(src: &[crate::factory::FurnEmitter]) -> Vec<crate::factory::FurnEmitter> {
+    let max = crate::app::MAX_EMITTERS_PER_FIXTURE;
+    if src.len() <= max || src.is_empty() {
+        return src.to_vec();
+    }
+    let stride = src.len().div_ceil(max);
+    src.chunks(stride)
+        .map(|c| {
+            let n = c.len() as f32;
+            let mut pos = [0.0f32; 3];
+            for e in c {
+                for k in 0..3 {
+                    pos[k] += e.pos[k] / n;
+                }
+            }
+            crate::factory::FurnEmitter {
+                pos,
+                lumens: c.iter().map(|e| e.lumens).sum(),
+                watts: c.iter().map(|e| e.watts).sum(),
+            }
+        })
+        .collect()
+}
+
 /// Photometry for one emitting point of a diffused linear fitting, carrying `lumens` and `watts`.
 ///
 /// LAMBERTIAN, and that is a decision worth stating rather than a default that fell out. A curved
@@ -969,12 +1008,14 @@ impl LightState {
     /// Registers a synthesised photometry per asset as a side effect, which is why this takes
     /// `&mut self`.
     /// Count the model-carried luminaires for the status strip, without building them.
+    ///
+    /// The MERGED count, so the strip agrees with what Calculate will actually run.
     pub fn refresh_model_fixtures(&mut self, f: &crate::factory::FactoryState) {
         self.model_fixtures = f
             .furniture
             .iter()
             .filter_map(|inst| f.furniture_lib.get(inst.asset))
-            .map(|a| a.emitters.len())
+            .map(|a| merge_emitters(&a.emitters).len())
             .sum();
     }
 
@@ -989,15 +1030,16 @@ impl LightState {
             }
             let Some(m) = f.furniture_model_matrix(i) else { continue };
             let m = glam::Mat4::from_cols_array(&m);
+            let groups = merge_emitters(&asset.emitters);
             // One profile per ASSET: every point on a run carries the same share of its flux, so
             // they share a distribution, while two different fittings do not.
             let profile = format!("{} · {} K", asset.name, asset.cct_k);
             if !self.profiles.contains_key(&profile) {
-                let per_lm = asset.emitters[0].lumens;
-                let per_w = asset.emitters[0].watts;
+                let per_lm = groups[0].lumens;
+                let per_w = groups[0].watts;
                 self.profiles.insert(profile.clone(), lambertian_profile(&profile, per_lm, per_w));
             }
-            for e in &asset.emitters {
+            for e in &groups {
                 let p = m.transform_point3(glam::Vec3::from(e.pos));
                 out.push(Luminaire {
                     id,
@@ -3076,5 +3118,108 @@ mod the_project_file_describes_the_dialux_room {
                 None => println!("  E average {avg:>8.1} lx   (that report's summary is stale)"),
             }
         }
+    }
+}
+
+/// A FITTING CANNOT BE SAMPLED INTO UNBOUNDED WORK.
+///
+/// Reported as: "why is the app frozen? it froze after i gave calculate."
+///
+/// The emitter count is the PATH LENGTH divided by a spacing, and a curved light swept along a
+/// drawn 2D curve has no bound on its path. The user's own session snapshot carries a circle of
+/// 30 m radius — 188 m around, 753 point sources at 0.25 m for ONE fitting, and their scene had
+/// three. Every calculation point, every cylindrical sample and every surface sample then fires a
+/// shadow ray at each of ~2 250 luminaires, on the UI thread, with no progress and no way out.
+#[cfg(test)]
+mod a_fitting_is_bounded_work {
+    use super::*;
+    use crate::factory::FurnEmitter;
+
+    fn run(n: usize, lm_each: f64) -> Vec<FurnEmitter> {
+        (0..n)
+            .map(|i| FurnEmitter {
+                pos: [i as f32 * 0.25, 0.0, 0.0],
+                lumens: lm_each,
+                watts: lm_each / 100.0,
+            })
+            .collect()
+    }
+
+    /// A 188 m ring must not put 753 luminaires into the calculation.
+    #[test]
+    fn a_long_run_is_capped() {
+        let merged = merge_emitters(&run(753, 10.0));
+        assert!(
+            merged.len() <= crate::app::MAX_EMITTERS_PER_FIXTURE,
+            "753 points came through as {}",
+            merged.len(),
+        );
+        assert!(merged.len() > 1, "…but it is still sampled as a line, not collapsed to a point");
+    }
+
+    /// AND THE LIGHT IS ALL STILL THERE. Capping the count must not dim the fitting — the whole
+    /// difference between sampling a line more coarsely and throwing part of it away.
+    #[test]
+    fn the_flux_is_conserved_exactly() {
+        for n in [1usize, 119, 120, 121, 753, 2000] {
+            let src = run(n, 10.0);
+            let want: f64 = src.iter().map(|e| e.lumens).sum();
+            let got: f64 = merge_emitters(&src).iter().map(|e| e.lumens).sum();
+            assert!(
+                (got - want).abs() < 1e-9,
+                "n = {n}: {got} lm out of {want} lm — a cap that dims the fitting is not a cap",
+            );
+            let ww: f64 = src.iter().map(|e| e.watts).sum();
+            let gw: f64 = merge_emitters(&src).iter().map(|e| e.watts).sum();
+            assert!((gw - ww).abs() < 1e-9, "n = {n}: the connected load moved too");
+        }
+    }
+
+    /// The merged points must still lie ALONG the run, not pile up at one end — a merged point
+    /// sits at the centroid of the ones it replaces.
+    #[test]
+    fn the_merged_points_still_span_the_run() {
+        let src = run(753, 10.0);
+        let merged = merge_emitters(&src);
+        let (lo, hi) = (merged[0].pos[0], merged[merged.len() - 1].pos[0]);
+        let span = src[src.len() - 1].pos[0];
+        assert!(lo < span * 0.02, "the first merged point is not near the start: {lo}");
+        assert!(hi > span * 0.98, "the last is not near the end: {hi} of {span}");
+    }
+
+    /// A short run is left completely alone — no merging, no repositioning.
+    #[test]
+    fn a_short_run_is_untouched() {
+        let src = run(40, 10.0);
+        let merged = merge_emitters(&src);
+        assert_eq!(merged.len(), 40);
+        for (a, b) in src.iter().zip(&merged) {
+            assert_eq!(a.pos, b.pos);
+            assert_eq!(a.lumens, b.lumens);
+        }
+    }
+
+    /// The count on screen must be the count that will be CALCULATED, or the strip promises one
+    /// cost and Calculate pays another.
+    #[test]
+    fn the_strip_counts_what_calculate_will_run() {
+        let mut f = crate::factory::FactoryState::default();
+        let positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let idx = f.add_furniture_asset(
+            "Curved light 1".into(),
+            crate::mesh_io::ObjMesh { positions, normals: vec![[0.0, 0.0, 1.0]; 3], color: None, alpha: Vec::new() },
+        );
+        if let Some(a) = f.furniture_lib.get_mut(idx) {
+            a.cct_k = 3000;
+            a.emitters = run(753, 10.0);
+        }
+        f.place_mode = crate::factory::PlaceMode::Centre;
+        f.place_furniture(idx, glam::Vec3::new(0.0, 0.0, 0.0));
+
+        let mut s = LightState::new();
+        s.refresh_model_fixtures(&f);
+        let built = s.generated_luminaires(&f).len();
+        assert_eq!(s.model_fixtures, built, "the strip said {} and Calculate runs {built}", s.model_fixtures);
+        assert!(built <= crate::app::MAX_EMITTERS_PER_FIXTURE);
     }
 }

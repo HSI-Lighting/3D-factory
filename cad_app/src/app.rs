@@ -138,6 +138,26 @@ const PAIR_LIMIT: usize = 5_000_000;
 /// itself — at which distance a real diffuser is not a line source either.
 const EMITTER_SPACING_M: f32 = 0.25;
 
+/// The most emitting points one fitting may be sampled into.
+///
+/// WHY THERE HAS TO BE A CEILING. The spacing above is a length, so the count is the PATH LENGTH
+/// divided by it — and a curved light swept along a drawn 2D curve has no bound on its path. A ring
+/// of 30 m radius is 188 m around, which at 0.25 m is 753 point sources for ONE fitting; three of
+/// them is 2 259 luminaires, and every calculation point, every cylindrical sample and every
+/// surface sample then fires a shadow ray at each. That is the freeze the user hit on Calculate.
+///
+/// Capping the COUNT rather than the flux keeps the physics: the total is `path × W/m × efficacy`
+/// however many points it is divided into, so a longer run simply gets a coarser sampling of the
+/// same line. What that costs is accuracy CLOSE to the fitting, within about one spacing of it —
+/// so the spacing actually used is stated on the fixture rather than applied quietly.
+pub const MAX_EMITTERS_PER_FIXTURE: usize = 120;
+
+/// Emitter spacing for a run of `path_len` metres: [`EMITTER_SPACING_M`], opened up only as far as
+/// [`MAX_EMITTERS_PER_FIXTURE`] requires.
+fn emitter_spacing_for(path_len: f32) -> f32 {
+    (path_len / MAX_EMITTERS_PER_FIXTURE as f32).max(EMITTER_SPACING_M)
+}
+
 // ── Properties-panel chrome ────────────────────────────────────────────────
 // These now ALIAS the design-token module (`crate::theme`) — the single source
 // of truth (THEME_SYSTEM.md §5). Do not put raw hex here; change values in
@@ -25570,14 +25590,27 @@ impl CadApp {
                         // What it will contribute to the CALCULATION, quoted before the build so a
                         // fitting specified with no output is visible as such rather than silently
                         // producing a shape that lights nothing.
-                        let em = cad_solid::sweeplight::emitters(s, EMITTER_SPACING_M);
+                        let spacing = emitter_spacing_for(m.path_len);
+                        let em = cad_solid::sweeplight::emitters(s, spacing);
                         let lm: f64 = em.iter().map(|e| e.lumens).sum();
                         let w: f64 = em.iter().map(|e| e.watts).sum();
                         feedback(ui, if em.is_empty() {
                             "no light output — set a load and an efficacy above zero".to_string()
                         } else {
-                            format!("{lm:.0} lm · {w:.1} W · {} emitting points at {EMITTER_SPACING_M:.2} m", em.len())
+                            format!("{lm:.0} lm · {w:.1} W · {} emitting points at {spacing:.2} m", em.len())
                         });
+                        // Say it BEFORE the build when a long run has been sampled more coarsely
+                        // than the default, rather than letting the number appear in a report.
+                        if spacing > EMITTER_SPACING_M * 1.001 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "  ⓘ {:.0} m of run — sampled every {spacing:.2} m instead of {EMITTER_SPACING_M:.2} m to keep the calculation finite. Total output is unchanged; only the field within ~{spacing:.1} m of the fitting is coarser.",
+                                    m.path_len,
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        }
                         for w in m.warnings.iter().take(3) {
                             ui.label(egui::RichText::new(format!("  ⚠ {w}")).small().weak());
                         }
@@ -26244,7 +26277,8 @@ impl CadApp {
         let part_ids = mesh.face_ids.clone();
         // The emitting points, in the SAME frame the mesh arrives in — so they survive the
         // recentre/rebase the asset library applies to it, below.
-        let emitters = cad_solid::sweeplight::emitters(inp, EMITTER_SPACING_M);
+        let spacing = emitter_spacing_for(m.path_len);
+        let emitters = cad_solid::sweeplight::emitters(inp, spacing);
         let rebase = crate::factory::FactoryState::asset_rebase(&mesh.positions);
         let obj = crate::mesh_io::ObjMesh {
             positions: mesh.positions,
