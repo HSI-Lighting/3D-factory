@@ -6156,6 +6156,21 @@ impl CadApp {
                 inst.surface_texture.clear(); // …including any per-face textures
             }
             self.history.push("  furniture colour applied".into());
+        } else if !self.factory.selection.is_empty() && self.factory.paint_surface_mode {
+            // ONE FACE, NOT THE WHOLE SOLID — "the changes are still getting applied to [the]
+            // whole building".
+            //
+            // The guard used to live in the Textures MENU, so picking a colour there behaved while
+            // the properties panel's own swatches called straight through and coloured the entire
+            // extrusion — every wall of a building at once. A rule enforced at one of two entry
+            // points is not a rule; it belongs here, where every caller passes.
+            self.factory.last_pick_color = c;
+            self.factory.surface_tex_brush = None; // a colour supersedes any texture brush
+            self.factory.status =
+                "colour ready — click a face to paint just that surface (turn off \
+                 'Paint one face at a time' to cover the whole object)"
+                    .into();
+            self.history.push("  colour armed for per-face painting".into());
         } else if !self.factory.selection.is_empty() {
             self.snapshot_factory();
             for id in self.factory.selection.clone() {
@@ -53707,5 +53722,83 @@ mod materials_follow_the_surface {
         let b = app.factory.surface_texture.get(&k2).copied();
         assert!(a.is_some() && b.is_some());
         assert_ne!(a, b, "each face must own its material, or editing one changes the other");
+    }
+}
+
+/// A COLOUR SWATCH MUST NOT COLOUR THE WHOLE BUILDING EITHER.
+///
+/// Reported twice. The first fix guarded the TEXTURES MENU, so picking a colour there behaved —
+/// and the properties panel's own swatches called `apply_color_to_selection` straight through and
+/// coloured the entire extrusion, which for a building is every wall at once. A rule enforced at
+/// one of two entry points is not a rule.
+///
+/// The dump made it identifiable: the material read `used by 0 feat / 0 surf / 0 furn` while the
+/// building visibly changed, because that line counts TEXTURE users and what had changed was
+/// `feature_color`.
+#[cfg(test)]
+mod colour_targets_a_surface {
+    use super::*;
+
+    fn a_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(6.0, 0.0),
+                    glam::Vec2::new(6.0, 6.0),
+                    glam::Vec2::new(0.0, 6.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    /// THE REPORTED CASE, by the route that was missed: a swatch clicked with the solid selected.
+    #[test]
+    fn a_colour_does_not_repaint_the_whole_solid_by_default() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        app.factory.selection = vec![id];
+
+        app.apply_color_to_selection([0.9, 0.2, 0.2]);
+        assert!(
+            !app.factory.feature_color.contains_key(&id),
+            "the whole extrusion was coloured — every wall of the building at once",
+        );
+        assert_eq!(
+            app.factory.last_pick_color,
+            [0.9, 0.2, 0.2],
+            "it should be armed to paint the face clicked next",
+        );
+    }
+
+    /// A colour supersedes a texture brush, or the next click would apply the texture the user
+    /// just moved away from.
+    #[test]
+    fn choosing_a_colour_disarms_the_texture_brush() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        app.factory.selection = vec![id];
+        let t = app.factory.add_texture("t".into(), 2, 2, [10u8, 10, 10, 255].repeat(4));
+        app.factory.surface_tex_brush = Some(t);
+
+        app.apply_color_to_selection([0.1, 0.8, 0.3]);
+        assert_eq!(app.factory.surface_tex_brush, None);
+    }
+
+    /// …and with per-face off, the sweeping behaviour is still there deliberately.
+    #[test]
+    fn whole_object_colour_is_still_available_explicitly() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        app.factory.selection = vec![id];
+        app.factory.paint_surface_mode = false;
+
+        app.apply_color_to_selection([0.4, 0.5, 0.6]);
+        assert_eq!(app.factory.feature_color.get(&id).copied(), Some([0.4, 0.5, 0.6]));
     }
 }
