@@ -11784,46 +11784,53 @@ impl CadApp {
                         // A miss (clicked empty space / off the object) falls through to selection.
                     }
                 }
-                // PAINT SURFACE mode — a click colours the face under the cursor instead
-                // of selecting. One undo step per paint.
+                // NOTHING PAINTS UNLESS THE MATERIALS FACTORY IS OPEN.
+                //
+                // Reported as: "when i click on a surface it applied a texture to it, i cant select
+                // a building … a texture application should only work when materials factory window
+                // is open."
+                //
+                // Loading or pasting an image ARMS a face brush — `apply_texture_index_to_selection`
+                // does that whenever nothing is selected — and the brush used to be consumed by any
+                // click anywhere, with the Materials Factory shut and nothing on screen saying a
+                // brush was live. So every click painted a face instead of selecting the building,
+                // and the only way out was to notice a mode you were never told you were in.
+                //
+                // The rule is now the user's: the Materials Factory window is the paint tool. Shut,
+                // a click selects — always. Open, an ARMED brush paints the clicked face, and with
+                // no brush the click still selects normally AND opens that face's material, so the
+                // building stays selectable either way.
+                let brush_painted = if self.materials_open
+                    && self.factory.surface_tex_brush.is_some()
+                    && resp.clicked()
+                    && !return_after_click
+                    && !furn_handled
+                {
+                    let ti = self.factory.surface_tex_brush.unwrap_or_default();
+                    match resp.interact_pointer_pos() {
+                        Some(pos) => {
+                            self.snapshot_factory();
+                            let hit = self.factory.paint_surface_texture(pos, rect, &mvp, ti);
+                            if hit {
+                                self.factory.recompute();
+                                self.history.push("  surface textured".into());
+                            } else {
+                                self.undo_stack.pop(); // missed — no-op, drop the snapshot
+                                self.factory.status =
+                                    "click a surface to apply the material to it".into();
+                            }
+                            hit
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
                 if furn_handled {
                     // consumed by per-surface furniture handling above
                 }
-                // THE MATERIALS FACTORY FOLLOWS THE CLICK. With that window open, clicking a face
-                // is how you choose what to edit — "when the user clicks on a surface the materials
-                // factory will show every parameter related to it". A face with no material of its
-                // own is GIVEN one, so editing it cannot silently repaint every other face that
-                // happens to share the object's material.
-                else if self.materials_open && resp.clicked() && !return_after_click {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        if let Some(key) = self.factory.pick_surface_key(pos, rect, &mvp) {
-                            self.materials_select_surface(key);
-                        } else {
-                            self.factory.status =
-                                "Materials Factory: click a surface to edit its material".into();
-                        }
-                    }
-                }
-                else if self.factory.paint_surface_mode && resp.clicked() && !return_after_click {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        self.snapshot_factory();
-                        // A texture "brush" (set when a texture is applied in paint mode) paints
-                        // the clicked face with that image; otherwise the palette colour.
-                        let hit = if let Some(ti) = self.factory.surface_tex_brush {
-                            let ok = self.factory.paint_surface_texture(pos, rect, &mvp, ti);
-                            if ok { self.factory.recompute(); self.history.push("  surface textured".into()); }
-                            ok
-                        } else {
-                            let c = self.factory.last_pick_color;
-                            let ok = self.factory.paint_surface(pos, rect, &mvp, c);
-                            if ok { self.history.push("  surface painted".into()); }
-                            ok
-                        };
-                        if !hit {
-                            self.undo_stack.pop(); // missed — no-op, drop the snapshot
-                            self.factory.status = "click a surface to paint it".into();
-                        }
-                    }
+                else if brush_painted {
+                    // consumed by the Materials Factory's brush
                 }
                 else if resp.clicked() && !return_after_click {
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -11931,6 +11938,27 @@ impl CadApp {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                // …AND THE MATERIALS FACTORY FOLLOWS THE SAME CLICK.
+                //
+                // "When the user clicks on a surface the materials factory will show every
+                // parameter related to it." It runs AFTER the selection above rather than instead
+                // of it, which is the whole difference from the version that broke: choosing what
+                // to edit must not cost you the ability to select the building.
+                //
+                // The face is given its own material if it has none, so editing it cannot silently
+                // repaint every other face sharing the object's material.
+                if self.materials_open
+                    && resp.clicked()
+                    && !return_after_click
+                    && !furn_handled
+                    && !brush_painted
+                {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(key) = self.factory.pick_surface_key(pos, rect, &mvp) {
+                            self.materials_select_surface(key);
                         }
                     }
                 }
@@ -23071,6 +23099,16 @@ impl CadApp {
                     .show_inside(ui, |ui| self.mf_inspector(ui));
                 egui::CentralPanel::default().show_inside(ui, |ui| self.mf_canvas(ui));
             });
+        // CLOSING THE WINDOW PUTS THE BRUSH DOWN.
+        //
+        // An armed brush is a mode, and a mode with nothing on screen to show it is a trap: shut
+        // the window with a material still armed and the next click in the 3D view would have
+        // painted a face for reasons the user could not see. The click path already refuses to
+        // paint while the window is closed; disarming as well means reopening it does not resume a
+        // brush from ten minutes ago either.
+        if self.materials_open && !open {
+            self.factory.surface_tex_brush = None;
+        }
         self.materials_open = open;
 
         // Compile the edited graph back onto the material (live, uniform-driven — no re-upload).
@@ -23095,13 +23133,14 @@ impl CadApp {
                     self.materials.sel = Some(idx);
                     self.materials.sel_node = None;
                 }
-                if ui.small_button("🖼").on_hover_text("Paste an image from the clipboard as a new material").clicked() {
-                    // As a MATERIAL, with no selection required — the library is built here, and
-                    // "Apply to" below is what puts one on a surface.
+                if ui.small_button("🖼").on_hover_text("Paste an image from the clipboard as a new material — applied to the selection, or armed for the next face you click").clicked() {
+                    // Create it with NO selection required, then apply it the way every other
+                    // material is applied. Create-only was the other half of "i cant apply texture
+                    // from clip board": the material appeared in the library and went nowhere.
                     if let Some((idx, name, w, h)) = self.paste_texture_as_material() {
                         self.materials.sel = Some(idx);
                         self.materials.sel_node = None;
-                        self.factory.status = format!("material '{name}' ({w}×{h}) pasted from the clipboard");
+                        self.apply_texture_index_to_selection(idx, &name, w, h);
                     }
                 }
                 if ui.small_button("📂").on_hover_text("Load an image file (PNG/JPG) as a new material").clicked() {
@@ -53866,5 +53905,128 @@ mod materials_are_made_in_one_place {
             app.factory.status,
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// THE MATERIALS FACTORY WINDOW IS THE PAINT TOOL.
+///
+/// Reported as: "when i click on a surface it applied a texture to it, i cant select a building …
+/// and i cant apply texture from clip board. a texture application should only work when materials
+/// factory window is open."
+///
+/// Both halves came from the same place. Loading or pasting an image with nothing selected ARMS a
+/// face brush — `apply_texture_index_to_selection` does that deliberately, because a wall's two
+/// sides are different materials and a per-feature texture covers both. But the brush was then
+/// consumed by ANY click in the 3D view, with the window shut and nothing on screen saying a brush
+/// was live. Every click painted a face instead of selecting the building, and the way out was to
+/// notice a mode you had never been told you were in.
+///
+/// This asserts the source of the click path rather than the click itself, because the gesture
+/// needs a live egui pointer a unit test cannot supply. The shape is what matters: the paint is
+/// guarded by `materials_open`, and selection is not an `else` of it.
+#[cfg(test)]
+mod only_the_materials_factory_paints {
+    use super::*;
+
+    /// Isolate the 3D click handler: from the paint guard to the right-click handler after it.
+    fn click_path() -> &'static str {
+        let src = include_str!("app.rs");
+        let a = src.find("// NOTHING PAINTS UNLESS THE MATERIALS FACTORY IS OPEN.")
+            .expect("the guard's own comment marks the start of the click path");
+        let b = src[a..].find("// ---- RIGHT-CLICK").map(|e| a + e).expect("right-click handler follows");
+        &src[a..b]
+    }
+
+    /// The brush may only fire with the window open.
+    #[test]
+    fn painting_is_guarded_by_the_window_being_open() {
+        let body = click_path();
+        let paint = body.find("paint_surface_texture").expect("the brush paints somewhere here");
+        let guard = body.find("self.materials_open").expect("and it is guarded");
+        assert!(guard < paint, "the guard must come BEFORE the paint, not after it");
+    }
+
+    /// The old shape — `else if paint_surface_mode` — took the click away from selection whenever a
+    /// brush happened to be armed. Selection must not be an `else` of painting.
+    #[test]
+    fn selection_is_not_an_else_of_painting() {
+        let body = click_path();
+        for line in body.lines() {
+            let l = line.trim();
+            if l.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(l.contains("else if") && l.contains("paint_surface_mode")),
+                "a click must not be diverted into painting by a mode flag: {l}",
+            );
+        }
+        // And the colour brush is gone entirely — the palette that armed it no longer exists.
+        assert!(
+            !body.contains("last_pick_color"),
+            "clicking must not paint a colour: the palette that set it was removed",
+        );
+    }
+
+    /// Closing the window puts the brush down, so it cannot be resumed by a later click.
+    #[test]
+    fn closing_the_window_disarms_the_brush() {
+        let src = include_str!("app.rs");
+        let a = src.find("// CLOSING THE WINDOW PUTS THE BRUSH DOWN.").expect("it does");
+        let b = src[a..].find("self.materials_open = open;").map(|e| a + e).unwrap();
+        assert!(
+            src[a..b].contains("surface_tex_brush = None"),
+            "the brush must be cleared when the window closes",
+        );
+    }
+
+    /// Pasting from the clipboard must APPLY, not merely file the material in the library. The
+    /// other half of the report: "i cant apply texture from clip board".
+    #[test]
+    fn pasting_from_the_clipboard_applies_it() {
+        let src = include_str!("app.rs");
+        let a = src.find("Paste an image from the clipboard as a new material").expect("the button");
+        let b = a + src[a..].find("\n                }").expect("its handler ends");
+        let handler = &src[a..b];
+        assert!(handler.contains("paste_texture_as_material"), "it captures the clipboard");
+        assert!(
+            handler.contains("apply_texture_index_to_selection"),
+            "…and then applies it, rather than leaving it in the library going nowhere",
+        );
+    }
+
+    /// A material armed as a brush and then applied to a surface is what the whole flow is for —
+    /// this exercises the routing itself rather than the source.
+    #[test]
+    fn an_armed_material_lands_on_the_face_it_is_painted_onto() {
+        let mut app = CadApp::default();
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(4.0, 0.0),
+                    glam::Vec2::new(4.0, 4.0),
+                    glam::Vec2::new(0.0, 4.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+
+        let ti = app.factory.add_texture("t".into(), 2, 2, [255u8, 0, 0, 255].repeat(4));
+        app.factory.clear_selection();
+        app.apply_texture_index_to_selection(ti, "t", 2, 2);
+        assert_eq!(
+            app.factory.surface_tex_brush,
+            Some(ti),
+            "with nothing selected the material arms as a face brush: {}",
+            app.factory.status,
+        );
+        // …and nothing is painted until a face is actually clicked.
+        assert!(
+            app.factory.surface_texture.is_empty(),
+            "arming must not paint anything on its own",
+        );
     }
 }
