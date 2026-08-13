@@ -1002,6 +1002,8 @@ pub struct FactoryState {
     /// warning anybody.
     /// Draw the ground grid in the 3D view. Toggled by the GRID badge on the drafting bar.
     pub show_grid: bool,
+    /// Draw the three-axis gizmo at the world origin. OFF by default — see `origin_gizmo_lines`.
+    pub show_origin: bool,
     pub unit_asked: bool,
     /// The unit question is on screen right now.
     pub ask_unit: bool,
@@ -2960,6 +2962,7 @@ impl Default for FactoryState {
             // in it; the fix is not a better default position, it is being ASKED. Switch it to
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
             show_grid: true,
+            show_origin: false,
             unit_asked: false,
             ask_unit: false,
             place_mode: PlaceMode::Click,
@@ -8066,6 +8069,13 @@ impl FactoryState {
     /// and a wall from close up. RGB = XYZ, the convention every 3D tool uses.
     pub fn origin_gizmo_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
+        // OFF BY DEFAULT. Asked for, then "the origin gizmo needs to turned off" — it sits in the
+        // middle of the model and there is rarely anything at the world origin worth looking at.
+        // Kept behind a toggle rather than deleted: it is the reference `origin` and `@X,Y,Z`
+        // measure from, so it earns its place the moment those are being used.
+        if !self.show_origin {
+            return out;
+        }
         // A fixed fraction of the view, so it reads the same at 2 m and at 2 km.
         let len = (self.cam_dist * 0.12).clamp(0.05, 1.0e5);
         const RED: [f32; 3] = [0.95, 0.25, 0.25]; // +X
@@ -8091,8 +8101,8 @@ impl FactoryState {
     pub fn overlay_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
         out.extend(self.grid_lines());
-        // ALWAYS, even with the grid off: the grid is a convenience, the origin is a fact about the
-        // model that the placement modes are measured from.
+        // Each behind its own switch — the grid is a working surface, the origin is a reference
+        // point, and wanting one is no reason to be given the other.
         out.extend(self.origin_gizmo_lines());
         for id in &self.selection {
             if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {

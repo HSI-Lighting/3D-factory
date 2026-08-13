@@ -1357,6 +1357,8 @@ pub struct CadApp {
     /// The `Placement [Click/Centre/Origin/Offset] <x>:` prompt is open and the next line is its
     /// answer. Replaces the toolbar dropdown that used to ask this.
     place_prompt_open: bool,
+    /// The `Distance from origin  X,Y,Z <…>:` follow-up is open and the next line is a coordinate.
+    place_coord_prompt: bool,
     /// Grip drag — Some(GripDrag) while the user is dragging a grip
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
@@ -3534,6 +3536,7 @@ impl Default for CadApp {
             focus_at_frame_start: None,
             empty_enter_count_in_select: 0,
             place_prompt_open: false,
+            place_coord_prompt: false,
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
             screen_stats_open:   false,
@@ -4094,21 +4097,44 @@ impl CadApp {
             if m != PlaceMode::Click {
                 self.factory.awaiting_place = None;
             }
-            let msg = if m == PlaceMode::Offset {
-                let u = self.factory.units;
-                let o = self.factory.place_offset;
-                format!(
-                    "Offset from origin — type @X,Y,Z  (now {}, {}, {})",
-                    crate::factory::length_str(u, o[0]),
-                    crate::factory::length_str(u, o[1]),
-                    crate::factory::length_str(u, o[2]),
-                )
-            } else {
-                m.hint().to_string()
-            };
+            // OFFSET ASKS FOR THE COORDINATE, THERE AND THEN.
+            //
+            // Reported as: "once a co ordinate is chosen it keeps on placing on the same co
+            // ordinate. why is that[?] the user need to be able to select a new coordinate."
+            //
+            // It did keep the old one — correctly, by its own rules — because choosing `offset`
+            // only set the MODE and left a note saying to type `@X,Y,Z` as a separate line. The
+            // session shows exactly that: `place` → `offset`, twice, with no `@` after either, and
+            // every object landing on the coordinate from twenty minutes earlier. Choosing the mode
+            // and choosing the point are one intention, so they are now one exchange.
+            if m == PlaceMode::Offset {
+                self.set_place_coord_prompt();
+                return true;
+            }
+            let msg = m.hint().to_string();
             self.history.push(format!("  {msg}"));
             self.factory.status = msg;
             self.clear_prompt();
+            return true;
+        }
+        // The answer to that coordinate question. `@` is optional here — it is already unambiguous
+        // once the app has asked for a coordinate, and insisting on punctuation at a prompt that
+        // says "X,Y,Z" is a way of rejecting the right answer.
+        if self.place_coord_prompt && !lc.is_empty() {
+            let with_at = if lc.starts_with('@') { lc.clone() } else { format!("@{lc}") };
+            let Some(o) = Self::parse_at_coords(&with_at, self.factory.units) else {
+                self.history.push(format!("  '{lc}' is not a coordinate"));
+                self.set_place_coord_prompt();
+                return true;
+            };
+            self.factory.place_offset = o;
+            self.factory.place_mode = PlaceMode::Offset;
+            self.factory.awaiting_place = None;
+            self.place_coord_prompt = false;
+            self.clear_prompt();
+            let msg = self.place_offset_summary();
+            self.history.push(format!("  {msg}"));
+            self.factory.status = msg;
             return true;
         }
         // An unrecognised reply to an open prompt is a typo, not a new command — say what was
@@ -4124,6 +4150,32 @@ impl CadApp {
             return true;
         }
         false
+    }
+
+    /// "New objects land at 900 mm, 0 mm, 0 mm from the origin" — in the working unit.
+    fn place_offset_summary(&self) -> String {
+        let u = self.factory.units;
+        let o = self.factory.place_offset;
+        format!(
+            "New objects land at {}, {}, {} from the origin",
+            crate::factory::length_str(u, o[0]),
+            crate::factory::length_str(u, o[1]),
+            crate::factory::length_str(u, o[2]),
+        )
+    }
+
+    /// Ask for the offset coordinate, with the current one as the `<default>` bare Enter keeps.
+    fn set_place_coord_prompt(&mut self) {
+        self.place_prompt_open = false;
+        self.place_coord_prompt = true;
+        let u = self.factory.units;
+        let o = self.factory.place_offset;
+        self.current_prompt = format!(
+            "Distance from origin  X,Y,Z <{}, {}, {}>:",
+            crate::factory::length_str(u, o[0]),
+            crate::factory::length_str(u, o[1]),
+            crate::factory::length_str(u, o[2]),
+        );
     }
 
     /// Ask the placement question, AutoCAD-style: the options in brackets, the current setting as
@@ -36986,8 +37038,9 @@ impl eframe::App for CadApp {
             // The placement question, abandoned. Without this the prompt vanished but
             // `place_prompt_open` stayed true, and the next word typed was eaten as a bad answer
             // to a question no longer on screen.
-            if self.place_prompt_open {
+            if self.place_prompt_open || self.place_coord_prompt {
                 self.place_prompt_open = false;
+                self.place_coord_prompt = false;
                 self.clear_prompt();
                 self.history.push("  place: cancelled".into());
                 return;
@@ -37375,9 +37428,31 @@ impl eframe::App for CadApp {
         // The placement prompt's `<default>`. AutoCAD's bare Enter accepts what is in the angle
         // brackets, and the command-line TextEdit never forwards an empty line to the dispatcher —
         // so the default has to be taken here or the brackets would be a lie.
+        if trigger && cmd_is_empty && self.place_coord_prompt {
+            // Bare Enter keeps the coordinate already set — the <default> in the angle brackets.
+            self.place_coord_prompt = false;
+            let msg = self.place_offset_summary();
+            self.history.push(format!("  {msg}"));
+            self.factory.status = msg;
+            self.clear_prompt();
+            if space_now {
+                self.cmd.clear();
+            }
+            return;
+        }
         if trigger && cmd_is_empty && self.place_prompt_open {
             self.place_prompt_open = false;
             let m = self.factory.place_mode;
+            // Enter on <offset> goes straight to the coordinate question, exactly as typing the
+            // word does. A default that takes a different route from the answer it stands for is a
+            // trap, not a shortcut.
+            if m == crate::factory::PlaceMode::Offset {
+                self.set_place_coord_prompt();
+                if space_now {
+                    self.cmd.clear();
+                }
+                return;
+            }
             self.history.push(format!("  {}", m.label()));
             self.factory.status = m.hint().into();
             self.clear_prompt();
@@ -39013,8 +39088,13 @@ impl eframe::App for CadApp {
                         // routinely closed to make room for the canvas.
                         let has_model = !self.factory.model.features.is_empty()
                             || !self.factory.furniture.is_empty();
-                        if has_model && drafting_badge(ui, "3D", self.factory.show_furniture_outlines_2d,
-                            "Show the 3D model on the 2D plan — buildings, rooms, furniture, \
+                        // STILL CALLED FURN. It was briefly renamed "3D" when it grew from
+                        // furniture-only to the whole model, and the rename cost more than the
+                        // accuracy gained — "what happened to furn where we could turn on or off to
+                        // see the furnitures in 2d". The name people look for wins; the tooltip
+                        // carries what it actually does now.
+                        if has_model && drafting_badge(ui, "FURN", self.factory.show_furniture_outlines_2d,
+                            "Show the 3D model on the 2D plan — furniture, buildings, rooms, \
                              apertures and architecture, as footprints you can trace and snap to.")
                         {
                             self.factory.show_furniture_outlines_2d = !self.factory.show_furniture_outlines_2d;
@@ -39028,6 +39108,15 @@ impl eframe::App for CadApp {
                                  spacing with the zoom, so it covers the whole view at any scale.")
                         {
                             self.factory.show_grid = !self.factory.show_grid;
+                        }
+                        // The world-origin axes. Off by default and separate from the grid: one is
+                        // a working surface, the other a reference point.
+                        if self.factory.open
+                            && drafting_badge(ui, "ORG", self.factory.show_origin,
+                                "Three-axis gizmo at the world origin (0, 0, 0) — the point the \
+                                 `origin` and `@X,Y,Z` placement modes measure from.")
+                        {
+                            self.factory.show_origin = !self.factory.show_origin;
                         }
                         ui.separator();
                         // Snap badges — click any letter to toggle.
@@ -43805,7 +43894,8 @@ impl CadApp {
             // Worse than invisible: `place_prompt_open` stayed true with nothing on screen saying
             // so, and the next word typed was eaten as a bad answer to a question the user could
             // not see.
-            || self.place_prompt_open;
+            || self.place_prompt_open
+            || self.place_coord_prompt;
         if !any_edit_active && !self.current_prompt.is_empty() {
             self.clear_prompt();
         }
@@ -52311,14 +52401,88 @@ mod command_target {
         assert!(last.contains("not one of the options"), "got {last:?}");
     }
 
-    /// Choosing Offset points at the coordinate, because that is the next thing to type.
+    /// CHOOSING OFFSET ASKS FOR THE COORDINATE, THERE AND THEN.
+    ///
+    /// Reported as: "once a co ordinate is chosen it keeps on placing on the same co ordinate. why
+    /// is that[?] the user need to be able to select a new coordinate." It did keep the old one,
+    /// correctly by its own rules — choosing `offset` set only the MODE and left a note saying to
+    /// type `@X,Y,Z` on a separate line. The session shows `place` → `offset` twice with no `@`
+    /// after either, and every object landing on a coordinate set twenty minutes earlier.
     #[test]
     fn choosing_offset_asks_for_the_coordinate() {
         let mut app = app_in_3d();
         app.run_command("place");
         app.run_command("offset");
-        assert_eq!(app.factory.place_mode, crate::factory::PlaceMode::Offset);
-        assert!(app.factory.status.contains("@X,Y,Z"), "got {:?}", app.factory.status);
+        assert!(app.place_coord_prompt, "it must ask for the coordinate");
+        assert!(
+            app.current_prompt.contains("Distance from origin"),
+            "got {:?}",
+            app.current_prompt,
+        );
+    }
+
+    /// …and the answer is taken WITHOUT the `@`. The prompt says "X,Y,Z"; insisting on punctuation
+    /// is a way of rejecting the right answer.
+    #[test]
+    fn the_coordinate_answer_needs_no_at_sign() {
+        let mut app = app_in_3d();
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.run_command("place");
+        app.run_command("offset");
+        app.run_command("200,300,500");
+        assert!(!app.place_coord_prompt, "the question is answered");
+        let o = app.factory.place_offset;
+        assert!((o[0] - 0.2).abs() < 1e-6 && (o[1] - 0.3).abs() < 1e-6 && (o[2] - 0.5).abs() < 1e-6,
+            "got {o:?}");
+        // …and `@` is still fine, because that is what was taught first.
+        app.run_command("place");
+        app.run_command("offset");
+        app.run_command("@1000,0,0");
+        assert!((app.factory.place_offset[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// A SECOND coordinate replaces the first. This is the whole complaint.
+    #[test]
+    fn a_new_coordinate_replaces_the_old_one() {
+        let mut app = app_in_3d();
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        app.run_command("@1,2,3");
+        assert!((app.factory.place_offset[0] - 1.0).abs() < 1e-6);
+        app.run_command("place");
+        app.run_command("offset");
+        app.run_command("7,8,9");
+        let o = app.factory.place_offset;
+        assert!(
+            (o[0] - 7.0).abs() < 1e-6 && (o[1] - 8.0).abs() < 1e-6 && (o[2] - 9.0).abs() < 1e-6,
+            "the old coordinate was kept: {o:?}",
+        );
+    }
+
+    /// Bare Enter at the coordinate prompt keeps what is there — the <default> in the brackets.
+    #[test]
+    fn the_coordinate_prompt_has_a_default() {
+        let mut app = app_in_3d();
+        app.factory.units =
+            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        app.run_command("@4,5,6");
+        app.run_command("place");
+        app.run_command("offset");
+        assert!(app.current_prompt.contains('4'), "the default must be visible: {:?}", app.current_prompt);
+    }
+
+    /// Nonsense keeps asking rather than falling through as a command — the same rule the mode
+    /// question follows.
+    #[test]
+    fn a_bad_coordinate_keeps_asking() {
+        let mut app = app_in_3d();
+        app.run_command("place");
+        app.run_command("offset");
+        app.run_command("over there");
+        assert!(app.place_coord_prompt, "still asking");
+        let last = app.history.last().cloned().unwrap_or_default();
+        assert!(last.contains("not a coordinate"), "got {last:?}");
     }
 }
 
@@ -52871,7 +53035,8 @@ mod origin_and_prompt {
     /// from the origin, and `@X,Y,Z` is relative to it.
     #[test]
     fn the_origin_has_three_coloured_axes() {
-        let st = crate::factory::FactoryState::default();
+        let mut st = crate::factory::FactoryState::default();
+        st.show_origin = true;
         let g = st.origin_gizmo_lines();
         assert!(!g.is_empty(), "the origin must be visible");
 
@@ -52913,6 +53078,7 @@ mod origin_and_prompt {
         let reach = |st: &crate::factory::FactoryState| {
             st.origin_gizmo_lines().iter().fold(0.0_f32, |a, v| a.max(v.x.max(v.y).max(v.z)))
         };
+        st.show_origin = true;
         st.cam_dist = 10.0;
         let near = reach(&st);
         st.cam_dist = 1000.0;
@@ -52920,14 +53086,31 @@ mod origin_and_prompt {
         assert!(far > near * 10.0, "near {near:.2} m, far {far:.2} m — it did not scale");
     }
 
-    /// It survives the grid being switched off — the grid is a convenience, the origin is a fact
-    /// about the model that the placement modes are measured from.
+    /// OFF by default. Asked for, then "the origin gizmo needs to turned off" — it sits in the
+    /// middle of the model and there is rarely anything at the world origin worth looking at.
     #[test]
-    fn the_origin_survives_the_grid_being_turned_off() {
+    fn the_origin_is_off_until_asked_for() {
+        let mut st = crate::factory::FactoryState::default();
+        assert!(!st.show_origin, "off by default");
+        assert!(st.origin_gizmo_lines().is_empty());
+        st.show_origin = true;
+        assert!(!st.origin_gizmo_lines().is_empty(), "…and the toggle brings it back");
+    }
+
+    /// The two switches are independent: the grid is a working surface, the origin a reference
+    /// point, and wanting one is no reason to be handed the other.
+    #[test]
+    fn the_grid_and_the_origin_switch_separately() {
         let mut st = crate::factory::FactoryState::default();
         st.show_grid = false;
+        st.show_origin = true;
         assert!(st.grid_lines().is_empty());
-        assert!(!st.overlay_lines().is_empty(), "the origin must still be drawn");
+        assert!(!st.origin_gizmo_lines().is_empty());
+
+        st.show_grid = true;
+        st.show_origin = false;
+        assert!(!st.grid_lines().is_empty());
+        assert!(st.origin_gizmo_lines().is_empty());
     }
 
     // ---- the prompt that was being wiped -------------------------------------------------
