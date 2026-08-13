@@ -1190,6 +1190,16 @@ pub struct FactoryState {
     pub surface_color: std::collections::HashMap<SurfaceKey, [f32; 3]>,
     /// When on, clicking a face in the 3D view PAINTS that surface with the palette colour
     /// instead of selecting the object.
+    ///
+    /// ON BY DEFAULT. Reported as: "when i try to apply a texture of colour to wall of a room it
+    /// applied for the entire building except the floor." That is exactly what per-FEATURE paint
+    /// does — a building is ONE extrusion, so every wall of it is one feature, and only the floor
+    /// slab (a separate feature) escaped. Per-face painting was already implemented and sat behind
+    /// a checkbox nobody had reason to find.
+    ///
+    /// A surface is what a person means by "this wall". Painting the whole solid is still there and
+    /// is now the explicit act, which is the right way round: the narrow, obvious result by
+    /// default; the sweeping one on request.
     pub paint_surface_mode: bool,
     /// Last colour chosen in the Textures picker, so it persists across opens of the menu.
     pub last_pick_color: [f32; 3],
@@ -3028,7 +3038,7 @@ impl Default for FactoryState {
             clay_mode: false,
             feature_color: std::collections::HashMap::new(),
             surface_color: std::collections::HashMap::new(),
-            paint_surface_mode: false,
+            paint_surface_mode: true,
             last_pick_color: [0.8, 0.8, 0.82],
             textures: Vec::new(),
             feature_texture: std::collections::HashMap::new(),

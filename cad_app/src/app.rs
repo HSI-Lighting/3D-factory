@@ -5822,10 +5822,18 @@ impl CadApp {
 
     fn factory_textures_menu(&mut self, ui: &mut egui::Ui) {
         // Paint mode: click individual faces instead of colouring the whole object.
+        // WHICH SURFACE gets painted. Per-face is now the default: a building is one extrusion, so
+        // per-FEATURE paint puts a wall colour on every wall in the model, which is what
+        // "it applied for the entire building except the floor" was. The floor escaped only
+        // because a slab is a separate feature.
         let mut paint = self.factory.paint_surface_mode;
         if ui
-            .checkbox(&mut paint, "  Paint single surface (click faces)")
-            .on_hover_text("On: pick a palette colour, then click any face to paint just that surface.")
+            .checkbox(&mut paint, "  Paint one face at a time")
+            .on_hover_text(
+                "On (default): pick a colour or texture, then click a face to paint JUST that \
+                 surface.\nOff: the paint covers every face of the selected object — a whole \
+                 building at once, if the building is one solid.",
+            )
             .changed()
         {
             self.factory.paint_surface_mode = paint;
@@ -50360,6 +50368,10 @@ mod factory_texture_tests {
             },
         );
         app.factory.place_furniture(idx, glam::Vec3::new(0.0, 0.0, 0.0)); // selects it
+        // These tests are about WHOLE-OBJECT paint, which is now the explicit mode rather than
+        // the default: per-face is on by default so that colouring a wall does not colour every
+        // wall in the building. Saying so keeps their subject unchanged.
+        app.factory.paint_surface_mode = false;
         (app, idx)
     }
 
@@ -50396,6 +50408,7 @@ mod factory_texture_tests {
     #[test]
     fn colour_replaces_a_feature_texture() {
         let mut app = CadApp::default();
+        app.factory.paint_surface_mode = false; // this test is about whole-object paint
         app.factory.add_box();
         app.factory.recompute();
         let id = app.factory.model.features[0].id;
@@ -53447,5 +53460,87 @@ mod snap_and_replace {
             st.furniture[0].pos[2],
         );
         assert!((st.furniture[0].pos[0] - 4.0).abs() < 1e-6, "…but it did move in plan");
+    }
+}
+
+/// PAINTING A WALL MUST NOT PAINT THE BUILDING.
+///
+/// Reported as: "when i try to apply a texture of colour to wall of a room it applied for the
+/// entire building except the floor." A building is ONE extrusion, so a per-FEATURE paint puts the
+/// colour on every wall of it at once; the floor escaped only because a slab is a separate feature.
+///
+/// Per-face painting already existed — it sat behind a checkbox that defaulted OFF, so nobody had
+/// reason to find it. The surface is what a person means by "this wall", so that is the default
+/// now, and whole-object paint is the explicit act.
+#[cfg(test)]
+mod paint_targets_a_surface {
+    use super::*;
+
+    fn a_building() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.building_height = 3.0;
+        app.factory
+            .add_building_outline(
+                &vec![
+                    glam::Vec2::new(0.0, 0.0),
+                    glam::Vec2::new(6.0, 0.0),
+                    glam::Vec2::new(6.0, 6.0),
+                    glam::Vec2::new(0.0, 6.0),
+                    glam::Vec2::new(0.0, 0.0),
+                ],
+                3.0,
+            )
+            .expect("building");
+        app.factory.recompute();
+        app
+    }
+
+    /// THE DEFAULT. Out of the box, paint lands on one face.
+    #[test]
+    fn per_face_painting_is_the_default() {
+        let app = CadApp::default();
+        assert!(
+            app.factory.paint_surface_mode,
+            "a wall colour that covers the whole building is the bug this default prevents",
+        );
+    }
+
+    /// Applying a texture with an object selected must NOT bind it to the feature — that is the
+    /// reported behaviour. It arms the face brush instead, and the next click paints one surface.
+    #[test]
+    fn a_texture_does_not_cover_the_whole_solid_by_default() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        app.factory.selection = vec![id];
+        let t = app.factory.add_texture("t".into(), 2, 2, [200u8, 30, 30, 255].repeat(4));
+
+        app.apply_texture_index_to_selection(t, "t", 2, 2);
+        assert!(
+            !app.factory.feature_texture.contains_key(&id),
+            "the whole extrusion was textured — every wall of the building at once",
+        );
+        assert_eq!(
+            app.factory.surface_tex_brush,
+            Some(t),
+            "it should be armed to paint the face that is clicked next",
+        );
+    }
+
+    /// …and turning the mode off still gives the sweeping behaviour, deliberately, for when that
+    /// IS what is wanted.
+    #[test]
+    fn whole_object_paint_is_still_available_explicitly() {
+        let mut app = a_building();
+        let id = app.factory.model.features[0].id;
+        app.factory.selection = vec![id];
+        app.factory.paint_surface_mode = false;
+        let t = app.factory.add_texture("t".into(), 2, 2, [200u8, 30, 30, 255].repeat(4));
+
+        app.apply_texture_index_to_selection(t, "t", 2, 2);
+        assert_eq!(
+            app.factory.feature_texture.get(&id).copied(),
+            Some(t),
+            "with per-face off, the whole solid should take it",
+        );
     }
 }
