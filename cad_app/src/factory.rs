@@ -872,6 +872,17 @@ pub fn length_decimals(u: cad_kernel::DocUnits) -> usize {
 /// would refuse every legal millimetre entry, and a drag speed left at `0.01` would move a
 /// millimetre field by a hundredth of a millimetre per pixel — which reads as a field that has
 /// stopped responding.
+///
+/// `update_while_editing(false)` is on every numeric field in the app, and it is not a detail.
+/// Reported as: "when entering the parameters for ceiling, it doesnt allow to delete the already
+/// existing values — when the user enters a new value it automatically has a 2 already there."
+///
+/// egui's `DragValue` clamps to its range on EVERY KEYSTROKE by default. A ceiling slab's minimum
+/// is 0.02 m, which in millimetres is 20 — so clearing the box and typing anything smaller snapped
+/// the text to "20" mid-word, and the digits that followed landed after a "2" the user never typed.
+/// The range is right; enforcing it on half-finished input is not. With the flag off, the text is
+/// left alone while typing and the value commits — still clamped — on Enter or on leaving the
+/// field. 105 fields carried the same behaviour; all of them are fixed, not just the reported one.
 pub fn length_ui(
     ui: &mut egui::Ui,
     u: cad_kernel::DocUnits,
@@ -882,7 +893,7 @@ pub fn length_ui(
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
-        egui::DragValue::new(&mut shown)
+        egui::DragValue::new(&mut shown).update_while_editing(false)
             .speed(u.from_metres(speed_m))
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
@@ -906,7 +917,7 @@ pub fn length_ui_pre(
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
-        egui::DragValue::new(&mut shown)
+        egui::DragValue::new(&mut shown).update_while_editing(false)
             .speed(u.from_metres(speed_m))
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
@@ -1397,7 +1408,7 @@ pub fn primitive_dim_fields(
     fn u(ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32) -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            ui.add(egui::DragValue::new(v).speed(1.0).range(min..=512)).changed()
+            ui.add(egui::DragValue::new(v).update_while_editing(false).speed(1.0).range(min..=512)).changed()
         })
         .inner
     }
@@ -4055,17 +4066,32 @@ impl FactoryState {
     ///
     /// Unlike [`Self::group_selection`] this does not touch the selection — it is for the BUILD
     /// paths, which know what they just made and must not disturb what the user had picked.
-    /// Ids already in a group keep theirs: a room carved out of a building must not silently
-    /// pull the building into the room's group.
+    ///
+    /// MERGES rather than skips. A building with two rooms carved out of it calls this twice, and
+    /// the second call shares the shell with the first; making a fresh group for it would leave
+    /// one building in two groups, so moving the shell would take room A along and abandon room B.
+    /// Any group the ids already belong to is absorbed into one.
     pub fn group_features(&mut self, ids: &[u32]) {
-        let fresh: Vec<u32> =
-            ids.iter().copied().filter(|id| !self.feature_group.contains_key(id)).collect();
-        if fresh.len() < 2 {
+        if ids.len() < 2 {
             return;
         }
-        let gid = self.next_group_id;
-        self.next_group_id += 1;
-        for id in fresh {
+        let existing: Vec<u32> =
+            ids.iter().filter_map(|id| self.feature_group.get(id).copied()).collect();
+        let gid = existing.first().copied().unwrap_or_else(|| {
+            let g = self.next_group_id;
+            self.next_group_id += 1;
+            g
+        });
+        let absorb: std::collections::HashSet<u32> =
+            existing.into_iter().filter(|g| *g != gid).collect();
+        if !absorb.is_empty() {
+            for g in self.feature_group.values_mut() {
+                if absorb.contains(g) {
+                    *g = gid;
+                }
+            }
+        }
+        for &id in ids {
             self.feature_group.insert(id, gid);
         }
     }
@@ -5349,7 +5375,14 @@ impl FactoryState {
     /// room footprint. The carve is the room footprint extruded from `base` up through the
     /// building's top, subtracted (`BoolOp::Difference`). The Difference feature is placed
     /// IMMEDIATELY AFTER the building so the group-based `eval` applies it to that body.
-    fn carve_interior_from_building(&mut self, footprint: &[Vec2], base: f32) -> Option<u32> {
+    /// Returns `(void feature id, the BUILDING it was cut from)`.
+    ///
+    /// The building's id comes back because a room carved out of a building is PART of that
+    /// building: the void, the slabs, and the mass around them are one object, and a Move that
+    /// takes only one of them is exactly "when i move a building its floor and ceiling stay in
+    /// place". The enclosing solid is identified here and nowhere else, so this is the only place
+    /// that can say which one it was.
+    fn carve_interior_from_building(&mut self, footprint: &[Vec2], base: f32) -> Option<(u32, u32)> {
         // Find the enclosing building and its feature index + top height.
         let mut target: Option<(usize, f32)> = None;
         for (i, f) in self.model.features.iter().enumerate() {
@@ -5367,6 +5400,7 @@ impl FactoryState {
             }
         }
         let Some((idx, top)) = target else { return None };
+        let building_id = self.model.features[idx].id;
         // Build the void, then move it to sit right after the building it cuts.
         let Ok((profile, centre, w, d)) = self.model.add_profile(footprint) else {
             return None;
@@ -5387,7 +5421,7 @@ impl FactoryState {
             self.model.features.insert(idx + 1, void);
         }
         self.dirty = true;
-        void_id
+        void_id.map(|v| (v, building_id))
     }
 
     pub fn add_room(&mut self, footprint: &[Vec2]) -> Result<u32, RoomError> {
@@ -5412,7 +5446,10 @@ impl FactoryState {
         // solid cap. Then hiding the room's ceiling reveals the floor while the surrounding
         // wall — its own solid, with its own top — stays. Without this, a solid building
         // over a room can never be "seen into".
-        let carve = self.carve_interior_from_building(footprint, base);
+        let (carve, carved_from) = match self.carve_interior_from_building(footprint, base) {
+            Some((void, building)) => (Some(void), Some(building)),
+            None => (None, None),
+        };
 
         // Distinct default colours (≈ real reflectances) so floor / walls / ceiling are
         // TELLABLE APART from any angle — including straight down, where hiding the light
@@ -5497,10 +5534,16 @@ impl FactoryState {
         // Grouping is the mechanism that already exists for this — members "select / move /
         // delete as one entity" — and using it means no new movement code, no second rule about
         // what moves with what, and Explode still works for anyone who wants the parts apart.
+        // …INCLUDING THE BUILDING IT WAS CARVED OUT OF, which is what the first attempt at this
+        // missed. The user's dump picked `feature#1` — the building SHELL — and moved it, and the
+        // shell was not in the room's group because only the room's own features were. A room cut
+        // from a building and the mass around it are one object; grouping half of them fixed
+        // nothing for the half that gets clicked.
         let mut parts = vec![floor_id];
         parts.extend(wall_ids);
         parts.extend(ceiling_id);
         parts.extend(carve);
+        parts.extend(carved_from);
         self.group_features(&parts);
 
         self.selection = vec![floor_id];
@@ -14634,5 +14677,191 @@ mod a_room_moves_as_one_object {
         f.selection = vec![one];
         f.expand_selection_to_groups();
         assert_eq!(f.selection, vec![one], "after Explode a part is its own object again");
+    }
+}
+
+/// THE BUILDING SHELL IS PART OF THE BUILDING TOO.
+///
+/// The first attempt at "a room moves as one object" grouped only the features the ROOM owns —
+/// floor, walls, ceiling, carve. The user's dump then picked `feature#1`, the building SHELL that
+/// the room was carved out of, moved it, and everything else stayed put: "the building moving
+/// thing i reported is still the same. seems like the fix isnt working."
+///
+/// These tests pick the shell, the way the dump did.
+#[cfg(test)]
+mod a_carved_building_moves_as_one_object {
+    use super::*;
+
+    /// A building with a room carved out of it — the shape the dump had: 4 features, 3 bodies,
+    /// 1 cut.
+    fn a_building_with_a_room() -> FactoryState {
+        let mut f = FactoryState::default();
+        f.add_building_outline(
+            &[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(40.0, 0.0),
+                Vec2::new(40.0, 20.0),
+                Vec2::new(0.0, 20.0),
+                Vec2::new(0.0, 0.0),
+            ],
+            3.0,
+        )
+        .expect("building");
+        f.add_room(&[
+            Vec2::new(1.0, 1.0),
+            Vec2::new(39.0, 1.0),
+            Vec2::new(39.0, 19.0),
+            Vec2::new(1.0, 19.0),
+            Vec2::new(1.0, 1.0),
+        ])
+        .expect("room");
+        f.recompute();
+        f
+    }
+
+    /// The shell is feature #1 and it must be in the group.
+    #[test]
+    fn picking_the_shell_selects_the_whole_building() {
+        let mut f = a_building_with_a_room();
+        let n = f.model.features.len();
+        assert!(n >= 4, "expected the dump's shape, got {n} features");
+
+        let shell = f.model.features[0].id;
+        f.selection = vec![shell];
+        f.expand_selection_to_groups();
+        assert_eq!(
+            f.selection.len(),
+            n,
+            "picking the shell must select all {n} parts, got {:?}",
+            f.selection,
+        );
+    }
+
+    /// THE REPORTED BUG, measured as the dump measured it: moving the shell must not stretch the
+    /// model. It stretches by exactly the distance moved when parts stay behind.
+    #[test]
+    fn moving_the_shell_takes_everything_with_it() {
+        let mut f = a_building_with_a_room();
+        let extent = |f: &FactoryState| {
+            let (mn, mx) = f.cached.bounds().expect("geometry");
+            [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]
+        };
+        let before = extent(&f);
+
+        f.selection = vec![f.model.features[0].id]; // the SHELL, as the dump picked it
+        f.expand_selection_to_groups();
+        f.move_selection(Vec3::new(30.0, 0.0, 0.0));
+        f.recompute();
+
+        let after = extent(&f);
+        for k in 0..3 {
+            assert!(
+                (after[k] - before[k]).abs() < 1e-3,
+                "the model stretched on axis {k}: {before:?} → {after:?} — a part stayed behind",
+            );
+        }
+        let min_x = f.cached.bounds().unwrap().0[0];
+        assert!((min_x - 30.0).abs() < 1e-3, "and all of it travelled 30 m, got min x {min_x}");
+    }
+
+    /// The room is still a void in the moved building — the carve has to travel too, or the
+    /// building arrives solid and the room is left as a hole in empty space.
+    #[test]
+    fn the_room_is_still_hollow_after_the_move() {
+        let mut f = a_building_with_a_room();
+        let tris = f.cached.positions.len();
+        f.selection = vec![f.model.features[0].id];
+        f.expand_selection_to_groups();
+        f.move_selection(Vec3::new(30.0, 0.0, 0.0));
+        f.recompute();
+        assert_eq!(
+            f.cached.positions.len(),
+            tris,
+            "the evaluated solid changed shape — the cut did not travel with the mass",
+        );
+    }
+
+    /// TWO rooms in one building are ONE object, not two groups sharing a shell. Grouping that
+    /// skipped already-grouped ids would leave the second room behind.
+    #[test]
+    fn a_second_room_joins_the_same_building() {
+        let mut f = FactoryState::default();
+        f.add_building_outline(
+            &[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(40.0, 0.0),
+                Vec2::new(40.0, 20.0),
+                Vec2::new(0.0, 20.0),
+                Vec2::new(0.0, 0.0),
+            ],
+            3.0,
+        )
+        .expect("building");
+        for x in [(1.0, 18.0), (21.0, 38.0)] {
+            f.add_room(&[
+                Vec2::new(x.0, 1.0),
+                Vec2::new(x.1, 1.0),
+                Vec2::new(x.1, 19.0),
+                Vec2::new(x.0, 19.0),
+                Vec2::new(x.0, 1.0),
+            ])
+            .expect("room");
+        }
+        f.recompute();
+
+        let n = f.model.features.len();
+        f.selection = vec![f.model.features[0].id]; // the shell both rooms were cut from
+        f.expand_selection_to_groups();
+        assert_eq!(
+            f.selection.len(),
+            n,
+            "both rooms must move with the building, got {:?} of {n}",
+            f.selection,
+        );
+    }
+}
+
+/// A HALF-TYPED NUMBER IS NOT A VALUE YET.
+///
+/// Reported as: "when entering the parameters for ceiling, it doesnt allow to delete the already
+/// existing values — when the user enters a new value it automatically has a 2 already there."
+/// egui's `DragValue` clamps to its range on every keystroke, and a ceiling slab's minimum of
+/// 0.02 m is 20 in millimetres, so clearing the field and typing snapped it to "20" mid-word.
+#[cfg(test)]
+mod numeric_fields_do_not_clamp_mid_keystroke {
+    use super::*;
+
+    /// Every `DragValue` in the app must carry the flag. Asserted on the SOURCE because the
+    /// behaviour lives inside egui's text-edit state, which a unit test cannot drive.
+    #[test]
+    fn every_numeric_field_defers_its_clamp() {
+        for (name, src) in [
+            ("factory.rs", include_str!("factory.rs")),
+            ("app.rs", include_str!("app.rs")),
+            ("light.rs", include_str!("light.rs")),
+        ] {
+            // Cut this module off first: it names both literals, so a whole-file count counts the
+            // assertions themselves. That is how the first version of this test failed.
+            let src = src.split("mod numeric_fields_do_not_clamp_mid_keystroke").next().unwrap();
+            let fields = src.matches("DragValue::new(").count();
+            let deferred = src.matches(".update_while_editing(false)").count();
+            assert_eq!(
+                fields, deferred,
+                "{name}: {fields} numeric fields but {deferred} defer their clamp — one that does \
+                 not will snap the text to its minimum while the user is still typing",
+            );
+        }
+    }
+
+    /// The RANGE itself must survive — deferring the clamp must not mean abandoning it, or a
+    /// ceiling could be committed at zero thickness.
+    #[test]
+    fn the_range_is_still_enforced() {
+        let src = include_str!("factory.rs");
+        let a = src.find("pub fn length_ui(").expect("the helper");
+        let b = src[a..].find("\n}").map(|e| a + e).unwrap();
+        let f = &src[a..b];
+        assert!(f.contains(".range("), "the field must still declare its limits");
+        assert!(f.contains(".update_while_editing(false)"), "…and defer them until commit");
     }
 }

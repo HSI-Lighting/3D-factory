@@ -1494,8 +1494,8 @@ impl LightState {
                 ui.separator();
                 ui.label(egui::RichText::new("array — the usual way to light a room").small().weak());
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.array_rows).range(1..=40).prefix("rows "));
-                    ui.add(egui::DragValue::new(&mut self.array_cols).range(1..=40).prefix("cols "));
+                    ui.add(egui::DragValue::new(&mut self.array_rows).update_while_editing(false).range(1..=40).prefix("rows "));
+                    ui.add(egui::DragValue::new(&mut self.array_cols).update_while_editing(false).range(1..=40).prefix("cols "));
                 });
                 if ui
                     .button("⊞  Lay out grid over the room")
@@ -1517,11 +1517,11 @@ impl LightState {
                 ui.horizontal(|ui| {
                     if self.mount_to_ceiling {
                         ui.label("drop below it");
-                        ui.add(egui::DragValue::new(&mut self.ceiling_drop).speed(0.02).suffix(" m").range(0.0..=5.0))
+                        ui.add(egui::DragValue::new(&mut self.ceiling_drop).update_while_editing(false).speed(0.02).suffix(" m").range(0.0..=5.0))
                             .on_hover_text("0 = surface-mounted · 0.3 = a short pendant");
                     } else {
                         ui.label("mount at");
-                        ui.add(egui::DragValue::new(&mut self.mount_height).speed(0.05).suffix(" m").range(0.1..=30.0));
+                        ui.add(egui::DragValue::new(&mut self.mount_height).update_while_editing(false).speed(0.05).suffix(" m").range(0.1..=30.0));
                     }
                 });
                 ui.checkbox(&mut self.auto_center_light, "auto-place one at the centre if none")
@@ -1540,19 +1540,19 @@ impl LightState {
             crate::app::click_menu_button(ui, "▼ Calculation", |ui| {
                 egui::Grid::new("simlux_calc_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     ui.label("work plane").on_hover_text("Height above the floor the lux is measured at — 0.8 m is the usual desk height");
-                    ui.add(egui::DragValue::new(&mut self.plane_height).speed(0.05).suffix(" m").range(0.0..=10.0));
+                    ui.add(egui::DragValue::new(&mut self.plane_height).update_while_editing(false).speed(0.05).suffix(" m").range(0.0..=10.0));
                     ui.end_row();
                     ui.label("grid cell").on_hover_text("Target spacing of the measurement grid; finer is slower");
-                    ui.add(egui::DragValue::new(&mut self.cell_size).speed(0.05).suffix(" m").range(0.05..=5.0));
+                    ui.add(egui::DragValue::new(&mut self.cell_size).update_while_editing(false).speed(0.05).suffix(" m").range(0.05..=5.0));
                     ui.end_row();
                     ui.label("eye height").on_hover_text("Height the cylindrical illuminance Ez is measured at — 1.2 m seated, 1.6 m standing");
-                    ui.add(egui::DragValue::new(&mut self.eye_height).speed(0.05).suffix(" m").range(0.3..=2.5));
+                    ui.add(egui::DragValue::new(&mut self.eye_height).update_while_editing(false).speed(0.05).suffix(" m").range(0.3..=2.5));
                     ui.end_row();
                     ui.label("bounces").on_hover_text("Indirect light: 0 is direct only, which under-reads a bright room badly");
-                    ui.add(egui::DragValue::new(&mut self.settings.max_bounces).range(0..=8));
+                    ui.add(egui::DragValue::new(&mut self.settings.max_bounces).update_while_editing(false).range(0..=8));
                     ui.end_row();
                     ui.label("rays").on_hover_text("Samples per point for the indirect term — more is smoother and slower");
-                    ui.add(egui::DragValue::new(&mut self.settings.rays_per_point).range(1..=4096));
+                    ui.add(egui::DragValue::new(&mut self.settings.rays_per_point).update_while_editing(false).range(1..=4096));
                     ui.end_row();
                 });
                 ui.separator();
@@ -1566,7 +1566,7 @@ impl LightState {
                 egui::Grid::new("simlux_mf_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     let mut row = |ui: &mut egui::Ui, label: &str, tip: &str, v: &mut f64| {
                         ui.label(label).on_hover_text(tip);
-                        ui.add(egui::DragValue::new(v).speed(0.005).range(0.1..=1.0).fixed_decimals(2));
+                        ui.add(egui::DragValue::new(v).update_while_editing(false).speed(0.005).range(0.1..=1.0).fixed_decimals(2));
                         ui.end_row();
                     };
                     row(ui, "LLMF", "Lamp lumen maintenance — output left after the operating interval, from the luminaire's data sheet", &mut self.maintenance.llmf);
@@ -1615,7 +1615,7 @@ impl LightState {
                 egui::Grid::new("simlux_mat_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     for m in &mut self.materials {
                         ui.label(&m.name);
-                        ui.add(egui::DragValue::new(&mut m.reflectance).speed(0.01).range(0.0..=1.0));
+                        ui.add(egui::DragValue::new(&mut m.reflectance).update_while_editing(false).speed(0.01).range(0.0..=1.0));
                         ui.end_row();
                     }
                 });
@@ -1654,7 +1654,7 @@ impl LightState {
                 }
                 if let Some(m) = &mut self.scale_max {
                     ui.add(
-                        egui::DragValue::new(m)
+                        egui::DragValue::new(m).update_while_editing(false)
                             .speed(10.0)
                             .prefix("top of scale  ")
                             .suffix(" lx")
@@ -1856,7 +1856,7 @@ impl LightState {
                                 .weak(),
                         );
                         ui.add(
-                            egui::DragValue::new(&mut g.height)
+                            egui::DragValue::new(&mut g.height).update_while_editing(false)
                                 .speed(0.05)
                                 .suffix(" m")
                                 .range(0.1..=20.0),
@@ -2024,7 +2024,7 @@ impl LightState {
             }
             if let Some(m) = &mut self.scale_max {
                 ui.add(
-                    egui::DragValue::new(m)
+                    egui::DragValue::new(m).update_while_editing(false)
                         .speed(10.0)
                         .suffix(" lx")
                         .range(1.0..=100_000.0),

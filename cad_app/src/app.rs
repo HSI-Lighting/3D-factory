@@ -295,7 +295,7 @@ fn pp_num_field(ui: &mut egui::Ui, rect: egui::Rect, v: &mut f64) -> egui::Respo
             st.bg_stroke = egui::Stroke::NONE;
         }
     }
-    let r = ui.put(inner, egui::DragValue::new(v).speed(0.5).max_decimals(2));
+    let r = ui.put(inner, egui::DragValue::new(v).update_while_editing(false).speed(0.5).max_decimals(2));
     ui.style_mut().override_font_id = saved_font;
     ui.visuals_mut().widgets = saved_widgets;
     r
@@ -5240,7 +5240,7 @@ impl CadApp {
                 ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("grain").small().weak()))
                     .on_hover_text("World-space scale across / along / through the grain (anisotropic — squash across, stretch along, for timber).");
                 for k in 0..3 {
-                    let r = ui.add(egui::DragValue::new(&mut d.scale[k]).speed(0.2).range(0.1..=400.0));
+                    let r = ui.add(egui::DragValue::new(&mut d.scale[k]).update_while_editing(false).speed(0.2).range(0.1..=400.0));
                     if r.changed() { changed = true; }
                     if r.drag_started() { started = true; }
                 }
@@ -5248,8 +5248,8 @@ impl CadApp {
             ui.horizontal(|ui| {
                 ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("detail").small().weak()))
                     .on_hover_text("Noise octaves (fractal detail) and ramp contrast.");
-                let rd = ui.add(egui::DragValue::new(&mut d.detail).speed(0.1).range(1.0..=8.0).prefix("oct "));
-                let rc = ui.add(egui::DragValue::new(&mut d.contrast).speed(0.02).range(0.2..=4.0).prefix("×"));
+                let rd = ui.add(egui::DragValue::new(&mut d.detail).update_while_editing(false).speed(0.1).range(1.0..=8.0).prefix("oct "));
+                let rc = ui.add(egui::DragValue::new(&mut d.contrast).update_while_editing(false).speed(0.02).range(0.2..=4.0).prefix("×"));
                 for r in [&rd, &rc] {
                     if r.changed() { changed = true; }
                     if r.drag_started() { started = true; }
@@ -5285,7 +5285,7 @@ impl CadApp {
                 } else {
                     "Image repeats per metre of surface."
                 });
-            let r = ui.add(egui::DragValue::new(&mut scale).speed(0.05).range(0.05..=200.0));
+            let r = ui.add(egui::DragValue::new(&mut scale).update_while_editing(false).speed(0.05).range(0.05..=200.0));
             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
             if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].scale = scale; } }
         });
@@ -5293,8 +5293,8 @@ impl CadApp {
         ui.horizontal(|ui| {
             ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("move").small().weak()))
                 .on_hover_text("Shift the image across the surface (U/V, in tile units).");
-            let ru = ui.add(egui::DragValue::new(&mut off[0]).speed(0.02).prefix("U ").range(-100.0..=100.0));
-            let rv = ui.add(egui::DragValue::new(&mut off[1]).speed(0.02).prefix("V ").range(-100.0..=100.0));
+            let ru = ui.add(egui::DragValue::new(&mut off[0]).update_while_editing(false).speed(0.02).prefix("U ").range(-100.0..=100.0));
+            let rv = ui.add(egui::DragValue::new(&mut off[1]).update_while_editing(false).speed(0.02).prefix("V ").range(-100.0..=100.0));
             for r in [&ru, &rv] {
                 if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
             }
@@ -5304,7 +5304,7 @@ impl CadApp {
         ui.horizontal(|ui| {
             ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new("rotate").small().weak()))
                 .on_hover_text("Rotate the image on the surface (degrees).");
-            let r = ui.add(egui::DragValue::new(&mut rot).speed(1.0).suffix("°").range(-360.0..=360.0));
+            let r = ui.add(egui::DragValue::new(&mut rot).update_while_editing(false).speed(1.0).suffix("°").range(-360.0..=360.0));
             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
             if r.changed() { if let Some(ti) = self.tune_target(&face_sel, &feat_sel, tex_idx) { self.factory.textures[ti].rot_deg = rot; } }
             if ui.small_button("⟳ 90°").on_hover_text("Rotate 90°").clicked() {
@@ -7328,7 +7328,7 @@ impl CadApp {
                     }
                     ui.horizontal(|ui| {
                         ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new("scale").small().weak()));
-                        let r = ui.add(egui::DragValue::new(&mut scale).speed(0.01).range(0.01..=100.0));
+                        let r = ui.add(egui::DragValue::new(&mut scale).update_while_editing(false).speed(0.01).range(0.01..=100.0));
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.furniture[fi].scale = scale; }
                     });
@@ -7339,7 +7339,7 @@ impl CadApp {
                     for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
                         ui.horizontal(|ui| {
                             ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).update_while_editing(false).speed(1.0).suffix("°"));
                             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                             if r.changed() { self.factory.furniture[fi].rot[axis] = rot[axis]; }
                         });
@@ -7432,7 +7432,7 @@ impl CadApp {
                     for (axis, lbl) in [(0usize, "pitch"), (1, "roll"), (2, "spin")] {
                         ui.horizontal(|ui| {
                             ui.add_sized([40.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).speed(1.0).suffix("°"));
+                            let r = ui.add(egui::DragValue::new(&mut rot[axis]).update_while_editing(false).speed(1.0).suffix("°"));
                             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                             if r.changed() {
                                 self.factory.set_feature_rotation(id, axis, rot[axis]);
@@ -9849,7 +9849,7 @@ impl CadApp {
                 egui::Grid::new("draw3d_tess").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     let mut cnt = |ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32| {
                         ui.label(label);
-                        if ui.add(egui::DragValue::new(v).speed(1.0).range(min..=512)).changed() {
+                        if ui.add(egui::DragValue::new(v).update_while_editing(false).speed(1.0).range(min..=512)).changed() {
                             changed.set(true);
                         }
                         ui.end_row();
@@ -17977,7 +17977,7 @@ impl CadApp {
                                 .show_value(false));
                             ui.add_space(4.0);
                             ui.add(egui::DragValue::new(
-                                    &mut self.hatch_dialog_scale)
+                                    &mut self.hatch_dialog_scale).update_while_editing(false)
                                 .speed(0.01)
                                 .range(0.05..=100.0)
                                 .min_decimals(3)
@@ -17995,7 +17995,7 @@ impl CadApp {
                             ui.vertical(|ui| {
                                 ui.add_space(54.0);
                                 ui.add(egui::DragValue::new(
-                                        &mut self.hatch_dialog_angle)
+                                        &mut self.hatch_dialog_angle).update_while_editing(false)
                                     .speed(1.0)
                                     .range(-360.0..=360.0)
                                     .suffix("°"));
@@ -18495,7 +18495,7 @@ impl CadApp {
                         ui.end_row();
 
                         ui.label("Default height");
-                        ui.add(egui::DragValue::new(&mut dialog.default_height)
+                        ui.add(egui::DragValue::new(&mut dialog.default_height).update_while_editing(false)
                             .speed(0.05)
                             .range(0.0..=1000.0)
                             .min_decimals(3)
@@ -18510,7 +18510,7 @@ impl CadApp {
                             }
                             ui.add_enabled_ui(!by_layer, |ui| {
                                 let mut aci = dialog.color_aci.unwrap_or(7);
-                                if ui.add(egui::DragValue::new(&mut aci)
+                                if ui.add(egui::DragValue::new(&mut aci).update_while_editing(false)
                                     .speed(1.0)
                                     .range(1..=255)
                                     .prefix("ACI "))
@@ -18751,7 +18751,7 @@ impl CadApp {
                             .desired_width(220.0).hint_text("Dry Wall, Structural…"));
                         ui.end_row();
                         ui.label("Thickness");
-                        ui.add(egui::DragValue::new(&mut dialog.thickness)
+                        ui.add(egui::DragValue::new(&mut dialog.thickness).update_while_editing(false)
                             .speed(0.01).range(0.0..=1000.0).min_decimals(3).max_decimals(3));
                         ui.end_row();
                         ui.label("Fill (poché)");
@@ -19058,7 +19058,7 @@ impl CadApp {
                         ui.end_row();
 
                         ui.label("Arrow size");
-                        ui.add(egui::DragValue::new(&mut dialog.arrow_size)
+                        ui.add(egui::DragValue::new(&mut dialog.arrow_size).update_while_editing(false)
                             .speed(0.01).range(0.0..=1000.0)
                             .min_decimals(3).max_decimals(3));
                         ui.end_row();
@@ -19098,7 +19098,7 @@ impl CadApp {
                         ui.end_row();
 
                         ui.label("Text height");
-                        ui.add(egui::DragValue::new(&mut dialog.text_height)
+                        ui.add(egui::DragValue::new(&mut dialog.text_height).update_while_editing(false)
                             .speed(0.01).range(0.0..=1000.0)
                             .min_decimals(3).max_decimals(3));
                         ui.end_row();
@@ -19134,7 +19134,7 @@ impl CadApp {
                         ui.end_row();
 
                         ui.label("Decimal places");
-                        ui.add(egui::DragValue::new(&mut dialog.decimal_places)
+                        ui.add(egui::DragValue::new(&mut dialog.decimal_places).update_while_editing(false)
                             .speed(1.0).range(0..=12));
                         ui.end_row();
                     });
@@ -19590,7 +19590,7 @@ impl CadApp {
             }
             ui.horizontal(|ui| {
                 ui.label("Height:");
-                ui.add(egui::DragValue::new(&mut self.text_input_dialog_height)
+                ui.add(egui::DragValue::new(&mut self.text_input_dialog_height).update_while_editing(false)
                     .speed(0.05).range(1e-3..=1e6));
             });
             ui.add_space(6.0);
@@ -19792,7 +19792,7 @@ impl CadApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Auto-snap every:");
-                ui.add(egui::DragValue::new(&mut self.dbg.auto_snap_every)
+                ui.add(egui::DragValue::new(&mut self.dbg.auto_snap_every).update_while_editing(false)
                     .speed(1.0)
                     .range(0..=10_000)
                     .suffix(" events"));
@@ -22365,7 +22365,7 @@ impl CadApp {
                         varies(ui, half, "LENGTH · value");
                     } else {
                         let r = ui.add_sized([half, PP_ROW_H],
-                            egui::DragValue::new(&mut len).speed(0.1).range(0.0..=1e12));
+                            egui::DragValue::new(&mut len).update_while_editing(false).speed(0.1).range(0.0..=1e12));
                         pp_capture(ui, "LENGTH · value", r.rect);
                         self.props_gesture_snapshot(&r);
                         if r.changed() { len_set = Some(len); }
@@ -22380,7 +22380,7 @@ impl CadApp {
                         varies(ui, half, "ANGLE · value");
                     } else {
                         let r = ui.add_sized([half, PP_ROW_H],
-                            egui::DragValue::new(&mut ang).speed(0.5).range(-360.0..=360.0).suffix("°"));
+                            egui::DragValue::new(&mut ang).update_while_editing(false).speed(0.5).range(-360.0..=360.0).suffix("°"));
                         pp_capture(ui, "ANGLE · value", r.rect);
                         self.props_gesture_snapshot(&r);
                         if r.changed() { ang_set = Some(ang); }
@@ -22416,7 +22416,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::Point(p) = g { Some(p.style as i64) } else { None } });
                     let mut v = shared.unwrap_or(0) as u8;
-                    let resp = ui.add(egui::DragValue::new(&mut v).range(0..=99)
+                    let resp = ui.add(egui::DragValue::new(&mut v).update_while_editing(false).range(0..=99)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22429,7 +22429,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::Point(p) = g { Some((p.size * 1000.0) as i64) } else { None } });
                     let mut sz = shared.map(|x| x as f32 / 1000.0).unwrap_or(0.0);
-                    let resp = ui.add(egui::DragValue::new(&mut sz).speed(0.1).range(0.0..=1e6)
+                    let resp = ui.add(egui::DragValue::new(&mut sz).update_while_editing(false).speed(0.1).range(0.0..=1e6)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22510,7 +22510,7 @@ impl CadApp {
                                 } else { None }
                             } else { None } });
                         let mut sc = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
-                        let resp = ui.add(egui::DragValue::new(&mut sc).speed(0.05).range(0.001..=1e6)
+                        let resp = ui.add(egui::DragValue::new(&mut sc).update_while_editing(false).speed(0.05).range(0.001..=1e6)
                             .prefix(if shared.is_none() { "≠ " } else { "" }));
                         if resp.changed() {
                             self.props_gesture_snapshot(&resp);
@@ -22531,7 +22531,7 @@ impl CadApp {
                                 } else { None }
                             } else { None } });
                         let mut ang = shared.map(|x| x as f64 / 1e4).unwrap_or(0.0);
-                        let resp = ui.add(egui::DragValue::new(&mut ang).speed(0.5).range(-360.0..=360.0)
+                        let resp = ui.add(egui::DragValue::new(&mut ang).update_while_editing(false).speed(0.5).range(-360.0..=360.0)
                             .suffix("°").prefix(if shared.is_none() { "≠ " } else { "" }));
                         if resp.changed() {
                             self.props_gesture_snapshot(&resp);
@@ -22585,7 +22585,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::Wall(w) = g { Some((w.thickness * 1e6) as i64) } else { None } });
                     let mut th = shared.map(|x| x as f64 / 1e6).unwrap_or(0.0);
-                    let resp = ui.add(egui::DragValue::new(&mut th).speed(0.1).range(0.001..=1e9)
+                    let resp = ui.add(egui::DragValue::new(&mut th).update_while_editing(false).speed(0.1).range(0.001..=1e9)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22625,7 +22625,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::Text(t) = g { Some((t.height * 1e6) as i64) } else { None } });
                     let mut h = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
-                    let resp = ui.add(egui::DragValue::new(&mut h).speed(0.1).range(0.001..=1e9)
+                    let resp = ui.add(egui::DragValue::new(&mut h).update_while_editing(false).speed(0.1).range(0.001..=1e9)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22638,7 +22638,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::Text(t) = g { Some((t.angle.to_degrees() * 1e3) as i64) } else { None } });
                     let mut a = shared.map(|x| x as f64 / 1e3).unwrap_or(0.0);
-                    let resp = ui.add(egui::DragValue::new(&mut a).speed(1.0).range(-360.0..=360.0)
+                    let resp = ui.add(egui::DragValue::new(&mut a).update_while_editing(false).speed(1.0).range(-360.0..=360.0)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22705,7 +22705,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::BlockRef(b) = g { Some((b.scale * 1e6) as i64) } else { None } });
                     let mut sc = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
-                    let resp = ui.add(egui::DragValue::new(&mut sc).speed(0.05).range(0.0001..=1e9)
+                    let resp = ui.add(egui::DragValue::new(&mut sc).update_while_editing(false).speed(0.05).range(0.0001..=1e9)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22718,7 +22718,7 @@ impl CadApp {
                     let shared = self.props_shared_geom(targets, |g| {
                         if let Geom::BlockRef(b) = g { Some((b.rotation.to_degrees() * 1e3) as i64) } else { None } });
                     let mut rot = shared.map(|x| x as f64 / 1e3).unwrap_or(0.0);
-                    let resp = ui.add(egui::DragValue::new(&mut rot).speed(1.0).range(-360.0..=360.0)
+                    let resp = ui.add(egui::DragValue::new(&mut rot).update_while_editing(false).speed(1.0).range(-360.0..=360.0)
                         .prefix(if shared.is_none() { "≠ " } else { "" }));
                     if resp.changed() {
                         self.props_gesture_snapshot(&resp);
@@ -22747,7 +22747,7 @@ impl CadApp {
                         for (k, (pname, curval)) in param_info.into_iter().enumerate() {
                             ui.label(format!("◉ {}", pname));
                             let mut v = curval;
-                            let resp = ui.add(egui::DragValue::new(&mut v).speed(1.0));
+                            let resp = ui.add(egui::DragValue::new(&mut v).update_while_editing(false).speed(1.0));
                             if resp.changed() {
                                 self.props_gesture_snapshot(&resp);
                                 self.props_apply(targets, false, move |d| {
@@ -23034,10 +23034,10 @@ impl CadApp {
                 );
                 ui.horizontal(|ui| {
                     ui.add_sized([110.0, 18.0], egui::Label::new("Exposure").selectable(false));
-                    ui.add(egui::DragValue::new(&mut c.exposure).speed(0.05).range(-8.0..=8.0).suffix(" EV"))
+                    ui.add(egui::DragValue::new(&mut c.exposure).update_while_editing(false).speed(0.05).range(-8.0..=8.0).suffix(" EV"))
                         .on_hover_text("Stops. +1 EV is exactly twice the light — the photographic control, not a brightness fudge.");
                     ui.add_sized([44.0, 18.0], egui::Label::new("Look").selectable(false));
-                    ui.add(egui::DragValue::new(&mut c.look).speed(0.02).range(-1.0..=1.0))
+                    ui.add(egui::DragValue::new(&mut c.look).update_while_editing(false).speed(0.02).range(-1.0..=1.0))
                         .on_hover_text("Extra saturation applied inside the view transform. 0 = neutral.");
                 });
                 ui.horizontal(|ui| {
@@ -23050,7 +23050,7 @@ impl CadApp {
                              washing out. 0 turns it off entirely.",
                         );
                     ui.add_sized([44.0, 18.0], egui::Label::new("above").selectable(false));
-                    ui.add(egui::DragValue::new(&mut c.bloom_threshold).speed(0.05).range(0.05..=8.0))
+                    ui.add(egui::DragValue::new(&mut c.bloom_threshold).update_while_editing(false).speed(0.05).range(0.05..=8.0))
                         .on_hover_text(
                             "Where the spill starts, in scene-referred light. 1.0 is about 'brighter \
                              than a white surface in full light', so only real sources and specular \
@@ -23149,7 +23149,7 @@ impl CadApp {
                     ui.horizontal(|ui| {
                         crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.ao.radius, 0.02, 0.05, 3.0)
                             .on_hover_text("How far a crease reaches, in metres. 0.5 m suits rooms and furniture; raise it for large exteriors.");
-                        ui.add(egui::DragValue::new(&mut s.ao.strength).speed(0.02).range(0.0..=2.0).prefix("strength "))
+                        ui.add(egui::DragValue::new(&mut s.ao.strength).update_while_editing(false).speed(0.02).range(0.0..=2.0).prefix("strength "))
                             .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
                     });
                 });
@@ -23169,7 +23169,7 @@ impl CadApp {
                     ui.horizontal(|ui| {
                         crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.gi.radius, 0.05, 0.1, 8.0)
                             .on_hover_text("How far a bounce reaches. 1.5 m suits rooms; raise it for large interiors.");
-                        ui.add(egui::DragValue::new(&mut s.gi.strength).speed(0.05).range(0.0..=4.0).prefix("strength "))
+                        ui.add(egui::DragValue::new(&mut s.gi.strength).update_while_editing(false).speed(0.05).range(0.0..=4.0).prefix("strength "))
                             .on_hover_text(
                                 "1.0 is the geometric estimate — one bounce, at the brightness one \
                                  bounce actually has. Screen-space GI only ever sees part of the \
@@ -23196,7 +23196,7 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.refract.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut s.refract.ior).speed(0.01).range(1.0..=2.5).prefix("IOR "))
+                        ui.add(egui::DragValue::new(&mut s.refract.ior).update_while_editing(false).speed(0.01).range(1.0..=2.5).prefix("IOR "))
                             .on_hover_text("Window glass is 1.52, water 1.33, acrylic 1.49. 1.0 is no bend at all.");
                         crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.refract.thickness, 0.005, 0.0, 0.5)
                             .on_hover_text(
@@ -23253,7 +23253,7 @@ impl CadApp {
                         }
                     });
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut s.north_offset_deg).speed(1.0).range(-180.0..=180.0).prefix("building faces N+ ").suffix("°"))
+                    ui.add(egui::DragValue::new(&mut s.north_offset_deg).update_while_editing(false).speed(1.0).range(-180.0..=180.0).prefix("building faces N+ ").suffix("°"))
                         .on_hover_text("Rotate true north off world +Y so the building can face any way. This is about ORIENTATION, not location.");
                 });
                 // Raw coordinates for anywhere not in the list (or fine-tuning) — hidden by default so
@@ -23262,20 +23262,20 @@ impl CadApp {
                     .id_salt("sun_exact_coords")
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut s.lat_deg).speed(0.1).range(-90.0..=90.0).prefix("lat ").suffix("°"))
+                            ui.add(egui::DragValue::new(&mut s.lat_deg).update_while_editing(false).speed(0.1).range(-90.0..=90.0).prefix("lat ").suffix("°"))
                                 .on_hover_text("Latitude, + north");
-                            ui.add(egui::DragValue::new(&mut s.lon_deg).speed(0.1).range(-180.0..=180.0).prefix("lon ").suffix("°"))
+                            ui.add(egui::DragValue::new(&mut s.lon_deg).update_while_editing(false).speed(0.1).range(-180.0..=180.0).prefix("lon ").suffix("°"))
                                 .on_hover_text("Longitude, + east");
                         });
-                        ui.add(egui::DragValue::new(&mut s.utc_offset).speed(0.25).range(-12.0..=14.0).prefix("UTC ").suffix(" h"))
+                        ui.add(egui::DragValue::new(&mut s.utc_offset).update_while_editing(false).speed(0.25).range(-12.0..=14.0).prefix("UTC ").suffix(" h"))
                             .on_hover_text("Timezone offset from UTC, + east (GMT = 0, Gulf = +4, PST = −8). Add an hour for daylight saving.");
                     });
 
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Date & time").small().weak());
                 ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut s.month).range(1..=12).prefix("mo "));
-                    ui.add(egui::DragValue::new(&mut s.day).range(1..=31).prefix("day "));
+                    ui.add(egui::DragValue::new(&mut s.month).update_while_editing(false).range(1..=12).prefix("mo "));
+                    ui.add(egui::DragValue::new(&mut s.day).update_while_editing(false).range(1..=31).prefix("day "));
                 });
                 ui.horizontal(|ui| {
                     ui.add(egui::Slider::new(&mut s.hour, 0.0..=24.0).text("hour").show_value(true))
@@ -24205,7 +24205,7 @@ impl CadApp {
         ui.horizontal(|ui| {
             ui.label("Grain");
             for k in 0..3 {
-                ui.add(egui::DragValue::new(&mut def.scale[k]).speed(0.5).range(0.1..=400.0));
+                ui.add(egui::DragValue::new(&mut def.scale[k]).update_while_editing(false).speed(0.5).range(0.1..=400.0));
             }
         });
         ui.add(egui::Slider::new(&mut def.contrast, 0.2..=4.0).text("Contrast"));
@@ -24218,8 +24218,8 @@ impl CadApp {
         ui.label(egui::RichText::new("Surface").small().weak());
         ui.horizontal(|ui| {
             ui.label("Rough A→B");
-            ui.add(egui::DragValue::new(&mut def.surf_rough[0]).speed(0.01).range(0.02..=1.0));
-            ui.add(egui::DragValue::new(&mut def.surf_rough[1]).speed(0.01).range(0.02..=1.0));
+            ui.add(egui::DragValue::new(&mut def.surf_rough[0]).update_while_editing(false).speed(0.01).range(0.02..=1.0));
+            ui.add(egui::DragValue::new(&mut def.surf_rough[1]).update_while_editing(false).speed(0.01).range(0.02..=1.0));
             if ui.small_button("=").on_hover_text("Uniform finish — use the material's own Roughness instead").clicked() {
                 def.surf_rough = [0.5, 0.5];
             }
@@ -24243,18 +24243,18 @@ impl CadApp {
         ui.checkbox(&mut t.triplanar, "World-space (triplanar)")
             .on_hover_text("Project the image on the three world axes and blend by the surface normal, at a fixed size in metres — instead of using the mesh's UVs. The right choice for walls, floors and anything built from a plan.");
         if t.triplanar {
-            ui.add(egui::DragValue::new(&mut t.tiles_per_m).speed(0.02).range(0.02..=64.0).prefix("tiles/m "))
+            ui.add(egui::DragValue::new(&mut t.tiles_per_m).update_while_editing(false).speed(0.02).range(0.02..=64.0).prefix("tiles/m "))
                 .on_hover_text("How many times the image repeats per metre. 2.0 = a 0.5 m tile, on any surface it lands on.");
         }
-        ui.add(egui::DragValue::new(&mut t.scale).speed(0.05).range(0.05..=200.0).prefix("tiling "))
+        ui.add(egui::DragValue::new(&mut t.scale).update_while_editing(false).speed(0.05).range(0.05..=200.0).prefix("tiling "))
             .on_hover_text("UV tiling: tiles per metre (features) / repeats across the piece (furniture). Ignored in world-space mode.");
         ui.horizontal(|ui| {
             ui.label("move");
-            ui.add(egui::DragValue::new(&mut t.offset[0]).speed(0.01).prefix("u "));
-            ui.add(egui::DragValue::new(&mut t.offset[1]).speed(0.01).prefix("v "));
+            ui.add(egui::DragValue::new(&mut t.offset[0]).update_while_editing(false).speed(0.01).prefix("u "));
+            ui.add(egui::DragValue::new(&mut t.offset[1]).update_while_editing(false).speed(0.01).prefix("v "));
         });
         ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut t.rot_deg).speed(1.0).range(-360.0..=360.0).prefix("rotate ").suffix("°"));
+            ui.add(egui::DragValue::new(&mut t.rot_deg).update_while_editing(false).speed(1.0).range(-360.0..=360.0).prefix("rotate ").suffix("°"));
             if ui.small_button("⟳ 90°").clicked() {
                 t.rot_deg = (t.rot_deg + 90.0).rem_euclid(360.0);
             }
@@ -25113,11 +25113,11 @@ impl CadApp {
                 num(ui, u, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Steps per turn").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.steps_per_turn).speed(0.2).range(3..=64));
+                    ui.add(egui::DragValue::new(&mut s.steps_per_turn).update_while_editing(false).speed(0.2).range(3..=64));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Total turns").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.total_turns).speed(0.05).range(0.1..=20.0));
+                    ui.add(egui::DragValue::new(&mut s.total_turns).update_while_editing(false).speed(0.05).range(0.1..=20.0));
                 });
                 ui.checkbox(&mut s.has_handrail, "Outer handrail");
                 if s.has_handrail {
@@ -25156,11 +25156,11 @@ impl CadApp {
                 let d = &mut self.arch_dogleg;
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Lower-flight steps").selectable(false));
-                    ui.add(egui::DragValue::new(&mut d.n_lower).speed(0.2).range(1..=100));
+                    ui.add(egui::DragValue::new(&mut d.n_lower).update_while_editing(false).speed(0.2).range(1..=100));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Upper-flight steps").selectable(false));
-                    ui.add(egui::DragValue::new(&mut d.n_upper).speed(0.2).range(1..=100));
+                    ui.add(egui::DragValue::new(&mut d.n_upper).update_while_editing(false).speed(0.2).range(1..=100));
                 });
                 num(ui, u, "Going (tread depth)", &mut d.going, 0.01, 0.1, 1.0);
                 num(ui, u, "Stair width", &mut d.width, 0.05, 0.3, 4.0);
@@ -25194,7 +25194,7 @@ impl CadApp {
                 let s = &mut self.arch_spiral_csg;
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Number of steps").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.n_steps).speed(0.2).range(3..=200));
+                    ui.add(egui::DragValue::new(&mut s.n_steps).update_while_editing(false).speed(0.2).range(3..=200));
                 });
                 num(ui, u, "Number of turns", &mut s.turns, 0.02, 0.25, 6.0);
                 num(ui, u, "Overall height", &mut s.total_height, 0.05, 0.2, 20.0);
@@ -25206,7 +25206,7 @@ impl CadApp {
                     num(ui, u, "Handrail height", &mut s.handrail_height, 0.02, 0.3, 1.3);
                     ui.horizontal(|ui| {
                         ui.add_sized([150.0, 18.0], egui::Label::new("Infill rails").selectable(false));
-                        ui.add(egui::DragValue::new(&mut s.n_infill).speed(0.1).range(0..=10));
+                        ui.add(egui::DragValue::new(&mut s.n_infill).update_while_editing(false).speed(0.1).range(0..=10));
                     });
                 }
                 let inp = self.arch_spiral_csg;
@@ -25363,7 +25363,7 @@ impl CadApp {
                 num(ui, u, "Outer radius", &mut r.r_outer, 0.02, 0.3, 30.0);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Turns").selectable(false));
-                    ui.add(egui::DragValue::new(&mut r.turns).speed(0.05).range(0.1..=20.0));
+                    ui.add(egui::DragValue::new(&mut r.turns).update_while_editing(false).speed(0.05).range(0.1..=20.0));
                 });
                 num(ui, u, "Slab thickness", &mut r.slab_thickness, 0.005, 0.02, 1.0);
                 ui.horizontal(|ui| {
@@ -25374,7 +25374,7 @@ impl CadApp {
                 num(ui, u, "Rail height", &mut r.rail_height, 0.02, 0.3, 1.5);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Rails per edge").selectable(false));
-                    ui.add(egui::DragValue::new(&mut r.rail_count).speed(0.1).range(1..=8));
+                    ui.add(egui::DragValue::new(&mut r.rail_count).update_while_editing(false).speed(0.1).range(1..=8));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Balustrade").selectable(false));
@@ -25420,9 +25420,9 @@ impl CadApp {
                 let (mut n_cols, mut n_rows) = (cup.cols.len(), cup.rows.len());
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Bays × tiers").selectable(false));
-                    ui.add(egui::DragValue::new(&mut n_cols).speed(0.05).range(1..=6));
+                    ui.add(egui::DragValue::new(&mut n_cols).update_while_editing(false).speed(0.05).range(1..=6));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut n_rows).speed(0.05).range(1..=6));
+                    ui.add(egui::DragValue::new(&mut n_rows).update_while_editing(false).speed(0.05).range(1..=6));
                 });
                 if n_cols != cup.cols.len() || n_rows != cup.rows.len() {
                     cup.cols.resize(n_cols, 1.0);
@@ -25459,7 +25459,7 @@ impl CadApp {
                                     }
                                 });
                             if let Cell::Drawers(n) = cell {
-                                ui.add(egui::DragValue::new(n).speed(0.1).range(1..=8));
+                                ui.add(egui::DragValue::new(n).update_while_editing(false).speed(0.1).range(1..=8));
                             }
                         }
                     });
@@ -25532,7 +25532,7 @@ impl CadApp {
                             });
                         crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0);
                         if matches!(m.kind, BaseKind::Door | BaseKind::Drawers) {
-                            ui.add(egui::DragValue::new(&mut m.count).range(1..=6))
+                            ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                 .on_hover_text(if m.kind == BaseKind::Door { "door leaves" } else { "drawers" });
                         }
                         if ui.small_button("🗑").clicked() { rm = Some(i); }
@@ -25559,7 +25559,7 @@ impl CadApp {
                                 });
                             crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0);
                             if matches!(m.kind, WallKind::Door | WallKind::Open) {
-                                ui.add(egui::DragValue::new(&mut m.count).range(1..=6))
+                                ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                     .on_hover_text(if m.kind == WallKind::Door { "door leaves" } else { "shelves" });
                             }
                             if ui.small_button("🗑").clicked() { rmw = Some(i); }
@@ -25631,7 +25631,7 @@ impl CadApp {
                                 ui.selectable_value(&mut cb.edge_band, b, b.label());
                             }
                         });
-                    ui.add(egui::DragValue::new(&mut cb.shelves).range(0..=6)).on_hover_text("shelves per non-drawer cell");
+                    ui.add(egui::DragValue::new(&mut cb.shelves).update_while_editing(false).range(0..=6)).on_hover_text("shelves per non-drawer cell");
                     ui.label(egui::RichText::new("shelves").small().weak());
                 });
                 ui.checkbox(&mut cb.pin_rows, "Shelf-pin rows");
@@ -25640,9 +25640,9 @@ impl CadApp {
                 let (mut n_cols, mut n_rows) = (cb.cols.len(), cb.rows.len());
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Columns × rows").selectable(false));
-                    ui.add(egui::DragValue::new(&mut n_cols).speed(0.05).range(1..=6));
+                    ui.add(egui::DragValue::new(&mut n_cols).update_while_editing(false).speed(0.05).range(1..=6));
                     ui.label("×");
-                    ui.add(egui::DragValue::new(&mut n_rows).speed(0.05).range(1..=6));
+                    ui.add(egui::DragValue::new(&mut n_rows).update_while_editing(false).speed(0.05).range(1..=6));
                 });
                 if n_cols != cb.cols.len() || n_rows != cb.rows.len() {
                     cb.cols.resize(n_cols, 1.0);
@@ -25682,8 +25682,8 @@ impl CadApp {
                                     ui.selectable_value(cell, Cell::Panel, "Panel");
                                 });
                             match cell {
-                                Cell::Door(n) => { ui.add(egui::DragValue::new(n).speed(0.1).range(1..=3)).on_hover_text("leaves"); }
-                                Cell::Drawers(n) => { ui.add(egui::DragValue::new(n).speed(0.1).range(1..=8)).on_hover_text("drawers"); }
+                                Cell::Door(n) => { ui.add(egui::DragValue::new(n).update_while_editing(false).speed(0.1).range(1..=3)).on_hover_text("leaves"); }
+                                Cell::Drawers(n) => { ui.add(egui::DragValue::new(n).update_while_editing(false).speed(0.1).range(1..=8)).on_hover_text("drawers"); }
                                 _ => {}
                             }
                         }
@@ -25693,7 +25693,7 @@ impl CadApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Open pose").small().weak());
-                    ui.add(egui::DragValue::new(&mut cb.open_deg).speed(1.0).range(0.0..=110.0).suffix("°"))
+                    ui.add(egui::DragValue::new(&mut cb.open_deg).update_while_editing(false).speed(1.0).range(0.0..=110.0).suffix("°"))
                         .on_hover_text("swing every door leaf open by this angle (0 = shut)");
                     crate::factory::length_ui(ui, u, &mut cb.drawer_out, 0.005, 0.0, 0.6)
                         .on_hover_text("pull every drawer front out by this much");
@@ -25862,15 +25862,15 @@ impl CadApp {
                 ui.label(egui::RichText::new("Output").strong());
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Load").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.watts_per_m).speed(0.1).range(0.0..=100.0).suffix(" W/m"));
+                    ui.add(egui::DragValue::new(&mut s.watts_per_m).update_while_editing(false).speed(0.1).range(0.0..=100.0).suffix(" W/m"));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Efficacy").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.efficacy_lm_per_w).speed(1.0).range(0.0..=250.0).suffix(" lm/W"));
+                    ui.add(egui::DragValue::new(&mut s.efficacy_lm_per_w).update_while_editing(false).speed(1.0).range(0.0..=250.0).suffix(" lm/W"));
                 });
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Colour temperature").selectable(false));
-                    ui.add(egui::DragValue::new(&mut s.cct_k).speed(50.0).range(1800..=8000).suffix(" K"));
+                    ui.add(egui::DragValue::new(&mut s.cct_k).update_while_editing(false).speed(50.0).range(1800..=8000).suffix(" K"));
                 });
                 // CCT is deliberately NOT in the lux maths, and the UI has to say so or someone
                 // will change it expecting the numbers to move. Lux and candela are already
@@ -25981,7 +25981,7 @@ impl CadApp {
                     num(ui, u, "Pedestal width", &mut d.ped_w, 0.01, 0.25, 0.8);
                     ui.horizontal(|ui| {
                         ui.add_sized([150.0, 18.0], egui::Label::new("Drawers").selectable(false));
-                        ui.add(egui::DragValue::new(&mut d.ped_n).speed(0.1).range(1..=6));
+                        ui.add(egui::DragValue::new(&mut d.ped_n).update_while_editing(false).speed(0.1).range(1..=6));
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([150.0, 18.0], egui::Label::new("Fronts open on").selectable(false));
@@ -26077,7 +26077,7 @@ impl CadApp {
                         ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
                         crate::factory::length_ui(ui, u, &mut r.length, 0.01, 0.4, 6.0);
                         ui.add(
-                            egui::DragValue::new(&mut r.cushions)
+                            egui::DragValue::new(&mut r.cushions).update_while_editing(false)
                                 .speed(0.1)
                                 .range(0..=8)
                                 .custom_formatter(|n, _| if n < 0.5 { "auto".to_string() } else { format!("{n:.0}") }),
@@ -28866,7 +28866,7 @@ impl CadApp {
                     ui.add(egui::TextEdit::singleline(&mut ed.active_original)
                         .desired_width(56.0));
                     ui.label("gain:");
-                    ui.add(egui::DragValue::new(&mut ed.active_gain)
+                    ui.add(egui::DragValue::new(&mut ed.active_gain).update_while_editing(false)
                         .speed(0.05).range(-10.0..=10.0))
                         .on_hover_text("How much each new stretch moves per unit of \
                                         value. 1.0 = full; 0.5 = half (centered).");
@@ -29222,7 +29222,7 @@ impl CadApp {
                             ui.add(egui::TextEdit::singleline(&mut r.original)
                                 .desired_width(52.0));
                             ui.label("gain:");
-                            ui.add(egui::DragValue::new(&mut r.gain)
+                            ui.add(egui::DragValue::new(&mut r.gain).update_while_editing(false)
                                 .speed(0.05).range(-10.0..=10.0));
                             if ui.small_button("✕").clicked() { del = Some(k); }
                         });
@@ -32245,20 +32245,20 @@ impl CadApp {
             }
             Kind::U8 { min, max } => {
                 let mut n: u8 = cur.parse().unwrap_or(min);
-                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)).changed() {
                     changed = Some(n.to_string());
                 }
             }
             Kind::Int { min, max } => {
                 let mut n: i64 = cur.parse().unwrap_or(min);
-                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)).changed() {
                     changed = Some(n.to_string());
                 }
             }
             Kind::Float { min, max } => {
                 let mut f: f64 = cur.parse().unwrap_or(0.0);
                 let speed = ((max - min) / 500.0).clamp(0.001, 1.0);
-                if ui.add(egui::DragValue::new(&mut f).range(min..=max).speed(speed)).changed() {
+                if ui.add(egui::DragValue::new(&mut f).update_while_editing(false).range(min..=max).speed(speed)).changed() {
                     changed = Some(format!("{}", f));
                 }
             }
@@ -39309,17 +39309,17 @@ impl eframe::App for CadApp {
 
                         ui.horizontal(|ui| {
                             ui.label("columns");
-                            ui.add(egui::DragValue::new(&mut self.array_cols)
+                            ui.add(egui::DragValue::new(&mut self.array_cols).update_while_editing(false)
                                 .range(1..=3000_usize).speed(1));
                             ui.label("× rows");
-                            ui.add(egui::DragValue::new(&mut self.array_rows)
+                            ui.add(egui::DragValue::new(&mut self.array_rows).update_while_editing(false)
                                 .range(1..=3000_usize).speed(1));
                         });
                         ui.horizontal(|ui| {
                             ui.label("dx");
-                            ui.add(egui::DragValue::new(&mut self.array_dx).speed(1.0));
+                            ui.add(egui::DragValue::new(&mut self.array_dx).update_while_editing(false).speed(1.0));
                             ui.label("    dy");
-                            ui.add(egui::DragValue::new(&mut self.array_dy).speed(1.0));
+                            ui.add(egui::DragValue::new(&mut self.array_dy).update_while_editing(false).speed(1.0));
                         });
                         let cells = self.array_cols * self.array_rows;
                         let new_dobjects = cells.saturating_sub(1) * sources.len().max(1);
@@ -47634,7 +47634,7 @@ impl CadApp {
                                         ui.selectable_value(&mut b.geom, BufferGeom::Nurbs, "NURBS");
                                     });
                                 ui.label("ACI");
-                                ui.add(egui::DragValue::new(&mut b.dobject_aci).range(0..=255));
+                                ui.add(egui::DragValue::new(&mut b.dobject_aci).update_while_editing(false).range(0..=255));
                             });
                             ui.horizontal(|ui| {
                                 ui.label("CAD layer");
