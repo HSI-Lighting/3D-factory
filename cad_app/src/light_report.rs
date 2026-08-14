@@ -26,6 +26,16 @@ pub struct ReportInput<'a> {
     pub materials: Vec<(String, f32)>,
     /// Fixtures that have no photometric file assigned yet.
     pub unassigned: usize,
+    /// The false-colour palette, as the app has it set. A plain `fn` pointer because the report is
+    /// rendered from a plain struct and must not borrow the app.
+    pub ramp: fn(f32) -> (f32, f32, f32),
+    /// Top of the colour scale, lx — the number without which a false-colour plot means nothing.
+    pub scale_top: f64,
+    /// Whether that top was auto (this room's maximum) or pinned. Stated, because two reports at
+    /// different auto-scales are not comparable and nothing else on the page would say so.
+    pub scale_auto: bool,
+    /// Which cells are inside the room; empty when the plane was not placed on one.
+    pub mask: Vec<bool>,
 }
 
 /// Minimal HTML escaping — a room called `Smith & Sons <Ltd>` must not break the document.
@@ -138,7 +148,64 @@ pub fn render(inp: &ReportInput) -> String {
     }
     h.push_str("</table>");
 
-    // ---- the field --------------------------------------------------------------------------
+    // ---- the FALSE-COLOUR FIELD -----------------------------------------------------------------
+    //
+    // Asked for as: "add the psudo colors layout in the report too."
+    //
+    // The colour AND the number in the same cell, which is how DIALux prints it and the only form
+    // that is both readable and checkable: a ramp shows the shape of the field at a glance and
+    // cannot be read back into values; a table of numbers is exact and shows no shape. Printing
+    // them apart makes the reader hold one in their head while looking at the other.
+    //
+    // The scale is stated WITH the picture. A false-colour plot whose top is unstated says nothing:
+    // the same room reads "mostly red" or "mostly blue" depending on a number in a menu.
+    let top = inp.scale_top.max(1.0);
+    h.push_str("<h2>Illuminance — false colour</h2>");
+    h.push_str("<div class=\"scroll\"><table class=\"fc\">");
+    for r in (0..p.rows).rev() {
+        h.push_str("<tr>");
+        for c in 0..p.cols {
+            let i = (r * p.cols + c) as usize;
+            // A cell outside the room is not the room's result: left blank rather than coloured,
+            // because colouring it reports illuminance on ground the room does not occupy.
+            if inp.mask.get(i).is_some_and(|inside| !inside) {
+                h.push_str("<td class=\"fc out\"></td>");
+                continue;
+            }
+            let v = g.values.get(i).copied().unwrap_or(0.0);
+            let (rr, gg, bb) = (inp.ramp)((v / top) as f32);
+            // Dark text on the bright end of a ramp, light on the dark end — the number has to stay
+            // readable whichever palette was chosen.
+            let lum = 0.2126 * rr + 0.7152 * gg + 0.0722 * bb;
+            let fg = if lum > 0.55 { "#111" } else { "#fff" };
+            h.push_str(&format!(
+                "<td class=\"fc\" style=\"background:rgb({},{},{});color:{fg}\">{v:.0}</td>",
+                (rr * 255.0).round() as u8,
+                (gg * 255.0).round() as u8,
+                (bb * 255.0).round() as u8,
+            ));
+        }
+        h.push_str("</tr>");
+    }
+    h.push_str("</table></div>");
+    h.push_str("<div class=\"legend\"><span class=\"lgz\">0</span><span class=\"lgbar\">");
+    const STEPS: usize = 40;
+    for i in 0..STEPS {
+        let (rr, gg, bb) = (inp.ramp)(i as f32 / (STEPS - 1) as f32);
+        h.push_str(&format!(
+            "<i style=\"background:rgb({},{},{})\"></i>",
+            (rr * 255.0).round() as u8,
+            (gg * 255.0).round() as u8,
+            (bb * 255.0).round() as u8,
+        ));
+    }
+    h.push_str(&format!("</span><span class=\"lgz\">{top:.0} lx</span></div>"));
+    h.push_str(&format!(
+        "<p class=\"note\">Scale 0 – {top:.0} lx ({}).</p>",
+        if inp.scale_auto { "auto — this room's maximum" } else { "pinned" },
+    ));
+
+    // ---- the field, as numbers ------------------------------------------------------------------
     // The whole grid, not a picture of it: a report has to be checkable, and a colour ramp cannot
     // be read back into numbers.
     h.push_str("<h2>Illuminance grid (lx)</h2><div class=\"scroll\"><table class=\"grid\">");
@@ -229,6 +296,18 @@ td,th{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em}
 td.v,td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 table.grid td.g{text-align:right;font-variant-numeric:tabular-nums;padding:4px 7px;font-size:12.5px}
+/* FALSE COLOUR: the cell carries the colour AND the number, so the field can be read at a glance
+   and checked value by value. Fixed cell size so the plot keeps the plane's proportions. */
+table.fc{border-collapse:collapse;margin:2px 0}
+table.fc td.fc{width:44px;height:30px;text-align:center;vertical-align:middle;
+  font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-variant-numeric:tabular-nums;border:1px solid rgba(0,0,0,.18)}
+table.fc td.out{background:transparent;border:1px dashed rgba(128,128,128,.35)}
+/* The legend is the scale the plot was drawn at; without it the picture states nothing. */
+.legend{display:flex;align-items:center;gap:8px;margin:6px 0 2px}
+.legend .lgbar{display:flex;flex:0 0 320px;height:14px;border:1px solid rgba(128,128,128,.5)}
+.legend .lgbar i{flex:1}
+.legend .lgz{font-size:12px;color:#667}
 .scroll{overflow-x:auto}
 .kpi{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}
 .kpi div{flex:1 1 150px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:11px 13px}
@@ -277,6 +356,10 @@ mod tests {
             room_height: 3.0,
             materials: vec![("Floor".into(), 0.2), ("Ceiling".into(), 0.7)],
             unassigned: 0,
+            ramp: crate::light::lux_rgb,
+            scale_top: 500.0,
+            scale_auto: true,
+            mask: Vec::new(),
         }
     }
 
@@ -378,5 +461,122 @@ mod tests {
         let html = render(&i);
         assert!(html.contains("LLMF 0.95"), "sub-factors must be visible");
         assert!(html.contains("0.80"), "…and their product");
+    }
+}
+
+/// THE FALSE-COLOUR FIELD IS ON THE REPORT.
+///
+/// Asked for as: "add the psudo colors layout in the report too." Colour and number in the same
+/// cell — a ramp shows the shape of the field and cannot be read back into values; a table of
+/// numbers is exact and shows no shape.
+#[cfg(test)]
+mod the_report_carries_the_false_colour_field {
+    use super::*;
+
+    fn grid(vals: Vec<f64>, cols: u32, rows: u32) -> LuxGrid {
+        let min = vals.iter().cloned().fold(f64::MAX, f64::min);
+        let max = vals.iter().cloned().fold(f64::MIN, f64::max);
+        let avg = vals.iter().sum::<f64>() / vals.len() as f64;
+        LuxGrid { cols, rows, values: vals, min, max, avg, maintenance: 0.8,
+                  direct: Vec::new(), indirect: Vec::new() }
+    }
+
+    fn plane(cols: u32, rows: u32) -> CalcPlane {
+        CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols, rows }
+    }
+
+    fn base<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
+        ReportInput {
+            title: "R".into(), grid: g, plane: p,
+            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
+            installation: None, surfaces: &[], cylindrical_avg: None,
+            eye_height: 1.2, room_height: 3.0, materials: Vec::new(), unassigned: 0,
+            ramp: crate::light::lux_rgb, scale_top: 500.0, scale_auto: true, mask: Vec::new(),
+        }
+    }
+
+    /// A coloured cell per grid point, each carrying its own value.
+    #[test]
+    fn every_cell_is_coloured_and_labelled() {
+        let g = grid(vec![100.0, 200.0, 300.0, 400.0], 2, 2);
+        let p = plane(2, 2);
+        let html = render(&base(&g, &p));
+        assert_eq!(html.matches("class=\"fc\" style=\"background:rgb(").count(), 4);
+        for v in ["100", "200", "300", "400"] {
+            assert!(html.contains(&format!(">{v}</td>")), "{v} lx is not on the plot");
+        }
+    }
+
+    /// THE SCALE IS STATED. Without it the same room reads "mostly red" or "mostly blue" depending
+    /// on a number in a menu, and two reports are not comparable.
+    #[test]
+    fn the_scale_and_its_mode_are_stated() {
+        let g = grid(vec![100.0, 900.0], 2, 1);
+        let p = plane(2, 1);
+        let auto = render(&base(&g, &p));
+        assert!(auto.contains("500 lx"), "the top of the scale must be on the page");
+        assert!(auto.contains("auto"), "…and whether it was auto");
+
+        let mut pinned = base(&g, &p);
+        pinned.scale_auto = false;
+        assert!(render(&pinned).contains("pinned"), "a pinned scale must say so");
+    }
+
+    /// It follows the CHOSEN palette, so the file matches the screen.
+    #[test]
+    fn it_uses_the_chosen_palette() {
+        let g = grid(vec![500.0], 1, 1);
+        let p = plane(1, 1);
+        let mut grey = base(&g, &p);
+        grey.ramp = crate::light::LuxRamp::Grey.rgb_fn();
+        let html = render(&grey);
+        // Greyscale at the top of the scale is near-white: r == g == b.
+        let c = html
+            .split("class=\"fc\" style=\"background:rgb(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("a coloured cell");
+        let n: Vec<i32> = c.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        assert_eq!(n.len(), 3);
+        assert!(n[0] == n[1] && n[1] == n[2], "greyscale must be neutral, got {n:?}");
+    }
+
+    /// Cells outside the room are blank, not coloured — colouring them would report illuminance on
+    /// ground the room does not occupy.
+    #[test]
+    fn masked_cells_are_left_blank() {
+        let g = grid(vec![100.0, 900.0], 2, 1);
+        let p = plane(2, 1);
+        let mut masked = base(&g, &p);
+        masked.mask = vec![true, false];
+        let html = render(&masked);
+        assert_eq!(html.matches("class=\"fc out\"").count(), 1, "the outside cell is blank");
+        assert_eq!(
+            html.matches("class=\"fc\" style=\"background:rgb(").count(),
+            1,
+            "and only the inside one is coloured",
+        );
+    }
+
+    /// The numeric grid SURVIVES alongside it. The picture is for reading at a glance; the table is
+    /// what makes the report checkable, and losing it to a prettier page would be a regression.
+    #[test]
+    fn the_numeric_grid_is_still_there() {
+        let g = grid(vec![100.0, 200.0, 300.0, 400.0], 2, 2);
+        let p = plane(2, 2);
+        let html = render(&base(&g, &p));
+        assert_eq!(html.matches("class=\"g\"").count(), 4, "every value still has a plain cell");
+        assert!(html.contains("Illuminance grid (lx)"));
+        assert!(html.contains("Illuminance — false colour"));
+    }
+
+    /// A legend, in the same ramp, or the colours mean nothing.
+    #[test]
+    fn there_is_a_legend() {
+        let g = grid(vec![250.0], 1, 1);
+        let p = plane(1, 1);
+        let html = render(&base(&g, &p));
+        assert!(html.contains("class=\"legend\""), "the plot needs its scale drawn");
+        assert!(html.matches("<i style=\"background:rgb(").count() >= 20, "sampled across the ramp");
     }
 }

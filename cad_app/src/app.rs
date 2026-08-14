@@ -7321,7 +7321,11 @@ impl CadApp {
     fn paint_plan_underlay(&self, ui: &egui::Ui, rect: egui::Rect, mvp: &[f32; 16]) {
         // X-RAY ONLY. By default the plan goes in with the depth-tested scene lines instead,
         // so a wall in front of it hides it. See the call site in the 3D render.
-        if !self.factory.show_plan || !self.factory.plan_xray || self.doc.dobjects.is_empty() {
+        // THE PLAN, NOT WHATEVER IS ON THE CANVAS — the same hazard as the depth-tested branch.
+        // While a face sketch is open `self.doc` IS the sketch, so this drew the sketch a second
+        // time, flat on the ground, in the x-ray path too.
+        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+        if !self.factory.show_plan || !self.factory.plan_xray || plan.dobjects.is_empty() {
             return;
         }
         // Clipped to the viewport — a foreground layer otherwise spans the WHOLE window,
@@ -7334,7 +7338,7 @@ impl CadApp {
             ))
             .with_clip_rect(rect);
         let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(120, 175, 225, 160));
-        for d in &self.doc.dobjects {
+        for d in &plan.dobjects {
             // METRES: this projects into the 3D view's world space, so it must be scaled the
             // same way the build tools scale it — otherwise a millimetre plan draws its
             // reference kilometres away from the model it is meant to sit under.
@@ -12753,9 +12757,22 @@ impl CadApp {
                 // lines on a foreground egui layer that always sits over the 3D texture — is
                 // `paint_plan_underlay`, and on a full drawing it reads as texture on the near
                 // wall, because every line on the FAR side of the building projects onto it.
-                if self.factory.show_plan && !self.factory.plan_xray && !self.doc.dobjects.is_empty() {
+                //
+                // THE PLAN, NOT WHATEVER IS ON THE CANVAS. Reported as: "i drew a sketch on a wall
+                // … see how the same drawing is getting drawn in the ground plane too."
+                //
+                // `factory_enter_sketch` REPLACES `self.doc` with the sketch and parks the real
+                // drawing in `session.saved_doc`, so while a face sketch is open `self.doc` is the
+                // sketch. Read here, its u/v coordinates were laid out as world x/y at ground
+                // level: the circle drawn on the wall appeared a second time lying on the floor.
+                // The line above draws the sketch on its own plane, which is the one that is right.
+                //
+                // `plan_doc()` exists for exactly this and has to be used at every site that means
+                // THE PLAN — the swap makes the wrong document the default.
+                let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+                if self.factory.show_plan && !self.factory.plan_xray && !plan.dobjects.is_empty() {
                     let z = self.factory.active_base_z();
-                    lines.extend(self.factory.plan_lines(&self.doc, z));
+                    lines.extend(self.factory.plan_lines(plan, z));
                 }
 
                 // ---- §0.6 PREVIEW — shade / ghost / marching-ants / blip -----
@@ -24986,6 +25003,13 @@ impl CadApp {
                 .map(|m| (m.name.clone(), m.reflectance))
                 .collect(),
             unassigned: self.light.unassigned_count(),
+            // The report is drawn in the SAME palette and at the SAME scale as the screen, so what
+            // gets filed matches what was looked at. Both are stated on the page — a false-colour
+            // plot whose top is unstated is a picture, not a result.
+            ramp: self.light.ramp.rgb_fn(),
+            scale_top: self.light.scale_ceiling(),
+            scale_auto: self.light.scale_max.is_none(),
+            mask: self.light.grid_mask.clone(),
         });
 
         let out = match self.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -55178,5 +55202,73 @@ mod the_quit_dialog_cannot_trap_the_app {
         );
         assert!(b.contains("self.pending_close = true"), "Close without saving authorises the close");
         assert!(b.contains("self.close_after_save = true"), "Save and close authorises it after the save");
+    }
+}
+
+/// A SKETCH BELONGS TO ITS OWN PLANE.
+///
+/// Reported as: "i drew a sketch on a wall … see how the same drawing is getting drawn in the
+/// ground plane too."
+///
+/// `factory_enter_sketch` REPLACES `self.doc` with the sketch and parks the real drawing in
+/// `session.saved_doc`. Every site that means THE PLAN must therefore say so — the swap makes the
+/// wrong document the default, and reading `self.doc` at a plan site lays the sketch's u/v out as
+/// world x/y on the ground.
+#[cfg(test)]
+mod a_sketch_is_not_the_plan {
+    use super::*;
+
+    /// Both plan underlays — the depth-tested one and the x-ray one — must read `plan_doc`.
+    /// Asserted on the source because the drawing needs a live GL context a unit test has not got.
+    #[test]
+    fn both_plan_underlays_read_the_plan() {
+        let src = include_str!("app.rs");
+        for (what, anchor, end) in [
+            ("depth-tested", "THE PLAN, NOT WHATEVER IS ON THE CANVAS. Reported as", "// ---- §0.6 PREVIEW"),
+            ("x-ray", "fn paint_plan_underlay", "\n    fn "),
+        ] {
+            let a = src.find(anchor).unwrap_or_else(|| panic!("{what}: anchor gone"));
+            let b = src[a + anchor.len()..].find(end).map(|e| a + anchor.len() + e).unwrap_or(src.len());
+            let body = &src[a..b];
+            assert!(
+                body.contains("plan_doc_of(self.factory.session.as_ref()"),
+                "{what} underlay must resolve the PLAN, not use self.doc",
+            );
+            for line in body.lines() {
+                let l = line.trim();
+                if l.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !l.contains("&self.doc.dobjects") && !l.contains("plan_lines(&self.doc"),
+                    "{what} underlay still reads self.doc: {l}",
+                );
+            }
+        }
+    }
+
+    /// The helper itself: with a session open it must hand back the SAVED plan, not the sketch.
+    /// This is the property both call sites depend on.
+    #[test]
+    fn plan_doc_returns_the_saved_drawing_while_sketching() {
+        let mut plan = cad_kernel::Document::default();
+        plan.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point { location: Vec2::new(1.0, 2.0), style: 0, size: 0.0 })));
+        let mut sketch = cad_kernel::Document::default();
+        for _ in 0..3 {
+            sketch.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point { location: Vec2::new(9.0, 9.0), style: 0, size: 0.0 })));
+        }
+        let session = crate::factory::SketchSession {
+            idx: 0,
+            saved_doc: plan,
+            saved_undo: Vec::new(),
+            saved_redo: Vec::new(),
+        };
+        // `self.doc` is the sketch during a session — that is the swap.
+        let got = CadApp::plan_doc_of(Some(&session), &sketch);
+        assert_eq!(got.dobjects.len(), 1, "the PLAN has one object; the sketch has three");
+
+        // …and with no session it is simply the document.
+        let got = CadApp::plan_doc_of(None, &sketch);
+        assert_eq!(got.dobjects.len(), 3);
     }
 }
