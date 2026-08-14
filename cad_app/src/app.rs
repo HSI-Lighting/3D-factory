@@ -7342,7 +7342,20 @@ impl CadApp {
             // METRES: this projects into the 3D view's world space, so it must be scaled the
             // same way the build tools scale it — otherwise a millimetre plan draws its
             // reference kilometres away from the model it is meant to sit under.
-            for path in self.outlines_m(&d.geom) {
+            //
+            // BY THE PLAN'S OWN UNITS. `outlines_m` goes through `doc_k()`, which reads
+            // `self.doc.units` — the SKETCH's while a session is open, and a sketch document is
+            // `Document::default()` at 1.0 m/unit. So a millimetre plan (k = 0.001) drew this
+            // underlay at 1000×: the comment directly above describes that failure, and the code
+            // walked into it anyway.
+            //
+            // This is the second half of a fix that was made an hour earlier and corrected only
+            // WHICH DOCUMENT. The sibling branch is right for a structural reason —
+            // `FactoryState::plan_lines` takes `k` from the document it is handed, so it cannot
+            // disagree with itself. This one took the document from a local and the scale from a
+            // global, which is precisely how the two came apart.
+            let k = plan.units.metres_per_unit;
+            for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
                 for w in path.windows(2) {
                     let a = crate::factory::world_to_screen(glam::Vec3::new(w[0].x, w[0].y, 0.0), rect, mvp);
                     let b = crate::factory::world_to_screen(glam::Vec3::new(w[1].x, w[1].y, 0.0), rect, mvp);
@@ -55242,6 +55255,15 @@ mod a_sketch_is_not_the_plan {
                 assert!(
                     !l.contains("&self.doc.dobjects") && !l.contains("plan_lines(&self.doc"),
                     "{what} underlay still reads self.doc: {l}",
+                );
+                // …AND THE SCALE MUST COME FROM THE PLAN TOO. The first version of this test
+                // checked only which DOCUMENT was iterated, and passed over `self.outlines_m`,
+                // which scales by `doc_k()` = `self.doc.units` — the SKETCH's. A millimetre plan
+                // drew at 1000× with the test green. A guard that lists the two spellings someone
+                // already found is whack-a-mole; this names the hazard itself.
+                assert!(
+                    !l.contains("self.outlines_m(") && !l.contains("self.doc_k()"),
+                    "{what} underlay takes its SCALE from self.doc, which is the sketch: {l}",
                 );
             }
         }
