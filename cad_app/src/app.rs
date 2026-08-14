@@ -138,6 +138,16 @@ const PAIR_LIMIT: usize = 5_000_000;
 /// itself — at which distance a real diffuser is not a line source either.
 const EMITTER_SPACING_M: f32 = 0.25;
 
+/// The narrowest a view is allowed to be squeezed to while it is open, in points.
+///
+/// The three views — 2D CAD, 3D Factory, SIMLUX — are peers, and each may be dragged to any width
+/// the user likes; the only rule is that an OPEN view keeps enough to be a view. Without it the
+/// first panel laid out can take the whole window, leaving the next one nowhere to go: it starts
+/// at x = 0, overlaps the first, and — being drawn second — paints on top. That is the reported
+/// "it only extends to a length and when extend it beyond that it goes behind the 3d factory
+/// window". A CLOSED view reserves nothing, so any one of them alone can fill the window.
+const MIN_VIEW_W: f32 = 260.0;
+
 /// The most emitting points one fitting may be sampled into.
 ///
 /// WHY THERE HAS TO BE A CEILING. The spacing above is a length, so the count is the PATH LENGTH
@@ -2017,6 +2027,16 @@ pub struct CadApp {
     materials: MaterialsFactoryState,
     /// The ⏺ Render (path tracer) window is open.
     render_modal_open: bool,
+    /// Is the 2D CAD canvas shown?
+    ///
+    /// The three views — 2D CAD, 3D Factory, SIMLUX — are peers: "make sure the windows of 2d cad
+    /// 3d factory and simlux can be extended to which ever length the user prefers and they can
+    /// close any of them to have any of the single window open". The 2D canvas is egui's
+    /// CentralPanel, which always exists and always takes the remainder, so "closed" here means it
+    /// reserves no width — leaving the whole window to whichever panels are open.
+    ///
+    /// Never all three off; see [`CadApp::keep_one_view_open`].
+    two_d_open: bool,
     /// The Help ▸ Keyboard shortcuts window.
     shortcuts_open: bool,
     /// Was the SIMLUX workspace split on LAST frame? Only the transition matters: the panel's
@@ -3754,6 +3774,7 @@ impl Default for CadApp {
             materials_open: false,
             materials: MaterialsFactoryState::default(),
             render_modal_open: false,
+            two_d_open: true,
             shortcuts_open: false,
             simlux_split_prev: false,
             pt_job: None,
@@ -9948,8 +9969,15 @@ impl CadApp {
             self.factory.recompute();
         }
         let mut open = self.factory.open;
+        // Bounded for the same reason the SIMLUX panel is: this one is laid out SECOND, so egui
+        // already clamps it to what is left — but "what is left" can be the whole window with the
+        // 2D canvas at zero width. The canvas keeps `MIN_VIEW_W`, and only while it is OPEN: with
+        // the 2D view closed this panel is free to fill everything the SIMLUX panel is not using.
+        let keep_2d = if self.two_d_open { MIN_VIEW_W } else { 0.0 };
+        let factory_max = (ctx.available_rect().width() - keep_2d).max(MIN_VIEW_W);
         egui::SidePanel::right("factory_3d_panel")
             .min_width(240.0)
+            .max_width(factory_max)
             .resizable(true)
             .default_width(420.0)
             .show(ctx, |ui| {
@@ -12891,6 +12919,18 @@ impl CadApp {
         self.factory.open = open;
     }
 
+    /// Never leave the user with no view at all.
+    ///
+    /// The three views can each be closed — "they can close any of them to have any of the single
+    /// window open" — but closing the LAST one leaves a window with a menu bar and nothing under
+    /// it, and no obvious way back except the menu they just used. Whichever was closed last is
+    /// re-opened, so the answer to "where did everything go" is that it never went.
+    fn keep_one_view_open(&mut self) {
+        if !self.two_d_open && !self.factory.open && !self.light.view3d_open && !self.light.simlux_mode {
+            self.two_d_open = true;
+        }
+    }
+
     /// Help ▸ Keyboard shortcuts — the whole table, grouped by where each key applies.
     ///
     /// Generated from [`SHORTCUTS`] rather than written out here, so a key that moves in the code
@@ -12981,7 +13021,36 @@ impl CadApp {
         //
         // So force the width on the frame the workspace is ENTERED — which is what half-the-window
         // always meant, a starting position — and leave it freely resizable every frame after.
-        let max = (ctx.screen_rect().width() - 260.0).max(260.0);
+        // LEAVE ROOM FOR THE PANELS THAT COME AFTER THIS ONE.
+        //
+        // Reported twice: "the simlux window ... only extends to a length and when extend it
+        // beyond that it goes behind the 3d factory window."
+        //
+        // `screen - 260` reserved 260 px for everything else — but "everything else" is the 3D
+        // Factory panel AND the 2D canvas, and the Factory alone has a min_width of 240. This
+        // panel is laid out FIRST, so once it takes more than the window can spare the Factory has
+        // nowhere to go: it ends up starting at x = 0, overlapping this one, and because it is
+        // drawn second it paints on top — which is what "goes behind" looks like from here.
+        //
+        // Measured, before and after, in `panel_geometry_measurement`: on a 2763 px window, asking
+        // for 2400 used to put the Factory at 0..449 against a SIMLUX panel starting at 363 — an
+        // 86 px overlap, with the 2D canvas squeezed to zero width.
+        //
+        // Only for the views that are actually OPEN, though. "make sure the windows of 2d cad 3d
+        // factory and simlux can be extended to which ever length the user prefers and they can
+        // close any of them to have any of the single window open" — so a closed view reserves
+        // nothing, and with the other two closed this panel can take the entire window.
+        //
+        // The Factory's width comes from egui's own panel state rather than an assumption, because
+        // that one is draggable too.
+        let factory_w = if self.factory.open {
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("factory_3d_panel"))
+                .map_or(420.0, |s| s.rect.width())
+        } else {
+            0.0
+        };
+        let keep_2d = if self.two_d_open { MIN_VIEW_W } else { 0.0 };
+        let max = (ctx.screen_rect().width() - factory_w - keep_2d).max(MIN_VIEW_W);
         let entering_split = split && !self.simlux_split_prev;
         self.simlux_split_prev = split;
         let base = egui::SidePanel::right("simlux_3d_panel")
@@ -22846,9 +22915,30 @@ impl CadApp {
     /// Modal "unsaved changes" prompt shown when a close was vetoed. Save / Don't Save / Cancel.
     fn render_close_confirm(&mut self, ctx: &egui::Context) {
         let screen = ctx.screen_rect();
+        // ESC IS ALWAYS A WAY OUT. A modal with no keyboard escape is one bug away from being a
+        // hang, and this one WAS that bug — see below.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_confirm = false;
+            self.close_after_save = false;
+            return;
+        }
         // Dimmed backdrop that also swallows clicks behind the dialog.
+        //
+        // ITS ORDER MUST BE BELOW THE DIALOG'S, and that is the whole of a reported hang: "when i
+        // close the app and the save or not windows shows, if i click accidentally outside the
+        // window the app stops responding."
+        //
+        // Both this backdrop and the dialog used to be `Order::Foreground`. Within ONE order egui
+        // raises an area to the top when you interact with it — so clicking the backdrop put a
+        // full-screen, click-swallowing overlay ON TOP of the dialog. The buttons could no longer
+        // be reached, `close_confirm` stayed true, and the close stayed vetoed: an app that is
+        // running and repainting normally and cannot be answered or quit.
+        //
+        // `Middle` is strictly below `Foreground`, and areas in different orders cannot be
+        // reordered past one another, so no amount of clicking can raise it now. It still covers
+        // the panels, which are painted in `Background`.
         egui::Area::new(egui::Id::new("close_confirm_backdrop"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .interactable(true)
             .show(ctx, |ui| {
@@ -38903,6 +38993,19 @@ impl eframe::App for CadApp {
                     {
                         self.factory.recompute();
                     }
+                    // The 2D canvas is a view like the other two, and closing it is how you give
+                    // the whole window to the 3D one. It sits here because this is the menu people
+                    // are in when they want more room for the model.
+                    if ui
+                        .checkbox(&mut self.two_d_open, "  ▤  2D CAD view")
+                        .on_hover_text(
+                            "The drawing canvas. Close it to give the whole window to the 3D \
+                             Factory and SIMLUX; each view can then be dragged to any width.",
+                        )
+                        .changed()
+                    {
+                        self.keep_one_view_open();
+                    }
                     ui.separator();
                     // ---- STOREYS -----------------------------------------
                     // The building's levels. `base_z` is DERIVED (sum of the heights
@@ -39838,6 +39941,12 @@ impl eframe::App for CadApp {
         }
 
         // ---- central panel: canvas --------------------------------------
+        //
+        // ALWAYS SHOWN, even when the 2D view is "closed". egui's CentralPanel takes whatever the
+        // side panels left, so skipping it does not give that space away — it just leaves a hole
+        // that nothing paints. Closing the 2D view instead means it reserves no WIDTH (see
+        // `MIN_VIEW_W`), and with both panels open across the whole window this is the sliver
+        // between them, drawing nothing anyone can see.
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
             let (resp, painter) =
@@ -54759,5 +54868,234 @@ mod the_toolbars_wrap_and_do_not_hover_switch {
         assert!(f.contains("gated.hovered = false"), "the gated copy is what egui must see");
         assert!(f.contains("bar_menu(&gated"), "…and it is what is passed to bar_menu");
         assert!(f.contains("InnerResponse::new(inner, resp)"), "the caller gets the real response");
+    }
+}
+
+/// WHERE DOES THE 3D FACTORY VIEWPORT ACTUALLY GO?
+///
+/// Reported twice: "the simlux window ... only extends to a length and when extend it beyond that
+/// it goes behind the 3d factory window." The screenshots are cropped, so the geometry cannot be
+/// read off them. This measures it instead: run real headless egui frames with the SIMLUX panel
+/// widened step by step, and record what rect each panel ends up with.
+#[cfg(test)]
+mod panel_geometry_measurement {
+    use super::*;
+
+    const W: f32 = 2763.0;
+    const H: f32 = 1298.0;
+
+    /// Drive one frame with the SIMLUX panel forced to `simlux_w`, and report
+    /// `(simlux_rect, factory_rect, central_rect)`.
+    fn frame(app: &mut CadApp, ctx: &egui::Context, simlux_w: f32) -> (egui::Rect, egui::Rect, egui::Rect) {
+        // Force the stored panel width the way a drag would.
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                egui::Id::new("simlux_3d_panel"),
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(
+                        egui::pos2(W - simlux_w, 0.0),
+                        egui::vec2(simlux_w, H),
+                    ),
+                },
+            );
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(W, H))),
+            ..Default::default()
+        };
+        let mut central = egui::Rect::NOTHING;
+        let _ = ctx.run(input, |ctx| {
+            app.render_light_3d_panel(ctx);
+            app.render_factory_panel(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                central = ui.max_rect();
+            });
+        });
+        let get = |id: &str| {
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new(id))
+                .map(|s| s.rect)
+                .unwrap_or(egui::Rect::NOTHING)
+        };
+        (get("simlux_3d_panel"), get("factory_3d_panel"), central)
+    }
+
+    /// THE MEASUREMENT. Prints the geometry at a range of SIMLUX widths so the failure mode is
+    /// visible as numbers rather than inferred from a cropped screenshot.
+    #[test]
+    fn the_panels_never_overlap_at_any_simlux_width() {
+        let mut app = CadApp::default();
+        app.two_d_open = true;
+        app.factory.open = true;
+        app.light.view3d_open = true;
+        app.factory.add_box();
+        app.factory.recompute();
+        let ctx = egui::Context::default();
+
+        // A warm-up frame: egui needs one pass to settle panel state and widget sizes.
+        let _ = frame(&mut app, &ctx, 600.0);
+
+        let mut bad = Vec::new();
+        for w in [400.0_f32, 800.0, 1200.0, 1600.0, 2000.0, 2200.0, 2400.0, 2500.0, 2600.0, 2700.0] {
+            let (s, f, c) = frame(&mut app, &ctx, w);
+            println!(
+                "asked {w:>6.0}  simlux {:>7.1}..{:<7.1} ({:>6.1})   factory {:>7.1}..{:<7.1} ({:>6.1})   central {:>7.1}..{:<7.1} ({:>6.1})",
+                s.left(), s.right(), s.width(),
+                f.left(), f.right(), f.width(),
+                c.left(), c.right(), c.width(),
+            );
+            // The factory panel must sit entirely LEFT of the SIMLUX panel.
+            if f.right() > s.left() + 0.5 {
+                bad.push(format!(
+                    "at simlux width {w:.0}: factory panel reaches {:.1} but SIMLUX starts at {:.1} \
+                     — they overlap by {:.1} px",
+                    f.right(), s.left(), f.right() - s.left(),
+                ));
+            }
+            // …and the 2D canvas must keep something usable.
+            if c.width() < 1.0 {
+                bad.push(format!("at simlux width {w:.0}: the 2D canvas is {:.1} px wide", c.width()));
+            }
+        }
+        assert!(bad.is_empty(), "panel geometry breaks down:\n  {}", bad.join("\n  "));
+    }
+
+    /// EACH VIEW ALONE CAN FILL THE WINDOW. "make sure the windows of 2d cad 3d factory and simlux
+    /// can be extended to which ever length the user prefers and they can close any of them to
+    /// have any of the single window open."
+    #[test]
+    fn one_view_alone_gets_the_whole_window() {
+        // SIMLUX alone.
+        let mut app = CadApp::default();
+        app.two_d_open = false;
+        app.factory.open = false;
+        app.light.view3d_open = true;
+        let ctx = egui::Context::default();
+        let _ = frame(&mut app, &ctx, 600.0);
+        let (s, _f, _c) = frame(&mut app, &ctx, W);
+        println!("simlux alone: {:.1}..{:.1} ({:.1}) of {W}", s.left(), s.right(), s.width());
+        assert!(
+            s.width() > W - MIN_VIEW_W - 1.0,
+            "with the others closed SIMLUX must take the window, got {:.1} of {W}",
+            s.width(),
+        );
+
+        // The 3D Factory alone. A panel keeps whatever width it was dragged to — it does not grow
+        // on its own — so what is under test is that its LIMIT allows the whole window. Drag it
+        // there, the way the user would.
+        let mut app = CadApp::default();
+        app.two_d_open = false;
+        app.factory.open = true;
+        app.light.view3d_open = false;
+        let ctx = egui::Context::default();
+        let _ = frame(&mut app, &ctx, 600.0);
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                egui::Id::new("factory_3d_panel"),
+                egui::containers::panel::PanelState {
+                    rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(W, H)),
+                },
+            );
+        });
+        let (_s, f, _c) = frame(&mut app, &ctx, 600.0);
+        println!("factory alone: {:.1}..{:.1} ({:.1}) of {W}", f.left(), f.right(), f.width());
+        assert!(
+            f.width() > W - MIN_VIEW_W - 1.0,
+            "with the others closed the 3D Factory must be allowed the window, got {:.1} of {W}",
+            f.width(),
+        );
+
+        // The 2D canvas alone.
+        let mut app = CadApp::default();
+        app.two_d_open = true;
+        app.factory.open = false;
+        app.light.view3d_open = false;
+        let ctx = egui::Context::default();
+        let _ = frame(&mut app, &ctx, 600.0);
+        let (_s, _f, c) = frame(&mut app, &ctx, 600.0);
+        println!("2D alone: {:.1}..{:.1} ({:.1}) of {W}", c.left(), c.right(), c.width());
+        assert!(c.width() > W - 40.0, "the 2D canvas alone must take the window, got {:.1}", c.width());
+    }
+
+    /// Closing the last view must not leave an empty window.
+    #[test]
+    fn the_last_view_cannot_be_closed() {
+        let mut app = CadApp::default();
+        app.two_d_open = false;
+        app.factory.open = false;
+        app.light.view3d_open = false;
+        app.light.simlux_mode = false;
+        app.keep_one_view_open();
+        assert!(app.two_d_open, "closing the last view must bring one back");
+    }
+}
+
+/// THE QUIT DIALOG MUST STAY REACHABLE.
+///
+/// Reported as: "when i close the app and the save or not windows shows, if i click accidentally
+/// outside the window the app stops responding."
+///
+/// The dimmed backdrop and the dialog were both `Order::Foreground`. Within one order egui raises
+/// an area to the top when you interact with it, so clicking the backdrop put a full-screen,
+/// click-swallowing overlay ON TOP of the dialog: the buttons became unreachable, `close_confirm`
+/// stayed true and the close stayed vetoed. The app was running and repainting the whole time —
+/// it just could not be answered or quit.
+#[cfg(test)]
+mod the_quit_dialog_cannot_trap_the_app {
+    use super::*;
+
+    fn body() -> &'static str {
+        let src = include_str!("app.rs");
+        let a = src.find("fn render_close_confirm").expect("the dialog");
+        let b = src[a..].find("\n    /// ").map(|e| a + e).unwrap_or(src.len());
+        &src[a..b]
+    }
+
+    /// The backdrop must be strictly BELOW the dialog, so no click can raise it over the buttons.
+    #[test]
+    fn the_backdrop_is_below_the_dialog() {
+        let b = body();
+        let backdrop = b.find("close_confirm_backdrop").expect("the backdrop");
+        let win = b.find("Window::new(\"close_confirm\")").expect("the dialog window");
+        assert!(backdrop < win, "the backdrop must be declared before the dialog");
+
+        // The order each one is given, taken from its own section of the function.
+        let backdrop_order = b[backdrop..win].contains("Order::Middle");
+        let dialog_order = b[win..].contains("Order::Foreground");
+        assert!(
+            backdrop_order,
+            "the backdrop must be Order::Middle — at Foreground a click raises it over the dialog",
+        );
+        assert!(dialog_order, "the dialog must be Order::Foreground, above the backdrop");
+        assert!(
+            !b[backdrop..win].contains("Order::Foreground"),
+            "the backdrop must NOT share the dialog's order — that is the reported hang",
+        );
+    }
+
+    /// And there must be a keyboard way out regardless.
+    #[test]
+    fn escape_dismisses_it() {
+        let b = body();
+        let esc = b.find("Key::Escape").expect("Esc must dismiss the dialog");
+        let backdrop = b.find("close_confirm_backdrop").unwrap();
+        assert!(esc < backdrop, "the Esc check must run before anything can swallow input");
+        assert!(
+            b[esc..backdrop].contains("self.close_confirm = false"),
+            "Esc must actually clear the flag that vetoes the close",
+        );
+    }
+
+    /// Answering it must not leave the app permanently unable to quit: every button clears
+    /// `close_confirm`, and exactly one of them authorises the close.
+    #[test]
+    fn every_button_clears_the_veto() {
+        let b = body();
+        assert_eq!(
+            b.matches("self.close_confirm = false").count(),
+            4,
+            "Esc + Save + Don't Save + Cancel must each clear the veto",
+        );
+        assert!(b.contains("self.pending_close = true"), "Close without saving authorises the close");
+        assert!(b.contains("self.close_after_save = true"), "Save and close authorises it after the save");
     }
 }
