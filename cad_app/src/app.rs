@@ -4951,7 +4951,36 @@ impl CadApp {
     }
 
     /// Promote the selection to 3D walls, reporting both what converted and what did not.
+    /// Refuse a PLAN-level build while a face sketch is open, and say why.
+    ///
+    /// The ▼ Building rows — Make building / room / floor / ceiling / 3D walls — read
+    /// `self.selection`, which indexes whatever document is installed, and `self.doc`, which during
+    /// a session IS the sketch. Draw a rectangle on a wall, select it, click Make floor, and a slab
+    /// lands flat on the GROUND at that wall sketch's local (u, v): the reported circle-on-the-floor
+    /// bug promoted to a permanent CSG feature. Make room is worse — it carves a void, walls and a
+    /// ceiling out of the actual building.
+    ///
+    /// SWAPPING IN `plan_doc()` WOULD BE WRONG HERE, which is the trap. `self.selection` indexes the
+    /// installed document — `factory_reset_doc_state` clears it on every swap precisely to keep that
+    /// invariant — so plan indices would silently build a DIFFERENT wrong thing. There is no correct
+    /// answer while a sketch is open, so the honest one is to decline and say so.
+    fn refuse_plan_action_in_sketch(&mut self, what: &str) -> bool {
+        if self.factory.session.is_none() {
+            return false;
+        }
+        let msg = format!(
+            "{what} works on the PLAN, and a face sketch is open — finish the sketch first \
+             (✔ Finish sketch), then select the outline on the plan."
+        );
+        self.history.push(format!("  ! {msg}"));
+        self.factory.status = msg;
+        true
+    }
+
     fn do_make_3d_wall(&mut self) {
+        if self.refuse_plan_action_in_sketch("Make 3D walls") {
+            return;
+        }
         if !self.can_make_3d_wall() {
             let msg = "select walls / lines / polylines in 2D first, then Make 3D walls";
             self.factory.status = msg.into();
@@ -4970,6 +4999,9 @@ impl CadApp {
 
     /// Extrude the selected closed outline into one solid mass on the active storey.
     fn do_make_building(&mut self) {
+        if self.refuse_plan_action_in_sketch("Make building") {
+            return;
+        }
         let Some(outline) = self.slab_outline_from_selection() else {
             // Say what to do, rather than doing nothing. On the STATUS line as well as
             // the history: a user who clicked a menu row is looking at the viewport, not
@@ -5007,6 +5039,9 @@ impl CadApp {
     /// outline. The whole point of "add a room": click a polygon inside the building and
     /// it hollows out that space.
     fn do_make_room(&mut self) {
+        if self.refuse_plan_action_in_sketch("Make room") {
+            return;
+        }
         let Some(outline) = self.slab_outline_from_selection() else {
             let msg = "select a CLOSED outline first, then Make room";
             self.factory.status = msg.into();
@@ -5061,6 +5096,9 @@ impl CadApp {
 
     /// Floor (`is_floor`) or ceiling slab across the selected outline, on the active storey.
     fn do_make_slab(&mut self, is_floor: bool) {
+        if self.refuse_plan_action_in_sketch("Make floor / ceiling") {
+            return;
+        }
         let what = if is_floor { "floor" } else { "ceiling" };
         let Some(outline) = self.slab_outline_from_selection() else {
             let msg = format!("{what}: select a CLOSED outline in 2D first");
@@ -7984,7 +8022,32 @@ impl CadApp {
             if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
                 sk.doc = sketch_doc;
             }
+            // 3D WORK DONE INSIDE A SKETCH IS STILL UNDOABLE.
+            //
+            // This used to be `self.undo_stack = s.saved_undo`, discarding the whole session
+            // stack. That is right for the DOC steps — a sketch has its own 2D history, and it
+            // ends with the sketch — and wrong for the FACTORY ones, which are snapshots of the
+            // 3D MODEL and outlive it. `factory_extrude_sketch` snapshots, builds the solid, then
+            // `factory_consume_sketch` calls this: the operation destroyed its own undo step, so
+            // Ctrl+Z afterwards walked back into whatever 2D action preceded entering the sketch
+            // while the new solid stayed. That is the flagship flow — draw on a face, Extrude —
+            // losing exactly its own history.
+            //
+            // The model steps are carried out and appended, so the most recent 3D operation is
+            // the first thing Ctrl+Z reaches. Each already records the sketch's real contents
+            // (see `snapshot_factory`), so undoing one cannot erase the drawing on the face.
+            let carried: Vec<UndoStep> = std::mem::take(&mut self.undo_stack)
+                .into_iter()
+                .filter(|u| matches!(u, UndoStep::Factory(_)))
+                .collect();
             self.undo_stack = s.saved_undo;
+            self.undo_stack.extend(carried);
+            if self.undo_stack.len() > UNDO_STACK_CAP {
+                let drop = self.undo_stack.len() - UNDO_STACK_CAP;
+                self.undo_stack.drain(0..drop);
+            }
+            // The redo stack does NOT come out. A redo is only meaningful against the undo history
+            // it was made from, and that history has just been replaced.
             self.redo_stack = s.saved_redo;
             // same hazard in reverse: sketch-relative indices must not survive into
             // the model-space document.
@@ -28537,8 +28600,22 @@ impl CadApp {
         if self.undo_stack.len() >= UNDO_STACK_CAP {
             self.undo_stack.remove(0);
         }
+        // A SNAPSHOT TAKEN INSIDE A SKETCH MUST NOT RECORD THAT SKETCH AS EMPTY.
+        //
+        // `factory_enter_sketch` does `mem::take` on `model.sketches[idx].doc` and installs it as
+        // `self.doc`, so while a session is live the MODEL's copy of the open plane is empty. A
+        // Factory snapshot clones the model — hole and all — and undoing to it after the sketch
+        // closed would restore that empty doc and wipe everything drawn on the face.
+        //
+        // Patched at the source, so every snapshot is self-consistent whoever takes one.
+        let mut model = self.factory.model.clone();
+        if let Some(s) = self.factory.session.as_ref() {
+            if let Some(sk) = model.sketches.get_mut(s.idx) {
+                sk.doc = self.doc.clone();
+            }
+        }
         self.undo_stack.push(UndoStep::Factory(FactorySnap {
-            model: self.factory.model.clone(),
+            model,
             walls: self.factory.walls.clone(),
             storeys: self.factory.storeys.clone(),
             active_storey: self.factory.active_storey,
@@ -55414,5 +55491,127 @@ mod a_plane_shares_the_drawings_layers {
         );
         // …and the GROUND PLAN rule must survive: it is a separate case, not covered by the toggle.
         assert!(body.contains("ground_only"), "the plan's own rule must still apply");
+    }
+}
+
+/// 3D WORK DONE INSIDE A SKETCH IS STILL UNDOABLE, AND PLAN TOOLS DECLINE TO RUN THERE.
+///
+/// Both from the `self.doc`-swap audit. `factory_exit_sketch` used to discard the whole session
+/// undo stack, so `draw on a face → Extrude` destroyed its own undo step; and the ▼ Building rows
+/// were clickable while a sketch was open, building ground geometry out of a wall sketch's (u, v).
+#[cfg(test)]
+mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
+    use super::*;
+
+    fn app_with_a_box() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.factory.add_box();
+        app.factory.recompute();
+        app
+    }
+
+    /// THE FLAGSHIP FLOW. A 3D snapshot taken inside a sketch must survive the sketch closing.
+    #[test]
+    fn a_model_change_made_in_a_sketch_survives_the_exit() {
+        let mut app = app_with_a_box();
+        app.undo_stack.clear();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+
+        app.snapshot_factory(); // what Extrude / Cut / a gizmo move each do
+        app.factory.add_box(); // …then change the model
+        app.factory_exit_sketch();
+
+        assert!(
+            app.undo_stack.iter().any(|u| matches!(u, UndoStep::Factory(_))),
+            "the 3D step was thrown away with the sketch's own history — Ctrl+Z would walk past it",
+        );
+    }
+
+    /// The sketch's OWN 2D history does not come out. It belongs to the sketch, which has closed.
+    #[test]
+    fn the_sketches_2d_history_stays_behind() {
+        let mut app = app_with_a_box();
+        app.undo_stack.clear();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.snapshot_doc(); // a 2D edit inside the sketch
+        app.factory_exit_sketch();
+        assert!(
+            !app.undo_stack.iter().any(|u| matches!(u, UndoStep::Doc(_))),
+            "a sketch's 2D history must end with the sketch",
+        );
+    }
+
+    /// THE COROLLARY, and the trap: a snapshot taken mid-session must record the face's drawing,
+    /// not the empty hole `mem::take` left in the model. Otherwise undoing a 3D step after the
+    /// sketch closed would erase everything drawn on that face.
+    #[test]
+    fn a_snapshot_taken_in_a_sketch_keeps_that_faces_drawing() {
+        let mut app = app_with_a_box();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let idx = app.factory.session.as_ref().expect("a session").idx;
+        // Draw something on the face.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point {
+            location: Vec2::new(1.0, 1.0),
+            style: 0,
+            size: 0.0,
+        })));
+        app.snapshot_factory();
+
+        let snap = app
+            .undo_stack
+            .iter()
+            .rev()
+            .find_map(|u| match u {
+                UndoStep::Factory(f) => Some(f),
+                _ => None,
+            })
+            .expect("a factory snapshot");
+        assert_eq!(
+            snap.model.sketches[idx].doc.dobjects.len(),
+            1,
+            "the snapshot recorded the open plane as EMPTY — undoing to it would wipe the face",
+        );
+    }
+
+    /// PLAN TOOLS DECLINE while a sketch is open, rather than building from its (u, v).
+    #[test]
+    fn the_building_tools_refuse_inside_a_sketch() {
+        let mut app = app_with_a_box();
+        let before = app.factory.model.features.len();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        // A closed outline on the FACE, which is exactly the gesture that used to build a slab.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (2.0, 0.0), (2.0, 2.0), (0.0, 2.0)]
+                .into_iter()
+                .map(|(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.selection = vec![0];
+
+        app.do_make_slab(true);
+        app.do_make_building();
+        app.do_make_room();
+        app.do_make_3d_wall();
+
+        assert_eq!(
+            app.factory.model.features.len(),
+            before,
+            "a plan tool built geometry from a face sketch's local coordinates",
+        );
+        assert!(
+            app.factory.status.contains("face sketch is open"),
+            "and it must SAY why rather than silently doing nothing: {}",
+            app.factory.status,
+        );
+    }
+
+    /// …and they still work normally with no sketch open.
+    #[test]
+    fn the_building_tools_still_work_on_the_plan() {
+        let mut app = app_with_a_box();
+        assert!(!app.refuse_plan_action_in_sketch("Make floor"), "no session, no refusal");
     }
 }
