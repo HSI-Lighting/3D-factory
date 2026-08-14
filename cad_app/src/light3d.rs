@@ -120,7 +120,9 @@ impl Default for ProcParams {
     }
 }
 
-const CEILING: u32 = 2; // material id skipped in the viewer so we can look in
+// (There was a `const CEILING: u32 = 2` here, "material id skipped in the viewer so we can
+// look in". It was the whole of the SIMLUX hide-ceilings bug: the viewer skipped it whatever the
+// toggle said. Hiding the ceiling is the caller's decision now, so nothing here needs the id.)
 const FLOOR: u32 = 0;
 
 const IDENTITY16: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
@@ -186,9 +188,19 @@ fn material_color(materials: &[Material], id: u32) -> [f32; 3] {
     materials.iter().find(|m| m.id == id).map(|m| m.color).unwrap_or([0.7, 0.7, 0.7])
 }
 
-/// Build the flat-shaded triangle soup for the room. The ceiling is skipped so
-/// the camera can look down into the room. If `floor_grid` is given, floor
-/// vertices are coloured by sampled lux (P3) instead of the floor material.
+/// Build the flat-shaded triangle soup for the room. If `floor_grid` is given, floor vertices are
+/// coloured by sampled lux (P3) instead of the floor material.
+///
+/// IT DRAWS WHAT IT IS GIVEN. This used to skip `material == CEILING` unconditionally — "the ceiling
+/// is skipped so the camera can look down into the room" — which made the SIMLUX hide-ceilings
+/// toggle DEAD CODE for the whole life of the toggle: ticked or unticked, the ceiling was never
+/// drawn. That is the reported "hide ceiling in simlux doesnt work", and it went unnoticed because
+/// the SIMLUX default is `hide_ceilings: true`, so the broken state and the intended state looked
+/// identical out of the box.
+///
+/// Whether to hide the ceiling is the CALLER's decision. There is exactly one caller and it makes
+/// that decision explicitly; a filter here could only ever remove meshes this function was about to
+/// drop anyway, while silently overriding the one that mattered.
 pub fn build_scene_verts(
     meshes: &[Mesh],
     materials: &[Material],
@@ -196,9 +208,6 @@ pub fn build_scene_verts(
 ) -> Vec<V3> {
     let mut out = Vec::new();
     for m in meshes {
-        if m.material == CEILING {
-            continue;
-        }
         let base = material_color(materials, m.material);
         for t in &m.triangles {
             let (Some(a), Some(b), Some(c)) =
@@ -6580,3 +6589,58 @@ mod tests {
     }
 }
 
+
+/// THE VIEWER DRAWS WHAT IT IS GIVEN.
+///
+/// `build_scene_verts` used to skip `material == CEILING` unconditionally, which made the SIMLUX
+/// hide-ceilings toggle dead code for the whole life of the toggle — the reported "hide ceiling in
+/// simlux doesnt work". The old test for it grepped `app.rs` for the string "hide_ceilings"; it
+/// could not observe behaviour and could not see this file at all, so it passed throughout.
+#[cfg(test)]
+mod the_viewer_draws_what_it_is_given {
+    use cad_light::{default_materials, Mesh, Triangle, Vertex};
+
+    fn quad(material: u32, z: f32) -> Mesh {
+        Mesh {
+            vertices: vec![
+                Vertex::new(0.0, 0.0, z),
+                Vertex::new(1.0, 0.0, z),
+                Vertex::new(1.0, 1.0, z),
+                Vertex::new(0.0, 1.0, z),
+            ],
+            triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
+            material,
+        }
+    }
+
+    /// A ceiling mesh must reach the vertex buffer. THIS IS THE TEST THAT WOULD HAVE CAUGHT IT:
+    /// against the old code the two counts were equal, because the ceiling was dropped here.
+    #[test]
+    fn a_ceiling_mesh_reaches_the_buffer() {
+        let mats = default_materials();
+        let floor_only = super::build_scene_verts(&[quad(0, 0.0)], &mats, None).len();
+        let with_ceiling =
+            super::build_scene_verts(&[quad(0, 0.0), quad(2, 3.0)], &mats, None).len();
+        assert!(
+            with_ceiling > floor_only,
+            "material 2 must be drawn when it is passed in — {with_ceiling} verts against \
+             {floor_only} without it. Hiding it is the caller's decision, not this function's.",
+        );
+        assert_eq!(
+            with_ceiling - floor_only,
+            6,
+            "and it must be the whole ceiling: two triangles, six vertices",
+        );
+    }
+
+    /// Every material it is handed gets drawn — no material is special here.
+    #[test]
+    fn no_material_is_silently_dropped() {
+        let mats = default_materials();
+        let base = super::build_scene_verts(&[], &mats, None).len();
+        for mat in [0u32, 1, 2, cad_light::MATERIAL_FURNITURE] {
+            let n = super::build_scene_verts(&[quad(mat, 1.0)], &mats, None).len();
+            assert_eq!(n - base, 6, "material {mat} was dropped by the viewer");
+        }
+    }
+}

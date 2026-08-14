@@ -68,6 +68,35 @@ pub struct LumDrag {
 /// Returns empty when the model is empty, so the caller falls back to the extrusion and a
 /// 2D-only project keeps working exactly as before.
 pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
+    meshes_from_factory_ex(f, None)
+}
+
+/// [`meshes_from_factory`], optionally with everything that LIDS THE ROOM left out — DRAWING only.
+///
+/// Reported twice: "hide ceiling in simlux doesnt work". The view filtered by MATERIAL, and material
+/// here is assigned by ORIENTATION: a ceiling slab is a box, so its underside is material 2 and was
+/// dropped while its TOP face is `n.z > 0.7` — material 0, *floor* — and stayed. Looking down at the
+/// room you still saw a solid lid, so the toggle appeared to do nothing.
+///
+/// FILTERING BY FEATURE IS NOT ENOUGH EITHER, which the tests measured before this settled: on a
+/// 10 × 8 m building with an 8 × 6 m room carved out of it, dropping the hidden-ceiling features
+/// took the room's slab — 48 m² of 80 — and left the building's own roof, the 32 m² annulus around
+/// it, because that roof belongs to the same feature as the WALLS and dropping the feature would
+/// take the walls with it.
+///
+/// So the rule is geometric and says what it means: a triangle is part of the lid when it is
+/// HORIZONTAL (`|n.z| > 0.7`, either way up, so a soffit goes with its slab) and sits ABOVE
+/// `hide_above`. Nothing legitimate is horizontal between the working plane and a real ceiling
+/// except furniture, which is bucketed separately and never filtered here. A mezzanine floor goes
+/// too — which is what looking down from above means.
+///
+/// `hide_above` must only ever be `Some` for a DISPLAY build. The calculation has to keep the
+/// ceiling: it is around 70 % of the interreflection, and a view option that changed the answer
+/// would be a trap.
+pub fn meshes_from_factory_ex(
+    f: &crate::factory::FactoryState,
+    hide_above: Option<f32>,
+) -> Vec<Mesh> {
     let pos = &f.cached.positions;
     if pos.len() < 3 && f.furniture.is_empty() {
         return Vec::new();
@@ -83,6 +112,12 @@ pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
         let n = (b - a).cross(c - a).normalize_or_zero();
         if n.length_squared() < 0.5 {
             continue; // degenerate sliver: it can only add noise to the trace
+        }
+        if let Some(z) = hide_above {
+            // Horizontal, and above the line the result is read on: this is the lid.
+            if n.z.abs() > 0.7 && a.z.min(b.z).min(c.z) > z {
+                continue;
+            }
         }
         // 0.7 ≈ 45°, so a surface is floor or ceiling only when it is nearer flat than upright.
         // A sloped ceiling therefore reads as a wall, which is the conservative way round.
@@ -3479,12 +3514,135 @@ mod the_simlux_view_can_be_read {
         let a = src.find("fn build_scene3d_verts").expect("the SIMLUX vertex builder");
         let b = src[a..].find("\n    /// SIMLUX 3D viewport").map(|e| a + e).unwrap_or(src.len());
         let body = &src[a..b];
-        assert!(body.contains("hide_ceilings"), "the view filters the ceiling out");
+        // THIS ASSERTION USED TO BE THE WHOLE TEST, and it passed for the entire life of a toggle
+        // that did nothing: `build_scene_verts` dropped the ceiling unconditionally over in
+        // light3d.rs, which this test cannot see — and could not have observed in any case, because
+        // it greps a string instead of running the code. The behaviour is now covered where it
+        // belongs: `light3d::the_viewer_draws_what_it_is_given`, proven to fail against the old
+        // code, and `hiding_the_ceiling_opens_the_room`, which measures the area of the lid.
+        assert!(body.contains("hide_ceilings"), "the view must still consult the flag");
         // The filter has to be on a COPY for drawing. If `self.light.meshes` itself were pruned,
         // the next Calculate would run on a room with no ceiling.
         assert!(
             !body.contains("self.light.meshes.retain") && !body.contains("meshes.retain"),
             "the scene meshes must not be pruned in place — Calculate reads them",
         );
+    }
+}
+
+/// HIDING THE CEILING IN SIMLUX MUST ACTUALLY OPEN THE ROOM.
+///
+/// Reported twice: "hide ceiling in simlux doesnt work". The view filtered by MATERIAL, and
+/// material is assigned by ORIENTATION — so a ceiling slab lost its underside (material 2) and kept
+/// its top face (material 0, floor). Looking down, the room was still lidded.
+#[cfg(test)]
+mod hiding_the_ceiling_opens_the_room {
+    use super::*;
+
+    /// A building with a room carved out of it, so there is a real ceiling slab AND a roof.
+    fn a_building() -> crate::factory::FactoryState {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(
+            &[
+                glam::Vec2::new(0.0, 0.0),
+                glam::Vec2::new(10.0, 0.0),
+                glam::Vec2::new(10.0, 8.0),
+                glam::Vec2::new(0.0, 8.0),
+                glam::Vec2::new(0.0, 0.0),
+            ],
+            3.0,
+        )
+        .expect("building");
+        f.add_room(&[
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(9.0, 1.0),
+            glam::Vec2::new(9.0, 7.0),
+            glam::Vec2::new(1.0, 7.0),
+            glam::Vec2::new(1.0, 1.0),
+        ])
+        .expect("room");
+        f.recompute();
+        f
+    }
+
+    /// The area of every UPWARD-facing triangle above the working plane — the "lid" you are looking
+    /// through from above. Hiding the ceiling has to remove most of it; the OLD material filter
+    /// removed none of it, which is the whole bug.
+    fn lid_area(meshes: &[Mesh]) -> f64 {
+        let mut a = 0.0;
+        for m in meshes {
+            for t in &m.triangles {
+                let p = |i: u32| {
+                    let v = m.vertices[i as usize];
+                    glam::Vec3::new(v.x, v.y, v.z)
+                };
+                let (x, y, z) = (p(t.a), p(t.b), p(t.c));
+                let cr = (y - x).cross(z - x);
+                let n = cr.normalize_or_zero();
+                // Upward-facing and above head height: this is a lid, not a floor.
+                if n.z > 0.7 && x.z.min(y.z).min(z.z) > 2.0 {
+                    a += (cr.length() * 0.5) as f64;
+                }
+            }
+        }
+        a
+    }
+
+    /// THE BUG. Filtering by material leaves the lid in place.
+    #[test]
+    fn the_old_material_filter_did_not_open_the_room() {
+        let f = a_building();
+        let all = meshes_from_factory(&f);
+        let by_material: Vec<Mesh> = all.iter().filter(|m| m.material != 2).cloned().collect();
+        let before = lid_area(&all);
+        assert!(before > 10.0, "precondition: there is a lid to remove, got {before:.1} m2");
+        assert!(
+            (lid_area(&by_material) - before).abs() < 1e-6,
+            "the material filter removes NONE of the lid — that is the reported bug",
+        );
+    }
+
+    /// THE FIX. Filtering by feature takes the lid with it.
+    #[test]
+    fn filtering_by_feature_opens_the_room() {
+        let f = a_building();
+        let before = lid_area(&meshes_from_factory(&f));
+        let after = lid_area(&meshes_from_factory_ex(&f, Some(0.8)));
+        println!("lid above 2 m: {before:.2} m2 -> {after:.2} m2");
+        assert!(
+            after < before * 0.25,
+            "hiding the ceiling must open the room: {before:.2} m2 of lid became {after:.2} m2",
+        );
+    }
+
+    /// …and the walls and floor must survive. An "open" room with no walls is a different bug.
+    #[test]
+    fn the_rest_of_the_building_survives() {
+        let f = a_building();
+        let all = meshes_from_factory(&f);
+        let open = meshes_from_factory_ex(&f, Some(0.8));
+        let tris = |m: &[Mesh], mat: u32| {
+            m.iter().filter(|x| x.material == mat).map(|x| x.triangles.len()).sum::<usize>()
+        };
+        // The walls are what you look INTO the room past, so they must survive. Not bit-identical
+        // though: a ceiling slab has vertical edge faces, which are bucketed as wall and go with
+        // the slab. Measuring "most of it" is the honest assertion — the first version of this test
+        // demanded equality and failed on exactly those edge faces.
+        let (wall_all, wall_open) = (tris(&all, 1), tris(&open, 1));
+        assert!(
+            wall_open as f64 > wall_all as f64 * 0.7,
+            "the walls must survive: {wall_all} triangles became {wall_open}",
+        );
+        assert!(tris(&open, 0) > 0, "the floor must still be there — it is what the result is on");
+    }
+
+    /// THE CALCULATION MUST STILL SEE THE CEILING. It is around 70 % of the interreflection, and a
+    /// view option that changed the answer would be a trap.
+    #[test]
+    fn the_unfiltered_build_is_unchanged() {
+        let f = a_building();
+        let plain = meshes_from_factory(&f);
+        let ceil = plain.iter().filter(|m| m.material == 2).map(|m| m.triangles.len()).sum::<usize>();
+        assert!(ceil > 0, "the default build must still contain the ceiling for Calculate");
     }
 }

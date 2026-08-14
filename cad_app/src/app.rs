@@ -4643,15 +4643,27 @@ impl CadApp {
         // surface this view exists to show. Filtered here rather than in the mesh build so the
         // CALCULATION still sees the ceiling — it is 70 % of the interreflection, and a view
         // option that changed the answer would be a trap.
-        let shown: Vec<cad_light::Mesh> = if self.light.hide_ceilings {
-            self.light
-                .meshes
-                .iter()
-                .filter(|m| m.material != 2)
-                .cloned()
-                .collect()
-        } else {
+        // …and filtered by FEATURE, not by material. Material here is assigned by ORIENTATION, so
+        // dropping material 2 took only the ceiling's UNDERSIDE: its top face is `n.z > 0.7`, i.e.
+        // material 0 (floor), and stayed — as did the building's own roof. Looking down, the room
+        // was still lidded and the toggle looked broken, which is what was reported. Twice.
+        //
+        // Rebuilt from the factory with the ceiling features left out, the way the 3D Factory does
+        // it, so both faces go. `self.light.meshes` is untouched and Calculate still sees the
+        // ceiling. With no 3D model — a 2D-only project lit from the plan extrusion — there are no
+        // features to ask about, so the old material filter is still the best available.
+        let shown: Vec<cad_light::Mesh> = if !self.light.hide_ceilings {
             self.light.meshes.clone()
+        } else if self.factory.cached.positions.len() >= 3 {
+            // Everything horizontal above the working plane. See `meshes_from_factory_ex` for why
+            // this is geometric and not per-material or per-feature — both of those were tried and
+            // measured, and both left the room lidded.
+            crate::light::meshes_from_factory_ex(
+                &self.factory,
+                Some(self.light.plane_height.max(0.1)),
+            )
+        } else {
+            self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
         };
         let mut verts = crate::light3d::build_scene_verts(&shown, &self.light.materials, floor);
         let s = (self.light.cam_dist * 0.02).clamp(0.05, 0.3);
