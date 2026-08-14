@@ -720,7 +720,7 @@ fn tri_is_translucent(asset: &FurnitureAsset, base: usize) -> bool {
 /// Even–odd ray-cast point-in-polygon test in XY. Used to tell whether a ceiling triangle
 /// sits over the OPEN room interior (a floor footprint) — where it is hidden — or over the
 /// surrounding wall, where it is kept.
-fn point_in_poly(poly: &[Vec2], x: f32, y: f32) -> bool {
+pub fn point_in_poly(poly: &[Vec2], x: f32, y: f32) -> bool {
     let mut inside = false;
     let n = poly.len();
     let mut j = n - 1;

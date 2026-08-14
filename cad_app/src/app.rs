@@ -4326,7 +4326,14 @@ impl CadApp {
         let clip = painter.with_clip_rect(rect);
         for row in 0..plane.rows {
             for col in 0..plane.cols {
-                let v = grid.values[(row * plane.cols + col) as usize];
+                let i = (row * plane.cols + col) as usize;
+                // Cells outside the room are not the room's result and are not painted. A grid is
+                // a rectangle and a room need not be; those cells were computed, but colouring them
+                // reports illuminance on ground the room does not occupy.
+                if self.light.grid_mask.get(i).is_some_and(|inside| !inside) {
+                    continue;
+                }
+                let v = grid.values[i];
                 // THE CHOSEN PALETTE, not a fixed one. This called `lux_color`, which is hard-wired
                 // to Classic — so picking Viridis or Greyscale changed the 3D floor and the legend
                 // and left the plan exactly as it was: "i cant change the colors. it just shows

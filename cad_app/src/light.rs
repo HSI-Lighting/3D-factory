@@ -411,6 +411,17 @@ pub struct LightState {
     /// the desks and still read as flat and cave-like, and this is the only number that says so —
     /// EN 12464-1 asks for at least 50 lx in most occupied spaces, and more where faces matter.
     pub cylindrical_avg: Option<f64>,
+    /// How far in from the room's own outline the working plane starts, metres.
+    ///
+    /// DIALux calls this the WALL ZONE and states it on every report — 0.010 m on the identical-room
+    /// files this engine is validated against. Zero means the whole room interior. It is here rather
+    /// than assumed because it is a stated condition of the result, not a preference.
+    pub wall_zone: f32,
+    /// Which grid cells lie inside the room, when the plane was placed on one. Empty otherwise.
+    ///
+    /// A non-rectangular room's rectangular grid necessarily covers ground outside it; those cells
+    /// are computed but are not part of the room's average and are not painted.
+    pub grid_mask: Vec<bool>,
     /// How many luminaires the MODEL is carrying — curved lights, counted for the status strip.
     ///
     /// Kept as a number rather than derived on the spot because the strip is drawn inside the
@@ -513,6 +524,8 @@ impl LightState {
             installation: None,
             eye_height: 1.2,
             cylindrical_avg: None,
+            wall_zone: 0.010,
+            grid_mask: Vec::new(),
             model_fixtures: 0,
             surfaces: Vec::new(),
             luminaires: Vec::new(),
@@ -1225,6 +1238,82 @@ impl LightState {
         }
     }
 
+    /// The polygon the working plane belongs to: the SELECTED room's footprint, else the only
+    /// room's, else `None` (a 2D-only project, or a model with no rooms defined).
+    ///
+    /// One room at a time is the honest unit. EN 12464-1's Ē and U₀ are per SPACE — averaging a
+    /// corridor together with the office it serves produces a number describing neither, and it is
+    /// the number a scheme is signed off on.
+    fn calc_room_polygon(f: &crate::factory::FactoryState) -> Option<Vec<glam::Vec2>> {
+        if f.rooms.is_empty() {
+            return None;
+        }
+        // A room whose geometry is selected wins; otherwise, only act when there is no ambiguity.
+        let picked = f.rooms.iter().find(|r| {
+            r.floor.iter().chain(r.ceiling.iter()).chain(r.walls.iter()).chain(r.carve.iter())
+                .any(|id| f.selection.contains(id))
+        });
+        match picked.or(if f.rooms.len() == 1 { f.rooms.first() } else { None }) {
+            Some(r) if r.footprint.len() >= 3 => Some(r.footprint.clone()),
+            _ => None,
+        }
+    }
+
+    /// Shrink a `(min_x, min_y, max_x, max_y)` by the wall zone, never past nothing.
+    fn inset_bounds(&self, b: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let z = self.wall_zone.max(0.0);
+        let (x0, y0, x1, y1) = b;
+        if x1 - x0 <= 2.0 * z || y1 - y0 <= 2.0 * z {
+            return b; // the zone is wider than the room: an inset would invert it
+        }
+        (x0 + z, y0 + z, x1 - z, y1 - z)
+    }
+
+    /// Which grid cells lie INSIDE `poly` — the mask that keeps an L-shaped room from averaging in
+    /// the outside of its own corner.
+    ///
+    /// The engine's plane is a rectangle, which is right: it is a sampling grid, not a boundary. A
+    /// non-rectangular room's grid necessarily covers ground the room does not, and those cells are
+    /// not part of the room's average however bright they read.
+    fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
+        let (dx, dy) = (
+            plane.width / plane.cols.max(1) as f32,
+            plane.depth / plane.rows.max(1) as f32,
+        );
+        let mut m = Vec::with_capacity((plane.cols * plane.rows) as usize);
+        for r in 0..plane.rows {
+            for c in 0..plane.cols {
+                let x = plane.origin.x + (c as f32 + 0.5) * dx;
+                let y = plane.origin.y + (r as f32 + 0.5) * dy;
+                m.push(crate::factory::point_in_poly(poly, x, y));
+            }
+        }
+        m
+    }
+
+    /// Re-derive `avg` / `min` / `max` over the cells the mask keeps.
+    ///
+    /// The engine computes them over the whole rectangle, which is correct for the grid it was
+    /// given; the room's figures are over the room. Left exactly as the engine returned them when
+    /// every cell is inside, so the rectangular case — every validated case — is untouched.
+    fn apply_room_mask(grid: &mut cad_light::LuxGrid, mask: &[bool]) {
+        if mask.len() != grid.values.len() || mask.iter().all(|k| *k) {
+            return;
+        }
+        let kept: Vec<f64> = grid
+            .values
+            .iter()
+            .zip(mask)
+            .filter_map(|(v, k)| k.then_some(*v))
+            .collect();
+        if kept.is_empty() {
+            return; // nothing inside: leave the engine's own figures rather than invent zeroes
+        }
+        grid.avg = kept.iter().sum::<f64>() / kept.len() as f64;
+        grid.min = kept.iter().cloned().fold(f64::MAX, f64::min);
+        grid.max = kept.iter().cloned().fold(f64::MIN, f64::max);
+    }
+
     /// Count the model-carried luminaires for the status strip, without building them.
     ///
     /// The MERGED count, so the strip agrees with what Calculate will actually run.
@@ -1280,7 +1369,25 @@ impl LightState {
         // the MODEL's footprint, which need not match the 2D drawing's at all — a plan carries
         // dimensions, notes and title blocks that are not part of the building, and a building can
         // sit anywhere relative to them.
-        let bounds = if meshes.is_empty() { None } else { mesh_bbox(&meshes) };
+        // THE ROOM INTERIOR, NOT THE BUILDING'S BOUNDING BOX.
+        //
+        // Reported as: "is [it] also calculating for the solid wall (the thickness i.e) becasue i
+        // see the pseuso colors there too." It was. The plane spanned `mesh_bbox` — outer wall face
+        // to outer wall face — so points buried in the wall thickness, and outside the building
+        // altogether on a non-rectangular plan, were computed, painted and counted in Ē and U₀.
+        // They read near zero, being inside solid material, which drags the average down and makes
+        // uniformity meaningless: U₀'s minimum was a point inside a wall.
+        //
+        // Be exact about what this did and did not undermine. The ENGINE is validated — the
+        // identical-room tests build their own plane, inset by DIALux's stated 0.010 m wall zone.
+        // What was never validated is the APP's placement of it. That is the gap this closes.
+        //
+        // `mesh_bbox` stays as the fallback for a 2D-only project, which has no rooms to ask about.
+        let room_poly = factory.and_then(Self::calc_room_polygon);
+        let bounds = room_poly
+            .as_ref()
+            .map(|p| self.inset_bounds(poly_bounds(p)))
+            .or_else(|| if meshes.is_empty() { None } else { mesh_bbox(&meshes) });
         let Some((min_x, min_y, max_x, max_y)) = bounds.or_else(|| bbox(doc)) else {
             self.grid = None;
             self.plane = None;
@@ -1325,7 +1432,7 @@ impl LightState {
             v.extend(generated);
             v
         };
-        let grid = calc_lux(
+        let mut grid = calc_lux(
             &meshes,
             &lums,
             &self.profiles,
@@ -1334,6 +1441,17 @@ impl LightState {
             &self.settings,
             self.maintenance,
         );
+        // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
+        // this changes nothing — which is every case the engine is validated on.
+        self.grid_mask = match &room_poly {
+            Some(p) => Self::inside_mask(&plane, p),
+            None => Vec::new(),
+        };
+        if !self.grid_mask.is_empty() {
+            let mask = std::mem::take(&mut self.grid_mask);
+            Self::apply_room_mask(&mut grid, &mask);
+            self.grid_mask = mask;
+        }
         // MEAN CYLINDRICAL ILLUMINANCE at eye height — how well the space renders faces and solid
         // objects, which the horizontal grid cannot report at any resolution.
         //
@@ -3809,5 +3927,153 @@ mod hiding_the_ceiling_opens_the_room {
         let plain = meshes_from_factory(&f);
         let ceil = plain.iter().filter(|m| m.material == 2).map(|m| m.triangles.len()).sum::<usize>();
         assert!(ceil > 0, "the default build must still contain the ceiling for Calculate");
+    }
+}
+
+/// The `(min_x, min_y, max_x, max_y)` of a polygon.
+fn poly_bounds(p: &[glam::Vec2]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for v in p {
+        x0 = x0.min(v.x);
+        y0 = y0.min(v.y);
+        x1 = x1.max(v.x);
+        y1 = y1.max(v.y);
+    }
+    (x0, y0, x1, y1)
+}
+
+/// THE WORKING PLANE BELONGS TO THE ROOM, NOT TO THE BOUNDING BOX.
+///
+/// Reported as: "is [it] also calculating for the solid wall (the thickness i.e) becasue i see the
+/// pseuso colors there too." It was: the plane spanned `mesh_bbox`, outer wall face to outer wall
+/// face, so points buried in the wall thickness were computed, painted, and counted in Ē and U₀.
+#[cfg(test)]
+mod the_plane_is_the_room {
+    use super::*;
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(x0, y0),
+            glam::Vec2::new(x1, y0),
+            glam::Vec2::new(x1, y1),
+            glam::Vec2::new(x0, y1),
+            glam::Vec2::new(x0, y0),
+        ]
+    }
+
+    /// A building with ONE room carved out of it: the plane must follow the room, not the building.
+    #[test]
+    fn the_plane_follows_the_room_not_the_building() {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect(0.0, 0.0, 10.0, 8.0), 3.0).expect("building");
+        f.add_room(&rect(1.0, 1.0, 9.0, 7.0)).expect("room");
+        f.recompute();
+
+        let poly = LightState::calc_room_polygon(&f).expect("one room, so no ambiguity");
+        let b = poly_bounds(&poly);
+        assert!((b.0 - 1.0).abs() < 1e-4 && (b.2 - 9.0).abs() < 1e-4, "x {:?}", (b.0, b.2));
+        assert!((b.1 - 1.0).abs() < 1e-4 && (b.3 - 7.0).abs() < 1e-4, "y {:?}", (b.1, b.3));
+        // …and NOT the building, which is what it used to be.
+        let (bmn, bmx) = f.cached.bounds().expect("geometry");
+        assert!(bmn[0] < b.0 - 0.5, "the building really is wider than the room");
+        assert!(bmx[0] > b.2 + 0.5);
+    }
+
+    /// The wall zone insets it, and states the condition the way DIALux states it.
+    #[test]
+    fn the_wall_zone_insets_the_plane() {
+        let mut s = LightState::new();
+        s.wall_zone = 0.5;
+        let b = s.inset_bounds((0.0, 0.0, 10.0, 8.0));
+        assert_eq!(b, (0.5, 0.5, 9.5, 7.5));
+    }
+
+    /// A zone wider than the room would invert the rectangle. Better the whole room than a plane
+    /// turned inside out.
+    #[test]
+    fn an_over_wide_zone_is_refused_rather_than_inverted() {
+        let mut s = LightState::new();
+        s.wall_zone = 3.0;
+        assert_eq!(s.inset_bounds((0.0, 0.0, 4.0, 4.0)), (0.0, 0.0, 4.0, 4.0));
+    }
+
+    /// AN L-SHAPED ROOM must not average in the outside of its own corner. The rectangular grid
+    /// covers it; the mask is what keeps it out of the numbers.
+    #[test]
+    fn an_l_shaped_room_masks_out_its_own_corner() {
+        // An L: 10 x 10 with the top-right 5 x 5 removed.
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 5.0),
+            glam::Vec2::new(5.0, 5.0),
+            glam::Vec2::new(5.0, 10.0),
+            glam::Vec2::new(0.0, 10.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let plane = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 10.0,
+            depth: 10.0,
+            cols: 10,
+            rows: 10,
+        };
+        let mask = LightState::inside_mask(&plane, &poly);
+        assert_eq!(mask.len(), 100);
+        let inside = mask.iter().filter(|k| **k).count();
+        assert_eq!(inside, 75, "the L is three quarters of its own bounding box, got {inside}");
+    }
+
+    /// The mask re-derives the room's figures. The cut-out cells here are bright, so leaving them
+    /// in would OVERSTATE the room — the direction that matters, since it passes a design.
+    #[test]
+    fn the_masked_average_is_the_rooms_average() {
+        let mut g = cad_light::LuxGrid {
+            cols: 2,
+            rows: 1,
+            values: vec![100.0, 900.0],
+            min: 100.0,
+            max: 900.0,
+            avg: 500.0,
+            maintenance: 1.0,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        };
+        LightState::apply_room_mask(&mut g, &[true, false]);
+        assert_eq!(g.avg, 100.0, "only the cell inside the room counts");
+        assert_eq!(g.min, 100.0);
+        assert_eq!(g.max, 100.0);
+    }
+
+    /// AND A RECTANGULAR ROOM IS UNTOUCHED — every cell inside, so the engine's own figures stand.
+    /// This is the property that keeps the DIALux agreement intact.
+    #[test]
+    fn an_all_inside_mask_changes_nothing() {
+        let mut g = cad_light::LuxGrid {
+            cols: 2,
+            rows: 1,
+            values: vec![100.0, 900.0],
+            min: 100.0,
+            max: 900.0,
+            avg: 500.0,
+            maintenance: 1.0,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        };
+        LightState::apply_room_mask(&mut g, &[true, true]);
+        assert_eq!((g.avg, g.min, g.max), (500.0, 100.0, 900.0));
+    }
+
+    /// Two rooms and no selection is ambiguous, and guessing would silently report one room's
+    /// figures under the other's name.
+    #[test]
+    fn two_rooms_with_no_selection_is_left_alone() {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect(0.0, 0.0, 20.0, 8.0), 3.0).expect("building");
+        f.add_room(&rect(1.0, 1.0, 9.0, 7.0)).expect("room a");
+        f.add_room(&rect(11.0, 1.0, 19.0, 7.0)).expect("room b");
+        f.recompute();
+        f.clear_selection();
+        assert!(LightState::calc_room_polygon(&f).is_none(), "ambiguous: fall back to the model");
     }
 }
