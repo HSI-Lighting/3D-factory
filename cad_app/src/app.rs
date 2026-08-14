@@ -12951,7 +12951,7 @@ impl CadApp {
                     }
                 }
                 let mut lines = self.factory.overlay_lines();
-                lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
+                lines.extend(self.factory.sketch_lines(&self.doc)); // 2D work, lifted onto its plane
                 // LAST of the three, so the yellow face outline is drawn over the sketch geometry
                 // sitting on it rather than under. It is the answer to "is this the right face?",
                 // and an answer half-hidden behind the drawing is no answer.
@@ -48761,6 +48761,195 @@ impl CadApp {
 mod factory_sketch_tests {
     use super::*;
 
+    // ── LAYER COLOUR REACHES 3D ─────────────────────────────────────────────────────────────
+    //
+    // "i drew some of these arrays in different colors but they showed up in the same color",
+    // then, once the layer table was carried into sketches and 2D was right: "see how the color
+    // is not getting carried. why is that" — a white circle and a green circle on a face, both
+    // drawn ORANGE in the viewport. The line builders picked a literal before entering the
+    // dobject loop, so every object in a sketch was one colour by construction.
+    //
+    // Every test below was run against the unfixed builders and seen to fail.
+
+    /// Distinct (r,g,b) triples in a line buffer, quantised to 1/100 so float noise cannot split
+    /// one colour in two, with `sketch_lines`' red/green FRAME AXES dropped — they mark an empty
+    /// plane, they are not sketch geometry, and they are not layer-coloured.
+    fn line_colours(vs: &[crate::light3d::V3]) -> Vec<(i32, i32, i32)> {
+        let q = |x: f32| (x * 100.0).round() as i32;
+        let mut c: Vec<(i32, i32, i32)> = vs
+            .iter()
+            .map(|v| (q(v.r), q(v.g), q(v.b)))
+            .filter(|&t| t != (100, 30, 30) && t != (30, 100, 30))
+            .collect();
+        c.sort();
+        c.dedup();
+        c
+    }
+
+    fn unit_circle_at(x: f64) -> cad_kernel::DObject {
+        cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(x, 0.0),
+            radius: 1.0,
+        }))
+    }
+
+    /// `CadApp::default()` ships three demo layers and starts on WALLS (red), so a test that
+    /// means layer 0 has to say so.
+    fn app_on_a_green_layer() -> (CadApp, u32) {
+        let mut app = CadApp::default();
+        let g = app.doc.layers.add(Layer {
+            name: "G".into(), color: Color::Aci(3), ..Layer::layer_zero()
+        });
+        app.doc.layers.active = g;
+        (app, g)
+    }
+
+    #[test]
+    fn a_layer_colour_reaches_the_live_sketch_in_3d() {
+        let (mut app, g) = app_on_a_green_layer();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert_eq!(app.doc.layers.active, g, "the sketch inherits the drawing's active layer");
+        app.doc.push(unit_circle_at(0.0));
+
+        let lines = app.factory.live_sketch_lines(&app.doc);
+        assert!(!lines.is_empty(), "the live sketch shows in 3D at all");
+        for v in &lines {
+            assert!(
+                v.g > 0.9 && v.r < 0.1 && v.b < 0.1,
+                "ACI 3 green must reach 3D, got ({:.2}, {:.2}, {:.2})", v.r, v.g, v.b,
+            );
+        }
+    }
+
+    /// The half a green-only test would let through — the user's other circle was WHITE.
+    #[test]
+    fn a_white_layer_reads_white_in_3d() {
+        let mut app = CadApp::default();
+        app.doc.layers.active = LayerTable::LAYER_ZERO;
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(unit_circle_at(0.0));
+        for v in &app.factory.live_sketch_lines(&app.doc) {
+            assert!(
+                v.r > 0.99 && v.g > 0.99 && v.b > 0.99,
+                "a white layer must read white, got ({:.2}, {:.2}, {:.2})", v.r, v.g, v.b,
+            );
+        }
+    }
+
+    /// THE REPORT, STATED LITERALLY. Cannot be passed by changing the constant.
+    #[test]
+    fn two_layers_two_colours_in_one_sketch() {
+        let (mut app, g) = app_on_a_green_layer();
+        app.doc.layers.active = LayerTable::LAYER_ZERO; // white
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(unit_circle_at(0.0));
+        app.doc.layers.active = g;
+        app.doc.push(unit_circle_at(5.0));
+
+        let cols = line_colours(&app.factory.live_sketch_lines(&app.doc));
+        assert_eq!(cols.len(), 2, "a white circle and a green circle are two colours, got {cols:?}");
+        assert!(cols.contains(&(100, 100, 100)), "the white-layer circle is white: {cols:?}");
+        assert!(cols.contains(&(0, 100, 0)), "the green-layer circle is green: {cols:?}");
+    }
+
+    /// …and it does not evaporate the moment the sketch is finished.
+    #[test]
+    fn a_finished_sketch_keeps_its_layer_colours() {
+        let (mut app, g) = app_on_a_green_layer();
+        app.doc.layers.active = LayerTable::LAYER_ZERO;
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(unit_circle_at(0.0));
+        app.doc.layers.active = g;
+        app.doc.push(unit_circle_at(5.0));
+        app.factory_exit_sketch();
+
+        let cols = line_colours(&app.factory.sketch_lines(&app.doc));
+        assert_eq!(cols.len(), 2, "two layers, two colours after Finish: {cols:?}");
+        let neutral = *cols.iter().find(|c| c.0 == c.1 && c.1 == c.2)
+            .unwrap_or_else(|| panic!("the white-layer circle stays neutral: {cols:?}"));
+        assert!(neutral.0 > 50, "…and stays light, not black: {neutral:?}");
+        let green = *cols.iter().find(|c| c.1 > c.0 && c.1 > c.2)
+            .unwrap_or_else(|| panic!("the green-layer circle stays green: {cols:?}"));
+        assert!(green.0 < 10 && green.2 < 10, "…and stays pure green: {green:?}");
+    }
+
+    /// WHICH TABLE IS THE SOURCE. Recolouring a layer must recolour the work on every plane —
+    /// so a finished sketch's own snapshot of the table is NOT the answer. Without this test a
+    /// fix that resolves against `sk.doc.layers` ships stale colours and looks correct.
+    #[test]
+    fn recolouring_a_layer_in_the_plan_updates_finished_sketches() {
+        let (mut app, g) = app_on_a_green_layer();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(unit_circle_at(0.0));
+        app.factory_exit_sketch();
+
+        let before = line_colours(&app.factory.sketch_lines(&app.doc));
+        assert!(before.iter().all(|c| c.1 > c.0 && c.1 > c.2), "green to start with: {before:?}");
+
+        app.doc.layers.get_mut(g).expect("the layer").color = Color::Aci(1); // red
+        let after = line_colours(&app.factory.sketch_lines(&app.doc));
+        assert!(
+            after.iter().all(|c| c.0 > c.1 && c.0 > c.2),
+            "recolouring the layer must reach work already drawn on a plane: {after:?}",
+        );
+    }
+
+    /// The live/finished cue moved from HUE to VALUE. A finished plane keeps its colour and only
+    /// steps back, so "which plane am I on" survives without costing the colour the user chose.
+    #[test]
+    fn a_finished_plane_keeps_its_hue_and_only_dims() {
+        let (mut app, _g) = app_on_a_green_layer();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(unit_circle_at(0.0));
+        app.factory_exit_sketch();
+        // A GENUINELY non-coplanar plane, or `factory_enter_sketch` reopens the first one.
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(
+            glam::Vec3::ZERO, glam::Vec3::X,
+        ));
+        app.doc.push(unit_circle_at(0.0));
+
+        let live = line_colours(&app.factory.live_sketch_lines(&app.doc));
+        let fin = line_colours(&app.factory.sketch_lines(&app.doc));
+        assert_eq!(live, vec![(0, 100, 0)], "the plane being drawn on is full strength: {live:?}");
+        assert_eq!(fin.len(), 1, "one finished plane, one colour: {fin:?}");
+        let f = fin[0];
+        assert!(f.1 > f.0 && f.1 > f.2, "the finished plane keeps its HUE, got {f:?}");
+        assert!(f.1 < 100 && f.1 > 20, "…and only steps back in VALUE, got {f:?}");
+    }
+
+    /// A sketch object naming a layer only the DRAWING can answer — what a copy from the plan
+    /// leaves behind, and what `LayerTable::remove`'s renumbering leaves behind, since its fixup
+    /// walks `self.doc.dobjects` alone and never repairs stored sketches. Must resolve, and must
+    /// not panic on an id past the end of every table.
+    #[test]
+    fn a_sketch_with_a_stale_layer_id_resolves_against_the_plan_and_never_panics() {
+        let mut app = CadApp::default();
+        let three = app.doc.layers.add(Layer {
+            name: "L3".into(), color: Color::Aci(1), ..Layer::layer_zero()
+        });
+        assert_eq!(three, 3, "LayerTable::add hands back sequential ids");
+
+        let mut sk = cad_solid::Sketch::new(crate::factory::FactoryState::ground_frame());
+        let mut d3 = unit_circle_at(0.0);
+        d3.style.layer = 3;
+        sk.doc.dobjects.push(d3);
+        let mut d99 = unit_circle_at(5.0);
+        d99.style.layer = 99;
+        sk.doc.dobjects.push(d99);
+        app.factory.model.sketches.push(sk);
+
+        let cols = line_colours(&app.factory.sketch_lines(&app.doc));
+        assert_eq!(cols.len(), 2, "two objects, two colours: {cols:?}");
+        assert!(
+            cols.iter().any(|c| c.0 > c.1 && c.0 > c.2 && c.1 < 10),
+            "layer 3 is answered by the DRAWING's table → red: {cols:?}",
+        );
+        assert!(
+            cols.iter().any(|c| c.0 == c.1 && c.1 == c.2 && c.0 > 20),
+            "layer 99 is past the end of both tables → the neutral fallback, not a crash: {cols:?}",
+        );
+    }
+
     /// Regression: entering a sketch swaps `self.doc` to the sketch's Document.
     /// Anything still holding indices into the OLD doc goes stale — this test drives
     /// the real path headlessly so a panic shows up in CI, not in the user's hands.
@@ -50968,7 +51157,7 @@ mod factory_sketch_tests {
         })));
         assert!(!app.factory.live_sketch_lines(&app.doc).is_empty(), "the live sketch shows in 3D as drawn");
         app.factory_exit_sketch();
-        assert!(!app.factory.sketch_lines().is_empty(), "the finished sketch stays visible in 3D");
+        assert!(!app.factory.sketch_lines(&app.doc).is_empty(), "the finished sketch stays visible in 3D");
     }
 
     /// SELECT a closed 2D shape and Extrude it — no face sketch needed. The solid is made on

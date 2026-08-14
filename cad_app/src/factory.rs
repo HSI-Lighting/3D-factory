@@ -794,6 +794,63 @@ fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
     out.push(v(b, ui(c)));
 }
 
+/// The colour a 2D entity draws in, as authored **sRGB** 0..1 — the same answer the 2D canvas
+/// gets from `cad_kernel::resolve_color`, which is the whole point: a circle on a green layer is
+/// green in both views.
+///
+/// Reported as: "see how the color is not getting carried. why is that" — two circles, one on a
+/// white layer and one on a green one, both drawn ORANGE in 3D. Nothing was missing from the data
+/// model. The line builders below simply never looked at `d.style` at all: they picked a literal
+/// before entering the dobject loop, so every object in a sketch was the same colour by
+/// construction. The layer table has been inside sketch documents since 752b77d, `V3` has carried
+/// per-vertex RGB all along, and the 2D canvas has always resolved through this same function.
+///
+/// TWO documents, because an entity and the layer table that answers for it do not always live in
+/// the same one. A FINISHED sketch keeps its own `Document` — its entities, its `truecolors` —
+/// while the table that decides what "green" MEANS belongs to the DRAWING and is edited from the
+/// Layers panel. `own` answers an entity-level override; `layer_src` answers ByLayer/ByBlock.
+///
+/// Exactly ONE document reaches any single `resolve_color` call, so a `TrueColorRef` is never
+/// dereferenced against a table that does not index it. Be precise about what that does NOT
+/// promise: `factory_enter_sketch` copies `layers` into a sketch and NOT `truecolors`, so a
+/// `TrueColorRef` layer resolves to the white fallback while a sketch is open. The 2D canvas
+/// reads that same broken pair, so the two views agree — it is a 2D gap, and not this one's to
+/// close. Unreachable today in any case: every live path writes `Color::Aci`.
+///
+/// A layer id past the end of the table is `.get()` → `None` → the ACI-7 white fallback. A short
+/// or drifted table is a wrong-ish colour, never a panic.
+fn dobject_srgb(
+    d: &cad_kernel::DObject,
+    own: &cad_kernel::Document,
+    layer_src: &cad_kernel::Document,
+) -> [f32; 3] {
+    let src = match d.style.color {
+        cad_kernel::Color::ByLayer | cad_kernel::Color::ByBlock => layer_src,
+        // Aci / TrueColorRef never consult the layer table; the entity's own document owns the
+        // truecolor index.
+        _ => own,
+    };
+    let (r, g, b) =
+        cad_kernel::resolve_color(d.style.color, d.style.layer, &src.layers, &src.truecolors);
+    // AUTHORED sRGB, NOT LINEAR. `seg` → `ui` marks the vertex `SHADE_UI`, and the line pass sets
+    // `u_linearize = 1` so the FRAGMENT shader decodes it. Decoding on the CPU here would decode
+    // it twice and every layer colour would come out roughly half-bright and muddy.
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+}
+
+/// How far a FINISHED plane's drawing sits back from the one being drawn on, as a multiply on the
+/// authored sRGB triple.
+///
+/// Colour used to carry "which plane is live" — hot orange against cool grey-blue — and it cannot
+/// any more, because colour now carries the LAYER. VALUE carries it instead: same hue, dimmer. A
+/// green layer still reads green on a plane you are not on; it just steps back. Deliberately a
+/// multiply in sRGB rather than in light, because this is a perceptual step back and sRGB is the
+/// space that steps back evenly across white, green and grey.
+///
+/// Set this to 1.0 for maximum colour fidelity — "the same white on every plane" — and leave the
+/// live plane to be marked by its frame axes, the drafting banner and the yellow face outline.
+const FINISHED_DIM: f32 = 0.65;
+
 /// A tiny, STABLE outward nudge for body `fid`, in metres.
 ///
 /// Two solids can legitimately meet face to face — a slab resting exactly on another, a wall
@@ -8795,13 +8852,28 @@ impl FactoryState {
 
     /// Every sketch's geometry, lifted from its frame's `(u,v)` back into world space,
     /// as GL_LINES. This is what makes 2D work drawn on a plane visible in 3D.
-    pub fn sketch_lines(&self) -> Vec<V3> {
+    ///
+    /// `doc` is the DRAWING, for the layer table — the one the Layers panel edits, so recolouring
+    /// a layer recolours the work on every plane at once. A finished sketch keeps its own snapshot
+    /// of the table from when it closed, and resolving against that would ship stale colours.
+    pub fn sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
         let mut out = Vec::new();
         for (i, sk) in self.model.sketches.iter().enumerate() {
-            // the sketch being edited right now is drawn hot, the others cool
             let active = self.session.as_ref().is_some_and(|s| s.idx == i);
-            let c = if active { [1.0, 0.62, 0.12] } else { [0.55, 0.62, 0.72] };
+            // THE ACTIVE PLANE IS NOT DRAWN FROM HERE. `factory_enter_sketch` `mem::take`s its
+            // document, so this loop would emit nothing for it anyway — `live_sketch_lines` is
+            // what shows it, at full strength. Skipping it explicitly means the dim below applies
+            // to everything this function ever emits, so nothing pops brighter on Finish.
+            if active {
+                let o = sk.frame.origin;
+                seg(&mut out, o, o + sk.frame.u * 1.5, [1.0, 0.3, 0.3]);
+                seg(&mut out, o, o + sk.frame.v * 1.5, [0.3, 1.0, 0.3]);
+                continue;
+            }
             for d in &sk.doc.dobjects {
+                // The entity's own document answers an entity-level colour; the DRAWING answers
+                // ByLayer, which is what almost everything is. Stepped back in value, not in hue.
+                let c = dobject_srgb(d, &sk.doc, doc).map(|x| x * FINISHED_DIM);
                 // By the SKETCH's own unit — `from_uv` lifts (u,v) into world METRES.
                 for poly in cad_solid::geom_outlines_scaled(&d.geom, sk.doc.units.metres_per_unit) {
                     for w in poly.windows(2) {
@@ -8813,12 +8885,6 @@ impl FactoryState {
                         );
                     }
                 }
-            }
-            // frame axes, so an empty sketch plane is still visible
-            if active {
-                let o = sk.frame.origin;
-                seg(&mut out, o, o + sk.frame.u * 1.5, [1.0, 0.3, 0.3]);
-                seg(&mut out, o, o + sk.frame.v * 1.5, [0.3, 1.0, 0.3]);
             }
         }
         out
@@ -8863,8 +8929,12 @@ impl FactoryState {
         let mut out = Vec::new();
         let Some(session) = self.session.as_ref() else { return out };
         let Some(sk) = self.model.sketches.get(session.idx) else { return out };
-        let c = [1.0, 0.62, 0.12]; // hot — the sketch you are drawing right now
         for d in &doc.dobjects {
+            // THE LIVE SKETCH RESOLVES AGAINST ITSELF, at full strength — this is the plane being
+            // drawn on. While a session is open `doc` IS the sketch: it carries the clone of the
+            // drawing's layer table taken on the way in, and the Layers panel edits THAT table, so
+            // it is the freshest there is and the one `factory_exit_sketch` copies back out.
+            let c = dobject_srgb(d, doc, doc);
             // By the live sketch document's own unit — `from_uv` lifts into world METRES.
             for poly in cad_solid::geom_outlines_scaled(&d.geom, doc.units.metres_per_unit) {
                 for w in poly.windows(2) {
