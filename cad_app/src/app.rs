@@ -4327,7 +4327,11 @@ impl CadApp {
         for row in 0..plane.rows {
             for col in 0..plane.cols {
                 let v = grid.values[(row * plane.cols + col) as usize];
-                let color = crate::light::lux_color((v / maxv) as f32);
+                // THE CHOSEN PALETTE, not a fixed one. This called `lux_color`, which is hard-wired
+                // to Classic — so picking Viridis or Greyscale changed the 3D floor and the legend
+                // and left the plan exactly as it was: "i cant change the colors. it just shows
+                // some preset colors which also appears to show no change."
+                let color = self.light.ramp.color((v / maxv) as f32);
                 let x0 = plane.origin.x + col as f32 * dx;
                 let y0 = plane.origin.y + row as f32 * dy;
                 // The calc plane is METRES (cad_light's contract; its bounds come from

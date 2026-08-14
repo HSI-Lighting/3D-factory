@@ -2359,7 +2359,9 @@ impl LightState {
                     );
                 }
             }
-            legend_bar(ui, self.scale_ceiling());
+            // The chosen palette here too — a legend in a different colour scheme from the
+            // picture it explains is worse than no legend.
+            legend_bar_with(ui, self.scale_ceiling(), self.ramp);
         }
 
         ui.add_space(4.0);
