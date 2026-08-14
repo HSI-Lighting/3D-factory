@@ -318,6 +318,7 @@ dependencies = [
  "glam 0.29.3",
  "rayon",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

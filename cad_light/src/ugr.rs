@@ -248,6 +248,8 @@ mod tests {
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }]
     }
 
@@ -371,6 +373,8 @@ mod tests {
                     position: Vertex::new(i as f32 * 0.01, 2.0, 3.2),
                     rotation_deg: 0.0,
                     dimming: 1.0,
+                    watts_override: None,
+                    flux_override: None,
                 })
                 .collect()
         };

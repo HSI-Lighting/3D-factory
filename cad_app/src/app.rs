@@ -4666,9 +4666,35 @@ impl CadApp {
             self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
         };
         let mut verts = crate::light3d::build_scene_verts(&shown, &self.light.materials, floor);
+        // EACH FITTING AT ITS REAL SIZE, when its file declares one.
+        //
+        // "i need to see the illuminare as the dimensions in the ies/ldt files not the diamond
+        // icon." The marker is sized by camera distance and clamped to 100–600 mm, so it says
+        // nothing about the product. The housing dimensions are already parsed and already in
+        // metres — LDT converts mm→m, IES converts feet — so this only has to draw them.
+        //
+        // The icon stays as the fallback and that is not an edge case: most profiles declare no
+        // dimensions at all, including the built-in downlight and every curved-light emitter, and a
+        // body of size zero would be nothing to look at.
         let s = (self.light.cam_dist * 0.02).clamp(0.05, 0.3);
         for l in &self.light.luminaires {
-            crate::light3d::push_luminaire_marker(&mut verts, l.position.x, l.position.y, l.position.z, s);
+            let body = self
+                .light
+                .profiles
+                .get(&l.profile)
+                .and_then(|p| p.housing_shape().zip(p.housing()));
+            match body {
+                Some((shape, (_, _, h))) => crate::light3d::push_luminaire_body(
+                    &mut verts,
+                    [l.position.x, l.position.y, l.position.z],
+                    shape,
+                    h as f32,
+                    l.rotation_deg,
+                ),
+                None => crate::light3d::push_luminaire_marker(
+                    &mut verts, l.position.x, l.position.y, l.position.z, s,
+                ),
+            }
         }
         verts
     }
@@ -12729,6 +12755,38 @@ impl CadApp {
                 // (osnap → CARD → raw), so what you see is exactly where it lands.
                 self.factory.sync_selection_mesh();
                 let mut overlay = self.factory.shade_verts();
+                // ---- PLACED LUMINAIRES, AT THEIR REAL SIZE --------------------
+                //
+                // "i also need to see it in the 3d factory." Fittings were only ever drawn in the
+                // SIMLUX view, so a layout laid out in SIMLUX was invisible in the window where the
+                // building is modelled — and the two views are meant to be the same scene.
+                //
+                // On the OVERLAY list rather than in `opaque_verts`: that one is cached behind a
+                // signature for render performance (a heavy model must not be rebuilt because a
+                // light moved), and a box is 36 vertices, so rebuilding these every frame costs
+                // nothing. Same bodies, same fallback icon, one implementation shared with SIMLUX.
+                {
+                    let s = (self.factory.cam_dist * 0.02).clamp(0.05, 0.3);
+                    for l in &self.light.luminaires {
+                        match self
+                            .light
+                            .profiles
+                            .get(&l.profile)
+                            .and_then(|p| p.housing_shape().zip(p.housing()))
+                        {
+                            Some((shape, (_, _, h))) => crate::light3d::push_luminaire_body(
+                                &mut overlay,
+                                [l.position.x, l.position.y, l.position.z],
+                                shape,
+                                h as f32,
+                                l.rotation_deg,
+                            ),
+                            None => crate::light3d::push_luminaire_marker(
+                                &mut overlay, l.position.x, l.position.y, l.position.z, s,
+                            ),
+                        }
+                    }
+                }
                 // (Furniture is drawn full-form via the GPU model-matrix pass — see `furn_draws`.)
                 // ---- §0.6 preview: the ghost + the path -----------------------
                 // "while moving it shows the path" — redrawn each frame at the

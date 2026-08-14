@@ -178,7 +178,7 @@ fn intensity_toward(prof: &IesProfile, lum: &Luminaire, point: Vec3) -> f64 {
     let dir = d / dist;
     let gamma = (-dir.z).clamp(-1.0, 1.0).acos().to_degrees() as f64;
     let phi = (dir.y.atan2(dir.x).to_degrees() as f64) - lum.rotation_deg as f64;
-    prof.intensity(gamma, phi) * lum.dimming as f64
+    prof.intensity(gamma, phi) * lum.output_scale(prof)
 }
 
 /// Direct illuminance (lux) at a surface point with the given outward `normal`.
@@ -392,7 +392,7 @@ mod tests {
         let meshes = extrude::box_room(w, d, h);
         let mut profiles = HashMap::new();
         profiles.insert("flat".into(), flat_1000cd());
-        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, dimming: 1.0 }];
+        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None }];
         let plane = CalcPlane { origin: Vertex::new(0.0, 0.0, 0.0), width: w, depth: d, cols: 24, rows: 24 };
         (meshes, profiles, lums, plane, RaySettings { rays_per_point: 64, max_bounces: bounces, shadows: true })
     }
@@ -535,6 +535,8 @@ mod tests {
             position: Vertex::new(w / 2.0, d / 2.0, h / 2.0), // centred, so nothing self-shadows
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }];
 
         let flux = 4.0 * PI * I;
@@ -627,6 +629,8 @@ mod tests {
             position: Vertex::new(0.0, 0.0, 0.0),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }];
         (Vec::new(), profiles, lums, RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false })
     }
@@ -943,6 +947,8 @@ mod surface_tests {
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }]
     }
 

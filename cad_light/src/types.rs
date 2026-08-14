@@ -83,6 +83,57 @@ pub struct Luminaire {
     pub rotation_deg: f32,
     /// Dimming / output scale, 0.0–1.0.
     pub dimming: f32,
+    /// CONNECTED LOAD for THIS fitting (W), overriding the profile's.
+    ///
+    /// "the paramters of the light also need to accessible to the user, like that wattage and
+    /// efficacy. the changes should be for the ldt file in the app the parent ldt file shouldnt
+    /// change." So the override lives on the FIXTURE and travels in the project sidecar; the
+    /// photometric file on disk is never touched — nothing in either crate writes `.ldt` or `.ies`.
+    ///
+    /// Watts alone do NOT change the light. A fitting rewired to draw less power for the same
+    /// output is more efficient, not dimmer; this moves the power density and nothing else.
+    #[serde(default)]
+    pub watts_override: Option<f64>,
+    /// INSTALLED FLUX for this fitting (lm), overriding the profile's.
+    ///
+    /// This one DOES change the light, and it must: a luminaire's flux scales its whole intensity
+    /// distribution, so 3600 lm from a profile measured at 4000 lm is that profile at 0.9. Editing
+    /// EFFICACY is editing this — `flux = watts × efficacy` — which is why efficacy is not a third
+    /// stored field. Two numbers that must agree are one number and a bug.
+    #[serde(default)]
+    pub flux_override: Option<f64>,
+}
+
+impl Luminaire {
+    /// This fitting's connected load (W), given the profile it points at.
+    pub fn watts(&self, prof: &crate::IesProfile) -> f64 {
+        self.watts_override.unwrap_or(prof.watts)
+    }
+
+    /// This fitting's installed flux (lm), given the profile it points at.
+    pub fn lumens(&self, prof: &crate::IesProfile) -> f64 {
+        self.flux_override.unwrap_or(prof.lumens)
+    }
+
+    /// This fitting's efficacy (lm/W), or `None` when either figure is missing.
+    pub fn efficacy(&self, prof: &crate::IesProfile) -> Option<f64> {
+        let (w, lm) = (self.watts(prof), self.lumens(prof));
+        (w > 0.0 && lm > 0.0).then(|| lm / w)
+    }
+
+    /// The factor every candela value from `prof` is multiplied by for THIS fitting: dimming, times
+    /// the ratio of its installed flux to the flux the profile was measured at.
+    ///
+    /// WITH NO OVERRIDE THIS IS EXACTLY `dimming`, to the bit. That is the property that keeps the
+    /// engine's DIALux agreement intact: the calculation is unchanged for every existing project,
+    /// and provably so — the identical-room comparisons still report 200.1 / 337.6 / 337.5 lx.
+    pub fn output_scale(&self, prof: &crate::IesProfile) -> f64 {
+        let d = self.dimming as f64;
+        match self.flux_override {
+            Some(lm) if prof.lumens > 0.0 && lm >= 0.0 => d * (lm / prof.lumens),
+            _ => d,
+        }
+    }
 }
 
 /// What the installation costs to run, as distinct from what it delivers.
@@ -127,13 +178,16 @@ pub fn installation_summary(
             continue; // an unassigned point is not a fixture yet
         };
         s.count += 1;
-        if p.watts > 0.0 {
-            s.total_watts += p.watts;
+        // PER-FITTING FIGURES, not the profile's, so a fixture the user has re-rated counts as what
+        // it actually is. With no override these are the profile's values unchanged.
+        let (w, lm) = (l.watts(p), l.lumens(p));
+        if w > 0.0 {
+            s.total_watts += w;
         } else {
             s.missing_watts += 1;
         }
-        if p.lumens > 0.0 {
-            s.total_lumens += p.lumens;
+        if lm > 0.0 {
+            s.total_lumens += lm;
         } else {
             s.missing_lumens += 1;
         }
@@ -530,6 +584,8 @@ mod metric_tests {
             position: Vertex::new(0.0, 0.0, 3.0),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }
     }
 
@@ -702,5 +758,141 @@ mod uniformity_grid {
         // Non-square cells say so rather than quietly quoting one number.
         let oblong = CalcPlane { width: 12.0, depth: 2.0, cols: 12, rows: 2, ..p };
         assert!(oblong.grid_note().contains('×'), "got {:?}", oblong.grid_note());
+    }
+}
+
+/// PER-FITTING OVERRIDES, AND WHAT EACH ONE IS ALLOWED TO CHANGE.
+///
+/// "the paramters of the light also need to accessible to the user, like that wattage and efficacy
+/// … make sure the changes work" — alongside "make sure it doesnt break any thing with calculation
+/// since we already have it working well."
+///
+/// The two are not the same kind of number and must not behave the same way. Watts is what the
+/// fitting COSTS; flux is what it DELIVERS. Re-rating the wattage of a fitting that emits the same
+/// light makes it more efficient, not brighter.
+#[cfg(test)]
+mod a_fitting_may_be_re_rated {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn profile(lumens: f64, watts: f64) -> crate::IesProfile {
+        crate::IesProfile {
+            name: "p".into(),
+            photometry: crate::PhotometryType::C,
+            lumens,
+            multiplier: 1.0,
+            vertical_angles: vec![0.0, 90.0],
+            horizontal_angles: vec![0.0],
+            candela: vec![vec![1000.0, 0.0]],
+            watts,
+            width: 0.0,
+            length: 0.0,
+            height: 0.0,
+            luminous_length: 0.0,
+            luminous_width: 0.0,
+        }
+    }
+
+    fn lum() -> Luminaire {
+        Luminaire {
+            id: 1,
+            profile: "p".into(),
+            position: Vertex::new(0.0, 0.0, 3.0),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+        }
+    }
+
+    /// THE SAFETY PROPERTY. With no override the output scale is EXACTLY `dimming` — the same bits,
+    /// not merely a close number — so every existing project computes what it always did.
+    #[test]
+    fn no_override_is_bit_identical_to_dimming() {
+        let p = profile(4000.0, 40.0);
+        for d in [1.0_f32, 0.75, 0.5, 0.331, 0.0] {
+            let mut l = lum();
+            l.dimming = d;
+            assert_eq!(
+                l.output_scale(&p),
+                d as f64,
+                "an un-overridden fitting must scale by exactly its dimming",
+            );
+        }
+    }
+
+    /// WATTS DO NOT CHANGE THE LIGHT. Re-rating the load must move the power density and nothing
+    /// else — a fitting that draws less for the same output is more efficient, not dimmer.
+    #[test]
+    fn re_rating_the_wattage_does_not_change_the_output() {
+        let p = profile(4000.0, 40.0);
+        let mut l = lum();
+        let before = l.output_scale(&p);
+        l.watts_override = Some(32.0);
+        assert_eq!(l.output_scale(&p), before, "watts must not touch the light");
+        assert_eq!(l.watts(&p), 32.0);
+        assert_eq!(l.lumens(&p), 4000.0, "flux is unchanged");
+        assert_eq!(l.efficacy(&p), Some(125.0), "…so it is now 125 lm/W, which is the point");
+    }
+
+    /// FLUX DOES CHANGE THE LIGHT, and it must: a luminaire's flux scales its whole distribution.
+    #[test]
+    fn re_rating_the_flux_scales_the_output() {
+        let p = profile(4000.0, 40.0);
+        let mut l = lum();
+        l.flux_override = Some(3600.0);
+        assert!((l.output_scale(&p) - 0.9).abs() < 1e-12, "3600 of 4000 is the profile at 0.9");
+        // …and it compounds with dimming rather than replacing it.
+        l.dimming = 0.5;
+        assert!((l.output_scale(&p) - 0.45).abs() < 1e-12);
+    }
+
+    /// A profile with no rated flux cannot be scaled against — there is nothing to take a ratio of,
+    /// and inventing one would silently rescale a whole scheme.
+    #[test]
+    fn a_profile_with_no_rated_flux_is_left_alone() {
+        let p = profile(0.0, 40.0);
+        let mut l = lum();
+        l.flux_override = Some(3600.0);
+        assert_eq!(l.output_scale(&p), 1.0, "no ratio is possible, so no scaling is applied");
+    }
+
+    /// The connected load counts the FITTING's figures, so a re-rated fixture shows up in W/m².
+    #[test]
+    fn the_power_density_follows_the_override() {
+        let mut profs = HashMap::new();
+        profs.insert("p".to_string(), profile(4000.0, 40.0));
+        let plain = installation_summary(&[lum(), lum()], &profs, 10.0);
+        assert!((plain.total_watts - 80.0).abs() < 1e-9);
+        assert!((plain.power_density - 8.0).abs() < 1e-9);
+
+        let mut a = lum();
+        a.watts_override = Some(32.0);
+        let rerated = installation_summary(&[a, lum()], &profs, 10.0);
+        assert!((rerated.total_watts - 72.0).abs() < 1e-9, "32 + 40, not 80");
+        assert!((rerated.total_lumens - 8000.0).abs() < 1e-9, "flux untouched");
+    }
+
+    /// The override survives a save. It lives on the FIXTURE, in the project — the photometric file
+    /// on disk is never written, which is the whole of "the parent ldt file shouldnt change".
+    #[test]
+    fn overrides_round_trip_through_serde() {
+        let mut l = lum();
+        l.watts_override = Some(32.0);
+        l.flux_override = Some(3600.0);
+        let json = serde_json::to_string(&l).expect("serialise");
+        let back: Luminaire = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.watts_override, Some(32.0));
+        assert_eq!(back.flux_override, Some(3600.0));
+    }
+
+    /// …and a project saved BEFORE these fields existed still opens, with no override.
+    #[test]
+    fn an_older_project_opens_without_them() {
+        let json = r#"{"id":1,"profile":"p","position":{"x":0.0,"y":0.0,"z":3.0},
+                       "rotation_deg":0.0,"dimming":1.0}"#;
+        let back: Luminaire = serde_json::from_str(json).expect("older sidecar must still load");
+        assert_eq!(back.watts_override, None);
+        assert_eq!(back.flux_override, None);
     }
 }

@@ -54,16 +54,74 @@ impl IesProfile {
     /// `None` rather than zero — an area of zero is an infinite luminance, and a glare figure built
     /// on it would be nonsense presented as a number.
     pub fn projected_luminous_area(&self, gamma_deg: f64) -> Option<f64> {
-        let (l, w) = (self.luminous_length, self.luminous_width);
-        if l <= 0.0 {
-            return None;
-        }
-        // EULUMDAT marks a round aperture by leaving the width at zero.
-        let flat = if w <= 0.0 { std::f64::consts::PI * (l * 0.5).powi(2) } else { l * w };
+        let flat = self.aperture()?.flat_area();
         let cos = gamma_deg.to_radians().cos().abs();
         // Below ~5° of grazing the projection collapses and the luminance runs away; the standard
         // treats such a source as contributing nothing, and so does this.
         (cos > 0.087).then_some(flat * cos)
+    }
+
+    /// The EMITTING APERTURE's outline, in metres, or `None` when the file declares none.
+    ///
+    /// Zero dimensions are the normal case, not an error — this crate's own IES fixture declares
+    /// `0 0 0`, and both synthesised profiles in the app hard-code every dimension to zero.
+    pub fn aperture(&self) -> Option<Aperture> {
+        Aperture::from_pair(self.luminous_length, self.luminous_width)
+    }
+
+    /// The HOUSING outline — the physical body, not the light-emitting part. `(length, width,
+    /// height)` in metres, or `None` when the file declares none.
+    ///
+    /// This is what to DRAW. The aperture is what glare is computed from, and the two are
+    /// different numbers on purpose: a 600 mm fitting with a 300 mm aperture is four times brighter
+    /// than its outline suggests.
+    pub fn housing(&self) -> Option<(f64, f64, f64)> {
+        (self.length > 0.0).then_some((self.length, self.width, self.height))
+    }
+
+    /// The housing's footprint as a SHAPE, so drawing code and glare code cannot disagree about
+    /// what "width = 0" means.
+    pub fn housing_shape(&self) -> Option<Aperture> {
+        Aperture::from_pair(self.length, self.width)
+    }
+}
+
+/// A luminous or physical outline: rectangular, or round with a diameter.
+///
+/// EULUMDAT (and LM-63, once its negative-means-circular convention is normalised at parse time)
+/// marks a ROUND outline by leaving the width at zero and putting the diameter in the length. That
+/// rule used to live inside `projected_luminous_area` alone; anything else that needed to know a
+/// fitting's shape — such as drawing it — would have had to re-derive it and could have got it
+/// wrong. One definition, used by both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Aperture {
+    Round { d: f64 },
+    Rect { l: f64, w: f64 },
+}
+
+impl Aperture {
+    /// From a `(length, width)` pair in metres. `None` when the length is not positive.
+    pub fn from_pair(l: f64, w: f64) -> Option<Self> {
+        if l <= 0.0 {
+            return None;
+        }
+        Some(if w <= 0.0 { Aperture::Round { d: l } } else { Aperture::Rect { l, w } })
+    }
+
+    /// Its area seen face-on, m².
+    pub fn flat_area(self) -> f64 {
+        match self {
+            Aperture::Round { d } => std::f64::consts::PI * (d * 0.5).powi(2),
+            Aperture::Rect { l, w } => l * w,
+        }
+    }
+
+    /// Its extent as `(along x, along y)` before rotation, m — what a drawer needs.
+    pub fn footprint(self) -> (f64, f64) {
+        match self {
+            Aperture::Round { d } => (d, d),
+            Aperture::Rect { l, w } => (l, w),
+        }
     }
 }
 
@@ -189,6 +247,17 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         _ => PhotometryType::C,
     };
 
+    // LM-63 MARKS A CIRCULAR OPENING WITH A NEGATIVE DIMENSION. Taken literally — and it was, there
+    // being no `abs()` anywhere on this path — a header of `-0.6` became −0.6 metres: a negative
+    // area for glare, and an inside-out box for anything that tried to draw it.
+    //
+    // This crate already has a convention for round, the one EULUMDAT uses: width zero, diameter in
+    // the length (see `Aperture::from_pair`). Normalising here means both formats arrive in the same
+    // shape and nothing downstream has to know which file it came from.
+    let circular = width < 0.0 || length < 0.0;
+    let (w_m, l_m, h_m) = (width.abs() * to_m, length.abs() * to_m, height.abs() * to_m);
+    let w_m = if circular { 0.0 } else { w_m };
+
     Ok(IesProfile {
         name,
         photometry,
@@ -198,14 +267,14 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         horizontal_angles,
         candela,
         watts,
-        width: width * to_m,
-        length: length * to_m,
-        height: height * to_m,
+        width: w_m,
+        length: l_m,
+        height: h_m,
         // LM-63's header dimensions ARE the luminous opening — the format calls them "luminous
         // width / length / height", unlike EULUMDAT which carries the housing and the aperture
         // separately. So there is nothing else to read here.
-        luminous_length: length * to_m,
-        luminous_width: width * to_m,
+        luminous_length: l_m,
+        luminous_width: w_m,
     })
 }
 
@@ -302,4 +371,139 @@ fn photometry_probe_real_files() {
     }
     println!("\n{ok} parsed, {bad} failed, {suspect} physically impossible");
     assert_eq!(bad, 0, "every manufacturer file in the folder should parse");
+}
+
+/// THE GLARE AREA MUST NOT MOVE.
+///
+/// `projected_luminous_area` feeds UGR (`L² ω / p²` in CIE 117), and the engine is validated against
+/// DIALux. Before this function was refactored to go through the new shape accessors, its outputs
+/// were pinned here — so the refactor is provably a refactor and not a change of answer.
+///
+/// The values are the FORMULA's, computed by hand, not captured from the code: a golden file
+/// recorded from the implementation it is meant to check is a circular test.
+///   rect 1.2 × 0.3 m: 0.36 m² × cos γ
+///   round Ø0.2 m:     π(0.1)² = 0.031415926535897934 m² × cos γ
+#[cfg(test)]
+mod the_glare_area_is_unchanged {
+    use super::*;
+
+    fn prof(luminous_length: f64, luminous_width: f64) -> IesProfile {
+        IesProfile {
+            name: "t".into(),
+            photometry: PhotometryType::C,
+            lumens: 1000.0,
+            multiplier: 1.0,
+            vertical_angles: vec![0.0],
+            horizontal_angles: vec![0.0],
+            candela: vec![vec![100.0]],
+            watts: 10.0,
+            width: 0.0,
+            length: 0.0,
+            height: 0.0,
+            luminous_length,
+            luminous_width,
+        }
+    }
+
+    #[test]
+    fn a_rectangular_aperture_foreshortens_as_cos_gamma() {
+        let p = prof(1.2, 0.3);
+        for (g, want) in [
+            (0.0_f64, 0.36_f64),
+            (30.0, 0.36 * 0.866_025_403_784_438_6),
+            (45.0, 0.36 * 0.707_106_781_186_547_6),
+            (60.0, 0.36 * 0.5),
+            (80.0, 0.36 * 0.173_648_177_666_930_3),
+        ] {
+            let got = p.projected_luminous_area(g).expect("declared aperture");
+            assert!((got - want).abs() < 1e-12, "gamma {g}: {got} != {want}");
+        }
+    }
+
+    #[test]
+    fn a_round_aperture_is_a_disc_of_the_declared_length() {
+        let p = prof(0.2, 0.0); // EULUMDAT: width 0 marks it round, length is the diameter
+        let flat = std::f64::consts::PI * 0.1_f64 * 0.1;
+        for g in [0.0_f64, 25.0, 55.0, 79.0] {
+            let want = flat * g.to_radians().cos();
+            let got = p.projected_luminous_area(g).expect("declared aperture");
+            assert!((got - want).abs() < 1e-12, "gamma {g}: {got} != {want}");
+        }
+    }
+
+    /// The grazing cut-off and the no-aperture case are part of the contract too: an area of zero
+    /// is an infinite luminance, and a glare figure built on it would be nonsense with a number.
+    #[test]
+    fn the_edges_of_the_contract_hold() {
+        assert!(prof(0.0, 0.0).projected_luminous_area(0.0).is_none(), "no aperture declared");
+        assert!(prof(-1.0, 0.2).projected_luminous_area(0.0).is_none(), "negative length");
+        let p = prof(1.2, 0.3);
+        // `cos > 0.087` puts the cut-off at 85.01 deg, not 85: cos(85 deg) = 0.0872, still in.
+        // Stated exactly, because "about 5 degrees of grazing" is prose, not a test.
+        assert!(p.projected_luminous_area(86.0).is_none(), "past the grazing cut-off: excluded");
+        assert!(p.projected_luminous_area(85.0).is_some(), "just inside it: included");
+        // Symmetric in gamma — the sign of the angle cannot change an area.
+        assert_eq!(p.projected_luminous_area(40.0), p.projected_luminous_area(-40.0));
+    }
+}
+
+/// LM-63'S NEGATIVE DIMENSIONS MEAN CIRCULAR, NOT NEGATIVE.
+///
+/// There was no `abs()` anywhere on the IES path, so a header of `-0.6` became −0.6 metres: a
+/// negative area for glare and an inside-out box for anything that drew it. Normalised at parse time
+/// onto the convention this crate already had — width zero, diameter in the length.
+#[cfg(test)]
+mod a_negative_ies_dimension_means_round {
+    use super::*;
+
+    /// The LM-63 header line is: num_lamps, lumens, multiplier, n_vert, n_horiz, photo, units,
+    /// WIDTH, LENGTH, HEIGHT; then ballast, future, watts on the next line.
+    fn ies(width: &str, length: &str, height: &str) -> String {
+        format!(
+            "IESNA:LM-63-1995\nTILT=NONE\n1 1000 1.0 2 1 1 2 {width} {length} {height}\n\
+             1.0 1.0 100\n0.0 90.0\n0.0\n1000.0 10.0\n"
+        )
+    }
+
+    #[test]
+    fn a_negative_width_becomes_a_round_aperture() {
+        let p = parse(&ies("-0.6", "-0.6", "0.0")).expect("parses");
+        assert_eq!(p.width, 0.0, "round is marked by a zero width, not a negative one");
+        assert!((p.length - 0.6).abs() < 1e-12, "the diameter is positive: {}", p.length);
+        assert_eq!(p.aperture(), Some(Aperture::Round { d: 0.6 }));
+        assert_eq!(p.housing_shape(), Some(Aperture::Round { d: 0.6 }));
+        let a = p.projected_luminous_area(0.0).expect("declared");
+        assert!((a - std::f64::consts::PI * 0.09).abs() < 1e-12, "area {a}");
+    }
+
+    /// One negative field is enough to mean circular, which is how real files write it.
+    #[test]
+    fn a_negative_length_alone_also_means_round() {
+        let p = parse(&ies("0.0", "-0.25", "0.0")).expect("parses");
+        assert_eq!(p.aperture(), Some(Aperture::Round { d: 0.25 }));
+    }
+
+    #[test]
+    fn a_positive_header_is_still_rectangular() {
+        let p = parse(&ies("0.3", "1.2", "0.08")).expect("parses");
+        assert_eq!(p.aperture(), Some(Aperture::Rect { l: 1.2, w: 0.3 }));
+        assert!((p.projected_luminous_area(0.0).unwrap() - 0.36).abs() < 1e-12);
+        assert_eq!(p.housing(), Some((1.2, 0.3, 0.08)));
+    }
+
+    /// Height is normalised too — a negative one would hang the drawn body upwards.
+    #[test]
+    fn a_negative_height_is_taken_as_a_magnitude() {
+        let p = parse(&ies("0.3", "1.2", "-0.08")).expect("parses");
+        assert!((p.height - 0.08).abs() < 1e-12, "height must be positive, got {}", p.height);
+    }
+
+    /// The all-zero case stays "no dimensions declared" — the common one, and not an error.
+    #[test]
+    fn zeros_still_mean_nothing_declared() {
+        let p = parse(&ies("0", "0", "0")).expect("parses");
+        assert!(p.aperture().is_none());
+        assert!(p.housing().is_none());
+        assert!(p.projected_luminous_area(0.0).is_none());
+    }
 }

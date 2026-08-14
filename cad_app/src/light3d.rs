@@ -6644,3 +6644,186 @@ mod the_viewer_draws_what_it_is_given {
         }
     }
 }
+
+/// A luminaire drawn at ITS REAL SIZE, from the dimensions the IES/LDT file declares.
+///
+/// Asked for as: "i need to see the illuminare as the dimensions in the ies/ldt files not the
+/// diamond icon." [`push_luminaire_marker`] is an octahedron sized by CAMERA DISTANCE, clamped to
+/// 100–600 mm across — deliberately a constant-on-screen glyph, with no link to the photometry. It
+/// stays, because most profiles declare no dimensions at all (this crate's own IES fixture is
+/// `0 0 0`, and both synthesised profiles are all-zero), and a body of size zero is nothing to look
+/// at. When the file DOES declare a housing, this draws it.
+///
+/// `pos` is the PHOTOMETRIC CENTRE and the body hangs DOWNWARD from it, spanning `[z - h, z]`.
+/// `mount_height` / `ceiling_above` put that centre at the ceiling, so a body centred on `pos` would
+/// push half the fitting through the slab.
+///
+/// `rot_deg` rotates the footprint about Z — the same `Luminaire::rotation_deg` the physics already
+/// honours (`calc.rs` subtracts it from the azimuth), which until now nothing set and nothing drew.
+///
+/// SHADING is pre-computed on the CPU with `nx = ny = nz = 0, mode = 0`, exactly as every other
+/// surface in the SIMLUX view is: that view renders with `ColorPipeline::passthrough()` and
+/// `EnvRender::none()`, so a body with real normals would be the one object in it responding to
+/// lighting the room does not have.
+pub fn push_luminaire_body(
+    out: &mut Vec<V3>,
+    pos: [f32; 3],
+    shape: cad_light::Aperture,
+    h: f32,
+    rot_deg: f32,
+) {
+    /// The aperture face — the bit that emits — keeps the marker's amber so a fitting still reads
+    /// as a light. The body is dark anodised, like a real extrusion.
+    const LENS: [f32; 3] = [1.0, 0.86, 0.38];
+    const BODY: [f32; 3] = [0.16, 0.17, 0.18];
+
+    let h = h.max(0.004); // a declared height of 0 would be a zero-volume sliver
+    let (z1, z0) = (pos[2], pos[2] - h); // top at the mounting point, hanging down
+    let (c, s) = (rot_deg.to_radians().cos(), rot_deg.to_radians().sin());
+    // Footprint point → world, rotated about Z through the luminaire's own centre.
+    let fp = |dx: f32, dy: f32| [pos[0] + dx * c - dy * s, pos[1] + dx * s + dy * c];
+
+    let mut quad = |a: [f32; 3], b: [f32; 3], d: [f32; 3], e: [f32; 3], base: [f32; 3]| {
+        let n = (glam::Vec3::from(b) - glam::Vec3::from(a))
+            .cross(glam::Vec3::from(d) - glam::Vec3::from(a))
+            .normalize_or_zero();
+        let col = shade(base, n);
+        for p in [a, b, d, a, d, e] {
+            out.push(V3 {
+                x: p[0], y: p[1], z: p[2],
+                r: col[0], g: col[1], b: col[2],
+                nx: 0.0, ny: 0.0, nz: 0.0, mode: 0.0,
+            });
+        }
+    };
+
+    match shape {
+        cad_light::Aperture::Rect { l, w } => {
+            let (hl, hw) = (l as f32 * 0.5, w as f32 * 0.5);
+            let p = |sx: f32, sy: f32, z: f32| {
+                let q = fp(sx * hl, sy * hw);
+                [q[0], q[1], z]
+            };
+            // Bottom = the aperture, wound so its normal points DOWN into the room.
+            quad(p(-1.0, -1.0, z0), p(-1.0, 1.0, z0), p(1.0, 1.0, z0), p(1.0, -1.0, z0), LENS);
+            // Top and the four sides: the housing.
+            quad(p(-1.0, -1.0, z1), p(1.0, -1.0, z1), p(1.0, 1.0, z1), p(-1.0, 1.0, z1), BODY);
+            for (a, b) in [((-1.0, -1.0), (1.0, -1.0)), ((1.0, -1.0), (1.0, 1.0)),
+                           ((1.0, 1.0), (-1.0, 1.0)), ((-1.0, 1.0), (-1.0, -1.0))] {
+                quad(
+                    p(a.0, a.1, z0), p(b.0, b.1, z0), p(b.0, b.1, z1), p(a.0, a.1, z1), BODY,
+                );
+            }
+        }
+        cad_light::Aperture::Round { d } => {
+            const N: usize = 24;
+            let r = d as f32 * 0.5;
+            let ring: Vec<[f32; 2]> = (0..N)
+                .map(|i| {
+                    let a = i as f32 / N as f32 * std::f32::consts::TAU;
+                    fp(r * a.cos(), r * a.sin())
+                })
+                .collect();
+            let cen_lo = [pos[0], pos[1], z0];
+            let cen_hi = [pos[0], pos[1], z1];
+            for i in 0..N {
+                let (p0, p1) = (ring[i], ring[(i + 1) % N]);
+                let lo0 = [p0[0], p0[1], z0];
+                let lo1 = [p1[0], p1[1], z0];
+                let hi0 = [p0[0], p0[1], z1];
+                let hi1 = [p1[0], p1[1], z1];
+                // Aperture disc (facing down), top disc, and the wall between them.
+                quad(cen_lo, lo1, lo0, cen_lo, LENS);
+                quad(cen_hi, hi0, hi1, cen_hi, BODY);
+                quad(lo0, lo1, hi1, hi0, BODY);
+            }
+        }
+    }
+}
+
+/// A FITTING IS DRAWN AT ITS REAL SIZE.
+///
+/// "i need to see the illuminare as the dimensions in the ies/ldt files not the diamond icon."
+#[cfg(test)]
+mod a_luminaire_is_drawn_at_its_real_size {
+    use cad_light::Aperture;
+
+    fn aabb(v: &[super::V3]) -> ([f32; 3], [f32; 3]) {
+        let mut lo = [f32::MAX; 3];
+        let mut hi = [f32::MIN; 3];
+        for p in v {
+            for (k, c) in [p.x, p.y, p.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(c);
+                hi[k] = hi[k].max(c);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// A 1200 × 300 × 80 mm fitting must measure 1200 × 300 × 80 mm.
+    #[test]
+    fn a_rectangular_body_has_the_declared_dimensions() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(&mut v, [2.0, 5.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 0.0);
+        let (lo, hi) = aabb(&v);
+        assert!((hi[0] - lo[0] - 1.2).abs() < 1e-5, "length {:.4}", hi[0] - lo[0]);
+        assert!((hi[1] - lo[1] - 0.3).abs() < 1e-5, "width {:.4}", hi[1] - lo[1]);
+        assert!((hi[2] - lo[2] - 0.08).abs() < 1e-5, "height {:.4}", hi[2] - lo[2]);
+    }
+
+    /// It HANGS from the mounting point. `position.z` is where the photometric centre goes, and
+    /// `mount_z` puts that at the ceiling — a body centred on it would push half the fitting
+    /// through the slab.
+    #[test]
+    fn the_body_hangs_below_the_mounting_point() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 0.0);
+        let (lo, hi) = aabb(&v);
+        assert!((hi[2] - 3.0).abs() < 1e-5, "the top sits at the mounting height, got {:.4}", hi[2]);
+        assert!((lo[2] - 2.92).abs() < 1e-5, "and it hangs down, got {:.4}", lo[2]);
+    }
+
+    /// ROTATION IS APPLIED. This is the test that catches `rotation_deg` being ignored — which it
+    /// was everywhere until now, so every linear fitting lay along +X.
+    #[test]
+    fn the_footprint_turns_with_the_fitting() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 1.2, w: 0.3 }, 0.08, 90.0);
+        let (lo, hi) = aabb(&v);
+        assert!((hi[0] - lo[0] - 0.3).abs() < 1e-5, "turned 90 deg: x is the WIDTH, got {:.4}", hi[0] - lo[0]);
+        assert!((hi[1] - lo[1] - 1.2).abs() < 1e-5, "…and y is the length, got {:.4}", hi[1] - lo[1]);
+    }
+
+    /// A round fitting is a cylinder of the declared diameter, not a box.
+    #[test]
+    fn a_round_body_is_a_disc_of_the_declared_diameter() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(&mut v, [1.0, 1.0, 2.5], Aperture::Round { d: 0.2 }, 0.05, 0.0);
+        let (lo, hi) = aabb(&v);
+        // A 24-gon inscribed in the circle is a hair under the diameter across the flats.
+        assert!((hi[0] - lo[0] - 0.2).abs() < 0.004, "diameter x {:.4}", hi[0] - lo[0]);
+        assert!((hi[1] - lo[1] - 0.2).abs() < 0.004, "diameter y {:.4}", hi[1] - lo[1]);
+        assert!((hi[2] - lo[2] - 0.05).abs() < 1e-5, "height {:.4}", hi[2] - lo[2]);
+    }
+
+    /// Every vertex is a whole triangle's worth — a mesh with a partial triangle renders as
+    /// garbage, and that is easy to do wrong when hand-winding quads.
+    #[test]
+    fn the_output_is_whole_triangles() {
+        for shape in [Aperture::Rect { l: 1.2, w: 0.3 }, Aperture::Round { d: 0.2 }] {
+            let mut v = Vec::new();
+            super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], shape, 0.08, 17.0);
+            assert!(!v.is_empty(), "{shape:?} produced nothing");
+            assert_eq!(v.len() % 3, 0, "{shape:?} left a partial triangle");
+        }
+    }
+
+    /// A zero height would be a zero-volume sliver; it is floored so the fitting is still visible.
+    #[test]
+    fn a_zero_height_still_draws_something() {
+        let mut v = Vec::new();
+        super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 0.6, w: 0.6 }, 0.0, 0.0);
+        let (lo, hi) = aabb(&v);
+        assert!(hi[2] - lo[2] > 0.0, "a flat fitting must still have some body");
+    }
+}

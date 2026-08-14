@@ -623,6 +623,8 @@ impl LightState {
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         });
         self.selected = vec![id];
         let what = if profile.is_empty() {
@@ -944,6 +946,8 @@ impl LightState {
                     position: Vertex::new(x, y, z),
                     rotation_deg: 0.0,
                     dimming: 1.0,
+                    watts_override: None,
+                    flux_override: None,
                 });
                 placed.push(id);
                 n += 1;
@@ -1070,6 +1074,157 @@ impl LightState {
         self.cam_target = [t.x, t.y, t.z];
     }
 
+    /// Wattage, efficacy and aiming for the SELECTED fittings — editable, per fitting.
+    ///
+    /// "the paramters of the light also need to accessible to the user, like that wattage and
+    /// efficacy … the changes should be for the ldt file in the app the parent ldt file shouldnt
+    /// change." These are overrides carried on the FIXTURE and saved in the project. Nothing in
+    /// either crate writes a `.ldt` or `.ies` file, so the manufacturer's data is safe by
+    /// construction, not by care.
+    ///
+    /// WATTS and FLUX are the two independent numbers; EFFICACY is shown and edited as
+    /// `flux / watts`, because storing it as a third field would be storing a number that must
+    /// agree with the other two — which is a bug waiting to happen. Editing efficacy moves the
+    /// FLUX, which is what changes the light; editing watts alone changes only the power density.
+    fn selected_fixture_params_ui(&mut self, ui: &mut egui::Ui) {
+        let sel: Vec<u32> = self.selected.clone();
+        if sel.is_empty() {
+            ui.label(
+                egui::RichText::new("  select a fitting on the plan to edit its parameters")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+        // Read the first selected fixture's current figures; an edit applies to all of them.
+        let Some(first) = self.luminaires.iter().find(|l| sel.contains(&l.id)).cloned() else {
+            return;
+        };
+        let Some(prof) = self.profiles.get(&first.profile).cloned() else {
+            ui.label(
+                egui::RichText::new("  no fitting assigned — pick one from ▼ Fittings first")
+                    .small()
+                    .weak(),
+            );
+            return;
+        };
+
+        let mut watts = first.watts(&prof);
+        let mut flux = first.lumens(&prof);
+        let mut rot = first.rotation_deg;
+        let overridden = first.watts_override.is_some() || first.flux_override.is_some();
+
+        ui.label(
+            egui::RichText::new(format!("parameters — {} selected", sel.len())).small().weak(),
+        );
+        let mut changed_w = false;
+        let mut changed_f = false;
+        ui.horizontal(|ui| {
+            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("load").small()));
+            changed_w |= ui
+                .add(
+                    egui::DragValue::new(&mut watts)
+                        .update_while_editing(false)
+                        .speed(0.5)
+                        .range(0.0..=10_000.0)
+                        .suffix(" W"),
+                )
+                .on_hover_text("Connected load. Changes the power density; does NOT change the light.")
+                .changed();
+            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("flux").small()));
+            changed_f |= ui
+                .add(
+                    egui::DragValue::new(&mut flux)
+                        .update_while_editing(false)
+                        .speed(10.0)
+                        .range(0.0..=1_000_000.0)
+                        .suffix(" lm"),
+                )
+                .on_hover_text(
+                    "Installed luminous flux. This DOES change the light — the profile's whole \
+                     distribution is scaled by flux / rated flux.",
+                )
+                .changed();
+        });
+        // Efficacy, derived. Editing it moves the FLUX at the current wattage.
+        let mut eff = if watts > 0.0 { flux / watts } else { 0.0 };
+        ui.horizontal(|ui| {
+            ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("efficacy").small()));
+            let r = ui.add_enabled(
+                watts > 0.0,
+                egui::DragValue::new(&mut eff)
+                    .update_while_editing(false)
+                    .speed(1.0)
+                    .range(0.0..=400.0)
+                    .suffix(" lm/W"),
+            );
+            if r.changed() {
+                flux = eff * watts;
+                changed_f = true;
+            }
+            r.on_hover_text("flux ÷ load. Editing this sets the flux at the current wattage.");
+            ui.add_sized([44.0, 18.0], egui::Label::new(egui::RichText::new("aim").small()));
+            changed_w |= false;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut rot)
+                        .update_while_editing(false)
+                        .speed(1.0)
+                        .range(-360.0..=360.0)
+                        .suffix("°"),
+                )
+                .on_hover_text(
+                    "Rotation about the vertical axis. The physics already honours it — an \
+                     asymmetric distribution turns with the fitting.",
+                )
+                .changed()
+            {
+                for l in self.luminaires.iter_mut().filter(|l| sel.contains(&l.id)) {
+                    l.rotation_deg = rot;
+                }
+            }
+        });
+
+        if changed_w || changed_f {
+            for l in self.luminaires.iter_mut().filter(|l| sel.contains(&l.id)) {
+                if changed_w {
+                    l.watts_override = Some(watts);
+                }
+                if changed_f {
+                    l.flux_override = Some(flux);
+                }
+            }
+            self.last_msg = format!(
+                "{} fitting(s) re-rated — {watts:.1} W, {flux:.0} lm{}. Press Calculate.",
+                sel.len(),
+                if watts > 0.0 { format!(" ({:.0} lm/W)", flux / watts) } else { String::new() },
+            );
+        }
+        // A way back to the file's own figures, so an override is never a one-way door.
+        if overridden
+            && ui
+                .small_button("↺ back to the file's rating")
+                .on_hover_text("Drop the overrides and use the photometric file's own watts and flux")
+                .clicked()
+        {
+            for l in self.luminaires.iter_mut().filter(|l| sel.contains(&l.id)) {
+                l.watts_override = None;
+                l.flux_override = None;
+            }
+            self.last_msg = "back to the fitting's own rating — press Calculate.".into();
+        }
+        if overridden {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  overriding {} — the file on disk is unchanged",
+                    prof.name
+                ))
+                .small()
+                .color(egui::Color32::from_rgb(230, 190, 110)),
+            );
+        }
+    }
+
     /// Count the model-carried luminaires for the status strip, without building them.
     ///
     /// The MERGED count, so the strip agrees with what Calculate will actually run.
@@ -1110,6 +1265,8 @@ impl LightState {
                     position: Vertex::new(p.x, p.y, p.z),
                     rotation_deg: 0.0,
                     dimming: 1.0,
+                    watts_override: None,
+                    flux_override: None,
                 });
                 id += 1;
             }
@@ -1160,6 +1317,8 @@ impl LightState {
                 position: Vertex::new(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), self.room_height),
                 rotation_deg: 0.0,
                 dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
             }]
         } else {
             let mut v = self.luminaires.clone();
@@ -1504,6 +1663,8 @@ impl LightState {
                     }
                     ui.close_menu();
                 }
+                ui.separator();
+                self.selected_fixture_params_ui(ui);
                 ui.separator();
                 ui.label(
                     egui::RichText::new(format!("selection — {} of {}", self.selected.len(), self.luminaires.len()))
@@ -2988,6 +3149,8 @@ mod furniture_in_the_light_scene {
             position: Vertex::new(3.0, 3.0, 2.9),
             rotation_deg: 0.0,
             dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
         }];
         // One cell, directly under the fitting.
         let plane = CalcPlane {
