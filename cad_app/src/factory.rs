@@ -300,6 +300,24 @@ pub struct SketchSession {
     /// `UndoStep`s (not bare Documents) since undo spans 2D and 3D in one stack.
     pub saved_undo: Vec<crate::app::UndoStep>,
     pub saved_redo: Vec<crate::app::UndoStep>,
+    /// The drawing's PARAMETRIC CONSTRAINTS, parked for the same reason as the document they
+    /// describe.
+    ///
+    /// A constraint names its geometry by `Handle`, and handles come from a process-global
+    /// counter — so a fresh sketch document shares NO handle with the plan. `prune_constraints`
+    /// drops every constraint whose handles are absent from the document it is handed, and the
+    /// parametric panel runs it against `self.doc` each frame. With a sketch installed that is
+    /// the WHOLE drawing's constraint set, on the FIRST FRAME, silently: the DOF readout fell to
+    /// 0 and nothing said why. Constraints live only in memory — no `UndoStep` variant carries
+    /// them and `simlux_io` does not write them — so there was nothing to recover them from.
+    ///
+    /// Parking them gives the sketch a constraint space of its own, which is also the honest
+    /// model: its handles are its own.
+    pub saved_constraints: Vec<crate::param_editor::CRef>,
+    /// A half-picked two-entity constraint ("select one, choose Parallel, now pick the other").
+    /// Parked with the constraints: its `Handle` refers to the parked document, so leaving it
+    /// live would let the next pick inside the sketch complete a pair spanning two documents.
+    pub saved_pending: Option<(crate::param_editor::PendingKind, cad_kernel::Handle)>,
 }
 
 /// Daylight settings the user edits (▼ Environment) — where/when the building is, so the sun can be

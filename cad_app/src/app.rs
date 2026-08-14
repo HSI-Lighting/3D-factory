@@ -4014,9 +4014,24 @@ impl CadApp {
     /// `&self.doc`, so the panel returns an action instead of touching it.
     fn render_light_panel(&mut self, ctx: &egui::Context) {
         if !self.light.window_open { return; }
+        // THE PLAN, NOT WHATEVER IS ON THE CANVAS — at all three sites below, and they have to
+        // agree with each other. SIMLUX lights the BUILDING; a face sketch is a drawing on one
+        // plane of it and is never the thing being lit.
+        //
+        // The picker and the import are fixed TOGETHER deliberately. Layer ids are positions in
+        // the table, so fixing only the import would list one document's layer names while
+        // importing the other document's layer at that number — worse than either alone.
+        //
+        // `calculate` is the one that reads oddly on its own: `scene_meshes` early-returns the
+        // Factory model's geometry whenever the model holds anything, so on a project with a
+        // building the document argument never reaches the lux figures and the validated numbers
+        // cannot move. It still matters for a 2D-only project, where `bbox(doc)` is what places
+        // the calculation plane — a sketch's (u, v) there put the plane somewhere unrelated to
+        // the drawing.
+        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
         // Snapshot (layer id, name) OUTSIDE the window closure so panel_ui never
         // borrows self.doc while self.light is borrowed mutably (Phase B picker).
-        let layers: Vec<(u32, String)> = self.doc.layers.layers.iter().enumerate()
+        let layers: Vec<(u32, String)> = plan.layers.layers.iter().enumerate()
             .map(|(i, l)| (i as u32, l.name.clone()))
             .collect();
         let mut open = self.light.window_open;
@@ -4032,13 +4047,17 @@ impl CadApp {
             });
         self.light.window_open = open;
         if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
-        if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
+        if let Some(id) = action.import_layer {
+            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+            self.light.import_layer(plan, id);
+        }
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
         if action.import_photometry {
             self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
         }
         if action.calculate {
-            self.light.calculate(&self.doc, Some(&self.factory));
+            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+            self.light.calculate(plan, Some(&self.factory));
         }
     }
 
@@ -4429,15 +4448,38 @@ impl CadApp {
         self.factory_note(format!("place ✓ {name} ({:.2},{:.2})", at.x, at.y));
     }
 
+    /// Is the SIMLUX layer — the fixture markers on the 2D canvas and the pointer that places
+    /// and drags them — live right now?
+    ///
+    /// TWO conditions, and the second is the one that was missing. SIMLUX has to be on screen,
+    /// AND the canvas has to be showing the PLAN. A luminaire's position is a WORLD (x, y) in
+    /// metres; during a face sketch the canvas shows that plane's (u, v), so the two are simply
+    /// different spaces. Drawn there, a fitting at world (4, 2) painted itself 4 m along and 2 m
+    /// up an elevation and read as a light mounted on that wall; clicked there, `place_point`
+    /// wrote a point measured on the wall straight into a luminaire's world x/y, and a drag
+    /// applied a delta measured on the sketch plane to a world position.
+    ///
+    /// `paint_lux_overlay` already refused for exactly this reason, with a note about the work
+    /// plane. Its two neighbours did not — so the heatmap correctly vanished while the fixtures
+    /// it was computed from kept drawing. One predicate now, so they cannot drift again.
+    fn simlux_2d_layer_live(&self) -> bool {
+        if self.factory.session.is_some() {
+            return false;
+        }
+        self.light.simlux_mode || self.light.view3d_open || self.light.window_open
+    }
+
     fn simlux_pointer_2d(
         &mut self,
         resp: &egui::Response,
         rect: egui::Rect,
         ctx: &egui::Context,
     ) -> bool {
-        // Only while SIMLUX is on screen. The markers are not drawn otherwise either, and an
-        // invisible thing must never eat a click.
-        if !(self.light.simlux_mode || self.light.view3d_open || self.light.window_open) {
+        // Only while SIMLUX is on screen AND the canvas is the plan. The markers are not drawn
+        // otherwise either, and an invisible thing must never eat a click. Clearing hover/drag on
+        // the way out also cancels a drag left in flight by entering a sketch mid-gesture, rather
+        // than leaving it dangling.
+        if !self.simlux_2d_layer_live() {
             self.light.hover = None;
             self.light.drag = None;
             self.light_gesture = false;
@@ -4589,8 +4631,11 @@ impl CadApp {
     /// emit nothing until a fitting is chosen), and hovered (what a press will grab). An
     /// unassigned point is drawn HOLLOW — it is a mark on the plan, not a light yet.
     fn paint_luminaires_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let show_ghost = self.light.place_mode
-            && (self.light.simlux_mode || self.light.view3d_open || self.light.window_open);
+        // The markers are WORLD metres; a face sketch's canvas is not. See `simlux_2d_layer_live`.
+        if self.factory.session.is_some() {
+            return;
+        }
+        let show_ghost = self.light.place_mode && self.simlux_2d_layer_live();
         if self.light.luminaires.is_empty() && !show_ghost {
             return;
         }
@@ -7984,11 +8029,27 @@ impl CadApp {
         let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
         let saved_undo = std::mem::take(&mut self.undo_stack);
         let saved_redo = std::mem::take(&mut self.redo_stack);
+        // THE CONSTRAINTS GO WITH THE DOCUMENT THEY CONSTRAIN. `prune_constraints` runs against
+        // `self.doc` every frame the parametric panel is up, and a sketch shares no handle with
+        // the plan, so leaving them installed deleted the drawing's whole constraint set on the
+        // first frame of every sketch. See `SketchSession::saved_constraints`.
+        let saved_constraints = std::mem::take(&mut self.parametric.constraints);
+        let saved_pending = self.parametric.pending.take();
+        // The derived caches describe geometry that is no longer installed; `analyze_doc`
+        // recomputes them next frame. `last_solved_sig` is zeroed so the sketch gets a solve of
+        // its own rather than matching the plan's signature by accident and skipping one.
+        self.parametric.defined.clear();
+        self.parametric.dof = 0;
+        self.parametric.fully_defined = false;
+        self.parametric.redundant = false;
+        self.parametric.last_solved_sig = 0;
         self.factory.session = Some(crate::factory::SketchSession {
             idx,
             saved_doc,
             saved_undo,
             saved_redo,
+            saved_constraints,
+            saved_pending,
         });
         // land in a clean drafting state on the new plane. MUST run after the swap:
         // every index-holding field still points into the model-space doc we just
@@ -8049,6 +8110,14 @@ impl CadApp {
             // The redo stack does NOT come out. A redo is only meaningful against the undo history
             // it was made from, and that history has just been replaced.
             self.redo_stack = s.saved_redo;
+            // The drawing's constraints come back with the drawing. Anything constrained INSIDE
+            // the sketch is dropped here with the rest of the sketch's parametric state — its
+            // handles belong to the sketch document, and there is nowhere to keep them: `CRef` is
+            // not serialisable and nothing persists constraints across a save even for the plan.
+            self.parametric.constraints = s.saved_constraints;
+            self.parametric.pending = s.saved_pending;
+            self.parametric.defined.clear();
+            self.parametric.last_solved_sig = 0;
             // same hazard in reverse: sketch-relative indices must not survive into
             // the model-space document.
             self.factory_reset_doc_state();
@@ -8082,6 +8151,26 @@ impl CadApp {
     fn factory_pick_ground_dobject(
         &self, pos: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16],
     ) -> Option<usize> {
+        // NOTHING ON THE GROUND IS PICKABLE WHILE A SKETCH IS OPEN — and this REFUSES rather
+        // than redirecting, which is the part worth reading before "fixing" it.
+        //
+        // The returned index goes straight into `self.selection`, and `self.selection` indexes
+        // whatever document is installed. So swapping in `plan_doc()` here — the fix that is
+        // right for the two plan underlays, and the obvious thing to pattern-match — would hand
+        // back PLAN indices to be stored against the SKETCH: a wrong-document bug traded for an
+        // out-of-range one, which in this file is a panic and not a glitch.
+        //
+        // Unguarded, it ray-cast to world z = 0 and then point-in-polygoned against `self.doc`,
+        // i.e. the sketch, treating the plane's (u, v) as world (x, y). Clicking bare floor next
+        // to a building cleared the 3D selection, put grips on a shape the user never clicked,
+        // and printed "2D shape selected — ▼ Room elements ▸ Extrude / Cut", which was untrue:
+        // `factory_resolve_extrude` takes the session branch and ignores that selection entirely.
+        //
+        // Returning None lets the caller's existing `else if !add` arm deselect, which is the
+        // honest answer to a click on empty ground.
+        if self.factory.session.is_some() {
+            return None;
+        }
         // `cursor_on_plane` returns a WORLD (metre) point, so the plan outlines it is compared
         // against must be metres too — otherwise the `0.3` nearest-line tolerance below is
         // metres judging drawing units, and picking a line from the 3D view never fires.
@@ -9387,10 +9476,21 @@ impl CadApp {
         }
         let org = f.uv_rebase_origin();
         model_lines.push(format!("uv_rebase_origin = ({:.1}, {:.1}, {:.1})", org[0], org[1], org[2]));
-        let u = self.doc.units;
+        // THE PLAN'S UNIT, not the installed canvas's. A sketch document is `Document::default()`
+        // — 1.0 m/unit, "Assumed" — so with a face open this reported the drawing's plan↔3D scale
+        // as 1.0 when it was 0.001. `scene` exists to give measured truth instead of a guess, and
+        // mm-vs-m is the live problem area it is most often pointed at, so it was misleading
+        // exactly when it was being trusted.
+        //
+        // `doc_k()` itself is left alone: the sketch-lift paths depend on its current meaning.
+        let plan = self.plan_doc();
+        let u = plan.units;
         model_lines.push(format!(
-            "doc units: {:.6} m/unit ({:?})   ·   factory working unit: {}   ·   plan↔3D scale {:.6}",
-            u.metres_per_unit, u.source, self.factory.units.label(), self.doc_k()));
+            "doc units: {:.6} m/unit ({:?})   ·   factory working unit: {}   ·   plan↔3D scale {:.6}{}",
+            u.metres_per_unit, u.source, self.factory.units.label(), u.metres_per_unit,
+            if self.factory.session.is_some() {
+                "   ·   [sketch open: canvas is that plane's (u,v) at 1.0 m/unit]"
+            } else { "" }));
         // A footprint hundreds of times the height is the signature of a wrong plan→3D scale: a
         // millimetre outline read as metres builds a thousand times too wide under a storey-height
         // extrusion, and the result draws as a sheet with nothing else on screen explaining it.
@@ -13298,7 +13398,11 @@ impl CadApp {
                     open_ies_picker = true;
                 }
                 if act.calculate {
-                    self.light.calculate(&self.doc, Some(&self.factory));
+                    // THE PLAN. The live preview 100 lines above already reads `plan_doc()`; this
+                    // reached for `self.doc` again, so the picture and the number printed under it
+                    // were fed by two different documents.
+                    let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+                    self.light.calculate(plan, Some(&self.factory));
                 }
                 if act.export_report {
                     self.export_light_report();
@@ -27421,6 +27525,17 @@ impl CadApp {
     /// absent) and mark that layer for 3D — the "shift the room into a SIMLUX
     /// layer" step. Undoable.
     fn shift_selection_to_simlux_layer(&mut self) {
+        // REFUSES inside a sketch rather than reaching for the plan, and for the same reason as
+        // the Make-* tools: it needs `&mut` on the document AND `self.selection`, which indexes
+        // whichever document is installed. There is no correct answer — plan indices would name
+        // the wrong objects and sketch indices would move a drawing on a face onto a room layer.
+        if self.factory.session.is_some() {
+            self.history.push(
+                "  ! SIMLUX: finish the sketch first — this moves objects in the PLAN".into(),
+            );
+            self.factory.status = "finish the sketch first — SIMLUX layers are the plan's".into();
+            return;
+        }
         if self.selection.is_empty() {
             self.history.push("  ! SIMLUX: select geometry first, then Move".into());
             return;
@@ -39420,7 +39535,8 @@ impl eframe::App for CadApp {
                         .color(egui::Color32::from_rgb(150, 165, 185)));
                     if ui.button("  ⚡  Calculate lux").clicked() {
                         self.light.window_open = true;
-                        self.light.calculate(&self.doc, Some(&self.factory));
+                        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+                        self.light.calculate(plan, Some(&self.factory));
                         ui.close_menu();
                     }
                     ui.separator();
@@ -55398,6 +55514,8 @@ mod a_sketch_is_not_the_plan {
             saved_doc: plan,
             saved_undo: Vec::new(),
             saved_redo: Vec::new(),
+            saved_constraints: Vec::new(),
+            saved_pending: None,
         };
         // `self.doc` is the sketch during a session — that is the swap.
         let got = CadApp::plan_doc_of(Some(&session), &sketch);
@@ -55613,5 +55731,272 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
     fn the_building_tools_still_work_on_the_plan() {
         let mut app = app_with_a_box();
         assert!(!app.refuse_plan_action_in_sketch("Make floor"), "no session, no refusal");
+    }
+}
+
+/// The rest of the sketch-swap audit: everything else that read the installed canvas while
+/// meaning the drawing. Each of these was written against the UNFIXED code first and seen to
+/// fail — a guard that has never failed is not known to guard anything.
+#[cfg(test)]
+mod a_sketch_does_not_reach_into_the_drawing {
+    use super::*;
+    use crate::param_editor::CRef;
+
+    fn app_with_a_box() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.factory.add_box();
+        app.factory.recompute();
+        app
+    }
+
+    fn line(ax: f64, ay: f64, bx: f64, by: f64) -> cad_kernel::DObject {
+        cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(ax, ay),
+            b: Vec2::new(bx, by),
+        }))
+    }
+
+    fn square(half: f64) -> cad_kernel::DObject {
+        cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(-half, -half), (half, -half), (half, half), (-half, half)]
+                .into_iter()
+                .map(|(x, y)| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        }))
+    }
+
+    /// A drawing with two lines and one constraint on them, parametric mode on.
+    fn app_with_a_constraint() -> CadApp {
+        let mut app = app_with_a_box();
+        app.doc.push(line(0.0, 0.0, 1.0, 0.0));
+        app.doc.push(line(0.0, 1.0, 1.0, 1.0));
+        let (h0, h1) = (app.doc.dobjects[0].handle, app.doc.dobjects[1].handle);
+        app.parametric.active = true;
+        app.parametric.constraints.push(CRef::Parallel(h0, h1));
+        app
+    }
+
+    /// What the parametric panel does on EVERY frame it is open.
+    fn one_panel_frame(app: &mut CadApp) {
+        crate::param_editor::prune_constraints(&app.doc, &mut app.parametric.constraints);
+    }
+
+    // ── #2 — the constraint wipe ────────────────────────────────────────────────────────────
+
+    /// Handles come from a process-global counter, so a sketch document shares NONE with the
+    /// plan: `prune_constraints` matched nothing and emptied the list on the sketch's first
+    /// frame. Nothing recovers it — no `UndoStep` carries constraints and nothing writes them
+    /// to disk.
+    #[test]
+    fn the_drawings_constraints_survive_a_sketch() {
+        let mut app = app_with_a_constraint();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        one_panel_frame(&mut app);
+        one_panel_frame(&mut app); // and it is not a first-frame-only effect
+        app.factory_exit_sketch();
+
+        assert_eq!(
+            app.parametric.constraints.len(),
+            1,
+            "the drawing's constraints were deleted by a sketch it had nothing to do with",
+        );
+    }
+
+    /// The mechanism, stated as its own test: while the sketch is open the drawing's constraints
+    /// are PARKED, not merely spared the prune. Left installed they would also be solved against,
+    /// and drawn over, geometry that is not theirs.
+    #[test]
+    fn the_drawings_constraints_are_not_live_inside_the_sketch() {
+        let mut app = app_with_a_constraint();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(
+            app.parametric.constraints.is_empty(),
+            "a sketch is its own constraint space — its handles are its own",
+        );
+        assert!(app.parametric.pending.is_none(), "a half-picked pair must not span two documents");
+    }
+
+    /// …and a constraint made INSIDE the sketch does not follow the drawing back out, where its
+    /// handles name nothing.
+    #[test]
+    fn a_sketch_constraint_does_not_leak_into_the_drawing() {
+        let mut app = app_with_a_constraint();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(line(0.0, 0.0, 2.0, 0.0));
+        let h = app.doc.dobjects[0].handle;
+        app.parametric.constraints.push(CRef::Horizontal(h));
+        app.factory_exit_sketch();
+
+        assert_eq!(app.parametric.constraints.len(), 1, "exactly the drawing's own constraint");
+        let present: std::collections::HashSet<_> =
+            app.doc.dobjects.iter().map(|d| d.handle).collect();
+        assert!(
+            app.parametric.constraints[0].handles().iter().all(|h| present.contains(h)),
+            "every restored constraint must name geometry that is actually in the drawing",
+        );
+    }
+
+    /// The prune still does its real job — dropping constraints whose geometry was deleted.
+    #[test]
+    fn the_prune_still_drops_deleted_geometry() {
+        let mut app = app_with_a_constraint();
+        app.doc.dobjects.remove(1);
+        one_panel_frame(&mut app);
+        assert!(app.parametric.constraints.is_empty(), "the prune must still prune");
+    }
+
+    // ── #5 — picking bare ground from the 3D view ───────────────────────────────────────────
+
+    fn view(app: &CadApp, rect: egui::Rect) -> [f32; 16] {
+        let f = &app.factory;
+        crate::light3d::mvp(
+            f.cam_yaw, f.cam_pitch, f.cam_dist, f.cam_target,
+            rect.width() / rect.height(), f.ortho,
+        )
+    }
+
+    /// PROVES THE MACHINERY WORKS, so the refusal test below cannot pass by accident — the
+    /// mistake that has bitten this codebase three times.
+    #[test]
+    fn the_ground_pick_finds_plan_geometry_with_no_sketch_open() {
+        let mut app = app_with_a_box();
+        app.doc.push(square(0.5)); // smallest containing shape wins the pick
+        let want = app.doc.dobjects.len() - 1;
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = view(&app, rect);
+        assert_eq!(
+            app.factory_pick_ground_dobject(rect.center(), rect, &mvp),
+            Some(want),
+            "the pick must actually hit a plan shape under the cursor",
+        );
+    }
+
+    /// It ray-cast to world z = 0 and then point-in-polygoned against the SKETCH, reading a
+    /// plane's (u, v) as world (x, y). A click on bare floor cleared the 3D selection and put
+    /// grips on a shape the user never clicked.
+    #[test]
+    fn the_ground_pick_ignores_a_face_sketch() {
+        let mut app = app_with_a_box();
+        app.doc.push(square(5.0));
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(square(5.0)); // the same shape, now drawn ON THE FACE
+
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = view(&app, rect);
+        assert_eq!(
+            app.factory_pick_ground_dobject(rect.center(), rect, &mvp),
+            None,
+            "a sketch's local coordinates were picked as if they were the ground plan",
+        );
+    }
+
+    // ── #7 — the SIMLUX layer on the 2D canvas ──────────────────────────────────────────────
+
+    /// `paint_lux_overlay` already refused during a sketch; the fixtures and the pointer that
+    /// places them did not. So the heatmap vanished while the fittings it was computed from kept
+    /// drawing at world metres on a wall's (u, v) — and a click wrote that wall coordinate
+    /// straight into a luminaire's world position.
+    #[test]
+    fn the_simlux_2d_layer_is_off_during_a_sketch() {
+        let mut app = app_with_a_box();
+        app.light.window_open = true;
+        assert!(app.simlux_2d_layer_live(), "SIMLUX is on screen and the canvas is the plan");
+
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(
+            !app.simlux_2d_layer_live(),
+            "fixtures are world metres; a face sketch's canvas is that plane's (u, v)",
+        );
+
+        app.factory_exit_sketch();
+        assert!(app.simlux_2d_layer_live(), "and it comes back when the sketch closes");
+    }
+
+    /// The other half of the predicate is unchanged: with SIMLUX off screen, nothing is live.
+    #[test]
+    fn the_simlux_2d_layer_is_off_when_simlux_is_closed() {
+        let app = app_with_a_box();
+        assert!(!app.simlux_2d_layer_live());
+    }
+
+    /// Moving objects onto the SIMLUX layer REFUSES in a sketch rather than reaching for the
+    /// plan: it needs `&mut` on the document and `self.selection`, which indexes whichever
+    /// document is installed, so there is no correct answer.
+    #[test]
+    fn the_simlux_layer_move_refuses_inside_a_sketch() {
+        let mut app = app_with_a_box();
+        app.doc.push(square(5.0));
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.push(square(5.0));
+        app.selection = vec![0];
+        let layers_before = app.factory.session.as_ref().unwrap().saved_doc.layers.layers.len();
+
+        app.shift_selection_to_simlux_layer();
+
+        assert_eq!(
+            app.factory.session.as_ref().unwrap().saved_doc.layers.layers.len(),
+            layers_before,
+            "it created a SIMLUX layer in the drawing on behalf of a click inside a sketch",
+        );
+        assert!(
+            app.factory.status.contains("finish the sketch"),
+            "and it must say why: {}",
+            app.factory.status,
+        );
+    }
+
+    // ── #8 — the `scene` diagnostic ─────────────────────────────────────────────────────────
+
+    /// `scene` exists to give measured truth instead of a guess, and mm-vs-m is what it is most
+    /// often pointed at. With a face open it reported the SKETCH's 1.0 m/unit as the drawing's
+    /// plan↔3D scale — misleading exactly when it was being trusted.
+    #[test]
+    fn the_scene_report_states_the_drawings_unit_not_the_sketchs() {
+        let mut app = app_with_a_box();
+        app.doc.units.metres_per_unit = 0.001; // a millimetre drawing
+        app.doc.units.source = cad_kernel::UnitSource::Declared;
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+
+        let ev = app.factory_scene_capture("test");
+        let crate::dbg_recorder::DbgEvent::FactoryScene { sections, .. } = ev else {
+            panic!("factory_scene_capture must return a FactoryScene event");
+        };
+        let units_line = sections
+            .iter()
+            .flat_map(|(_, lines)| lines.iter())
+            .find(|l| l.starts_with("doc units:"))
+            .expect("the report states the document's units")
+            .clone();
+
+        assert!(
+            units_line.contains("0.001000"),
+            "the drawing is millimetres and the report must say so: {units_line}",
+        );
+        assert!(
+            units_line.contains("sketch open"),
+            "and it must say the canvas is a plane, not silently report the plan: {units_line}",
+        );
+    }
+
+    /// With no sketch open it is unchanged.
+    #[test]
+    fn the_scene_report_is_unchanged_with_no_sketch() {
+        let mut app = app_with_a_box();
+        app.doc.units.metres_per_unit = 0.001;
+        let ev = app.factory_scene_capture("test");
+        let crate::dbg_recorder::DbgEvent::FactoryScene { sections, .. } = ev else {
+            panic!("FactoryScene");
+        };
+        let units_line = sections
+            .iter()
+            .flat_map(|(_, lines)| lines.iter())
+            .find(|l| l.starts_with("doc units:"))
+            .expect("units line")
+            .clone();
+        assert!(units_line.contains("0.001000"), "{units_line}");
+        assert!(!units_line.contains("sketch open"), "{units_line}");
     }
 }
