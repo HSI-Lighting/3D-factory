@@ -1015,6 +1015,12 @@ pub struct FactoryState {
     pub rename_plane: Option<(usize, String)>,
     /// The distance from the world origin used by [`PlaceMode::Offset`], in metres.
     pub place_offset: [f32; 3],
+    /// The typed coordinate applies to the NEXT object only, then the mode goes back to
+    /// [`Self::place_mode_before_offset`]. Not persisted: a one-shot answer to a prompt is not
+    /// project state, and restoring it on load would re-arm a placement nobody asked for.
+    pub place_offset_once: bool,
+    /// What [`Self::place_mode`] was before a typed coordinate borrowed it.
+    pub place_mode_before_offset: PlaceMode,
     /// The object that was just added and is waiting for a click — in EITHER window — to say
     /// where it goes. See [`FactoryState::place_awaiting_at`].
     pub awaiting_place: Option<AwaitingPlace>,
@@ -3043,6 +3049,8 @@ impl Default for FactoryState {
             place_mode: PlaceMode::Click,
             rename_plane: None,
             place_offset: [0.0, 0.0, 0.0],
+            place_offset_once: false,
+            place_mode_before_offset: PlaceMode::Click,
             awaiting_place: None,
             wall_height: 2.7,
             wall_thickness: 0.2,
@@ -3414,6 +3422,23 @@ impl FactoryState {
     fn arm_placement(&mut self, what: AwaitingPlace) {
         if self.place_mode == PlaceMode::Click {
             self.awaiting_place = Some(what);
+        }
+        // A TYPED COORDINATE IS ONE PLACEMENT, NOT A MODE.
+        //
+        // Reported as: "placing the objects with coordinates — once i enter a coordinate it keeps
+        // inserting it in the same place again and again." Answering the coordinate prompt set
+        // `place_mode = Offset` and left it there, so every later add landed on the same point,
+        // stacked inside the last one, with nothing on screen saying a mode was still in force.
+        //
+        // A coordinate typed at a prompt answers THAT prompt — it is a point, the way a point is
+        // in any drafting command. Choosing "Offset from origin" from the placement menu is a
+        // different act and stays sticky, because that one IS a mode and the menu shows it.
+        //
+        // Consumed here because this runs at the END of every add, after the object has taken its
+        // position — so nothing upstream needs to know the offset was single-use.
+        if self.place_offset_once {
+            self.place_offset_once = false;
+            self.place_mode = self.place_mode_before_offset;
         }
     }
 
@@ -4026,6 +4051,25 @@ impl FactoryState {
         members.len()
     }
 
+    /// Tag `ids` as one group, so they select, move and delete together.
+    ///
+    /// Unlike [`Self::group_selection`] this does not touch the selection — it is for the BUILD
+    /// paths, which know what they just made and must not disturb what the user had picked.
+    /// Ids already in a group keep theirs: a room carved out of a building must not silently
+    /// pull the building into the room's group.
+    pub fn group_features(&mut self, ids: &[u32]) {
+        let fresh: Vec<u32> =
+            ids.iter().copied().filter(|id| !self.feature_group.contains_key(id)).collect();
+        if fresh.len() < 2 {
+            return;
+        }
+        let gid = self.next_group_id;
+        self.next_group_id += 1;
+        for id in fresh {
+            self.feature_group.insert(id, gid);
+        }
+    }
+
     /// EXPLODE: dissolve the group(s) of the selected features so each piece is independent again.
     /// Returns the number of features released.
     pub fn ungroup_selection(&mut self) -> usize {
@@ -4213,7 +4257,46 @@ impl FactoryState {
                 *f = f.translated(delta);
             }
         }
+        self.translate_surface_textures(&self.selection.clone(), delta);
         self.dirty = true;
+    }
+
+    /// Carry per-face textures along when their feature moves.
+    ///
+    /// A [`SurfaceKey`] is `(feature id, quantised normal, quantised plane offset d)` — it names a
+    /// PLANE, not a triangle, which is what lets one key paint a whole flat face however it is
+    /// tessellated. The cost is that `d = n · p` moves with the geometry: translate a wall and
+    /// every one of its painted faces is looked up under a key that no longer exists, so the paint
+    /// silently vanishes.
+    ///
+    /// That was already true of moving a single feature. It matters more now that a building moves
+    /// as one object — "make sure you dont break the texture application while fixing this" — so
+    /// the keys move too. For a pure translation the new offset is exact: `d' = n · (p + Δ) =
+    /// d + n · Δ`, with the normal unchanged. No re-derivation from geometry, no tolerance.
+    fn translate_surface_textures(&mut self, ids: &[u32], delta: Vec3) {
+        if self.surface_texture.is_empty() && self.surface_color.is_empty() {
+            return;
+        }
+        let moved: std::collections::HashSet<u32> = ids.iter().copied().collect();
+        let shift = |k: &SurfaceKey| -> SurfaceKey {
+            let n = Vec3::new(k.1 as f32 / 50.0, k.2 as f32 / 50.0, k.3 as f32 / 50.0);
+            (k.0, k.1, k.2, k.3, ((k.4 as f32 / 100.0 + n.dot(delta)) * 100.0).round() as i32)
+        };
+        let remap = |map: &mut std::collections::HashMap<SurfaceKey, usize>| {
+            let (mut keep, mut move_): (Vec<_>, Vec<_>) =
+                map.drain().partition(|(k, _)| !moved.contains(&k.0));
+            for (k, v) in move_.drain(..) {
+                keep.push((shift(&k), v));
+            }
+            *map = keep.into_iter().collect();
+        };
+        remap(&mut self.surface_texture);
+        let (mut keep, mut move_): (Vec<_>, Vec<_>) =
+            self.surface_color.drain().partition(|(k, _)| !moved.contains(&k.0));
+        for (k, v) in move_.drain(..) {
+            keep.push((shift(&k), v));
+        }
+        self.surface_color = keep.into_iter().collect();
     }
 
     /// Uniformly scale the current selection about its own centre — furniture instance or
@@ -5397,10 +5480,28 @@ impl FactoryState {
             wall_t,
             open_top: self.room_open_top,
             floor: Some(floor_id),
-            walls: wall_ids,
+            walls: wall_ids.clone(),
             ceiling: ceiling_id,
             carve,
         });
+
+        // A ROOM IS ONE OBJECT.
+        //
+        // Reported as: "when i move a building its floor and ceiling stay in place — the ceiling
+        // and floor are part of the building so they should stay attached to it." They were built
+        // as separate CSG features and nothing tied them together, so Move took whichever one the
+        // click had landed on and left the rest behind. The dump shows the cost exactly: a 20 m
+        // building whose model AABB had stretched to 69.31 m after two moves, because the parts
+        // had walked away from each other.
+        //
+        // Grouping is the mechanism that already exists for this — members "select / move /
+        // delete as one entity" — and using it means no new movement code, no second rule about
+        // what moves with what, and Explode still works for anyone who wants the parts apart.
+        let mut parts = vec![floor_id];
+        parts.extend(wall_ids);
+        parts.extend(ceiling_id);
+        parts.extend(carve);
+        self.group_features(&parts);
 
         self.selection = vec![floor_id];
         self.dirty = true;
@@ -6612,6 +6713,22 @@ impl FactoryState {
         self.dirty = false;
         // The solids changed → the cached opaque render buffer is stale.
         self.geom_version = self.geom_version.wrapping_add(1);
+        // …AND SO HAS ANY OPEN SKETCH'S REFERENCE OUTLINE.
+        //
+        // Reported as: "when i move a building the building outline moves in the global view but
+        // not in any other view — if i pick a face to draw and move the building while doing it,
+        // the outline in 2D stays in the same place. Only after finishing the sketch and opening
+        // it again does it fix itself." The outline was projected ONCE, when the sketch was
+        // entered, and never again: a photograph of where the face used to be. Everything drawn
+        // after that was aligned and osnapped to a ghost.
+        //
+        // Rebuilt here rather than at the call sites because this is the one place that already
+        // means "the model changed" — a caller that forgot would leave the drawing on the ghost.
+        if let Some(idx) = self.session.as_ref().map(|s| s.idx) {
+            if let Some(frame) = self.model.sketches.get(idx).map(|sk| sk.frame) {
+                self.sketch_ref = self.frame_face_edges(&frame);
+            }
+        }
     }
 
     /// Is feature `id` hidden while "Hide ceilings" is on? True if it is a tracked room
@@ -14274,5 +14391,248 @@ mod grid_pitch {
                 );
             }
         }
+    }
+}
+
+/// A TYPED COORDINATE IS ONE PLACEMENT, NOT A MODE.
+///
+/// Reported as: "placing the objects with coordinates — once i enter a coordinate it keeps
+/// inserting it in the same place again and again." Answering the coordinate prompt set
+/// `place_mode = Offset` and left it there, so every later add landed on the same point, stacked
+/// inside the last one, with nothing on screen saying a mode was still in force.
+#[cfg(test)]
+mod a_typed_coordinate_places_once {
+    use super::*;
+
+    fn a_state() -> FactoryState {
+        let mut f = FactoryState::default();
+        f.model.push(
+            cad_solid::BoolOp::Union,
+            cad_solid::Plane::default(),
+            cad_solid::Placement::default(),
+            cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+        );
+        f
+    }
+
+    /// Arm a one-shot coordinate the way the command line does.
+    fn type_a_coordinate(f: &mut FactoryState, at: [f32; 3]) {
+        f.place_offset = at;
+        if f.place_mode != PlaceMode::Offset {
+            f.place_mode_before_offset = f.place_mode;
+        }
+        f.place_offset_once = true;
+        f.place_mode = PlaceMode::Offset;
+    }
+
+    /// THE BUG: the second object must not land on the first.
+    #[test]
+    fn the_mode_reverts_after_one_object() {
+        let mut f = a_state();
+        f.place_mode = PlaceMode::Centre;
+        type_a_coordinate(&mut f, [3.0, 4.0, 0.0]);
+
+        assert_eq!(f.place_at(), Vec3::new(3.0, 4.0, 0.0), "the object being placed uses it");
+        f.arm_placement(AwaitingPlace::Feature(1)); // end of the add
+        assert_eq!(f.place_mode, PlaceMode::Centre, "and the mode goes back");
+        assert!(!f.place_offset_once);
+        assert_ne!(f.place_at(), Vec3::new(3.0, 4.0, 0.0), "the NEXT object does not stack on it");
+    }
+
+    /// It goes back to whatever was in force, not to a hardcoded default — Click is the common
+    /// case and reverting to Centre would silently change where every later object lands.
+    #[test]
+    fn it_reverts_to_the_mode_that_was_in_force() {
+        for before in [PlaceMode::Click, PlaceMode::Centre, PlaceMode::Origin] {
+            let mut f = a_state();
+            f.place_mode = before;
+            type_a_coordinate(&mut f, [1.0, 2.0, 3.0]);
+            f.arm_placement(AwaitingPlace::Feature(1));
+            assert_eq!(f.place_mode, before, "reverted to the wrong mode from {before:?}");
+        }
+    }
+
+    /// The STICKY mode is still available and still sticky — it is chosen from the placement menu,
+    /// where it is visible, rather than implied by having typed a number once.
+    #[test]
+    fn choosing_offset_from_the_menu_stays_on() {
+        let mut f = a_state();
+        f.place_mode = PlaceMode::Offset; // as the menu sets it — no one-shot flag
+        f.place_offset = [5.0, 6.0, 0.0];
+        f.arm_placement(AwaitingPlace::Feature(1));
+        assert_eq!(f.place_mode, PlaceMode::Offset, "an explicitly chosen mode must persist");
+        assert_eq!(f.place_at(), Vec3::new(5.0, 6.0, 0.0));
+    }
+
+    /// Typing a coordinate twice in a row must not lose the original mode — the second entry must
+    /// not record "Offset" as the thing to revert to.
+    #[test]
+    fn two_coordinates_in_a_row_still_revert_to_the_original_mode() {
+        let mut f = a_state();
+        f.place_mode = PlaceMode::Click;
+        type_a_coordinate(&mut f, [1.0, 0.0, 0.0]);
+        type_a_coordinate(&mut f, [2.0, 0.0, 0.0]); // before the first was consumed
+        f.arm_placement(AwaitingPlace::Feature(1));
+        assert_eq!(f.place_mode, PlaceMode::Click, "the original mode was overwritten by Offset");
+    }
+
+    /// A one-shot placement is not project state. Reloading a file must not re-arm it.
+    #[test]
+    fn it_does_not_survive_a_save() {
+        let mut f = a_state();
+        type_a_coordinate(&mut f, [7.0, 8.0, 0.0]);
+        let doc = f.to_persist();
+        let mut g = FactoryState::default();
+        g.apply_persist(doc);
+        assert!(!g.place_offset_once, "a reopened project must not be holding a typed coordinate");
+    }
+}
+
+/// A ROOM MOVES AS ONE OBJECT, AND ITS PAINT GOES WITH IT.
+///
+/// Reported as: "when i move a building its floor and ceiling stay in place — the ceiling and
+/// floor are part of building so they should stay attached to it. but make sure you dont break the
+/// texture application while fixing this."
+///
+/// The parts were separate CSG features with nothing tying them together, so Move took whichever
+/// one the click landed on. The session dump measures it: a 20 m building whose model AABB had
+/// stretched to 69.31 m after two moves.
+#[cfg(test)]
+mod a_room_moves_as_one_object {
+    use super::*;
+
+    fn a_room() -> FactoryState {
+        let mut f = FactoryState::default();
+        f.add_room(&[
+            Vec2::new(0.0, 0.0),
+            Vec2::new(6.0, 0.0),
+            Vec2::new(6.0, 4.0),
+            Vec2::new(0.0, 4.0),
+            Vec2::new(0.0, 0.0),
+        ])
+        .expect("room");
+        f.recompute();
+        f
+    }
+
+    /// Picking ONE part selects the whole room — the mechanism that makes Move take all of it.
+    #[test]
+    fn picking_one_part_selects_the_room() {
+        let mut f = a_room();
+        let parts = f.model.features.len();
+        assert!(parts >= 3, "a room is built from several features, got {parts}");
+
+        let one = f.model.features[0].id;
+        f.selection = vec![one];
+        f.expand_selection_to_groups();
+        assert_eq!(
+            f.selection.len(),
+            parts,
+            "one click must select all {parts} parts, got {:?}",
+            f.selection,
+        );
+    }
+
+    /// THE BUG, measured the way the dump measured it: the model's own extent must not grow when
+    /// the room is moved. It grows exactly when a part is left behind.
+    #[test]
+    fn moving_it_does_not_stretch_the_model() {
+        let mut f = a_room();
+        let size = |f: &FactoryState| {
+            let (mn, mx) = f.cached.bounds().expect("geometry");
+            [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]]
+        };
+        let before = size(&f);
+
+        f.selection = vec![f.model.features[0].id];
+        f.expand_selection_to_groups();
+        f.move_selection(Vec3::new(25.0, 0.0, 0.0));
+        f.recompute();
+
+        let after = size(&f);
+        for k in 0..3 {
+            assert!(
+                (after[k] - before[k]).abs() < 1e-3,
+                "the model stretched on axis {k}: {:?} → {:?} — a part stayed behind",
+                before,
+                after,
+            );
+        }
+    }
+
+    /// …and it actually WENT somewhere. A test that only checks the size would pass on a move
+    /// that did nothing at all.
+    #[test]
+    fn all_of_it_actually_moved() {
+        let mut f = a_room();
+        let min_x = |f: &FactoryState| f.cached.bounds().unwrap().0[0];
+        let before = min_x(&f);
+        f.selection = vec![f.model.features[0].id];
+        f.expand_selection_to_groups();
+        f.move_selection(Vec3::new(25.0, 0.0, 0.0));
+        f.recompute();
+        assert!((min_x(&f) - before - 25.0).abs() < 1e-3, "the whole room must travel 25 m");
+    }
+
+    /// THE TEXTURE WARNING. A face painted before the move must still be painted after it — the
+    /// key names a plane, and the plane moved.
+    #[test]
+    fn a_painted_face_keeps_its_paint_through_a_move() {
+        let mut f = a_room();
+        let id = f.model.features[0].id;
+        // A face on the plane z = 0 with an upward normal, as `surface_key` would produce it.
+        let key = surface_key(id, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        f.surface_texture.insert(key, 7);
+
+        f.selection = vec![id];
+        f.move_selection(Vec3::new(0.0, 0.0, 2.5)); // straight up: d changes by n·Δ = 2.5
+
+        assert!(!f.surface_texture.contains_key(&key), "the old key must not survive");
+        let want = surface_key(id, [0.0, 0.0, 2.5], [1.0, 0.0, 2.5], [0.0, 1.0, 2.5]);
+        assert_eq!(
+            f.surface_texture.get(&want).copied(),
+            Some(7),
+            "the paint must move with the face; keys are {:?}",
+            f.surface_texture.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    /// A move ALONG a face's plane must not disturb its key at all — `n · Δ` is zero there, and a
+    /// rounding slip would drop the paint on every horizontal drag.
+    #[test]
+    fn sliding_along_a_face_leaves_its_key_alone() {
+        let mut f = a_room();
+        let id = f.model.features[0].id;
+        let key = surface_key(id, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        f.surface_texture.insert(key, 3);
+        f.selection = vec![id];
+        f.move_selection(Vec3::new(9.0, -4.0, 0.0)); // in the plane z = 0
+        assert_eq!(f.surface_texture.get(&key).copied(), Some(3), "an in-plane slide changes nothing");
+    }
+
+    /// Paint on a feature that did NOT move must be left exactly where it is.
+    #[test]
+    fn paint_on_an_unmoved_feature_is_untouched() {
+        let mut f = a_room();
+        let moved = f.model.features[0].id;
+        let still = f.model.features[1].id;
+        let k_still = surface_key(still, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        f.surface_texture.insert(k_still, 11);
+        f.selection = vec![moved];
+        f.move_selection(Vec3::new(0.0, 0.0, 2.5));
+        assert_eq!(f.surface_texture.get(&k_still).copied(), Some(11));
+    }
+
+    /// Explode still works — grouping must not take away the ability to move one slab.
+    #[test]
+    fn a_room_can_still_be_taken_apart() {
+        let mut f = a_room();
+        f.selection = vec![f.model.features[0].id];
+        f.expand_selection_to_groups();
+        assert!(f.ungroup_selection() > 0, "Explode must release the parts");
+        let one = f.model.features[0].id;
+        f.selection = vec![one];
+        f.expand_selection_to_groups();
+        assert_eq!(f.selection, vec![one], "after Explode a part is its own object again");
     }
 }

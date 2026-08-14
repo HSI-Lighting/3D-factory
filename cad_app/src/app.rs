@@ -4100,11 +4100,18 @@ impl CadApp {
                 return true;
             };
             self.factory.place_offset = o;
+            // ONE placement, like the prompt — a coordinate is a point, not a mode. The sticky
+            // version is still there and still explicit: ▼ placement → "Offset from origin",
+            // which stays on and says so in the menu.
+            if self.factory.place_mode != PlaceMode::Offset {
+                self.factory.place_mode_before_offset = self.factory.place_mode;
+            }
+            self.factory.place_offset_once = true;
             self.factory.place_mode = PlaceMode::Offset;
             self.factory.awaiting_place = None;
             let u = self.factory.units;
             let msg = format!(
-                "New objects land at {}, {}, {} from the origin",
+                "The next object lands at {}, {}, {} from the origin",
                 crate::factory::length_str(u, o[0]),
                 crate::factory::length_str(u, o[1]),
                 crate::factory::length_str(u, o[2]),
@@ -4182,6 +4189,12 @@ impl CadApp {
                 return true;
             };
             self.factory.place_offset = o;
+            // ONE placement, not a mode — see `FactoryState::arm_placement`. Remember what the
+            // mode was so the next add goes back to it instead of stacking on this coordinate.
+            if self.factory.place_mode != PlaceMode::Offset {
+                self.factory.place_mode_before_offset = self.factory.place_mode;
+            }
+            self.factory.place_offset_once = true;
             self.factory.place_mode = PlaceMode::Offset;
             self.factory.awaiting_place = None;
             self.place_coord_prompt = false;
@@ -4223,12 +4236,17 @@ impl CadApp {
         false
     }
 
-    /// "New objects land at 900 mm, 0 mm, 0 mm from the origin" — in the working unit.
+    /// "The next object lands at 900 mm, 0 mm, 0 mm from the origin" — in the working unit.
+    ///
+    /// NEXT, singular, when the coordinate was typed: it is one placement and the line has to say
+    /// so, or the mode is invisible and the next five objects stack on the same point. The sticky
+    /// version comes from the placement menu and says "New objects".
     fn place_offset_summary(&self) -> String {
         let u = self.factory.units;
         let o = self.factory.place_offset;
+        let who = if self.factory.place_offset_once { "The next object lands" } else { "New objects land" };
         format!(
-            "New objects land at {}, {}, {} from the origin",
+            "{who} at {}, {}, {} from the origin",
             crate::factory::length_str(u, o[0]),
             crate::factory::length_str(u, o[1]),
             crate::factory::length_str(u, o[2]),
@@ -10079,23 +10097,7 @@ impl CadApp {
                 //   Building   — the plan→3D actions (walls / building / slabs)
                 // plus Frame and Clear. Both dropdowns drive the SAME code the main-menu
                 // rows do, so there is one implementation, not two.
-                // ONE ROW, SCROLLED — never wrapped.
-                //
-                // Reported as: "while selecting something from the drop down menu, when i move
-                // the cursor it opens the menu of whatever is below it". A wrapped bar puts menu
-                // buttons on the rows BENEATH the one you opened, an open dropdown covers them,
-                // and egui switches menus on hover of a sibling button without knowing that a
-                // popup is in front of it. So moving the cursor down through the open panel ran
-                // it over the buttons underneath and swapped the menu out from under the click.
-                //
-                // Nothing sits below the bar when the bar is one row, so a downward popup cannot
-                // cover a button. Scrolling is the honest cost: a narrow panel now scrolls its
-                // toolbar instead of silently rearranging it into a trap.
-                egui::ScrollArea::horizontal()
-                    .id_salt("factory_toolbar_scroll")
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     // WORKING UNIT — what every length in the Factory is typed and shown in.
                     //
                     // First on the bar because it is the first decision: a building is dimensioned
@@ -10104,7 +10106,7 @@ impl CadApp {
                     // model is stored in metres either way — so it is safe to switch at any point
                     // and safe to switch back.
                     let cur = self.factory.units;
-                    ui.menu_button(format!("▼ {}", cur.label()), |ui| {
+                    click_menu_button(ui, format!("▼ {}", cur.label()), |ui| {
                         ui.label(egui::RichText::new("working unit — what you type in").small().weak());
                         for (label, m) in [
                             ("millimetres  mm", cad_kernel::DocUnits::MM),
@@ -10139,7 +10141,7 @@ impl CadApp {
 
 
                     ui.separator();
-                    ui.menu_button("▼ 3D solids", |ui| {
+                    click_menu_button(ui, "▼ 3D solids", |ui| {
                         for k in crate::factory::Draw3dKind::ALL {
                             if ui.button(format!("{}  {}", k.icon(), k.label())).clicked() {
                                 // Same as the main-menu path: open the dialog; nothing is
@@ -10153,7 +10155,7 @@ impl CadApp {
                     .response
                     .on_hover_text("Parametric 3D primitives — opens the Draw3D dialog");
 
-                    ui.menu_button("▼ Building", |ui| {
+                    click_menu_button(ui, "▼ Building", |ui| {
                         // Live count, so it is obvious WHY a row might report "select
                         // something first".
                         let sel = self.selection.len();
@@ -10208,7 +10210,7 @@ impl CadApp {
                     // it again, losing any window already cut into its walls.
                     {
                         let n = self.factory.rooms.len();
-                        ui.menu_button(format!("▼ Rooms ({n})"), |ui| {
+                        click_menu_button(ui, format!("▼ Rooms ({n})"), |ui| {
                             if n == 0 {
                                 ui.label(
                                     egui::RichText::new("No rooms yet.\nDraw a closed outline, then ▼ Room → Make room.")
@@ -10349,7 +10351,7 @@ impl CadApp {
                         .on_hover_text("Every room built — rename, change its height, select or delete it");
                     }
 
-                    ui.menu_button("▼ Room", |ui| {
+                    click_menu_button(ui, "▼ Room", |ui| {
                         ui.label(
                             egui::RichText::new("  Carve an interior out of the building")
                                 .small()
@@ -10467,7 +10469,7 @@ impl CadApp {
                     .response
                     .on_hover_text("Carve interior rooms out of a building solid");
 
-                    ui.menu_button("▼ Room elements", |ui| {
+                    click_menu_button(ui, "▼ Room elements", |ui| {
                         ui.label(
                             egui::RichText::new("  Extrude / cut a shape drawn on a face")
                                 .small()
@@ -10531,7 +10533,7 @@ impl CadApp {
                     .response
                     .on_hover_text("Extrude or cut shapes drawn on a face — enabled while drafting on a face");
 
-                    ui.menu_button("▼ Furniture", |ui| {
+                    click_menu_button(ui, "▼ Furniture", |ui| {
                         if ui
                             .button("⭳  Import OBJ / 3DS / FBX / glTF…")
                             .on_hover_text("Import a furniture mesh (.obj, .3ds, .fbx, .glb or .gltf). Stored in the project for reuse.")
@@ -10663,31 +10665,31 @@ impl CadApp {
                     .response
                     .on_hover_text("Import furniture (.obj/.3ds/.fbx), place it, or extrude/sweep a drawn shape into furniture");
 
-                    ui.menu_button("▼ FBC scene import", |ui| {
+                    click_menu_button(ui, "▼ FBC scene import", |ui| {
                         self.factory_scene_import_menu(ui);
                     })
                     .response
                     .on_hover_text("Import a whole scene exported from Blender (.glb / .gltf / .fbx) at its real-world size, with its materials and textures");
 
-                    ui.menu_button("▼ Textures", |ui| {
+                    click_menu_button(ui, "▼ Textures", |ui| {
                         self.factory_textures_menu(ui);
                     })
                     .response
                     .on_hover_text("Colour or texture the selected object (paste/load an image, or reuse one from the library); tune tiling · opacity · reflection in the properties panel");
 
-                    ui.menu_button("▼ Openings", |ui| {
+                    click_menu_button(ui, "▼ Openings", |ui| {
                         self.factory_openings_menu(ui);
                     })
                     .response
                     .on_hover_text("Select, resize or delete cutouts (windows/doors/recesses)");
 
-                    ui.menu_button("▼ Apertures", |ui| {
+                    click_menu_button(ui, "▼ Apertures", |ui| {
                         self.factory_apertures_menu(ui);
                     })
                     .response
                     .on_hover_text("Doors & windows: import one, or draw a rectangle on a wall and the app cuts the opening + fits a door/window into it");
 
-                    ui.menu_button("▼ Architecture", |ui| {
+                    click_menu_button(ui, "▼ Architecture", |ui| {
                         self.factory_architecture_menu(ui);
                     })
                     .response
@@ -10787,7 +10789,6 @@ impl CadApp {
                         self.snapshot_factory();
                         self.factory.clear();
                     }
-                });
                 });
                 // ---- ACTIVE STOREY — where new geometry is placed -----------
                 // The build tools live in this panel, but the storey list is in the main
@@ -35936,6 +35937,44 @@ fn menu_hug_geometry(ui: &egui::Ui, rows: &[(&str, RowT)]) -> (f32, f32) {
 /// border (edge-to-edge hover, §3) — saved + restored on the menubar `ui` around
 /// the button — and flush the row spacing to 0. The `body` then measures via
 /// `menu_hug_geometry`, `ui.set_width(w)`, and paints rows with `paint_menu_row`.
+/// A menu button that opens on CLICK and never switches on hover.
+///
+/// Reported as: "while selecting something from the drop down menu, when i move the cursor it
+/// opens the menu of whatever is below it."
+///
+/// egui's `menu_button` opens a menu when `button.clicked() || (button.hovered() && some other
+/// menu is open)` — `stationary_interaction`, egui 0.30 `menu.rs:386`. Hover-switching is right
+/// for a single-row menu bar. These bars WRAP, so the next row of buttons sits directly beneath
+/// the one you opened, and `style.spacing.menu_spacing` leaves a few pixels of it exposed between
+/// the button and its own panel. Moving the cursor straight down into the panel crosses that strip
+/// and swaps the menu out from under you.
+///
+/// That rule reads the BUTTON's own `hovered`, so clearing it removes hover-switching and nothing
+/// else: clicking still opens, clicking again still closes, and the panel behaves normally once
+/// open. Every button shares one bar id, so opening one still closes the last.
+///
+/// The layout is deliberately left alone. The first attempt at this made the bar a single
+/// scrolling row — which removed the second row, and with it the symptom, by changing something
+/// nobody asked to change.
+pub(crate) fn click_menu_button<R>(
+    ui: &mut egui::Ui,
+    title: impl Into<egui::WidgetText>,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    // ONE id for the whole bar: `ui.id()` belongs to the wrapping layout and is shared by every
+    // button in it, so they behave as one menu bar rather than as N independent popups.
+    let bar_id = ui.id().with("click_only_menu_bar");
+    let mut state = egui::menu::BarState::load(ui.ctx(), bar_id);
+    // The response given to `bar_menu` has its hover cleared; the one handed BACK to the caller
+    // keeps it, so `.on_hover_text(…)` on these buttons still works.
+    let resp = ui.button(title);
+    let mut gated = resp.clone();
+    gated.hovered = false; // ← the whole fix
+    let inner = state.bar_menu(&gated, body).map(|ir| ir.inner);
+    state.store(ui.ctx(), bar_id);
+    egui::InnerResponse::new(inner, resp)
+}
+
 fn custom_menu(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     let saved_mm = ui.style().spacing.menu_margin;
     ui.style_mut().spacing.menu_margin.left  = 0.0;
@@ -54624,5 +54663,101 @@ mod the_shortcut_table_is_honest {
     fn the_3d_group_states_its_gate() {
         let g = SHORTCUTS.iter().find(|g| g.title == "3D Factory").unwrap();
         assert!(g.scope.contains("ACTIVE"), "the gate has to be stated: {}", g.scope);
+    }
+}
+
+/// A WRAPPED MENU BAR MUST NOT SWITCH MENUS ON HOVER.
+///
+/// Reported as: "while selecting something from the drop down menu, when i move the cursor it
+/// opens the menu of whatever is below it." egui opens a menu on
+/// `button.clicked() || (button.hovered() && another menu is open)` — right for a single-row menu
+/// bar, wrong for one that WRAPS, because the next row sits directly beneath the one you opened
+/// and `menu_spacing` leaves a strip of it exposed above the panel.
+///
+/// The first attempt made the bar a single scrolling row. That removed the second row, and with it
+/// the symptom, by changing the layout — which is not what was asked for, and the user said so:
+/// "i asked to fix the hover selecting problem not change the layout."
+#[cfg(test)]
+mod the_toolbars_wrap_and_do_not_hover_switch {
+    use super::*;
+
+    fn source_between(anchor: &'static str, src: &'static str) -> String {
+        let a = src.find(anchor).unwrap_or_else(|| panic!("anchor not found: {anchor}"));
+        let w = src[a..].find("horizontal_wrapped").map(|e| a + e).expect("the bar wraps");
+        let bytes = src.as_bytes();
+        let (mut depth, mut seen, mut end) = (0i32, false, src.len());
+        for (i, &c) in bytes.iter().enumerate().skip(w) {
+            if c == b'{' {
+                depth += 1;
+                seen = true;
+            } else if c == b'}' {
+                depth -= 1;
+            }
+            if seen && depth == 0 {
+                end = i;
+                break;
+            }
+        }
+        src[w..end].to_string()
+    }
+
+    /// THE LAYOUT STAYS WRAPPED. Both bars stack when the panel is narrow, as they always did.
+    #[test]
+    fn both_bars_still_wrap() {
+        let app = include_str!("app.rs");
+        let light = include_str!("light.rs");
+        assert!(
+            source_between("plus Frame and Clear. Both dropdowns drive the SAME code", app)
+                .starts_with("horizontal_wrapped"),
+            "the 3D Factory toolbar must wrap, not scroll",
+        );
+        assert!(
+            source_between("pub fn toolbar_ui", light).starts_with("horizontal_wrapped"),
+            "the SIMLUX toolbar must wrap, not scroll",
+        );
+        // Checked on the EXTRACTED bodies, never on the whole file: a test that greps a file for
+        // the thing it forbids finds its own assertion and fails on itself. The first version of
+        // this did exactly that.
+        for (name, body) in [
+            ("3D Factory", source_between("plus Frame and Clear. Both dropdowns drive the SAME code", app)),
+            ("SIMLUX", source_between("pub fn toolbar_ui", light)),
+        ] {
+            assert!(
+                !body.contains("ScrollArea::horizontal"),
+                "{name} toolbar scrolls instead of wrapping",
+            );
+        }
+    }
+
+    /// …and every menu on them opens on CLICK ONLY. A single `ui.menu_button` left on either bar
+    /// is one button that still swaps under the cursor.
+    #[test]
+    fn no_hover_switching_menu_survives_on_either_bar() {
+        for (name, body) in [
+            (
+                "3D Factory",
+                source_between("plus Frame and Clear. Both dropdowns drive the SAME code", include_str!("app.rs")),
+            ),
+            ("SIMLUX", source_between("pub fn toolbar_ui", include_str!("light.rs"))),
+        ] {
+            assert!(
+                !body.contains("ui.menu_button("),
+                "{name} toolbar still has a hover-switching menu_button",
+            );
+            assert!(body.contains("click_menu_button("), "{name} toolbar uses the click-only menu");
+        }
+    }
+
+    /// The fix is clearing the BUTTON's hover, and it must be the response handed to egui — not
+    /// the one handed back to the caller, which still needs its hover for tooltips.
+    #[test]
+    fn the_gate_is_on_the_response_egui_reads() {
+        let src = include_str!("app.rs");
+        let a = src.find("pub(crate) fn click_menu_button").expect("the helper");
+        let b = src[a..].find("\n}").map(|e| a + e).unwrap();
+        let f = &src[a..b];
+        assert!(f.contains("gated.hovered = false"), "the gated copy is what egui must see");
+        assert!(f.contains("bar_menu(&gated"), "…and it is what is passed to bar_menu");
+        assert!(f.contains("InnerResponse::new(inner, resp)"), "the caller gets the real response");
     }
 }

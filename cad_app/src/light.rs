@@ -1377,23 +1377,14 @@ impl LightState {
     ///   Display — how the result is drawn
     pub fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
         let mut action = LightAction::default();
-        // ONE ROW, SCROLLED — never wrapped. A wrapped bar puts menu buttons on the rows
-        // BENEATH the one you opened; an open dropdown covers them, and egui switches menus on
-        // hover of a sibling button without knowing a popup is in front of it. Moving the cursor
-        // down through the open panel then swapped the menu out from under the click. Nothing is
-        // below the bar when the bar is one row.
-        egui::ScrollArea::horizontal()
-            .id_salt("simlux_toolbar_scroll")
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             // ---- ① the LIBRARY of imported fittings -------------------------------------
             //
             // First on the bar because it is first in the workflow, and because a photometric
             // file is a product brought into the project exactly as a piece of furniture is.
             let waiting = self.unassigned_count();
             let fittings = self.profiles.len();
-            ui.menu_button("▼ Fittings", |ui| {
+            crate::app::click_menu_button(ui, "▼ Fittings", |ui| {
                 if ui
                     .button("📂  Import light file…")
                     .on_hover_text("IES (.ies) or EULUMDAT (.ldt) from the manufacturer — the same picker furniture uses")
@@ -1464,7 +1455,7 @@ impl LightState {
             .on_hover_text(format!("{fittings} fitting(s) in the library"));
 
             // ---- ② where the lights go, ③ what goes in each spot -----------------------
-            ui.menu_button("▼ Luminaires", |ui| {
+            crate::app::click_menu_button(ui, "▼ Luminaires", |ui| {
                 ui.label(egui::RichText::new("place").small().weak());
                 let placing = self.place_mode;
                 if ui
@@ -1546,7 +1537,7 @@ impl LightState {
                 }
             });
 
-            ui.menu_button("▼ Calculation", |ui| {
+            crate::app::click_menu_button(ui, "▼ Calculation", |ui| {
                 egui::Grid::new("simlux_calc_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     ui.label("work plane").on_hover_text("Height above the floor the lux is measured at — 0.8 m is the usual desk height");
                     ui.add(egui::DragValue::new(&mut self.plane_height).speed(0.05).suffix(" m").range(0.0..=10.0));
@@ -1619,7 +1610,7 @@ impl LightState {
                 action.export_report = true;
             }
 
-            ui.menu_button("▼ Surfaces", |ui| {
+            crate::app::click_menu_button(ui, "▼ Surfaces", |ui| {
                 ui.label(egui::RichText::new("reflectance — how much light a surface returns").small().weak());
                 egui::Grid::new("simlux_mat_grid").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
                     for m in &mut self.materials {
@@ -1634,7 +1625,7 @@ impl LightState {
                 );
             });
 
-            ui.menu_button("▼ Display", |ui| {
+            crate::app::click_menu_button(ui, "▼ Display", |ui| {
                 ui.checkbox(&mut self.floor_heatmap, "false-colour on the floor")
                     .on_hover_text("Paint the calculated illuminance onto the floor of the 3D view.");
                 ui.checkbox(&mut self.hide_ceilings, "hide ceilings")
@@ -1694,7 +1685,6 @@ impl LightState {
             {
                 action.calculate = true;
             }
-        });
         });
 
         // The state line, exactly as the Factory reports features/tris/selection: what is loaded,
