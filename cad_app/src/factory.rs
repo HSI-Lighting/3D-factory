@@ -1081,6 +1081,17 @@ pub struct FactoryState {
     /// Show the 2D drawing (the plan) as a ground-plane underlay in the 3D view — so you
     /// can see the plan you are building the 3D model from. Toggled from the panel toolbar.
     pub show_plan: bool,
+    /// While drawing ON a plane, also show what is drawn on the OTHER planes, projected onto this
+    /// canvas.
+    ///
+    /// Asked for as: "when i chose a plane to on i can see the sketch made on another plane i need
+    /// a toggle to turn it off so i can only see the what ever is on the plane i am drawing."
+    ///
+    /// OFF by default, which is the answer to that sentence: a face sketch is its own drawing, and
+    /// another plane's work projected onto it is reference at best and unselectable clutter at
+    /// worst. Kept available because lining one plane's work up against another's is a real thing
+    /// to want — just not the default.
+    pub show_other_planes: bool,
 
     /// Feature ids that are ROOM CEILINGS — separate slab objects created by the room tool.
     /// Tracked so they can be hidden as a group without deleting them; the lighting model
@@ -3084,6 +3095,7 @@ impl Default for FactoryState {
             rot_drag: None,
             dim_edit_active: false,
             show_plan: true,
+            show_other_planes: false,
             ceilings: std::collections::HashSet::new(),
             rooms: Vec::new(),
             next_room_id: 1,

@@ -7927,7 +7927,22 @@ impl CadApp {
         self.factory.sketch_ref =
             self.factory.frame_face_edges(&self.factory.model.sketches[idx].frame);
 
-        let sketch_doc = std::mem::take(&mut self.factory.model.sketches[idx].doc);
+        let mut sketch_doc = std::mem::take(&mut self.factory.model.sketches[idx].doc);
+        // LAYERS ARE THE PROJECT'S, NOT THE SKETCH'S.
+        //
+        // Reported as: "i drew some of these arrays in different colors but they showed up in the
+        // same color why is that are the layers tool no integrated into this?" They are not — and
+        // this is why. `Sketch::new` builds a `Document::default()`, which carries a DEFAULT
+        // LayerTable: the project's layers, with the names and colours the user set, live in the
+        // plan document and simply do not exist inside a sketch. So everything drawn on a face
+        // landed on the base layer, an Array copied a layer id that resolved against a table with
+        // one entry in it, and the Layers panel opened during a sketch was editing the SKETCH's
+        // empty table rather than the drawing's.
+        //
+        // A layer is a property of the DRAWING, not of one plane of it. The table is carried in on
+        // the way through, and carried back out again on exit so a layer created while sketching is
+        // not lost. Ids stay valid because both sides share the one table.
+        sketch_doc.layers = self.doc.layers.clone();
         let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
         let saved_undo = std::mem::take(&mut self.undo_stack);
         let saved_redo = std::mem::take(&mut self.redo_stack);
@@ -7960,7 +7975,12 @@ impl CadApp {
         self.factory.sketch_ref.clear();
         self.factory.editing_cutout = false; // any cutout-edit ends when the sketch closes
         if let Some(s) = self.factory.session.take() {
+            // …AND THE LAYER TABLE COMES BACK OUT. A layer created or recoloured while drawing on
+            // a face belongs to the drawing, not to that face — see the note on the way in. Taken
+            // BEFORE the swap, because after it `self.doc` is the plan again.
+            let layers = self.doc.layers.clone();
             let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
+            self.doc.layers = layers;
             if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
                 sk.doc = sketch_doc;
             }
@@ -10176,6 +10196,16 @@ impl CadApp {
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.factory.keep_sketch, "keep shape")
                                     .on_hover_text("Keep the drawing after Extrude/Cut so you can act on the SAME outline again (e.g. recess + through)");
+                                // In the banner, because it is a property of the sketch you are in
+                                // and this is the one place that is only ever on screen while you
+                                // are in one.
+                                ui.checkbox(&mut self.factory.show_other_planes, "other planes")
+                                    .on_hover_text(
+                                        "Show what is drawn on the OTHER planes, projected onto \
+                                         this one. Off by default: a face sketch is its own \
+                                         drawing, and another plane's work here is reference you \
+                                         cannot select.",
+                                    );
                                 ui.label(
                                     egui::RichText::new("· draw a CLOSED shape, then act on it")
                                         .small()
@@ -47594,6 +47624,13 @@ impl CadApp {
         // The GROUND PLAN shows only what is drawn on it. A face plane is its own drawing, and
         // stacking every plane on the plan is what "global view" was invented to stop.
         let ground_only = self.factory.session.is_none();
+        // ONE PLANE AT A TIME, unless asked otherwise. While a face sketch is open the other
+        // planes were projected onto this canvas — reference at best, unselectable clutter at
+        // worst: "i need a toggle to turn it off so i can only see the what ever is on the plane
+        // i am drawing". The ground plan is a separate rule, handled below, and is unaffected.
+        if !ground_only && !self.factory.show_other_planes {
+            return;
+        }
         for (i, sk) in self.factory.model.sketches.iter().enumerate() {
             if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
                 continue; // the active sketch is the live canvas — don't double-draw it
@@ -55292,5 +55329,90 @@ mod a_sketch_is_not_the_plan {
         // …and with no session it is simply the document.
         let got = CadApp::plan_doc_of(None, &sketch);
         assert_eq!(got.dobjects.len(), 3);
+    }
+}
+
+/// LAYERS BELONG TO THE DRAWING, AND A PLANE SHOWS ONLY ITSELF.
+///
+/// Reported together: "i need a toggle to turn it off so i can only see the what ever is on the
+/// plane i am drawing" and "i drew some of these arrays in different colors but they showed up in
+/// the same color … are the layers tool no integrated into this?"
+///
+/// The colours were the swap again: `Sketch::new` builds a `Document::default()`, whose LayerTable
+/// is empty, so nothing drawn on a face could be on one of the project's layers.
+#[cfg(test)]
+mod a_plane_shares_the_drawings_layers {
+    use super::*;
+
+    fn app_with_layers() -> CadApp {
+        let mut app = CadApp::default();
+        let mut l = cad_kernel::Layer::layer_zero();
+        l.name = "Lighting".into();
+        app.doc.layers.add(l);
+        let mut l = cad_kernel::Layer::layer_zero();
+        l.name = "Power".into();
+        app.doc.layers.add(l);
+        app
+    }
+
+    /// THE BUG: a sketch used to start with the default table, so the project's layers were not
+    /// there to draw on and everything came out one colour.
+    #[test]
+    fn a_sketch_gets_the_projects_layers() {
+        let mut app = app_with_layers();
+        let before = app.doc.layers.layers.len();
+        assert!(before >= 3, "precondition: base plus two named layers");
+
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert_eq!(
+            app.doc.layers.layers.len(),
+            before,
+            "the sketch must have the drawing's layers, not an empty table",
+        );
+        assert!(app.doc.layers.layers.iter().any(|l| l.name == "Lighting"));
+        assert!(app.doc.layers.layers.iter().any(|l| l.name == "Power"));
+    }
+
+    /// …and a layer made while drawing on a face is not lost when the sketch closes.
+    #[test]
+    fn a_layer_created_in_a_sketch_survives_the_exit() {
+        let mut app = app_with_layers();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let mut l = cad_kernel::Layer::layer_zero();
+        l.name = "Sprinklers".into();
+        app.doc.layers.add(l);
+        app.factory_exit_sketch();
+        assert!(
+            app.doc.layers.layers.iter().any(|l| l.name == "Sprinklers"),
+            "a layer is a property of the drawing, so it must come back out with it",
+        );
+    }
+
+    /// The ACTIVE layer travels too — otherwise the first thing drawn on a face silently lands on
+    /// the base layer however carefully the layer was chosen beforehand.
+    #[test]
+    fn the_active_layer_travels_into_the_sketch() {
+        let mut app = app_with_layers();
+        app.doc.layers.active = 2;
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert_eq!(app.doc.layers.active, 2, "the chosen layer must still be the one in force");
+    }
+
+    /// The other-planes projection is OFF by default and gated on the toggle.
+    #[test]
+    fn other_planes_are_hidden_by_default() {
+        let f = crate::factory::FactoryState::default();
+        assert!(!f.show_other_planes, "a plane shows its own work unless asked otherwise");
+
+        let src = include_str!("app.rs");
+        let a = src.find("fn draw_factory_sketches_2d").expect("the projector");
+        let b = src[a..].find("\n    fn ").map(|e| a + e).unwrap_or(src.len());
+        let body = &src[a..b];
+        assert!(
+            body.contains("!self.factory.show_other_planes"),
+            "the projection must be gated on the toggle",
+        );
+        // …and the GROUND PLAN rule must survive: it is a separate case, not covered by the toggle.
+        assert!(body.contains("ground_only"), "the plan's own rule must still apply");
     }
 }
