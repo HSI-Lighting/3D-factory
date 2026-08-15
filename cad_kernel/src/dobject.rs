@@ -118,6 +118,37 @@ pub fn next_handle() -> Handle {
     HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Guarantee every future [`next_handle`] is greater than `max`.
+///
+/// A LOADER MUST CALL THIS. Handles are preserved by RSM, and the counter is a fresh
+/// process-global starting at 1 — so opening a file saved in a long session hands the next object
+/// drawn a handle a loaded object already owns. Nothing announces it.
+///
+/// A duplicate handle is not cosmetic, because handles are how objects REFER to each other:
+///
+///   * `cad_light::extrude_handles` resolves a lit room with `find_by_handle`, so a collision
+///     silently lights the WRONG GEOMETRY — the validated calculation, run on the wrong room.
+///   * `Hatch.boundary_handles` binds a hatch to its boundary the same way.
+///
+/// `find_by_handle` returns the FIRST match, so a collision resolves to whichever object sits
+/// earlier in the document: stable, arbitrary, and wrong.
+///
+/// Idempotent, and it never lowers the counter — two documents loaded in one session each raise
+/// the floor, and a load after drawing cannot reissue handles already handed out.
+/// Compare-exchange rather than load-then-store, because a concurrent allocation between the read
+/// and the write would otherwise be lost.
+pub fn reserve_handles_above(max: Handle) {
+    let mut cur = HANDLE_COUNTER.load(Ordering::Relaxed);
+    while cur <= max {
+        match HANDLE_COUNTER.compare_exchange_weak(
+            cur, max + 1, Ordering::Relaxed, Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

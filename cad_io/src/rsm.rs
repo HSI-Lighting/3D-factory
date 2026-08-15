@@ -652,6 +652,18 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     // (1 unit = 1 metre, ASSUMED). That is the zero-delta path: every 2D→3D boundary then
     // multiplies by 1.0 and the drawing behaves exactly as it did before units existed.
     let units = if ver >= 8 { read_units(&mut r)? } else { cad_kernel::DocUnits::default() };
+    // THE HANDLE FLOOR. RSM preserves handles; the allocator is a process-global counter starting
+    // at 1. Without this, opening a file saved in a long session hands the next object drawn a
+    // handle a loaded object already owns — and handles are how objects refer to each other, so a
+    // collision binds a hatch to the wrong boundary and lights the wrong room. Silent both times.
+    //
+    // BLOCK CONTENTS COUNT. `Block.dobjects` carry handles of their own and are just as loadable,
+    // so the floor is the maximum over both or the collision simply moves inside a definition.
+    let max_handle = dobjects.iter().map(|d| d.handle)
+        .chain(blocks.blocks.iter().flat_map(|b| b.dobjects.iter().map(|d| d.handle)))
+        .max()
+        .unwrap_or(0);
+    cad_kernel::reserve_handles_above(max_handle);
     Ok(Document {
         dobjects, layers, linetypes, pens, truecolors,
         text_styles, dim_styles, wall_styles, blocks, raster_images, units,
@@ -1337,24 +1349,100 @@ mod handle_collision_probe {
         read_rsm(&write_rsm(doc)).expect("rsm round-trip")
     }
 
-    /// PROBE: RSM preserves handles on load, but nothing bumps `HANDLE_COUNTER` past
-    /// the loaded maximum — so the next dobject drawn after opening a file can be
-    /// handed a handle a loaded dobject already owns.
-    /// Beyond planes this matters because `Hatch.boundary_handles` resolves its
-    /// boundary BY HANDLE: a collision binds a hatch to the wrong geometry.
+    /// These three tests share the process-global handle counter, so they must not INTERLEAVE —
+    /// one test's reservation landing between another's two reads makes that other test pass
+    /// against unfixed code. Observed, not theorised: it is what happened while these were written.
+    /// The guard makes them serial with respect to each other and leaves the rest of the suite
+    /// parallel. Poisoning is ignored — a failing test has already reported itself.
+    static COUNTER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RSM preserves handles, and the allocator is a process-global counter starting at 1. Loading
+    /// a file saved in a long session therefore used to hand the next object drawn a handle a
+    /// loaded object already owned — silently, because `find_by_handle` returns the first match.
+    ///
+    /// It is not cosmetic. `Hatch.boundary_handles` binds a hatch to its boundary by handle, and
+    /// `cad_light::extrude_handles` resolves a lit room the same way — so a collision runs the
+    /// validated lighting calculation on the wrong geometry.
+    ///
+    /// (Was `known_bug_next_handle_collides_with_a_loaded_handle`, `#[ignore]`d. Un-ignored and
+    /// inverted once `reserve_handles_above` landed at the end of `read_rsm`.)
+    /// EVERY TEST HERE IS SELF-RELATIVE, and that is not a style choice.
+    ///
+    /// The counter is a process-global and cargo runs these tests in one process, in parallel. A
+    /// test that hard-codes "assume a loaded handle of 1,000,000" passes as soon as ANY other test
+    /// in the binary happens to push the counter past it — which is exactly what happened while
+    /// these were being written: all three passed against deliberately unfixed code, because the
+    /// third one reserves 5,000,000 directly and poisoned the other two.
+    ///
+    /// So each takes a fresh handle first and targets an offset above it. Then the only thing that
+    /// can make the assertion true is the reservation under test.
     #[test]
-    #[ignore = "KNOWN BUG (documented, not yet fixed): HANDLE_COUNTER is not bumped on load. \
-                Run with `cargo test -p cad_io -- --ignored` to see it. Fix = an additive \
-                `cad_kernel::reserve_handles_above(max)` called at the end of read_rsm."]
-    fn known_bug_next_handle_collides_with_a_loaded_handle() {
+    fn loading_raises_the_handle_floor_above_every_loaded_handle() {
+        let _g = guard();
+        let target = cad_kernel::next_handle() + 1_000_000;
+
         let mut doc = Document::default();
         let i = doc.push(DObject::new(Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(1.0, 1.0) })));
-        doc.dobjects[i].handle = 1_000_000; // a file saved in an earlier, long session
+        doc.dobjects[i].handle = target; // a file saved in an earlier, long session
         let back = rt(&doc);
-        assert_eq!(back.dobjects[0].handle, 1_000_000, "handle preserved on load");
+        assert_eq!(back.dobjects[0].handle, target, "handle preserved on load");
 
         let fresh = cad_kernel::next_handle();
-        println!("PROBE: loaded handle = 1000000, next_handle() = {fresh}");
-        assert!(fresh > 1_000_000, "BUG CONFIRMED: next_handle() = {fresh} collides with loaded handles");
+        assert!(
+            fresh > target,
+            "next_handle() = {fresh} collides with the loaded handle {target}",
+        );
+    }
+
+    /// BLOCK CONTENTS COUNT. A definition's dobjects carry handles of their own, so a floor taken
+    /// over the top-level list alone just moves the collision inside a block.
+    #[test]
+    fn the_handle_floor_covers_handles_inside_block_definitions() {
+        let _g = guard();
+        let target = cad_kernel::next_handle() + 2_000_000;
+
+        let mut doc = Document::default();
+        let mut inner = DObject::new(Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) }));
+        inner.handle = target;
+        doc.blocks.blocks.push(cad_kernel::Block {
+            name: "DEEP".into(),
+            base: Vec2::ZERO,
+            dobjects: vec![inner],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+
+        let back = rt(&doc);
+        assert_eq!(
+            back.blocks.blocks[0].dobjects[0].handle, target,
+            "a block's handles survive the round trip",
+        );
+        let fresh = cad_kernel::next_handle();
+        assert!(
+            fresh > target,
+            "next_handle() = {fresh} collides with the handle {target} inside a block definition",
+        );
+    }
+
+    /// It never LOWERS the floor — a second, older file must not reissue handles already handed
+    /// out, and two documents in one session each raise it.
+    #[test]
+    fn reserving_never_lowers_the_handle_floor() {
+        let _g = guard();
+        let target = cad_kernel::next_handle() + 5_000_000;
+        cad_kernel::reserve_handles_above(target);
+        let high = cad_kernel::next_handle();
+        assert!(high > target);
+
+        cad_kernel::reserve_handles_above(10); // an older, smaller file, opened second
+        let after = cad_kernel::next_handle();
+        assert!(
+            after > high,
+            "the floor dropped: {after} is not above the already-issued {high}",
+        );
     }
 }

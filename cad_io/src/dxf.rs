@@ -700,7 +700,15 @@ fn write_entities(s: &mut String, doc: &Document) {
     pair(s, 0, "ENDSEC");
 }
 
+/// How deep the exploded-block walk may go before it gives up. Matches the caps already used by
+/// the other two recursive block walkers in the app, so a drawing that renders explodes the same.
+const MAX_BLOCK_DEPTH: u32 = 8;
+
 fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
+    write_entity_at(s, d, doc, 0);
+}
+
+fn write_entity_at(s: &mut String, d: &DObject, doc: &Document, depth: u32) {
     let layer_name = doc.layers.get(d.style.layer)
         .map(|l| l.name.clone()).unwrap_or_else(|| "0".into());
     let linetype_name = doc.linetypes.get(d.style.linetype)
@@ -841,8 +849,16 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
             pair_f(s, 20, pos.y);
             pair_f(s, 30, 0.0);
             pair_f(s, 40, 0.18);  // placeholder text height
-            let st = doc.dim_styles.get(d.style)
-                .unwrap_or(doc.dim_styles.get(0).unwrap());
+            // NO `.unwrap()` ON THE FALLBACK. `dim_styles` is seeded with id 0 by `with_defaults`,
+            // so today the inner get always succeeds — but the fallback exists precisely for a
+            // document whose table is not what we expect, and a table merged in from another
+            // document is exactly that. A panic while SAVING is the worst failure there is: it
+            // takes the drawing with it. A default style is one wrong number in one dimension.
+            let owned;
+            let st = match doc.dim_styles.get(d.style).or_else(|| doc.dim_styles.get(0)) {
+                Some(st) => st,
+                None => { owned = cad_kernel::DimStyle::standard(); &owned }
+            };
             pair(s, 1, &d.formatted_text(st));
         }
         Geom::BlockRef(br) => {
@@ -850,8 +866,22 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
             // are written EXPLODED — each contained dobject transformed
             // into world space and emitted as a plain entity. The block
             // identity is lost in DXF (RSM keeps it); BLOCK/INSERT
-            // round-trip is the "DXF parity" roadmap item. Recursion
-            // handles nested blocks; cycles can't exist (see block.rs).
+            // round-trip is the "DXF parity" roadmap item.
+            //
+            // CYCLES CAN EXIST, and the comment that used to sit here said they could not.
+            // `block.rs` reasons that a definition can only reference blocks that already existed
+            // when it was built — true of the EDITOR, false of the LOADER: `read_blocks` resolves
+            // forward references by a second pass that ASSIGNS into an already-created definition,
+            // so a file describing A-contains-B and B-contains-A loads without complaint. This arm
+            // then recursed for ever and took the process down with a stack overflow, during SAVE.
+            //
+            // The depth cap is the same defence `draw_blockref` and `expand_cutter_geoms` already
+            // use — this was the one recursive block walker without one. Beyond the cap the
+            // instance is DROPPED rather than partially written, because half a definition is
+            // geometry the user never drew.
+            if depth >= MAX_BLOCK_DEPTH {
+                return;
+            }
             if let Some(blk) = doc.blocks.get(br.block) {
                 for cd in &blk.dobjects {
                     let mut inst = cd.clone();
@@ -860,7 +890,7 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
                     if matches!(inst.style.color, Color::ByBlock) {
                         inst.style.color = d.style.color;
                     }
-                    write_entity(s, &inst, doc);
+                    write_entity_at(s, &inst, doc, depth + 1);
                 }
             }
         }
@@ -874,6 +904,53 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SAVING MUST NOT BE ABLE TO KILL THE PROCESS.
+    ///
+    /// `block.rs` argues a definition can only reference blocks that already existed when it was
+    /// built, so cycles are impossible. That is true of the editor and false of the LOADER:
+    /// `read_blocks` resolves forward references by assigning into an already-created definition,
+    /// so a file describing A-contains-B and B-contains-A loads without complaint. The exploded
+    /// write then recursed for ever — a stack overflow during Save As DXF, which aborts the
+    /// process and takes the drawing with it.
+    ///
+    /// Without the depth cap this test does not fail, it CRASHES THE TEST BINARY, which is what
+    /// it is asserting cannot happen.
+    #[test]
+    fn a_cyclic_block_table_cannot_overflow_the_dxf_writer() {
+        let mut doc = Document::default();
+        let line = DObject::new(Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) }));
+        let mk = |name: &str, dobjects: Vec<DObject>| cad_kernel::Block {
+            name: name.into(),
+            base: Vec2::ZERO,
+            dobjects,
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        };
+        // A contains a ref to B; B contains a ref to A. Exactly the shape the two-pass loader
+        // can build out of legal DXF.
+        let ref_to = |id: u32| DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
+            block: id,
+            insert: Vec2::ZERO,
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            mirror_x: false,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        }));
+        doc.blocks.blocks.push(mk("A", vec![line.clone(), ref_to(1)]));
+        doc.blocks.blocks.push(mk("B", vec![ref_to(0)]));
+        doc.push(ref_to(0));
+
+        let text = write_dxf(&doc);
+        assert!(text.ends_with("0\nEOF\n"), "the writer must still finish the file");
+        assert!(
+            text.matches("\nLINE\n").count() <= 64,
+            "the cap must bound the explosion, got {} lines",
+            text.matches("\nLINE\n").count(),
+        );
+    }
 
     fn round_trip(doc: &Document) -> Document {
         let text = write_dxf(doc);

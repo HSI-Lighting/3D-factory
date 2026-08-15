@@ -71,7 +71,7 @@ pub use linetype::{Linetype, LinetypeTable};
 pub use layer::{Layer, LayerId, LayerTable};
 pub use style::Style;
 pub use pen::{Pen, PenTable};
-pub use dobject::{next_handle, DObject, Handle};
+pub use dobject::{next_handle, reserve_handles_above, DObject, Handle};
 pub use document::{DocUnits, Document, RasterImage, UnitSource};
 pub use intersect::intersect;
 pub use parser::{parse, Command, ToolKind};
