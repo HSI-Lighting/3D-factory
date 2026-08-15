@@ -17891,9 +17891,17 @@ impl CadApp {
 
     /// Add every dobject index to the selection. Used by the `all` sub-command.
     fn add_all_to_selection(&mut self) -> usize {
+        // Same quadratic as `add_window_selection`, and worse: Select All visits EVERY object, so
+        // the scan it used to run per object was over a selection growing to the whole document.
+        // A mask built once turns it linear. See the note there on why it is rebuilt rather than
+        // maintained.
+        let mut in_sel = vec![false; self.doc.dobjects.len()];
+        for &s in &self.selection {
+            if s < in_sel.len() { in_sel[s] = true; }
+        }
         let mut added = 0usize;
         for i in 0..self.doc.dobjects.len() {
-            if !self.selection.contains(&i) {
+            if !in_sel[i] {
                 self.selection.push(i);
                 added += 1;
             }
@@ -17972,6 +17980,24 @@ impl CadApp {
                 .into_iter().map(|u| u as usize).collect(),
             _ => (0..self.doc.dobjects.len()).collect(),
         };
+        // O(1) MEMBERSHIP FOR THIS CALL. `self.selection.contains(&i)` is a linear scan of a Vec,
+        // and it sat inside the candidate loop — so one crossing window over a big drawing was
+        // candidates × selected comparisons. MEASURED 22.4 s of frozen UI at 500k objects, and
+        // 830 ms at 100k, which is a size you reach today.
+        //
+        // REBUILT PER CALL, NOT MAINTAINED. This is the pattern `sel_mask` already proves two
+        // thousand lines up: a mask that lives across frames would need invalidating at 43+ sites
+        // that mutate `selection`, and a stale one silently selects the wrong objects. Built here,
+        // used here, dropped here — nothing to keep in step.
+        let mut in_sel = vec![false; self.doc.dobjects.len()];
+        for &s in &self.selection {
+            if s < in_sel.len() { in_sel[s] = true; }
+        }
+        // The REMOVE path was quadratic twice over: `position()` to find the entry, then
+        // `Vec::remove` shifting every element after it. Removals are marked here and applied in
+        // ONE `retain` after the loop, which also preserves the order of everything that stays.
+        let mut drop_from_sel = vec![false; self.doc.dobjects.len()];
+        let mut any_dropped = false;
         // SESSION RECORDER — record EVERY candidate's verdict so the
         // user can see exactly which dobjects were considered and why
         // each one was rejected. This is the diagnostic that nails
@@ -18015,14 +18041,21 @@ impl CadApp {
             }
             if !inside { continue; }
             if want_remove {
-                if let Some(pos) = self.selection.iter().position(|&x| x == i) {
-                    self.selection.remove(pos);
+                if i < in_sel.len() && in_sel[i] {
+                    in_sel[i] = false;
+                    drop_from_sel[i] = true;
+                    any_dropped = true;
                     changed += 1;
                 }
-            } else if !self.selection.contains(&i) {
+            } else if i >= in_sel.len() || !in_sel[i] {
+                if i < in_sel.len() { in_sel[i] = true; }
                 self.selection.push(i);
                 changed += 1;
             }
+        }
+        // One pass for every removal, instead of one shift per removal.
+        if any_dropped {
+            self.selection.retain(|&x| x >= drop_from_sel.len() || !drop_from_sel[x]);
         }
         self.history.push(format!(
             "    {} {} dobject(s) via {} window (current: {})",
@@ -52894,6 +52927,81 @@ mod perf_investigation {
         let one_ms = t.elapsed().as_secs_f64() * 1000.0;
         std::hint::black_box(&g2);
         println!("  build_auto (1 sweep)        : {one_ms:7.1} ms   → {:.2}× faster", (a_ms + b_ms) / one_ms);
+    }
+
+    /// THE SAME FREEZE, IN THE SELECTION PATHS — the draw loop was fixed with `sel_mask` and
+    /// these two were left behind, so a crossing window still ran `selection.contains(&i)` per
+    /// candidate: candidates × selected comparisons, MEASURED at 22.4 s over 500k objects and
+    /// 830 ms at 100k. This is a PERFORMANCE refactor, so what has to be pinned is that the
+    /// answer did not change — including the parts that are easy to get wrong.
+    ///
+    /// Run against a reference implementation of the old logic rather than against hand-written
+    /// expectations: the two must agree exactly, on membership AND on order.
+    #[test]
+    fn the_fast_selection_paths_agree_with_the_slow_ones() {
+        // The old add: linear `contains` per candidate, push in candidate order.
+        fn slow_add(sel: &mut Vec<usize>, cands: &[usize]) {
+            for &i in cands {
+                if !sel.contains(&i) { sel.push(i); }
+            }
+        }
+        // The old remove: `position` then `Vec::remove`, one shift each.
+        fn slow_remove(sel: &mut Vec<usize>, cands: &[usize]) {
+            for &i in cands {
+                if let Some(p) = sel.iter().position(|&x| x == i) { sel.remove(p); }
+            }
+        }
+        // The new remove: mark, then one retain.
+        fn fast_remove(sel: &mut Vec<usize>, cands: &[usize], n: usize) {
+            let mut drop = vec![false; n];
+            let mut any = false;
+            for &i in cands {
+                if i < n && sel.contains(&i) { drop[i] = true; any = true; }
+            }
+            if any { sel.retain(|&x| x >= n || !drop[x]); }
+        }
+        // The new add: mask, push in candidate order.
+        fn fast_add(sel: &mut Vec<usize>, cands: &[usize], n: usize) {
+            let mut in_sel = vec![false; n];
+            for &s in sel.iter() { if s < n { in_sel[s] = true; } }
+            for &i in cands {
+                if i >= n || !in_sel[i] {
+                    if i < n { in_sel[i] = true; }
+                    sel.push(i);
+                }
+            }
+        }
+
+        let n = 400usize;
+        // A starting selection that is NOT sorted and NOT contiguous — order preservation is the
+        // property most likely to be lost by a `retain`, and a tidy fixture would hide it.
+        let start: Vec<usize> = [317, 4, 128, 9, 250, 63, 199, 88].to_vec();
+        // Candidates with duplicates and an out-of-range index, because both reach these
+        // functions in practice — a stale index survives until the next reindex.
+        let cands: Vec<usize> = vec![4, 4, 7, 128, 401, 9, 7, 250, 12];
+
+        let (mut a, mut b) = (start.clone(), start.clone());
+        slow_add(&mut a, &cands);
+        fast_add(&mut b, &cands, n);
+        assert_eq!(a, b, "add diverged (order or membership)");
+
+        let (mut a, mut b) = (start.clone(), start.clone());
+        slow_remove(&mut a, &cands);
+        fast_remove(&mut b, &cands, n);
+        assert_eq!(a, b, "remove diverged — retain must preserve the order of what stays");
+
+        // And on the empty and full edges.
+        for base in [Vec::new(), (0..n).collect::<Vec<_>>()] {
+            let (mut a, mut b) = (base.clone(), base.clone());
+            slow_add(&mut a, &cands);
+            fast_add(&mut b, &cands, n);
+            assert_eq!(a, b, "add diverged on an edge case");
+
+            let (mut a, mut b) = (base.clone(), base.clone());
+            slow_remove(&mut a, &cands);
+            fast_remove(&mut b, &cands, n);
+            assert_eq!(a, b, "remove diverged on an edge case");
+        }
     }
 
     /// ⭐ THE FREEZE, from the owner's real 1.5M session:
