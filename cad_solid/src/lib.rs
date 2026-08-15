@@ -1214,8 +1214,50 @@ impl Model {
 
     /// Fold the whole history through csgrs into a triangle soup. Re-run on ANY
     /// param edit — this IS the parametric re-derivation.
+    ///
+    /// ON A THREAD WITH A BIG STACK, and that is not a performance decision.
+    ///
+    /// csgrs's BSP degenerates to a linked list for a convex body: `Node::build`,
+    /// `clip_polygons`, `clip_to` and `Drop` are all recursive, and the tree depth of an extruded
+    /// N-gon is measured at exactly N + 2. A curved wall traced from a DXF is an N-gon with a
+    /// large N, so a real drawing walks a recursion thousands deep. On the default 8 MB main
+    /// thread that is not a slow rebuild — it is `STATUS_STACK_OVERFLOW`, and the process is gone
+    /// along with the drawing.
+    ///
+    /// WHY HERE AND NOT AT THE CALLERS. This one-line delegation is the choke point for every
+    /// evaluation in the app: the rebuild after any model edit, the selection mesh on every 3D
+    /// selection change, the repair command's before/after counts — and, decisively,
+    /// `startup_repair`, which evaluates TWICE WHILE OPENING A FILE. Wrap only the rebuild and a
+    /// deep model still kills the app on open, which means it cannot be opened, cannot be
+    /// measured, and cannot be repaired.
+    ///
+    /// SCOPED, NOT SPAWNED. `std::thread::spawn` requires `'static`, so the closure would have to
+    /// OWN the model — a full clone of every feature, profile and sketch, on every evaluation, at
+    /// every call site. `scope` lets it borrow `&self` and hand the mesh back, so this costs one
+    /// thread launch and nothing else.
+    ///
+    /// 64 MB is a judgement: eight times the default, comfortably past the depths measured so far,
+    /// and trivial beside the mesh being built. It is reserved address space, not committed
+    /// memory.
     pub fn eval(&self) -> SolidMesh {
-        csg::eval(self)
+        const EVAL_STACK: usize = 64 << 20;
+        std::thread::scope(|s| {
+            match std::thread::Builder::new()
+                .name("csg-eval".into())
+                .stack_size(EVAL_STACK)
+                .spawn_scoped(s, || csg::eval(self))
+            {
+                Ok(h) => match h.join() {
+                    Ok(mesh) => mesh,
+                    // The worker panicked. Propagate rather than swallow — an empty mesh here
+                    // reads as "the model is empty", and the caller would cache that and move on.
+                    Err(e) => std::panic::resume_unwind(e),
+                },
+                // The OS refused a thread. Evaluate in place: a possible overflow on a very deep
+                // model is still better than refusing to draw the scene at all.
+                Err(_) => csg::eval(self),
+            }
+        })
     }
 }
 
