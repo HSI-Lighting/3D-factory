@@ -293,6 +293,83 @@ fn signed_area2(p: &[Vec2]) -> f32 {
 ///
 /// O(n²), which is right for building outlines (tens of points) and keeps the test exact
 /// rather than approximate. Adjacent edges are skipped — they legitimately share a vertex.
+#[cfg(test)]
+mod self_intersect_tests {
+    use super::*;
+
+    /// The exact test with NO bounding-box reject — what the function was before the fast path.
+    fn reference(p: &[Vec2]) -> bool {
+        let n = p.len();
+        let orient = |a: Vec2, b: Vec2, c: Vec2| {
+            let v = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if v > 1e-9 { 1 } else if v < -1e-9 { -1 } else { 0 }
+        };
+        for i in 0..n {
+            let (a1, a2) = (p[i], p[(i + 1) % n]);
+            for j in (i + 1)..n {
+                if j == i || (j + 1) % n == i || (i + 1) % n == j { continue; }
+                let (b1, b2) = (p[j], p[(j + 1) % n]);
+                let (d1, d2) = (orient(a1, a2, b1), orient(a1, a2, b2));
+                let (d3, d4) = (orient(b1, b2, a1), orient(b1, b2, a2));
+                if d1 != d2 && d3 != d4 && d1 != 0 && d2 != 0 && d3 != 0 && d4 != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn v(x: f32, y: f32) -> Vec2 { Vec2::new(x, y) }
+
+    /// A REJECT THAT CHANGES THE ANSWER IS NOT AN OPTIMISATION. The box test can only skip pairs
+    /// that cannot cross — so on every shape, fast and reference must agree exactly.
+    ///
+    /// The fixture deliberately includes the cases a sloppy reject gets wrong: edges that merely
+    /// TOUCH at a box corner, edges sharing an exact coordinate (so a strict-vs-inclusive
+    /// comparison flips), axis-aligned edges with zero-area boxes, and a genuine crossing whose
+    /// boxes overlap only slightly.
+    #[test]
+    fn the_bbox_reject_never_changes_the_answer() {
+        let shapes: Vec<(&str, Vec<Vec2>)> = vec![
+            ("square", vec![v(0.,0.), v(4.,0.), v(4.,4.), v(0.,4.)]),
+            ("bowtie — self-intersecting", vec![v(0.,0.), v(4.,4.), v(4.,0.), v(0.,4.)]),
+            ("concave L", vec![v(0.,0.), v(4.,0.), v(4.,2.), v(2.,2.), v(2.,4.), v(0.,4.)]),
+            ("touching boxes, no crossing", vec![v(0.,0.), v(2.,0.), v(2.,2.), v(4.,2.), v(4.,4.), v(0.,4.)]),
+            ("shared x, axis-aligned", vec![v(0.,0.), v(0.,4.), v(4.,4.), v(4.,0.)]),
+            ("slight overlap crossing", vec![v(0.,0.), v(10.,0.1), v(0.,0.2), v(10.,0.3)]),
+            ("narrow bowtie — ONE crossing, tiny x-overlap", vec![v(0.,0.), v(0.2,4.), v(0.2,0.), v(0.,4.)]),
+            ("collinear spike", vec![v(0.,0.), v(4.,0.), v(2.,0.), v(2.,3.)]),
+            ("triangle", vec![v(0.,0.), v(3.,0.), v(1.5,2.6)]),
+        ];
+        for (name, pts) in shapes {
+            assert_eq!(
+                self_intersects(&pts), reference(&pts),
+                "the box reject changed the answer for: {name}",
+            );
+        }
+    }
+
+    /// And on a large generated outline, where the reject actually earns its keep — a star
+    /// polygon, which crosses itself many times and has edges spread across the whole extent.
+    #[test]
+    fn fast_and_reference_agree_on_a_large_outline() {
+        for n in [64usize, 257] {
+            for step in [1usize, 2, 7] {
+                let pts: Vec<Vec2> = (0..n)
+                    .map(|i| {
+                        let a = std::f32::consts::TAU * ((i * step) % n) as f32 / n as f32;
+                        v(a.cos() * 10.0, a.sin() * 10.0)
+                    })
+                    .collect();
+                assert_eq!(
+                    self_intersects(&pts), reference(&pts),
+                    "disagreement at n={n} step={step}",
+                );
+            }
+        }
+    }
+}
+
 fn self_intersects(p: &[Vec2]) -> bool {
     let n = p.len();
     let orient = |a: Vec2, b: Vec2, c: Vec2| {
@@ -301,12 +378,27 @@ fn self_intersects(p: &[Vec2]) -> bool {
     };
     for i in 0..n {
         let (a1, a2) = (p[i], p[(i + 1) % n]);
+        // BOUNDING-BOX REJECT BEFORE THE ORIENTATION TESTS. Four orientation predicates are eight
+        // multiplies and a stack of branches, and two edges whose boxes miss cannot possibly
+        // cross — which is the overwhelming majority of pairs on any real outline. Measured before
+        // this: 1,000 vertices 1.4–2.2 ms, 4,000 → 21–33 ms, 8,000 → 85–128 ms, and it runs
+        // unconditionally on every profile the app stores.
+        //
+        // It does not change the ANSWER, only how many pairs reach the exact test. Still O(n²) in
+        // the worst case — a sweep line is the real fix, and is not worth its risk yet.
+        let (alo_x, ahi_x) = (a1.x.min(a2.x), a1.x.max(a2.x));
+        let (alo_y, ahi_y) = (a1.y.min(a2.y), a1.y.max(a2.y));
         for j in (i + 1)..n {
             // skip edges sharing a vertex (including the wrap pair n-1 ↔ 0)
             if j == i || (j + 1) % n == i || (i + 1) % n == j {
                 continue;
             }
             let (b1, b2) = (p[j], p[(j + 1) % n]);
+            if b1.x.min(b2.x) > ahi_x || b1.x.max(b2.x) < alo_x
+                || b1.y.min(b2.y) > ahi_y || b1.y.max(b2.y) < alo_y
+            {
+                continue;
+            }
             let (d1, d2) = (orient(a1, a2, b1), orient(a1, a2, b2));
             let (d3, d4) = (orient(b1, b2, a1), orient(b1, b2, a2));
             if d1 != d2 && d3 != d4 && d1 != 0 && d2 != 0 && d3 != 0 && d4 != 0 {
