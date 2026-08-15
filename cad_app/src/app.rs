@@ -34205,9 +34205,20 @@ impl CadApp {
         // smallest-containing rule — clicking the inner island wins over
         // the outer ring). Boundary-edge clicks already won above, so
         // this fallback only kicks in for clicks in the empty fill.
+        // OVER THE CANDIDATES, NOT THE WHOLE DOCUMENT. Both fallbacks below used to walk every
+        // dobject on every MISSED click — measured floor 0.95 ms against 5.8 µs for the indexed
+        // query they are backing up, i.e. 160× the cost of the thing they exist to supplement, and
+        // it fires on every click that lands on empty space.
+        //
+        // `cands` loses nothing here. `UniformGrid` classes Hatch and BlockRef as
+        // view-independent and appends them to the result of EVERY query regardless of the
+        // rectangle, precisely because their true extent cannot be known without the Document. So
+        // the candidate list already contains every one of them; when the index is dirty it is the
+        // whole document anyway. Same answer, bounded work.
         let mut hatch_best: Option<(usize, f64)> = None;
-        for i in 0..self.doc.dobjects.len() {
-            let Geom::Hatch(h) = &self.doc.dobjects[i].geom else { continue; };
+        for &i in &cands {
+            let Some(dob) = self.doc.dobjects.get(i) else { continue; };
+            let Geom::Hatch(h) = &dob.geom else { continue; };
             let loops = self.resolve_hatch_loops(h);
             if loops.is_empty() { continue; }
             let inside = loops.iter().fold(false,
@@ -34237,9 +34248,12 @@ impl CadApp {
         // loop above never matches them. Test the transformed contents
         // directly (one nesting level; nested instances contribute their
         // insertion point only — full recursion when pick perf matters).
+        // Same reasoning as the hatch fallback above — block references are view-independent too,
+        // so the candidate list already holds every one of them.
         let mut blk_best: Option<(usize, f64)> = None;
-        for i in 0..self.doc.dobjects.len() {
-            let Geom::BlockRef(br) = &self.doc.dobjects[i].geom else { continue; };
+        for &i in &cands {
+            let Some(dob) = self.doc.dobjects.get(i) else { continue; };
+            let Geom::BlockRef(br) = &dob.geom else { continue; };
             let Some(blk) = self.doc.blocks.get(br.block) else { continue; };
             for cd in &blk.dobjects {
                 let g = br.transform_geom(&cd.geom, blk.base);

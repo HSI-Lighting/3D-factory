@@ -387,6 +387,35 @@ mod tests {
         Circle { center: Vec2::new(x, y), radius: r }.into()
     }
 
+    /// VIEW-INDEPENDENT ENTITIES MUST REACH EVERY QUERY, and this is load-bearing beyond the
+    /// render path.
+    ///
+    /// A Hatch resolves its real extent through the Document's boundary handles and a BlockRef
+    /// through the block table, so the kernel's own bbox for either is a placeholder. They are
+    /// therefore not bucketed — they are appended to every result regardless of the rectangle.
+    ///
+    /// `nearest_entity_under`'s two fallbacks now depend on exactly that. They used to walk the
+    /// whole document on every missed click (measured floor 0.95 ms, against 5.8 µs for the
+    /// indexed query they back up) and iterate the candidate list instead. That is equivalent only
+    /// while this invariant holds — quietly bucketing hatches one day would make clicks inside a
+    /// hatch fill stop selecting it, with nothing to say why.
+    #[test]
+    fn view_independent_entities_reach_every_query() {
+        let mut hatch = c(0.0, 0.0, 1.0);
+        hatch.geom = crate::geom::Geom::Hatch(crate::geom::Hatch { boundary_handles: Vec::new(), pattern: crate::geom::HatchPattern::Solid });
+        assert!(hatch.geom.is_view_independent_bbox(), "a Hatch must be view-independent");
+
+        // The hatch sits at index 1; the query is a pinprick nowhere near anything.
+        let ents = vec![c(0.0, 0.0, 1.0), hatch, c(500.0, 500.0, 1.0)];
+        let g = UniformGrid::build(&ents, 10.0);
+        let hits = g.query_bbox(Vec2::new(-9000.0, -9000.0), Vec2::new(-8999.0, -8999.0));
+
+        assert!(
+            hits.contains(&1),
+            "the hatch was left out of a query it can never be culled from: {hits:?}",
+        );
+    }
+
     #[test]
     fn empty_grid_returns_empty() {
         let g = UniformGrid::build(&[], 1.0);
