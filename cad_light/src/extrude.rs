@@ -60,6 +60,26 @@ fn circle_pts(center: Vec2, radius: f64) -> Vec<Vec2> {
         .collect()
 }
 
+/// An ellipse as a closed ring, sampled in PARAMETER space.
+///
+/// `point_at` takes the parameter `t`, not a geometric angle at the centre — for a stretched
+/// ellipse those differ, and sampling the angle uniformly would bunch the points at the ends of
+/// the major axis and thin them at the sides, which is where a room's wall is longest.
+fn ellipse_pts(e: &cad_kernel::Ellipse) -> Vec<Vec2> {
+    (0..CURVE_SEGMENTS)
+        .map(|i| e.point_at(std::f64::consts::TAU * (i as f64 / CURVE_SEGMENTS as f64)))
+        .collect()
+}
+
+fn ellipse_arc_pts(ea: &cad_kernel::EllipseArc) -> Vec<Vec2> {
+    (0..=CURVE_SEGMENTS)
+        .map(|i| {
+            let t = i as f64 / CURVE_SEGMENTS as f64;
+            ea.ellipse.point_at(ea.start_param + ea.sweep_param * t)
+        })
+        .collect()
+}
+
 fn arc_pts(a: &KArc) -> Vec<Vec2> {
     (0..=CURVE_SEGMENTS)
         .map(|i| {
@@ -83,6 +103,22 @@ fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>, k: f64) {
         }
         Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, out, k),
         Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out, k),
+        Geom::Ellipse(e) => extrude_path(&ellipse_pts(e), true, height, out, k),
+        Geom::EllipseArc(ea) => extrude_path(&ellipse_arc_pts(ea), false, height, out, k),
+        // EVERYTHING BELOW IS DROPPED ON PURPOSE, and saying so is the point — this arm used to
+        // swallow the two above it as well, so a room traced with an ellipse was lit AS IF IT HAD
+        // NO WALLS: no error, no warning, a plausible lux figure somebody sizes an installation
+        // from.
+        //
+        //   Text, Dimension — annotation, not building fabric. A drawing full of dimension
+        //     strings must not light like a maze.
+        //   Hatch — a fill. Its boundary is other objects, which extrude on their own account;
+        //     extruding it too would double every wall it touches.
+        //   BlockRef — deliberately NOT resolved here. It would turn every piece of imported
+        //     furniture into a wall. Whether a block's contents should light is a real question,
+        //     and it deserves an answer rather than a side effect.
+        //   Spline — a genuine gap, not a decision. `Spline::tessellate` already exists; the arm
+        //     is simply unwritten, and a curved wall drafted with it lights as open air today.
         _ => {}
     }
 }
@@ -134,6 +170,12 @@ pub fn bbox(doc: &Document) -> Option<(f32, f32, f32, f32)> {
                 add(Vec2::new(c.center.x + c.radius, c.center.y + c.radius));
             }
             Geom::Arc(a) => arc_pts(a).into_iter().for_each(&mut add),
+            // MUST MATCH `extrude_geom` ABOVE. This sizes the calculation plane, so a shape that
+            // extrudes to walls but is missing here gets a plane that does not cover it — the
+            // room is built and then only partly measured, which is the same wrong answer arriving
+            // by a different route.
+            Geom::Ellipse(e) => ellipse_pts(e).into_iter().for_each(&mut add),
+            Geom::EllipseArc(ea) => ellipse_arc_pts(ea).into_iter().for_each(&mut add),
             _ => {}
         }
     }
@@ -252,5 +294,65 @@ mod tests {
     #[test]
     fn triangulate_square() {
         assert_eq!(triangulate(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]).len(), 2);
+    }
+
+    // ── A ROOM IS A ROOM WHATEVER IT WAS DRAWN WITH ────────────────────────────────────────
+    //
+    // `extrude_geom`'s `_ => {}` arm silently discarded every curved entity, so a room traced
+    // with an ellipse or a spline was LIT AS THOUGH IT HAD NO WALLS. No error, no warning —
+    // a plausible-looking lux figure that someone sizes an installation from.
+    //
+    // Deliberately still dropped, and these are correct rather than missing: Text and Dimension
+    // are annotation, not building fabric; Hatch is a fill whose boundary is other objects that
+    // extrude on their own account; BlockRef is left alone on purpose, because resolving it here
+    // would turn every imported furniture block into a wall.
+
+    fn doc_with(geom: cad_kernel::Geom) -> Document {
+        let mut d = Document::default();
+        d.push(DObject::new(geom));
+        d
+    }
+
+    /// The control. A circle already extruded, and it is the same shape as an ellipse of ratio 1 —
+    /// without this pair the ellipse assertion could pass for the wrong reason.
+    #[test]
+    fn a_circular_room_has_walls() {
+        let c = cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 3.0 };
+        assert!(!extrude(&doc_with(cad_kernel::Geom::Circle(c)), 2.7).is_empty());
+    }
+
+    #[test]
+    fn an_elliptical_room_has_walls() {
+        let e = cad_kernel::Ellipse {
+            center: Vec2::new(0.0, 0.0),
+            major: Vec2::new(4.0, 0.0),
+            ratio: 0.6,
+        };
+        assert!(
+            !extrude(&doc_with(cad_kernel::Geom::Ellipse(e)), 2.7).is_empty(),
+            "an ellipse produced no wall surfaces — the room would be lit as if open to the sky",
+        );
+    }
+
+    #[test]
+    fn an_elliptical_arc_wall_is_extruded() {
+        let e = cad_kernel::Ellipse {
+            center: Vec2::new(0.0, 0.0),
+            major: Vec2::new(4.0, 0.0),
+            ratio: 0.6,
+        };
+        let ea = cad_kernel::EllipseArc { ellipse: e, start_param: 0.0, sweep_param: 1.2 };
+        assert!(!extrude(&doc_with(cad_kernel::Geom::EllipseArc(ea)), 2.7).is_empty());
+    }
+
+    /// The other half of the contract: annotation must NOT become fabric. A drawing full of
+    /// dimension strings should not light like a maze.
+    #[test]
+    fn annotation_is_not_building_fabric() {
+        let t = cad_kernel::Text::empty();
+        assert!(
+            extrude(&doc_with(cad_kernel::Geom::Text(t)), 2.7).is_empty(),
+            "text was extruded into walls",
+        );
     }
 }
