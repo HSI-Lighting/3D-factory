@@ -6313,6 +6313,12 @@ impl FactoryState {
             });
         }
         self.model = d.model;
+        // The id counters are `#[serde(default)]`, so every project saved before they existed
+        // loads with them at 0 — and the next feature drawn would be handed id 1, which the loaded
+        // model already uses. That new object would inherit the existing one's colour, texture and
+        // group, because all of those are keyed by feature id. Raise the floor before anything can
+        // allocate.
+        self.model.reserve_ids_above_loaded();
         self.walls = walls;
         // A zero height means the sidecar predates the field — keep the live default
         // rather than adopting a building of no height.
@@ -6695,8 +6701,21 @@ impl FactoryState {
     pub fn erase_selection(&mut self) {
         for id in std::mem::take(&mut self.selection) {
             self.model.remove(id);
+            // EVERY SIDE MAP KEYED BY THIS ID, or whatever is given the id next inherits what was
+            // left behind. Four of the six were missing, and under the old `max + 1` allocator the
+            // id WAS handed out again the moment you deleted the newest feature — so deleting a
+            // coloured object and drawing another made the new one wear the dead one's paint.
+            //
+            // The allocator no longer recycles ids, which removes the symptom. These stay because
+            // a leak that only shows when something else regresses is the kind that comes back:
+            // without them the maps also grow for the whole session, and `SurfaceKey`'s first
+            // field is the feature id, so a stale surface entry outlives the surface itself.
             self.ceilings.remove(&id); // keep the ceiling set in step with the model
             self.feature_group.remove(&id); // drop it from any group
+            self.feature_color.remove(&id);
+            self.feature_texture.remove(&id);
+            self.surface_color.retain(|k, _| k.0 != id);
+            self.surface_texture.retain(|k, _| k.0 != id);
         }
         self.dirty = true;
     }
@@ -9826,6 +9845,56 @@ mod gizmo_and_props_tests {
         assert_eq!(st.model.features.len(), 1);
         st.erase_selection();
         assert!(st.model.features.is_empty());
+    }
+
+    /// AN ID IS AN IDENTITY AND MUST NOT BE RECYCLED.
+    ///
+    /// The allocator was `features.iter().map(|f| f.id).max() + 1`, so deleting the newest feature
+    /// handed its id straight to the next one. Every per-object property the app keeps — colour,
+    /// texture, group, ceiling flag — lives in a side map keyed by that id, and `erase_selection`
+    /// purged only two of them. So: paint a box, delete it, draw another, and the new one came up
+    /// wearing the dead one's paint.
+    #[test]
+    fn a_new_object_never_inherits_a_deleted_ones_identity() {
+        let mut st = one_box();
+        let first = st.model.features[0].id;
+        st.feature_color.insert(first, [1.0, 0.0, 0.0]);
+        st.feature_texture.insert(first, 7);
+
+        st.selection = vec![first];
+        st.erase_selection();
+        st.add_box();
+        let second = st.model.features.last().expect("a second box").id;
+
+        assert_ne!(second, first, "the deleted feature's id was reused");
+        assert!(
+            !st.feature_color.contains_key(&second) && !st.feature_texture.contains_key(&second),
+            "the new object inherited the deleted object's paint",
+        );
+        assert!(
+            st.feature_color.is_empty() && st.feature_texture.is_empty(),
+            "erase left stale per-feature state behind",
+        );
+    }
+
+    /// A project saved before the counters existed loads with them at zero. Without raising the
+    /// floor, the next object drawn is handed id 1 — which the loaded model is already using.
+    #[test]
+    fn loading_an_older_model_raises_the_id_floor() {
+        let mut st = one_box();
+        st.add_box();
+        let used: Vec<u32> = st.model.features.iter().map(|f| f.id).collect();
+
+        // Exactly the shape serde produces for a file that predates the counters.
+        st.model.next_feature_id = 0;
+        st.model.reserve_ids_above_loaded();
+        st.add_box();
+
+        let fresh = st.model.features.last().unwrap().id;
+        assert!(
+            !used.contains(&fresh),
+            "id {fresh} collides with the loaded model's {used:?}",
+        );
     }
 }
 
