@@ -2349,6 +2349,15 @@ pub struct CadApp {
 
 const UNDO_STACK_CAP: usize = 64;
 
+/// Above this many selected objects, grips stop being drawn — AutoCAD's `GRIPOBJLIMIT`, whose
+/// default is the same 100.
+///
+/// The grip pass is per-selected-object per-frame with no viewport cull, so a few thousand
+/// selected objects cost 25–80 ms EVERY FRAME. Grips exist to drag ONE thing; nobody reaches for a
+/// handle on the 900th object of a selection, and a canvas solid with squares is less usable, not
+/// more. Selection itself is unaffected — only the handles.
+const GRIP_OBJ_LIMIT: usize = 100;
+
 /// The 3D Factory state an undo step restores. Model + alive walls only: the camera,
 /// the selection and any open dialog are VIEW state, and yanking the camera back on
 /// Ctrl+Z would be disorienting rather than helpful.
@@ -43349,7 +43358,23 @@ impl eframe::App for CadApp {
             // Render small filled squares at each grip point of every
             // selected dobject when in pointer mode + GrpEnb is on. v1
             // semantic: dragging any grip translates the whole dobject.
-            if self.env.GrpEnb && !in_click_only_phase && self.select_mode == SelectMode::Off {
+            // A COUNT CAP, THE WAY AutoCAD HAS ONE. `GRIPOBJLIMIT` defaults to 100 there and does
+            // exactly this: past the limit, grips stop being drawn for the selection.
+            //
+            // Everything below is per-selected-object per-frame — a clone, a sort, a dedup, then
+            // a loop that reads each dobject and paints a square at every grip point. Selecting a
+            // few thousand objects, which one crossing window does, turned that into 25-80 ms
+            // EVERY FRAME. There is no viewport cull anywhere in this block, and adding one is
+            // harder than adding a count test: grips are screen-space squares, so culling means
+            // projecting each grip point rather than rejecting a bbox.
+            //
+            // It is also the honest behaviour. Grips exist so you can drag ONE thing; nobody
+            // reaches for a grip on the 900th object of a selection, and a canvas solid with
+            // handles is less usable, not more.
+            let grips_shown = self.selection.len() <= GRIP_OBJ_LIMIT;
+            if self.env.GrpEnb && grips_shown && !in_click_only_phase
+                && self.select_mode == SelectMode::Off
+            {
                 let mut grip_targets: Vec<usize> = self.selection.clone();
                 if let Some(s) = self.selected { grip_targets.push(s); }
                 grip_targets.sort_unstable(); grip_targets.dedup();
