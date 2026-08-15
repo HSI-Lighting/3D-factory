@@ -296,6 +296,103 @@ mod tests {
         assert_eq!(triangulate(&[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]).len(), 2);
     }
 
+    // ── THE SAME ROOM IN DIFFERENT UNITS IS THE SAME ROOM ──────────────────────────────────
+    //
+    // Every function here scales X and Y by `doc.units.metres_per_unit`, because the engine's
+    // world is METRES while the document's coordinates are drawing units. Get that factor wrong
+    // and the inverse-square law in `calc` is evaluated on nonsense — a millimetre plan lit as
+    // though it were a kilometre across.
+    //
+    // THERE WAS NO TEST FOR IT. Coverage pinned units at the IO layer only; nothing exercised
+    // this crate at a non-default unit, so the factor could be dropped, doubled or inverted and
+    // the suite would stay green. That is the same shape as the "1000 m solid" defect, in the one
+    // crate whose numbers a lighting designer acts on.
+    //
+    // The test is an EQUIVALENCE, which is the only form that cannot be satisfied by writing down
+    // whatever the code currently does: the same physical room, drafted in metres and in
+    // millimetres, must extrude to the same world geometry.
+
+    fn room_doc(unit_m: f64, side: f64) -> Document {
+        let mut d = Document::default();
+        d.units = cad_kernel::DocUnits::new(unit_m, cad_kernel::UnitSource::Declared);
+        let verts: Vec<PolyVertex> = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
+            .iter()
+            .map(|&(x, y)| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
+            .collect();
+        d.push(DObject::new(Geom::Polyline(Polyline {
+            vertices: verts, closed: true, widths: Vec::new(),
+        })));
+        d
+    }
+
+    /// A 4 m room drawn in metres and the SAME 4 m room drawn in millimetres must produce
+    /// identical world geometry. If the scale factor is ever dropped, the mm version comes out
+    /// 1000× too big and this fails immediately.
+    #[test]
+    fn a_room_extrudes_the_same_whatever_unit_it_was_drafted_in() {
+        let in_metres = extrude(&room_doc(1.0, 4.0), 2.7);
+        let in_mm = extrude(&room_doc(0.001, 4000.0), 2.7);
+
+        assert_eq!(in_metres.len(), in_mm.len(), "same room, different mesh count");
+        for (a, b) in in_metres.iter().zip(in_mm.iter()) {
+            assert_eq!(a.material, b.material);
+            assert_eq!(a.vertices.len(), b.vertices.len());
+            for (va, vb) in a.vertices.iter().zip(b.vertices.iter()) {
+                assert!(
+                    (va.x - vb.x).abs() < 1e-3 && (va.y - vb.y).abs() < 1e-3
+                        && (va.z - vb.z).abs() < 1e-3,
+                    "unit scaling lost: metres gave ({:.4}, {:.4}, {:.4}), \
+                     millimetres gave ({:.4}, {:.4}, {:.4})",
+                    va.x, va.y, va.z, vb.x, vb.y, vb.z,
+                );
+            }
+        }
+    }
+
+    /// And the absolute value, not just the agreement — two wrong answers can agree with each
+    /// other. A 4 m room's far corner is at 4 m in the engine's world, whatever it was drafted in.
+    #[test]
+    fn drafting_units_reach_the_engine_as_metres() {
+        for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
+            let meshes = extrude(&room_doc(unit_m, side), 2.7);
+            let max_x = meshes.iter()
+                .flat_map(|m| m.vertices.iter())
+                .fold(f32::MIN, |acc, v| acc.max(v.x));
+            assert!(
+                (max_x - 4.0).abs() < 1e-3,
+                "a 4 m room at {unit_m} m/unit reached the engine {max_x} m across",
+            );
+        }
+    }
+
+    /// `bbox` sizes the CALCULATION PLANE, so it has to scale identically. A plane that does not
+    /// cover the room measures part of it and reports the average over the rest — a wrong lux
+    /// figure with no symptom.
+    #[test]
+    fn the_calc_plane_bbox_is_in_metres_too() {
+        for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
+            let (mnx, mny, mxx, mxy) = bbox(&room_doc(unit_m, side)).expect("a room has a bbox");
+            assert!(
+                mnx.abs() < 1e-3 && mny.abs() < 1e-3
+                    && (mxx - 4.0).abs() < 1e-3 && (mxy - 4.0).abs() < 1e-3,
+                "bbox at {unit_m} m/unit came out ({mnx}, {mny})..({mxx}, {mxy}), not 0..4 metres",
+            );
+        }
+    }
+
+    /// The per-layer room build takes the same path and must scale the same way — it is the one
+    /// SIMLUX actually calls, via the layer heights.
+    #[test]
+    fn the_per_layer_room_build_scales_too() {
+        let doc = room_doc(0.001, 4000.0);
+        let handles: Vec<u64> = doc.dobjects.iter().map(|d| d.handle).collect();
+        let meshes = extrude_handles(&doc, &handles, 2.7);
+        let max_x = meshes.iter()
+            .flat_map(|m| m.vertices.iter())
+            .fold(f32::MIN, |acc, v| acc.max(v.x));
+        assert!((max_x - 4.0).abs() < 1e-3, "extrude_handles ignored the unit: {max_x} m");
+    }
+
     // ── A ROOM IS A ROOM WHATEVER IT WAS DRAWN WITH ────────────────────────────────────────
     //
     // `extrude_geom`'s `_ => {}` arm silently discarded every curved entity, so a room traced
