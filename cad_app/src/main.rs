@@ -48,6 +48,16 @@ fn main() -> Result<(), eframe::Error> {
     );
     eprintln!("{}", assets::report());
 
+    // BEFORE ANYTHING CAN RUN A BOOLEAN — the generators, an autoloaded fixture, a reopened
+    // project. csgrs keeps its tolerance in a `OnceLock` whose first READER initialises it to the
+    // default, so this has to be the earliest thing that touches the crate or it silently no-ops.
+    // At the default, cuts on work smaller than about 300 mm come back with the wrong volume and
+    // no error of any kind. See `cad_solid::BOOLEAN_TOLERANCE` for the measurements.
+    match cad_solid::init_boolean_tolerance() {
+        Ok(t)  => eprintln!("[simlux] boolean tolerance {t:e}"),
+        Err(e) => eprintln!("[simlux] WARNING: {e}"),
+    }
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])

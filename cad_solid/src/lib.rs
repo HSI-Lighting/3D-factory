@@ -17,6 +17,53 @@ use cad_kernel::Vec2 as KVec2;
 use glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+/// The coplanarity tolerance every boolean in this app runs at.
+///
+/// WHY IT IS NOT THE DEFAULT. csgrs classifies a point against a plane with Shewchuk's exact
+/// `orient3d` predicate and compares the result against `tolerance()` — but that predicate returns
+/// six times a TETRAHEDRON VOLUME, i.e. `2·area(abc)·distance`. So the effective band *in distance*
+/// is `tolerance / (2·area)`: the smaller the triangle, the wider the band. The default is `1e-6`,
+/// and the crate's own unit table declares it dimensioned for MILLIMETRES. This app works in
+/// metres, which puts ordinary work far deeper into that band than the default assumes.
+///
+/// MEASURED — a plate cut by a 64-sided hole, volume error against closed form:
+///
+/// ```text
+///   plate size   default 1e-6         this constant
+///     10.0 m     −0.00 %              0.00 %
+///      1.0 m      0.00 %              0.00 %
+///      0.3 m     +0.21 … +0.65 %      0.00 %
+///      0.1 m     −33 … +732 %         0.00 %   ← BSP collapsed to depth 1
+///     0.03 m     +682 %               0.00 %
+///     0.01 m    +1048 %               0.00 %
+/// ```
+///
+/// No error, no panic, no open-edge signal — it returns the WRONG SOLID, silently. And it is
+/// reachable from ordinary building input: a 5 m-radius circle extruded 3 m and cut by one
+/// 1 × 1 m window removes 0.99 m³ at 1,024 segments, 0.66 at 2,048 and 1.67 at 4,096.
+pub const BOOLEAN_TOLERANCE: f64 = 1e-12;
+
+/// Set [`BOOLEAN_TOLERANCE`] and PROVE it took. Call once at startup, before anything can run a
+/// boolean — including the generators and any autoloaded fixture.
+///
+/// THE READ-BACK IS THE POINT, not belt and braces. csgrs keeps the tolerance in a `OnceLock` and
+/// its setter is `let _ = TOLERANCE_CELL.set(value)` — it SWALLOWS its own failure. `tolerance()`
+/// is `get_or_init`, so the first *reader* initialises the cell to the default, and any
+/// `set_tolerance` after that is a silent no-op leaving the app on the broken value with nothing
+/// said. That is precisely the failure this exists to remove, so it is observed, not assumed.
+pub fn init_boolean_tolerance() -> Result<f64, String> {
+    csgrs::float_types::set_tolerance(BOOLEAN_TOLERANCE);
+    let got = csgrs::float_types::tolerance();
+    if got == BOOLEAN_TOLERANCE {
+        Ok(got)
+    } else {
+        Err(format!(
+            "boolean tolerance is {got:e}, not {BOOLEAN_TOLERANCE:e} — something ran a boolean \
+             before startup finished, so the setter was a no-op. Small cuts will be silently wrong."
+        ))
+    }
+}
+
 pub mod architecture; // staircase / spiral / ramp generators → SolidMesh
 pub mod dogleg; // parametric half-turn (dog-leg) staircase → editable CSG parts
 pub mod spiral; // parametric helical (spiral) staircase → editable CSG parts
