@@ -80,12 +80,35 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 //     of loading it, silently dropping the unit, and writing back a v7 file whose
 //     geometry no longer matches its (now lost) scale. Refusing is recoverable;
 //     silent stripping is not.
-const VERSION: u16  = 8;
+// ── VERSION NUMBERING: 100+ IS THIS LINE, 1..99 IS RUST-AutoRASM ──────────────────────────
+//
+// Two independent codebases write this format under the SAME magic bytes. RUST-AutoRASM forked
+// from here at v7 and has since reached v16 — and its v8 means "TextStyle bold/outline" where ours
+// meant "document units". Both readers accept anything up to their own VERSION, so a file written
+// by one line was ACCEPTED by the other and its bytes parsed as an entirely different field. No
+// error, no panic: a corrupted drawing that opens.
+//
+// The sequences are now disjoint. 100 and up is ours; below is theirs. A reader from either line
+// meeting a file from the other exceeds its own VERSION and REFUSES it — which is exactly what the
+// units note below already argues for: refusing is recoverable, silent misreading is not.
+//
+// NOTHING MIGRATES. Every file that exists was checked before this changed: the .rsm files on disk
+// are v7 and v3, and the sketch payloads embedded in .simlux.json sidecars are v7. Not one v8 file
+// had ever been written, because `version_for` emits the units version only when a unit was
+// explicitly DECLARED, and no saved drawing had one. So this renumber cannot orphan a file.
+//
+// Keep the gap. If this line needs another version, use 101 — do not creep back down toward
+// theirs, and do not assume their 16 is a ceiling.
+const VERSION: u16  = 100;
+
+/// The version at which this line started recording document units. Was 8, which collided with
+/// RUST-AutoRASM's TextStyle version — see the note above.
+const V_UNITS: u16 = 100;
 
 /// The lowest version that can represent `doc` — so adding units costs nothing to
 /// every drawing that does not use them.
 fn version_for(doc: &Document) -> u16 {
-    if doc.units.source == cad_kernel::UnitSource::Assumed { 7 } else { 8 }
+    if doc.units.source == cad_kernel::UnitSource::Assumed { 7 } else { V_UNITS }
 }
 
 // =============================================================================
@@ -110,7 +133,7 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_dim_style_table(&mut w, &doc.dim_styles);
     write_wall_style_table(&mut w, &doc.wall_styles);
     write_raster_images(&mut w, &doc.raster_images);          // v4
-    if ver >= 8 {
+    if ver >= V_UNITS {
         write_units(&mut w, &doc.units);                       // v8
     }
 
@@ -651,7 +674,7 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     // v8 — document unit. Every older file predates the concept, so it gets the default
     // (1 unit = 1 metre, ASSUMED). That is the zero-delta path: every 2D→3D boundary then
     // multiplies by 1.0 and the drawing behaves exactly as it did before units existed.
-    let units = if ver >= 8 { read_units(&mut r)? } else { cad_kernel::DocUnits::default() };
+    let units = if ver >= V_UNITS { read_units(&mut r)? } else { cad_kernel::DocUnits::default() };
     // THE HANDLE FLOOR. RSM preserves handles; the allocator is a process-global counter starting
     // at 1. Without this, opening a file saved in a long session hands the next object drawn a
     // handle a loaded object already owns — and handles are how objects refer to each other, so a
@@ -1039,12 +1062,16 @@ mod tests {
     /// rather than loading it, dropping the unit, and writing back a v7 file whose geometry
     /// silently no longer matches its scale.
     #[test]
-    fn declaring_a_unit_bumps_to_v8_and_round_trips() {
+    fn declaring_a_unit_bumps_the_version_and_round_trips() {
         let mut doc = Document::default();
         doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::User);
         let bytes = write_rsm(&doc);
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 8, "a declared unit is v8");
-        let back = read_rsm(&bytes).expect("v8 round-trip");
+        let written = u16::from_le_bytes([bytes[4], bytes[5]]);
+        assert_eq!(written, V_UNITS, "a declared unit writes the units version");
+        // And it must stay clear of RUST-AutoRASM's range, or that line's reader ACCEPTS this file
+        // and parses the unit bytes as TextStyle fields. See the note on VERSION.
+        assert!(written >= 100, "the units version collided with the other line's range");
+        let back = read_rsm(&bytes).expect("units round-trip");
         assert_eq!(back.units.metres_per_unit, 0.001);
         assert_eq!(back.units.source, cad_kernel::UnitSource::User);
     }
