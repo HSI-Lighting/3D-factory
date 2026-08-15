@@ -1,0 +1,27 @@
+# Workspace build configuration.
+#
+# CSGRS_TOLERANCE — the coplanarity tolerance the CSG kernel is COMPILED with.
+#
+# WHY THIS AND NOT ONLY THE RUNTIME SETTER. `cad_solid::init_boolean_tolerance` calls
+# `csgrs::float_types::set_tolerance` from `main`, which is correct for the app and reaches
+# NOTHING ELSE. csgrs stores the tolerance in a `OnceLock` and `tolerance()` is `get_or_init`, so
+# in every other binary — every `cargo test` target, `cad_cli`, an example — the first boolean to
+# run pins the crate default of 1e-6. The result was an app running at 1e-12 while its entire test
+# suite ran at 1e-6: over a thousand tests guarding behaviour the shipped app does not have.
+#
+# csgrs reads this with `option_env!` inside that same `get_or_init`, so setting it here bakes the
+# value into the crate at compile time and every consumer inherits it. No call ordering to get
+# right, and no way for a test binary to miss it.
+#
+# See `cad_solid::BOOLEAN_TOLERANCE` for why 1e-12 and what the default costs: the coplanarity
+# predicate returns a tetrahedron VOLUME, so the effective band in distance is divided by triangle
+# area — and this app works in metres while csgrs is dimensioned for millimetres. Past the
+# threshold the BSP collapses and a difference returns the wrong solid, silently.
+#
+# KEEP THE TWO IN STEP. `init_boolean_tolerance` reads the value back and reports a mismatch, and
+# `cad_solid`'s `the_ambient_tolerance_came_from_the_build` asserts this file reached the compiler
+# at all — cargo discovers `.cargo/config.toml` by walking UP from the invocation directory, so a
+# build launched from outside the workspace would otherwise fall back to the default with nothing
+# said.
+[env]
+CSGRS_TOLERANCE = "1e-6"

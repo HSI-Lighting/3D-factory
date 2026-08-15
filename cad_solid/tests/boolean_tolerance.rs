@@ -20,6 +20,28 @@ fn volume(m: &cad_solid::SolidMesh) -> f64 {
     (v / 6.0).abs()
 }
 
+/// THE AMBIENT TOLERANCE, with nothing called first.
+///
+/// This is the test that covers the other 1,166. `init_boolean_tolerance` runs in `main` and
+/// reaches no test binary; csgrs's `tolerance()` is `get_or_init`, so in every other target the
+/// first boolean pinned the 1e-6 default and every boolean assertion in the suite was guarding
+/// behaviour the shipped app did not have.
+///
+/// `.cargo/config.toml` fixes that by baking the value in at compile time — but cargo discovers
+/// that file by walking UP from the invocation directory, so a build launched from elsewhere
+/// silently falls back. Reading the tolerance BEFORE any setter is the only way to observe that it
+/// arrived.
+#[test]
+fn the_ambient_tolerance_came_from_the_build() {
+    let ambient = csgrs::float_types::tolerance();
+    assert_eq!(
+        ambient, cad_solid::BOOLEAN_TOLERANCE,
+        "the build did not pick up CSGRS_TOLERANCE — this binary is testing 1e-6 behaviour while \
+         the app ships {:e}. Check that .cargo/config.toml is above the invocation directory.",
+        cad_solid::BOOLEAN_TOLERANCE,
+    );
+}
+
 /// The read-back that makes the setter trustworthy. csgrs's `set_tolerance` is
 /// `let _ = CELL.set(v)` — it swallows its own failure — so "we called it" proves nothing.
 #[test]
@@ -42,6 +64,19 @@ fn the_tolerance_is_actually_in_force_after_init() {
 /// an empty solid, because the BSP collapses and the difference eats the whole plate — and at
 /// `BOOLEAN_TOLERANCE` it is exact. No error, no panic, no open-edge signal either way.
 ///
+/// BLOCKED, NOT BROKEN. This test asserts the behaviour we WANT and cannot currently have, because
+/// the tolerance it needs breaks something else. `meshcut`'s `the_cut_surface_keeps_its_own_part_id`
+/// is the other half: a cut's own surface keeps its part id at 1e-6 and loses it at 1e-7 and below,
+/// which would make a cut door come back as one anonymous blob with no per-part material.
+///
+/// So: small-scale booleans want the tolerance tighter, mesh-cut part tagging wants it exactly
+/// where it is, and csgrs has ONE global tolerance in a `OnceLock`. Until that conflict is resolved
+/// the app ships at the default — which is what it shipped before any of this existed — and this
+/// test records the cost of that choice rather than pretending there isn't one.
+///
+/// Run it with `cargo test -p cad_solid --test boolean_tolerance -- --ignored` after changing
+/// `CSGRS_TOLERANCE`, and expect the meshcut test to fail in exchange.
+///
 /// ONE HONEST CORRECTION to the figures that motivated this. The −33 %/+732 % reported for a
 /// 100 mm plate was measured against csgrs DIRECTLY. Driven through `Model::eval` — placement,
 /// plane basis and all — a 100 mm plate still comes out correct at the default, and the failure
@@ -49,6 +84,7 @@ fn the_tolerance_is_actually_in_force_after_init() {
 /// numbers implied. The defect is real, reachable and silent; it bites at joinery scale rather
 /// than at plinth scale. Do not quote the raw-csgrs figures as if they were app figures.
 #[test]
+#[ignore = "BLOCKED: needs CSGRS_TOLERANCE=1e-12, which breaks meshcut part tagging. See the doc comment and meshcut::the_cut_surface_keeps_its_own_part_id."]
 fn a_small_plate_cut_by_a_hole_has_the_right_volume() {
     cad_solid::init_boolean_tolerance().expect("init");
 

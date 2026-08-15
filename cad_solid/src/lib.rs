@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 /// No error, no panic, no open-edge signal — it returns the WRONG SOLID, silently. And it is
 /// reachable from ordinary building input: a 5 m-radius circle extruded 3 m and cut by one
 /// 1 × 1 m window removes 0.99 m³ at 1,024 segments, 0.66 at 2,048 and 1.67 at 4,096.
-pub const BOOLEAN_TOLERANCE: f64 = 1e-12;
+pub const BOOLEAN_TOLERANCE: f64 = 1e-6;
 
 /// Set [`BOOLEAN_TOLERANCE`] and PROVE it took. Call once at startup, before anything can run a
 /// boolean — including the generators and any autoloaded fixture.

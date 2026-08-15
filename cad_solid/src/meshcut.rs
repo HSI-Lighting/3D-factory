@@ -819,6 +819,49 @@ mod tests {
         );
     }
 
+    /// THE TOLERANCE CONFLICT, pinned as a test so it cannot be rediscovered by accident.
+    ///
+    /// A cut's own surface is tagged with a fresh part id so it can carry its own material — the
+    /// module's whole reason for `Mesh<u32>`. MEASURED, cutting a letterbox through the default
+    /// door and collecting the part ids present in the result:
+    ///
+    /// ```text
+    ///   tolerance   slot's part id 9   open edges
+    ///     1e-6      PRESENT            20
+    ///     1e-7      absent             22
+    ///     1e-9      absent              6
+    ///     1e-12     absent              6
+    /// ```
+    ///
+    /// So the tagging survives only at the csgrs default and fails one decade below it. That
+    /// collides head-on with `BOOLEAN_TOLERANCE`, which exists because at the default a cut on
+    /// 10 mm work returns the wrong solid. Small-scale booleans want it tighter; the mesh-cut part
+    /// tagging wants it exactly where it is.
+    ///
+    /// (Open-edge counts are NOT the signal here — this module documents that a BSP boolean leaves
+    /// T-junctions, so a watertight result still reports some. The part id is the signal.)
+    ///
+    /// Until that is resolved the app ships at the default, which is what it shipped before
+    /// `init_boolean_tolerance` existed. Raising it is scheduled work, blocked on this.
+    #[test]
+    fn the_cut_surface_keeps_its_own_part_id() {
+        let inp = crate::door::DoorInput::default();
+        let (_m, mesh) = crate::door::build(&inp).unwrap();
+        let frame = Frame::from_point_normal(Vec3::new(0.0, 0.0, 0.9), Vec3::Y);
+        let slot = vec![[-0.13, -0.04], [0.13, -0.04], [0.13, 0.04], [-0.13, 0.04]];
+        let out = apply(&mesh.positions, &mesh.normals, &mesh.face_ids,
+            &[MeshCut::through(frame, slot, "letterbox")]).unwrap().expect("cut");
+
+        let before_max = mesh.face_ids.iter().copied().max().unwrap_or(0);
+        assert!(
+            out.face_ids.iter().any(|&p| p > before_max),
+            "the slot's surface lost its part id at tolerance {:e} — it would come back as part of \
+             the leaf and lose its own material. Present ids: {:?}",
+            csgrs::float_types::tolerance(),
+            out.face_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+
     /// The frame's `to_uv`/`from_uv` round-trip is what the app relies on to turn a drawn point
     /// into a profile coordinate. If it did not, cuts would land offset from where they were drawn.
     #[test]
