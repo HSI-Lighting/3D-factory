@@ -6626,7 +6626,18 @@ impl FactoryState {
         if wi >= self.walls.len() {
             return;
         }
-        for id in std::mem::take(&mut self.walls[wi].segments) {
+        // WHERE THE OLD SEGMENTS SAT, so the rebuilt ones can go back there. Ascending, because
+        // re-inserting in ascending order at the original indices reconstructs the original
+        // arrangement exactly: each insert shifts only what follows it, so by the time the k-th
+        // index is used every earlier hole has already been refilled.
+        let old: Vec<u32> = std::mem::take(&mut self.walls[wi].segments);
+        let mut slots: Vec<usize> = old
+            .iter()
+            .filter_map(|id| self.model.features.iter().position(|f| f.id == *id))
+            .collect();
+        slots.sort_unstable();
+
+        for id in old {
             self.model.remove(id);
         }
         let fp = self.walls[wi].footprint.clone();
@@ -6640,6 +6651,32 @@ impl FactoryState {
                 segments.push(id);
             }
         }
+
+        // PUT THEM BACK WHERE THEY WERE, or this wall's openings become the next wall's.
+        //
+        // `push_wall_box` APPENDS. An opening is a Difference that must sit directly behind the
+        // body it cuts — `csg::eval` folds each Difference onto the most recent Union, and
+        // `factory_cut_sketch` re-inserts cutters at `position(host) + 1` for exactly that reason.
+        // Rebuilding a wall at the END of the feature list therefore left every cutter that used
+        // to sit behind it bound to whichever Union now precedes it: the NEIGHBOURING wall. A
+        // window silently moved house, on an ordinary corner drag.
+        //
+        // ONLY WHEN THE COUNT MATCHES, which is the honest limit of this fix. Moving a vertex
+        // keeps the segment count, so the mapping is exact and the old order is restored.
+        // Inserting or deleting a vertex CHANGES the count — there is no 1:1 mapping, and an
+        // opening can be left with no host segment at all. That case keeps today's behaviour
+        // rather than being papered over: the decision is that an orphaned opening must be KEPT
+        // AND FLAGGED, which needs a per-feature flag and a visible marker on the body, and a
+        // half-answer here would silently re-bind precisely the openings it cannot place.
+        if !segments.is_empty() && slots.len() == segments.len() {
+            let tail = self.model.features.len() - segments.len();
+            let rebuilt: Vec<_> = self.model.features.drain(tail..).collect();
+            for (slot, feat) in slots.into_iter().zip(rebuilt) {
+                let at = slot.min(self.model.features.len());
+                self.model.features.insert(at, feat);
+            }
+        }
+
         self.walls[wi].segments = segments;
         self.dirty = true;
     }
@@ -15060,5 +15097,57 @@ mod numeric_fields_do_not_clamp_mid_keystroke {
         let f = &src[a..b];
         assert!(f.contains(".range("), "the field must still declare its limits");
         assert!(f.contains(".update_while_editing(false)"), "…and defer them until commit");
+    }
+}
+
+#[cfg(test)]
+mod wall_opening_tests {
+    use super::*;
+
+    /// A WALL EDIT MUST NOT MOVE ANOTHER WALL'S OPENINGS.
+    ///
+    /// `rederive_wall` removes a wall's segments and rebuilds them, and the rebuild APPENDS. An
+    /// opening is a Difference that must sit directly behind the body it cuts — `csg::eval` folds
+    /// each Difference onto the most recent Union. So rebuilding at the END of the feature list
+    /// left every cutter that used to sit behind that wall bound to whichever Union now precedes
+    /// it: the neighbouring wall. Silently, on an ordinary corner drag.
+    ///
+    /// The assertion is on ORDER, not on geometry, because order IS the binding. A cutter that is
+    /// no longer immediately after its host wall is cutting something else.
+    #[test]
+    fn dragging_a_corner_leaves_this_walls_opening_on_this_wall() {
+        let mut st = FactoryState::default();
+
+        // Two walls, so there is a neighbour for an opening to defect to.
+        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
+            .expect("wall a");
+        st.add_wall(vec![Vec2::new(0.0, 5.0), Vec2::new(4.0, 5.0)], 0.2, 2.7)
+            .expect("wall b");
+
+        // An opening in wall A's segment, placed the way a cut places one: directly behind it.
+        let host = *st.walls[a].segments.first().expect("a segment");
+        let host_at = st.model.features.iter().position(|f| f.id == host).expect("host present");
+        let cutter = cad_solid::Feature {
+            id: 9_000,
+            op: cad_solid::BoolOp::Difference,
+            plane: cad_solid::Plane::default(),
+            placement: cad_solid::Placement::default(),
+            primitive: cad_solid::Primitive::Box { w: 0.9, d: 1.0, h: 1.2 },
+        };
+        st.model.features.insert(host_at + 1, cutter);
+
+        // Drag a corner of wall A. Segment count is unchanged.
+        st.wall_move_vertex(a, 1, Vec2::new(4.5, 0.3));
+
+        let new_host = *st.walls[a].segments.first().expect("a segment after the edit");
+        let host_now = st.model.features.iter().position(|f| f.id == new_host)
+            .expect("the rebuilt segment is in the model");
+        let cutter_now = st.model.features.iter().position(|f| f.id == 9_000)
+            .expect("the cutter is still in the model");
+
+        assert_eq!(
+            cutter_now, host_now + 1,
+            "the opening is no longer directly behind its own wall — it is cutting a neighbour",
+        );
     }
 }
