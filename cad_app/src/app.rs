@@ -1898,6 +1898,20 @@ pub struct CadApp {
     /// therefore structural rather than remembered: you cannot mark the view dirty without
     /// advancing the counter, because there is one function that does both.
     view_seq: u64,
+    /// The two EXPENSIVE 3D line builders, held across frames. See [`Self::lines_sig`].
+    ///
+    /// Measured before this existed: a 265-object drawing spent 15.7 ms per frame re-flattening
+    /// its plan into 312,576 vertices — 12.2 MB, rebuilt sixty times a second for a drawing that
+    /// was not changing, and 112% of a frame's budget before anything was drawn.
+    ///
+    /// Kept as TWO buffers rather than one concatenated block because ORDER between the builders
+    /// is load-bearing: the picked-face outline has to be emitted after the finished sketches so
+    /// the yellow reads over the drawing rather than z-fighting under it, and it sits between
+    /// these two.
+    cached_sketch_lines: Vec<crate::light3d::V3>,
+    cached_plan_lines: Vec<crate::light3d::V3>,
+    /// `lines_sig()` when the two buffers above were built. `u64::MAX` = never built.
+    cached_lines_sig: u64,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
     /// caching it means it runs once per doc change instead of every frame,
@@ -3763,6 +3777,9 @@ impl Default for CadApp {
             sel_mask:            Vec::new(),
             gpu_dirty:    true,
             view_seq: 1,
+            cached_sketch_lines: Vec::new(),
+            cached_plan_lines: Vec::new(),
+            cached_lines_sig: u64::MAX,
             layer_panel_open:   true,
             layer_rename:       None,
             layer_rename_buf:   String::new(),
@@ -8258,6 +8275,12 @@ impl CadApp {
             saved_constraints,
             saved_pending,
         });
+        // Entering a plane moves its document out from under `sketch_lines` and installs it as
+        // the live one, so the cached finished-plane buffer IS stale here — and nothing is added
+        // for it deliberately. `factory_reset_doc_state` below already calls `touch_view` (the
+        // spatial index and GPU vertex cache are keyed to the document that just went away), and
+        // `lines_sig` hashes the open plane's index on top of that. A mark was added here first
+        // and then removed: no test could tell the difference, which is what redundant means.
         // land in a clean drafting state on the new plane. MUST run after the swap:
         // every index-holding field still points into the model-space doc we just
         // parked, and the app panics on a stale `doc.dobjects[i]`.
@@ -8307,6 +8330,11 @@ impl CadApp {
             if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
                 sk.doc = sketch_doc;
             }
+            // Leaving one moves the document back the other way, and nothing is added for that
+            // here either — same reasons as on the way in. The marks that ARE needed are on the
+            // two paths that rewrite a plane's drawing WITHOUT it being the open one:
+            // `factory_clear_sketch_on` and `factory_consume_sketch`, where no session index
+            // changes and no 2D edit happens, so nothing else would notice.
             // 3D WORK DONE INSIDE A SKETCH IS STILL UNDOABLE.
             //
             // This used to be `self.undo_stack = s.saved_undo`, discarding the whole session
@@ -8622,6 +8650,7 @@ impl CadApp {
             .find(|s| Self::frames_coplanar(&s.frame, &frame))
         {
             sk.doc.dobjects.clear();
+            self.touch_view(); // a plane's drawing changed → the cached sketch lines are stale
         }
     }
 
@@ -8652,6 +8681,7 @@ impl CadApp {
                 if let Some(sk) = self.factory.model.sketches.get_mut(i) {
                     sk.doc.dobjects.clear();
                 }
+                self.touch_view(); // consumed a plane's drawing → cached sketch lines are stale
             }
         }
     }
@@ -13209,8 +13239,13 @@ impl CadApp {
                         );
                     }
                 }
+                // THE TWO EXPENSIVE BUILDERS RUN ONLY WHEN SOMETHING THEY READ CHANGED. Measured
+                // at 15.7 ms and 12.2 MB per frame on a 265-object drawing before this; the
+                // signature is `lines_sig`, and what is deliberately left out of it is documented
+                // there.
+                self.refresh_cached_lines();
                 let mut lines = self.factory.overlay_lines();
-                lines.extend(self.factory.sketch_lines(&self.doc)); // 2D work, lifted onto its plane
+                lines.extend_from_slice(&self.cached_sketch_lines); // 2D work, lifted onto its plane
                 // LAST of the three, so the yellow face outline is drawn over the sketch geometry
                 // sitting on it rather than under. It is the answer to "is this the right face?",
                 // and an answer half-hidden behind the drawing is no answer.
@@ -13234,11 +13269,10 @@ impl CadApp {
                 //
                 // `plan_doc()` exists for exactly this and has to be used at every site that means
                 // THE PLAN — the swap makes the wrong document the default.
-                let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-                if self.factory.show_plan && !self.factory.plan_xray && !plan.dobjects.is_empty() {
-                    let z = self.factory.active_base_z();
-                    lines.extend(self.factory.plan_lines(plan, z));
-                }
+                // Cached above, with the show_plan / x-ray / empty tests applied there — an empty
+                // buffer IS the "do not draw the plan" answer, rather than a second copy of the
+                // condition that could drift out of step with the one the cache used.
+                lines.extend_from_slice(&self.cached_plan_lines);
 
                 // ---- §0.6 PREVIEW — shade / ghost / marching-ants / blip -----
                 // The complete move, per BASIC_MODIFIERS_RULES §0.6 and §1:
@@ -33963,6 +33997,69 @@ impl CadApp {
         self.intersections.clear();
         self.index_dirty = true;
         self.touch_view();
+    }
+
+    /// Signature of everything the CACHED 3D line builders read.
+    ///
+    /// Modelled on `FactoryState::opaque_sig`, including the habit of saying what is deliberately
+    /// absent. Two builders are cached — `sketch_lines` (every finished plane's drawing) and
+    /// `plan_lines` (the 2D plan on the ground) — because they are the expensive ones and neither
+    /// depends on the camera.
+    ///
+    /// NOT CACHED, and each for its own reason:
+    ///   `overlay_lines`      READS THE CAMERA. `grid_lines` sizes the ground grid by camera
+    ///                        distance and 1/sin(pitch), so it genuinely changes on every orbit.
+    ///                        Measured at 0.02 ms and 172 verts, so there is nothing to win.
+    ///   `picked_face_lines`  a handful of segments, and it tracks a live pick.
+    ///   `live_sketch_lines`  the plane being drawn on RIGHT NOW; it changes as the mouse moves,
+    ///                        which is the one thing a cache must never be between.
+    fn lines_sig(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // The drawing, via the counter every mutation site advances (see `touch_view`).
+        self.view_seq.hash(&mut h);
+        // The 3D model, via the counter `recompute` advances. `sketch_lines` resolves colours
+        // through the layer table, and the plan's z comes off the active storey, so both of the
+        // model's own version signals belong here.
+        self.factory.geom_version.hash(&mut h);
+        // Which plane is open, because entering one moves its document out of `sketch_lines`
+        // and into `live_sketch_lines` — the same drawing, drawn by a different builder.
+        self.factory.session.as_ref().map(|s| s.idx).hash(&mut h);
+        self.factory.model.sketches.len().hash(&mut h);
+        // Toggles and placement that change WHAT IS EMITTED without changing any geometry.
+        self.factory.show_plan.hash(&mut h);
+        self.factory.plan_xray.hash(&mut h);
+        self.factory.active_base_z().to_bits().hash(&mut h);
+        // The document the plan is read FROM, and the scale it is read at. A unit change moves
+        // every line without touching a single coordinate.
+        self.doc.units.metres_per_unit.to_bits().hash(&mut h);
+        self.doc.dobjects.len().hash(&mut h);
+        h.finish()
+    }
+
+    /// Rebuild the cached line buffers if anything they read has changed. Returns whether it
+    /// actually rebuilt — which is what the tests assert on.
+    ///
+    /// The plan's warning about this work was that caching some of the builders "makes the version
+    /// check inert". It does not here, and the reason is the measurement rather than the design:
+    /// the two cached builders are 15.7 ms of a 15.7 ms total, and the three left live cost
+    /// 0.02 ms between them. The check covers what costs.
+    fn refresh_cached_lines(&mut self) -> bool {
+        let sig = self.lines_sig();
+        if sig == self.cached_lines_sig {
+            return false;
+        }
+        self.cached_sketch_lines = self.factory.sketch_lines(&self.doc);
+        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+        self.cached_plan_lines =
+            if self.factory.show_plan && !self.factory.plan_xray && !plan.dobjects.is_empty() {
+                let z = self.factory.active_base_z();
+                self.factory.plan_lines(plan, z)
+            } else {
+                Vec::new()
+            };
+        self.cached_lines_sig = sig;
+        true
     }
 
     /// THE DRAWING CHANGED. Marks the GPU vertex cache stale AND advances [`Self::view_seq`],
@@ -56423,11 +56520,18 @@ mod a_sketch_is_not_the_plan {
 
     /// Both plan underlays — the depth-tested one and the x-ray one — must read `plan_doc`.
     /// Asserted on the source because the drawing needs a live GL context a unit test has not got.
+    ///
+    /// THE DEPTH-TESTED ANCHOR MOVED, and the move is worth recording. The plan used to be
+    /// resolved inline in the frame; it is now resolved in `refresh_cached_lines`, because that
+    /// builder is cached. This test caught that as a failure — correctly, by its own terms — and
+    /// the fix is to follow the code rather than to relax the rule. The hazard it names has not
+    /// changed: read the sketch instead of the plan, or take the scale from the sketch's units,
+    /// and a millimetre plan draws at 1000x with everything else still green.
     #[test]
     fn both_plan_underlays_read_the_plan() {
         let src = include_str!("app.rs");
         for (what, anchor, end) in [
-            ("depth-tested", "THE PLAN, NOT WHATEVER IS ON THE CANVAS. Reported as", "// ---- §0.6 PREVIEW"),
+            ("depth-tested", "fn refresh_cached_lines", "\n    /// THE DRAWING CHANGED"),
             ("x-ray", "fn paint_plan_underlay", "\n    fn "),
         ] {
             let a = src.find(anchor).unwrap_or_else(|| panic!("{what}: anchor gone"));
@@ -57406,10 +57510,232 @@ fn frame_cost_of_real_drawing() {
         displayed / buildable.max(1),
     );
 
+    // THE CACHED FRAME — what the app actually runs now. The first call builds; the rest are the
+    // steady state, which is what panning and orbiting a still drawing cost.
+    let cached = {
+        const N: u32 = 20;
+        app.refresh_cached_lines();
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..N {
+            app.refresh_cached_lines(); // settled → a signature compare, not a rebuild
+            let mut lines = app.factory.overlay_lines();
+            lines.extend_from_slice(&app.cached_sketch_lines);
+            lines.extend(app.factory.picked_face_lines());
+            lines.extend(app.factory.live_sketch_lines(&app.doc));
+            lines.extend_from_slice(&app.cached_plan_lines);
+            n = lines.len();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / N as f64;
+        println!("  → cached frame (settled)   {ms:>9.2} ms   {n:>9} verts");
+        ms
+    };
+
     println!("\n  builders summed        {total:>9.2} ms");
     println!("  whole frame            {concat:>9.2} ms");
+    println!("  cached frame           {cached:>9.2} ms  ({:.0}x)", concat / cached.max(1e-9));
     println!(
-        "  at 60 Hz that is       {:>9.1}% of one frame's 16.7 ms budget, before anything is drawn\n",
+        "  of a 16.7 ms budget:   {:>8.1}% uncached  ->  {:.1}% cached",
         100.0 * concat / 16.7,
+        100.0 * cached / 16.7,
     );
+    // WHAT IS LEFT IS THE CONCATENATION, which is the thing the plan warned about by name. The
+    // cached buffers are copied into one Vec every frame because the renderer takes a single line
+    // list; removing that means giving the static lines their own persistent GPU buffer and a
+    // second draw call, rather than rebuilding the combined one. Named here so the next person
+    // measuring this knows the remaining cost is understood rather than mysterious.
+    println!(
+        "  remaining {cached:.2} ms is the per-frame memcpy of {} KB of cached lines\n",
+        (app.cached_plan_lines.len() + app.cached_sketch_lines.len()) * 40 / 1024,
+    );
+}
+
+/// THE 3D LINE CACHE MUST NEVER SHOW YOU GEOMETRY THAT IS NO LONGER THERE.
+///
+/// A stale render cache is the worst shape of bug in this file: the picture is wrong, nothing
+/// errors, and the user's own drawing is the thing lying to them. So every input to `lines_sig`
+/// gets a test that changes it and asserts the cache notices — and the general test at the end
+/// asserts the cached buffers equal what the uncached builders would have produced, which is the
+/// property all of it exists to preserve.
+#[cfg(test)]
+mod the_line_cache_cannot_go_stale {
+    use super::*;
+
+    fn app_with_a_plan() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..8 {
+            let x = i as f64 * 3.0;
+            app.doc.push(DObject::new(Geom::Line(Line {
+                a: Vec2::new(x, 0.0), b: Vec2::new(x + 2.0, 4.0),
+            })));
+        }
+        app.factory.show_plan = true;
+        app.factory.plan_xray = false;
+        app
+    }
+
+    /// Build the cache, run `change`, and report whether the cache rebuilt.
+    fn rebuilds_after(app: &mut CadApp, change: impl FnOnce(&mut CadApp)) -> bool {
+        app.refresh_cached_lines();
+        assert!(!app.refresh_cached_lines(), "the cache is not settled — it rebuilds every call");
+        change(app);
+        app.refresh_cached_lines()
+    }
+
+    /// THE POINT OF THE WHOLE THING: a settled cache does not rebuild. Without this the rest of
+    /// the tests could all pass on a cache that never caches anything.
+    #[test]
+    fn a_settled_cache_does_not_rebuild() {
+        let mut app = app_with_a_plan();
+        assert!(app.refresh_cached_lines(), "the first call must build");
+        assert!(!app.refresh_cached_lines(), "nothing changed, so nothing should rebuild");
+        assert!(!app.refresh_cached_lines(), "…still nothing");
+        assert!(!app.cached_plan_lines.is_empty(), "the fixture must produce plan lines");
+    }
+
+    /// THE CACHED BUFFERS ARE WHAT THE BUILDERS WOULD HAVE RETURNED. Equality on the actual
+    /// vertices, because "it rebuilt at the right times" is worthless if what it rebuilt is wrong.
+    #[test]
+    fn the_cache_holds_exactly_what_the_builders_produce() {
+        let mut app = app_with_a_plan();
+        app.refresh_cached_lines();
+
+        let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc);
+        let z = app.factory.active_base_z();
+        let fresh_plan = app.factory.plan_lines(plan, z);
+        let fresh_sketch = app.factory.sketch_lines(&app.doc);
+
+        assert_eq!(app.cached_plan_lines.len(), fresh_plan.len(), "plan line count differs");
+        assert_eq!(app.cached_sketch_lines.len(), fresh_sketch.len(), "sketch line count differs");
+        for (i, (c, f)) in app.cached_plan_lines.iter().zip(fresh_plan.iter()).enumerate() {
+            assert!(
+                (c.x - f.x).abs() < 1e-6 && (c.y - f.y).abs() < 1e-6 && (c.z - f.z).abs() < 1e-6,
+                "cached plan vertex {i} is not where the builder puts it",
+            );
+        }
+    }
+
+    // ---- one per input to `lines_sig` -------------------------------------------------------
+
+    /// Drawing something. This is the one that goes through `touch_view`, i.e. the sixty-odd
+    /// ordinary edit sites.
+    #[test]
+    fn drawing_an_object_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.add_dobject(Geom::Line(Line { a: Vec2::new(0.0, 9.0), b: Vec2::new(5.0, 9.0) }), "test");
+        }), "a new object did not invalidate the cached plan");
+    }
+
+    /// Moving one. The count is unchanged, so a cache keyed on `dobjects.len()` alone would
+    /// happily serve the old position — which is the classic way this bug appears.
+    #[test]
+    fn moving_an_object_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.snapshot_doc();
+            a.doc.dobjects[0] = a.doc.dobjects[0].translated(Vec2::new(50.0, 50.0));
+            a.touch_view();
+        }), "a moved object did not invalidate the cache — the plan would draw where it WAS");
+    }
+
+    /// Hiding the plan.
+    #[test]
+    fn toggling_the_plan_off_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| a.factory.show_plan = false),
+                "hiding the plan did not invalidate the cache");
+        assert!(app.cached_plan_lines.is_empty(), "a hidden plan must cache as nothing");
+    }
+
+    /// Switching to x-ray, which moves the plan to a different renderer entirely.
+    #[test]
+    fn switching_to_xray_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| a.factory.plan_xray = true),
+                "x-ray did not invalidate the depth-tested copy");
+        assert!(app.cached_plan_lines.is_empty(), "in x-ray the depth-tested plan must be empty");
+    }
+
+    /// Changing storey, which is the height the plan is drawn AT.
+    #[test]
+    fn changing_the_active_storey_invalidates_it() {
+        let mut app = app_with_a_plan();
+        let before = app.factory.active_base_z();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.factory.storeys.push(crate::factory::Storey { name: "First".into(), height: 3.0 });
+            a.factory.active_storey = a.factory.storeys.len() - 1;
+        }), "the plan did not move to the new storey's height");
+        assert!(
+            app.factory.active_base_z() > before + 1e-4,
+            "the fixture must actually raise the plan, or this proves nothing",
+        );
+    }
+
+    /// Redeclaring the drawing's unit. Not one coordinate changes; every line moves.
+    #[test]
+    fn redeclaring_the_unit_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.doc.units = cad_kernel::DocUnits::new(
+                cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        }), "a unit change did not invalidate the cache — every line is at the wrong scale");
+    }
+
+    /// Opening a plane. Its drawing moves from `sketch_lines` to `live_sketch_lines`, so a stale
+    /// cache draws it twice: once dimmed where it was, once live.
+    #[test]
+    fn entering_a_sketch_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        }), "entering a plane did not invalidate the finished-plane lines");
+    }
+
+    /// …and closing it moves the drawing back the other way.
+    #[test]
+    fn leaving_a_sketch_invalidates_it() {
+        let mut app = app_with_a_plan();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(rebuilds_after(&mut app, |a| a.factory_exit_sketch()),
+                "leaving a plane did not invalidate the cache");
+    }
+
+    /// A 3D model edit, which reaches the cache through the factory's own version counter —
+    /// `sketch_lines` resolves colour through the layer table and the plan sits on the storey.
+    #[test]
+    fn a_model_rebuild_invalidates_it() {
+        let mut app = app_with_a_plan();
+        assert!(rebuilds_after(&mut app, |a| {
+            a.factory.add_box();
+            a.factory.recompute();
+        }), "a 3D model change did not invalidate the cache");
+    }
+
+    /// A PLANE'S DRAWING CAN CHANGE WHILE IT IS NOT THE OPEN ONE, and that is the case nothing
+    /// else notices. `factory_clear_sketch_on` wipes a finished plane after a sweep consumes it:
+    /// no session index changes, no 2D edit happens, and `view_seq` would not move — so the 3D
+    /// view would go on drawing a sketch that has been deleted.
+    #[test]
+    fn clearing_a_finished_plane_invalidates_it() {
+        let mut app = app_with_a_plan();
+        // A plane with something on it, closed again so it is drawn by `sketch_lines`.
+        let frame = crate::factory::FactoryState::ground_frame();
+        app.factory_enter_sketch(frame);
+        app.add_dobject(Geom::Circle(Circle { center: Vec2::new(1.0, 1.0), radius: 2.0 }), "test");
+        app.factory_exit_sketch();
+        app.refresh_cached_lines();
+        assert!(
+            !app.cached_sketch_lines.is_empty(),
+            "the fixture must leave a drawing on a finished plane, or this proves nothing",
+        );
+
+        assert!(rebuilds_after(&mut app, |a| a.factory_clear_sketch_on(frame)),
+                "clearing a finished plane did not invalidate the cached sketch lines");
+        assert!(
+            app.cached_sketch_lines.is_empty(),
+            "the cleared plane is still being drawn — the cache is showing deleted geometry",
+        );
+    }
 }
