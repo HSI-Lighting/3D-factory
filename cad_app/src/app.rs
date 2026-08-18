@@ -1886,6 +1886,18 @@ pub struct CadApp {
     /// instead of O(drawn × selection).
     sel_mask: Vec<bool>,
     gpu_dirty:    bool,
+    /// MONOTONIC COUNTER OF "the drawing changed", bumped by every site that sets `gpu_dirty`.
+    ///
+    /// `gpu_dirty` cannot be a cache key, and the reason is worth stating: it is CONSUMED —
+    /// `std::mem::take` in the 2D path, plain assignment in two others — so whichever consumer
+    /// runs first eats the signal and the rest never see it. Two edits in one frame are also
+    /// indistinguishable from one. A counter has neither problem: readers compare against their
+    /// own last-seen value and no reader can destroy another's.
+    ///
+    /// Bumped in `touch_view`, which is what all 60-odd mutation sites call. The invariant is
+    /// therefore structural rather than remembered: you cannot mark the view dirty without
+    /// advancing the counter, because there is one function that does both.
+    view_seq: u64,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
     /// caching it means it runs once per doc change instead of every frame,
@@ -3750,6 +3762,7 @@ impl Default for CadApp {
             active_view:         ActiveView::TwoD,
             sel_mask:            Vec::new(),
             gpu_dirty:    true,
+            view_seq: 1,
             layer_panel_open:   true,
             layer_rename:       None,
             layer_rename_buf:   String::new(),
@@ -8051,7 +8064,7 @@ impl CadApp {
         self.blockdiff_overlay = None;
         self.param_name_dialog = None;
         self.block_task_rec = None;
-        self.gpu_dirty = true; // the GPU renderer caches vertex data per dobject
+        self.touch_view(); // the GPU renderer caches vertex data per dobject
     }
 
     /// Enter a sketch on `frame`: create the sketch and **swap the app's active document
@@ -13832,7 +13845,7 @@ impl CadApp {
                 Some(i) => {
                     self.history.push(format!(
                         "  selection: removed #{} ({} left)", i, self.selection.len()));
-                    self.gpu_dirty = true;
+                    self.touch_view();
                     CmdUndo::Handled
                 }
                 None => CmdUndo::NothingLeft,
@@ -13888,7 +13901,7 @@ impl CadApp {
                         }
                         self.intersections.clear();
                         self.index_dirty = true;
-                        self.gpu_dirty = true;
+                        self.touch_view();
                         self.history.push("  line: removed last segment".into());
                     }
                     CmdUndo::Handled
@@ -15179,7 +15192,7 @@ impl CadApp {
                         self.offset_applied_count -= 1;
                         self.intersections.clear();
                         self.index_dirty = true;
-                        self.gpu_dirty = true;
+                        self.touch_view();
                         self.history.push("  offset: ↺ last offset undone".into());
                         // Return to "Select object" with whatever mode
                         // was current — don't change the distance.
@@ -15677,7 +15690,7 @@ impl CadApp {
                     self.selected = None;
                     self.intersections.clear();
                     self.index_dirty = true;
-                    self.gpu_dirty = true;
+                    self.touch_view();
                     self.history.push(format!("  - erased {} dobject(s)", n));
                 }
             }
@@ -15753,7 +15766,7 @@ impl CadApp {
                                     self.history.push(format!(
                                         "  layer '{}' linetype → '{}' (id {})",
                                         l.name, name, id));
-                                    self.gpu_dirty = true;
+                                    self.touch_view();
                                 }
                             }
                             None => {
@@ -16368,7 +16381,7 @@ impl CadApp {
         self.index_dirty   = true;
         self.index_label.clear();
         self.last_intersect_label.clear();
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     // ---- selection helpers (list / select commands) -------------------
@@ -17423,7 +17436,7 @@ impl CadApp {
             }
         }
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!(
             "  ⊛ chprop {}={}: {} dobject(s) updated",
             prop, val, changed));
@@ -17534,7 +17547,7 @@ impl CadApp {
                     }
                 }
             }
-            self.gpu_dirty = true;
+            self.touch_view();
             self.index_dirty = true;
             self.history.push(format!(
                 "  ⊛ hatch #{} updated → {}", idx, pattern_label));
@@ -17546,7 +17559,7 @@ impl CadApp {
                 boundary_handles: handles,
                 pattern,
             }.into());
-            self.gpu_dirty = true;
+            self.touch_view();
             self.index_dirty = true;
             self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
             self.history.push(format!(
@@ -17797,7 +17810,7 @@ impl CadApp {
                 });
                 d.style = cad_kernel::Style::on_layer(worker.active_layer);
                 self.doc.push(d);
-                self.gpu_dirty = true;
+                self.touch_view();
                 self.index_dirty = true;
                 self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
                 self.history.push(format!(
@@ -18132,7 +18145,7 @@ impl CadApp {
         self.selection.clear();
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty   = true;
+        self.touch_view();
     }
 
     /// Add every dobject index to the selection. Used by the `all` sub-command.
@@ -19073,7 +19086,7 @@ impl CadApp {
             self.selection.clear();
             self.selected = None;
             self.index_dirty = true;
-            self.gpu_dirty   = true;
+            self.touch_view();
             self.hatch_last_idx = None;
             self.history.push(
                 "  ✗ hatch discarded — reverted to pre-hatch state".into());
@@ -19543,7 +19556,7 @@ impl CadApp {
                 Some(lt) => { self.wall_centerline_ltype.insert(saved_id, lt); }
                 None     => { self.wall_centerline_ltype.remove(&saved_id); }
             }
-            self.gpu_dirty = true;
+            self.touch_view();
             return;
         }
         self.wall_style_dialog = Some(dialog);
@@ -21125,7 +21138,7 @@ impl CadApp {
                         l.linetype = lt_id;
                         self.history.push(format!(
                             "  layer '{}' linetype → '{}'", l.name, lt_name));
-                        self.gpu_dirty = true;
+                        self.touch_view();
                     }
                 }
                 if let Some((id, new_name)) = rename_commit {
@@ -21313,13 +21326,13 @@ impl CadApp {
                     if let Some(l) = self.doc.layers.get_mut(id) {
                         l.color = Color::Aci(aci);
                     }
-                    self.gpu_dirty = true;
+                    self.touch_view();
                 }
                 AciPickRequest::Dobject(ix) => {
                     if let Some(d) = self.doc.dobjects.get_mut(ix) {
                         d.style.color = Color::Aci(aci);
                     }
-                    self.gpu_dirty = true;
+                    self.touch_view();
                 }
                 AciPickRequest::DobjectMany => {
                     let targets = std::mem::take(&mut self.aci_pick_many);
@@ -21474,7 +21487,7 @@ impl CadApp {
                         self.history.push(format!(
                             "  pen '{}' applied to {} dobject(s)", pen_name, count
                         ));
-                        self.gpu_dirty = true;
+                        self.touch_view();
                     }
                 }
             });
@@ -22595,7 +22608,7 @@ impl CadApp {
         }
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Small integer tag for a Geom variant, used to decide whether the
@@ -27815,7 +27828,7 @@ impl CadApp {
                 self.selected = None;
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
                 self.stage_evt("install doc", n, t.elapsed(), &format!("{l} layer(s)"));
                 // ---- Stage 4: frame the drawing (bbox sweep). ----------------------
                 let t = std::time::Instant::now();
@@ -27884,7 +27897,7 @@ impl CadApp {
         }
         self.light.import_layer(&self.doc, lid); // use it for 3D straight away
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!("  moved {n} object(s) to layer 'SIMLUX' (now used for 3D)"));
     }
 
@@ -28197,7 +28210,7 @@ impl CadApp {
         self.selected = None;
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
         // Frame the drawing, record where the file came from.
         self.fit_view_to_drawing();
         self.current_file = Some(std::path::PathBuf::from(path));
@@ -28464,7 +28477,7 @@ impl CadApp {
         self.paste_state = PasteState::Off;
         self.clear_prompt();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!("  ⎗ pasted {} dobject(s) (selected)", n));
     }
 
@@ -29144,7 +29157,7 @@ impl CadApp {
                 self.selected = None;
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             UndoStep::Factory(snap) => {
                 self.factory.model = snap.model;
@@ -29258,7 +29271,7 @@ impl CadApp {
             (Geom::Text(s), Geom::Text(d))           => d.style = s.style,
             _ => {}
         }
-        self.gpu_dirty = true;
+        self.touch_view();
         true
     }
 
@@ -30509,7 +30522,7 @@ impl CadApp {
         self.add_dobject(Geom::BlockRef(br), "insert");
         self.apply_block_cut(br);
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!(
             "  + inserted block #{} at ({:.2}, {:.2})  s={:.3}  rot={:.1}°",
             block, insert.x, insert.y, s, rotation.to_degrees()));
@@ -30569,7 +30582,7 @@ impl CadApp {
             name, if smart { " [smart]" } else { "" }, id, n));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Start the pick-two-blocks-on-screen compare flow (bare `blockdiff`
@@ -30723,7 +30736,7 @@ impl CadApp {
                 }
             }
         }
-        self.gpu_dirty = true;
+        self.touch_view();
         self.index_dirty = true;
         self.history.push(format!(
             "  ✔ block '{}' is now parametric — {} param(s). Insert it, then set values in the Inspector.",
@@ -30776,7 +30789,7 @@ impl CadApp {
             world_offset: br.insert, temp_handles, removed_instances,
             recorded: Vec::new() });
         self.index_dirty = true;
-        self.gpu_dirty   = true;
+        self.touch_view();
         self.history.push(format!(
             "  ◉ Block Task Recorder: '{}' exploded to a sandbox — crossing-window to STRETCH each parameter, then `finish`",
             source_name));
@@ -30825,7 +30838,7 @@ impl CadApp {
         self.window_first    = None;
         self.stretch_window_box = None;
         self.index_dirty = true;
-        self.gpu_dirty   = true;
+        self.touch_view();
         self.clear_prompt();
         if rec.recorded.is_empty() {
             self.history.push("  Block Task Recorder: no stretches recorded — nothing to save".into());
@@ -31793,7 +31806,7 @@ impl CadApp {
         self.doc.dobjects = out;
         if changed {
             self.index_dirty = true;
-            self.gpu_dirty   = true;
+            self.touch_view();
             self.history.push("  ✔ opening cut into host geometry".into());
         }
     }
@@ -31907,7 +31920,7 @@ impl CadApp {
             else { String::new() }));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_reverse(&mut self) {
@@ -31936,7 +31949,7 @@ impl CadApp {
         ));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     // ---- Slice L apply methods ----
@@ -32026,7 +32039,7 @@ impl CadApp {
                 }
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -32055,7 +32068,7 @@ impl CadApp {
         for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_lengthen(&mut self, delta: f64, near: Vec2) {
@@ -32081,7 +32094,7 @@ impl CadApp {
         for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_break(&mut self, at: Vec2) {
@@ -32118,7 +32131,7 @@ impl CadApp {
         for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_align(&mut self, s1: Vec2, s2: Vec2, t1: Vec2, t2: Vec2) {
@@ -32159,7 +32172,7 @@ impl CadApp {
             n, v.x, v.y, dtheta.to_degrees(), scale, t1.x, t1.y));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_stretch(&mut self, win_min: Vec2, win_max: Vec2, base: Vec2, dest: Vec2) {
@@ -32242,7 +32255,7 @@ impl CadApp {
             self.selection.clear();
             self.intersections.clear();
             self.index_dirty = true;
-            self.gpu_dirty = true;
+            self.touch_view();
             return;
         }
         self.history.push(format!(
@@ -32252,7 +32265,7 @@ impl CadApp {
         self.selection.clear();
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Recorder "📐 Capture smart dobject" — snapshot the FULL geometry of
@@ -32648,7 +32661,7 @@ impl CadApp {
                     target_idx, n_pieces, if edge_mode {"ON"} else {"OFF"}));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
                 crate::dbg_event!(self,
                     crate::dbg_recorder::DbgEvent::ApplyOp {
                         name: "apply_trim_pick".into(),
@@ -32734,7 +32747,7 @@ impl CadApp {
                     target_idx, if edge_mode {"ON"} else {"OFF"}));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
                 true
             }
             Err(msg) => {
@@ -33235,7 +33248,7 @@ impl CadApp {
                     r, idx1, idx2, if trim { "trim" } else { "no-trim" }));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33271,7 +33284,7 @@ impl CadApp {
                     "  ⌐ fillet ✓ r={} corner of polyline #{} (segments {}+{})", r, idx, sa, sb));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33296,7 +33309,7 @@ impl CadApp {
                     "  ⌐ fillet ✓ r={} on polyline #{} — {} corner(s) rounded", r, idx, count));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33389,7 +33402,7 @@ impl CadApp {
                     if trim {"trim"} else {"no-trim"}));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33444,7 +33457,7 @@ impl CadApp {
                     d1_dist, d2_dist, idx1, idx2, if trim { "trim" } else { "no-trim" }));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33482,7 +33495,7 @@ impl CadApp {
                     d1_dist, d2_dist, idx, sa, sb));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33508,7 +33521,7 @@ impl CadApp {
                     d1_dist, d2_dist, idx, count));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33556,7 +33569,7 @@ impl CadApp {
                     if trim {"trim"} else {"no-trim"}));
                 self.intersections.clear();
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
             }
             Err(msg) => {
                 self.rollback_doc();
@@ -33619,7 +33632,7 @@ impl CadApp {
             to_remove.len(), self.doc.dobjects.len()));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     fn apply_chlayer(&mut self) {
@@ -33640,7 +33653,7 @@ impl CadApp {
         self.history.push(format!(
             "  → chlayer: {} dobject(s) moved to active layer '{}'", n, name
         ));
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Append translated copies of the current selection (`copy` op).
@@ -33663,7 +33676,7 @@ impl CadApp {
         self.history.push(format!("  + copy: {} dobject(s) duplicated", n));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Rotate the current selection in place by `angle` around `pivot`.
@@ -33682,7 +33695,7 @@ impl CadApp {
         ));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Dispatch the rotate session's commit step: if `rotate_copy` is on,
@@ -33710,7 +33723,7 @@ impl CadApp {
             n, angle.to_degrees(), pivot.x, pivot.y));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Scale the current selection in place by `factor` around `pivot`.
@@ -33729,7 +33742,7 @@ impl CadApp {
         ));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Dispatch the scale session's commit step: if `scale_copy` is on,
@@ -33756,7 +33769,7 @@ impl CadApp {
             n, factor, pivot.x, pivot.y));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Mirror the current selection in place across the axis A→B.
@@ -33793,7 +33806,7 @@ impl CadApp {
         ));
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Commit a Text dobject at `pos` with the given string + height.
@@ -33949,7 +33962,19 @@ impl CadApp {
         // invalidates them. Index is now stale until next ensure_index().
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty   = true;
+        self.touch_view();
+    }
+
+    /// THE DRAWING CHANGED. Marks the GPU vertex cache stale AND advances [`Self::view_seq`],
+    /// which is what every cross-frame cache keys off.
+    ///
+    /// ONE function rather than two assignments, so the two cannot drift apart. This replaced
+    /// sixty-odd bare `gpu_dirty = true` sites, and the point of doing so is that a future edit
+    /// site cannot invalidate one and forget the other — there is nothing left to forget.
+    #[inline]
+    fn touch_view(&mut self) {
+        self.gpu_dirty = true;
+        self.view_seq = self.view_seq.wrapping_add(1);
     }
 
     /// Rebuild the spatial index if it's missing or stale. Returns the build
@@ -34875,7 +34900,7 @@ impl CadApp {
         let new_total = self.doc.dobjects.len();
         self.intersections.clear();
         self.index_dirty = true;
-        self.gpu_dirty   = true;
+        self.touch_view();
         self.history.push(format!(
             "  + array: {} cells × {} source(s) = {} new → {} total dobjects",
             cells, sources.len(), new_dobjects, new_total,
@@ -38564,7 +38589,7 @@ impl eframe::App for CadApp {
                 self.doc.dobjects.retain(|d| !rec.temp_handles.contains(&d.handle));
                 for d in &rec.removed_instances { self.doc.push(d.clone()); }
                 self.index_dirty = true;
-                self.gpu_dirty = true;
+                self.touch_view();
                 self.history.push("  Block Task Recorder cancelled (sandbox discarded)".into());
             }
             if self.blockdiff_pick != BlockDiffPick::Off {
@@ -40030,7 +40055,7 @@ impl eframe::App for CadApp {
                 self.history.push(format!(
                     "  render mode → {:?}", self.render_mode
                 ));
-                self.gpu_dirty = true;
+                self.touch_view();
             }
         }
 
@@ -41439,7 +41464,7 @@ impl eframe::App for CadApp {
                                 }
                                 self.intersections.clear();
                                 self.index_dirty = true;
-                                self.gpu_dirty = true;
+                                self.touch_view();
                                 self.history.push(format!(
                                     "  ⊕ grip: #{} {:?} → ({:.3}, {:.3})",
                                     gd.dobject_idx, gd.role,
@@ -47476,7 +47501,7 @@ impl CadApp {
     fn set_render_mode(&mut self, m: RenderMode) {
         if self.render_mode == m { return; }
         self.render_mode = m;
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!("  render mode → {:?}", m));
     }
 
@@ -48127,7 +48152,7 @@ impl CadApp {
             let s = ((rect.width() / world_w as f32).min(rect.height() / world_h as f32)) * 0.9;
             if s.is_finite() && s > 0.0 { self.scale = s; }
         }
-        self.gpu_dirty = true;
+        self.touch_view();
         self.history.push(format!(
             "  ✔ embedded raster underlay '{}'  {}×{}  (saved in RSM; drafted over, not vectorized)",
             name, w, h));
@@ -48684,7 +48709,7 @@ impl CadApp {
         self.parametric.last_trace = out.trace;
         self.parametric.last_solved_sig = crate::param_editor::geom_signature(&self.doc);
         self.index_dirty = true;
-        self.gpu_dirty = true;
+        self.touch_view();
     }
 
     /// Parametric MODE panel — add geometric/dimensional/variable constraints to
@@ -49112,7 +49137,7 @@ impl CadApp {
             // into the session recorder so a Start/Stop dump captures everything.
             crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: full_trace });
             self.index_dirty = true;
-            self.gpu_dirty = true;
+            self.touch_view();
             // record the post-solve geometry so keep-link doesn't re-fire on it
             self.parametric.last_solved_sig = crate::param_editor::geom_signature(&self.doc);
         }
