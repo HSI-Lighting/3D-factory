@@ -14163,6 +14163,7 @@ mod plan_footprint_tests {
             primitive: p,
             enabled: true,
             target: None,
+            through: None,
         }
     }
 
@@ -15453,6 +15454,7 @@ mod wall_opening_tests {
             primitive: cad_solid::Primitive::Box { w: 0.9, d: 1.0, h: 1.2 },
             enabled: true,
             target: None,
+            through: None,
         };
         st.model.insert_at(host_at + 1, cutter);
 
@@ -15490,6 +15492,7 @@ mod wall_opening_tests {
             primitive: cad_solid::Primitive::Box { w: size[0], d: size[1], h: size[2] },
             enabled: true,
             target: None,
+            through: None,
         };
         assert!(st.model.insert_after(host, cutter), "the host body must exist");
         id

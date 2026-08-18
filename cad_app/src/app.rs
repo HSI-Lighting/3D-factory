@@ -5978,8 +5978,13 @@ impl CadApp {
                 .small()
                 .color(egui::Color32::from_rgb(230, 150, 150)),
             );
+            // AND THE ROUTE BACK IS NAMED. "Kept and flagged" is only half an answer if nobody
+            // can find how to clear the flag — it quietly becomes "kept but permanently dead".
+            // ✏ Edit in 2D lifts the flagged cutter out and ✔ Apply re-cuts a live one wherever
+            // the outline now sits, which is exactly what this needs; it was already the route
+            // and this line is the only place that can say so.
             ui.label(
-                egui::RichText::new("  Marked in red in 3D. Delete, or re-cut on the new wall.")
+                egui::RichText::new("  Marked in red in 3D. ✏ Edit in 2D → ✔ Apply re-cuts it.")
                     .small()
                     .weak(),
             );
@@ -6092,8 +6097,16 @@ impl CadApp {
         //
         // `total == 0` means no wall was found under the opening at all — nothing to conclude from,
         // so keep the old assumption rather than inventing a recess out of a failed measurement.
-        let (cov_ok, cov_total, _) = self.cut_coverage(&f);
-        let through = cov_total == 0 || cov_ok == cov_total;
+        //
+        // ASK THE CUT FIRST. It records what it was for now (see `Feature::through`), and the
+        // measurement below is the FALLBACK for openings cut before it did. The inference is not
+        // merely less direct, it is wrong in one direction it cannot detect: a through-cut that
+        // failed to reach through measures as a recess, so reshaping it re-cut it as the pocket it
+        // had accidentally become and the window never came back.
+        let through = f.through.unwrap_or_else(|| {
+            let (cov_ok, cov_total, _) = self.cut_coverage(&f);
+            cov_total == 0 || cov_ok == cov_total
+        });
         // The pocket depth to re-cut with, recovered from the cutter itself so a reshape that only
         // moves a corner reproduces the depth exactly. `factory_cut_sketch` builds a recess as
         // `h = depth + CUT_EPS`, so undoing that term here keeps the round-trip stable instead of
@@ -9373,7 +9386,12 @@ impl CadApp {
                         cad_solid::BoolOp::Difference, plane, placement,
                         cad_solid::Primitive::Extrusion { profile, h, w, d },
                     );
-                    if let Some(diff) = self.factory.model.features.pop() {
+                    if let Some(mut diff) = self.factory.model.features.pop() {
+                        // WHAT THIS CUT WAS FOR, recorded where it happens. Every reader
+                        // afterwards had to infer it from the geometry, and the only inference
+                        // available — "does the cutter span the wall?" — a recess fails by
+                        // construction. See `Feature::through`.
+                        diff.through = Some(through);
                         // A MISSING TARGET IS NOT A NO-OP. `insert_after` appends when it cannot
                         // find the host, so the cutter is still in the model — bound to whatever
                         // Union happens to be last, which is some other body. That is the same
@@ -9416,8 +9434,12 @@ impl CadApp {
             .rev()
             .find(|f| f.op == cad_solid::BoolOp::Difference)
             .map_or((0, 0, 0.0), |c| self.cut_coverage(c));
+        // A RECESS THAT STOPS INSIDE THE WALL IS DOING ITS JOB, so it is not warned about. The
+        // coverage numbers are still printed — a pocket that found no wall at all is worth seeing.
         let verdict = if cov_total == 0 {
             "  ⚠ NO WALL under this opening".to_string()
+        } else if !through {
+            String::new()
         } else if cov_ok < cov_total {
             format!("  ⚠ DOES NOT GO THROUGH at {}/{cov_total} points, short by {cov_short:.3} m",
                 cov_total - cov_ok)
@@ -10219,8 +10241,19 @@ impl CadApp {
             .filter(|f| f.op == cad_solid::BoolOp::Difference).collect();
         if !cuts.is_empty() {
             let mut bad: Vec<String> = Vec::new();
-            let (mut full, mut nowall) = (0usize, 0usize);
+            let (mut full, mut nowall, mut pockets) = (0usize, 0usize, 0usize);
             for c in &cuts {
+                // A RECESS IS NOT A FAILED THROUGH-CUT. `cut_coverage` asks "does the cutter span
+                // the wall?", which is the only question geometry alone can answer — and a pocket
+                // fails it by construction, because stopping inside the wall is the whole point of
+                // a pocket. Measured on the real project: 18 flagged, 6 of them recesses working
+                // exactly as drawn. `Feature::through` records the intent at cut time so they can
+                // be told apart; `None` is an opening cut before it existed, and those still go
+                // through the inference below.
+                if c.through == Some(false) {
+                    pockets += 1;
+                    continue;
+                }
                 let (ok, total, short) = self.cut_coverage(c);
                 if total == 0 { nowall += 1; }
                 else if ok == total { full += 1; }
@@ -10231,8 +10264,9 @@ impl CadApp {
                 }
             }
             out.push(format!(
-                "  openings: {full} go fully through, {} do not, {nowall} sit over no wall \
-                 (of {} cuts)", bad.len(), cuts.len()));
+                "  openings: {full} go fully through, {} do not, {nowall} sit over no wall, \
+                 {pockets} are recesses and are meant to stop (of {} cuts)",
+                bad.len(), cuts.len()));
             for b in bad.iter().take(12) { out.push(b.clone()); }
             if bad.len() > 12 {
                 out.push(format!("      … and {} more", bad.len() - 12));
@@ -54954,6 +54988,7 @@ mod plan_overlay {
             primitive: cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
             target: None,
+            through: None,
         });
         assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
         let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
@@ -57214,6 +57249,127 @@ mod the_quit_dialog_cannot_trap_the_app {
 /// which is precisely the data loss the stash exists to prevent. Every test runs in a debug build,
 /// so no amount of testing the behaviour could have found it — only reading the code, or the user.
 
+
+/// A CUT SAYS WHAT IT WAS FOR, INSTEAD OF BEING GUESSED AT AFTERWARDS.
+///
+/// "Does the cutter span the wall?" is the only question geometry alone can answer, and a blind
+/// recess fails it BY CONSTRUCTION — stopping inside the wall is the whole point of a recess. So
+/// the ⚠ DOES-NOT-REACH warning fired on every pocket in the model. Measured on the real
+/// 172-feature project: 18 openings flagged, of which 6 were recesses working exactly as drawn.
+/// A warning that cries wolf on a third of its cases is one people learn to scroll past, which is
+/// worse than no warning — the genuinely stopped cuts were in the same list.
+#[cfg(test)]
+mod a_cut_records_what_it_was_for {
+    use super::*;
+
+    /// A 4 m x 0.3 m wall, 3 m high, with a face sketch open on its outside face — the state the
+    /// Cut command runs from.
+    fn a_wall_ready_to_cut() -> CadApp {
+        let mut app = CadApp::default();
+        app.factory
+            .add_wall(vec![glam::Vec2::new(0.0, 0.0), glam::Vec2::new(4.0, 0.0)], 0.3, 3.0)
+            .expect("a wall");
+        app.factory.recompute();
+        // Draw on the wall's +Y face, looking at it from outside.
+        let frame = cad_solid::Frame::from_point_normal(
+            glam::Vec3::new(2.0, 0.15, 1.5),
+            glam::Vec3::Y,
+        );
+        app.factory_enter_sketch(frame);
+        // A 1 m square opening, centred where the frame's origin landed.
+        let c = cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 0.5 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(c)));
+        app
+    }
+
+    fn last_cut(app: &CadApp) -> &cad_solid::Feature {
+        app.factory
+            .model
+            .features
+            .iter()
+            .rev()
+            .find(|f| f.op == cad_solid::BoolOp::Difference)
+            .expect("a cut was made")
+    }
+
+    /// THE RECORD IS MADE. Both ways round, because a field that is always `Some(true)` would
+    /// satisfy the through case and quietly reinstate the whole defect for recesses.
+    #[test]
+    fn a_through_cut_and_a_recess_are_told_apart_at_the_moment_they_are_cut() {
+        let mut app = a_wall_ready_to_cut();
+        assert!(app.factory_cut_sketch(true) > 0, "the through cut must be made");
+        assert_eq!(
+            last_cut(&app).through, Some(true),
+            "a through cut did not record that it was meant to go through",
+        );
+
+        let mut app = a_wall_ready_to_cut();
+        app.factory.element_height = 0.1;
+        assert!(app.factory_cut_sketch(false) > 0, "the recess must be made");
+        assert_eq!(
+            last_cut(&app).through, Some(false),
+            "a recess did not record that it was meant to stop",
+        );
+    }
+
+    /// AND A RECESS IS NOT REPORTED AS A FAILURE. The diagnostic counts it as a recess rather
+    /// than flagging it, which is the whole point of recording the intent.
+    #[test]
+    fn a_recess_is_not_flagged_as_an_opening_that_does_not_reach() {
+        let mut app = a_wall_ready_to_cut();
+        app.factory.element_height = 0.1;
+        assert!(app.factory_cut_sketch(false) > 0, "the recess must be made");
+        app.factory_exit_sketch();
+        app.factory.recompute();
+
+        let report = app.factory_geometry_report().join("\n");
+        let line = report
+            .lines()
+            .find(|l| l.contains("openings:"))
+            .unwrap_or_else(|| panic!("no openings line in:\n{report}"));
+        assert!(
+            line.contains("1 are recesses"),
+            "the recess was not counted as one: {line}",
+        );
+        assert!(
+            !report.contains("does not reach") && !report.contains("short by"),
+            "a recess working exactly as drawn was reported as a failure:\n{report}",
+        );
+    }
+
+    /// AN OPENING CUT BEFORE THE FIELD EXISTED STILL GETS AN ANSWER. `None` means nobody said, and
+    /// the reader falls back to measuring — which is what the app did everywhere, and is still
+    /// right for every project already on disk.
+    #[test]
+    fn an_opening_with_no_recorded_intent_falls_back_to_measuring() {
+        let mut app = a_wall_ready_to_cut();
+        assert!(app.factory_cut_sketch(true) > 0);
+        app.factory_exit_sketch();
+        // Erase the record, exactly as a project saved before the field carries it.
+        let id = last_cut(&app).id;
+        if let Some(f) = app.factory.model.get_mut(id) {
+            f.through = None;
+        }
+        app.factory.recompute();
+
+        let report = app.factory_geometry_report().join("\n");
+        let line = report
+            .lines()
+            .find(|l| l.contains("openings:"))
+            .unwrap_or_else(|| panic!("the diagnostic gave up on it:\n{report}"));
+        // MEASURED, not assumed. Reading `None` as "recess" would silence the warning for every
+        // opening in every project already on disk — the reverse of the defect, and just as quiet.
+        assert!(
+            line.contains("0 are recesses"),
+            "an opening with no recorded intent was counted as a recess instead of being \
+             measured: {line}",
+        );
+        assert!(
+            line.contains("1 go fully through"),
+            "an opening with no recorded intent was not measured at all: {line}",
+        );
+    }
+}
 /// A PLANE'S DRAWING IS PART OF THE DRAWING, AND SHARES ITS TABLES.
 ///
 /// A face sketch is a whole `Document` of its own, built from `Document::default()` — so it
