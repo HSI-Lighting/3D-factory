@@ -423,6 +423,19 @@ pub type ProfileId = u32;
 pub struct Profile {
     pub id: ProfileId,
     pub pts: Vec<[f32; 2]>,
+    /// INNER RINGS — the holes. Empty for a plain outline, which is every profile written before
+    /// this field existed, so `#[serde(default)]` is exact here rather than merely safe.
+    ///
+    /// A HOLE BELONGS TO THE OUTLINE, not to the model. Punching one with a separate `Difference`
+    /// feature works, and is what the app did — but it makes a plate with four bolt holes five
+    /// objects: five things to select, five to move, five to keep in step, and four that go on
+    /// cutting whatever body they land behind if the plate is ever deleted. One outline with four
+    /// holes in it is one object, and moves like one.
+    ///
+    /// Recentred with the outline and by the SAME offset. A hole is positioned relative to the
+    /// shape it is in; shifting the two independently slides every hole across its plate.
+    #[serde(default)]
+    pub holes: Vec<Vec<[f32; 2]>>,
 }
 
 /// Stable key into [`Model::paths`] — same "key not index" rule as [`ProfileId`].
@@ -1431,6 +1444,57 @@ impl Model {
     ///
     /// Validation is refusal, not repair — see [`ProfileError`].
     pub fn add_profile(&mut self, pts: &[Vec2]) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
+        self.add_profile_with_holes(pts, &[])
+    }
+
+    /// A closed outline WITH HOLES IN IT — see [`Profile::holes`]. `add_profile` is this with an
+    /// empty hole list, so the two cannot drift.
+    ///
+    /// Every ring goes through the same validation: a hole that is a bow-tie or has no area is
+    /// refused rather than handed to the boolean, for exactly the reason the outline is.
+    ///
+    /// WHERE A HOLE SITS IS NOT CHECKED. One outside the outline, or overlapping another, is left
+    /// to the 2D boolean in `csg::local_mesh`, which subtracts rings from the region and produces
+    /// the sensible answer — the part that overlaps is removed and the rest does nothing. Refusing
+    /// it here would mean re-implementing containment, and getting that subtly wrong would reject
+    /// drawings a person can see are fine.
+    ///
+    /// The BOUNDING BOX and centre come from the OUTLINE alone. A hole is inside it by definition
+    /// when it is a hole at all, and letting a stray ring stretch the box would move the whole
+    /// plate rather than being ignored.
+    pub fn add_profile_with_holes(
+        &mut self, pts: &[Vec2], holes: &[Vec<Vec2>],
+    ) -> Result<(ProfileId, Vec2, f32, f32), ProfileError> {
+        let p = Self::clean_ring(pts)?;
+        let mut rings: Vec<Vec<Vec2>> = Vec::with_capacity(holes.len());
+        for h in holes {
+            rings.push(Self::clean_ring(h)?);
+        }
+        let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for q in &p {
+            mn = mn.min(*q);
+            mx = mx.max(*q);
+        }
+        let centre = (mn + mx) * 0.5;
+        let (w, d) = (mx.x - mn.x, mx.y - mn.y);
+        let shift = |r: &[Vec2]| -> Vec<[f32; 2]> {
+            r.iter().map(|q| [q.x - centre.x, q.y - centre.y]).collect()
+        };
+        let id = { if self.next_profile_id == 0 { self.reserve_ids_above_loaded(); } let i = self.next_profile_id; self.next_profile_id += 1; i };
+        self.profiles.push(Profile {
+            id,
+            pts: shift(&p),
+            // THE SAME OFFSET as the outline. Recentring each ring on its own box would put every
+            // hole at the middle of the plate.
+            holes: rings.iter().map(|r| shift(r)).collect(),
+        });
+        Ok((id, centre, w, d))
+    }
+
+    /// One ring, cleaned and validated: duplicates collapsed, the wrap point dropped, winding
+    /// normalised to counter-clockwise. Shared by the outline and by every hole, so a hole cannot
+    /// be admitted on looser terms than the shape it is in.
+    fn clean_ring(pts: &[Vec2]) -> Result<Vec<Vec2>, ProfileError> {
         // Drop a repeated wrap point, then collapse consecutive duplicates.
         let mut p: Vec<Vec2> = Vec::with_capacity(pts.len());
         for &q in pts {
@@ -1457,19 +1521,7 @@ impl Model {
         if area2 < 0.0 {
             p.reverse(); // normalise to CCW
         }
-        let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
-        for q in &p {
-            mn = mn.min(*q);
-            mx = mx.max(*q);
-        }
-        let centre = (mn + mx) * 0.5;
-        let (w, d) = (mx.x - mn.x, mx.y - mn.y);
-        let id = { if self.next_profile_id == 0 { self.reserve_ids_above_loaded(); } let i = self.next_profile_id; self.next_profile_id += 1; i };
-        self.profiles.push(Profile {
-            id,
-            pts: p.iter().map(|q| [q.x - centre.x, q.y - centre.y]).collect(),
-        });
-        Ok((id, centre, w, d))
+        Ok(p)
     }
 
     /// Look up a profile by id. `None` for a stale id — never panics.
