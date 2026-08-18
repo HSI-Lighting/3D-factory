@@ -9137,7 +9137,7 @@ impl FactoryState {
                 // ByLayer, which is what almost everything is. Stepped back in value, not in hue.
                 let c = dobject_srgb(d, &sk.doc, doc).map(|x| x * FINISHED_DIM);
                 // By the SKETCH's own unit — `from_uv` lifts (u,v) into world METRES.
-                for poly in cad_solid::geom_outlines_scaled(&d.geom, sk.doc.units.metres_per_unit) {
+                for poly in cad_solid::geom_display_outlines_scaled(&d.geom, &sk.doc, sk.doc.units.metres_per_unit) {
                     for w in poly.windows(2) {
                         seg(
                             &mut out,
@@ -9173,7 +9173,7 @@ impl FactoryState {
         // two fight for the depth buffer and the lines stipple in and out as the camera moves.
         let z = z + 0.002;
         for d in &doc.dobjects {
-            for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
+            for path in cad_solid::geom_display_outlines_scaled(&d.geom, doc, k) {
                 for w in path.windows(2) {
                     seg(
                         &mut out,
@@ -9198,7 +9198,7 @@ impl FactoryState {
             // it is the freshest there is and the one `factory_exit_sketch` copies back out.
             let c = dobject_srgb(d, doc, doc);
             // By the live sketch document's own unit — `from_uv` lifts into world METRES.
-            for poly in cad_solid::geom_outlines_scaled(&d.geom, doc.units.metres_per_unit) {
+            for poly in cad_solid::geom_display_outlines_scaled(&d.geom, doc, doc.units.metres_per_unit) {
                 for w in poly.windows(2) {
                     seg(
                         &mut out,

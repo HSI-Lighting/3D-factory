@@ -1078,6 +1078,70 @@ pub fn geom_outlines_scaled(g: &cad_kernel::Geom, k: f64) -> Vec<Vec<Vec2>> {
     }
 }
 
+/// Flatten a geom for the VIEWPORT — everything that can be DRAWN, which is a superset of
+/// everything that can be BUILT.
+///
+/// THE TWO ARE DELIBERATELY DIFFERENT FUNCTIONS, and that is the whole point of this one.
+/// [`geom_outlines_scaled`] answers "what may Extrude, Cut and Make-3D-wall consume?" — and its
+/// answer has to stay narrow. Adding block references to it would make Make-building start
+/// extruding the furniture, because a block's contents include closed loops and the construction
+/// path takes every closed loop it is given.
+///
+/// So the viewport gets its own flattener. What it adds:
+///   - `Spline`, via the kernel's own tessellator — the same curve the 2D canvas draws.
+///   - `Wall`, as its two exact FACE lines, so a wall reads as a wall in 3D and not a centreline.
+///   - `BlockRef`, resolved through `doc.blocks` and transformed by the insert, recursively — so
+///     an imported plan made of blocks is visible instead of being 90% missing.
+///
+/// What it still leaves out, and why: `Text` and `Dimension` have no honest line form (a bbox
+/// rectangle in 3D reads as a solid object that is not there), and `Hatch` boundaries are the
+/// loops of the objects already drawn beside them. Those belong with the plane-as-a-document
+/// work, not here.
+///
+/// `depth` bounds block recursion. A block that contains itself is a cycle the DXF writer already
+/// has to defend against, and a viewport helper must not be the thing that overflows the stack.
+pub fn geom_display_outlines_scaled(
+    g: &cad_kernel::Geom, doc: &cad_kernel::Document, k: f64,
+) -> Vec<Vec<Vec2>> {
+    display_outlines_depth(g, doc, k, 8)
+}
+
+fn display_outlines_depth(
+    g: &cad_kernel::Geom, doc: &cad_kernel::Document, k: f64, depth: u32,
+) -> Vec<Vec<Vec2>> {
+    use cad_kernel::Geom as G;
+    match g {
+        G::Spline(s) => vec![s.tessellate(64).into_iter().map(|p| gvec(p, k)).collect()],
+        G::Wall(w) => match w.face_polylines(24) {
+            Some((l, r)) => vec![
+                l.into_iter().map(|p| gvec(p, k)).collect(),
+                r.into_iter().map(|p| gvec(p, k)).collect(),
+            ],
+            // A degenerate wall has no faces to derive; its centreline is still where it is.
+            None => vec![vec![gvec(w.start, k), gvec(w.end, k)]],
+        },
+        G::BlockRef(br) => {
+            if depth == 0 {
+                return Vec::new();
+            }
+            let Some(blk) = doc.blocks.get(br.block) else {
+                // A dangling block id draws nothing rather than panicking — the same choice
+                // `local_mesh` makes for a stale profile id.
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for cd in &blk.dobjects {
+                let placed = br.transform_geom(&cd.geom, blk.base);
+                out.extend(display_outlines_depth(&placed, doc, k, depth - 1));
+            }
+            out
+        }
+        // Everything the construction path already understands is flattened by the one function
+        // that defines it, so the two can never disagree about a Line or an Arc.
+        _ => geom_outlines_scaled(g, k),
+    }
+}
+
 #[inline]
 fn gvec(p: KVec2, k: f64) -> Vec2 {
     Vec2::new((p.x * k) as f32, (p.y * k) as f32)

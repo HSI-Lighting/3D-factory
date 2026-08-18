@@ -2429,9 +2429,15 @@ const SLAB_THICKNESS: f32 = 0.2;
 /// or traced plan** consists of — DXF has no wall entity, so a real floor plan arrives as
 /// lines, polylines and arcs. Closed shapes (circle / ellipse) promote as rings.
 ///
-/// Excluded: text, dimensions, hatches and points (nothing to extrude), and splines —
-/// `cad_solid::geom_outlines` has no sampler for them, so accepting one here would
-/// promise a wall that could not be built.
+/// Excluded: text, dimensions, hatches and points (nothing to extrude); block references, whose
+/// contents are closed loops that would turn Make-building into "extrude the furniture"; and
+/// splines, which `cad_solid::geom_outlines_scaled` still has no sampler for, so accepting one
+/// here would promise a wall that could not be built.
+///
+/// The spline exclusion is now a CHOICE rather than an absence: `geom_display_outlines_scaled`
+/// tessellates one for the viewport, so the geometry is available. Admitting curved splines to
+/// the construction path is its own piece of work — a wall promoted from one has to decide how
+/// its centreline is stored — and is not smuggled in behind a rendering change.
 fn is_promotable_to_wall(g: &Geom) -> bool {
     matches!(
         g,
@@ -7612,7 +7618,10 @@ impl CadApp {
             // disagree with itself. This one took the document from a local and the scale from a
             // global, which is precisely how the two came apart.
             let k = plan.units.metres_per_unit;
-            for path in cad_solid::geom_outlines_scaled(&d.geom, k) {
+            // The DISPLAY flattener, like the depth-tested `plan_lines` it is the alternative to.
+            // The two draw the same plan by two routes, so a spline or a block missing from one
+            // and present in the other would read as a rendering bug.
+            for path in cad_solid::geom_display_outlines_scaled(&d.geom, plan, k) {
                 for w in path.windows(2) {
                     let a = crate::factory::world_to_screen(glam::Vec3::new(w[0].x, w[0].y, 0.0), rect, mvp);
                     let b = crate::factory::world_to_screen(glam::Vec3::new(w[1].x, w[1].y, 0.0), rect, mvp);
@@ -8200,6 +8209,17 @@ impl CadApp {
         // the way through, and carried back out again on exit so a layer created while sketching is
         // not lost. Ids stay valid because both sides share the one table.
         sketch_doc.layers = self.doc.layers.clone();
+        // AND THE BLOCKS, for exactly the same reason.
+        //
+        // A `Sketch` is built from `Document::default()`, so its block table is EMPTY. That made
+        // inserting a block onto a plane impossible in the strict sense: the Insert list had
+        // nothing in it, and a `BlockRef` pushed there would name a definition that did not
+        // exist — an id resolving against a table of length zero.
+        //
+        // A block definition is a property of the DRAWING, not of one plane of it. Carried in
+        // here and carried back out on exit, so a block made while drawing on a face is not lost,
+        // and ids stay valid because both sides share the one table.
+        sketch_doc.blocks = self.doc.blocks.clone();
         let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
         let saved_undo = std::mem::take(&mut self.undo_stack);
         let saved_redo = std::mem::take(&mut self.redo_stack);
@@ -8263,8 +8283,14 @@ impl CadApp {
             // a face belongs to the drawing, not to that face — see the note on the way in. Taken
             // BEFORE the swap, because after it `self.doc` is the plan again.
             let layers = self.doc.layers.clone();
+            // …AND THE BLOCK TABLE COMES BACK OUT TOO. A block defined while drawing on a face
+            // belongs to the drawing, the same as a layer created there — see the note on the
+            // way in. Also taken BEFORE the swap, and kept on the sketch as well, so the
+            // `BlockRef`s left on the plane still resolve when it is drawn in 3D.
+            let blocks = self.doc.blocks.clone();
             let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
             self.doc.layers = layers;
+            self.doc.blocks = blocks;
             if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
                 sk.doc = sketch_doc;
             }
@@ -57034,5 +57060,202 @@ mod a_locked_layer_is_locked {
         );
         let hit = hit.expect("the locked line's endpoint must still snap");
         assert_eq!(hit.point, Vec2::new(0.0, 50.0), "snapped to the wrong point");
+    }
+}
+
+/// WHAT YOU SEE IS NOT WHAT FEEDS EXTRUDE — and both halves of that matter.
+///
+/// The 3D viewport flattened 2D geometry through `cad_solid::geom_outlines_scaled`, which knows
+/// Line, Circle, Arc, Ellipse, EllipseArc, Polyline and Point and returns nothing for anything
+/// else. A spline, a wall and an imported block therefore existed in the drawing and were simply
+/// absent from the 3D view — an imported plan made of blocks showed as very nearly nothing.
+///
+/// The fix is a SECOND flattener rather than a wider one. `geom_outlines_scaled` also answers
+/// "what may Extrude and Make-3D-wall consume?", and a block's contents are full of closed loops:
+/// widening it would make Make-building start extruding the furniture. The guard test below is
+/// the one that would catch that, and it is the reason this is two functions.
+#[cfg(test)]
+mod the_viewport_sees_what_the_drawing_has {
+    use super::*;
+
+    fn app_with(geoms: Vec<Geom>) -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for g in geoms {
+            app.doc.push(DObject::new(g));
+        }
+        app
+    }
+
+    /// An unrotated, unscaled instance of `id` at `insert`.
+    fn block_ref(id: u32, insert: Vec2) -> cad_kernel::BlockRef {
+        cad_kernel::BlockRef {
+            block: id, insert, scale: 1.0, scale_y: 1.0, rotation: 0.0, mirror_x: false,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        }
+    }
+
+    /// A closed 2 x 2 square as a block definition, plus one reference to it at `at`.
+    fn block_with_a_square(app: &mut CadApp, at: Vec2) -> usize {
+        let mut blk = cad_kernel::Block { name: "FURNITURE".into(), base: Vec2::ZERO, dobjects: Vec::new(), smart: false, params: Vec::new(), cut_edges: Vec::new() };
+        blk.dobjects.push(DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 2.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 2.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        })));
+        let id = app.doc.blocks.add(blk);
+        app.doc.push(DObject::new(Geom::BlockRef(block_ref(id, at))))
+    }
+
+    /// A SPLINE IS DRAWN IN 3D. Traced curves are how a real plan describes anything organic,
+    /// and the viewport showed nothing at all where one was.
+    #[test]
+    fn a_spline_appears_in_the_3d_view() {
+        let app = app_with(vec![Geom::Spline(Spline::new_bspline(
+            3,
+            vec![
+                Vec2::new(0.0, 0.0), Vec2::new(1.0, 4.0),
+                Vec2::new(5.0, -2.0), Vec2::new(8.0, 1.0),
+            ],
+        ))]);
+        assert!(
+            !app.factory.plan_lines(&app.doc, 0.0).is_empty(),
+            "a spline in the drawing produced no 3D geometry",
+        );
+    }
+
+    /// A WALL IS DRAWN AS A WALL — both faces, not a bare centreline.
+    #[test]
+    fn a_wall_appears_in_the_3d_view_with_both_faces() {
+        let app = app_with(vec![Geom::Wall(Wall {
+            start: Vec2::new(0.0, 0.0),
+            end: Vec2::new(10.0, 0.0),
+            thickness: 0.2,
+            style: 0,
+            bulge: 0.0,
+        })]);
+        let lines = app.factory.plan_lines(&app.doc, 0.0);
+        assert!(!lines.is_empty(), "a wall in the drawing produced no 3D geometry");
+        // Two faces, either side of y = 0 — a centreline-only fallback would put every
+        // vertex on it.
+        let (lo, hi) = lines
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v.y), hi.max(v.y)));
+        assert!(hi - lo > 1e-4, "the wall was drawn as a single centreline, not as two faces");
+    }
+
+    /// AN IMPORTED BLOCK IS DRAWN. A DXF floor plan arrives as block references; without this
+    /// the 3D view of an imported drawing is very nearly empty.
+    #[test]
+    fn an_imported_block_appears_in_the_3d_view() {
+        let mut app = app_with(vec![]);
+        block_with_a_square(&mut app, Vec2::new(20.0, 5.0));
+        let lines = app.factory.plan_lines(&app.doc, 0.0);
+        assert!(!lines.is_empty(), "a block reference produced no 3D geometry");
+        // Drawn WHERE IT WAS INSERTED, not at the block's own origin.
+        let k = app.doc.units.metres_per_unit as f32;
+        assert!(
+            lines.iter().any(|v| v.x > 19.0 * k),
+            "the block was drawn at the origin instead of at its insertion point",
+        );
+    }
+
+    /// THE GUARD. Everything above is display; none of it may reach the construction path.
+    ///
+    /// A block's contents are closed loops, and Extrude / Make-building take every closed loop
+    /// they are handed. If the two flatteners were ever merged, dropping a furniture block on a
+    /// plan and pressing Make-building would extrude the furniture into the building.
+    #[test]
+    fn a_block_is_visible_but_not_buildable() {
+        let mut app = app_with(vec![]);
+        block_with_a_square(&mut app, Vec2::new(20.0, 5.0));
+
+        assert!(
+            !app.factory.plan_lines(&app.doc, 0.0).is_empty(),
+            "the fixture must be VISIBLE, or the assertion below proves nothing",
+        );
+        assert!(
+            CadApp::closed_loops_of(&app.doc).is_empty(),
+            "a block reference reached the construction path — Make-building would extrude it",
+        );
+        let br = &app.doc.dobjects[0].geom;
+        assert!(!is_promotable_to_wall(br), "a block reference must not promote to a wall");
+    }
+
+    /// ...and the buildable types are still buildable, so the guard above is not simply "nothing
+    /// can be built any more".
+    #[test]
+    fn a_drawn_square_is_still_buildable() {
+        let app = app_with(vec![Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        })]);
+        assert_eq!(
+            CadApp::closed_loops_of(&app.doc).len(), 1,
+            "an ordinary closed polyline stopped being buildable",
+        );
+    }
+
+    /// A BLOCK CAN BE INSERTED ONTO A PLANE. The block TABLE lives in the drawing, and a sketch
+    /// document was built from `Document::default()` — so on a plane there were no blocks to
+    /// insert, and a reference pushed there pointed at a definition that did not exist.
+    ///
+    /// The same reasoning, and the same fix, as the layer table before it: a block definition is
+    /// a property of the DRAWING, not of one plane of it.
+    #[test]
+    fn a_block_can_be_inserted_onto_a_plane_and_is_drawn_there() {
+        let mut app = app_with(vec![]);
+        let mut blk = cad_kernel::Block { name: "CHAIR".into(), base: Vec2::ZERO, dobjects: Vec::new(), smart: false, params: Vec::new(), cut_edges: Vec::new() };
+        blk.dobjects.push(DObject::new(Geom::Line(Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 1.0),
+        })));
+        let id = app.doc.blocks.add(blk);
+        let blocks_before = app.doc.blocks.len();
+
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert_eq!(
+            app.doc.blocks.len(), blocks_before,
+            "the drawing's blocks did not come with us onto the plane — nothing to insert",
+        );
+        app.add_dobject(
+            Geom::BlockRef(block_ref(id, Vec2::new(3.0, 3.0))),
+            "test",
+        );
+        assert!(
+            !app.factory.live_sketch_lines(&app.doc).is_empty(),
+            "a block inserted on a plane is not drawn in 3D",
+        );
+    }
+
+    /// ...AND A BLOCK DEFINED ON A PLANE COMES BACK OUT, exactly as a layer created there does.
+    /// Otherwise the plane is a place where block work quietly disappears on Finish.
+    #[test]
+    fn a_block_defined_on_a_plane_returns_to_the_drawing() {
+        let mut app = app_with(vec![]);
+        let before = app.doc.blocks.len();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let mut blk = cad_kernel::Block { name: "MADE-ON-A-PLANE".into(), base: Vec2::ZERO, dobjects: Vec::new(), smart: false, params: Vec::new(), cut_edges: Vec::new() };
+        blk.dobjects.push(DObject::new(Geom::Line(Line {
+            a: Vec2::ZERO,
+            b: Vec2::new(1.0, 0.0),
+        })));
+        app.doc.blocks.add(blk);
+        app.factory_exit_sketch();
+        assert_eq!(
+            app.doc.blocks.len(), before + 1,
+            "a block defined while drawing on a plane was lost when the sketch closed",
+        );
     }
 }
