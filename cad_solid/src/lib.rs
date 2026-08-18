@@ -644,6 +644,23 @@ pub struct Feature {
     /// `None`, which IS the positional rule, so an older file loads meaning what it meant.
     #[serde(default)]
     pub target: Option<u32>,
+    /// WAS THIS CUT MEANT TO GO THROUGH? `Some(false)` is a blind recess — a pocket that stops
+    /// inside the wall on purpose. Meaningless on a `Union`.
+    ///
+    /// `None` means NOBODY SAID, which is every opening cut before this field existed. That is the
+    /// honest value rather than a default with an opinion: a reader has to fall back to inferring
+    /// the intent from the geometry, which is what the app did everywhere.
+    ///
+    /// The inference has one failure it cannot avoid, and ending that is why this exists. "Does
+    /// the cutter span the wall?" is the only test available from geometry alone — and a recess
+    /// fails it BY CONSTRUCTION, because not spanning the wall is the entire point of a recess. So
+    /// the ⚠ DOES-NOT-REACH warning fired on every pocket in the model. Measured on the real
+    /// 172-feature project: 18 openings flagged, of which 6 were recesses working exactly as
+    /// drawn. A warning that cries wolf on a third of its cases is one people learn to scroll
+    /// past — which is worse than no warning at all, because the genuinely stopped cuts were in
+    /// the same list.
+    #[serde(default)]
+    pub through: Option<bool>,
 }
 
 /// Serde's default for [`Feature::enabled`] — see the field. Must be `true`: it is what every
@@ -1353,7 +1370,7 @@ impl Model {
     pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
         let id = self.take_feature_id();
         self.features.push(Feature {
-            id, op, plane, placement, primitive, enabled: true, target: None,
+            id, op, plane, placement, primitive, enabled: true, target: None, through: None,
         });
         id
     }
@@ -1893,6 +1910,7 @@ mod tests {
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
             enabled: true,
             target: None,
+            through: None,
         };
         let (mn, mx) = f.world_aabb();
         // Centred at u=3 on X → x spans 2..4; sits on plane at z=offset=2 → z 2..3.
@@ -1909,6 +1927,7 @@ mod tests {
             primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
             target: None,
+            through: None,
         }
     }
 
