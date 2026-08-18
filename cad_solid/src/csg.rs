@@ -604,6 +604,169 @@ mod tests {
         );
     }
 
+
+    // ── WOULD BATCHING THE CUTTERS BE WORTH IT? ────────────────────────────────────────────
+    //
+    // M8 carries "batched cutters": union a wall's openings into ONE mesh and take a single
+    // difference, instead of folding each one onto the accumulated body in turn. It was written
+    // when a cut cost what it cost before `mesh-bbopt`, and the plan itself says the acceptance
+    // numbers are dead and must be re-derived from M6. This is that re-derivation, in code, so
+    // the decision is a number rather than an argument.
+    //
+    // The trade is not "N booleans versus one". It is:
+    //
+    //     A   N differences of a small cutter against a large accumulated body
+    //     B   N−1 unions of small cutters with each other, then ONE difference
+    //
+    // Post-bbopt, (A)'s differences only ever build a BSP from the polygons that overlap the
+    // cutter's bounding box — so they are already small-mesh booleans, which is exactly what (B)
+    // replaces them with.
+    //
+    // MEASURED ANSWER: BATCHING IS 3-5x SLOWER, and the table says why. A batch of openings
+    // spread along a wall has a bounding box spanning nearly the whole wall — 24.2 m of a 25.3 m
+    // wall at 40 openings — so the one boolean batching keeps is precisely the one that gets no
+    // help from `mesh-bbopt`, while the N-1 unions that build the batch re-partition a mesh that
+    // grows with every cutter added. The item traded a cheap operation for an expensive one.
+    //
+    //     windows   one at a time      batched     ratio   batch span / wall span
+    //           4        19.5 ms      97.6 ms      0.20x     19.5 m / 25.3 m
+    //          12        39.3 ms     224.5 ms      0.17x     23.1 m / 25.3 m
+    //          24        84.7 ms     403.8 ms      0.21x     23.9 m / 25.3 m
+    //          40       151.6 ms     471.1 ms      0.32x     24.2 m / 25.3 m
+    //
+    // (debug build, so the absolute numbers are inflated; the ratio is the point.)
+    //
+    // A cleverer batch — grouping openings that are near each other — would do better than this
+    // naive fold. It would also be a good deal more code, for a saving bounded by the cutting
+    // time that survives `mesh-bbopt` at all: 109 ms of a 165 ms evaluation on the real 172
+    // feature project. And it would cost every opening its identity: `Feature::enabled`,
+    // `Feature::target`, the orphan flag and the Openings menu all name ONE cutter, and a batch
+    // has one name for forty of them. That is the whole of M8 spent to buy back part of M6.
+
+    /// A traced curved wall as one extrusion — the shape a DXF facade arrives as. Matches the
+    /// fixture in `tests/boolean_cost.rs`, deliberately, so the two sets of numbers compare.
+    fn curved_wall(n: usize) -> (Model, f32) {
+        let (radius, thickness) = (12.0_f32, 0.3_f32);
+        let (ro, ri) = (radius + thickness * 0.5, radius - thickness * 0.5);
+        let sweep = std::f32::consts::PI * 0.8;
+        let mut pts = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = sweep * i as f32 / (n - 1) as f32;
+            pts.push(glam::Vec2::new(ro * t.cos(), ro * t.sin()));
+        }
+        for i in (0..n).rev() {
+            let t = sweep * i as f32 / (n - 1) as f32;
+            pts.push(glam::Vec2::new(ri * t.cos(), ri * t.sin()));
+        }
+        let mut m = Model::default();
+        let (profile, centre, w, d) = m.add_profile(&pts).expect("wall profile");
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement {
+                u: centre.x, v: centre.y, lift: 0.0,
+                spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+            },
+            Primitive::Extrusion { profile, h: 3.0, w, d },
+        );
+        (m, radius)
+    }
+
+    fn add_window(m: &mut Model, radius: f32, t: f32) {
+        let (c, s) = (t.cos(), t.sin());
+        m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            Placement {
+                u: radius * c, v: radius * s, lift: 1.0,
+                spin_deg: s.atan2(c).to_degrees(), pitch_deg: 0.0, roll_deg: 0.0,
+            },
+            Primitive::Box { w: 1.2, d: 1.0, h: 1.4 },
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark — cargo test -p cad_solid --lib what_batching -- --ignored --nocapture"]
+    fn what_batching_the_cutters_would_save() {
+        println!("\nmesh-bbopt: {}\n", if cfg!(feature = "bbopt") { "ON" } else { "OFF" });
+        println!(
+            "{:<12} {:>12} {:>12} {:>10}   {}",
+            "windows", "one at a time", "batched", "ratio", "what batching costs in identity",
+        );
+        println!("{}", "-".repeat(92));
+
+        for cuts in [4usize, 12, 24, 40] {
+            let (mut m, r) = curved_wall(96);
+            for i in 0..cuts {
+                add_window(&mut m, r, 0.15 + 2.2 * i as f32 / cuts as f32);
+            }
+
+            // A — what `eval` does today.
+            let t = std::time::Instant::now();
+            let a_mesh = eval(&m);
+            let a_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // B — union every cutter first, then one difference.
+            let t = std::time::Instant::now();
+            let body = world_mesh(&m.features[0], &m);
+            let mut batch: Option<CsgMesh> = None;
+            for f in &m.features[1..] {
+                let c = world_mesh(f, &m);
+                batch = Some(match batch {
+                    Some(b) => b.union(&c),
+                    None => c,
+                });
+            }
+            let b_mesh = match batch {
+                Some(ref b) => body.difference(b),
+                None => body,
+            };
+            let b_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            // WHY, measured rather than asserted: the batch's bounding box is what the single
+            // remaining difference gets pre-partitioned against, and a batch of openings spread
+            // along a wall spans the WHOLE wall — so the one boolean batching keeps is the one
+            // that gets no help from `mesh-bbopt` at all.
+            let span = |mesh: &CsgMesh| {
+                let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+                for v in mesh.polygons.iter().flat_map(|p| p.vertices.iter()) {
+                    for (k, c) in [v.position.x, v.position.y, v.position.z].iter().enumerate() {
+                        lo[k] = lo[k].min(*c);
+                        hi[k] = hi[k].max(*c);
+                    }
+                }
+                ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt()
+            };
+            let bat_span = batch.as_ref().map_or(0.0, &span);
+            let wall_span = span(&world_mesh(&m.features[0], &m));
+            println!(
+                "{cuts:<12} {a_ms:>9.1} ms {b_ms:>9.1} ms {:>9.2}x   batch spans {bat_span:5.1} m \
+                 of a {wall_span:.1} m wall",
+                a_ms / b_ms.max(1e-9),
+            );
+            // Sanity: both routes must describe the same solid, or the comparison is of two
+            // different things. Triangle counts legitimately differ (different BSP splits), so
+            // this compares the extents.
+            let (amn, amx) = a_mesh.bounds().expect("A has bounds");
+            let bmn = b_mesh.polygons.iter().flat_map(|p| p.vertices.iter())
+                .fold([f64::MAX; 3], |acc, v| {
+                    [acc[0].min(v.position.x), acc[1].min(v.position.y), acc[2].min(v.position.z)]
+                });
+            for k in 0..3 {
+                assert!(
+                    (amn[k] as f64 - bmn[k]).abs() < 0.05,
+                    "the two routes built different solids on axis {k}: {} vs {}",
+                    amn[k], bmn[k],
+                );
+            }
+            let _ = amx;
+        }
+        println!(
+            "\nBatching trades N differences against a large body for N-1 unions of small cutters\n\
+             plus one difference. With mesh-bbopt on, (A)'s differences ALREADY build their BSP\n\
+             from the overlapping subset only, so both sides of the trade are small-mesh booleans.\n"
+        );
+    }
     /// The worst-N view is what a 4,000-feature table is actually read through, so it has to be
     /// sorted the way it claims.
     #[test]
