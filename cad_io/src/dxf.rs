@@ -402,6 +402,54 @@ fn is_real_block(name: &str) -> bool {
     !(u.starts_with("*MODEL_SPACE") || u.starts_with("*PAPER_SPACE"))
 }
 
+/// WHICH WAY ROUND AN ENTITY'S OWN COORDINATE SYSTEM SITS.
+///
+/// Most DXF entities are written in OBJECT COORDINATES, not world coordinates, and carry a
+/// 210/220/230 extrusion vector saying which way that system faces. This reader ignored it and
+/// read the numbers as world coordinates — right for the extrusion nearly every entity has, and a
+/// silent mirror for the ones that do not.
+///
+/// It is not a rare case. AutoCAD writes `(0, 0, -1)` whenever a circle, arc or block reference is
+/// MIRRORED, and several exporters write it for whole drawings. The symptom is geometry that comes
+/// in back to front with no error — and only for the entities that carry it, so a plan can arrive
+/// with half its blocks flipped and the walls exactly where they should be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ocs {
+    /// Extrusion +Z. Object coordinates ARE world coordinates; nothing to do, which is the path
+    /// almost every entity in almost every file takes.
+    World,
+    /// Extrusion −Z. The arbitrary-axis algorithm gives `Ax = (−1, 0, 0)` and `Ay = (0, 1, 0)`, so
+    /// object `(x, y)` is world `(−x, y)`: a mirror in X, and an exact one.
+    MirroredX,
+    /// Anything else — an entity standing on a tilted plane.
+    ///
+    /// LEFT ALONE ON PURPOSE. A 2D document has nowhere to put a tilted entity: the honest
+    /// transform is a projection, which turns its circles into ellipses and its right angles into
+    /// something else. That is a different silent wrong answer, not a fix. A file full of tilted
+    /// extrusions is 3D data arriving through a 2D door, and needs saying out loud rather than
+    /// quietly flattening.
+    Tilted,
+}
+
+/// Read an entity's extrusion. Absent means +Z — what the spec says, and what the vast majority
+/// of entities carry.
+fn entity_ocs(fields: &[(i32, &str)]) -> Ocs {
+    let axis = |code: i32, dflt: f64| -> f64 {
+        fields
+            .iter()
+            .find(|&&(c, _)| c == code)
+            .and_then(|&(_, v)| v.parse::<f64>().ok())
+            .unwrap_or(dflt)
+    };
+    let (nx, ny, nz) = (axis(210, 0.0), axis(220, 0.0), axis(230, 1.0));
+    // The 1/64 threshold is the DXF arbitrary-axis algorithm's own: below it an axis counts as
+    // aligned. Using the same number means this agrees with the transform it stands in for.
+    if nx.abs() >= 1.0 / 64.0 || ny.abs() >= 1.0 / 64.0 {
+        return Ocs::Tilted;
+    }
+    if nz < 0.0 { Ocs::MirroredX } else { Ocs::World }
+}
+
 fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DObject> {
     let mut layer_name: &str = "";
     let mut color: Option<Color> = None;
@@ -431,22 +479,45 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DO
         }
     }
 
+    // WHICH ENTITIES THIS APPLIES TO IS NOT A GUESS. The DXF reference states, per entity, whether
+    // its points are world or object coordinates, and the two are NOT the same list:
+    //
+    //   OBJECT coordinates — CIRCLE, ARC, LWPOLYLINE, POINT, INSERT.  Transformed below.
+    //   WORLD  coordinates — LINE, ELLIPSE.  Left exactly as they are, extrusion or no extrusion.
+    //
+    // Mirroring a LINE because it happens to carry a 210 would put it somewhere it is not, which
+    // is the same defect arriving from the other direction.
+    let flip = entity_ocs(fields) == Ocs::MirroredX;
+    // Object → world for a −Z extrusion: x negated, y kept.
+    let ocs_pt = |p: Vec2| if flip { Vec2::new(-p.x, p.y) } else { p };
+
     let geom = match kind {
+        // LINE is a WORLD entity — its 10/11 are already world coordinates.
         "LINE" => Geom::Line(Line {
             a: Vec2::new(get_f(10)?, get_f(20)?),
             b: Vec2::new(get_f(11)?, get_f(21)?),
         }),
         "CIRCLE" => Geom::Circle(Circle {
-            center: Vec2::new(get_f(10)?, get_f(20)?),
+            center: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
             radius: get_f(40)?,
         }),
         "ARC" => {
             let sa = get_f(50)?.to_radians();
             let ea = get_f(51)?.to_radians();
+            // A MIRROR REVERSES THE SWEEP. An object angle θ is measured from `Ax` toward `Ay`,
+            // and under a −Z extrusion that pair maps to world (−1, 0) and (0, 1) — so θ arrives
+            // as π − θ, which runs the other way. Keeping the start and letting the sweep run the
+            // original way draws the COMPLEMENT of the arc: everything except the piece that is
+            // actually there.
+            let (sa, ea) = if flip {
+                (std::f64::consts::PI - ea, std::f64::consts::PI - sa)
+            } else {
+                (sa, ea)
+            };
             let sweep = (ea - sa).rem_euclid(std::f64::consts::TAU);
             let sweep = if sweep < 1e-9 { std::f64::consts::TAU } else { sweep };
             Geom::Arc(Arc {
-                center: Vec2::new(get_f(10)?, get_f(20)?),
+                center: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
                 radius: get_f(40)?,
                 start_angle: sa.rem_euclid(std::f64::consts::TAU),
                 sweep_angle: sweep,
@@ -475,7 +546,7 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DO
             }
         }
         "POINT" => Geom::Point(Point {
-            location: Vec2::new(get_f(10)?, get_f(20)?),
+            location: ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
             style: 0, size: 0.0,
         }),
         "LWPOLYLINE" => {
@@ -518,6 +589,16 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DO
                 vwidths.push((cur_sw, cur_ew));
             }
             if vertices.is_empty() { return None; }
+            // A MIRROR FLIPS EVERY BULGE. Bulge is a SIGNED measure of how far a segment bows —
+            // positive counter-clockwise — so reflecting the vertices without negating it leaves
+            // every curved segment bowing the wrong way: a door swing that opens into the wall.
+            // The vertex ORDER is untouched; each segment simply curves the other way.
+            if flip {
+                for v in &mut vertices {
+                    v.pos.x = -v.pos.x;
+                    v.bulge = -v.bulge;
+                }
+            }
             // Map to per-SEGMENT widths (n-1 open, n closed). Prefer per-vertex
             // 40/41; fall back to constant width 43; empty when all zero.
             let seg_count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
@@ -546,12 +627,21 @@ fn build_entity(kind: &str, fields: &[(i32, &str)], doc: &Document) -> Option<DO
             // MAGNITUDES go to scale / scale_y (non-uniform → ellipses).
             let mirror_x = (sx < 0.0) != (sy < 0.0);
             let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
+            let rotation = get_f(50).unwrap_or(0.0).to_radians() + extra;
+            // A −Z EXTRUSION ON AN INSERT IS ANOTHER MIRROR, composed with whichever one the
+            // scale signs already carry. This form reads as "mirror in x, then rotate", and
+            // `S · R(θ)` is `R(−θ) · S` — so the extrusion contributes one more mirror and turns
+            // the rotation the other way. Two mirrors CANCEL, which is why this is a toggle and
+            // not an assignment: a block flipped by a negative scale AND written with a −Z
+            // extrusion is not flipped at all, and that combination is one AutoCAD really emits.
+            let (mirror_x, rotation) =
+                if flip { (!mirror_x, -rotation) } else { (mirror_x, rotation) };
             Geom::BlockRef(BlockRef {
                 block,
-                insert:   Vec2::new(get_f(10)?, get_f(20)?),
+                insert:   ocs_pt(Vec2::new(get_f(10)?, get_f(20)?)),
                 scale:    sx.abs().max(1e-9),
                 scale_y:  sy.abs().max(1e-9),
-                rotation: get_f(50).unwrap_or(0.0).to_radians() + extra,
+                rotation,
                 mirror_x,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             })
@@ -1251,6 +1341,218 @@ mod tests {
         assert!(matches!(back.layers.get(id).unwrap().color, Color::Aci(1)));
         // Dobject's style.layer must point at WALLS post-import
         assert_eq!(back.dobjects[0].style.layer, id);
+    }
+
+    // ── A MIRRORED ENTITY COMES IN THE RIGHT WAY ROUND ─────────────────────────────────────
+    //
+    // Most DXF entities are written in OBJECT coordinates and carry a 210/220/230 extrusion
+    // saying which way that system faces. This reader ignored it, which is right for the +Z
+    // extrusion nearly everything has and a silent mirror for the rest — and AutoCAD writes
+    // `(0, 0, -1)` every time a circle, arc or block reference is mirrored.
+
+    /// A one-entity DXF: `kind` with `fields` (pairs of code and value), in ENTITIES.
+    fn dxf_with(kind: &str, fields: &[(i32, &str)]) -> String {
+        let mut s = String::from("0\nSECTION\n2\nENTITIES\n0\n");
+        s.push_str(kind);
+        s.push('\n');
+        for (c, v) in fields {
+            s.push_str(&format!("{c}\n{v}\n"));
+        }
+        s.push_str("0\nENDSEC\n0\nEOF\n");
+        s
+    }
+
+    /// The same entity twice — once plain, once with a −Z extrusion.
+    fn plain_and_flipped(kind: &str, fields: &[(i32, &str)]) -> (Geom, Geom) {
+        let plain = read_dxf(&dxf_with(kind, fields)).expect("plain parses");
+        let mut f = fields.to_vec();
+        f.extend_from_slice(&[(210, "0.0"), (220, "0.0"), (230, "-1.0")]);
+        let flipped = read_dxf(&dxf_with(kind, &f)).expect("flipped parses");
+        assert_eq!(plain.dobjects.len(), 1, "the plain fixture must produce one entity");
+        assert_eq!(flipped.dobjects.len(), 1, "the flipped fixture must produce one entity");
+        (plain.dobjects[0].geom.clone(), flipped.dobjects[0].geom.clone())
+    }
+
+    /// A CIRCLE. The simplest statement of the whole thing: its centre is at −x, not x.
+    #[test]
+    fn a_mirrored_circle_lands_on_the_other_side() {
+        let (plain, flipped) =
+            plain_and_flipped("CIRCLE", &[(10, "7.0"), (20, "3.0"), (40, "2.0")]);
+        let (Geom::Circle(a), Geom::Circle(b)) = (&plain, &flipped) else {
+            panic!("expected two circles, got {plain:?} / {flipped:?}");
+        };
+        assert!((a.center.x - 7.0).abs() < 1e-9, "the control moved: {:?}", a.center);
+        assert!(
+            (b.center.x + 7.0).abs() < 1e-9 && (b.center.y - 3.0).abs() < 1e-9,
+            "a −Z extrusion must mirror x and keep y; got {:?}",
+            b.center,
+        );
+        assert!((b.radius - 2.0).abs() < 1e-9, "a mirror does not change a radius");
+    }
+
+    /// AN ARC RUNS THE OTHER WAY ROUND. Mirroring reverses the sweep direction, so keeping the
+    /// start angle and the sweep would draw the COMPLEMENT of the arc — everything except the
+    /// piece that is actually there. Asserted on the two ENDPOINTS, which is what the drafter
+    /// sees, rather than on the angles, which are an encoding of it.
+    #[test]
+    fn a_mirrored_arc_keeps_its_own_two_ends() {
+        let fields = [(10, "0.0"), (20, "0.0"), (40, "10.0"), (50, "20.0"), (51, "70.0")];
+        let (plain, flipped) = plain_and_flipped("ARC", &fields);
+        let (Geom::Arc(a), Geom::Arc(b)) = (&plain, &flipped) else { panic!("expected two arcs") };
+
+        let ends = |arc: &Arc| {
+            let p = |t: f64| {
+                let ang = arc.start_angle + arc.sweep_angle * t;
+                Vec2::new(
+                    arc.center.x + arc.radius * ang.cos(),
+                    arc.center.y + arc.radius * ang.sin(),
+                )
+            };
+            (p(0.0), p(1.0))
+        };
+        let (a0, a1) = ends(a);
+        let (b0, b1) = ends(b);
+        // The mirrored arc's two ends are the plain arc's two ends reflected in x. Which of them
+        // is "start" swaps, because the sweep reversed — so the pair is compared as a SET.
+        let refl = |p: Vec2| Vec2::new(-p.x, p.y);
+        let same = |p: Vec2, q: Vec2| (p.x - q.x).abs() < 1e-6 && (p.y - q.y).abs() < 1e-6;
+        assert!(
+            (same(b0, refl(a1)) && same(b1, refl(a0)))
+                || (same(b0, refl(a0)) && same(b1, refl(a1))),
+            "the mirrored arc does not span the same ground: plain {a0:?}..{a1:?} \
+             mirrored {b0:?}..{b1:?}",
+        );
+        assert!(
+            (b.sweep_angle - a.sweep_angle).abs() < 1e-6,
+            "the arc grew from {} to {} radians — that is the complement, not the arc",
+            a.sweep_angle, b.sweep_angle,
+        );
+    }
+
+    /// A POLYLINE'S BULGES FLIP WITH IT. Bulge is SIGNED — positive is counter-clockwise — so
+    /// reflecting the vertices without negating it leaves every curved segment bowing the wrong
+    /// way: a door swing that opens into the wall.
+    #[test]
+    fn a_mirrored_polyline_bows_the_other_way() {
+        let fields = [
+            (90, "2"), (70, "0"),
+            (10, "0.0"), (20, "0.0"), (42, "0.5"),
+            (10, "4.0"), (20, "0.0"),
+        ];
+        let (plain, flipped) = plain_and_flipped("LWPOLYLINE", &fields);
+        let (Geom::Polyline(a), Geom::Polyline(b)) = (&plain, &flipped) else {
+            panic!("expected two polylines");
+        };
+        assert!((a.vertices[0].bulge - 0.5).abs() < 1e-9, "the control changed");
+        assert!(
+            (b.vertices[1].pos.x + 4.0).abs() < 1e-9,
+            "the vertices were not mirrored: {:?}",
+            b.vertices[1].pos,
+        );
+        assert!(
+            (b.vertices[0].bulge + 0.5).abs() < 1e-9,
+            "the bulge kept its sign through a mirror ({}), so the arc bows into the wall",
+            b.vertices[0].bulge,
+        );
+    }
+
+    /// A BLOCK REFERENCE picks up one more mirror, and TWO MIRRORS CANCEL. A block mirrored by a
+    /// negative scale AND written with a −Z extrusion is not mirrored at all — which is exactly
+    /// what AutoCAD produces for some mirror operations, so getting this wrong flips the blocks
+    /// that were already right.
+    #[test]
+    fn a_block_reference_composes_its_mirrors() {
+        let mut doc_src = String::from("0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nDOOR\n10\n0.0\n20\n0.0\n");
+        doc_src.push_str("0\nLINE\n10\n0.0\n20\n0.0\n11\n1.0\n21\n0.0\n0\nENDBLK\n0\nENDSEC\n");
+        let entities = |extra: &str, sx: &str| {
+            format!(
+                "{doc_src}0\nSECTION\n2\nENTITIES\n0\nINSERT\n2\nDOOR\n10\n5.0\n20\n2.0\n\
+                 41\n{sx}\n42\n1.0\n50\n30.0\n{extra}0\nENDSEC\n0\nEOF\n"
+            )
+        };
+        let br = |src: String| match read_dxf(&src).expect("parses").dobjects[0].geom.clone() {
+            Geom::BlockRef(b) => b,
+            g => panic!("expected a block reference, got {g:?}"),
+        };
+        let flip = "210\n0.0\n220\n0.0\n230\n-1.0\n";
+
+        let plain = br(entities("", "1.0"));
+        let by_scale = br(entities("", "-1.0"));
+        let by_extrusion = br(entities(flip, "1.0"));
+        let by_both = br(entities(flip, "-1.0"));
+
+        assert!(!plain.mirror_x, "the control must not be mirrored");
+        assert!(by_scale.mirror_x, "a negative x scale is a mirror");
+        assert!(by_extrusion.mirror_x, "a −Z extrusion is a mirror");
+        assert!(
+            !by_both.mirror_x,
+            "two mirrors must cancel — a block flipped by scale AND by extrusion is upright",
+        );
+        assert!(
+            (by_extrusion.insert.x + 5.0).abs() < 1e-9,
+            "the insertion point was not mirrored: {:?}",
+            by_extrusion.insert,
+        );
+        assert!(
+            (by_extrusion.rotation + plain.rotation).abs() < 1e-9,
+            "the mirror must turn the rotation the other way: {} vs {}",
+            by_extrusion.rotation, plain.rotation,
+        );
+    }
+
+    /// A LINE IS A WORLD ENTITY AND MUST NOT MOVE. The DXF reference states per entity whether
+    /// its points are world or object coordinates, and LINE is world — extrusion or no extrusion.
+    /// Mirroring it because it happens to carry a 210 would put it somewhere it is not, which is
+    /// the same defect this fixes, arriving from the other direction.
+    #[test]
+    fn a_line_with_an_extrusion_stays_exactly_where_it_is() {
+        let (plain, flipped) = plain_and_flipped(
+            "LINE",
+            &[(10, "1.0"), (20, "2.0"), (11, "9.0"), (21, "4.0")],
+        );
+        let (Geom::Line(a), Geom::Line(b)) = (&plain, &flipped) else { panic!("expected lines") };
+        assert!(
+            (a.a.x - b.a.x).abs() < 1e-9 && (a.b.x - b.b.x).abs() < 1e-9,
+            "a LINE was mirrored: {:?}..{:?} became {:?}..{:?}",
+            a.a, a.b, b.a, b.b,
+        );
+    }
+
+    /// A TILTED EXTRUSION IS LEFT ALONE. There is nowhere in a 2D document to put an entity
+    /// standing on a tilted plane: the honest transform is a projection, which turns its circle
+    /// into an ellipse. Guessing one would be a different silent wrong answer, not a fix.
+    #[test]
+    fn a_tilted_extrusion_is_not_guessed_at() {
+        let src = dxf_with(
+            "CIRCLE",
+            &[(10, "7.0"), (20, "3.0"), (40, "2.0"), (210, "0.5"), (220, "0.0"), (230, "0.866")],
+        );
+        let doc = read_dxf(&src).expect("parses");
+        let Geom::Circle(c) = &doc.dobjects[0].geom else { panic!("expected a circle") };
+        assert!(
+            (c.center.x - 7.0).abs() < 1e-9,
+            "a tilted extrusion was flattened rather than left alone: {:?}",
+            c.center,
+        );
+    }
+
+    /// AND +Z CHANGES NOTHING, stated explicitly — an extrusion written out in full is the
+    /// commonest thing in a real file, and treating a present-but-default 210 as special would
+    /// mirror most of the drawing.
+    #[test]
+    fn an_explicit_plus_z_extrusion_is_the_default() {
+        let bare = read_dxf(&dxf_with("CIRCLE", &[(10, "7.0"), (20, "3.0"), (40, "2.0")]))
+            .expect("parses");
+        let spelled = read_dxf(&dxf_with(
+            "CIRCLE",
+            &[(10, "7.0"), (20, "3.0"), (40, "2.0"), (210, "0.0"), (220, "0.0"), (230, "1.0")],
+        ))
+        .expect("parses");
+        let cx = |d: &Document| match &d.dobjects[0].geom {
+            Geom::Circle(c) => c.center.x,
+            g => panic!("expected a circle, got {g:?}"),
+        };
+        assert!((cx(&bare) - cx(&spelled)).abs() < 1e-9, "a spelled-out +Z moved the entity");
     }
 }
 
