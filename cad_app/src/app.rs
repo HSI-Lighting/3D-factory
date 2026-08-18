@@ -18121,12 +18121,49 @@ impl CadApp {
         }
         let mut added = 0usize;
         for i in 0..self.doc.dobjects.len() {
-            if !in_sel[i] {
+            // "All" means all the objects you are allowed to have. A locked or hidden layer is
+            // excluded here rather than filtered afterwards, so the count reported back to the
+            // user is the number actually selected.
+            if !in_sel[i] && self.doc.is_selectable(i) {
                 self.selection.push(i);
                 added += 1;
             }
         }
         added
+    }
+
+    /// Lock or unlock a layer — and take its objects out of the selection when it locks.
+    ///
+    /// THE BASKET IS PART OF THE LOCK. Guarding only the ways INTO a selection leaves the obvious
+    /// hole open: select an object, lock its layer, then move — the edit runs off a basket
+    /// assembled while the lock was not there, and the lock does nothing.
+    ///
+    /// Unlocking does not restore anything. A selection is a thing the user made; putting objects
+    /// back into it because a checkbox changed would be a surprise in the opposite direction.
+    pub fn set_layer_locked(&mut self, id: LayerId, locked: bool) {
+        let Some(l) = self.doc.layers.get_mut(id) else { return };
+        if l.locked == locked {
+            return;
+        }
+        l.locked = locked;
+        if !locked {
+            self.history.push(format!("  layer #{id} unlocked"));
+            return;
+        }
+        let before = self.selection.len();
+        // Borrow-free: `is_selectable` reads the doc, `retain` writes the selection.
+        let keep: Vec<bool> =
+            (0..self.doc.dobjects.len()).map(|i| self.doc.is_selectable(i)).collect();
+        self.selection.retain(|&i| keep.get(i).copied().unwrap_or(false));
+        let dropped = before - self.selection.len();
+        self.history.push(if dropped > 0 {
+            format!("  layer #{id} locked — {dropped} object(s) dropped from the selection")
+        } else {
+            format!("  layer #{id} locked")
+        });
+        if dropped > 0 {
+            self.selected = self.selection.first().copied();
+        }
     }
 
     /// Close a window-selection rectangle. Direction = mode:
@@ -18228,6 +18265,13 @@ impl CadApp {
         let mut changed = 0usize;
         for i in &cands {
             let i = *i;
+            // A LOCKED OR HIDDEN OBJECT IS NOT IN THE WINDOW. Skipped before any geometry work,
+            // so dragging a window across a locked layer costs nothing extra — and skipped on the
+            // REMOVE path too, which is right: a subtracting window over a locked object has
+            // nothing to subtract, because it could never have been selected.
+            if !self.doc.is_selectable(i) {
+                continue;
+            }
             // BlockRefs resolve their real extent through the block table
             // (the kernel bbox is just the insertion point).
             let (emin, emax) = match &self.doc.dobjects[i].geom {
@@ -20864,6 +20908,7 @@ impl CadApp {
                 // ---- one row per layer ----------------------------------
                 let active = self.doc.layers.active;
                 let mut new_active: Option<LayerId> = None;
+                let mut lock_change: Option<(LayerId, bool)> = None;
                 let mut rename_commit: Option<(LayerId, String)> = None;
                 let mut rename_cancel = false;
                 // Color edits can't intern into self.doc.truecolors directly
@@ -20942,12 +20987,15 @@ impl CadApp {
                                     }
 
                                     // ----- lock toggle --------------------
+                                    // DEFERRED, unlike visible/frozen: locking has to reach the
+                                    // SELECTION as well as the layer, and that needs `self`,
+                                    // which this loop has borrowed. Same shape as `new_active`.
                                     let mut l = layer.locked;
                                     if ui.checkbox(&mut l, "")
-                                        .on_hover_text("Locked — Dobjects render but can't be selected")
+                                        .on_hover_text("Locked — Dobjects render and snap, but cannot be selected or edited")
                                         .changed()
                                     {
-                                        layer.locked = l;
+                                        lock_change = Some((id, l));
                                     }
 
                                     // ----- color swatch -------------------
@@ -21029,6 +21077,9 @@ impl CadApp {
                 if let Some(id) = new_active {
                     self.doc.layers.active = id;
                     self.history.push(format!("  active layer → #{}", id));
+                }
+                if let Some((id, on)) = lock_change {
+                    self.set_layer_locked(id, on);
                 }
                 // Color edits captured during the layer loop — intern into
                 // the truecolor table, then assign the ref. Two stages
@@ -34418,6 +34469,19 @@ impl CadApp {
         };
         let mut best: Option<(usize, f64)> = None;
         for i in &cands {
+            // LOCKED AND HIDDEN OBJECTS ARE NOT UNDER THE CURSOR.
+            //
+            // Every click-pick in the app comes through here, which is why the check belongs here
+            // and not at each of the eighteen call sites. A locked object is therefore clicked
+            // THROUGH, exactly as in AutoCAD: the click reads as a click on empty space, and what
+            // is behind the locked object can be picked instead.
+            //
+            // `is_selectable` is "not locked AND it renders", so this also stops a hidden or
+            // frozen layer being selected by clicking where it used to be — which the renderer
+            // already refuses to draw.
+            if !self.doc.is_selectable(*i) {
+                continue;
+            }
             let d = self.doc.dobjects[*i].distance_to_point(w);
             if d < tol_world {
                 if best.map_or(true, |(_, bd)| d < bd) {
@@ -34446,6 +34510,7 @@ impl CadApp {
         // whole document anyway. Same answer, bounded work.
         let mut hatch_best: Option<(usize, f64)> = None;
         for &i in &cands {
+            if !self.doc.is_selectable(i) { continue; } // the fallbacks obey the lock too
             let Some(dob) = self.doc.dobjects.get(i) else { continue; };
             let Geom::Hatch(h) = &dob.geom else { continue; };
             let loops = self.resolve_hatch_loops(h);
@@ -34481,6 +34546,7 @@ impl CadApp {
         // so the candidate list already holds every one of them.
         let mut blk_best: Option<(usize, f64)> = None;
         for &i in &cands {
+            if !self.doc.is_selectable(i) { continue; } // the fallbacks obey the lock too
             let Some(dob) = self.doc.dobjects.get(i) else { continue; };
             let Geom::BlockRef(br) = &dob.geom else { continue; };
             let Some(blk) = self.doc.blocks.get(br.block) else { continue; };
@@ -56853,5 +56919,120 @@ mod a_sketch_does_not_reach_into_the_drawing {
             .clone();
         assert!(units_line.contains("0.001000"), "{units_line}");
         assert!(!units_line.contains("sketch open"), "{units_line}");
+    }
+}
+
+/// LOCKING A LAYER LOCKS IT.
+///
+/// `LayerTable::selectable` — "not locked, and it renders" — was written, unit-tested in
+/// `cad_kernel`, and then called from nowhere in the app. Every route into the selection basket
+/// ignored it, so the padlock in the layer panel changed a bool and nothing else: locked geometry
+/// picked, window-selected, Select-All'd and edited exactly as before.
+///
+/// The rule these pin down is AutoCAD's, which is narrower than "locked means untouchable":
+/// a locked object still DRAWS and can still be SNAPPED to. It just cannot be selected, and
+/// therefore cannot be edited by anything that works through the selection.
+#[cfg(test)]
+mod a_locked_layer_is_locked {
+    use super::*;
+
+    /// A drawing with one line on a normal layer and one on a locked layer, far apart.
+    /// Returns `(app, free_index, locked_index)`.
+    fn two_layers() -> (CadApp, usize, usize) {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let free = app.doc.push(DObject::new(Geom::Line(Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0),
+        })));
+        let locked_layer = app.doc.layers.add(Layer {
+            name: "LOCKED".into(), locked: true, ..Layer::layer_zero()
+        });
+        app.doc.layers.active = locked_layer;
+        let locked = app.doc.push(DObject::new(Geom::Line(Line {
+            a: Vec2::new(0.0, 50.0), b: Vec2::new(10.0, 50.0),
+        })));
+        assert_eq!(app.doc.dobjects[locked].style.layer, locked_layer, "the fixture is wired up");
+        (app, free, locked)
+    }
+
+    /// A CLICK PASSES STRAIGHT THROUGH a locked object. `nearest_entity_under` is the one
+    /// function all eighteen click sites go through, so this is every pick in the app.
+    #[test]
+    fn a_click_does_not_pick_a_locked_object() {
+        let (app, free, _locked) = two_layers();
+        // Dead on the locked line.
+        assert_eq!(
+            app.nearest_entity_under(Vec2::new(5.0, 50.0), 1.0), None,
+            "clicking a locked object picked it",
+        );
+        // …and the unlocked one is still perfectly pickable, so this is not a blanket refusal.
+        assert_eq!(
+            app.nearest_entity_under(Vec2::new(5.0, 0.0), 1.0), Some(free),
+            "the fix stopped picking anything at all",
+        );
+    }
+
+    /// A WINDOW DRAG over both takes only the one it is allowed to take.
+    #[test]
+    fn a_window_drag_leaves_a_locked_object_behind() {
+        let (mut app, free, locked) = two_layers();
+        // A crossing window (R→L) spanning both lines.
+        app.add_window_selection(Vec2::new(20.0, 60.0), Vec2::new(-5.0, -5.0), false, false, true);
+        assert!(app.selection.contains(&free), "the unlocked line should have been caught");
+        assert!(!app.selection.contains(&locked), "a window drag selected a locked object");
+    }
+
+    /// SELECT ALL means all the objects you are allowed to have.
+    #[test]
+    fn select_all_leaves_a_locked_object_behind() {
+        let (mut app, free, locked) = two_layers();
+        app.add_all_to_selection();
+        assert!(app.selection.contains(&free), "Select All missed the unlocked line");
+        assert!(!app.selection.contains(&locked), "Select All selected a locked object");
+    }
+
+    /// LOCKING A LAYER TAKES ITS OBJECTS OUT OF THE BASKET. Guarding only the entry points
+    /// leaves the obvious hole open: select it, then lock the layer, then move — the edit runs
+    /// off a selection made when the lock was not there.
+    #[test]
+    fn locking_a_layer_drops_its_objects_from_the_current_selection() {
+        let (mut app, free, locked) = two_layers();
+        // Select both while nothing is locked yet.
+        let layer = app.doc.dobjects[locked].style.layer;
+        if let Some(l) = app.doc.layers.get_mut(layer) { l.locked = false; }
+        app.add_all_to_selection();
+        assert!(app.selection.contains(&locked), "both are selected before the lock");
+
+        app.set_layer_locked(layer, true);
+
+        assert!(app.selection.contains(&free), "the unlocked object was dropped too");
+        assert!(
+            !app.selection.contains(&locked),
+            "an object stayed selected after its layer was locked — the next edit still moves it",
+        );
+    }
+
+    /// A LOCKED OBJECT IS NOT A HIDDEN ONE. The cheapest way to pass every test above is to stop
+    /// drawing locked geometry, which would be a far worse product than the bug.
+    #[test]
+    fn a_locked_object_still_draws() {
+        let (app, _free, locked) = two_layers();
+        let layer = app.doc.dobjects[locked].style.layer;
+        assert!(app.doc.layers.renders(layer), "a locked layer must still render");
+        assert!(app.doc.dobjects[locked].style.visible, "and its object is still visible");
+    }
+
+    /// …AND IT CAN STILL BE SNAPPED TO, which is why the lock belongs at selection rather than
+    /// in the geometry. Tracing a new wall along a locked grid line is the reason to lock it.
+    #[test]
+    fn a_locked_object_can_still_be_snapped_to() {
+        let (app, _free, _locked) = two_layers();
+        let mut snaps = SnapSet::default();
+        snaps.end = true;
+        let hit = find_snap(
+            Vec2::new(0.1, 50.1), 1.0, snaps, None, None, &app.doc.dobjects, None,
+        );
+        let hit = hit.expect("the locked line's endpoint must still snap");
+        assert_eq!(hit.point, Vec2::new(0.0, 50.0), "snapped to the wrong point");
     }
 }
