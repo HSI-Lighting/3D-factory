@@ -167,6 +167,29 @@ impl Default for Document {
 
 impl Document {
     /// Append a Dobject. Returns its new index in `dobjects`.
+    /// Roughly how much memory this document occupies, in bytes.
+    ///
+    /// APPROXIMATE, and deliberately cheap: one pass over the dobjects summing each one's own size
+    /// plus its owned buffers. Block definitions are counted too, because a plan made of blocks
+    /// keeps most of its geometry in the table rather than in the objects.
+    ///
+    /// It exists so the undo stack can be bounded by MEMORY rather than by a count of steps. A
+    /// count is the wrong unit: 64 steps of a 200-object sketch is nothing, and 64 steps of a
+    /// 1.5-million-object plan is tens of gigabytes of identical-looking history.
+    pub fn approx_bytes(&self) -> usize {
+        let objs: usize = self.dobjects.iter().map(|d| d.geom.approx_bytes()).sum();
+        let blocks: usize = self
+            .blocks
+            .blocks
+            .iter()
+            .map(|b| b.name.capacity() + b.dobjects.iter().map(|d| d.geom.approx_bytes()).sum::<usize>())
+            .sum();
+        // The per-DObject overhead beyond its geom (handle, style, flags) rides on the struct size.
+        let per_obj = self.dobjects.capacity() * (std::mem::size_of::<crate::dobject::DObject>()
+            - std::mem::size_of::<crate::geom::Geom>());
+        objs + blocks + per_obj + std::mem::size_of::<Document>()
+    }
+
     pub fn push(&mut self, mut d: DObject) -> usize {
         // If the Dobject is being added with the default Style, pull the
         // active layer in so it inherits the user's current layer choice.

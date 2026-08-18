@@ -2098,6 +2098,13 @@ pub struct CadApp {
     /// The Light Editor asked for the folder picker, so the PickFolder result is its photometry
     /// folder rather than a Radiance output or a texture set. One picker, three callers.
     light_editor_wants_folder: bool,
+    /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
+    ///
+    /// A FIELD rather than the bare constant, for two reasons. It is the kind of limit a user with
+    /// 8 GB and a user with 128 GB should be able to set differently; and a floor that only engages
+    /// when one snapshot exceeds the whole budget is otherwise untestable without allocating half a
+    /// gigabyte in a unit test.
+    undo_budget_bytes: usize,
     /// True while the file picker was opened by ▼ FBC scene import rather than ▼ Furniture — the
     /// two share one dialog but place their result very differently.
     scene_import_pending: bool,
@@ -2378,6 +2385,26 @@ pub struct CadApp {
 
 const UNDO_STACK_CAP: usize = 64;
 
+/// HOW MUCH MEMORY THE UNDO HISTORY MAY HOLD, in bytes.
+///
+/// The stack used to be capped at 64 STEPS, and a step is a whole document. Measured: 15.7 MB per
+/// step at 100k dobjects — a gigabyte of history — and 240.2 MB per step at 1.5M, which is
+/// **15.4 GB** at the cap. A count is simply the wrong unit: 64 steps of a 200-object sketch is
+/// nothing at all, and 64 steps of a real plan is more memory than the machine has.
+///
+/// 512 MB is a judgement, and a generous one beside a 300 MB document: it keeps dozens of steps on
+/// anything of ordinary size and a handful on the largest plans, which is the trade a user would
+/// make if asked. It is not a promise about peak memory — the live document, the render buffers
+/// and the CSG model all sit outside it.
+const UNDO_BUDGET_BYTES: usize = 512 << 20;
+
+/// Steps kept REGARDLESS of the budget, so Ctrl+Z always does something.
+///
+/// A single snapshot of a large enough document exceeds the budget on its own. Evicting on size
+/// alone would then leave an empty stack and an undo that silently does nothing — which is worse
+/// than the memory it saves, because the user cannot tell it from an edit that did not register.
+const UNDO_MIN_STEPS: usize = 2;
+
 /// Above this many selected objects, grips stop being drawn — AutoCAD's `GRIPOBJLIMIT`, whose
 /// default is the same 100.
 ///
@@ -2431,6 +2458,29 @@ pub struct FactorySnap {
 pub enum UndoStep {
     Doc(Document),
     Factory(FactorySnap),
+}
+
+impl UndoStep {
+    /// Roughly how much memory this step holds. See [`UNDO_BUDGET_BYTES`].
+    ///
+    /// The Factory arm counts its feature list and the shared profile/path tables, which is where
+    /// a 3D model's weight actually is; the side maps are per-feature and small beside them. As
+    /// with `Document::approx_bytes`, a figure within a few percent computed cheaply is worth far
+    /// more here than an exact one, because this runs on every edit.
+    fn approx_bytes(&self) -> usize {
+        match self {
+            UndoStep::Doc(d) => d.approx_bytes(),
+            UndoStep::Factory(f) => {
+                let m = &f.model;
+                std::mem::size_of::<FactorySnap>()
+                    + m.features.capacity() * std::mem::size_of::<cad_solid::Feature>()
+                    + m.profiles.iter().map(|p| p.pts.capacity() * 8).sum::<usize>()
+                    + m.paths.iter().map(|p| p.pts.capacity() * 12).sum::<usize>()
+                    + f.walls.capacity() * std::mem::size_of::<crate::factory::WallInst>()
+                    + f.furniture.capacity() * std::mem::size_of::<crate::factory::FurnitureInst>()
+            }
+        }
+    }
 }
 
 /// Signed area of a closed path (shoelace). Sign gives winding; callers here want the
@@ -3842,6 +3892,7 @@ impl Default for CadApp {
             pt_denoise: true,
             texset_target: None,
             light_editor_wants_folder: false,
+            undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
             villa_autoloaded: false,
             startup_repair: 0,
@@ -19176,10 +19227,8 @@ impl CadApp {
         let idx_for_log = self.hatch_last_idx;
         self.hatch_confirm_open = false;
         if let Some(snap) = self.hatch_preview_snap.take() {
-            if self.undo_stack.len() >= UNDO_STACK_CAP {
-                self.undo_stack.remove(0);
-            }
             self.undo_stack.push(UndoStep::Doc(snap));
+            self.trim_undo_stack();
             self.redo_stack.clear();
         }
         self.clear_prompt();
@@ -29134,15 +29183,34 @@ impl CadApp {
     // roll back. The snapshot stack is bounded (UNDO_STACK_CAP) — oldest
     // snapshots fall off when the stack is full.
 
+
+    /// Keep the undo history inside BOTH its limits: a count cap, and a memory budget.
+    ///
+    /// ONE FUNCTION, called after every push, because the two limits used to be one — a bare
+    /// `if len >= CAP { remove(0) }` repeated at each snapshot site — and a count is the wrong
+    /// unit for a stack whose steps are whole documents. Measured before this existed: 15.7 MB per
+    /// step at 100k dobjects and 240.2 MB at 1.5M, i.e. 15.4 GB at the 64-step cap.
+    ///
+    /// Oldest first, and never below [`UNDO_MIN_STEPS`]: a single snapshot of a large enough
+    /// document exceeds the budget on its own, and an undo that silently does nothing is worse
+    /// than the memory it saves.
+    fn trim_undo_stack(&mut self) {
+        while self.undo_stack.len() > UNDO_STACK_CAP {
+            self.undo_stack.remove(0);
+        }
+        let mut total: usize = self.undo_stack.iter().map(|s| s.approx_bytes()).sum();
+        while total > self.undo_budget_bytes && self.undo_stack.len() > UNDO_MIN_STEPS {
+            total -= self.undo_stack[0].approx_bytes();
+            self.undo_stack.remove(0);
+        }
+    }
     #[track_caller]
     fn snapshot_doc(&mut self) {
         let t = std::time::Instant::now();
         self.unsaved = true; // an edit is about to happen → drawing diverges from disk
         self.edit_seq = self.edit_seq.wrapping_add(1);
-        if self.undo_stack.len() >= UNDO_STACK_CAP {
-            self.undo_stack.remove(0);
-        }
         self.undo_stack.push(UndoStep::Doc(self.doc.clone()));
+        self.trim_undo_stack();
         // A new editing op invalidates the redo branch — once you diverge
         // from the previously-redoable history you can't return to it.
         self.redo_stack.clear();
@@ -29198,9 +29266,6 @@ impl CadApp {
     fn snapshot_factory(&mut self) {
         self.unsaved = true; // a 3D edit is about to happen → drawing diverges from disk
         self.edit_seq = self.edit_seq.wrapping_add(1);
-        if self.undo_stack.len() >= UNDO_STACK_CAP {
-            self.undo_stack.remove(0);
-        }
         // A SNAPSHOT TAKEN INSIDE A SKETCH MUST NOT RECORD THAT SKETCH AS EMPTY.
         //
         // `factory_enter_sketch` does `mem::take` on `model.sketches[idx].doc` and installs it as
@@ -29226,6 +29291,7 @@ impl CadApp {
             next_room_id: self.factory.next_room_id,
             texture_xforms: self.factory.textures.iter().map(|t| (t.scale, t.offset, t.rot_deg, t.opacity, t.reflect)).collect(),
         }));
+        self.trim_undo_stack();
         self.redo_stack.clear();
     }
 
@@ -29351,12 +29417,11 @@ impl CadApp {
         let from_depth = self.redo_stack.len();
         match self.redo_stack.pop() {
             Some(next) => {
-                // Stash current state back on the undo stack — symmetric.
-                if self.undo_stack.len() >= UNDO_STACK_CAP {
-                    self.undo_stack.remove(0);
-                }
+                // Stash current state back on the undo stack — symmetric, and trimmed by the same
+                // rule as any other push. A redo puts a full document back on the stack too.
                 let cur = self.counterpart_of(&next);
                 self.undo_stack.push(cur);
+                self.trim_undo_stack();
                 self.restore_step(next);
                 crate::dbg_event!(self,
                     crate::dbg_recorder::DbgEvent::RedoFired {
@@ -54067,6 +54132,15 @@ mod perf_investigation {
             let c = doc.clone();
             let clone_ms = t.elapsed().as_secs_f64() * 1000.0;
             println!("  undo snapshot_doc (Document clone) : {clone_ms:8.1} ms   ← PER EDIT");
+            let mb = doc.approx_bytes() as f64 / (1024.0 * 1024.0);
+            let budget_mb = UNDO_BUDGET_BYTES as f64 / (1024.0 * 1024.0);
+            let steps_kept = (budget_mb / mb.max(1e-9)).floor().max(UNDO_MIN_STEPS as f64);
+            println!(
+                "  undo history: {mb:6.1} MB per step   {:7.0} MB at the {}-step cap  ->  \
+                 {:5.0} MB, {steps_kept:.0} steps within budget",
+                mb * UNDO_STACK_CAP as f64, UNDO_STACK_CAP,
+                (steps_kept * mb).min(budget_mb.max(mb * UNDO_MIN_STEPS as f64)),
+            );
             std::hint::black_box(&c);
 
             // ensure_index() calls BOTH — so the real per-edit cost is their sum.
@@ -57934,5 +58008,121 @@ mod the_line_cache_cannot_go_stale {
             app.cached_sketch_lines.is_empty(),
             "the cleared plane is still being drawn — the cache is showing deleted geometry",
         );
+    }
+}
+
+/// THE UNDO HISTORY IS BOUNDED BY MEMORY, NOT BY A COUNT OF STEPS.
+///
+/// A step is a whole document. Measured before this existed: 15.7 MB per step at 100k dobjects —
+/// a gigabyte of history — and 240.2 MB at 1.5M, i.e. **15.4 GB** at the old 64-step cap. A count
+/// is simply the wrong unit for something whose steps vary by four orders of magnitude.
+#[cfg(test)]
+mod the_undo_history_is_bounded_by_memory {
+    use super::*;
+
+    /// A document with `n` polylines of `pts` points each — the cheap way to make a snapshot big.
+    fn doc_of(n: usize, pts: usize) -> Document {
+        let mut d = Document::default();
+        d.dobjects.clear();
+        for i in 0..n {
+            let vertices: Vec<cad_kernel::PolyVertex> = (0..pts)
+                .map(|k| cad_kernel::PolyVertex {
+                    pos: Vec2::new(i as f64 + k as f64, k as f64),
+                    bulge: 0.0,
+                })
+                .collect();
+            d.push(DObject::new(Geom::Polyline(cad_kernel::Polyline {
+                vertices, closed: false, widths: Vec::new(),
+            })));
+        }
+        d
+    }
+
+    fn stack_bytes(app: &CadApp) -> usize {
+        app.undo_stack.iter().map(|s| s.approx_bytes()).sum()
+    }
+
+    /// A SMALL DOCUMENT STILL GETS THE FULL COUNT. The budget must not quietly shorten history
+    /// for the ordinary case it was never about.
+    #[test]
+    fn a_small_document_keeps_the_full_step_cap() {
+        let mut app = CadApp::default();
+        app.doc = doc_of(20, 4);
+        for _ in 0..(UNDO_STACK_CAP + 10) {
+            app.snapshot_doc();
+        }
+        assert_eq!(app.undo_stack.len(), UNDO_STACK_CAP, "a small document lost history it should keep");
+        assert!(stack_bytes(&app) < UNDO_BUDGET_BYTES, "…and is nowhere near the budget");
+    }
+
+    /// A BIG DOCUMENT IS EVICTED BY SIZE, long before it reaches the step cap.
+    #[test]
+    fn a_large_document_is_bounded_by_the_byte_budget() {
+        let mut app = CadApp::default();
+        // ~40 MB a step, so the 512 MB budget bites at about a dozen steps — well inside the cap.
+        app.doc = doc_of(200_000, 8);
+        let per_step = app.doc.approx_bytes();
+        assert!(per_step > 8 << 20, "the fixture must be big enough to matter: {per_step} B");
+
+        for _ in 0..UNDO_STACK_CAP {
+            app.snapshot_doc();
+        }
+        assert!(
+            app.undo_stack.len() < UNDO_STACK_CAP,
+            "the step cap was reached before the byte budget — the budget is doing nothing",
+        );
+        assert!(
+            stack_bytes(&app) <= UNDO_BUDGET_BYTES,
+            "the history is over budget: {} MB",
+            stack_bytes(&app) / (1024 * 1024),
+        );
+    }
+
+    /// CTRL+Z ALWAYS DOES SOMETHING. One snapshot of a large enough document exceeds the budget on
+    /// its own; evicting on size alone would leave an empty stack and an undo that silently does
+    /// nothing — indistinguishable, to the user, from an edit that never registered.
+    #[test]
+    fn undo_survives_a_document_bigger_than_the_whole_budget() {
+        let mut app = CadApp::default();
+        app.doc = doc_of(2_000, 8);
+        // THE PATHOLOGICAL CASE, reached by shrinking the budget rather than by allocating half a
+        // gigabyte in a unit test: one snapshot is now far over it on its own, which is exactly
+        // the position a 300 MB document is in against the real 512 MB default.
+        app.undo_budget_bytes = 1_024;
+        assert!(
+            app.doc.approx_bytes() > app.undo_budget_bytes,
+            "the fixture must exceed the budget in ONE step, or the floor is never reached",
+        );
+        for _ in 0..40 {
+            app.snapshot_doc();
+        }
+        assert!(
+            app.undo_stack.len() >= UNDO_MIN_STEPS,
+            "the budget emptied the undo stack — Ctrl+Z would silently do nothing, which a user \
+             cannot tell from an edit that never registered",
+        );
+    }
+
+    /// OLDEST FIRST. Undo is a stack; evicting from the wrong end would throw away the step the
+    /// user is about to press Ctrl+Z for.
+    #[test]
+    fn eviction_takes_the_oldest_step_first() {
+        let mut app = CadApp::default();
+        app.doc = doc_of(10, 4);
+        // A marker in the FIRST snapshot only, then fill past the cap.
+        app.doc.push(DObject::new(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(-999.0, -999.0), radius: 1.0,
+        })));
+        app.snapshot_doc();
+        let marked = app.doc.dobjects.len();
+        app.doc.dobjects.pop();
+        for _ in 0..UNDO_STACK_CAP {
+            app.snapshot_doc();
+        }
+        let oldest_still_marked = match &app.undo_stack[0] {
+            UndoStep::Doc(d) => d.dobjects.len() == marked,
+            _ => false,
+        };
+        assert!(!oldest_still_marked, "the oldest step survived while newer ones were dropped");
     }
 }

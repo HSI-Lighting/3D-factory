@@ -1323,6 +1323,33 @@ impl Geom {
         // every candidate set.
         matches!(self, Geom::Hatch(_) | Geom::BlockRef(_))
     }
+
+    /// Roughly how much memory this geometry occupies, in bytes — the struct itself plus whatever it
+    /// owns on the heap.
+    ///
+    /// APPROXIMATE ON PURPOSE, and the approximation is stated rather than hidden: it counts the
+    /// enum's own size once and the *capacity* of each owned buffer, and ignores allocator overhead
+    /// and any sharing. It exists so the undo stack can be bounded by MEMORY instead of by a count of
+    /// steps, and for that a figure within a few percent is worth far more than an exact one that
+    /// costs a traversal nobody can afford per edit.
+    pub fn approx_bytes(&self) -> usize {
+        let own = std::mem::size_of::<Geom>();
+        let heap = match self {
+            Geom::Polyline(p) => {
+                p.vertices.capacity() * std::mem::size_of::<PolyVertex>()
+                    + p.widths.capacity() * std::mem::size_of::<(f64, f64)>()
+            }
+            Geom::Spline(s) => {
+                s.control_points.capacity() * std::mem::size_of::<Vec2>()
+                    + s.weights.capacity() * std::mem::size_of::<f64>()
+            }
+            Geom::Hatch(h) => h.boundary_handles.capacity() * std::mem::size_of::<crate::dobject::Handle>(),
+            Geom::Text(t) => t.text.capacity(),
+            // The rest are fixed-size: their fields live inside the enum already.
+            _ => 0,
+        };
+        own + heap
+    }
 }
 
 // ---- Ellipse / EllipseArc geometry ----------------------------------------
