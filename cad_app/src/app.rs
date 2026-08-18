@@ -2095,6 +2095,9 @@ pub struct CadApp {
     /// Which material a pending folder pick is loading a PBR texture set into (the folder dialog is
     /// modal and asynchronous, so the target has to outlive the click that started it).
     texset_target: Option<usize>,
+    /// The Light Editor asked for the folder picker, so the PickFolder result is its photometry
+    /// folder rather than a Radiance output or a texture set. One picker, three callers.
+    light_editor_wants_folder: bool,
     /// True while the file picker was opened by ▼ FBC scene import rather than ▼ Furniture — the
     /// two share one dialog but place their result very differently.
     scene_import_pending: bool,
@@ -3838,6 +3841,7 @@ impl Default for CadApp {
             pt_passes: 64,
             pt_denoise: true,
             texset_target: None,
+            light_editor_wants_folder: false,
             scene_import_pending: false,
             villa_autoloaded: false,
             startup_repair: 0,
@@ -4054,6 +4058,78 @@ impl CadApp {
 
     // ---- commands & math -----------------------------------------------
 
+
+    /// The Light Editor window — block ↔ photometry wiring. Bails if closed.
+    ///
+    /// Everything the window needs is snapshotted BEFORE it opens, and everything it asks for is
+    /// carried out after: `self.doc` and `self.light` cannot both be borrowed while egui holds a
+    /// closure, which is the same reason `render_light_panel` returns an action.
+    fn render_light_editor(&mut self, ctx: &egui::Context) {
+        if !self.light.editor_open {
+            return;
+        }
+        // THE PLAN, NOT WHATEVER IS ON THE CANVAS — the blocks being wired are the drawing's, and
+        // during a face sketch `self.doc` is that plane's document instead.
+        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
+        let all = crate::light_editor::Wiring::block_rows(&plan);
+        let (rows, hidden): (Vec<_>, Vec<_>) =
+            all.into_iter().partition(|r| !self.light.editor.hidden.contains(&r.id));
+        let mut loaded: Vec<String> = self.light.profiles.keys().cloned().collect();
+        loaded.sort_by_key(|s| s.to_lowercase());
+        // How many fittings each wired block WOULD place, for the button's count.
+        let counts: std::collections::HashMap<u32, usize> = self
+            .light
+            .editor
+            .links
+            .keys()
+            .map(|b| (*b, self.light.editor.plan_placements(&plan, *b).len()))
+            .collect();
+
+        let mut open = self.light.editor_open;
+        let scanned = self.light.editor_scanned.clone();
+        let mut wiring = std::mem::take(&mut self.light.editor);
+        let mut pick = self.light.editor_pick;
+        let act = crate::light_editor::window_ui(
+            ctx, &mut open, &mut wiring, &mut pick, &rows, &hidden, &loaded, &scanned, &counts,
+        );
+        self.light.editor = wiring;
+        self.light.editor_pick = pick;
+        self.light.editor_open = open;
+
+        if act.browse_folder {
+            // The app's OWN picker — the same one the Radiance output folder and the PBR texture
+            // set use. One dialog with three callers, rather than a second file-dialog crate.
+            self.light_editor_wants_folder = true;
+            self.open_file_dialog(FileDialogMode::PickFolder, "");
+        }
+        if act.rescan {
+            self.light.editor_scanned = crate::light_editor::scan_folder(&self.light.editor.folder);
+            self.history.push(format!(
+                "  light editor: {} photometry file(s) found",
+                self.light.editor_scanned.len()
+            ));
+        }
+        if let Some((path, block)) = act.import_and_wire {
+            // IMPORT FIRST, WIRE ONLY IF IT PARSED. Wiring a name that is not in the library
+            // would place fittings whose profile never resolves — they would contribute no light
+            // and no error, which is the shape of bug this whole feature is meant to remove.
+            if self.light.load_photometry(&path) {
+                let name = self.light.active_profile.clone();
+                self.light.editor.links.insert(block, name);
+            }
+        }
+        if let Some(block) = act.clear_block {
+            let n = self.light.clear_block_fittings(block);
+            self.history.push(format!("  light editor: {n} fitting(s) removed"));
+        }
+        if act.apply {
+            let (placed, replaced) = self.light.apply_block_wiring(&plan, &self.light.editor.clone());
+            self.history.push(format!(
+                "  light editor: {placed} fitting(s) placed{}",
+                if replaced > 0 { format!(", {replaced} replaced") } else { String::new() },
+            ));
+        }
+    }
     // ===== SIMLUX lighting integration (grafted from simLUX main) ========
     /// Drives the `cad_light` engine on the shared document; `Calculate` needs
     /// `&self.doc`, so the panel returns an action instead of touching it.
@@ -29023,8 +29099,19 @@ impl CadApp {
                 FileDialogMode::PickFolder => {
                     // The Radiance output folder: the browsed dir, or a new subfolder in it.
                     let dir = if name.is_empty() { dlg.dir.clone() } else { dlg.dir.join(name) };
+                    // …or the Light Editor's photometry folder, scanned as soon as it is chosen so
+                    // the right-hand list fills in without a second click.
+                    if self.light_editor_wants_folder {
+                        self.light_editor_wants_folder = false;
+                        self.light.editor.folder = dir.to_string_lossy().into_owned();
+                        self.light.editor_scanned =
+                            crate::light_editor::scan_folder(&self.light.editor.folder);
+                        self.history.push(format!(
+                            "  light editor: {} photometry file(s) found",
+                            self.light.editor_scanned.len()
+                        ));
                     // …or a PBR texture-set folder, if that is what asked for the picker.
-                    if let Some(i) = self.texset_target.take() {
+                    } else if let Some(i) = self.texset_target.take() {
                         self.mf_load_texture_set(i, dir);
                     } else if self.rad_run_after_pick {
                         self.run_radiance_in(dir);
@@ -40053,6 +40140,20 @@ impl eframe::App for CadApp {
                     }
                     ui.separator();
                     ui.checkbox(&mut self.light.window_open, "  Light panel (settings + results)");
+                    if ui
+                        .checkbox(&mut self.light.editor_open, "  💡 Light Editor (blocks → fittings)")
+                        .on_hover_text(
+                            "Pair a block in the drawing with a photometric file and place a \
+                             fitting at every instance of it",
+                        )
+                        .changed()
+                        && self.light.editor_open
+                    {
+                        // Scan on OPEN, so a folder set last session is populated without the user
+                        // having to press anything to see what is in it.
+                        self.light.editor_scanned =
+                            crate::light_editor::scan_folder(&self.light.editor.folder);
+                    }
                     ui.checkbox(&mut self.light.view3d_open, "  3D view");
                     ui.checkbox(&mut self.light.place_mode, "  Place luminaire (click plan)");
                     ui.separator();
@@ -40727,6 +40828,8 @@ impl eframe::App for CadApp {
         }
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
+        // Light Editor (SIMLUX menu ▸ Light Editor) — block ↔ photometry wiring. Bails if closed.
+        self.render_light_editor(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_shortcuts_window(ctx);
         self.render_light_3d_panel(ctx);

@@ -102,6 +102,19 @@ pub struct Luminaire {
     /// stored field. Two numbers that must agree are one number and a bug.
     #[serde(default)]
     pub flux_override: Option<f64>,
+    /// WHICH BLOCK PUT THIS FITTING HERE, if one did. `None` means placed by hand.
+    ///
+    /// The Light Editor wires a block definition in the drawing to a photometric file and places
+    /// one fitting per instance of it. Re-applying that wiring — or changing which file it points
+    /// at — has to replace what it placed LAST time, or pressing Apply twice silently doubles the
+    /// installation, and the lux result with it.
+    ///
+    /// Held ON THE FITTING rather than in a side map beside it, so the two cannot fall out of
+    /// step: deleting a luminaire by hand takes its provenance with it, and the project sidecar
+    /// carries the pairing without a second thing to serialise. A block id is only a number here
+    /// — the engine neither knows nor cares what a block is.
+    #[serde(default)]
+    pub from_block: Option<u32>,
 }
 
 impl Luminaire {
@@ -586,6 +599,7 @@ mod metric_tests {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }
     }
 
@@ -802,6 +816,7 @@ mod a_fitting_may_be_re_rated {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }
     }
 

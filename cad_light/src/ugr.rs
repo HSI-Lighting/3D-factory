@@ -250,6 +250,7 @@ mod tests {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }]
     }
 
@@ -375,6 +376,7 @@ mod tests {
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
+            from_block: None,
                 })
                 .collect()
         };

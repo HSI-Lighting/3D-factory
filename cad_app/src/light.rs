@@ -376,6 +376,16 @@ pub struct RoomLayer {
 pub struct LightState {
     /// Toggles the Light window (Tools ▸ SIMLUX Light).
     pub window_open: bool,
+    /// Toggles the Light Editor window — block ↔ photometry wiring.
+    pub editor_open: bool,
+    /// The block ↔ photometry pairing and its curation. See [`crate::light_editor`].
+    pub editor: crate::light_editor::Wiring,
+    /// Block picked on the left of the Light Editor, waiting for a file on the right. Wiring is a
+    /// two-click gesture — pick the block, pick the fitting — rather than a drag, because the two
+    /// lists scroll independently and a drag between two scrolling lists is a fight.
+    pub editor_pick: Option<u32>,
+    /// Photometry files found by scanning [`crate::light_editor::Wiring::folder`].
+    pub editor_scanned: Vec<(String, String)>,
     /// Loaded IES profiles, keyed by name; always contains [`BUILTIN`].
     pub profiles: HashMap<String, IesProfile>,
     /// Profile used for auto-placed / new luminaires.
@@ -508,6 +518,10 @@ impl LightState {
         profiles.insert(BUILTIN.to_string(), builtin_downlight());
         Self {
             window_open: false,
+            editor_open: false,
+            editor: crate::light_editor::Wiring::default(),
+            editor_pick: None,
+            editor_scanned: Vec::new(),
             profiles,
             // NOT the built-in. Starting with a fitting already chosen makes the second step of
             // the workflow invisible: every point silently becomes a generic downlight and the
@@ -621,6 +635,63 @@ impl LightState {
         best.map(|(_, id)| id)
     }
 
+    /// APPLY A LIGHT-EDITOR WIRING: place one fitting per block instance, replacing whatever the
+    /// same blocks placed last time. Returns `(placed, replaced)`.
+    ///
+    /// REPLACE, NOT ADD, and that is the whole reason `Luminaire::from_block` exists. Pressing
+    /// Apply twice, or changing which photometric file a block points at, must not double the
+    /// installation — and it must not disturb a fitting the user placed by hand, which carries no
+    /// provenance and is therefore never touched.
+    ///
+    /// Only the blocks in THIS wiring are cleared. Unwiring a block deliberately leaves its
+    /// fittings alone: they are real fittings in a real layout, and removing them is a decision
+    /// the user makes with the ✖ on the row, not a side effect of editing something else.
+    pub fn apply_block_wiring(
+        &mut self,
+        doc: &cad_kernel::Document,
+        wiring: &crate::light_editor::Wiring,
+    ) -> (usize, usize) {
+        let wired: std::collections::HashSet<u32> = wiring.links.keys().copied().collect();
+        let before = self.luminaires.len();
+        self.luminaires.retain(|l| !l.from_block.is_some_and(|b| wired.contains(&b)));
+        let replaced = before - self.luminaires.len();
+
+        let mut placed = 0usize;
+        for (p, profile) in wiring.all_placements(doc) {
+            let (z, _) = self.mount_z_at(p.x, p.y);
+            let id = self.next_id;
+            self.next_id += 1;
+            self.luminaires.push(cad_light::Luminaire {
+                id,
+                profile: profile.clone(),
+                position: cad_light::Vertex::new(p.x, p.y, z),
+                rotation_deg: p.rotation_deg,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: Some(p.block),
+            });
+            placed += 1;
+        }
+        // A selection made of fittings that no longer exist would panic the panel that reads it.
+        self.selected.clear();
+        self.last_msg = format!(
+            "Light Editor: {placed} fitting(s) placed from {} block(s){}.",
+            wiring.links.len(),
+            if replaced > 0 { format!(", replacing {replaced}") } else { String::new() },
+        );
+        (placed, replaced)
+    }
+
+    /// Remove every fitting a given block placed — the ✖ on a wired row. Returns how many went.
+    pub fn clear_block_fittings(&mut self, block: u32) -> usize {
+        let before = self.luminaires.len();
+        self.luminaires.retain(|l| l.from_block != Some(block));
+        let gone = before - self.luminaires.len();
+        self.selected.clear();
+        gone
+    }
+
     /// Drop a light POINT at `(x, y)` — step ② of the workflow. Returns its id.
     ///
     /// The point carries whatever fitting is currently chosen, which is usually nothing: marking
@@ -638,6 +709,7 @@ impl LightState {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         });
         self.selected = vec![id];
         let what = if profile.is_empty() {
@@ -961,6 +1033,7 @@ impl LightState {
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
+                    from_block: None,
                 });
                 placed.push(id);
                 n += 1;
@@ -1356,6 +1429,7 @@ impl LightState {
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
+                    from_block: None,
                 });
                 id += 1;
             }
@@ -1426,6 +1500,7 @@ impl LightState {
                 dimming: 1.0,
                 watts_override: None,
                 flux_override: None,
+                from_block: None,
             }]
         } else {
             let mut v = self.luminaires.clone();
@@ -3271,6 +3346,7 @@ mod furniture_in_the_light_scene {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }];
         // One cell, directly under the fitting.
         let plane = CalcPlane {
@@ -4075,5 +4151,106 @@ mod the_plane_is_the_room {
         f.recompute();
         f.clear_selection();
         assert!(LightState::calc_room_polygon(&f).is_none(), "ambiguous: fall back to the model");
+    }
+}
+
+/// APPLYING A LIGHT-EDITOR WIRING places one fitting per block instance — and applying it twice
+/// must not place them twice. A doubled installation is not a visible bug: the markers overlap
+/// exactly, and the only symptom is a lux result and a power density that are both twice what the
+/// design actually is.
+#[cfg(test)]
+mod light_editor_apply {
+    use super::*;
+    use crate::light_editor::Wiring;
+    use cad_kernel::{Block, BlockRef, DObject, Document, Geom, Vec2, MAX_BLOCK_PARAMS};
+
+    fn plan(n: usize) -> (Document, u32) {
+        let mut doc = Document::default();
+        doc.dobjects.clear();
+        doc.units = cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        let id = doc.blocks.add(Block {
+            name: "DOWNLIGHT".into(), base: Vec2::ZERO, dobjects: Vec::new(),
+            smart: false, params: Vec::new(), cut_edges: Vec::new(),
+        });
+        for i in 0..n {
+            doc.push(DObject::new(Geom::BlockRef(BlockRef {
+                block: id, insert: Vec2::new(i as f64 * 2.0, 1.0), scale: 1.0, scale_y: 1.0,
+                rotation: 0.0, mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
+            })));
+        }
+        (doc, id)
+    }
+
+    fn wired(block: u32, profile: &str) -> Wiring {
+        let mut w = Wiring::default();
+        w.links.insert(block, profile.to_string());
+        w
+    }
+
+    #[test]
+    fn applying_a_wiring_places_one_fitting_per_instance() {
+        let (doc, b) = plan(12);
+        let mut s = LightState::default();
+        let (placed, replaced) = s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        assert_eq!((placed, replaced), (12, 0));
+        assert_eq!(s.luminaires.len(), 12);
+        assert!(s.luminaires.iter().all(|l| l.from_block == Some(b)), "provenance is recorded");
+        assert!(s.luminaires.iter().all(|l| l.profile == "PULSE"));
+    }
+
+    /// THE ONE THAT MATTERS. Twice must be the same as once.
+    #[test]
+    fn applying_twice_does_not_double_the_installation() {
+        let (doc, b) = plan(12);
+        let mut s = LightState::default();
+        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        let (placed, replaced) = s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        assert_eq!(placed, 12, "it places the same twelve again");
+        assert_eq!(replaced, 12, "…having removed the twelve it placed before");
+        assert_eq!(s.luminaires.len(), 12, "the installation was doubled");
+    }
+
+    /// Re-wiring to a different file UPDATES the fittings rather than adding a second set beside
+    /// them — which would leave the old product still lighting the room.
+    #[test]
+    fn changing_the_wired_profile_updates_in_place() {
+        let (doc, b) = plan(6);
+        let mut s = LightState::default();
+        s.apply_block_wiring(&doc, &wired(b, "OLD"));
+        s.apply_block_wiring(&doc, &wired(b, "NEW"));
+        assert_eq!(s.luminaires.len(), 6, "a re-wire added a second set");
+        assert!(s.luminaires.iter().all(|l| l.profile == "NEW"), "the fittings kept the old file");
+    }
+
+    /// HAND-PLACED FITTINGS ARE NEVER TOUCHED. They carry no provenance, and a layout is usually
+    /// part generated and part drawn by the designer.
+    #[test]
+    fn a_hand_placed_fitting_survives_every_apply() {
+        let (doc, b) = plan(4);
+        let mut s = LightState::default();
+        let hand = s.place_point(99.0, 99.0);
+        assert!(s.luminaires.iter().find(|l| l.id == hand).unwrap().from_block.is_none());
+
+        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        assert!(
+            s.luminaires.iter().any(|l| l.id == hand),
+            "an Apply deleted a fitting the user placed by hand",
+        );
+        assert_eq!(s.luminaires.len(), 5, "four generated plus the one by hand");
+    }
+
+    /// Unwiring leaves the fittings alone — they are real fittings, and removing them is the ✖ on
+    /// the row, not a side effect of editing a different block.
+    #[test]
+    fn unwiring_a_block_leaves_its_fittings_until_they_are_cleared() {
+        let (doc, b) = plan(5);
+        let mut s = LightState::default();
+        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
+        s.apply_block_wiring(&doc, &Wiring::default()); // nothing wired now
+        assert_eq!(s.luminaires.len(), 5, "unwiring silently deleted the layout");
+
+        assert_eq!(s.clear_block_fittings(b), 5, "the explicit clear removes them");
+        assert!(s.luminaires.is_empty());
     }
 }

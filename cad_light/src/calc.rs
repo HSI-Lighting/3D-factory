@@ -392,7 +392,7 @@ mod tests {
         let meshes = extrude::box_room(w, d, h);
         let mut profiles = HashMap::new();
         profiles.insert("flat".into(), flat_1000cd());
-        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None }];
+        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None, from_block: None }];
         let plane = CalcPlane { origin: Vertex::new(0.0, 0.0, 0.0), width: w, depth: d, cols: 24, rows: 24 };
         (meshes, profiles, lums, plane, RaySettings { rays_per_point: 64, max_bounces: bounces, shadows: true })
     }
@@ -537,6 +537,7 @@ mod tests {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }];
 
         let flux = 4.0 * PI * I;
@@ -631,6 +632,7 @@ mod tests {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }];
         (Vec::new(), profiles, lums, RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false })
     }
@@ -949,6 +951,7 @@ mod surface_tests {
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
+            from_block: None,
         }]
     }
 

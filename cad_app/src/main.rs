@@ -13,6 +13,7 @@ mod assets; // where bundled data lives at runtime — see the module docs
 mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
 mod light;
+mod light_editor; // Light Editor — wire drawing blocks to photometry, place a fitting per instance
 mod light_report; // the SIMLUX calculation written out as a standalone HTML report
 mod light3d;
 mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
