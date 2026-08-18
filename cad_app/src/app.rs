@@ -28750,6 +28750,28 @@ impl CadApp {
     ///
     /// Before this existed every solid operation was irreversible: `snapshot_doc` clones
     /// the `Document`, which does not contain the Factory model.
+    /// The Factory model as a snapshot must record it — with the OPEN PLANE'S DRAWING IN IT.
+    ///
+    /// `factory_enter_sketch` does `mem::take` on `model.sketches[idx].doc` and installs it as
+    /// `self.doc`, so while a session is live the MODEL's copy of the open plane is EMPTY. Any
+    /// snapshot that clones the model naively records that hole, and restoring it after the sketch
+    /// closed wipes everything drawn on that face.
+    ///
+    /// EXTRACTED BECAUSE THE TWO SITES HAD ALREADY DRIFTED. `snapshot_factory` patched this and
+    /// claimed in its own comment that every snapshot was therefore self-consistent "whoever takes
+    /// one" — while `counterpart_of`, which builds the opposite-stack entry on EVERY undo and EVERY
+    /// redo, cloned the model bare. The invariant that comment asserts was false, and it was false
+    /// on the path that runs most. One function now, so they cannot diverge again.
+    fn factory_model_for_snapshot(&self) -> cad_solid::Model {
+        let mut model = self.factory.model.clone();
+        if let Some(s) = self.factory.session.as_ref() {
+            if let Some(sk) = model.sketches.get_mut(s.idx) {
+                sk.doc = self.doc.clone();
+            }
+        }
+        model
+    }
+
     #[track_caller]
     fn snapshot_factory(&mut self) {
         self.unsaved = true; // a 3D edit is about to happen → drawing diverges from disk
@@ -28765,12 +28787,7 @@ impl CadApp {
         // closed would restore that empty doc and wipe everything drawn on the face.
         //
         // Patched at the source, so every snapshot is self-consistent whoever takes one.
-        let mut model = self.factory.model.clone();
-        if let Some(s) = self.factory.session.as_ref() {
-            if let Some(sk) = model.sketches.get_mut(s.idx) {
-                sk.doc = self.doc.clone();
-            }
-        }
+        let model = self.factory_model_for_snapshot();
         self.undo_stack.push(UndoStep::Factory(FactorySnap {
             model,
             walls: self.factory.walls.clone(),
@@ -28810,7 +28827,8 @@ impl CadApp {
         match step {
             UndoStep::Doc(_) => UndoStep::Doc(self.doc.clone()),
             UndoStep::Factory(_) => UndoStep::Factory(FactorySnap {
-                model: self.factory.model.clone(),
+                // THE FIX: was , which records the open plane empty.
+                model: self.factory_model_for_snapshot(),
                 walls: self.factory.walls.clone(),
                 storeys: self.factory.storeys.clone(),
                 active_storey: self.factory.active_storey,
@@ -56025,6 +56043,52 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
             snap.model.sketches[idx].doc.dobjects.len(),
             1,
             "the snapshot recorded the open plane as EMPTY — undoing to it would wipe the face",
+        );
+    }
+
+    /// …AND SO DOES THE COUNTERPART, which is the one that actually runs.
+    ///
+    /// `snapshot_factory` patched this and asserted in its own comment that every snapshot was
+    /// therefore self-consistent "whoever takes one". That was false. `counterpart_of` builds the
+    /// opposite-stack entry on EVERY undo and EVERY redo — the most-travelled path there is — and
+    /// cloned the model bare, recording the open plane as empty. Redo after an undo inside a
+    /// sketch would then restore that hole and wipe the face.
+    ///
+    /// The patch now lives in one function both call, so they cannot drift again.
+    #[test]
+    fn the_undo_counterpart_also_keeps_the_open_faces_drawing() {
+        let mut app = app_with_a_box();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let idx = app.factory.session.as_ref().expect("a session").idx;
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point {
+            location: Vec2::new(1.0, 1.0),
+            style: 0,
+            size: 0.0,
+        })));
+
+        // Exactly what `do_undo` / `do_redo` build for the opposite stack.
+        let counterpart = app.counterpart_of(&UndoStep::Factory(FactorySnap {
+            model: app.factory.model.clone(),
+            walls: app.factory.walls.clone(),
+            storeys: app.factory.storeys.clone(),
+            active_storey: app.factory.active_storey,
+            ceilings: app.factory.ceilings.clone(),
+            furniture: app.factory.furniture.clone(),
+            feature_color: app.factory.feature_color.clone(),
+            surface_color: app.factory.surface_color.clone(),
+            feature_texture: app.factory.feature_texture.clone(),
+            surface_texture: app.factory.surface_texture.clone(),
+            feature_group: app.factory.feature_group.clone(),
+            rooms: app.factory.rooms.clone(),
+            next_room_id: app.factory.next_room_id,
+            texture_xforms: Vec::new(),
+        }));
+
+        let UndoStep::Factory(snap) = counterpart else { panic!("a factory counterpart") };
+        assert_eq!(
+            snap.model.sketches[idx].doc.dobjects.len(),
+            1,
+            "the counterpart recorded the open plane as EMPTY — a redo would wipe the face",
         );
     }
 
