@@ -22,6 +22,9 @@ serde    = { version = "1", features = ["derive"] }
 # The standalone sandbox window is an EXAMPLE, so egui/eframe are dev-deps only —
 # `cad_solid` itself (lib) is UI-agnostic. Mirrors cad_app's eframe feature set.
 [dev-dependencies]
+# `Feature::enabled` must default to TRUE on load, and `bool::default()` is FALSE — proving that a
+# project saved before the flag existed still opens with its geometry takes real deserialisation.
+serde_json = "1"
 eframe    = { version = "0.30", default-features = false, features = ["default_fonts", "glow"] }
 egui      = "0.30"
 egui_glow = "0.30"

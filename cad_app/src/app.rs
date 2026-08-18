@@ -5759,6 +5759,20 @@ impl CadApp {
         }
     }
 
+    /// Record any opening the last wall edit orphaned, given the count from BEFORE it.
+    ///
+    /// The status bar says it and the 3D view marks it, but both are read at the moment they
+    /// happen and a wall edit is a busy moment. The history is the line the user scrolls back to
+    /// when a window turns out to be missing an hour later, so the loss belongs in it.
+    fn note_orphaned_openings(&mut self, lost_before: usize) {
+        let lost = self.factory.orphaned_cutouts().len().saturating_sub(lost_before);
+        if lost > 0 {
+            self.history.push(format!(
+                "  ! {lost} opening(s) lost their wall segment — kept, not applied (▼ Openings)"
+            ));
+        }
+    }
+
     /// The Openings menu — every cutout (window/door/recess = a Difference feature) listed so
     /// it can be SELECTED (→ its Position/Dimensions load into the properties panel for resize/
     /// move) or DELETED (the opening fills back in). Clicking a cutout in the 3D view is
@@ -5772,6 +5786,25 @@ impl CadApp {
         }
         ui.label(egui::RichText::new(format!("  {} cutout(s)", ids.len())).small().weak());
         ui.label(egui::RichText::new("  ✏ Edit in 2D reshapes the opening on its plane.").small().weak());
+        // ORPHANS ARE ANNOUNCED, not left to be found. An opening that lost its wall segment is
+        // kept but not applied, so the wall renders whole — the list is the only place that can
+        // say a window you drew is no longer cutting anything.
+        let orphaned = self.factory.orphaned_cutouts();
+        if !orphaned.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "  ⚠ {} opening(s) lost their wall — kept, not applied.",
+                    orphaned.len()
+                ))
+                .small()
+                .color(egui::Color32::from_rgb(230, 150, 150)),
+            );
+            ui.label(
+                egui::RichText::new("  Marked in red in 3D. Delete, or re-cut on the new wall.")
+                    .small()
+                    .weak(),
+            );
+        }
         ui.separator();
         let selected = self.factory.selected_single();
         let mut to_delete: Option<u32> = None;
@@ -5782,9 +5815,32 @@ impl CadApp {
             // The two largest extents are the opening's face size; the smallest is its depth.
             let mut s = size;
             s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let label = format!("Opening {}  ·  {:.2} × {:.2} m", n + 1, s[2], s[1]);
+            let lost = orphaned.contains(id);
+            let label = format!(
+                "{}Opening {}  ·  {:.2} × {:.2} m",
+                if lost { "⚠ " } else { "" },
+                n + 1,
+                s[2],
+                s[1]
+            );
             ui.horizontal(|ui| {
-                if ui.selectable_label(selected == Some(*id), label).clicked() {
+                let mut row = egui::RichText::new(label);
+                if lost {
+                    row = row.color(egui::Color32::from_rgb(230, 150, 150));
+                }
+                let resp = ui.selectable_label(selected == Some(*id), row);
+                let resp = if lost {
+                    resp.on_hover_text(
+                        "This opening's wall segment no longer exists — a vertex was added to or \
+                         removed from the wall, and no rebuilt segment contains it.\n\nIt is KEPT \
+                         but not applied: deleting it would destroy your window, and re-binding it \
+                         would cut a different wall. Delete it, or draw the opening again on the \
+                         wall you want.",
+                    )
+                } else {
+                    resp
+                };
+                if resp.clicked() {
                     to_select = Some(*id);
                 }
                 if ui
@@ -8882,6 +8938,7 @@ impl CadApp {
         self.snapshot_factory();
         let plane = cad_solid::Plane::from_basis(frame.origin, frame.u, frame.v);
         let mut made = 0;
+        let mut lost_target = 0;
         for pts in loops {
             if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
                 // One Difference per target body, each relocated to sit right AFTER its body.
@@ -8897,14 +8954,24 @@ impl CadApp {
                         cad_solid::Primitive::Extrusion { profile, h, w, d },
                     );
                     if let Some(diff) = self.factory.model.features.pop() {
-                        match self.factory.model.features.iter().position(|f| f.id == tid) {
-                            Some(ti) => self.factory.model.features.insert(ti + 1, diff),
-                            None => self.factory.model.features.push(diff),
+                        // A MISSING TARGET IS NOT A NO-OP. `insert_after` appends when it cannot
+                        // find the host, so the cutter is still in the model — bound to whatever
+                        // Union happens to be last, which is some other body. That is the same
+                        // silent mis-binding `rederive_wall` was fixed for, and it must not be
+                        // discarded just because the return type makes it easy to.
+                        if !self.factory.model.insert_after(tid, diff) {
+                            lost_target += 1;
                         }
                     }
                 }
                 made += 1;
             }
+        }
+        if lost_target > 0 {
+            self.history.push(format!(
+                "  ! {lost_target} cutter(s) could not find their body — appended, so they may cut \
+                 the wrong one (▼ Openings to check or delete)"
+            ));
         }
         if made == 0 {
             self.undo_stack.pop();
@@ -9027,11 +9094,16 @@ impl CadApp {
         );
         match target {
             Some(tid) => {
-                // Relocate the Difference to sit right after its target body.
+                // Relocate the Difference to sit right after its target body — and say so if it
+                // could not be found, because the fallback is to append, and an appended cutter
+                // opens whichever body is last rather than none.
                 if let Some(diff) = self.factory.model.features.pop() {
-                    match self.factory.model.features.iter().position(|f| f.id == tid) {
-                        Some(ti) => self.factory.model.features.insert(ti + 1, diff),
-                        None => self.factory.model.features.push(diff),
+                    if !self.factory.model.insert_after(tid, diff) {
+                        self.history.push(
+                            "  ! swept cut could not find its body — appended, so it may cut the \
+                             wrong one (▼ Openings to check or delete)"
+                                .into(),
+                        );
                     }
                 }
             }
@@ -11984,12 +12056,14 @@ impl CadApp {
                                 if let Some(si) = self.factory.pick_wall_edge(wi, pos, rect, &mvp) {
                                     if let Some(w) = self.factory.cursor_on_plane(pos, rect, &mvp) {
                                         self.snapshot_factory();
+                                        let lost_before = self.factory.orphaned_cutouts().len();
                                         self.factory.wall_insert_vertex(
                                             wi, si, glam::Vec2::new(w.x, w.y),
                                         );
                                         self.factory.select_wall(wi);
                                         self.factory.recompute();
                                         self.history.push("  3D wall: vertex added".into());
+                                        self.note_orphaned_openings(lost_before);
                                         handles_took_input = true;
                                         return_after_click = true;
                                     }
@@ -12002,10 +12076,12 @@ impl CadApp {
                             if let Some(pos) = resp.interact_pointer_pos() {
                                 if let Some(vi) = self.factory.pick_wall_vertex(wi, pos, rect, &mvp) {
                                     self.snapshot_factory();
+                                    let lost_before = self.factory.orphaned_cutouts().len();
                                     if self.factory.wall_delete_vertex(wi, vi) {
                                         self.factory.select_wall(wi);
                                         self.factory.recompute();
                                         self.history.push("  3D wall: vertex deleted".into());
+                                        self.note_orphaned_openings(lost_before);
                                     } else {
                                         // Refused (a wall needs 2 points) — say why, and
                                         // do not leave a no-op undo step behind.
@@ -53642,6 +53718,7 @@ mod plan_overlay {
             plane: cad_solid::Plane::default(),
             placement: cad_solid::Placement { u: 3.0, v: 3.0, ..Default::default() },
             primitive: cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            enabled: true,
         });
         assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
         let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();

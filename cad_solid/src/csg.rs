@@ -180,6 +180,22 @@ pub fn eval(model: &Model) -> SolidMesh {
     // produces is tagged with it, so the app can colour a body by its feature.
     let mut current: Option<(CsgMesh, u32)> = None;
     for f in &model.features {
+        // A DISABLED FEATURE IS SKIPPED — and skipping a disabled UNION also ENDS its body,
+        // rather than letting the cuts that follow it fall through onto the previous one.
+        //
+        // Dropping the body and keeping its cuts would re-bind them, which is the exact
+        // corruption `Feature::enabled` was added to refuse. So the body is flushed and
+        // `current` cleared: the trailing Differences then meet no body and are dropped, the
+        // same way `eval` already drops a leading Difference. Disabling a body disables what it
+        // was opened by; it never moves those openings onto a neighbour.
+        if !f.enabled {
+            if f.op == BoolOp::Union {
+                if let Some((c, id)) = current.take() {
+                    append_solid(&c, id, &mut out);
+                }
+            }
+            continue;
+        }
         let m = world_mesh(f, model);
         match f.op {
             BoolOp::Union => {
@@ -246,6 +262,76 @@ mod tests {
 
     fn boxf(w: f32, d: f32, h: f32) -> Primitive {
         Primitive::Box { w, d, h }
+    }
+
+    /// A DISABLED CUTTER DOES NOT CUT — the flag has to reach the geometry, or "kept and flagged"
+    /// is just "kept", and an orphaned opening goes on quietly making a hole in the wrong wall.
+    ///
+    /// Asserted on the BOUNDS rather than the triangle count: a cut that removes the whole +X end
+    /// of the body shortens the mesh, and that is a fact about the solid rather than about how
+    /// csgrs happened to tessellate it.
+    #[test]
+    fn a_disabled_difference_does_not_cut() {
+        // A 4 × 1 × 1 bar centred on the origin, so it spans x ∈ [-2, 2].
+        let mut m = Model::default();
+        m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        // A cutter that swallows everything past x = 1: centred at x = 2, 2 wide.
+        let cut = m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            Placement { u: 2.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(2.0, 2.0, 2.0),
+        );
+
+        let (_, mx) = m.eval().bounds().expect("the bar has bounds");
+        assert!(
+            (mx[0] - 1.0).abs() < 1e-3,
+            "with the cutter enabled the bar must end at x = 1, got {}",
+            mx[0]
+        );
+
+        assert_eq!(m.set_enabled(cut, false), Some(true), "the cutter was enabled before");
+        let (_, mx) = m.eval().bounds().expect("the bar still has bounds");
+        assert!(
+            (mx[0] - 2.0).abs() < 1e-3,
+            "a DISABLED cutter still cut: the bar should reach x = 2 again, got {}",
+            mx[0]
+        );
+    }
+
+    /// DISABLING A BODY ALSO ENDS IT — its openings must not fall through onto the previous body.
+    ///
+    /// `eval` folds each Difference onto the most recent Union. If a disabled Union were merely
+    /// skipped, the cutters behind it would meet the body BEFORE it and start cutting that
+    /// instead — re-binding an opening to a neighbour, which is the exact corruption the flag
+    /// exists to refuse. So the body is flushed and its cuts meet nothing.
+    #[test]
+    fn disabling_a_body_does_not_hand_its_cuts_to_the_previous_body() {
+        let mut m = Model::default();
+        // Body A: a 4 × 1 × 1 bar at the origin. Untouched by anything that follows.
+        m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        // Body B, well clear of A, with a cutter of its own sitting behind it.
+        let b = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 20.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(4.0, 1.0, 1.0),
+        );
+        m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            // Overlaps A, NOT B — so if this cut ever reaches A it is unmistakable.
+            Placement { u: 2.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(2.0, 2.0, 2.0),
+        );
+
+        m.set_enabled(b, false);
+        let (mn, mx) = m.eval().bounds().expect("body A survives");
+        assert!(
+            (mn[0] + 2.0).abs() < 1e-3 && (mx[0] - 2.0).abs() < 1e-3,
+            "body B's cutter reached body A: A should still span x ∈ [-2, 2], got [{}, {}]",
+            mn[0], mx[0]
+        );
     }
 
     #[test]

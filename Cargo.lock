@@ -360,6 +360,7 @@ dependencies = [
  "glam 0.29.3",
  "nalgebra",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

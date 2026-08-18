@@ -597,6 +597,26 @@ pub struct Feature {
     pub plane: Plane,
     pub placement: Placement,
     pub primitive: Primitive,
+    /// KEPT, BUT NOT APPLIED. A disabled feature stays in the history, keeps its id and every
+    /// side-map entry keyed on it, and is skipped by [`csg::eval`] — the same shape
+    /// `meshcut::Cut` already uses for a disabled cut.
+    ///
+    /// It exists so that a step which can no longer be honoured is neither silently deleted nor
+    /// silently re-bound. The case that forced it: a wall edit that changes the segment COUNT can
+    /// leave an opening with no host segment, and both alternatives are corruption — deleting it
+    /// destroys the user's window, re-binding it moves that window into a different wall.
+    ///
+    /// `#[serde(default = "…")]` and not `#[serde(default)]`, because `bool::default()` is FALSE:
+    /// a plain default would load every feature of every existing project disabled and open the
+    /// building as an empty scene.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+/// Serde's default for [`Feature::enabled`] — see the field. Must be `true`: it is what every
+/// project saved before the flag existed gets.
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl Feature {
@@ -1179,8 +1199,58 @@ impl Model {
     /// Append a feature, assigning it a fresh id; returns that id.
     pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
         let id = self.take_feature_id();
-        self.features.push(Feature { id, op, plane, placement, primitive });
+        self.features.push(Feature { id, op, plane, placement, primitive, enabled: true });
         id
+    }
+
+    /// Insert a fully-formed feature at `at`, clamped to the end. The id is kept as-is — this
+    /// MOVES or RESTORES a feature, it does not mint one.
+    ///
+    /// Position is not cosmetic in this list: [`csg::eval`] folds each `Difference` onto the most
+    /// recent `Union`, so an index IS a binding. Callers were reaching into `features` directly to
+    /// express that, which put the invariant in four places and none of them in this module.
+    pub fn insert_at(&mut self, at: usize, f: Feature) -> usize {
+        let at = at.min(self.features.len());
+        self.features.insert(at, f);
+        at
+    }
+
+    /// Put `f` DIRECTLY BEHIND the feature `host_id` — the placement a cutter needs, stated once.
+    ///
+    /// A `Difference` cuts the most recent `Union` before it, so "which body does this open?" is
+    /// answered entirely by where the cutter sits. Appending instead of inserting reaches only the
+    /// LAST body in the model, which is how an opening ends up in someone else's wall.
+    ///
+    /// Appends when `host_id` is unknown, and reports which happened: `false` means the host was
+    /// not found and the feature is now at the end, bound to whatever precedes it. A caller that
+    /// cannot accept that — anything placing an opening — must check.
+    ///
+    /// `#[must_use]`, because "reportable" and "reported" are not the same thing and the entire
+    /// failure mode here is silence. Discarding the result compiles perfectly and reinstates
+    /// exactly the mis-binding this method exists to name.
+    #[must_use = "false means the cutter was APPENDED and is now opening some other body"]
+    pub fn insert_after(&mut self, host_id: u32, f: Feature) -> bool {
+        match self.features.iter().position(|g| g.id == host_id) {
+            Some(i) => {
+                self.features.insert(i + 1, f);
+                true
+            }
+            None => {
+                self.features.push(f);
+                false
+            }
+        }
+    }
+
+    /// Set a feature's [`enabled`](Feature::enabled) flag; returns the previous value.
+    pub fn set_enabled(&mut self, id: u32, on: bool) -> Option<bool> {
+        let f = self.features.iter_mut().find(|f| f.id == id)?;
+        Some(std::mem::replace(&mut f.enabled, on))
+    }
+
+    /// Whether the feature with `id` is applied. `None` for an unknown id.
+    pub fn is_enabled(&self, id: u32) -> Option<bool> {
+        self.features.iter().find(|f| f.id == id).map(|f| f.enabled)
     }
 
     /// Store a closed outline and return `(id, centre, w, d)`.
@@ -1584,6 +1654,7 @@ mod tests {
             plane: Plane { kind: PlaneKind::XY, offset: 2.0, custom: None },
             placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
+            enabled: true,
         };
         let (mn, mx) = f.world_aabb();
         // Centred at u=3 on X → x spans 2..4; sits on plane at z=offset=2 → z 2..3.
@@ -1598,7 +1669,54 @@ mod tests {
             plane: Plane::default(),
             placement: Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
+            enabled: true,
         }
+    }
+
+    /// A PROJECT SAVED BEFORE THE FLAG EXISTED MUST OPEN WITH ITS BUILDING IN IT.
+    ///
+    /// `enabled` is a bool, and `bool::default()` is FALSE, so `#[serde(default)]` would have
+    /// loaded every feature of every existing file disabled — every saved building opening as an
+    /// empty scene, with no error and nothing to see. The field carries an explicit default
+    /// function instead, and this is what holds it there.
+    ///
+    /// The JSON is written out by hand rather than round-tripped, because a round-trip would
+    /// serialise the field and never exercise its absence.
+    #[test]
+    fn a_feature_saved_without_the_flag_loads_enabled() {
+        let legacy = r#"{
+            "id": 7,
+            "op": "Union",
+            "plane": { "kind": "XY", "offset": 0.0, "custom": null },
+            "placement": { "u": 0.0, "v": 0.0, "lift": 0.0, "spin_deg": 0.0, "pitch_deg": 0.0, "roll_deg": 0.0 },
+            "primitive": { "Box": { "w": 1.0, "d": 1.0, "h": 1.0 } }
+        }"#;
+        let f: Feature = serde_json::from_str(legacy).expect("a pre-flag feature must still parse");
+        assert!(f.enabled, "an existing project would open as an empty scene");
+    }
+
+    /// `insert_after` is where "a cutter sits directly behind the body it opens" is stated, so it
+    /// has to be true — including the part callers keep getting wrong, that a MISSING host means
+    /// the feature lands at the end bound to a stranger, and the caller must be told.
+    #[test]
+    fn insert_after_places_a_cutter_behind_its_host_and_reports_a_missing_one() {
+        let mut m = Model::default();
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+        let b = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
+
+        let mut cutter = box_at(0.0, 0.0);
+        cutter.id = 900;
+        cutter.op = BoolOp::Difference;
+        assert!(m.insert_after(a, cutter), "host `a` is present");
+
+        let at = |id: u32, m: &Model| m.features.iter().position(|f| f.id == id).expect("present");
+        assert_eq!(at(900, &m), at(a, &m) + 1, "the cutter must sit directly behind body a");
+        assert!(at(900, &m) < at(b, &m), "…and therefore before body b");
+
+        let mut stray = box_at(0.0, 0.0);
+        stray.id = 901;
+        assert!(!m.insert_after(4_242, stray), "an unknown host must be reported, not hidden");
+        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it appends when the host is gone");
     }
 
     #[test]
