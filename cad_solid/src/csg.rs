@@ -175,6 +175,74 @@ fn world_mesh(f: &Feature, model: &Model) -> CsgMesh {
 /// A leading Difference with no body to cut is simply dropped (there is nothing to
 /// subtract from) — which is why `add_room` requires a building first.
 pub fn eval(model: &Model) -> SolidMesh {
+    eval_inner(model, None)
+}
+
+/// What ONE feature cost to fold in. See [`EvalProfile`].
+#[derive(Clone, Debug)]
+pub struct FeatureCost {
+    pub id: u32,
+    pub op: BoolOp,
+    /// Primitive kind, for reading the table without cross-referencing the model.
+    pub kind: &'static str,
+    /// Wall-clock for this feature's own boolean, in milliseconds.
+    pub ms: f64,
+    /// Polygons in this feature's OWN mesh — the second operand of the boolean, and the thing
+    /// a bounding-box pre-partition gets to shrink.
+    pub polys_operand: usize,
+    /// Polygons in the running body AFTER this step. A Union starts a new body, so this is its
+    /// own count; a Difference's is the body it just cut.
+    pub polys_body: usize,
+}
+
+/// Where the time in an evaluation actually goes.
+///
+/// EVERY DOWNSTREAM THRESHOLD IN THE PLAN WAS ESTIMATED, and two of them were estimated against a
+/// BSP that was collapsing because the boolean tolerance was wrong. This is the measurement that
+/// replaces the estimates: per-feature cost against a real project, not a synthetic one.
+///
+/// `deepest_operand` is the recursion bound that matters. csgrs's BSP degenerates to a linked list
+/// for a convex body, and `Node::build`, `clip_polygons`, `clip_to` and `Drop` all recurse, so the
+/// largest single mesh fed to a boolean is what decides how close an evaluation comes to the
+/// stack. It is the number `Model::eval`'s 64 MB thread was sized against.
+#[derive(Clone, Debug, Default)]
+pub struct EvalProfile {
+    pub total_ms: f64,
+    pub features: Vec<FeatureCost>,
+    pub bodies: usize,
+    pub tris: usize,
+    pub deepest_operand: usize,
+    /// Features skipped because [`crate::Feature::enabled`] is clear.
+    pub disabled: usize,
+}
+
+impl EvalProfile {
+    /// The `n` most expensive features, worst first — the only part of a 4,000-feature table
+    /// anyone reads.
+    pub fn worst(&self, n: usize) -> Vec<&FeatureCost> {
+        let mut v: Vec<&FeatureCost> = self.features.iter().collect();
+        v.sort_by(|a, b| b.ms.total_cmp(&a.ms));
+        v.truncate(n);
+        v
+    }
+}
+
+/// [`eval`], with a per-feature cost table. Same fold, same result — deliberately the SAME
+/// FUNCTION with the profiler switched on, because a profiler that walks its own copy of the loop
+/// measures a code path the app does not run.
+///
+/// Runs on the caller's stack, unlike [`Model::eval`]: this is a diagnostic, and a diagnostic that
+/// silently used a different stack size would not be measuring the thing being diagnosed. Call it
+/// from a big-stack thread yourself if the model is deep.
+pub fn eval_profiled(model: &Model) -> (SolidMesh, EvalProfile) {
+    let mut p = EvalProfile::default();
+    let mesh = eval_inner(model, Some(&mut p));
+    p.tris = mesh.tri_count();
+    (mesh, p)
+}
+
+fn eval_inner(model: &Model, mut prof: Option<&mut EvalProfile>) -> SolidMesh {
+    let t_all = std::time::Instant::now();
     let mut out = SolidMesh::default();
     // The leading feature id of the body currently accumulating — every triangle it
     // produces is tagged with it, so the app can colour a body by its feature.
@@ -194,9 +262,14 @@ pub fn eval(model: &Model) -> SolidMesh {
                     append_solid(&c, id, &mut out);
                 }
             }
+            if let Some(p) = prof.as_deref_mut() {
+                p.disabled += 1;
+            }
             continue;
         }
+        let t = std::time::Instant::now();
         let m = world_mesh(f, model);
+        let operand = m.polygons.len();
         match f.op {
             BoolOp::Union => {
                 if let Some((c, id)) = current.take() {
@@ -215,11 +288,48 @@ pub fn eval(model: &Model) -> SolidMesh {
                 }
             }
         }
+        if let Some(p) = prof.as_deref_mut() {
+            // The BODY count is read AFTER the boolean, so a Difference reports what the cut
+            // left behind rather than what it started with — that is the number that grows.
+            // THE LARGEST MESH EVER FED TO A BOOLEAN, not the last one — that is the figure the
+            // eval stack has to survive, and a model rarely ends on its biggest solid.
+            p.deepest_operand = p.deepest_operand.max(operand);
+            let body = current.as_ref().map_or(0, |(c, _)| c.polygons.len());
+            p.deepest_operand = p.deepest_operand.max(body);
+            p.features.push(FeatureCost {
+                id: f.id,
+                op: f.op,
+                kind: primitive_kind(&f.primitive),
+                ms: t.elapsed().as_secs_f64() * 1000.0,
+                polys_operand: operand,
+                polys_body: body,
+            });
+        }
     }
     if let Some((c, id)) = current {
         append_solid(&c, id, &mut out);
     }
+    if let Some(p) = prof.as_deref_mut() {
+        p.total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
+        p.bodies = out.face_ids.iter().collect::<std::collections::HashSet<_>>().len();
+    }
     out
+}
+
+/// Primitive kind as a short word, for a diagnostic table.
+fn primitive_kind(p: &Primitive) -> &'static str {
+    match p {
+        Primitive::Box { .. } => "Box",
+        Primitive::Cylinder { .. } => "Cylinder",
+        Primitive::Sphere { .. } => "Sphere",
+        Primitive::Frustum { .. } => "Frustum",
+        Primitive::Torus { .. } => "Torus",
+        Primitive::Capsule { .. } => "Capsule",
+        Primitive::Tube { .. } => "Tube",
+        Primitive::Ellipsoid { .. } => "Ellipsoid",
+        Primitive::Extrusion { .. } => "Extrusion",
+        Primitive::Sweep { .. } => "Sweep",
+    }
 }
 
 /// World-space triangle positions (3 per triangle) of ONE feature's raw primitive mesh,
@@ -334,6 +444,137 @@ mod tests {
         );
     }
 
+
+    /// THE PROFILER MUST MEASURE THE EVALUATION THE APP ACTUALLY RUNS.
+    ///
+    /// `eval` and `eval_profiled` are the same function with the profiler switched on, and that
+    /// is the point: a profiler that walks its own copy of the fold measures a code path nobody
+    /// ships. This pins the two together on the thing that would diverge first — the mesh.
+    #[test]
+    fn profiling_an_evaluation_does_not_change_it() {
+        let mut m = Model::default();
+        m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 2.0, 2.0));
+        m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            Placement { u: 1.0, v: 0.0, lift: 0.5, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(1.0, 4.0, 1.0),
+        );
+        // A DISABLED FEATURE IS IN THE FIXTURE ON PURPOSE. It is the cheapest thing for a
+        // second copy of the fold to get wrong, and the difference would be invisible on any
+        // model that has none.
+        let off = m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            Placement { u: -1.0, v: 0.0, lift: 0.5, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(1.0, 4.0, 1.0),
+        );
+        m.set_enabled(off, false);
+
+        let plain = eval(&m);
+        let (profiled, p) = eval_profiled(&m);
+        assert_eq!(plain.tri_count(), profiled.tri_count(), "profiling changed the mesh");
+        assert_eq!(plain.positions, profiled.positions, "profiling moved a vertex");
+        assert_eq!(p.tris, plain.tri_count(), "the profile disagrees with its own mesh");
+        assert_eq!(p.disabled, 1, "the disabled feature was not seen as skipped");
+    }
+
+    /// EVERY APPLIED FEATURE IS ACCOUNTED FOR, and every skipped one is counted rather than
+    /// silently missing — otherwise a model with disabled features would report a total that
+    /// does not add up and nobody could tell which of the two numbers was wrong.
+    #[test]
+    fn the_profile_accounts_for_every_feature() {
+        let mut m = Model::default();
+        m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 2.0, 2.0));
+        let cut = m.push(
+            BoolOp::Difference,
+            Plane::default(),
+            Placement { u: 1.0, v: 0.0, lift: 0.5, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(1.0, 4.0, 1.0),
+        );
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 30.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(1.0, 1.0, 1.0),
+        );
+
+        let (_, p) = eval_profiled(&m);
+        assert_eq!(p.features.len(), 3, "a feature went unmeasured");
+        assert_eq!(p.disabled, 0, "nothing was disabled");
+        assert_eq!(p.bodies, 2, "two Unions are two bodies");
+
+        m.set_enabled(cut, false);
+        let (_, p) = eval_profiled(&m);
+        assert_eq!(p.features.len(), 2, "a disabled feature was still measured as work done");
+        assert_eq!(p.disabled, 1, "the skipped feature was not counted");
+    }
+
+    /// `deepest_operand` IS THE STACK NUMBER. csgrs's BSP degenerates to a linked list on a convex
+    /// body and recurses about once per polygon, so the largest single mesh in an evaluation is
+    /// what decides how close it comes to overflowing — the figure `Model::eval`'s 64 MB thread
+    /// was sized against, and until now the one nobody had measured on a real model.
+    #[test]
+    fn the_profile_reports_the_largest_mesh_it_fed_to_a_boolean() {
+        let mut m = Model::default();
+        // A 64-sided cylinder is far more polygons than the box that cuts it, so the deepest
+        // operand must be the cylinder's — not the last thing evaluated.
+        m.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Cylinder { r: 3.0, h: 2.0, sides: 64 },
+        );
+        m.push(BoolOp::Difference, Plane::default(), Placement::default(), boxf(1.0, 1.0, 4.0));
+        // A TINY BODY LAST, and this is the part that makes the assertion mean anything: it
+        // starts a new body, so whatever is "current" at the end is six polygons. A profiler
+        // that reported the LAST body instead of the LARGEST mesh would look correct on any
+        // model that happens to end on its biggest solid, and would understate the stack risk
+        // on every model that does not.
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 40.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(0.5, 0.5, 0.5),
+        );
+
+        let (_, p) = eval_profiled(&m);
+        let cyl = p.features.iter().find(|f| f.kind == "Cylinder").expect("the cylinder was measured");
+        assert!(cyl.polys_operand > 60, "a 64-sided cylinder should be > 60 polygons, got {}", cyl.polys_operand);
+        let last = p.features.last().expect("a last feature");
+        assert!(
+            last.polys_body < cyl.polys_operand,
+            "the fixture must END on a small body, or this proves nothing: {} vs {}",
+            last.polys_body, cyl.polys_operand,
+        );
+        assert!(
+            p.deepest_operand >= cyl.polys_operand,
+            "the deepest operand ({}) is smaller than a mesh that was actually evaluated ({}) — \
+             the stack figure is being read off the last body rather than the biggest one",
+            p.deepest_operand, cyl.polys_operand,
+        );
+    }
+
+    /// The worst-N view is what a 4,000-feature table is actually read through, so it has to be
+    /// sorted the way it claims.
+    #[test]
+    fn the_worst_features_come_back_worst_first() {
+        let mut m = Model::default();
+        m.push(
+            BoolOp::Union, Plane::default(), Placement::default(),
+            Primitive::Cylinder { r: 3.0, h: 2.0, sides: 64 },
+        );
+        for i in 0..4 {
+            m.push(
+                BoolOp::Difference, Plane::default(),
+                Placement { u: i as f32 * 0.5, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                boxf(0.4, 0.4, 4.0),
+            );
+        }
+        let (_, p) = eval_profiled(&m);
+        let worst = p.worst(3);
+        assert_eq!(worst.len(), 3, "asked for three");
+        assert!(worst[0].ms >= worst[1].ms && worst[1].ms >= worst[2].ms, "not sorted worst-first");
+        assert!(p.worst(999).len() == p.features.len(), "asking for more than there are is not an error");
+    }
     #[test]
     fn single_box_has_12_triangles() {
         let mut m = Model::default();

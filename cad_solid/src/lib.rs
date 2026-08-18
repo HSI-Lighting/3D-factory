@@ -1513,6 +1513,25 @@ impl Model {
     /// 64 MB is a judgement: eight times the default, comfortably past the depths measured so far,
     /// and trivial beside the mesh being built. It is reserved address space, not committed
     /// memory.
+    /// [`Self::eval`], with the per-feature cost table — on the same 64 MB thread, because a
+    /// diagnostic that overflows the stack on the very model it was pointed at is no diagnostic.
+    pub fn eval_profiled(&self) -> (SolidMesh, csg::EvalProfile) {
+        const EVAL_STACK: usize = 64 << 20;
+        std::thread::scope(|s| {
+            match std::thread::Builder::new()
+                .name("csg-eval-profiled".into())
+                .stack_size(EVAL_STACK)
+                .spawn_scoped(s, || csg::eval_profiled(self))
+            {
+                Ok(h) => match h.join() {
+                    Ok(r) => r,
+                    Err(e) => std::panic::resume_unwind(e),
+                },
+                Err(_) => csg::eval_profiled(self),
+            }
+        })
+    }
+
     pub fn eval(&self) -> SolidMesh {
         const EVAL_STACK: usize = 64 << 20;
         std::thread::scope(|s| {

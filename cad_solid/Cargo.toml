@@ -19,6 +19,41 @@ nalgebra = "0.34"                        # MUST match csgrs's nalgebra (Matrix4<
 serde    = { version = "1", features = ["derive"] }
 # csgrs (pure-Rust BSP CSG) added via `cargo add` so the version pins correctly.
 
+[features]
+# ON BY DEFAULT, on measurements taken both ways.
+#
+# Synthetic (`tests/boolean_cost.rs`): a 96-point traced wall with 24 windows in it evaluated in
+# 8,585 ms without and 87 ms with — 99x. A single window on a 240-point wall: 778 ms -> 30 ms.
+#
+# And on a REAL project (the 172-feature gym plan, via the `scene_of_real_project` harness):
+#
+#     total eval        1,759 ms  ->  165 ms      10.7x
+#     of which cutting  1,686 ms  ->  109 ms      15.5x   (96% of eval -> 66%)
+#     triangles           10,275  ->  5,623       45% fewer, for the same solid
+#     deepest operand  2,690 poly ->  1,193 poly  56% shallower
+#
+# THE LAST ROW IS NOT A PERFORMANCE NUMBER. `Model::eval` runs on a 64 MB thread because csgrs's
+# BSP recurses about once per polygon on a convex body, and the deepest single mesh fed to a
+# boolean is what decides how close an evaluation comes to the stack. Halving it halves the
+# exposure that thread exists to cover.
+#
+# Fewer triangles for the same solid is not a rounding artefact either: polygons the partition can
+# prove are untouched stop being split by a BSP that had no business splitting them.
+#
+# Opt OUT with `--no-default-features` to reproduce the old numbers.
+default = ["bbopt"]
+
+# BOUNDING-BOX PRE-PARTITION for every mesh boolean. csgrs splits each mesh into the polygons
+# whose bounding box meets the other mesh's, and the ones that cannot possibly be touched by it;
+# only the first group is built into a BSP, and the rest are appended to the result untouched.
+#
+# Sound rather than approximate — a polygon that does not overlap the other solid's bounding box
+# cannot be split by it — and it is exactly the shape this app builds: a 1.2 m window cutter
+# against a traced facade meets a handful of the wall's polygons and none of the rest.
+#
+# Measured by `tests/boolean_cost.rs`; the numbers either way are recorded there.
+bbopt = ["csgrs/mesh-bbopt"]
+
 # The standalone sandbox window is an EXAMPLE, so egui/eframe are dev-deps only —
 # `cad_solid` itself (lib) is UI-agnostic. Mirrors cad_app's eframe feature set.
 [dev-dependencies]

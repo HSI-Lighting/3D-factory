@@ -49560,6 +49560,40 @@ mod factory_sketch_tests {
         println!("{}", crate::dbg_recorder::format_event_oneline(
             &app.factory_scene_capture(&format!("offline capture of {path}"))));
 
+        // ---- IN-EVAL NUMBERS ------------------------------------------------------------
+        //
+        // The half the scene capture could not reach. Everything above describes the model as
+        // DATA; this is what evaluating it COSTS, per feature, on the real thing. Every
+        // performance threshold downstream of here was estimated, and two of them were estimated
+        // against a BSP that was collapsing because the boolean tolerance was wrong — an estimate
+        // is exactly what this exists to replace.
+        println!("\n=== in-eval cost ===");
+        let (_, prof) = app.factory.model.eval_profiled();
+        println!(
+            "total {:.0} ms over {} features ({} disabled) -> {} tris in {} bodies",
+            prof.total_ms, prof.features.len(), prof.disabled, prof.tris, prof.bodies,
+        );
+        println!(
+            "deepest single operand {} polygons — what the 64 MB eval stack is sized against, \
+             since csgrs's BSP recurses about once per polygon on a convex body",
+            prof.deepest_operand,
+        );
+        let cut_ms: f64 = prof.features.iter()
+            .filter(|f| f.op == cad_solid::BoolOp::Difference).map(|f| f.ms).sum();
+        let cuts = prof.features.iter().filter(|f| f.op == cad_solid::BoolOp::Difference).count();
+        println!(
+            "of which cutting: {:.0} ms ({:.0}%) across {cuts} Difference features",
+            cut_ms,
+            if prof.total_ms > 0.0 { 100.0 * cut_ms / prof.total_ms } else { 0.0 },
+        );
+        println!("\n  worst 20 features by eval time");
+        println!("  {:>8}  {:<11} {:<10} {:>9}  {:>9}  {:>9}",
+                 "id", "op", "kind", "ms", "operand", "body");
+        for f in prof.worst(20) {
+            println!("  {:>8}  {:<11} {:<10} {:>9.1}  {:>9}  {:>9}",
+                     f.id, f.op.label(), f.kind, f.ms, f.polys_operand, f.polys_body);
+        }
+
         // Per-suspect probe trace: where the face point lands, and what the ray finds in EACH
         // direction. This is the view that showed the reconstructed point sitting 0.64 m clear of
         // the wall — the reason the repair used to decline every one of these openings.
