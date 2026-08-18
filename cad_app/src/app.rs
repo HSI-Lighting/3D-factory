@@ -57293,3 +57293,98 @@ mod the_viewport_sees_what_the_drawing_has {
         );
     }
 }
+
+/// WHAT ONE FRAME OF 3D LINE WORK COSTS, on a real drawing.
+///
+///   SIMLUX_PLAN="D:\...\1 Mashrabiya.dxf" cargo test -p cad_app --bin simlux \
+///       frame_cost_of_real_drawing -- --ignored --nocapture
+///
+/// The 3D view rebuilds its whole line buffer every frame from FIVE separate builders and then
+/// concatenates them. None of it is cached and none of it depends on the camera, so panning a
+/// drawing re-flattens every entity in it, sixty times a second.
+///
+/// The plan's estimate for this was "drawing one object costs 30 ms" and "panning allocates
+/// megabytes per frame". M6 is the reason this is measured rather than trusted: the last two
+/// estimates in this plan were both wrong, one of them by having been taken against a BSP that
+/// was collapsing.
+#[test]
+#[ignore = "needs SIMLUX_PLAN=<drawing path>"]
+fn frame_cost_of_real_drawing() {
+    let Ok(path) = std::env::var("SIMLUX_PLAN") else {
+        println!("set SIMLUX_PLAN to a .dxf path");
+        return;
+    };
+    let text = std::fs::read_to_string(&path)
+        .or_else(|_| std::fs::read(&path).map(|b| String::from_utf8_lossy(&b).into_owned()))
+        .expect("read the drawing");
+    let t = std::time::Instant::now();
+    let doc = cad_io::dxf::read_dxf(&text).expect("parse dxf");
+    let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let mut app = CadApp::default();
+    app.doc = doc;
+    println!(
+        "\n{}\n  {} dobjects, {} layers, {} blocks — parsed in {:.0} ms",
+        path,
+        app.doc.dobjects.len(),
+        app.doc.layers.len(),
+        app.doc.blocks.len(),
+        parse_ms,
+    );
+
+    // Each builder, timed on its own, then the concatenation the frame actually performs.
+    let bench = |label: &str, f: &dyn Fn() -> usize| {
+        // A few passes, because one is dominated by first-touch page faults on the allocator.
+        const N: u32 = 5;
+        let t = std::time::Instant::now();
+        let mut verts = 0;
+        for _ in 0..N {
+            verts = f();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / N as f64;
+        println!("  {label:<26} {ms:>9.2} ms   {verts:>9} verts   {:>7} KB", verts * 40 / 1024);
+        ms
+    };
+
+    println!("\n  per-frame line builders (mean of 5)");
+    let mut total = 0.0;
+    total += bench("overlay_lines", &|| app.factory.overlay_lines().len());
+    total += bench("sketch_lines", &|| app.factory.sketch_lines(&app.doc).len());
+    total += bench("picked_face_lines", &|| app.factory.picked_face_lines().len());
+    total += bench("live_sketch_lines", &|| app.factory.live_sketch_lines(&app.doc).len());
+    total += bench("plan_lines", &|| app.factory.plan_lines(&app.doc, 0.0).len());
+
+    // THE CONCATENATION, which is the part a partial cache would leave behind. This is the exact
+    // sequence the frame runs.
+    let concat = bench("→ concatenated frame", &|| {
+        let mut lines = app.factory.overlay_lines();
+        lines.extend(app.factory.sketch_lines(&app.doc));
+        lines.extend(app.factory.picked_face_lines());
+        lines.extend(app.factory.live_sketch_lines(&app.doc));
+        lines.extend(app.factory.plan_lines(&app.doc, 0.0));
+        lines.len()
+    });
+
+    // WHAT THE DISPLAY FLATTENER ADDED. Block references used to flatten to nothing, which is
+    // why an imported plan was very nearly invisible in 3D; expanding them is the fix, and this
+    // is its price. Worth knowing separately from the cost of the drawing itself, because it is
+    // the difference between "this was always slow" and "we have just made it slow".
+    let k = app.doc.units.metres_per_unit;
+    let count = |f: &dyn Fn(&Geom) -> Vec<Vec<glam::Vec2>>| -> usize {
+        app.doc.dobjects.iter().map(|d| f(&d.geom).iter().map(|p| p.len()).sum::<usize>()).sum()
+    };
+    let buildable = count(&|g| cad_solid::geom_outlines_scaled(g, k));
+    let displayed = count(&|g| cad_solid::geom_display_outlines_scaled(g, &app.doc, k));
+    println!(
+        "\n  flattened points: {buildable} buildable-only vs {displayed} with blocks/splines/walls \
+         expanded ({}x)",
+        displayed / buildable.max(1),
+    );
+
+    println!("\n  builders summed        {total:>9.2} ms");
+    println!("  whole frame            {concat:>9.2} ms");
+    println!(
+        "  at 60 Hz that is       {:>9.1}% of one frame's 16.7 ms budget, before anything is drawn\n",
+        100.0 * concat / 16.7,
+    );
+}
