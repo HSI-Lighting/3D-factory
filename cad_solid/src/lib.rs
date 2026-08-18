@@ -1020,6 +1020,20 @@ impl Frame {
 /// draw / modifier / osnap code operates on it unchanged (flat sketch mode).
 #[derive(Clone)]
 pub struct Sketch {
+    /// WHICH PLANE THIS IS, and the only thing anything outside this vector may hold on to.
+    ///
+    /// Planes live in a `Vec`, and a `Vec` index is not an identity: deleting one slides every
+    /// plane after it down, so an index kept across that edit quietly names its neighbour. That
+    /// is not hypothetical — the open sketch session and the rename dialog both held one, and
+    /// only the session was ever patched to follow the shift.
+    ///
+    /// Monotonic and never reused, for the same reason feature ids are: an id that comes back
+    /// lets a stale reference resolve, which is worse than one that fails.
+    ///
+    /// Minted fresh on load. The vector is `#[serde(skip)]` and the sidecar rebuilds it from
+    /// [`crate::Sketch`] records in order, so no id survives a save — and none needs to, because
+    /// nothing persisted refers to a plane.
+    pub id: u32,
     pub frame: Frame,
     pub doc: cad_kernel::Document,
     /// Reference geometry (the selected face's outline, in u,v) — shown faintly so
@@ -1039,8 +1053,13 @@ pub struct Sketch {
 }
 
 impl Sketch {
+    /// A plane with NO id yet — id 0, which [`Model::push_sketch`] replaces with a real one.
+    ///
+    /// Zero is never handed out, so a sketch that somehow reaches the app without going through
+    /// `push_sketch` resolves to nothing rather than to whichever plane happens to hold id 0.
     pub fn new(frame: Frame) -> Self {
         Self {
+            id: 0,
             frame,
             doc: cad_kernel::Document::default(),
             reference: Vec::new(),
@@ -1251,6 +1270,10 @@ pub struct Model {
     pub next_profile_id: u32,
     #[serde(default)]
     pub next_path_id: u32,
+    /// High-water mark for [`Sketch::id`]. NOT persisted — `sketches` is `#[serde(skip)]`, so it
+    /// is rebuilt from the sidecar on every load and the ids are minted fresh with it.
+    #[serde(skip)]
+    pub next_sketch_id: u32,
 }
 
 impl Model {
@@ -1267,6 +1290,39 @@ impl Model {
         self.next_feature_id = self.next_feature_id.max(f + 1);
         self.next_profile_id = self.next_profile_id.max(p + 1);
         self.next_path_id = self.next_path_id.max(s + 1);
+        let k = self.sketches.iter().map(|x| x.id).max().unwrap_or(0);
+        self.next_sketch_id = self.next_sketch_id.max(k + 1);
+    }
+
+    /// Append a plane, assigning it a fresh [`Sketch::id`]; returns that id.
+    pub fn push_sketch(&mut self, mut sk: Sketch) -> u32 {
+        if self.next_sketch_id == 0 {
+            self.reserve_ids_above_loaded();
+        }
+        let id = self.next_sketch_id;
+        self.next_sketch_id += 1;
+        sk.id = id;
+        self.sketches.push(sk);
+        id
+    }
+
+    /// Where the plane `id` currently sits in `sketches`. The ONE place an id becomes an index,
+    /// so nothing else has to hold one across an edit.
+    pub fn sketch_index(&self, id: u32) -> Option<usize> {
+        self.sketches.iter().position(|s| s.id == id)
+    }
+
+    pub fn sketch_by_id(&self, id: u32) -> Option<&Sketch> {
+        self.sketches.iter().find(|s| s.id == id)
+    }
+
+    pub fn sketch_by_id_mut(&mut self, id: u32) -> Option<&mut Sketch> {
+        self.sketches.iter_mut().find(|s| s.id == id)
+    }
+
+    /// Remove the plane `id` and the drawing on it; returns it if it was there.
+    pub fn remove_sketch(&mut self, id: u32) -> Option<Sketch> {
+        self.sketch_index(id).map(|i| self.sketches.remove(i))
     }
 
     fn take_feature_id(&mut self) -> u32 {
