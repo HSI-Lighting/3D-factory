@@ -5543,12 +5543,18 @@ impl FactoryState {
             placement,
             Primitive::Extrusion { profile, h: void_h, w, d },
         );
-        // `push` appended at the end; relocate it to just after the building feature so the
-        // difference cuts the BUILDING body and nothing else.
+        // `push` appended at the end; bind it to the building and move it in behind, so the
+        // difference cuts the BUILDING body and nothing else — and goes on cutting that same
+        // body if anything later reorders the list.
         let mut void_id = None;
         if let Some(void) = self.model.features.pop() {
             void_id = Some(void.id);
-            self.model.insert_at(idx + 1, void);
+            // CALL FIRST, ASSERT SECOND. `debug_assert!(expr)` does not EVALUATE `expr` in a
+            // release build — it compiles to nothing — so wrapping the insert in one would make
+            // the void never get inserted in the shipped binary. `idx` was read out of `features`
+            // a few lines up, so the host really is present and the assert is a guard, not a path.
+            let placed = self.model.insert_after(building_id, void);
+            debug_assert!(placed, "the building was read from the feature list a moment ago");
         }
         self.dirty = true;
         void_id.map(|v| (v, building_id))
@@ -6680,14 +6686,17 @@ impl FactoryState {
             .collect();
         slots.sort_unstable();
 
-        // THE OPENINGS THIS WALL HOSTS, read off BEFORE anything moves — because after the
-        // removal there is nothing left in the model that says which body a cutter belonged to.
-        // Position is the only record: a cutter is hosted by the nearest Union above it, so a
-        // segment's openings are the unbroken run of non-Union features that follows it.
-        let hosted: Vec<u32> = old
+        // THE OPENINGS THIS WALL HOSTS, PER SEGMENT, read off BEFORE anything moves — because
+        // after the removal there is nothing left in the model that says which body a cutter
+        // belonged to. A cutter is hosted by the nearest Union above it, so a segment's openings
+        // are the unbroken run of non-Union features that follows it.
+        //
+        // Kept per segment rather than flattened, because the rebuilt segments carry NEW ids
+        // (`push_wall_box` mints one each) and every opening has to be told which of them it now
+        // belongs to. Same ascending order as `slots`, so index k means the same segment in both.
+        let hosted_by: Vec<Vec<u32>> = slots
             .iter()
-            .filter_map(|id| self.model.features.iter().position(|f| f.id == *id))
-            .flat_map(|i| {
+            .map(|&i| {
                 self.model.features[i + 1..]
                     .iter()
                     .take_while(|f| f.op != cad_solid::BoolOp::Union)
@@ -6695,6 +6704,7 @@ impl FactoryState {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let hosted: Vec<u32> = hosted_by.iter().flatten().copied().collect();
 
         for id in old {
             self.model.remove(id);
@@ -6722,6 +6732,17 @@ impl FactoryState {
             // restores every binding with them.
             let tail = self.model.features.len() - segments.len();
             let rebuilt: Vec<_> = self.model.features.drain(tail..).collect();
+            // AND EACH OPENING NOW NAMES ITS NEW SEGMENT. Restoring the positions restores the
+            // positional binding, but a cutter that names a body names it by ID — and every
+            // rebuilt segment has a fresh one, so an opening still naming the segment it was cut
+            // in would open nothing and the wall would come back solid. The binding has to be
+            // carried across the rebuild exactly as the position is.
+            for (k, ids) in hosted_by.iter().enumerate() {
+                let Some(&seg) = segments.get(k) else { continue };
+                for &c in ids {
+                    self.model.set_target(c, Some(seg));
+                }
+            }
             for (slot, feat) in slots.into_iter().zip(rebuilt) {
                 self.model.insert_at(slot, feat);
             }
@@ -6750,9 +6771,20 @@ impl FactoryState {
             for mut cut in lifted {
                 let (mn, mx) = cut.world_aabb();
                 match Self::segment_containing(&spans, (mn + mx) * 0.5, t, h, base_z) {
-                    Some(k) => per_seg[k].push(cut),
+                    Some(k) => {
+                        // Re-homed BY NAME as well as by position — the segment it used to name
+                        // no longer exists, so leaving the old target would turn a re-homed
+                        // opening into no opening at all.
+                        cut.target = rebuilt.get(k).map(|f| f.id);
+                        per_seg[k].push(cut);
+                    }
                     None => {
                         cut.enabled = false;
+                        // NO OPINION, rather than a wrong one. It named a segment that is gone;
+                        // naming a different one would be a claim nothing supports, so it goes
+                        // back to the positional rule — which, resting at the end of this wall's
+                        // own block, is what the comment below describes.
+                        cut.target = None;
                         orphans.push(cut);
                     }
                 }
@@ -14058,6 +14090,7 @@ mod plan_footprint_tests {
             placement: cad_solid::Placement { u: 0.0, v: 0.0, ..Default::default() },
             primitive: p,
             enabled: true,
+            target: None,
         }
     }
 
@@ -15347,6 +15380,7 @@ mod wall_opening_tests {
             placement: cad_solid::Placement::default(),
             primitive: cad_solid::Primitive::Box { w: 0.9, d: 1.0, h: 1.2 },
             enabled: true,
+            target: None,
         };
         st.model.insert_at(host_at + 1, cutter);
 
@@ -15383,6 +15417,7 @@ mod wall_opening_tests {
             },
             primitive: cad_solid::Primitive::Box { w: size[0], d: size[1], h: size[2] },
             enabled: true,
+            target: None,
         };
         assert!(st.model.insert_after(host, cutter), "the host body must exist");
         id
@@ -15548,6 +15583,75 @@ mod wall_opening_tests {
         assert_eq!(
             st.model.is_enabled(upstairs), Some(false),
             "a cut 1.3 m above the wall's own head height was adopted as one of its openings",
+        );
+    }
+
+    // ── AND THE OPENING IS STILL AN OPENING ────────────────────────────────────────────────
+    //
+    // Every test above asks WHERE the cutter sits, because until now position WAS the binding.
+    // It is not any more: a cutter names the body it opens, and `rederive_wall` mints fresh ids
+    // for every rebuilt segment — so an opening left naming the segment it was cut in names
+    // nothing, cuts nothing, and the wall comes back SOLID with the cutter still sitting in
+    // exactly the right place. Position assertions cannot see that. These two ask the geometry.
+
+    /// How far along X the whole model reaches — the cheapest observable that says "the hole is
+    /// still there", since each fixture puts its opening at the far end of the wall.
+    fn model_max_x(st: &FactoryState) -> f32 {
+        st.model.eval().bounds().expect("the model has bounds").1[0]
+    }
+
+    /// COUNT UNCHANGED (`wall_move_vertex`). The segments go back to their own slots, so the
+    /// positional binding is restored for free — and the NAMED binding is not, unless it is
+    /// carried across deliberately.
+    #[test]
+    fn an_opening_still_opens_after_its_wall_corner_is_dragged() {
+        let mut st = FactoryState::default();
+        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0)], 0.2, 2.7)
+            .expect("wall a");
+        let s0 = st.walls[a].segments[0];
+        // Takes everything past x = 3 away, so the hole is visible in the model's extent.
+        let cut = cut_on(&mut st, s0, Vec3::new(5.0, 0.0, 0.0), [4.0, 2.0, 4.0], 9_100);
+        assert!((model_max_x(&st) - 3.0).abs() < 0.05, "the fixture must cut before the edit");
+
+        // Drag the NEAR corner, so the far end — where the opening is — does not move.
+        st.wall_move_vertex(a, 0, Vec2::new(-1.0, 0.0));
+
+        let seg = st.walls[a].segments[0];
+        assert_eq!(
+            st.model.get(cut).and_then(|f| f.target), Some(seg),
+            "the opening still names the segment it was cut in, which no longer exists",
+        );
+        assert!(
+            (model_max_x(&st) - 3.0).abs() < 0.05,
+            "the wall came back SOLID: the opening is in the right place and bound to nothing \
+             (model reaches x = {})",
+            model_max_x(&st),
+        );
+    }
+
+    /// COUNT CHANGED (`wall_insert_vertex`). The opening is lifted out and re-homed by geometry
+    /// onto the half that contains it — and has to be re-named onto that half too.
+    #[test]
+    fn a_re_homed_opening_still_opens_the_half_it_landed_on() {
+        let mut st = FactoryState::default();
+        let a = st.add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(8.0, 0.0)], 0.2, 2.7)
+            .expect("wall a");
+        let s0 = st.walls[a].segments[0];
+        // Takes everything past x = 6 away — squarely inside the right-hand half after the split.
+        let cut = cut_on(&mut st, s0, Vec3::new(8.0, 0.0, 0.0), [4.0, 2.0, 4.0], 9_101);
+        assert!((model_max_x(&st) - 6.0).abs() < 0.05, "the fixture must cut before the edit");
+
+        assert_eq!(st.wall_insert_vertex(a, 0, Vec2::new(4.0, 0.0)), Some(1), "vertex inserted");
+        let right = st.walls[a].segments[1];
+
+        assert_eq!(
+            st.model.get(cut).and_then(|f| f.target), Some(right),
+            "the re-homed opening does not name the half it was re-homed onto",
+        );
+        assert!(
+            (model_max_x(&st) - 6.0).abs() < 0.05,
+            "the split wall came back SOLID (model reaches x = {})",
+            model_max_x(&st),
         );
     }
 }

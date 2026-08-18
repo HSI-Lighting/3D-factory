@@ -6227,9 +6227,19 @@ impl CadApp {
             let alive = s.host.is_some_and(|h| self.factory.model.features.iter().any(|f| f.id == h));
             match (alive, s.host) {
                 (true, Some(h)) => {
-                    // The host is present, so this cannot append — the check above is the
-                    // guarantee, and `insert_after` reporting otherwise would be a real bug.
-                    debug_assert!(self.factory.model.insert_after(h, s.feature));
+                    // CALL FIRST, ASSERT SECOND, and this is not style.
+                    //
+                    // `debug_assert!(expr)` compiles to `if cfg!(debug_assertions) { assert!(expr) }`
+                    // — and `cfg!` is a compile-time constant, so in a RELEASE build the
+                    // expression is never evaluated. Wrapping the insert in one meant the shipped
+                    // binary restored NOTHING: escaping a cutout edit left the openings deleted,
+                    // which is exactly the data loss the stash was built to prevent, and the debug
+                    // build the tests run in could never see it.
+                    //
+                    // The host is present — the check above is the guarantee — so `false` here
+                    // would be a real bug and the assert says so.
+                    let placed = self.factory.model.insert_after(h, s.feature);
+                    debug_assert!(placed, "the host was found a moment ago and cannot have moved");
                 }
                 _ => {
                     self.factory.model.insert_at(s.at, s.feature);
@@ -54848,6 +54858,7 @@ mod plan_overlay {
             placement: cad_solid::Placement { u: 3.0, v: 3.0, ..Default::default() },
             primitive: cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
+            target: None,
         });
         assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
         let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
@@ -57017,6 +57028,64 @@ mod the_quit_dialog_cannot_trap_the_app {
 /// `session.saved_doc`. Every site that means THE PLAN must therefore say so — the swap makes the
 /// wrong document the default, and reading `self.doc` at a plan site lays the sketch's u/v out as
 /// world x/y on the ground.
+/// A `debug_assert!` MUST NOT BE THE THING THAT DOES THE WORK.
+///
+/// It expands to `if cfg!(debug_assertions) { assert!(…) }`, and `cfg!` is a compile-time
+/// constant — so in a RELEASE build the expression inside is never evaluated at all.
+///
+/// THIS SHIPPED. `factory_restore_stashed_cutters` wrapped its restore call in one, so the
+/// installed binary put NOTHING back when a cutout edit was escaped: the openings stayed deleted,
+/// which is precisely the data loss the stash exists to prevent. Every test runs in a debug build,
+/// so no amount of testing the behaviour could have found it — only reading the code, or the user.
+#[cfg(test)]
+mod a_debug_assert_never_does_the_work {
+    /// The rule is narrow on purpose. A `debug_assert!` over a pure predicate is fine and there
+    /// are plenty of those; what is banned is a MUTATION inside one.
+    #[test]
+    fn nothing_is_mutated_inside_a_debug_assert() {
+        // Verbs that change the model rather than ask it a question. Spelled without their
+        // opening bracket so this list does not trip its own check.
+        const MUTATORS: [&str; 6] =
+            ["insert_after", "insert_at", ".push", ".remove", ".pop", ".take"];
+        for (name, src) in
+            [("app.rs", include_str!("app.rs")), ("factory.rs", include_str!("factory.rs"))]
+        {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find("debug_assert!(") {
+                let open = from + rel + "debug_assert!".len();
+                // Balanced scan to the closing bracket, so a call spread over several lines is
+                // covered as well as a one-liner.
+                let mut depth = 0i32;
+                let mut end = open;
+                for (i, c) in src[open..].char_indices() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let inside = &src[open..end];
+                let line = src[..open].lines().count();
+                for verb in MUTATORS {
+                    assert!(
+                        !inside.contains(&format!("{verb}(")),
+                        "{name}:{line}: `{verb}` is called inside a debug_assert!, so it does not \
+                         happen in a release build:\n    {}",
+                        inside.trim(),
+                    );
+                }
+                from = end.max(open + 1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod a_sketch_is_not_the_plan {
     use super::*;

@@ -611,6 +611,26 @@ pub struct Feature {
     /// building as an empty scene.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// WHICH BODY THIS CUTTER OPENS, by the id of the `Union` that starts it. Meaningless on a
+    /// `Union`, which starts a body rather than joining one.
+    ///
+    /// `None` means "the body before me in the list", which is the rule [`csg::eval`] has always
+    /// applied and is what every project ever saved carries. The trouble with that rule is not
+    /// that it is wrong but that AN INDEX IS A BINDING, so any edit which reorders the list
+    /// silently re-homes every opening after the edit. The same defect has been found and patched
+    /// three separate times — a wall rebuilt with a different segment count, a restored sketch
+    /// stash pushed onto the end, a duplicate body dropped from the middle. Each patch restored a
+    /// position; none of them stated a relationship.
+    ///
+    /// When it IS set it is honoured wherever the cutter sits, and a cutter naming a body that has
+    /// been deleted or disabled cuts NOTHING. Both other answers are corruption: falling back to
+    /// the previous body is exactly the re-binding this field refuses, and there is nothing else
+    /// for it to open.
+    ///
+    /// A plain `#[serde(default)]` is right here, unlike `enabled` above — `Option::default()` is
+    /// `None`, which IS the positional rule, so an older file loads meaning what it meant.
+    #[serde(default)]
+    pub target: Option<u32>,
 }
 
 /// Serde's default for [`Feature::enabled`] — see the field. Must be `true`: it is what every
@@ -1263,8 +1283,32 @@ impl Model {
     /// Append a feature, assigning it a fresh id; returns that id.
     pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
         let id = self.take_feature_id();
-        self.features.push(Feature { id, op, plane, placement, primitive, enabled: true });
+        self.features.push(Feature {
+            id, op, plane, placement, primitive, enabled: true, target: None,
+        });
         id
+    }
+
+    /// Read a feature by id.
+    pub fn get(&self, id: u32) -> Option<&Feature> {
+        self.features.iter().find(|f| f.id == id)
+    }
+
+    /// State which body a cutter opens — see [`Feature::target`]. `None` restores the positional
+    /// rule ("the body before me"). Returns false if `id` names no feature.
+    ///
+    /// The body it names is NOT checked here, deliberately. A cutter can be bound before its host
+    /// is inserted (that is half the point of naming rather than positioning), and a body that is
+    /// deleted afterwards must leave the binding standing and unhonoured rather than silently
+    /// reverting to the neighbour it would otherwise cut.
+    pub fn set_target(&mut self, id: u32, target: Option<u32>) -> bool {
+        match self.features.iter_mut().find(|f| f.id == id) {
+            Some(f) => {
+                f.target = target;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Insert a fully-formed feature at `at`, clamped to the end. The id is kept as-is — this
@@ -1279,21 +1323,23 @@ impl Model {
         at
     }
 
-    /// Put `f` DIRECTLY BEHIND the feature `host_id` — the placement a cutter needs, stated once.
+    /// BIND `f` TO THE BODY `host_id`, and put it directly behind that body in the list.
     ///
-    /// A `Difference` cuts the most recent `Union` before it, so "which body does this open?" is
-    /// answered entirely by where the cutter sits. Appending instead of inserting reaches only the
-    /// LAST body in the model, which is how an opening ends up in someone else's wall.
+    /// The binding is what matters and the position is now belt-and-braces: `f.target` is stamped
+    /// with `host_id`, so the cutter opens that body from wherever it ends up, and it is inserted
+    /// behind the host as well so a reader of the feature list still sees a wall followed by its
+    /// own openings.
     ///
-    /// Appends when `host_id` is unknown, and reports which happened: `false` means the host was
-    /// not found and the feature is now at the end, bound to whatever precedes it. A caller that
-    /// cannot accept that — anything placing an opening — must check.
+    /// WHEN THE HOST IS NOT THERE, the feature is appended and `false` is returned — but it keeps
+    /// the target it was given, so it cuts NOTHING rather than opening whichever body happens to
+    /// be last. That is the whole change: the fallback used to be a silent hole in a stranger's
+    /// wall, and a missing opening is at least visible to the person who asked for it.
     ///
-    /// `#[must_use]`, because "reportable" and "reported" are not the same thing and the entire
-    /// failure mode here is silence. Discarding the result compiles perfectly and reinstates
-    /// exactly the mis-binding this method exists to name.
-    #[must_use = "false means the cutter was APPENDED and is now opening some other body"]
-    pub fn insert_after(&mut self, host_id: u32, f: Feature) -> bool {
+    /// `#[must_use]` all the same, because "the cut did not happen" is still news. Discarding the
+    /// result compiles perfectly and says nothing to anybody.
+    #[must_use = "false means the host body was not found, so this cutter opens nothing"]
+    pub fn insert_after(&mut self, host_id: u32, mut f: Feature) -> bool {
+        f.target = Some(host_id);
         match self.features.iter().position(|g| g.id == host_id) {
             Some(i) => {
                 self.features.insert(i + 1, f);
@@ -1738,6 +1784,7 @@ mod tests {
             placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
             enabled: true,
+            target: None,
         };
         let (mn, mx) = f.world_aabb();
         // Centred at u=3 on X → x spans 2..4; sits on plane at z=offset=2 → z 2..3.
@@ -1753,6 +1800,7 @@ mod tests {
             placement: Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
+            target: None,
         }
     }
 
@@ -1776,13 +1824,19 @@ mod tests {
         }"#;
         let f: Feature = serde_json::from_str(legacy).expect("a pre-flag feature must still parse");
         assert!(f.enabled, "an existing project would open as an empty scene");
+        // And the SAME JSON is what a pre-`target` file carries, which is every file ever saved.
+        // `None` is the positional binding, so an older project's openings stay in the walls they
+        // were cut in. Unlike `enabled` this one is safe by construction — pinned anyway, on the
+        // hand-written JSON rather than a round trip, because a round trip writes the field and
+        // so never exercises its absence.
+        assert_eq!(f.target, None, "an older feature must keep the positional binding");
     }
 
-    /// `insert_after` is where "a cutter sits directly behind the body it opens" is stated, so it
-    /// has to be true — including the part callers keep getting wrong, that a MISSING host means
-    /// the feature lands at the end bound to a stranger, and the caller must be told.
+    /// `insert_after` is where "this cutter opens THAT body" is stated, so it has to be true both
+    /// ways: the binding is recorded on the feature, AND the feature sits behind its host so the
+    /// list still reads as a wall followed by its own openings.
     #[test]
-    fn insert_after_places_a_cutter_behind_its_host_and_reports_a_missing_one() {
+    fn insert_after_binds_a_cutter_to_its_host_and_places_it_behind_it() {
         let mut m = Model::default();
         let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
         let b = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
@@ -1795,11 +1849,35 @@ mod tests {
         let at = |id: u32, m: &Model| m.features.iter().position(|f| f.id == id).expect("present");
         assert_eq!(at(900, &m), at(a, &m) + 1, "the cutter must sit directly behind body a");
         assert!(at(900, &m) < at(b, &m), "…and therefore before body b");
+        assert_eq!(m.get(900).and_then(|f| f.target), Some(a), "the binding was not recorded");
+    }
+
+    /// A MISSING HOST IS REPORTED, AND THE CUTTER OPENS NOTHING.
+    ///
+    /// It used to land at the end bound to whatever body was last — a silent hole in a stranger's
+    /// wall. It now keeps the target it was given, which no longer names anything, so the cut
+    /// simply does not happen. A missing opening is at least visible to the person who asked for
+    /// one; a hole in someone else's wall is not.
+    #[test]
+    fn a_cutter_whose_host_is_gone_is_reported_and_opens_nothing() {
+        let mut m = Model::default();
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
 
         let mut stray = box_at(0.0, 0.0);
         stray.id = 901;
+        stray.op = BoolOp::Difference;
         assert!(!m.insert_after(4_242, stray), "an unknown host must be reported, not hidden");
-        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it appends when the host is gone");
+        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it is kept, at the end");
+        assert_eq!(
+            m.get(901).and_then(|f| f.target), Some(4_242),
+            "it must keep naming the body it was meant for, so it cuts nothing rather than \
+             opening whichever body is last",
+        );
+
+        // And the geometry agrees: body `a` is a 1 m cube at the origin, and the stray cutter is
+        // a 1 m cube at the origin too — if it were ever applied, `a` would vanish.
+        let _ = a;
+        assert!(m.eval().bounds().is_some(), "the appended cutter dissolved the body it landed on");
     }
 
     #[test]

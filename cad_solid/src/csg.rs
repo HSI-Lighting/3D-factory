@@ -214,6 +214,14 @@ pub struct EvalProfile {
     pub deepest_operand: usize,
     /// Features skipped because [`crate::Feature::enabled`] is clear.
     pub disabled: usize,
+    /// Cutters that were APPLIED TO NOTHING: they name a body (see [`crate::Feature::target`])
+    /// that has been deleted or disabled, or they sit before any body at all.
+    ///
+    /// Reported rather than folded into `disabled`, because the two are different facts about the
+    /// model. A disabled feature is a decision somebody made; an unbound one is an opening with
+    /// nothing left to be an opening in, and a model accumulating those is a model with a
+    /// housekeeping problem.
+    pub unbound: usize,
 }
 
 impl EvalProfile {
@@ -241,79 +249,122 @@ pub fn eval_profiled(model: &Model) -> (SolidMesh, EvalProfile) {
     (mesh, p)
 }
 
+/// One accumulating body: the index of the `Union` that starts it, and the indices of every
+/// cutter bound to it, in list order.
+struct Body {
+    union_at: usize,
+    cuts: Vec<usize>,
+}
+
+/// WHICH BODY DOES EACH CUTTER OPEN? Answered once, over the whole model, before any geometry is
+/// built — so the answer is a property of the model rather than of where the fold happened to be
+/// standing when the cutter came past.
+///
+/// Bodies come back in the order their `Union` appears, which is the order they are emitted in and
+/// the order the app's face ids are read in. A cutter that reaches no body is reported in the
+/// second return value and DROPPED; see [`crate::Feature::target`] for why the two other answers
+/// are both corruption.
+fn plan_bodies(model: &Model) -> (Vec<Body>, usize) {
+    // THE UNIONS FIRST, so a cutter may name a body that sits LATER in the list. Requiring it to
+    // sit behind its host would be the positional rule wearing a different hat.
+    let mut bodies: Vec<Body> = Vec::new();
+    let mut by_id: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, f) in model.features.iter().enumerate() {
+        if f.op == BoolOp::Union {
+            by_id.insert(f.id, bodies.len());
+            bodies.push(Body { union_at: i, cuts: Vec::new() });
+        }
+    }
+    // `recent` is counted rather than looked up by id, so a model that has somehow ended up with
+    // two features sharing an id still binds each unnamed cutter to the body immediately above it
+    // instead of to whichever one the map happened to keep.
+    let mut recent: Option<usize> = None;
+    let mut seen = 0usize;
+    let mut unbound = 0usize;
+    for (i, f) in model.features.iter().enumerate() {
+        if f.op == BoolOp::Union {
+            recent = Some(seen);
+            seen += 1;
+            continue;
+        }
+        // `None` IS THE POSITIONAL RULE, kept exactly: it is what every project saved before
+        // `target` existed carries, and what a cutter added with no opinion still means.
+        match f.target.map_or(recent, |t| by_id.get(&t).copied()) {
+            Some(s) => bodies[s].cuts.push(i),
+            None => unbound += 1,
+        }
+    }
+    (bodies, unbound)
+}
+
 fn eval_inner(model: &Model, mut prof: Option<&mut EvalProfile>) -> SolidMesh {
     let t_all = std::time::Instant::now();
     let mut out = SolidMesh::default();
-    // The leading feature id of the body currently accumulating — every triangle it
-    // produces is tagged with it, so the app can colour a body by its feature.
-    let mut current: Option<(CsgMesh, u32)> = None;
-    for f in &model.features {
-        // A DISABLED FEATURE IS SKIPPED — and skipping a disabled UNION also ENDS its body,
-        // rather than letting the cuts that follow it fall through onto the previous one.
-        //
-        // Dropping the body and keeping its cuts would re-bind them, which is the exact
-        // corruption `Feature::enabled` was added to refuse. So the body is flushed and
-        // `current` cleared: the trailing Differences then meet no body and are dropped, the
-        // same way `eval` already drops a leading Difference. Disabling a body disables what it
-        // was opened by; it never moves those openings onto a neighbour.
-        if !f.enabled {
-            if f.op == BoolOp::Union {
-                if let Some((c, id)) = current.take() {
-                    append_solid(&c, id, &mut out);
-                }
-            }
-            if let Some(p) = prof.as_deref_mut() {
-                p.disabled += 1;
-            }
+    let (bodies, mut unbound) = plan_bodies(model);
+
+    for b in &bodies {
+        let uf = &model.features[b.union_at];
+        // A DISABLED BODY TAKES ITS OPENINGS WITH IT. Keeping the cuts and dropping the body
+        // would re-bind them onto a neighbour, which is the exact corruption `Feature::enabled`
+        // was added to refuse — disabling a body disables what it was opened by.
+        if !uf.enabled {
+            unbound += b.cuts.iter().filter(|&&i| model.features[i].enabled).count();
             continue;
         }
         let t = std::time::Instant::now();
-        let m = world_mesh(f, model);
-        let operand = m.polygons.len();
-        match f.op {
-            BoolOp::Union => {
-                if let Some((c, id)) = current.take() {
-                    append_solid(&c, id, &mut out); // flush the finished body
-                }
-                current = Some((m, f.id));
+        // The leading feature id of this body — every triangle it produces is tagged with it, so
+        // the app can colour, pick and group a body by its feature.
+        let mut m = world_mesh(uf, model);
+        record(&mut prof, uf, m.polygons.len(), m.polygons.len(), t);
+
+        for &ci in &b.cuts {
+            let cf = &model.features[ci];
+            if !cf.enabled {
+                continue;
             }
-            BoolOp::Difference => {
-                if let Some((c, id)) = current.take() {
-                    current = Some((c.difference(&m), id));
-                }
-            }
-            BoolOp::Intersection => {
-                if let Some((c, id)) = current.take() {
-                    current = Some((c.intersection(&m), id));
-                }
-            }
+            let t = std::time::Instant::now();
+            let c = world_mesh(cf, model);
+            let operand = c.polygons.len();
+            m = match cf.op {
+                BoolOp::Difference => m.difference(&c),
+                BoolOp::Intersection => m.intersection(&c),
+                // `plan_bodies` never files a Union as a cut; it starts a body of its own.
+                BoolOp::Union => m,
+            };
+            record(&mut prof, cf, operand, m.polygons.len(), t);
         }
-        if let Some(p) = prof.as_deref_mut() {
-            // The BODY count is read AFTER the boolean, so a Difference reports what the cut
-            // left behind rather than what it started with — that is the number that grows.
-            // THE LARGEST MESH EVER FED TO A BOOLEAN, not the last one — that is the figure the
-            // eval stack has to survive, and a model rarely ends on its biggest solid.
-            p.deepest_operand = p.deepest_operand.max(operand);
-            let body = current.as_ref().map_or(0, |(c, _)| c.polygons.len());
-            p.deepest_operand = p.deepest_operand.max(body);
-            p.features.push(FeatureCost {
-                id: f.id,
-                op: f.op,
-                kind: primitive_kind(&f.primitive),
-                ms: t.elapsed().as_secs_f64() * 1000.0,
-                polys_operand: operand,
-                polys_body: body,
-            });
-        }
+        append_solid(&m, uf.id, &mut out);
     }
-    if let Some((c, id)) = current {
-        append_solid(&c, id, &mut out);
-    }
+
     if let Some(p) = prof.as_deref_mut() {
         p.total_ms = t_all.elapsed().as_secs_f64() * 1000.0;
         p.bodies = out.face_ids.iter().collect::<std::collections::HashSet<_>>().len();
+        // Counted straight off the model rather than tallied through the walk above, so the
+        // number means what the field says whether or not the body it belonged to was reached.
+        p.disabled = model.features.iter().filter(|f| !f.enabled).count();
+        p.unbound = unbound;
     }
     out
+}
+
+/// Note what one feature cost. `body` is read AFTER the boolean, so a Difference reports what the
+/// cut left behind rather than what it started with — that is the number which grows.
+fn record(
+    prof: &mut Option<&mut EvalProfile>, f: &Feature, operand: usize, body: usize,
+    t: std::time::Instant,
+) {
+    let Some(p) = prof.as_deref_mut() else { return };
+    // THE LARGEST MESH EVER FED TO A BOOLEAN, not the last one — that is the figure the eval
+    // stack has to survive, and a model rarely ends on its biggest solid.
+    p.deepest_operand = p.deepest_operand.max(operand).max(body);
+    p.features.push(FeatureCost {
+        id: f.id,
+        op: f.op,
+        kind: primitive_kind(&f.primitive),
+        ms: t.elapsed().as_secs_f64() * 1000.0,
+        polys_operand: operand,
+        polys_body: body,
+    });
 }
 
 /// Primitive kind as a short word, for a diagnostic table.
@@ -671,6 +722,233 @@ mod tests {
         let b = m.eval();
         assert_eq!(a.positions, b.positions, "same model must yield the same mesh");
     }
+
+    // ── A CUTTER NAMES THE BODY IT OPENS ───────────────────────────────────────────────────
+    //
+    // Everything above this line binds a Difference to whatever Union happened to precede it, so
+    // an INDEX IS A BINDING and any edit that reorders the list silently re-homes every opening
+    // after the edit. That rule has produced the same defect three separate times: a wall rebuilt
+    // with a different segment count, a restored sketch stash pushed onto the end, and a
+    // duplicate body dropped from the middle. Each was patched where it appeared.
+    //
+    // `Feature::target` states the binding instead of inferring it. `None` keeps the positional
+    // rule exactly — that is every project ever saved, and what the tests above pin — so this is
+    // an addition, not a change of meaning.
+
+    /// A helper that walks a solid's extent along X, which is what every one of these asserts on:
+    /// a cut that lands where it should shortens the body, and a cut that lands on a neighbour
+    /// shortens the neighbour. Bounds are a fact about the solid; triangle counts are a fact
+    /// about how csgrs happened to tessellate it.
+    fn span_x(m: &Model) -> (f32, f32) {
+        let (mn, mx) = m.eval().bounds().expect("the model has bounds");
+        (mn[0], mx[0])
+    }
+
+    /// Two bars far apart, each 4 long and 1 square, centred at x = 0 and x = 20.
+    /// Returns `(model, id of A, id of B)`.
+    fn two_bars() -> (Model, u32, u32) {
+        let mut m = Model::default();
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        let b = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 20.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(4.0, 1.0, 1.0),
+        );
+        (m, a, b)
+    }
+
+    /// A cutter that swallows everything past x = `at` + 1, placed at `at`.
+    fn cutter_at(at: f32) -> (Plane, Placement, Primitive) {
+        (
+            Plane::default(),
+            Placement { u: at, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(2.0, 2.0, 2.0),
+        )
+    }
+
+    /// THE POSITIONAL RULE IS UNCHANGED for a cutter that names nothing. Every project ever saved
+    /// loads with `target: None`, and if this ever stopped meaning "the Union before me" then
+    /// adding the field would itself be the corruption it exists to prevent.
+    #[test]
+    fn a_cutter_that_names_nothing_still_opens_the_body_before_it() {
+        let (mut m, _a, _b) = two_bars();
+        let (p, pl, pr) = cutter_at(22.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        assert_eq!(m.get(cut).and_then(|f| f.target), None, "push must not invent a target");
+
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 21.0).abs() < 1e-3,
+            "A must still span from -2 and B must end at 21, got [{mn}, {mx}]",
+        );
+    }
+
+    /// A NAMED CUTTER REACHES ITS BODY FROM ANYWHERE IN THE LIST. This is the whole point: the
+    /// cutter sits directly behind body A — where the positional rule would make it cut A — and
+    /// names B. B must be the one that loses its end, and A must be untouched.
+    #[test]
+    fn a_named_cutter_opens_the_body_it_names_not_the_one_before_it() {
+        let mut m = Model::default();
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        // The cutter overlaps B's far end, and is inserted BEFORE B exists in the list.
+        let (p, pl, pr) = cutter_at(22.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        let b = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 20.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(4.0, 1.0, 1.0),
+        );
+        assert!(m.set_target(cut, Some(b)), "the cutter and the body both exist");
+        let _ = a;
+
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 21.0).abs() < 1e-3,
+            "the named cutter did not reach B: expected [-2, 21], got [{mn}, {mx}]",
+        );
+    }
+
+    /// DELETING A BODY DOES NOT MOVE ANOTHER BODY'S HOLES.
+    ///
+    /// The user-visible statement of the defect. Body B has an opening of its own. Delete B, and
+    /// under the positional rule its cutter falls onto A and punches a hole in a solid nobody
+    /// touched. With the binding stated, the opening goes when the thing it was an opening IN
+    /// goes.
+    #[test]
+    fn deleting_a_body_takes_its_openings_with_it_and_leaves_its_neighbour_alone() {
+        let (mut m, _a, b) = two_bars();
+        // A cutter for B that OVERLAPS A — so if it is ever re-homed, it is unmistakable.
+        let (p, pl, pr) = cutter_at(2.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        assert!(m.set_target(cut, Some(b)), "bind the opening to B");
+
+        assert!(m.remove(b), "B was there to delete");
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 2.0).abs() < 1e-3,
+            "B's opening was re-homed onto A: A should still span [-2, 2], got [{mn}, {mx}]",
+        );
+    }
+
+    /// AND THE SAME WHEN THE BODY IS DISABLED rather than deleted. `Feature::enabled` already
+    /// refused this for the positional rule; a named cutter must not find a back door to it.
+    ///
+    /// The cutter sits DIRECTLY BEHIND A and overlaps it, so binding by position rather than by
+    /// name is not merely wrong here, it is visible: A would lose its far end.
+    #[test]
+    fn disabling_a_body_does_not_hand_its_named_cuts_to_a_neighbour() {
+        let mut m = Model::default();
+        let _a = m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        let (p, pl, pr) = cutter_at(2.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        let b = m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement { u: 20.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+            boxf(4.0, 1.0, 1.0),
+        );
+        assert!(m.set_target(cut, Some(b)));
+
+        m.set_enabled(b, false);
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 2.0).abs() < 1e-3,
+            "a disabled body's named cut reached its neighbour: A should still span [-2, 2], \
+             got [{mn}, {mx}]",
+        );
+    }
+
+    /// A CUTTER NAMING SOMETHING THAT IS NOT A BODY IS DROPPED, NOT RE-HOMED. Both of the other
+    /// answers are corruption: falling back to the positional rule is precisely the re-binding
+    /// this field exists to refuse, and there is nothing else for it to cut.
+    ///
+    /// ONE body in the fixture, and the cutter overlaps it — so "found one anyway" and "found the
+    /// right one" cannot be confused, which they can be as soon as a second body is in the model
+    /// and the assertion is on the whole thing's extent.
+    #[test]
+    fn a_cutter_naming_a_body_that_is_gone_cuts_nothing() {
+        let mut m = Model::default();
+        m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(4.0, 1.0, 1.0));
+        let (p, pl, pr) = cutter_at(2.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        assert!(m.set_target(cut, Some(4_242)), "an id that was never in this model");
+
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 2.0).abs() < 1e-3,
+            "a cutter with no body found one anyway: the bar should still span [-2, 2], \
+             got [{mn}, {mx}]",
+        );
+    }
+
+    /// EVERY CUT ON A BODY IS APPLIED, not just the first one it collected. Grouping is exactly
+    /// where an off-by-one loses a cutter, and one missing opening in a wall full of them is not
+    /// something a person spots by looking.
+    ///
+    /// NOT a test of the ORDER they run in, though the code keeps that order. Difference and
+    /// Intersection are set operations on the same solid, and `(A ∖ B) ∩ C` is `(A ∩ C) ∖ B`, so
+    /// no arrangement of the ops available here has a result that depends on their sequence — a
+    /// test claiming to pin one would pass whatever the code did, which is how a vacuous test gets
+    /// written. Order is kept because a reproducible tessellation is worth having, not because the
+    /// solid needs it.
+    #[test]
+    fn every_cut_on_a_body_is_applied() {
+        let mut m = Model::default();
+        // A bar spanning x ∈ [-4, 4].
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), boxf(8.0, 2.0, 2.0));
+        // One bite off each end: x > 2 and x < -2.
+        for u in [3.0_f32, -3.0] {
+            let bite = m.push(
+                BoolOp::Difference,
+                Plane::default(),
+                Placement { u, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
+                boxf(2.0, 4.0, 4.0),
+            );
+            assert!(m.set_target(bite, Some(a)));
+        }
+
+        let (mn, mx) = span_x(&m);
+        assert!(
+            (mn + 2.0).abs() < 1e-3 && (mx - 2.0).abs() < 1e-3,
+            "a cut on the body went unapplied: expected [-2, 2], got [{mn}, {mx}]",
+        );
+    }
+
+    /// BODIES ARE STILL EMITTED IN THE ORDER THEIR UNION APPEARS, and each body's triangles are
+    /// still tagged with its own leading feature id. The app paints, picks and groups by that id,
+    /// so a regrouped evaluation that shuffled them would repaint the model.
+    #[test]
+    fn every_body_keeps_its_own_face_id() {
+        let (mut m, a, b) = two_bars();
+        let (p, pl, pr) = cutter_at(22.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        assert!(m.set_target(cut, Some(b)));
+
+        let mesh = m.eval();
+        let ids: Vec<u32> = mesh.face_ids.clone();
+        assert!(ids.contains(&a) && ids.contains(&b), "a body lost its id: {ids:?}");
+        // The first triangle emitted belongs to the first Union in the list.
+        assert_eq!(ids[0], a, "bodies came out in the wrong order");
+    }
+
+    /// THE PROFILE STILL ACCOUNTS FOR EVERY FEATURE once they are grouped rather than folded in
+    /// place — including a cutter that named a body which is gone, which is work NOT done and
+    /// must not be reported as work done.
+    #[test]
+    fn the_profile_accounts_for_a_cutter_with_no_body() {
+        let (mut m, _a, _b) = two_bars();
+        let (p, pl, pr) = cutter_at(30.0);
+        let cut = m.push(BoolOp::Difference, p, pl, pr);
+        assert!(m.set_target(cut, Some(4_242)));
+
+        let (_, prof) = eval_profiled(&m);
+        assert_eq!(prof.features.len(), 2, "the unbound cutter was measured as work done");
+        assert_eq!(prof.unbound, 1, "the unbound cutter was not counted anywhere");
+        assert_eq!(prof.bodies, 2, "both bodies survived");
+    }
+
 }
 
 #[cfg(test)]
