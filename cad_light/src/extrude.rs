@@ -80,6 +80,32 @@ fn ellipse_arc_pts(ea: &cad_kernel::EllipseArc) -> Vec<Vec2> {
         .collect()
 }
 
+/// A spline as a point run, plus whether it closes back on itself.
+///
+/// A clamped NURBS interpolates its first and last control points, so a room traced as a closed
+/// spline comes back to where it started and this reports `true`. When it does, the duplicated end
+/// point is DROPPED: `extrude_path` closes a ring by joining the last point to the first, and
+/// leaving the duplicate in place would hand it a zero-length wall to build a surface from.
+///
+/// The closure tolerance is RELATIVE to the curve's own size rather than absolute. This crate is
+/// fed documents in metres and in millimetres, and a fixed epsilon that is generous at 1 m/unit is
+/// a thousand times too strict at 0.001 — the same room would close in one unit and stand open in
+/// the other, which is exactly the class of unit bug this file already carries tests against.
+fn spline_pts(s: &cad_kernel::Spline) -> (Vec<Vec2>, bool) {
+    let mut pts = s.tessellate(CURVE_SEGMENTS + 1);
+    if pts.len() < 2 {
+        return (pts, false);
+    }
+    let (first, last) = (pts[0], pts[pts.len() - 1]);
+    let span = pts.iter().fold(0.0_f64, |acc, p| acc.max(p.dist(first)));
+    let closed = span > 0.0 && first.dist(last) <= 1e-4 * span;
+    if closed {
+        pts.pop();
+    }
+    let closed = closed && pts.len() >= 3;
+    (pts, closed)
+}
+
 fn arc_pts(a: &KArc) -> Vec<Vec2> {
     (0..=CURVE_SEGMENTS)
         .map(|i| {
@@ -105,6 +131,10 @@ fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>, k: f64) {
         Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out, k),
         Geom::Ellipse(e) => extrude_path(&ellipse_pts(e), true, height, out, k),
         Geom::EllipseArc(ea) => extrude_path(&ellipse_arc_pts(ea), false, height, out, k),
+        Geom::Spline(s) => {
+            let (pts, closed) = spline_pts(s);
+            extrude_path(&pts, closed, height, out, k);
+        }
         // EVERYTHING BELOW IS DROPPED ON PURPOSE, and saying so is the point — this arm used to
         // swallow the two above it as well, so a room traced with an ellipse was lit AS IF IT HAD
         // NO WALLS: no error, no warning, a plausible lux figure somebody sizes an installation
@@ -117,8 +147,6 @@ fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>, k: f64) {
         //   BlockRef — deliberately NOT resolved here. It would turn every piece of imported
         //     furniture into a wall. Whether a block's contents should light is a real question,
         //     and it deserves an answer rather than a side effect.
-        //   Spline — a genuine gap, not a decision. `Spline::tessellate` already exists; the arm
-        //     is simply unwritten, and a curved wall drafted with it lights as open air today.
         _ => {}
     }
 }
@@ -176,6 +204,7 @@ pub fn bbox(doc: &Document) -> Option<(f32, f32, f32, f32)> {
             // by a different route.
             Geom::Ellipse(e) => ellipse_pts(e).into_iter().for_each(&mut add),
             Geom::EllipseArc(ea) => ellipse_arc_pts(ea).into_iter().for_each(&mut add),
+            Geom::Spline(s) => spline_pts(s).0.into_iter().for_each(&mut add),
             _ => {}
         }
     }
@@ -451,5 +480,106 @@ mod tests {
             extrude(&doc_with(cad_kernel::Geom::Text(t)), 2.7).is_empty(),
             "text was extruded into walls",
         );
+    }
+
+    // ── A CURVED WALL DRAFTED WITH A SPLINE ────────────────────────────────────────────────
+    //
+    // The arm above used to name Spline as "a genuine gap, not a decision" — the tessellator
+    // existed, the arm was simply unwritten, and a room traced with a spline lit as OPEN AIR.
+    // M5 then made splines visible in 3D, so the viewport showed walls the calculation could not
+    // see: the worst version of this defect, because the picture agrees with you.
+
+    /// Control points that trace a closed quadrilateral room, the first point repeated at the end
+    /// so the clamped curve comes back to where it started.
+    ///
+    /// NOT repeated EXACTLY. The end is offset by a ten-thousandth of the room — 0.04 mm on a 4 m
+    /// room — because that is what a closed spline looks like after a round trip through a DXF
+    /// written by another package, and a fixture that closes to the last bit would let an absolute
+    /// tolerance, or no tolerance at all, pass this file's unit tests for the wrong reason.
+    fn closed_spline(side: f64) -> cad_kernel::Spline {
+        let nudge = side * 1e-5;
+        let pts = [
+            (0.0, 0.0), (side, 0.0), (side, side), (0.0, side), (nudge, nudge),
+        ];
+        let ctrl: Vec<Vec2> = pts.iter().map(|&(x, y)| Vec2::new(x, y)).collect();
+        let w = vec![1.0; ctrl.len()];
+        cad_kernel::Spline::new(2, ctrl, w)
+    }
+
+    fn open_spline() -> cad_kernel::Spline {
+        let ctrl = vec![
+            Vec2::new(0.0, 0.0), Vec2::new(2.0, 3.0), Vec2::new(5.0, 1.0), Vec2::new(8.0, 4.0),
+        ];
+        cad_kernel::Spline::new(3, ctrl, vec![1.0; 4])
+    }
+
+    /// THE GAP ITSELF. A spline produced no surfaces at all, so the room had no walls.
+    #[test]
+    fn a_spline_traced_room_has_walls() {
+        let m = extrude(&doc_with(cad_kernel::Geom::Spline(closed_spline(4.0))), 2.7);
+        assert!(
+            !m.is_empty(),
+            "a spline produced no wall surfaces — the room would be lit as if open to the sky",
+        );
+    }
+
+    /// AND IT IS A ROOM, not a fence. A closed spline must get its floor and ceiling, or the
+    /// light escapes upward and the working-plane figure comes out low with nothing to show for
+    /// it. This is the assertion the bare `!is_empty()` above cannot make.
+    #[test]
+    fn a_closed_spline_room_is_capped() {
+        let m = extrude(&doc_with(cad_kernel::Geom::Spline(closed_spline(4.0))), 2.7);
+        assert!(m.iter().any(|x| x.material == FLOOR), "no floor");
+        assert!(m.iter().any(|x| x.material == CEILING), "no ceiling");
+        assert!(m.iter().any(|x| x.material == WALL), "no walls");
+    }
+
+    /// AN OPEN SPLINE IS A WALL, NOT A ROOM. Capping it would seal a curve the drafter left open
+    /// — a lid over an area they meant to leave connected to the space next door.
+    #[test]
+    fn an_open_spline_is_a_wall_and_is_not_capped() {
+        let m = extrude(&doc_with(cad_kernel::Geom::Spline(open_spline())), 2.7);
+        assert!(!m.is_empty(), "an open spline wall vanished");
+        assert!(
+            !m.iter().any(|x| x.material == FLOOR || x.material == CEILING),
+            "an open spline was capped — it sealed a space the drafter left open",
+        );
+    }
+
+    /// THE CALCULATION PLANE COVERS IT. `bbox` sizes the grid the lux figures are sampled on, and
+    /// it matched the same five types the extruder did. A spline that builds walls but is missing
+    /// here gets a plane that does not reach them: the room is modelled and then only partly
+    /// measured, which is the same wrong answer arriving by a different route.
+    #[test]
+    fn the_calc_plane_reaches_a_spline_room() {
+        let (mnx, mny, mxx, mxy) =
+            bbox(&doc_with(cad_kernel::Geom::Spline(closed_spline(4.0)))).expect("a room has a bbox");
+        assert!(
+            mnx.abs() < 0.05 && mny.abs() < 0.05 && (mxx - 4.0).abs() < 0.05 && (mxy - 4.0).abs() < 0.05,
+            "the calc plane came out ({mnx}, {mny})..({mxx}, {mxy}) for a 4 m spline room",
+        );
+    }
+
+    /// AND IT SCALES. The closure test is a distance between two points, so it has a tolerance,
+    /// and a tolerance in a crate fed both metres and millimetres is where a unit bug hides: an
+    /// absolute epsilon generous at 1 m/unit is 1000x too strict at 0.001. The same room drafted
+    /// either way must close either way.
+    #[test]
+    fn a_spline_room_closes_whatever_unit_it_was_drafted_in() {
+        for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
+            let mut d = Document::default();
+            d.units = cad_kernel::DocUnits::new(unit_m, cad_kernel::UnitSource::Declared);
+            d.push(DObject::new(cad_kernel::Geom::Spline(closed_spline(side))));
+            let m = extrude(&d, 2.7);
+            assert!(
+                m.iter().any(|x| x.material == FLOOR),
+                "a spline room drafted at {unit_m} m/unit did not close",
+            );
+            let max_x = m.iter().flat_map(|x| x.vertices.iter()).fold(f32::MIN, |a, v| a.max(v.x));
+            assert!(
+                (max_x - 4.0).abs() < 1e-2,
+                "a 4 m spline room at {unit_m} m/unit reached the engine {max_x} m across",
+            );
+        }
     }
 }
