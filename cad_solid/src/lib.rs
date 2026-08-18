@@ -611,6 +611,26 @@ pub struct Feature {
     /// building as an empty scene.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    /// WHICH BODY THIS CUTTER OPENS, by the id of the `Union` that starts it. Meaningless on a
+    /// `Union`, which starts a body rather than joining one.
+    ///
+    /// `None` means "the body before me in the list", which is the rule [`csg::eval`] has always
+    /// applied and is what every project ever saved carries. The trouble with that rule is not
+    /// that it is wrong but that AN INDEX IS A BINDING, so any edit which reorders the list
+    /// silently re-homes every opening after the edit. The same defect has been found and patched
+    /// three separate times — a wall rebuilt with a different segment count, a restored sketch
+    /// stash pushed onto the end, a duplicate body dropped from the middle. Each patch restored a
+    /// position; none of them stated a relationship.
+    ///
+    /// When it IS set it is honoured wherever the cutter sits, and a cutter naming a body that has
+    /// been deleted or disabled cuts NOTHING. Both other answers are corruption: falling back to
+    /// the previous body is exactly the re-binding this field refuses, and there is nothing else
+    /// for it to open.
+    ///
+    /// A plain `#[serde(default)]` is right here, unlike `enabled` above — `Option::default()` is
+    /// `None`, which IS the positional rule, so an older file loads meaning what it meant.
+    #[serde(default)]
+    pub target: Option<u32>,
 }
 
 /// Serde's default for [`Feature::enabled`] — see the field. Must be `true`: it is what every
@@ -1263,8 +1283,32 @@ impl Model {
     /// Append a feature, assigning it a fresh id; returns that id.
     pub fn push(&mut self, op: BoolOp, plane: Plane, placement: Placement, primitive: Primitive) -> u32 {
         let id = self.take_feature_id();
-        self.features.push(Feature { id, op, plane, placement, primitive, enabled: true });
+        self.features.push(Feature {
+            id, op, plane, placement, primitive, enabled: true, target: None,
+        });
         id
+    }
+
+    /// Read a feature by id.
+    pub fn get(&self, id: u32) -> Option<&Feature> {
+        self.features.iter().find(|f| f.id == id)
+    }
+
+    /// State which body a cutter opens — see [`Feature::target`]. `None` restores the positional
+    /// rule ("the body before me"). Returns false if `id` names no feature.
+    ///
+    /// The body it names is NOT checked here, deliberately. A cutter can be bound before its host
+    /// is inserted (that is half the point of naming rather than positioning), and a body that is
+    /// deleted afterwards must leave the binding standing and unhonoured rather than silently
+    /// reverting to the neighbour it would otherwise cut.
+    pub fn set_target(&mut self, id: u32, target: Option<u32>) -> bool {
+        match self.features.iter_mut().find(|f| f.id == id) {
+            Some(f) => {
+                f.target = target;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Insert a fully-formed feature at `at`, clamped to the end. The id is kept as-is — this
@@ -1738,6 +1782,7 @@ mod tests {
             placement: Placement { u: 3.0, v: 0.0, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 2.0, d: 2.0, h: 1.0 },
             enabled: true,
+            target: None,
         };
         let (mn, mx) = f.world_aabb();
         // Centred at u=3 on X → x spans 2..4; sits on plane at z=offset=2 → z 2..3.
@@ -1753,6 +1798,7 @@ mod tests {
             placement: Placement { u, v, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 },
             primitive: Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
+            target: None,
         }
     }
 
@@ -1776,6 +1822,12 @@ mod tests {
         }"#;
         let f: Feature = serde_json::from_str(legacy).expect("a pre-flag feature must still parse");
         assert!(f.enabled, "an existing project would open as an empty scene");
+        // And the SAME JSON is what a pre-`target` file carries, which is every file ever saved.
+        // `None` is the positional binding, so an older project's openings stay in the walls they
+        // were cut in. Unlike `enabled` this one is safe by construction — pinned anyway, on the
+        // hand-written JSON rather than a round trip, because a round trip writes the field and
+        // so never exercises its absence.
+        assert_eq!(f.target, None, "an older feature must keep the positional binding");
     }
 
     /// `insert_after` is where "a cutter sits directly behind the body it opens" is stated, so it

@@ -54848,6 +54848,7 @@ mod plan_overlay {
             placement: cad_solid::Placement { u: 3.0, v: 3.0, ..Default::default() },
             primitive: cad_solid::Primitive::Box { w: 1.0, d: 1.0, h: 1.0 },
             enabled: true,
+            target: None,
         });
         assert!(solids_before > 0, "the building itself must be drawn, or this test proves nothing");
         let solids_after = layers(&app).iter().filter(|l| **l == PlanLayer::Solid).count();
