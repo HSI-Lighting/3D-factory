@@ -33993,9 +33993,22 @@ impl CadApp {
         ));
         // No auto-recompute. Intersections are only computed when the user
         // presses an ∩ button — otherwise modifying dobjects silently
-        // invalidates them. Index is now stale until next ensure_index().
+        // invalidates them.
         self.intersections.clear();
-        self.index_dirty = true;
+        // THE INDEX ABSORBS THE ONE NEW OBJECT INSTEAD OF BEING REBUILT FROM SCRATCH.
+        //
+        // This used to set `index_dirty`, which costs a full O(n) rebuild on the next query:
+        // measured 13.4 ms at 100k dobjects and 247.9 ms at 1.5M, to record the arrival of one
+        // line. An APPEND shifts no existing index, so the grid can take it in O(1) — and when
+        // it cannot (the new object lands outside the grid's fixed bounds), it says so and we
+        // fall back to exactly the old behaviour.
+        if !self.index_dirty
+            && self.index.as_mut().is_some_and(|g| g.insert_appended(&self.doc.dobjects))
+        {
+            // absorbed — the grid is current, nothing to rebuild
+        } else {
+            self.index_dirty = true;
+        }
         self.touch_view();
     }
 
@@ -53886,6 +53899,58 @@ mod perf_investigation {
         }
     }
 
+    /// DRAWING ONE OBJECT NO LONGER REBUILDS THE WHOLE INDEX.
+    ///
+    /// `add_dobject` used to set `index_dirty`, which costs a full O(n) rebuild on the next
+    /// query — measured at 13.4 ms per edit at 100k dobjects and 247.9 ms at 1.5M, to record the
+    /// arrival of one line. An append shifts no existing index, so the grid absorbs it.
+    #[test]
+    fn drawing_an_object_does_not_rebuild_the_index() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..40 {
+            app.doc.push(DObject::new(Geom::Line(Line {
+                a: Vec2::new(i as f64, 0.0), b: Vec2::new(i as f64 + 1.0, 3.0),
+            })));
+        }
+        app.ensure_index();
+        assert!(!app.index_dirty, "the fixture must start with a live index");
+
+        // Inside the existing extent, so the grid can take it.
+        app.add_dobject(Geom::Line(Line { a: Vec2::new(5.0, 1.0), b: Vec2::new(6.0, 2.0) }), "test");
+        assert!(
+            !app.index_dirty,
+            "drawing one object still forces a full index rebuild",
+        );
+
+        // ABSORBED IS NOT THE SAME AS CORRECT. The new object has to be findable through the
+        // index, or the speed has been bought by dropping it out of every selection.
+        let idx = app.doc.dobjects.len() - 1;
+        let found = app.index.as_ref().expect("index").query_bbox(
+            Vec2::new(5.0, 1.0), Vec2::new(6.0, 2.0));
+        assert!(found.contains(&(idx as u32)), "the drawn object is not in the index: {found:?}");
+    }
+
+    /// …AND AN OBJECT DRAWN OUTSIDE THE GRID STILL FALLS BACK. The grid's bounds are fixed at
+    /// build time; growing them is a rebuild, and refusing to do one would mis-bucket the object.
+    #[test]
+    fn drawing_far_outside_the_grid_falls_back_to_a_rebuild() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..10 {
+            app.doc.push(DObject::new(Geom::Line(Line {
+                a: Vec2::new(i as f64, 0.0), b: Vec2::new(i as f64 + 1.0, 1.0),
+            })));
+        }
+        app.ensure_index();
+        assert!(!app.index_dirty);
+        app.add_dobject(
+            Geom::Line(Line { a: Vec2::new(1e6, 1e6), b: Vec2::new(1e6 + 1.0, 1e6 + 1.0) }),
+            "far away",
+        );
+        assert!(app.index_dirty, "an out-of-bounds draw must fall back to a rebuild");
+    }
+
     /// WHERE DOES THE TIME GO at 1.5M dobjects? Measures the per-EDIT and per-FRAME
     /// O(n) costs, so the answer to "why is it slow" is a number, not a hunch.
     #[test]
@@ -53911,6 +53976,35 @@ mod perf_investigation {
             println!("  index: auto_cell_size (bbox sweep)  : {auto_ms:8.1} ms");
             println!("  index: build (bbox sweep + bucket)  : {build_ms:8.1} ms");
             println!("  index TOTAL per edit                : {:8.1} ms   ← PER EDIT", auto_ms + build_ms);
+
+            // …AND WHAT DRAWING ONE OBJECT COSTS NOW. The rebuild above is what `index_dirty`
+            // buys; this is what an absorbed append costs instead — same grid, one more line.
+            {
+                let mut g2 = cad_kernel::UniformGrid::build(&doc.dobjects, cs);
+                let mut objs = doc.dobjects.clone();
+                let (mn, _) = objs[0].bbox();
+                objs.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                    a: mn, b: cad_kernel::Vec2::new(mn.x + 0.5, mn.y + 0.5),
+                })));
+                let t = std::time::Instant::now();
+                let ok = g2.insert_appended(&objs);
+                let us = t.elapsed().as_secs_f64() * 1_000_000.0;
+                println!(
+                    "  index: absorb ONE appended object   : {us:8.1} µs   ← PER DRAW ({})",
+                    if ok { "absorbed" } else { "REFUSED, rebuilt" },
+                );
+                // AND THE SECOND ONE, because the first push into a `with_capacity(n)` vector
+                // reallocates 24 MB at 1.5M and that cost is a one-off, not the per-draw price.
+                objs.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                    a: mn, b: cad_kernel::Vec2::new(mn.x + 0.25, mn.y + 0.25),
+                })));
+                let t = std::time::Instant::now();
+                g2.insert_appended(&objs);
+                println!(
+                    "  index: absorb a SECOND one          : {:8.1} µs   ← steady state",
+                    t.elapsed().as_secs_f64() * 1_000_000.0,
+                );
+            }
             std::hint::black_box(&g);
 
             // How much of that is just bbox()? It is called THREE times per dobject

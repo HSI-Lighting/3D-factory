@@ -141,6 +141,62 @@ impl UniformGrid {
                n_entities: dobjects.len() }
     }
 
+    /// Absorb dobjects APPENDED to the end of the document — the shape a DRAW makes. **O(added)**.
+    ///
+    /// [`Self::update`] cannot do this: it refuses any change in COUNT, because an insert or a
+    /// delete in the MIDDLE shifts every index after it and invalidates the whole bucket space.
+    /// An APPEND shifts nothing — every existing index still means what it meant — so the grid
+    /// only has to learn about the objects on the end. Drawing one line into a 1.5 M-object plan
+    /// stops re-bucketing 1.5 M objects to record the arrival of one.
+    ///
+    /// Refuses (and the caller must then rebuild) when:
+    ///   * the count did not GROW — this is for appends, not deletes,
+    ///   * the grid has no cells: an all-view-independent document has no spatial structure to
+    ///     add to, and a rebuild will make one once there is something worth bucketing, or
+    ///   * a new bbox falls OUTSIDE the current grid, which would need it to GROW — `origin`,
+    ///     `cols` and `rows` are fixed at build time. That is the ordinary case for the first
+    ///     object drawn well clear of everything else, and rebuilding is the right answer.
+    ///
+    /// VERIFIES EVERYTHING BEFORE MUTATING ANYTHING, exactly as `update` does. A refused append
+    /// must leave the grid untouched rather than half-populated: the caller's fallback is to
+    /// rebuild, and until it does, the grid it still holds gets queried.
+    pub fn insert_appended(&mut self, dobjects: &[DObject]) -> bool {
+        let old = self.ranges.len();
+        if dobjects.len() <= old || self.cells.is_empty() {
+            return false;
+        }
+        // Pass 1 — decide every new object's fate without touching the grid.
+        let mut planned: Vec<[u32; 4]> = Vec::with_capacity(dobjects.len() - old);
+        for e in &dobjects[old..] {
+            if e.geom.is_view_independent_bbox() {
+                planned.push(SKIP); // joins `view_independent`; never bucketed
+                continue;
+            }
+            let (emin, emax) = e.bbox();
+            if !fits(emin, emax, self.origin, self.cell_size, self.cols, self.rows) {
+                return false; // outside the grid → it would have to grow → rebuild
+            }
+            planned.push(cell_range(&(emin, emax), self.origin, self.cell_size, self.cols, self.rows));
+        }
+        // Pass 2 — commit.
+        for (k, r) in planned.into_iter().enumerate() {
+            let i = (old + k) as u32;
+            self.ranges.push(r);
+            if r == SKIP {
+                self.view_independent.push(i);
+                continue;
+            }
+            for cy in r[2]..=r[3] {
+                let row = cy as usize * self.cols;
+                for cx in r[0]..=r[1] {
+                    self.cells[row + cx as usize].push(i);
+                }
+            }
+        }
+        self.n_entities = dobjects.len();
+        true
+    }
+
     /// Incrementally re-bucket just the `changed` dobjects. **O(changed)**, not O(n).
     ///
     /// Returns `false` when the grid cannot absorb the change — the caller must then
@@ -572,5 +628,127 @@ mod tests {
             if let crate::geom::Geom::Line(l) = &mut ents[i].geom { l.a.x += 1.0; l.b.x += 1.0; }
         }
         assert!(g.update(&ents, &changed), "ranges are populated by build_auto too");
+    }
+
+    // ---- APPEND ABSORPTION ------------------------------------------------------------------
+    //
+    // Drawing an object used to invalidate the whole index: a full O(n) rebuild, measured at
+    // 13.4 ms per edit at 100k dobjects and 247.9 ms at 1.5M, to record the arrival of one line.
+    // `insert_appended` takes it in O(added) instead. The risk this trades for speed is an index
+    // that is subtly WRONG, so the governing test is the one that compares it against a rebuild.
+
+    /// THE INVARIANT. An absorbed append must answer every query exactly as a freshly built grid
+    /// would — same objects, for every rectangle. A fast index that quietly loses an object is
+    /// worse than a slow one, because the object is still on screen and simply stops being
+    /// selectable.
+    ///
+    /// Compared against `build`, which is the independent authority here: it is the code path the
+    /// fallback uses, so if the two ever disagree the fallback is the correct one.
+    #[test]
+    fn an_absorbed_append_answers_exactly_as_a_rebuild_would() {
+        let mut objs: Vec<DObject> = (0..40)
+            .map(|i| c((i % 8) as f64 * 5.0, (i / 8) as f64 * 5.0, 1.0))
+            .collect();
+        let mut grid = UniformGrid::build(&objs, 4.0);
+
+        // Three more, inside the existing extent so the grid can take them.
+        objs.push(c(11.0, 6.0, 0.5));
+        objs.push(c(3.0, 14.0, 2.0));
+        objs.push(c(28.0, 2.0, 1.5));
+        assert!(grid.insert_appended(&objs), "an in-bounds append must be absorbed");
+
+        let rebuilt = UniformGrid::build(&objs, 4.0);
+        // Sweep the whole populated area plus a margin, in windows of several sizes — one
+        // rectangle could agree by luck; forty cannot.
+        for &w in &[1.0_f64, 3.0, 9.0] {
+            let mut x = -5.0_f64;
+            while x < 40.0 {
+                let mut y = -5.0_f64;
+                while y < 25.0 {
+                    let (lo, hi) = (Vec2::new(x, y), Vec2::new(x + w, y + w));
+                    let mut a = grid.query_bbox(lo, hi);
+                    let mut b = rebuilt.query_bbox(lo, hi);
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    assert_eq!(a, b, "absorbed grid disagrees with a rebuild at ({x},{y}) w={w}");
+                    y += 3.0;
+                }
+                x += 3.0;
+            }
+        }
+    }
+
+    /// The new object is actually findable where it was put — the cheap sanity check that the
+    /// comparison above would also catch, kept because its failure message says what went wrong.
+    #[test]
+    fn an_appended_object_is_found_at_its_own_position() {
+        let mut objs = vec![c(0.0, 0.0, 1.0), c(10.0, 0.0, 1.0)];
+        let mut grid = UniformGrid::build(&objs, 4.0);
+        objs.push(c(5.0, 0.0, 0.5));
+        assert!(grid.insert_appended(&objs));
+        let hit = grid.query_bbox(Vec2::new(4.5, -0.5), Vec2::new(5.5, 0.5));
+        assert!(hit.contains(&2), "the appended circle is not in its own cell: {hit:?}");
+    }
+
+    /// OUT OF BOUNDS IS REFUSED, because the grid's origin/cols/rows are fixed at build time and
+    /// growing them is a rebuild. Drawing the first object far from everything else is the
+    /// ordinary way to reach this.
+    #[test]
+    fn an_append_outside_the_grid_is_refused() {
+        let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0)];
+        let mut grid = UniformGrid::build(&objs, 4.0);
+        objs.push(c(10_000.0, 10_000.0, 1.0));
+        assert!(!grid.insert_appended(&objs), "an out-of-bounds append must be refused");
+    }
+
+    /// …AND A REFUSAL LEAVES THE GRID EXACTLY AS IT WAS. The caller's answer to `false` is to
+    /// rebuild, and until it does, this grid is still being queried — so a half-applied append
+    /// would hand out wrong answers in the window between.
+    #[test]
+    fn a_refused_append_leaves_the_grid_untouched() {
+        let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0)];
+        let mut grid = UniformGrid::build(&objs, 4.0);
+        let before: Vec<u32> = grid.query_bbox(Vec2::new(-9.0, -9.0), Vec2::new(9.0, 9.0));
+
+        // One that fits, then one that does not — so a naive implementation that commits as it
+        // goes would already have written the first before refusing on the second.
+        objs.push(c(2.0, 2.0, 0.5));
+        objs.push(c(10_000.0, 10_000.0, 1.0));
+        assert!(!grid.insert_appended(&objs), "must refuse the batch");
+
+        let after: Vec<u32> = grid.query_bbox(Vec2::new(-9.0, -9.0), Vec2::new(9.0, 9.0));
+        assert_eq!(before, after, "a refused append modified the grid anyway");
+        assert_eq!(grid.ranges.len(), 2, "a refused append grew the range table");
+    }
+
+    /// A VIEW-INDEPENDENT APPEND JOINS THE GLOBAL LIST rather than a cell. Hatches and block
+    /// references resolve their real extent through the Document, so the kernel's bbox for them
+    /// is a placeholder — they are returned by every query instead of being bucketed, and an
+    /// append has to preserve that or a newly drawn hatch stops being clickable.
+    #[test]
+    fn an_appended_view_independent_object_still_reaches_every_query() {
+        use crate::geom::{Hatch, Geom};
+        let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0)];
+        let mut grid = UniformGrid::build(&objs, 4.0);
+        let h = Hatch { boundary_handles: Vec::new(), pattern: crate::geom::HatchPattern::Solid };
+        objs.push(DObject::new(Geom::Hatch(h)));
+        assert!(grid.insert_appended(&objs), "a view-independent append is always absorbable");
+
+        // Far from anything, so only the global list can supply it.
+        let far = grid.query_bbox(Vec2::new(500.0, 500.0), Vec2::new(501.0, 501.0));
+        assert!(far.contains(&2), "the appended hatch does not reach a distant query: {far:?}");
+    }
+
+    /// Appends are for GROWTH only. A delete shifts every index after it, which is the whole
+    /// reason `update` refuses a count change, and this must refuse it too rather than corrupt
+    /// the bucket space.
+    #[test]
+    fn a_shrunk_document_is_refused() {
+        let mut objs = vec![c(0.0, 0.0, 1.0), c(5.0, 5.0, 1.0), c(2.0, 2.0, 1.0)];
+        let mut grid = UniformGrid::build(&objs, 4.0);
+        objs.pop();
+        assert!(!grid.insert_appended(&objs), "a shrunk document must be refused");
+        objs.pop();
+        assert!(!grid.insert_appended(&objs), "…and so must a shorter one");
     }
 }
