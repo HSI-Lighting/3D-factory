@@ -293,8 +293,14 @@ impl RoomInst {
 /// alongside the model-space doc — otherwise an undo inside the sketch would restore a
 /// model-space document over the sketch. The sketch gets a fresh, empty undo history.
 pub struct SketchSession {
-    /// Index into `Model::sketches`.
-    pub idx: usize,
+    /// WHICH PLANE is open, by [`cad_solid::Sketch::id`] — not by index.
+    ///
+    /// It used to be an index, and `factory_delete_plane` carried a hand-written fixup to slide
+    /// it down when an earlier plane was removed. That fixup was correct, and it was also the
+    /// tell: an index that has to be patched after every edit is not an identity. The rename
+    /// dialog held one too and never got the same treatment, so deleting a plane while a rename
+    /// was open renamed a different plane.
+    pub plane: u32,
     pub saved_doc: cad_kernel::Document,
     /// The main drawing's undo/redo history, parked while the sketch owns `doc`. Holds
     /// `UndoStep`s (not bare Documents) since undo spans 2D and 3D in one stack.
@@ -1135,8 +1141,13 @@ pub struct FactoryState {
     /// The unit question is on screen right now.
     pub ask_unit: bool,
     pub place_mode: PlaceMode,
-    /// A face plane being renamed: its index and the text being typed. `None` = no dialog open.
-    pub rename_plane: Option<(usize, String)>,
+    /// A face plane being renamed: its [`cad_solid::Sketch::id`] and the text being typed.
+    /// `None` = no dialog open.
+    ///
+    /// BY ID, because the dialog is a plain window and the view list behind it stays live: open a
+    /// rename, delete an earlier plane from that list, press Rename, and an index would land on
+    /// whichever plane had slid into the slot.
+    pub rename_plane: Option<(u32, String)>,
     /// The distance from the world origin used by [`PlaceMode::Offset`], in metres.
     pub place_offset: [f32; 3],
     /// The typed coordinate applies to the NEXT object only, then the mode goes back to
@@ -6476,28 +6487,32 @@ impl FactoryState {
         }
         // FACE PLANES and their drawings. A file written before these were saved carries none, and
         // then the model simply has no planes yet — which is exactly what it had before.
-        self.model.sketches = d
-            .sketches
-            .iter()
-            .map(|r| {
-                let mut sk = cad_solid::Sketch::new(Frame {
-                    origin: Vec3::from(r.origin),
-                    u: Vec3::from(r.u),
-                    v: Vec3::from(r.v),
-                });
-                sk.name = r.name.clone();
-                // An unreadable drawing costs the DRAWING, not the plane: a named face with
-                // nothing on it can be drawn on again, where a dropped plane is a view that
-                // silently went missing.
-                use base64::Engine;
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&r.rsm_b64) {
-                    if let Ok(doc) = cad_io::rsm::read_rsm(&bytes) {
-                        sk.doc = doc;
-                    }
+        //
+        // IDS ARE MINTED FRESH, through `push_sketch`. Nothing persisted names a plane — the open
+        // sketch and the rename dialog are both session state — so an id only has to be unique
+        // within this run. Assigning the vector directly would leave every plane holding
+        // `Sketch::new`'s id 0, and a reference to plane 0 would resolve to whichever of them the
+        // search reached first.
+        self.model.sketches.clear();
+        self.model.next_sketch_id = 0;
+        for r in &d.sketches {
+            let mut sk = cad_solid::Sketch::new(Frame {
+                origin: Vec3::from(r.origin),
+                u: Vec3::from(r.u),
+                v: Vec3::from(r.v),
+            });
+            sk.name = r.name.clone();
+            // An unreadable drawing costs the DRAWING, not the plane: a named face with nothing
+            // on it can be drawn on again, where a dropped plane is a view that silently went
+            // missing.
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&r.rsm_b64) {
+                if let Ok(doc) = cad_io::rsm::read_rsm(&bytes) {
+                    sk.doc = doc;
                 }
-                sk
-            })
-            .collect();
+            }
+            self.model.push_sketch(sk);
+        }
         // ROOMS. A feature the model no longer holds is dropped from the room rather than left
         // dangling — a room pointing at geometry that is not there would resize nothing and
         // delete nothing, which is worse than a room that knows it has lost a wall.
@@ -7135,8 +7150,8 @@ impl FactoryState {
         //
         // Rebuilt here rather than at the call sites because this is the one place that already
         // means "the model changed" — a caller that forgot would leave the drawing on the ghost.
-        if let Some(idx) = self.session.as_ref().map(|s| s.idx) {
-            if let Some(frame) = self.model.sketches.get(idx).map(|sk| sk.frame) {
+        if let Some(idx) = self.session.as_ref().map(|s| s.plane) {
+            if let Some(frame) = self.model.sketch_by_id(idx).map(|sk| sk.frame) {
                 self.sketch_ref = self.frame_face_edges(&frame);
             }
         }
@@ -9166,7 +9181,7 @@ impl FactoryState {
     /// then the same edges by construction, and cannot disagree about which face is open.
     pub fn picked_face_lines(&self) -> Vec<V3> {
         let mut out = Vec::new();
-        let Some(sk) = self.session.as_ref().and_then(|s| self.model.sketches.get(s.idx)) else {
+        let Some(sk) = self.session.as_ref().and_then(|s| self.model.sketch_by_id(s.plane)) else {
             return out;
         };
         // Yellow, and brighter than anything else in the overlay — this answers "did I pick the
@@ -9187,7 +9202,7 @@ impl FactoryState {
     pub fn sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
         let mut out = Vec::new();
         for (i, sk) in self.model.sketches.iter().enumerate() {
-            let active = self.session.as_ref().is_some_and(|s| s.idx == i);
+            let active = self.session.as_ref().is_some_and(|s| s.plane == sk.id);
             // THE ACTIVE PLANE IS NOT DRAWN FROM HERE. `factory_enter_sketch` `mem::take`s its
             // document, so this loop would emit nothing for it anyway — `live_sketch_lines` is
             // what shows it, at full strength. Skipping it explicitly means the dim below applies
@@ -9256,7 +9271,7 @@ impl FactoryState {
     pub fn live_sketch_lines(&self, doc: &cad_kernel::Document) -> Vec<V3> {
         let mut out = Vec::new();
         let Some(session) = self.session.as_ref() else { return out };
-        let Some(sk) = self.model.sketches.get(session.idx) else { return out };
+        let Some(sk) = self.model.sketch_by_id(session.plane) else { return out };
         for d in &doc.dobjects {
             // THE LIVE SKETCH RESOLVES AGAINST ITSELF, at full strength — this is the plane being
             // drawn on. While a session is open `doc` IS the sketch: it carries the clone of the

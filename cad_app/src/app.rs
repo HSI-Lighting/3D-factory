@@ -8277,19 +8277,19 @@ impl CadApp {
     /// It opens the sketch BY INDEX rather than by rebuilding a frame, which is what makes picking
     /// a name out of the list and right-clicking the face itself land in the same place with the
     /// same drawing on it.
-    fn factory_open_plane(&mut self, which: Option<usize>) {
+    fn factory_open_plane(&mut self, which: Option<u32>) {
         match which {
             None => {
                 self.factory_exit_sketch();
                 self.factory.status =
                     "Global view — the whole model from above, furniture and all.".into();
             }
-            Some(i) => {
-                let Some(frame) = self.factory.model.sketches.get(i).map(|s| s.frame) else {
+            Some(id) => {
+                let Some(sk) = self.factory.model.sketch_by_id(id) else {
                     self.factory.status = "That plane is gone.".into();
                     return;
                 };
-                let name = self.factory.model.sketches[i].name.clone();
+                let (frame, name) = (sk.frame, sk.name.clone());
                 self.factory_enter_sketch(frame);
                 self.factory.status =
                     format!("{name} — every 2D tool draws on this plane, and stays on it.");
@@ -8302,24 +8302,25 @@ impl CadApp {
     ///
     /// Snapshotted, so it is one Ctrl+Z away: this throws work away, and the only safe way to offer
     /// that in a single click is to make it reversible.
-    fn factory_delete_plane(&mut self, i: usize) {
-        let Some(sk) = self.factory.model.sketches.get(i) else { return };
+    fn factory_delete_plane(&mut self, id: u32) {
+        let Some(sk) = self.factory.model.sketch_by_id(id) else { return };
         let name = sk.name.clone();
         let n = sk.doc.dobjects.len();
         self.snapshot_factory();
-        // LEAVE IT FIRST if it is the one open, or the session would be left holding an index into
-        // a vector that no longer has that entry — and it would write its drawing back on the way
-        // out, into whichever plane had slid into the gap.
-        if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
+        // LEAVE IT FIRST if it is the one open, or the exit would write its drawing back into a
+        // plane that is about to be removed — and the session would be left naming nothing.
+        //
+        // The vector shuffle that used to need patching here is gone: every reference to a plane
+        // is an id now, and an id does not move when its neighbour is deleted. What remains is
+        // the one real question — was this the plane being edited?
+        if self.factory.session.as_ref().is_some_and(|s| s.plane == id) {
             self.factory_exit_sketch();
         }
-        self.factory.model.sketches.remove(i);
-        // Everything after the removed one moved down by one; a session pointing past it must
-        // follow, for the same reason.
-        if let Some(s) = self.factory.session.as_mut() {
-            if s.idx > i {
-                s.idx -= 1;
-            }
+        self.factory.model.remove_sketch(id);
+        // A rename dialog naming this plane no longer has anything to rename. Closed, rather
+        // than left open to land on a survivor.
+        if self.factory.rename_plane.as_ref().is_some_and(|(k, _)| *k == id) {
+            self.factory.rename_plane = None;
         }
         self.factory.dirty = true;
         self.factory.status = format!("Deleted {name} and the {n} object(s) drawn on it — Ctrl+Z");
@@ -8347,27 +8348,28 @@ impl CadApp {
         // makes a fresh empty sketch and the previous drawing seems to vanish. This is also what
         // makes "when i click on the face again to sketch it should show the same plane" true:
         // clicking a face and picking its name out of the view list land in the SAME sketch.
-        let idx = match self
+        let plane = match self
             .factory
             .model
             .sketches
             .iter()
-            .position(|sk| Self::frames_coplanar(&sk.frame, &frame))
+            .find(|sk| Self::frames_coplanar(&sk.frame, &frame))
         {
-            Some(i) => i,
+            Some(sk) => sk.id,
             None => {
                 // Name it after the object it is a face of, so it is findable in the view list
                 // before anyone gets round to renaming it.
                 let mut sk = cad_solid::Sketch::new(frame);
                 sk.name = self.factory.sketch_auto_name(&picked);
-                self.factory.model.sketches.push(sk);
-                self.factory.model.sketches.len() - 1
+                self.factory.model.push_sketch(sk)
             }
         };
+        let auto = self.factory.sketch_auto_name(&picked);
+        let idx = self.factory.model.sketch_index(plane).expect("just resolved or just pushed");
         // A model loaded from a file written before planes had names carries blanks. Fill them in
         // on the way past rather than showing an empty row in the list.
         if self.factory.model.sketches[idx].name.is_empty() {
-            self.factory.model.sketches[idx].name = self.factory.sketch_auto_name(&picked);
+            self.factory.model.sketches[idx].name = auto;
         }
         // THE FACE, AND ONLY THE FACE. This used to project the WHOLE model onto the plane, which
         // on a wall of a 139 m building draws every wall, room and opening in it flattened on top
@@ -8421,7 +8423,7 @@ impl CadApp {
         self.parametric.redundant = false;
         self.parametric.last_solved_sig = 0;
         self.factory.session = Some(crate::factory::SketchSession {
-            idx,
+            plane,
             saved_doc,
             saved_undo,
             saved_redo,
@@ -8480,7 +8482,7 @@ impl CadApp {
             let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
             self.doc.layers = layers;
             self.doc.blocks = blocks;
-            if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
+            if let Some(sk) = self.factory.model.sketch_by_id_mut(s.plane) {
                 sk.doc = sketch_doc;
             }
             // Leaving one moves the document back the other way, and nothing is added for that
@@ -8654,7 +8656,7 @@ impl CadApp {
         &self,
     ) -> Option<(cad_solid::Frame, Vec<Vec<glam::Vec2>>, Option<usize>, bool)> {
         if let Some(session) = self.factory.session.as_ref() {
-            let frame = self.factory.model.sketches.get(session.idx)?.frame;
+            let frame = self.factory.model.sketch_by_id(session.plane)?.frame;
             let loops = Self::closed_loops_of(&self.doc);
             return (!loops.is_empty()).then_some((frame, loops, None, false));
         }
@@ -8751,7 +8753,7 @@ impl CadApp {
             crate::factory::SweepStage::Section => {
                 // The section is whatever closed loop was drawn on the face.
                 let frame = self.factory.session.as_ref()
-                    .and_then(|s| self.factory.model.sketches.get(s.idx))
+                    .and_then(|s| self.factory.model.sketch_by_id(s.plane))
                     .map(|sk| sk.frame);
                 let loop_ = Self::closed_loops_of(&self.doc).into_iter().next();
                 self.factory_exit_sketch();
@@ -25819,22 +25821,34 @@ impl CadApp {
             return;
         }
         if commit {
-            let t = text.trim().to_string();
-            // An empty name would leave a blank row in the list. Refuse it by keeping the old one
-            // rather than by arguing about it.
-            if !t.is_empty() {
-                if let Some(sk) = self.factory.model.sketches.get_mut(i) {
-                    self.history.push(format!("  plane '{}' renamed to '{t}'", sk.name));
-                    sk.name = t;
-                    self.factory.dirty = true;
-                }
-            }
-            self.factory.rename_plane = None;
+            self.factory_commit_plane_rename(&text);
             return;
         }
         // Keep the in-progress text between frames.
         if let Some(s) = self.factory.rename_plane.as_mut() {
             s.1 = text;
+        }
+        let _ = i;
+    }
+
+    /// Apply the pending rename and close the dialog.
+    ///
+    /// SEPARATE FROM THE WINDOW that collects the text, so which plane gets renamed is a question
+    /// a test can ask. It is also the question that was wrong: the pending rename used to name a
+    /// ROW, and the view list behind the dialog stays live, so deleting an earlier plane and then
+    /// pressing Rename renamed whichever plane had moved into that row.
+    fn factory_commit_plane_rename(&mut self, text: &str) {
+        let Some((id, _)) = self.factory.rename_plane.take() else { return };
+        let t = text.trim().to_string();
+        // An empty name would leave a blank row in the list. Refuse it by keeping the old one
+        // rather than by arguing about it.
+        if t.is_empty() {
+            return;
+        }
+        if let Some(sk) = self.factory.model.sketch_by_id_mut(id) {
+            self.history.push(format!("  plane '{}' renamed to '{t}'", sk.name));
+            sk.name = t;
+            self.factory.dirty = true;
         }
     }
 
@@ -28114,7 +28128,10 @@ impl CadApp {
     /// from the file. Same reasoning as `plan_doc`, which already picks the parked model-space
     /// document for the main save.
     fn patch_open_sketch_into(&self, cfg: &mut crate::simlux_io::SimluxConfig) {
-        let Some(i) = self.factory.session.as_ref().map(|s| s.idx) else { return };
+        let Some(id) = self.factory.session.as_ref().map(|s| s.plane) else { return };
+        // `cfg.factory.sketches` is written straight out of `model.sketches` by `to_persist`, in
+        // the same order, so the plane's row in the model is its row in the record.
+        let Some(i) = self.factory.model.sketch_index(id) else { return };
         let Some(rec) = cfg.factory.sketches.get_mut(i) else { return };
         use base64::Engine;
         rec.rsm_b64 =
@@ -29290,7 +29307,7 @@ impl CadApp {
     fn factory_model_for_snapshot(&self) -> cad_solid::Model {
         let mut model = self.factory.model.clone();
         if let Some(s) = self.factory.session.as_ref() {
-            if let Some(sk) = model.sketches.get_mut(s.idx) {
+            if let Some(sk) = model.sketch_by_id_mut(s.plane) {
                 sk.doc = self.doc.clone();
             }
         }
@@ -34224,7 +34241,7 @@ impl CadApp {
         self.factory.geom_version.hash(&mut h);
         // Which plane is open, because entering one moves its document out of `sketch_lines`
         // and into `live_sketch_lines` — the same drawing, drawn by a different builder.
-        self.factory.session.as_ref().map(|s| s.idx).hash(&mut h);
+        self.factory.session.as_ref().map(|s| s.plane).hash(&mut h);
         self.factory.model.sketches.len().hash(&mut h);
         // Toggles and placement that change WHAT IS EMITTED without changing any geometry.
         self.factory.show_plan.hash(&mut h);
@@ -45080,22 +45097,27 @@ impl eframe::App for CadApp {
             // picked by name here are the same plane with the same drawing on it — there is no
             // second record to fall out of step.
             {
-                let open = self.factory.session.as_ref().map(|s| s.idx);
-                let names: Vec<(usize, String)> = self
+                let open = self.factory.session.as_ref().map(|s| s.plane);
+                // BY ID, not by row number. The row a plane is on changes whenever another is
+                // deleted, and these values are read back AFTER the menu closes — so an index
+                // captured here would be answered against a different list.
+                let names: Vec<(u32, String)> = self
                     .factory
                     .model
                     .sketches
                     .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i, s.name.clone()))
+                    .map(|s| (s.id, s.name.clone()))
                     .collect();
+                let name_of = |id: u32| {
+                    names.iter().find(|(k, _)| *k == id).map(|(_, n)| n.clone())
+                };
                 let cur_label = match open {
-                    Some(i) => names.get(i).map(|(_, n)| n.clone()).unwrap_or_else(|| "Plane".into()),
+                    Some(id) => name_of(id).unwrap_or_else(|| "Plane".into()),
                     None => "Global view".to_string(),
                 };
-                let mut want: Option<Option<usize>> = None; // Some(None) = the global view
-                let mut rename: Option<usize> = None;
-                let mut delete: Option<usize> = None;
+                let mut want: Option<Option<u32>> = None; // Some(None) = the global view
+                let mut rename: Option<u32> = None;
+                let mut delete: Option<u32> = None;
                 // INSIDE THE CANVAS, not floating over the window.
                 //
                 // Reported as: "the views menu should be visible in the 2d cad window … now it
@@ -45176,12 +45198,11 @@ impl eframe::App for CadApp {
                 if let Some(w) = want {
                     self.factory_open_plane(w);
                 }
-                if let Some(i) = rename {
-                    self.factory.rename_plane =
-                        Some((i, names.get(i).map(|(_, n)| n.clone()).unwrap_or_default()));
+                if let Some(id) = rename {
+                    self.factory.rename_plane = Some((id, name_of(id).unwrap_or_default()));
                 }
-                if let Some(i) = delete {
-                    self.factory_delete_plane(i);
+                if let Some(id) = delete {
+                    self.factory_delete_plane(id);
                 }
             }
 
@@ -48659,7 +48680,7 @@ impl CadApp {
             return;
         }
         for (i, sk) in self.factory.model.sketches.iter().enumerate() {
-            if self.factory.session.as_ref().is_some_and(|s| s.idx == i) {
+            if self.factory.session.as_ref().is_some_and(|s| s.plane == sk.id) {
                 continue; // the active sketch is the live canvas — don't double-draw it
             }
             if ground_only && sk.frame.normal().z.abs() < 0.999 {
@@ -48703,7 +48724,7 @@ impl CadApp {
             .factory
             .session
             .as_ref()
-            .and_then(|s| self.factory.model.sketches.get(s.idx))
+            .and_then(|s| self.factory.model.sketch_by_id(s.plane))
             .map(|sk| sk.frame);
 
         // SOLIDS — buildings, walls, slabs, and every architecture generator.
@@ -55219,11 +55240,11 @@ mod view_planes {
     fn returning_to_a_face_returns_to_the_same_plane() {
         let mut app = a_building();
         app.factory_enter_sketch(wall_face());
-        let first = app.factory.session.as_ref().expect("in a sketch").idx;
+        let first = app.factory.session.as_ref().expect("in a sketch").plane;
         app.factory_exit_sketch();
 
         app.factory_enter_sketch(wall_face());
-        let again = app.factory.session.as_ref().expect("in a sketch").idx;
+        let again = app.factory.session.as_ref().expect("in a sketch").plane;
         assert_eq!(first, again, "the same face must reopen the same plane");
         assert_eq!(app.factory.model.sketches.len(), 1, "and must NOT make a second one");
     }
@@ -55233,12 +55254,12 @@ mod view_planes {
     fn opening_a_plane_by_name_is_the_same_plane() {
         let mut app = a_building();
         app.factory_enter_sketch(wall_face());
-        let idx = app.factory.session.as_ref().unwrap().idx;
+        let idx = app.factory.session.as_ref().unwrap().plane;
         app.factory_open_plane(None); // back to the ground plan
         assert!(app.factory.session.is_none());
 
         app.factory_open_plane(Some(idx));
-        assert_eq!(app.factory.session.as_ref().map(|s| s.idx), Some(idx));
+        assert_eq!(app.factory.session.as_ref().map(|s| s.plane), Some(idx));
     }
 
     /// Named after the object the face belongs to, so an unrenamed plane is still findable.
@@ -55302,46 +55323,127 @@ mod view_planes {
         app.factory_exit_sketch();
         assert_eq!(app.factory.model.sketches.len(), 1);
 
-        app.factory_delete_plane(0);
+        let id = app.factory.model.sketches[0].id;
+        app.factory_delete_plane(id);
         assert!(app.factory.model.sketches.is_empty(), "the plane is gone");
         app.run_command("undo");
         assert_eq!(app.factory.model.sketches.len(), 1, "…and undo brings it back");
     }
 
-    /// Deleting the plane you are STANDING ON must leave it first. Otherwise the session keeps an
-    /// index into a vector that no longer has that entry, and writes its drawing back on the way
-    /// out — into whichever plane slid into the gap.
+    /// Deleting the plane you are STANDING ON must leave it first, or the exit would write the
+    /// drawing back into a plane that is no longer there.
     #[test]
     fn deleting_the_open_plane_leaves_it_first() {
         let mut app = a_building();
         app.factory_enter_sketch(wall_face());
-        assert!(app.factory.session.is_some());
-        app.factory_delete_plane(0);
+        let open = app.factory.session.as_ref().expect("a session").plane;
+        app.factory_delete_plane(open);
         assert!(app.factory.session.is_none(), "it must not still be open");
         assert!(app.factory.model.sketches.is_empty());
     }
 
-    /// Deleting an EARLIER plane shifts every index after it. A session that does not follow would
-    /// save its drawing into the wrong plane on the way out.
+    /// Deleting an EARLIER plane slides every plane after it down a row. An open session survived
+    /// that only because `factory_delete_plane` carried a hand-written fixup; it now survives it
+    /// because a plane is named by id, and an id does not move when its neighbour goes.
     #[test]
     fn deleting_an_earlier_plane_keeps_the_open_one_open() {
         let mut app = a_building();
-        app.factory_enter_sketch(wall_face()); // sketch 0
+        app.factory_enter_sketch(wall_face()); // the first plane
         app.factory_exit_sketch();
+        let first = app.factory.model.sketches[0].id;
         let second = cad_solid::Frame::from_point_normal(
             glam::Vec3::new(3.0, 0.0, 1.5),
             glam::Vec3::Y,
         );
-        app.factory_enter_sketch(second); // sketch 1 — and stay in it
-        assert_eq!(app.factory.session.as_ref().unwrap().idx, 1);
-        let open_name = app.factory.model.sketches[1].name.clone();
+        app.factory_enter_sketch(second); // the second plane — and stay in it
+        let open = app.factory.session.as_ref().expect("a session").plane;
+        assert_ne!(open, first, "the fixture must be standing on the SECOND plane");
+        let open_name = app.factory.model.sketch_by_id(open).expect("open plane").name.clone();
 
-        app.factory_delete_plane(0);
-        assert_eq!(app.factory.session.as_ref().map(|s| s.idx), Some(0), "index must follow");
+        app.factory_delete_plane(first);
         assert_eq!(
-            app.factory.model.sketches[0].name, open_name,
+            app.factory.session.as_ref().map(|s| s.plane), Some(open),
+            "the open plane changed identity when a different one was deleted",
+        );
+        assert_eq!(
+            app.factory.model.sketch_by_id(open).expect("still there").name, open_name,
             "and it is still the SAME plane, not the one that was deleted",
         );
+    }
+
+    /// A PENDING RENAME NAMES A PLANE, NOT A ROW.
+    ///
+    /// The rename dialog is a plain window and the view list behind it stays live, so this is an
+    /// ordinary sequence: start renaming one plane, tidy up another, press Rename. While the
+    /// pending rename held a ROW NUMBER, deleting an earlier plane slid a different plane into
+    /// that row and the rename landed on it — silently renaming something the user never opened
+    /// the dialog for. This is the one reference to a plane that never got the fixup the session
+    /// had, which is why the fixup was the wrong answer.
+    #[test]
+    fn a_pending_rename_follows_its_plane_when_another_is_deleted() {
+        let mut app = a_building();
+        // Three planes, so that after a delete the target's OLD row still exists and can be hit.
+        let frames = [
+            wall_face(),
+            cad_solid::Frame::from_point_normal(glam::Vec3::new(3.0, 0.0, 1.5), glam::Vec3::Y),
+            cad_solid::Frame::from_point_normal(glam::Vec3::new(0.0, 3.0, 1.5), glam::Vec3::X),
+        ];
+        for f in frames {
+            app.factory_enter_sketch(f);
+            app.factory_exit_sketch();
+        }
+        assert_eq!(app.factory.model.sketches.len(), 3, "three planes in the fixture");
+        let ids: Vec<u32> = app.factory.model.sketches.iter().map(|s| s.id).collect();
+        let (first, target, bystander) = (ids[0], ids[1], ids[2]);
+        let bystander_name = app.factory.model.sketch_by_id(bystander).unwrap().name.clone();
+
+        // Start renaming the MIDDLE plane, then delete the first one — the middle plane slides
+        // into row 0 and the last one into row 1, which is the row the rename was opened on.
+        app.factory.rename_plane = Some((target, "Kitchen elevation".into()));
+        app.factory_delete_plane(first);
+        app.factory_commit_plane_rename("Kitchen elevation");
+
+        assert_eq!(
+            app.factory.model.sketch_by_id(target).expect("the target survives").name,
+            "Kitchen elevation",
+            "the rename did not reach the plane the dialog was opened on",
+        );
+        assert_eq!(
+            app.factory.model.sketch_by_id(bystander).expect("still there").name, bystander_name,
+            "a plane nobody opened the rename dialog for was renamed",
+        );
+    }
+
+    /// AND DELETING THE PLANE BEING RENAMED CLOSES THE DIALOG. There is nothing left to rename,
+    /// and leaving it open would hold a live text box over a plane that no longer exists.
+    #[test]
+    fn deleting_the_plane_being_renamed_closes_the_dialog() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.factory_exit_sketch();
+        let id = app.factory.model.sketches[0].id;
+
+        app.factory.rename_plane = Some((id, "gone".into()));
+        app.factory_delete_plane(id);
+        assert!(app.factory.rename_plane.is_none(), "the dialog outlived its plane");
+    }
+
+    /// EVERY PLANE HAS ITS OWN ID. Ids are handed out from a counter that never rewinds, so two
+    /// planes cannot share one and a deleted plane's id is never handed to its replacement — the
+    /// same rule feature ids follow, for the same reason: an id that comes back lets a stale
+    /// reference resolve, which is worse than one that fails.
+    #[test]
+    fn plane_ids_are_unique_and_never_reused() {
+        let mut app = a_building();
+        app.factory_enter_sketch(wall_face());
+        app.factory_exit_sketch();
+        let gone = app.factory.model.sketches[0].id;
+        app.factory_delete_plane(gone);
+
+        app.factory_enter_sketch(wall_face());
+        app.factory_exit_sketch();
+        let fresh = app.factory.model.sketches[0].id;
+        assert_ne!(fresh, gone, "the new plane inherited the deleted plane's identity");
     }
 }
 
@@ -57146,7 +57248,7 @@ mod a_sketch_is_not_the_plan {
             sketch.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point { location: Vec2::new(9.0, 9.0), style: 0, size: 0.0 })));
         }
         let session = crate::factory::SketchSession {
-            idx: 0,
+            plane: 1,
             saved_doc: plan,
             saved_undo: Vec::new(),
             saved_redo: Vec::new(),
@@ -57303,7 +57405,7 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
     fn a_snapshot_taken_in_a_sketch_keeps_that_faces_drawing() {
         let mut app = app_with_a_box();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        let idx = app.factory.session.as_ref().expect("a session").idx;
+        let idx = app.factory.session.as_ref().expect("a session").plane;
         // Draw something on the face.
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point {
             location: Vec2::new(1.0, 1.0),
@@ -57322,7 +57424,7 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
             })
             .expect("a factory snapshot");
         assert_eq!(
-            snap.model.sketches[idx].doc.dobjects.len(),
+            snap.model.sketch_by_id(idx).expect("the plane is in the snapshot").doc.dobjects.len(),
             1,
             "the snapshot recorded the open plane as EMPTY — undoing to it would wipe the face",
         );
@@ -57341,7 +57443,7 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
     fn the_undo_counterpart_also_keeps_the_open_faces_drawing() {
         let mut app = app_with_a_box();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        let idx = app.factory.session.as_ref().expect("a session").idx;
+        let idx = app.factory.session.as_ref().expect("a session").plane;
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Point(cad_kernel::Point {
             location: Vec2::new(1.0, 1.0),
             style: 0,
@@ -57368,7 +57470,7 @@ mod a_sketch_does_not_eat_history_or_build_the_wrong_thing {
 
         let UndoStep::Factory(snap) = counterpart else { panic!("a factory counterpart") };
         assert_eq!(
-            snap.model.sketches[idx].doc.dobjects.len(),
+            snap.model.sketch_by_id(idx).expect("the plane is in the counterpart").doc.dobjects.len(),
             1,
             "the counterpart recorded the open plane as EMPTY — a redo would wipe the face",
         );
