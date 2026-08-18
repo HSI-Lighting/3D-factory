@@ -5907,6 +5907,23 @@ impl CadApp {
         let (ua, va) = f.plane.axes();
         let frame = cad_solid::Frame { origin: f.plane.origin(), u: ua, v: va };
 
+        // WAS THIS A THROUGH CUT, OR A BLIND RECESS? Asked before anything is removed, because the
+        // answer is measured against the solid the cutter still sits in. Apply used to assume
+        // THROUGH, which turned a shelf niche into a hole into the next room on a corner drag.
+        //
+        // `total == 0` means no wall was found under the opening at all — nothing to conclude from,
+        // so keep the old assumption rather than inventing a recess out of a failed measurement.
+        let (cov_ok, cov_total, _) = self.cut_coverage(&f);
+        let through = cov_total == 0 || cov_ok == cov_total;
+        // The pocket depth to re-cut with, recovered from the cutter itself so a reshape that only
+        // moves a corner reproduces the depth exactly. `factory_cut_sketch` builds a recess as
+        // `h = depth + CUT_EPS`, so undoing that term here keeps the round-trip stable instead of
+        // deepening the pocket by a hair on every edit.
+        let depth = match f.primitive {
+            cad_solid::Primitive::Extrusion { h, .. } => (h - Self::CUT_EPS).max(0.01),
+            _ => self.factory.element_height.max(0.02),
+        };
+
         self.snapshot_factory();
         // Delete every Difference that is THIS opening (same profile + coincident centre) — a
         // through cut may have made one per body; they all rebuild from the re-cut.
@@ -5916,6 +5933,23 @@ impl CadApp {
             .filter(|g| (g.placement.u - pu).abs() < 1e-4 && (g.placement.v - pv).abs() < 1e-4)
             .map(|g| g.id)
             .collect();
+        // STASH THEM, WITH THE BODY EACH ONE OPENS. Between here and ✔ Apply the opening exists
+        // nowhere else in the app — it is out of the model, and the outline in the canvas is only
+        // a drawing. Recording the HOST rather than merely the cutter is what lets an abandoned
+        // edit put each one back behind its own body instead of behind whichever Union ends up
+        // last, which is the defect `rederive_wall` was just fixed for.
+        let mut stash: Vec<crate::factory::StashedCut> = Vec::with_capacity(same.len());
+        for gid in &same {
+            let Some(at) = self.factory.model.features.iter().position(|g| g.id == *gid) else {
+                continue;
+            };
+            let host = self.factory.model.features[..at]
+                .iter()
+                .rev()
+                .find(|g| g.op == cad_solid::BoolOp::Union)
+                .map(|g| g.id);
+            stash.push(crate::factory::StashedCut { feature: self.factory.model.features[at], host, at });
+        }
         for gid in same {
             self.factory.model.remove(gid);
         }
@@ -5936,31 +5970,106 @@ impl CadApp {
         }
         // Remember we are reshaping an opening → the sketch panel shows a prominent
         // "drag the points, then Apply" banner and Finish re-cuts automatically.
-        self.factory.editing_cutout = true;
+        self.factory.cutout_edit = Some(crate::factory::CutoutEdit { stash, through, depth });
         self.active_view = ActiveView::TwoD;
         self.factory.status =
             "opening opened in 2D — drag its corner points, then ✔ Apply reshape".into();
         self.history.push("  cutout opened for 2D editing".into());
     }
 
-    /// APPLY a cutout reshape: re-cut the (possibly edited) outline through every body it
-    /// passes through, close the sketch, and return to 3D so the reshaped hole is visible.
-    /// Counterpart to [`Self::factory_edit_cutout`]; the "✔ Apply reshape" button and finishing
-    /// the sketch both route here so a dragged point actually changes the opening.
+    /// APPLY a cutout reshape: re-cut the (possibly edited) outline AS THE OPENING IT WAS —
+    /// through if it went through, a pocket of the same depth if it was a recess — close the
+    /// sketch, and return to 3D so the reshaped hole is visible. Counterpart to
+    /// [`Self::factory_edit_cutout`]; the "✔ Apply reshape" button routes here.
+    ///
+    /// This used to re-cut with a hard-coded `through = true`, so dragging one corner of a
+    /// 100 mm niche punched it clean through the wall. A reshape edits the OUTLINE; nothing the
+    /// user did here says anything about depth, so nothing here may change it.
     fn factory_apply_cutout_reshape(&mut self) {
+        // TAKEN FIRST, and that ordering is load-bearing: `factory_exit_sketch` puts an
+        // un-consumed stash back, and `factory_cut_sketch` exits the sketch itself on success. If
+        // the stash were still held then, the old cutters would be restored alongside the new
+        // ones and the opening would be cut twice.
+        let edit = self.factory.cutout_edit.take();
+        let through = edit.as_ref().is_none_or(|e| e.through);
+        let depth = edit.as_ref().map_or(0.0, |e| e.depth);
+        // A recess re-cuts at ITS OWN depth. `factory_cut_sketch` reads the pocket depth from the
+        // panel's height box, which is a live UI value that has nothing to do with the opening
+        // being reshaped — so it is lent the remembered depth and handed straight back.
+        let saved_height = self.factory.element_height;
+        if let Some(e) = &edit {
+            if !e.through {
+                self.factory.element_height = e.depth;
+            }
+        }
         // Must run while the sketch session is still active — `factory_cut_sketch` reads the
         // outline from the live sketch document.
-        let made = self.factory_cut_sketch(true);
-        self.factory.editing_cutout = false;
+        let made = self.factory_cut_sketch(through);
+        self.factory.element_height = saved_height;
+        if made == 0 {
+            // THE RE-CUT WAS REFUSED, so the opening must come back. Handing the stash back makes
+            // the exit below restore it — the same path an abandoned edit takes. Without this a
+            // rejected reshape closed the sketch over an opening that had already been deleted.
+            self.factory.cutout_edit = edit;
+        }
         self.factory_exit_sketch();
         self.active_view = ActiveView::ThreeD;
         if made > 0 {
             self.factory.status = "opening reshaped".into();
-            self.history.push("  opening reshaped (re-cut through)".into());
+            self.history.push(if through {
+                "  opening reshaped (re-cut through)".to_string()
+            } else {
+                format!("  opening reshaped (re-cut as a {:.0} mm recess)", depth * 1000.0)
+            });
         } else {
             self.factory.status =
-                "reshape not applied — the outline must stay a single closed shape".into();
+                "reshape not applied — the opening is unchanged (the outline must stay a single \
+                 closed shape)".into();
         }
+    }
+
+    /// Put an abandoned cutout edit's cutters back, each BEHIND THE BODY IT OPENS.
+    ///
+    /// `csg::eval` binds a `Difference` to the nearest `Union` above it, so where a cutter sits is
+    /// what decides which body it cuts. Pushing these onto the end would bind every one of them to
+    /// whichever body happens to be last — an opening quietly moving house, which is the defect
+    /// `rederive_wall` was fixed for and must not be reintroduced by its restore path.
+    ///
+    /// A body deleted DURING the edit leaves its cutter with nowhere right to go. Rather than
+    /// guess, it goes back to the index it came from and the loss is reported: that cutter is now
+    /// bound to whatever precedes that index, which may be nothing at all.
+    fn factory_restore_stashed_cutters(&mut self, edit: crate::factory::CutoutEdit) {
+        if edit.stash.is_empty() {
+            return;
+        }
+        let n = edit.stash.len();
+        let mut homeless = 0;
+        for s in edit.stash {
+            let alive = s.host.is_some_and(|h| self.factory.model.features.iter().any(|f| f.id == h));
+            match (alive, s.host) {
+                (true, Some(h)) => {
+                    // The host is present, so this cannot append — the check above is the
+                    // guarantee, and `insert_after` reporting otherwise would be a real bug.
+                    debug_assert!(self.factory.model.insert_after(h, s.feature));
+                }
+                _ => {
+                    self.factory.model.insert_at(s.at, s.feature);
+                    homeless += 1;
+                }
+            }
+        }
+        self.factory.dirty = true;
+        self.factory.recompute();
+        self.factory.status = if homeless > 0 {
+            format!("opening restored — {homeless} of {n} cut(s) lost the body they opened")
+        } else {
+            "reshape abandoned — the opening is back as it was".into()
+        };
+        self.history.push(if homeless > 0 {
+            format!("  ! opening restored, {homeless} of {n} cut(s) lost their body (▼ Openings)")
+        } else {
+            "  cutout edit abandoned — opening restored".into()
+        });
     }
 
     /// **▼ FBC scene import** — bring a whole Blender scene in, rather than a single prop.
@@ -8137,7 +8246,18 @@ impl CadApp {
     /// model-space document + its undo history.
     fn factory_exit_sketch(&mut self) {
         self.factory.sketch_ref.clear();
-        self.factory.editing_cutout = false; // any cutout-edit ends when the sketch closes
+        // AN UNAPPLIED CUTOUT EDIT PUTS ITS OPENING BACK, whichever way the sketch was left.
+        //
+        // `factory_edit_cutout` deletes the baked cutters before handing the outline to the 2D
+        // canvas, so between there and ✔ Apply the opening exists only in the stash. This used to
+        // clear the flag and nothing else — so the Esc key, switching view, or opening a file all
+        // closed the sketch with the opening already destroyed, silently. Restoring HERE rather
+        // than at each exit is the point: this is the one function every one of them goes through.
+        //
+        // ✔ Apply takes the stash before re-cutting, so a successful reshape restores nothing.
+        if let Some(edit) = self.factory.cutout_edit.take() {
+            self.factory_restore_stashed_cutters(edit);
+        }
         if let Some(s) = self.factory.session.take() {
             // …AND THE LAYER TABLE COMES BACK OUT. A layer created or recoloured while drawing on
             // a face belongs to the drawing, not to that face — see the note on the way in. Taken
@@ -8804,7 +8924,9 @@ impl CadApp {
         // centroid test is unstable because the centroid sits almost ON the face). For a 2D
         // GROUND selection the plane normal is world +Z, so there orient by the target
         // centroid (the solid sits below/around the plane).
-        const EPS: f32 = 0.01;
+        // The recess over-reach, shared with `factory_edit_cutout`, which subtracts it back off to
+        // recover the depth a pocket was cut at.
+        const EPS: f32 = CadApp::CUT_EPS;
         let n = frame.u.cross(frame.v).normalize_or_zero();
         let center = (mn + mx) * 0.5;
         let inward = if is_sel {
@@ -9374,6 +9496,14 @@ impl CadApp {
     /// Shared by the cut and by `repaircuts`, deliberately: the repair exists to redo what the
     /// cut should have done, so the two must agree on what counts as "this wall".
     const CUT_SEARCH: f32 = 1.5;
+
+    /// The sliver a cut over-reaches by, so a cutter never leaves a coplanar face for the BSP to
+    /// argue about. A recess is built `depth + CUT_EPS` deep.
+    ///
+    /// Named and shared because `factory_edit_cutout` has to SUBTRACT it to recover the depth a
+    /// recess was cut at. Two copies of `0.01` would drift, and the symptom would be a pocket
+    /// that grows by a hair every time it is reshaped.
+    const CUT_EPS: f32 = 0.01;
 
     /// The wall's extent along the plane normal, taken over a GRID across the whole opening and
     /// returned as `(lo, hi)` in plane-local Z. `None` when no sample finds a wall.
@@ -10339,7 +10469,7 @@ impl CadApp {
                         .inner_margin(egui::Margin::symmetric(8.0, 5.0))
                         .rounding(4.0)
                         .show(ui, |ui| {
-                            let editing_cutout = self.factory.editing_cutout;
+                            let editing_cutout = self.factory.editing_cutout();
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(if editing_cutout {
@@ -10352,10 +10482,10 @@ impl CadApp {
                                 );
                                 if editing_cutout {
                                     // The one button that actually applies a dragged-point edit:
-                                    // re-cut the opening through every body and return to 3D.
+                                    // re-cut the opening AS ITSELF and return to 3D.
                                     if ui
                                         .button(egui::RichText::new("✔ Apply reshape").strong())
-                                        .on_hover_text("Re-cut the opening with the edited outline through the whole wall, then show it in 3D")
+                                        .on_hover_text("Re-cut the opening with the edited outline — through if it went through, at its own depth if it was a recess — then show it in 3D")
                                         .clicked()
                                     {
                                         self.factory_apply_cutout_reshape();
@@ -10365,11 +10495,16 @@ impl CadApp {
                                         .on_hover_text("Discard the reshape and leave the opening as it was")
                                         .clicked()
                                     {
-                                        // Leave the sketch FIRST so the model-space undo stack is
-                                        // restored, then undo the snapshot taken before the cut
-                                        // was deleted — putting the original opening back.
+                                        // Leaving the sketch IS the restore now — the stash goes
+                                        // back behind each cutter's own body, on this route and
+                                        // on every other way out.
+                                        //
+                                        // This used to also `do_undo()`, which was the only thing
+                                        // putting the opening back. That is worse than redundant
+                                        // now: an undo step is popped blind, and any 3D edit made
+                                        // DURING the sketch is on top of it — so Cancel would undo
+                                        // that instead, and still leave the opening deleted.
                                         self.factory_exit_sketch();
-                                        self.do_undo();
                                         self.active_view = ActiveView::ThreeD;
                                     }
                                 } else if ui.button("✔ Finish sketch").clicked() {
@@ -51289,7 +51424,7 @@ mod factory_sketch_tests {
 
         // Open it for 2D editing — the outline is selected so its grips show.
         app.factory_edit_cutout(cid0);
-        assert!(app.factory.editing_cutout, "edit mode is armed");
+        assert!(app.factory.editing_cutout(), "edit mode is armed");
         assert!(app.factory.session.is_some(), "a sketch session opened");
         assert_eq!(app.selection.len(), 1, "the editable outline is selected (grips visible)");
 
@@ -51299,7 +51434,7 @@ mod factory_sketch_tests {
             p.vertices[2].pos = Vec2::new(p.vertices[2].pos.x + 0.6, p.vertices[2].pos.y + 0.6);
         }
         app.factory_apply_cutout_reshape();
-        assert!(!app.factory.editing_cutout, "edit mode cleared after Apply");
+        assert!(!app.factory.editing_cutout(), "edit mode cleared after Apply");
         assert!(app.factory.session.is_none(), "sketch closed after Apply");
 
         let cid1 = app.factory.cutout_ids()[0];
@@ -51308,6 +51443,249 @@ mod factory_sketch_tests {
         assert!(
             s1[0] + s1[1] > s0[0] + s0[1] + 1e-4,
             "the reshaped opening is larger on its face: {:?} -> {:?}", s0, s1
+        );
+    }
+
+    /// Cut a square opening on the top face of a default box, `through` or as a blind recess of
+    /// `depth`. Returns the app and the opening's representative cutter id.
+    ///
+    /// The existing reshape test cuts THROUGH, which is why it could never catch the recess bug:
+    /// re-cutting a through hole as a through hole is correct by accident.
+    #[cfg(test)]
+    fn box_with_opening(through: bool, depth: f32) -> (CadApp, u32) {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        app.factory_enter_sketch(cad_solid::Frame::from_point_normal(c, glam::Vec3::Z));
+        let (cx, cy) = pick_uv(c, glam::Vec3::Z);
+        let v = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(cx + x, cy + y), bulge: 0.0 };
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: vec![v(-0.3, -0.3), v(0.3, -0.3), v(0.3, 0.3), v(-0.3, 0.3)],
+            closed: true,
+            widths: Vec::new(),
+        })));
+        app.factory.element_height = depth;
+        assert_eq!(app.factory_cut_sketch(through), 1, "one opening cut");
+        app.factory.recompute();
+        let id = app.factory.cutout_ids()[0];
+        (app, id)
+    }
+
+    /// Drag the +u/+v corner of the open reshape outline outward, the way a grip drag does.
+    #[cfg(test)]
+    fn drag_reshape_corner(app: &mut CadApp) {
+        let li = app.doc.dobjects.len() - 1;
+        if let cad_kernel::Geom::Polyline(p) = &mut app.doc.dobjects[li].geom {
+            p.vertices[2].pos = Vec2::new(p.vertices[2].pos.x + 0.2, p.vertices[2].pos.y + 0.2);
+        }
+    }
+
+    /// How deep the opening's cutter reaches into the solid, in metres — the pocket depth for a
+    /// recess, and more than the wall for a through cut. Read off the cutter itself rather than
+    /// from anything the reshape path computed, so it cannot agree with a bug by sharing it.
+    #[cfg(test)]
+    fn opening_depth(app: &CadApp, id: u32) -> f32 {
+        let f = app.factory.model.features.iter().find(|f| f.id == id).expect("cutter present");
+        match f.primitive {
+            cad_solid::Primitive::Extrusion { h, .. } => h,
+            _ => panic!("the opening is not an extrusion"),
+        }
+    }
+
+    /// RESHAPING A BLIND RECESS MUST LEAVE IT BLIND.
+    ///
+    /// `factory_apply_cutout_reshape` re-cut with a hard-coded `through = true`, so dragging a
+    /// corner of a 0.1 m recess punched it clean through the wall — a shelf niche became a hole
+    /// into the next room, from an edit that only touched the outline.
+    ///
+    /// Asserted on the SOLID, by ray: a blind pocket still has material under it, and a through
+    /// hole does not. The cutter's own depth is checked too, because a pocket that got deeper
+    /// but not quite through would pass a ray test alone.
+    #[test]
+    fn reshaping_a_blind_recess_keeps_it_blind() {
+        let (mut app, id) = box_with_opening(false, 0.1);
+        let d0 = opening_depth(&app, id);
+
+        // The floor of the pocket: fire UP the -Z axis from under the box and count surfaces.
+        // A recess leaves the far skin intact, so the ray meets material a through cut removes.
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        let below = glam::Vec3::new(c.x, c.y, mn.z - 1.0);
+        let before = surface_crossings(&app, below, glam::Vec3::Z);
+        assert!(before > 0, "a 0.1 m recess must not already go through — this test is inert");
+
+        app.factory_edit_cutout(id);
+        assert!(app.factory.editing_cutout(), "edit mode is armed");
+        drag_reshape_corner(&mut app);
+        app.factory_apply_cutout_reshape();
+        app.factory.recompute();
+
+        let id1 = app.factory.cutout_ids()[0];
+        let after = surface_crossings(&app, below, glam::Vec3::Z);
+        assert!(
+            after > 0,
+            "the recess was re-cut as a THROUGH hole — reshaping a niche opened the far face",
+        );
+        let d1 = opening_depth(&app, id1);
+        assert!(
+            (d1 - d0).abs() < 0.05,
+            "the recess changed depth on a reshape that only moved a corner: {d0:.3} m -> {d1:.3} m",
+        );
+    }
+
+    /// A THROUGH OPENING MUST STAY THROUGH. The counterpart, so that remembering the mode cannot
+    /// be "fixed" by simply cutting every reshape as a recess.
+    #[test]
+    fn reshaping_a_through_opening_keeps_it_through() {
+        let (mut app, id) = box_with_opening(true, 0.1);
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        let below = glam::Vec3::new(c.x, c.y, mn.z - 1.0);
+        assert_eq!(
+            surface_crossings(&app, below, glam::Vec3::Z), 0,
+            "the hole must start out clear through — this test is inert otherwise",
+        );
+
+        app.factory_edit_cutout(id);
+        drag_reshape_corner(&mut app);
+        app.factory_apply_cutout_reshape();
+        app.factory.recompute();
+
+        assert_eq!(
+            surface_crossings(&app, below, glam::Vec3::Z), 0,
+            "a through opening was re-cut as a blind recess — the hole grew a floor",
+        );
+    }
+
+    /// LEAVING THE SKETCH WITHOUT APPLYING MUST LEAVE THE OPENING WHERE IT WAS.
+    ///
+    /// `factory_edit_cutout` deletes the baked cutters before opening the outline for editing, and
+    /// `factory_exit_sketch` only cleared the edit flag. Every exit that is not ✔ Apply or
+    /// ✖ Cancel — the Esc key, switching view, opening a file — therefore closed the sketch with
+    /// the opening already deleted, silently and with nothing to undo toward.
+    #[test]
+    fn leaving_a_cutout_edit_without_applying_puts_the_opening_back() {
+        let (mut app, id) = box_with_opening(true, 0.1);
+        let before = app.factory.cutout_ids().len();
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        let below = glam::Vec3::new(c.x, c.y, mn.z - 1.0);
+
+        app.factory_edit_cutout(id);
+        assert!(app.factory.editing_cutout(), "edit mode is armed");
+        assert!(
+            app.factory.cutout_ids().is_empty(),
+            "the cutters really are removed while editing — otherwise this proves nothing",
+        );
+
+        // Escape: close the sketch without ✔ Apply and without ✖ Cancel.
+        app.factory_exit_sketch();
+        app.factory.recompute();
+
+        assert!(!app.factory.editing_cutout(), "edit mode cleared on exit");
+        assert_eq!(
+            app.factory.cutout_ids().len(), before,
+            "the opening was left deleted — an unapplied edit destroyed it",
+        );
+        assert_eq!(
+            surface_crossings(&app, below, glam::Vec3::Z), 0,
+            "the restored opening does not cut: it was put back bound to the wrong body",
+        );
+    }
+
+    /// The restored cutters must go back BEHIND THEIR OWN BODIES. Pushing them onto the end
+    /// re-binds every one of them to whatever Union is last — the same defect fixed in
+    /// `rederive_wall`, and it would leave this test's opening cutting a second box instead.
+    #[test]
+    fn an_abandoned_edit_restores_the_cutter_behind_its_own_body() {
+        let (mut app, id) = box_with_opening(true, 0.1);
+        let host = {
+            let at = app.factory.model.features.iter().position(|f| f.id == id).expect("cutter");
+            app.factory.model.features[..at].iter().rev()
+                .find(|f| f.op == cad_solid::BoolOp::Union).expect("a host body").id
+        };
+        // A SECOND body, added after the opening, so an appended cutter has somewhere wrong to go.
+        app.factory.add_box();
+        app.factory.recompute();
+
+        app.factory_edit_cutout(id);
+        app.factory_exit_sketch();
+
+        let restored = app.factory.cutout_ids();
+        assert_eq!(restored.len(), 1, "exactly the one opening came back");
+        let at = app.factory.model.features.iter()
+            .position(|f| f.id == restored[0]).expect("restored cutter is in the model");
+        let host_now = app.factory.model.features[..at].iter().rev()
+            .find(|f| f.op == cad_solid::BoolOp::Union).expect("a host body").id;
+        assert_eq!(
+            host_now, host,
+            "the restored opening is cutting a different body than the one it was drawn on",
+        );
+    }
+
+    /// THE ROUTE BACK FROM A FLAGGED OPENING. An opening that lost its wall is kept with
+    /// `enabled` cleared, which is only half an answer if nothing can ever clear the flag again.
+    ///
+    /// ▼ Openings ▸ ✏ Edit in 2D ▸ ✔ Apply is that route: the edit lifts the flagged cutter out
+    /// and Apply re-cuts a fresh, live one wherever the outline now sits. This pins that down, so
+    /// "kept and flagged" cannot quietly become "kept but permanently dead".
+    #[test]
+    fn a_flagged_opening_comes_back_by_editing_and_applying_it() {
+        let (mut app, id) = box_with_opening(true, 0.1);
+        // Flag it exactly as `rederive_wall` would: kept in the model, not applied.
+        app.factory.model.set_enabled(id, false);
+        app.factory.recompute();
+        assert_eq!(app.factory.orphaned_cutouts().len(), 1, "the opening starts out flagged");
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        let below = glam::Vec3::new(c.x, c.y, mn.z - 1.0);
+        assert!(
+            surface_crossings(&app, below, glam::Vec3::Z) > 0,
+            "a flagged opening must not be cutting — this test would prove nothing otherwise",
+        );
+
+        app.factory_edit_cutout(id);
+        app.factory_apply_cutout_reshape();
+        app.factory.recompute();
+
+        assert!(
+            app.factory.orphaned_cutouts().is_empty(),
+            "the opening is still flagged after being re-applied — there is no way back",
+        );
+        assert_eq!(
+            surface_crossings(&app, below, glam::Vec3::Z), 0,
+            "the re-applied opening does not actually cut",
+        );
+    }
+
+    /// A REFUSED RESHAPE LEAVES THE OPENING ALONE. `factory_apply_cutout_reshape` deletes the
+    /// cutters on the way in and closes the sketch whatever happens, so a re-cut that produces
+    /// nothing used to close over an opening that had already been destroyed.
+    #[test]
+    fn a_reshape_that_cannot_be_applied_leaves_the_opening_intact() {
+        let (mut app, id) = box_with_opening(true, 0.1);
+        let before = app.factory.cutout_ids().len();
+        let (mn, mx) = app.factory.model.features[0].world_aabb();
+        let c = (mn + mx) * 0.5;
+        let below = glam::Vec3::new(c.x, c.y, mn.z - 1.0);
+
+        app.factory_edit_cutout(id);
+        // Destroy the outline: with nothing closed to cut, the re-cut must refuse.
+        app.doc.dobjects.clear();
+        app.selection.clear();
+        app.selected = None;
+        app.factory_apply_cutout_reshape();
+        app.factory.recompute();
+
+        assert_eq!(
+            app.factory.cutout_ids().len(), before,
+            "a refused reshape deleted the opening it could not re-cut",
+        );
+        assert_eq!(
+            surface_crossings(&app, below, glam::Vec3::Z), 0,
+            "the opening came back but is no longer cutting its own body",
         );
     }
 

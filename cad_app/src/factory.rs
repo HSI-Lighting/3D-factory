@@ -1010,6 +1010,44 @@ pub fn length_str(u: cad_kernel::DocUnits, metres: f32) -> String {
     format!("{:.*} {}", length_decimals(u), u.from_metres(metres as f64), u.label())
 }
 
+/// An opening lifted out of the model for 2D reshaping — everything the sketch session has to
+/// carry so the edit can be finished OR abandoned without losing the opening.
+///
+/// `factory_edit_cutout` removes the baked cutters before handing the outline to the 2D canvas,
+/// which means that between entering and applying, the opening exists nowhere but here.
+#[derive(Clone, Debug)]
+pub struct CutoutEdit {
+    /// The removed cutters, each with the body it was cutting and the index it sat at.
+    ///
+    /// THE HOST ID IS THE POINT, not the index. `csg::eval` binds a Difference to the nearest
+    /// Union above it, so restoring by pushing onto the end would re-bind every cutter to
+    /// whichever body happens to be last — the same silent defect that `rederive_wall` was fixed
+    /// for. The index is the fallback for when the host body has itself been deleted meanwhile,
+    /// which is the one case where there is no right answer and the user has to be told.
+    pub stash: Vec<StashedCut>,
+    /// Whether this opening went THROUGH its wall, as opposed to being a blind recess.
+    ///
+    /// Measured from the cutter at edit time (see `CadApp::cut_coverage`) rather than stored with
+    /// the opening, so it works on openings cut by earlier versions and openings loaded from a
+    /// file. The honest limit: a THROUGH cut that never actually reached through is remembered as
+    /// the recess it visibly is. That is the safe direction — it never turns a working through
+    /// hole into a pocket, and never turns a pocket into a hole.
+    pub through: bool,
+    /// The pocket depth to re-cut with when `!through`, in metres. Taken off the stashed cutter,
+    /// so a reshape that only moves a corner reproduces the same depth exactly.
+    pub depth: f32,
+}
+
+/// One cutter held out of the model during a cutout edit. See [`CutoutEdit::stash`].
+#[derive(Clone, Copy, Debug)]
+pub struct StashedCut {
+    pub feature: cad_solid::Feature,
+    /// The Union this cutter was bound to — the body it opens.
+    pub host: Option<u32>,
+    /// Where it sat in `model.features`, used only when `host` no longer exists.
+    pub at: usize,
+}
+
 /// 3D Factory state — the model + its view. Lives on `CadApp` as one field.
 pub struct FactoryState {
     pub open: bool,
@@ -1378,10 +1416,15 @@ pub struct FactoryState {
     pub queued: Option<cad_solid::modify::ModifyOp>,
     /// Live prompt for the running/queued 3D op.
     pub status: String,
-    /// True while a cutout is open for 2D reshape (via `factory_edit_cutout`). Drives the
-    /// prominent "drag the points, then Apply" banner in the sketch panel and makes finishing
-    /// the sketch re-cut the opening automatically. Cleared when the sketch is exited/applied.
-    pub editing_cutout: bool,
+    /// The opening currently open for 2D reshape (via `factory_edit_cutout`), and everything
+    /// needed to put it back or re-cut it as itself. `None` when no cutout is being edited.
+    ///
+    /// This was a bare `bool`, which is what made both of its defects possible: the edit deleted
+    /// the opening's cutters and then carried nothing about them, so leaving without Apply had
+    /// nothing to restore and Apply had nothing to re-cut FROM — it just re-cut everything
+    /// through. Holding the state in an `Option` makes the invariant structural: you cannot be
+    /// editing a cutout without also holding what it takes to undo that.
+    pub cutout_edit: Option<CutoutEdit>,
     /// Cached library index of the default DOOR / WINDOW aperture mesh, once loaded from
     /// `assets/apertures/`. `[door, window]`. `None` until first used, so the bundled meshes are
     /// only parsed on demand and reused across every aperture placed.
@@ -3223,7 +3266,7 @@ impl Default for FactoryState {
             modify: None,
             queued: None,
             status: String::new(),
-            editing_cutout: false,
+            cutout_edit: None,
             aperture_asset: [None, None],
             sel_mesh: SolidMesh::default(),
             sel_key: Vec::new(),
@@ -6781,6 +6824,12 @@ impl FactoryState {
             }
         }
         best.map(|(_, k)| k)
+    }
+
+    /// True while an opening is open for 2D reshape — what the sketch panel's banner and its
+    /// ✔ Apply / ✖ Cancel buttons key off. The state itself is in [`Self::cutout_edit`].
+    pub fn editing_cutout(&self) -> bool {
+        self.cutout_edit.is_some()
     }
 
     /// Every opening that lost its host wall segment: kept in the model, NOT applied, and needing
