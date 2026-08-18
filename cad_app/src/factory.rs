@@ -4428,34 +4428,46 @@ impl FactoryState {
         self.dirty = true;
     }
 
-    /// Carry per-face textures along when their feature moves.
+    /// RE-KEY THE PER-FACE PAINT ON `ids` BY MAPPING THE WORLD PLANE EACH KEY NAMES.
     ///
     /// A [`SurfaceKey`] is `(feature id, quantised normal, quantised plane offset d)` — it names a
     /// PLANE, not a triangle, which is what lets one key paint a whole flat face however it is
-    /// tessellated. The cost is that `d = n · p` moves with the geometry: translate a wall and
-    /// every one of its painted faces is looked up under a key that no longer exists, so the paint
-    /// silently vanishes.
+    /// tessellated. The cost is that the plane moves with the geometry: change a feature's pose or
+    /// size and every painted face on it is looked up under a key that no longer exists, so the
+    /// paint silently vanishes. "A painted face keeps its paint" is exactly this function.
     ///
-    /// That was already true of moving a single feature. It matters more now that a building moves
-    /// as one object — "make sure you dont break the texture application while fixing this" — so
-    /// the keys move too. For a pure translation the new offset is exact: `d' = n · (p + Δ) =
-    /// d + n · Δ`, with the normal unchanged. No re-derivation from geometry, no tolerance.
-    fn translate_surface_textures(&mut self, ids: &[u32], delta: Vec3) {
+    /// `map` takes the old plane `(n, d)` and returns the new one. Every caller can state that in
+    /// closed form — a translation, a pose change, a scale about a pivot — so nothing here
+    /// re-derives a plane from the evaluated mesh and there is no tolerance anywhere.
+    ///
+    /// The normal is NORMALISED on the way out of the key. It was quantised at ×50 going in, so
+    /// an oblique face comes back up to a hundredth off unit, and `n · Δ` over a long move would
+    /// then miss the 1 cm offset quantisation and lose the paint anyway. An axis-aligned face —
+    /// which is nearly all of them — is unaffected either way.
+    fn remap_surface_keys(&mut self, ids: &[u32], map: impl Fn(Vec3, f32) -> (Vec3, f32)) {
         if self.surface_texture.is_empty() && self.surface_color.is_empty() {
             return;
         }
         let moved: std::collections::HashSet<u32> = ids.iter().copied().collect();
         let shift = |k: &SurfaceKey| -> SurfaceKey {
-            let n = Vec3::new(k.1 as f32 / 50.0, k.2 as f32 / 50.0, k.3 as f32 / 50.0);
-            (k.0, k.1, k.2, k.3, ((k.4 as f32 / 100.0 + n.dot(delta)) * 100.0).round() as i32)
+            let n = Vec3::new(k.1 as f32 / 50.0, k.2 as f32 / 50.0, k.3 as f32 / 50.0)
+                .normalize_or_zero();
+            let (n2, d2) = map(n, k.4 as f32 / 100.0);
+            (
+                k.0,
+                (n2.x * 50.0).round() as i32,
+                (n2.y * 50.0).round() as i32,
+                (n2.z * 50.0).round() as i32,
+                (d2 * 100.0).round() as i32,
+            )
         };
-        let remap = |map: &mut std::collections::HashMap<SurfaceKey, usize>| {
+        let remap = |m: &mut std::collections::HashMap<SurfaceKey, usize>| {
             let (mut keep, mut move_): (Vec<_>, Vec<_>) =
-                map.drain().partition(|(k, _)| !moved.contains(&k.0));
+                m.drain().partition(|(k, _)| !moved.contains(&k.0));
             for (k, v) in move_.drain(..) {
                 keep.push((shift(&k), v));
             }
-            *map = keep.into_iter().collect();
+            *m = keep.into_iter().collect();
         };
         remap(&mut self.surface_texture);
         let (mut keep, mut move_): (Vec<_>, Vec<_>) =
@@ -4464,6 +4476,41 @@ impl FactoryState {
             keep.push((shift(&k), v));
         }
         self.surface_color = keep.into_iter().collect();
+    }
+
+    /// Carry per-face paint along when its feature TRANSLATES.
+    ///
+    /// It matters more now that a building moves as one object — "make sure you dont break the
+    /// texture application while fixing this". `d' = n · (p + Δ) = d + n · Δ`, normal unchanged.
+    fn translate_surface_textures(&mut self, ids: &[u32], delta: Vec3) {
+        self.remap_surface_keys(ids, |n, d| (n, d + n.dot(delta)));
+    }
+
+    /// …and when its POSE changes: a rotation ring, a typed angle, anything that rewrites the
+    /// feature's plane or placement.
+    ///
+    /// The transform that took the old pose to the new one is `after · before⁻¹`, whatever the
+    /// edit was — so this needs no case per kind of edit, and a new one gets it for free.
+    /// `Plane::world_matrix` is an orthonormal basis times a rotation, with no scale in it, which
+    /// is what makes transforming the normal as a direction correct.
+    fn repose_surface_keys(&mut self, id: u32, before: glam::Mat4, after: glam::Mat4) {
+        if before.abs_diff_eq(after, 1e-6) {
+            return;
+        }
+        let m = after * before.inverse();
+        self.remap_surface_keys(&[id], |n, d| {
+            // `n * d` is the point on the plane nearest the origin — any point on it will do.
+            let p = m.transform_point3(n * d);
+            let n2 = m.transform_vector3(n).normalize_or_zero();
+            (n2, n2.dot(p))
+        });
+    }
+
+    /// …and when it is SCALED about a pivot. `world_matrix` carries no scale, so the pose is
+    /// unchanged and the faces move because the primitive itself grew: the normal stays, and a
+    /// point on the plane goes to `pivot + k(p − pivot)`.
+    fn rescale_surface_keys(&mut self, id: u32, pivot: Vec3, k: f32) {
+        self.remap_surface_keys(&[id], |n, d| (n, n.dot(pivot + (n * d - pivot) * k)));
     }
 
     /// Uniformly scale the current selection about its own centre — furniture instance or
@@ -4489,6 +4536,7 @@ impl FactoryState {
                 if let Some(fm) = self.model.get_mut(id) {
                     *fm = f.scaled(pivot, k);
                 }
+                self.rescale_surface_keys(id, pivot, k);
                 self.dirty = true;
             }
         }
@@ -5123,14 +5171,23 @@ impl FactoryState {
     /// axis 0 = pitch (about plane u), 1 = roll (about plane v), 2 = spin (about the
     /// normal). Drives both the numeric fields and the rotation-ring gizmo.
     pub fn set_feature_rotation(&mut self, id: u32, axis: usize, deg: f32) {
+        let Some(before) = self.model.get(id).map(|f| f.plane.world_matrix(&f.placement)) else {
+            return;
+        };
+        let mut after = before;
         if let Some(f) = self.model.get_mut(id) {
             match axis {
                 0 => f.placement.pitch_deg = deg,
                 1 => f.placement.roll_deg = deg,
                 _ => f.placement.spin_deg = deg,
             }
+            after = f.plane.world_matrix(&f.placement);
             self.dirty = true;
         }
+        // TURNING AN OBJECT DOES NOT REPAINT IT. Every face's world plane changed, and a
+        // `SurfaceKey` names a world plane — so without this the paint on a rotated wall is
+        // looked up under a plane that is no longer anywhere and quietly reverts to the default.
+        self.repose_surface_keys(id, before, after);
     }
 
     /// A feature's current rotation `[pitch, roll, spin]` in degrees, for the panel/gizmo.
@@ -15667,6 +15724,129 @@ mod wall_opening_tests {
             (model_max_x(&st) - 6.0).abs() < 0.05,
             "the split wall came back SOLID (model reaches x = {})",
             model_max_x(&st),
+        );
+    }
+}
+
+/// A PAINTED FACE KEEPS ITS PAINT.
+///
+/// Per-face paint is keyed by the face's WORLD PLANE, which is what lets one entry colour a whole
+/// flat face however csgrs happens to tessellate it — and what makes the key move with the object.
+/// A translate already carried the keys along; a rotation and a scale did not, so turning or
+/// resizing a wall you had just painted reverted it to the default with nothing said.
+///
+/// Each test paints EVERY face of the body, transforms it, and asks whether every face of the
+/// result is still painted. Asserting on the whole set rather than on one face is deliberate: a
+/// remap that is right for the two faces perpendicular to the motion and wrong for the four that
+/// turn would pass any single-face test written by someone who had just fixed the easy case.
+#[cfg(test)]
+mod a_painted_face_keeps_its_paint {
+    use super::*;
+
+    fn one_box() -> FactoryState {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+        st
+    }
+
+    /// Every distinct surface in the evaluated mesh.
+    fn surfaces(st: &FactoryState) -> std::collections::HashSet<SurfaceKey> {
+        let p = &st.cached.positions;
+        (0..p.len() / 3)
+            .map(|t| surface_key(st.cached.face_ids[t], p[t * 3], p[t * 3 + 1], p[t * 3 + 2]))
+            .collect()
+    }
+
+    /// Paint every face a distinguishable colour; returns how many there were.
+    fn paint_every_face(st: &mut FactoryState) -> usize {
+        let keys = surfaces(st);
+        for (i, k) in keys.iter().enumerate() {
+            st.surface_color.insert(*k, [i as f32 * 0.05, 0.5, 0.5]);
+        }
+        assert!(keys.len() >= 6, "a box has at least six faces, found {}", keys.len());
+        keys.len()
+    }
+
+    /// After the edit, every face of the body must still resolve to a colour, and no entry may
+    /// have been lost along the way.
+    fn assert_every_face_still_painted(st: &FactoryState, before: usize, what: &str) {
+        assert_eq!(
+            st.surface_color.len(), before,
+            "{what}: the paint table changed size — an entry was dropped or duplicated",
+        );
+        let now = surfaces(st);
+        let unpainted: Vec<_> = now.iter().filter(|k| !st.surface_color.contains_key(k)).collect();
+        assert!(
+            unpainted.is_empty(),
+            "{what}: {} of {} faces came back unpainted — the paint is keyed to a plane that is \
+             no longer anywhere",
+            unpainted.len(), now.len(),
+        );
+    }
+
+    /// The control, and the one case that already worked.
+    #[test]
+    fn a_moved_body_keeps_its_paint() {
+        let mut st = one_box();
+        let n = paint_every_face(&mut st);
+        st.move_selection(Vec3::new(3.0, -2.0, 1.5));
+        st.recompute();
+        assert_every_face_still_painted(&st, n, "after a move");
+    }
+
+    /// A ROTATION. Every side face's normal turns, so every one of their keys changes — the case
+    /// a translate-only remap gets completely wrong.
+    #[test]
+    fn a_rotated_body_keeps_its_paint() {
+        let mut st = one_box();
+        let n = paint_every_face(&mut st);
+        let id = st.selected_single().expect("the new box is selected");
+        st.set_feature_rotation(id, 2, 30.0); // spin about the plane normal
+        st.recompute();
+        assert_every_face_still_painted(&st, n, "after a 30° spin");
+    }
+
+    /// AND A ROTATION OUT OF THE PLANE, which turns the top and bottom faces as well — a remap
+    /// that only spun the sides would leave those two behind.
+    #[test]
+    fn a_body_tipped_out_of_its_plane_keeps_its_paint() {
+        let mut st = one_box();
+        let n = paint_every_face(&mut st);
+        let id = st.selected_single().expect("selected");
+        st.set_feature_rotation(id, 0, 25.0); // pitch
+        st.recompute();
+        assert_every_face_still_painted(&st, n, "after a 25° pitch");
+    }
+
+    /// A SCALE. The pose does not change at all here — `world_matrix` carries no scale — so the
+    /// faces move because the primitive itself grew, and only the offsets change.
+    #[test]
+    fn a_scaled_body_keeps_its_paint() {
+        let mut st = one_box();
+        let n = paint_every_face(&mut st);
+        st.scale_selection(1.7);
+        st.recompute();
+        assert_every_face_still_painted(&st, n, "after a 1.7x scale");
+    }
+
+    /// AND SOMEBODY ELSE'S PAINT IS LEFT ALONE. The remap partitions on the feature id, and a
+    /// remap that moved every key would repaint the building next door on every drag.
+    #[test]
+    fn paint_on_another_body_is_untouched() {
+        let mut st = one_box();
+        let moving = st.selected_single().expect("selected");
+        // A key belonging to a feature that is NOT selected, with a plane nothing else shares.
+        let stranger: SurfaceKey = (moving + 1_000, 50, 0, 0, 777);
+        st.surface_color.insert(stranger, [1.0, 0.0, 0.0]);
+
+        st.move_selection(Vec3::new(3.0, 0.0, 0.0));
+        st.set_feature_rotation(moving, 2, 40.0);
+        st.scale_selection(2.0);
+
+        assert_eq!(
+            st.surface_color.get(&stranger), Some(&[1.0, 0.0, 0.0]),
+            "another body's paint moved when this one did",
         );
     }
 }
