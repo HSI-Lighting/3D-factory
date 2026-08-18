@@ -1660,7 +1660,11 @@ impl LightState {
             layers_3d,
             ies_library,
             active_profile: self.active_profile.clone(),
-            lux_block_ies: BTreeMap::new(),
+            // THE LIGHT EDITOR'S WIRING, translated from block ids to block NAMES on the way out
+            // — ids are positions in the block table and do not survive a reopen.
+            lux_block_ies: self.editor.to_named(doc),
+            light_editor_hidden: self.editor.hidden_named(doc),
+            light_editor_folder: self.editor.folder.clone(),
             materials: self.materials.clone(),
             settings: self.settings,
             room_height: self.room_height,
@@ -1690,6 +1694,16 @@ impl LightState {
         if cfg.active_profile.is_empty() || self.profiles.contains_key(&cfg.active_profile) {
             self.active_profile = cfg.active_profile;
         }
+        // THE LIGHT EDITOR'S WIRING, resolved from names back to THIS document's block ids. A name
+        // the drawing no longer has is dropped: the drawing is the authority on what blocks exist,
+        // and a pairing to one nobody can see is not recoverable state.
+        self.editor = crate::light_editor::Wiring::from_named(
+            doc,
+            &cfg.lux_block_ies,
+            &cfg.light_editor_hidden,
+            cfg.light_editor_folder,
+        );
+        self.editor_scanned = crate::light_editor::scan_folder(&self.editor.folder);
         // The placed layout. A fixture whose fitting did not come back with the library is left
         // unassigned — visible as a hollow marker and counted in the toolbar — rather than kept
         // pointing at a name that resolves to nothing and silently emits no light.

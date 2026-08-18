@@ -436,8 +436,19 @@ pub struct SimluxConfig {
     #[serde(default)]
     pub active_profile: String,
     /// LUX block DEFINITION name → IES profile name (Slice 3; type-level D4).
+    ///
+    /// Declared with the format and written as an empty map ever since; the Light Editor is what
+    /// finally fills it in. Keyed by NAME, as everything here is, because a block id is a POSITION
+    /// in the table and positions do not survive a reopen — see `light_editor::Wiring::to_named`.
     #[serde(default)]
     pub lux_block_ies: BTreeMap<String, String>,
+    /// Blocks curated OUT of the Light Editor's list, by name. Not a property of the drawing —
+    /// most blocks in a plan are furniture, and this is which of them the user stopped looking at.
+    #[serde(default)]
+    pub light_editor_hidden: Vec<String>,
+    /// Folder the Light Editor scans for `.ldt` / `.ies` files.
+    #[serde(default)]
+    pub light_editor_folder: String,
     /// Surface materials [floor, wall, ceiling].
     #[serde(default)]
     pub materials: Vec<Material>,

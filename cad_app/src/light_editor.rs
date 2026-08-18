@@ -147,6 +147,62 @@ impl Wiring {
         });
         out
     }
+
+    /// The wiring as BLOCK NAMES, for the sidecar.
+    ///
+    /// IDS ARE POSITIONS IN THE BLOCK TABLE, and positions do not survive a save and reopen: a
+    /// re-import, or any edit that reorders the table, renumbers them. Persisting ids would
+    /// silently re-pair the wiring to whatever now sits at those numbers — two hundred downlights
+    /// landing on the chairs, with nothing to say why.
+    ///
+    /// This is the convention the sidecar already states for `wall_centerline` ("keyed by name …
+    /// so it survives save/reopen even though ids are positional"), and the reason `lux_block_ies`
+    /// was declared name-keyed years before anything filled it in.
+    ///
+    /// A link whose block no longer exists is dropped: the drawing is the authority on what blocks
+    /// there are, and a pairing to a block nobody can see is not recoverable state.
+    pub fn to_named(&self, doc: &Document) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for (&id, profile) in &self.links {
+            if let Some(b) = doc.blocks.blocks.get(id as usize) {
+                out.insert(b.name.clone(), profile.clone());
+            }
+        }
+        out
+    }
+
+    /// Curated-out blocks as NAMES, for the sidecar — same reasoning as [`Self::to_named`].
+    pub fn hidden_named(&self, doc: &Document) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .hidden
+            .iter()
+            .filter_map(|id| doc.blocks.blocks.get(*id as usize).map(|b| b.name.clone()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Rebuild a wiring from the sidecar's names, resolving each against THIS document's block
+    /// table. A name the drawing no longer has is dropped rather than guessed at.
+    pub fn from_named(
+        doc: &Document,
+        links: &std::collections::BTreeMap<String, String>,
+        hidden: &[String],
+        folder: String,
+    ) -> Self {
+        let id_of = |name: &str| -> Option<u32> {
+            doc.blocks
+                .blocks
+                .iter()
+                .position(|b| b.name.eq_ignore_ascii_case(name))
+                .map(|i| i as u32)
+        };
+        Self {
+            links: links.iter().filter_map(|(n, p)| Some((id_of(n)?, p.clone()))).collect(),
+            hidden: hidden.iter().filter_map(|n| id_of(n)).collect(),
+            folder,
+        }
+    }
 }
 
 /// Scan `dir` for photometric files. Non-recursive, and it never fails loudly: an unreadable or
@@ -411,6 +467,13 @@ mod tests {
     use super::*;
     use cad_kernel::{Block, BlockRef, DObject, Line, Vec2, MAX_BLOCK_PARAMS};
 
+
+    fn named_block(name: &str) -> Block {
+        Block {
+            name: name.into(), base: Vec2::ZERO, dobjects: Vec::new(),
+            smart: false, params: Vec::new(), cut_edges: Vec::new(),
+        }
+    }
     fn block_ref(id: u32, at: Vec2, rot: f64) -> Geom {
         Geom::BlockRef(BlockRef {
             block: id, insert: at, scale: 1.0, scale_y: 1.0, rotation: rot, mirror_x: false,
@@ -543,5 +606,77 @@ mod tests {
     fn a_missing_photometry_folder_is_an_empty_list_not_an_error() {
         assert!(scan_folder("Z:/no/such/folder/anywhere").is_empty());
         assert!(scan_folder("").is_empty());
+    }
+
+    /// THE WIRING SURVIVES A REOPEN, AND SURVIVES THE BLOCK TABLE BEING REORDERED.
+    ///
+    /// This is why the sidecar is keyed by NAME. A block id is a POSITION in the table, so a
+    /// re-import — or any edit that inserts a definition ahead of another — renumbers them. Had
+    /// the ids been persisted, reopening would re-pair the wiring to whatever now sits at those
+    /// numbers: two hundred downlights placed on the chairs, silently, with the layout looking
+    /// plausible until someone checked what was where.
+    #[test]
+    fn the_wiring_survives_a_reordered_block_table() {
+        let mut before = Document::default();
+        before.blocks.add(named_block("CHAIR"));
+        let down = before.blocks.add(named_block("DOWNLIGHT"));
+        let mut w = Wiring::default();
+        w.links.insert(down, "PULSE-14".into());
+        w.hidden.insert(0); // CHAIR curated out
+
+        let saved = w.to_named(&before);
+        let saved_hidden = w.hidden_named(&before);
+        assert_eq!(saved.get("DOWNLIGHT").map(String::as_str), Some("PULSE-14"));
+        assert_eq!(saved_hidden, vec!["CHAIR".to_string()]);
+
+        // Reopened with the table in a DIFFERENT order — DOWNLIGHT is now id 0, CHAIR id 2.
+        let mut after = Document::default();
+        let down_after = after.blocks.add(named_block("DOWNLIGHT"));
+        after.blocks.add(named_block("DESK"));
+        let chair_after = after.blocks.add(named_block("CHAIR"));
+        assert_ne!(down, down_after, "the fixture must actually renumber, or it proves nothing");
+
+        let restored = Wiring::from_named(&after, &saved, &saved_hidden, String::new());
+        assert_eq!(
+            restored.links.get(&down_after).map(String::as_str),
+            Some("PULSE-14"),
+            "the fitting was re-paired to the wrong block on reopen",
+        );
+        assert!(!restored.links.contains_key(&chair_after), "CHAIR must not be wired");
+        assert!(restored.hidden.contains(&chair_after), "the curation followed the wrong block");
+    }
+
+    /// A block the drawing no longer has is DROPPED rather than guessed at. The drawing is the
+    /// authority on what blocks exist; a pairing to one nobody can see is not recoverable state.
+    #[test]
+    fn a_wiring_for_a_deleted_block_is_dropped_on_reopen() {
+        let mut doc = Document::default();
+        doc.blocks.add(named_block("DOWNLIGHT"));
+        let mut saved = std::collections::BTreeMap::new();
+        saved.insert("DOWNLIGHT".to_string(), "PULSE".to_string());
+        saved.insert("A-BLOCK-THAT-WENT-AWAY".to_string(), "OTHER".to_string());
+
+        let w = Wiring::from_named(&doc, &saved, &[], String::new());
+        assert_eq!(w.links.len(), 1, "the vanished block was resurrected as some other id");
+        assert!(w.links.values().any(|v| v == "PULSE"));
+    }
+
+    /// Round-trip with no reordering at all — the ordinary case, and the one that would hide a
+    /// translation that simply dropped everything.
+    #[test]
+    fn an_unchanged_document_round_trips_the_wiring_exactly() {
+        let mut doc = Document::default();
+        let a = doc.blocks.add(named_block("DOWNLIGHT"));
+        let b = doc.blocks.add(named_block("TRACK"));
+        let mut w = Wiring::default();
+        w.links.insert(a, "PULSE".into());
+        w.links.insert(b, "SPOT".into());
+        w.folder = "D:/photometry".into();
+
+        let back = Wiring::from_named(&doc, &w.to_named(&doc), &w.hidden_named(&doc), w.folder.clone());
+        assert_eq!(back.links.len(), 2);
+        assert_eq!(back.links.get(&a).map(String::as_str), Some("PULSE"));
+        assert_eq!(back.links.get(&b).map(String::as_str), Some("SPOT"));
+        assert_eq!(back.folder, "D:/photometry");
     }
 }
