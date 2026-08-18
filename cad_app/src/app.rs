@@ -49975,6 +49975,46 @@ mod factory_sketch_tests {
     /// Read-only — it loads the sidecar and prints. Useful when the app will not start, when the
     /// question is about a file the user is not currently in, or to compare a file before and
     /// after an edit without asking them to record a session.
+
+/// REPRODUCE A CRASH REPORTED DURING `calculate`, on the user's real project.
+///
+///   SIMLUX_DIAG="D:\...\for3dfactorygym.dxf" cargo test -p cad_app --bin simlux \
+///       calculate_on_real_project -- --ignored --nocapture
+///
+/// Loads the sidecar, rebuilds the model, and runs the lux calculation exactly as the app does.
+/// A panic here IS the bug, with a stack; a clean run says the crash is somewhere else and stops
+/// this being guessed at.
+#[test]
+#[ignore = "needs SIMLUX_DIAG=<drawing path>"]
+fn calculate_on_real_project() {
+    let Ok(path) = std::env::var("SIMLUX_DIAG") else {
+        println!("set SIMLUX_DIAG to the drawing path");
+        return;
+    };
+    let cfg = crate::simlux_io::load(std::path::Path::new(&path))
+        .expect("sidecar read")
+        .expect("sidecar exists");
+    let mut app = CadApp::default();
+    app.factory.apply_persist(cfg.factory.clone());
+    app.factory.recompute();
+    app.light.apply_config(cfg, &app.doc);
+    println!(
+        "loaded: {} features, {} luminaires, {} profiles",
+        app.factory.model.features.len(),
+        app.light.luminaires.len(),
+        app.light.profiles.len(),
+    );
+
+    let t = std::time::Instant::now();
+    let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc).clone();
+    app.light.calculate(&plan, Some(&app.factory));
+    println!(
+        "calculate returned in {:.1} s — grid {:?}, msg: {}",
+        t.elapsed().as_secs_f64(),
+        app.light.grid.as_ref().map(|g| (g.cols, g.rows, g.avg)),
+        app.light.last_msg,
+    );
+}
     #[test]
     #[ignore = "needs SIMLUX_DIAG=<drawing path>"]
     fn scene_of_real_project() {

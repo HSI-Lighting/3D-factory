@@ -38,6 +38,40 @@ mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
+    // A CRASH MUST LEAVE SOMETHING BEHIND. A Windows GUI build has no console, so a panic prints
+    // its message to a stderr nobody sees and the process simply vanishes — which is exactly what
+    // "the app crashed while calculating" looks like from the outside, and it is not diagnosable.
+    //
+    // Written beside the executable, so it travels with the install rather than into a profile
+    // directory the user would have to be told how to find. Appended, because the second crash is
+    // usually the informative one and overwriting loses the first.
+    std::panic::set_hook(Box::new(|info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let where_ = info.location().map_or("?".to_string(), |l| format!("{}:{}", l.file(), l.line()));
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(no message)".into());
+        let text = format!(
+            "\n=== SIMLUX PANIC ===\nbuild {} ({})\nat {where_}\n{msg}\n\n{bt}\n",
+            option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
+            option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
+        );
+        eprintln!("{text}");
+        if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("simlux-crash.log"))
+            {
+                let _ = f.write_all(text.as_bytes());
+            }
+        }
+    }));
+
     // Say which build this is and what data it found, before anything else can go wrong. Both
     // questions have cost real time here: a repair was twice run against a stale binary, and a
     // bundled library that fails to resolve shows up as EMPTY MENUS rather than as an error, so
@@ -48,6 +82,17 @@ fn main() -> Result<(), eframe::Error> {
         option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
     );
     eprintln!("{}", assets::report());
+    // VERIFY THE HOOK IN THE SHIPPED BINARY. A crash reporter that has never been seen to fire is
+    // a guess; this makes it one command to prove, on the exact build a user is running:
+    //
+    //     SIMLUX_TEST_PANIC=1 simlux.exe      -> writes simlux-crash.log beside the exe
+    //
+    // Behind an env var rather than a menu item, because it is for whoever is diagnosing a crash,
+    // not for the person who just lost their work.
+    if std::env::var("SIMLUX_TEST_PANIC").is_ok() {
+        panic!("deliberate test panic — SIMLUX_TEST_PANIC was set");
+    }
+
 
     // BEFORE ANYTHING CAN RUN A BOOLEAN — the generators, an autoloaded fixture, a reopened
     // project. csgrs keeps its tolerance in a `OnceLock` whose first READER initialises it to the
