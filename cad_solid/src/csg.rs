@@ -30,9 +30,18 @@ fn local_mesh(p: &Primitive, model: &Model) -> CsgMesh {
         // Cargo.toml, so there is no new dependency here.
         Primitive::Extrusion { profile, h, .. } => match model.profile(profile) {
             Some(pr) => {
-                let pts: Vec<[f64; 2]> =
-                    pr.pts.iter().map(|q| [q[0] as f64, q[1] as f64]).collect();
-                Sketch::polygon(&pts, ()).extrude(h.max(1e-4) as f64)
+                let ring = |r: &[[f32; 2]]| -> Vec<[f64; 2]> {
+                    r.iter().map(|q| [q[0] as f64, q[1] as f64]).collect()
+                };
+                let mut face = Sketch::polygon(&ring(&pr.pts), ());
+                // HOLES ARE TAKEN OUT OF THE FACE, not out of the solid. A 2D difference on the
+                // outline costs one region subtraction per hole and then extrudes once; cutting
+                // the extruded solid instead would mean a full BSP boolean per hole, on the
+                // largest mesh in the model, for a shape that was flat when we had it.
+                for hole in &pr.holes {
+                    face = face.difference(&Sketch::polygon(&ring(hole), ()));
+                }
+                face.extrude(h.max(1e-4) as f64)
             }
             // A stale id must not take the app down — an empty mesh is a visible
             // "nothing there", which is recoverable; a panic is not.
@@ -766,6 +775,201 @@ mod tests {
              plus one difference. With mesh-bbopt on, (A)'s differences ALREADY build their BSP\n\
              from the overlapping subset only, so both sides of the trade are small-mesh booleans.\n"
         );
+    }
+
+    // ── A PLATE WITH A BOLT HOLE IS ONE FEATURE ────────────────────────────────────────────
+    //
+    // A hole used to be a second object: a `Difference` feature sitting behind the plate. That
+    // works, and it makes a plate with four bolt holes five things to select, five to move, five
+    // to keep in step — and four that go on cutting whatever body they land behind if the plate
+    // is ever deleted. `Profile::holes` puts the hole where it belongs, in the outline.
+
+    fn ring(cx: f32, cy: f32, r: f32, n: usize) -> Vec<glam::Vec2> {
+        (0..n)
+            .map(|i| {
+                let a = std::f32::consts::TAU * i as f32 / n as f32;
+                glam::Vec2::new(cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect()
+    }
+
+    fn square(cx: f32, cy: f32, half: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(cx - half, cy - half),
+            glam::Vec2::new(cx + half, cy - half),
+            glam::Vec2::new(cx + half, cy + half),
+            glam::Vec2::new(cx - half, cy + half),
+        ]
+    }
+
+    /// A plate 8 x 8 with one bolt hole, as ONE feature. Returns the model.
+    fn plate_with_hole(hole: Vec<glam::Vec2>) -> Model {
+        let mut m = Model::default();
+        let (profile, centre, w, d) =
+            m.add_profile_with_holes(&square(0.0, 0.0, 4.0), &[hole]).expect("plate profile");
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement {
+                u: centre.x, v: centre.y, lift: 0.0,
+                spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+            },
+            Primitive::Extrusion { profile, h: 1.0, w, d },
+        );
+        m
+    }
+
+    /// THE HOLE IS ACTUALLY THERE, and the plate is still the same plate.
+    ///
+    /// Asserted by RAY COUNT rather than by triangle count: shooting a vertical line through the
+    /// middle of the hole must cross no surface of the solid, and through the plate must cross
+    /// two. A triangle count would rise for a hole and rise for a botched tessellation equally.
+    #[test]
+    fn a_plate_with_a_bolt_hole_has_a_hole_in_it() {
+        let m = plate_with_hole(ring(0.0, 0.0, 1.0, 24));
+        let mesh = m.eval();
+        assert_eq!(m.features.len(), 1, "a plate with a hole must be ONE feature");
+
+        let (mn, mx) = mesh.bounds().expect("the plate has bounds");
+        for k in 0..2 {
+            assert!(
+                (mn[k] + 4.0).abs() < 1e-3 && (mx[k] - 4.0).abs() < 1e-3,
+                "the hole changed the plate's outline on axis {k}: {}..{}",
+                mn[k], mx[k],
+            );
+        }
+        assert!(
+            crossings_above(&mesh, 0.0, 0.0) == 0,
+            "a vertical line through the middle of the hole hit the solid — there is no hole",
+        );
+        assert!(
+            crossings_above(&mesh, 3.0, 3.0) >= 2,
+            "a vertical line through the plate missed it — the plate itself is gone",
+        );
+    }
+
+    /// FOUR BOLT HOLES, ALL FOUR OPEN. One hole can be produced by accident — by an outline that
+    /// happens to be re-wound, say. Four in the right four places cannot.
+    #[test]
+    fn every_hole_in_the_list_is_punched() {
+        let mut m = Model::default();
+        let holes: Vec<Vec<glam::Vec2>> = [(-2.5, -2.5), (2.5, -2.5), (2.5, 2.5), (-2.5, 2.5)]
+            .iter()
+            .map(|&(x, y)| ring(x, y, 0.6, 16))
+            .collect();
+        let (profile, centre, w, d) =
+            m.add_profile_with_holes(&square(0.0, 0.0, 4.0), &holes).expect("plate");
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement {
+                u: centre.x, v: centre.y, lift: 0.0,
+                spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+            },
+            Primitive::Extrusion { profile, h: 1.0, w, d },
+        );
+        let mesh = m.eval();
+        for &(x, y) in &[(-2.5_f32, -2.5_f32), (2.5, -2.5), (2.5, 2.5), (-2.5, 2.5)] {
+            assert_eq!(
+                crossings_above(&mesh, x, y), 0,
+                "the hole at ({x}, {y}) was not punched",
+            );
+        }
+        assert!(crossings_above(&mesh, 0.0, 0.0) >= 2, "the middle of the plate was removed too");
+    }
+
+    /// THE HOLE MOVES WITH THE PLATE. A profile is recentred on its own bounding box, and the
+    /// holes must take the SAME offset — recentring each ring on its own box would put every hole
+    /// dead centre, which is a plausible-looking plate with the bolt holes in the wrong place.
+    ///
+    /// Drawn far from the origin, because a plate centred on the origin has a zero offset and
+    /// would pass whatever the code did.
+    #[test]
+    fn a_hole_keeps_its_place_on_a_plate_drawn_far_from_the_origin() {
+        let mut m = Model::default();
+        // Plate spanning x ∈ [96, 104], y ∈ [46, 54]; hole near its top-right corner.
+        let (profile, centre, w, d) = m
+            .add_profile_with_holes(&square(100.0, 50.0, 4.0), &[ring(102.5, 52.5, 0.6, 16)])
+            .expect("plate");
+        assert!((centre.x - 100.0).abs() < 1e-4, "the fixture must be off the origin");
+        m.push(
+            BoolOp::Union,
+            Plane::default(),
+            Placement {
+                u: centre.x, v: centre.y, lift: 0.0,
+                spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0,
+            },
+            Primitive::Extrusion { profile, h: 1.0, w, d },
+        );
+        let mesh = m.eval();
+        assert_eq!(
+            crossings_above(&mesh, 102.5, 52.5), 0,
+            "the hole is not where it was drawn",
+        );
+        assert!(
+            crossings_above(&mesh, 100.0, 50.0) >= 2,
+            "the hole ended up at the centre of the plate — the rings were recentred separately",
+        );
+    }
+
+    /// A HOLE IS VALIDATED LIKE AN OUTLINE. A bow-tie handed to the boolean is undefined
+    /// behaviour, and it is undefined whether it arrived as the shape or as the hole.
+    #[test]
+    fn a_crossed_hole_is_refused_rather_than_extruded() {
+        let mut m = Model::default();
+        let bowtie = vec![
+            glam::Vec2::new(-1.0, -1.0), glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(1.0, -1.0), glam::Vec2::new(-1.0, 1.0),
+        ];
+        assert_eq!(
+            m.add_profile_with_holes(&square(0.0, 0.0, 4.0), &[bowtie]),
+            Err(crate::ProfileError::SelfIntersecting),
+            "a crossed hole was accepted",
+        );
+        assert!(m.profiles.is_empty(), "a refused profile must not be stored");
+    }
+
+    /// AND A PROFILE WITH NO HOLES IS WHAT IT ALWAYS WAS. `add_profile` is now
+    /// `add_profile_with_holes` with an empty list, and every existing caller goes through it.
+    #[test]
+    fn a_profile_with_no_holes_is_unchanged() {
+        let mut a = Model::default();
+        let mut b = Model::default();
+        let (ia, ca, wa, da) = a.add_profile(&square(3.0, 7.0, 2.0)).expect("plain");
+        let (ib, cb, wb, db) =
+            b.add_profile_with_holes(&square(3.0, 7.0, 2.0), &[]).expect("empty hole list");
+        assert_eq!((ia, wa, da), (ib, wb, db));
+        assert!((ca - cb).length() < 1e-6);
+        assert_eq!(a.profile(ia).unwrap().pts, b.profile(ib).unwrap().pts);
+        assert!(a.profile(ia).unwrap().holes.is_empty(), "a plain outline has no holes");
+    }
+
+    /// A PROFILE SAVED BEFORE HOLES EXISTED LOADS AS A PLAIN OUTLINE. Written by hand rather than
+    /// round-tripped, because a round trip writes the field and so never exercises its absence.
+    #[test]
+    fn a_profile_saved_without_holes_loads_solid() {
+        let json = r#"{ "id": 3, "pts": [[0.0,0.0],[1.0,0.0],[1.0,1.0]] }"#;
+        let p: crate::Profile = serde_json::from_str(json).expect("an older profile must load");
+        assert!(p.holes.is_empty(), "an older profile grew holes out of nowhere");
+    }
+
+    /// How many surfaces of `mesh` a vertical line through `(x, y)` crosses. Zero means the line
+    /// passes through open air — which, inside the outline of a solid plate, means a hole.
+    fn crossings_above(mesh: &SolidMesh, x: f32, y: f32) -> usize {
+        let p = &mesh.positions;
+        let mut hits = 0;
+        for t in 0..p.len() / 3 {
+            let (a, b, c) = (p[t * 3], p[t * 3 + 1], p[t * 3 + 2]);
+            // Barycentric containment in the XY projection of the triangle.
+            let d = |u: [f32; 3], v: [f32; 3]| (v[0] - u[0]) * (y - u[1]) - (v[1] - u[1]) * (x - u[0]);
+            let (d1, d2, d3) = (d(a, b), d(b, c), d(c, a));
+            let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            if !(neg && pos) {
+                hits += 1;
+            }
+        }
+        hits
     }
     /// The worst-N view is what a 4,000-feature table is actually read through, so it has to be
     /// sorted the way it claims.

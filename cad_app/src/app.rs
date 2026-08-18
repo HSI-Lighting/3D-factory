@@ -8539,6 +8539,84 @@ impl CadApp {
     /// for both callers: a face sketch is its own Document (metre-space, k = 1) while the plan
     /// may be millimetres. The `1e-3` closure test is likewise a real 1 mm once scaled, instead
     /// of a metre-shaped epsilon judging drawing units.
+    /// GROUP CLOSED LOOPS INTO OUTLINES AND THE HOLES INSIDE THEM.
+    ///
+    /// Every loop `closed_loops_of` finds used to become its own solid, so a plate drawn with four
+    /// bolt circles on it extruded as five posts and the drafter had to cut the holes back out by
+    /// hand — four more features, each of which then had to be kept beside the plate for ever.
+    ///
+    /// EVEN-ODD NESTING, which is the rule every CAD package uses and the only one that gets an
+    /// island right: a loop's DEPTH is how many loops contain it, loops at even depth are
+    /// outlines, and a loop at odd depth is a hole in its immediate parent. So a washer drawn as
+    /// a disc, a bore and a pin in the bore comes out as a washer with a hole and a separate pin —
+    /// rather than as a washer with two holes, one of which is solid.
+    ///
+    /// Containment is tested with the loop's first point, which is ON its own boundary and inside
+    /// or outside every OTHER loop unambiguously — the loops here come from distinct drawn
+    /// entities, so two of them sharing an edge is a drawing to fix rather than a case to model.
+    fn nest_loops(loops: Vec<Vec<glam::Vec2>>) -> Vec<(Vec<glam::Vec2>, Vec<Vec<glam::Vec2>>)> {
+        let n = loops.len();
+        if n < 2 {
+            return loops.into_iter().map(|l| (l, Vec::new())).collect();
+        }
+        let area = |l: &[glam::Vec2]| -> f32 {
+            let m = l.len();
+            (0..m)
+                .map(|i| {
+                    let (p, q) = (l[i], l[(i + 1) % m]);
+                    p.x * q.y - q.x * p.y
+                })
+                .sum::<f32>()
+                .abs()
+                * 0.5
+        };
+        let areas: Vec<f32> = loops.iter().map(|l| area(l)).collect();
+        let inside = |a: usize, b: usize| -> bool {
+            // `a` inside `b`. Area first, because a loop cannot contain one at least as big as
+            // itself and the check is a comparison rather than a ray cast.
+            areas[a] < areas[b]
+                && crate::factory::point_in_poly(&loops[b], loops[a][0].x, loops[a][0].y)
+        };
+        // The SMALLEST loop that contains each one — its immediate parent.
+        let parent: Vec<Option<usize>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .filter(|&j| j != i && inside(i, j))
+                    .min_by(|&x, &y| areas[x].total_cmp(&areas[y]))
+            })
+            .collect();
+        let depth = |mut i: usize| -> usize {
+            let mut d = 0;
+            // Bounded by `n`: a cycle in `parent` is impossible (each step strictly decreases
+            // area), but a bound costs nothing and a hang costs the app.
+            while let Some(p) = parent[i] {
+                d += 1;
+                i = p;
+                if d > n {
+                    break;
+                }
+            }
+            d
+        };
+        let depths: Vec<usize> = (0..n).map(depth).collect();
+        let mut out: Vec<(Vec<glam::Vec2>, Vec<Vec<glam::Vec2>>)> = Vec::new();
+        let mut slot: Vec<Option<usize>> = vec![None; n];
+        for i in 0..n {
+            if depths[i] % 2 == 0 {
+                slot[i] = Some(out.len());
+                out.push((loops[i].clone(), Vec::new()));
+            }
+        }
+        for i in 0..n {
+            if depths[i] % 2 == 1 {
+                if let Some(k) = parent[i].and_then(|p| slot[p]) {
+                    out[k].1.push(loops[i].clone());
+                }
+            }
+        }
+        out
+    }
+
     fn closed_loops_of(doc: &cad_kernel::Document) -> Vec<Vec<glam::Vec2>> {
         let mut out = Vec::new();
         let k = doc.units.metres_per_unit;
@@ -8862,8 +8940,12 @@ impl CadApp {
         let colour = if furniture { [0.60, 0.62, 0.70] } else { [0.72, 0.66, 0.52] };
         let mut made = 0;
         let mut last = None;
-        for pts in loops {
-            if let Ok((profile, centre, w, d)) = self.factory.model.add_profile(&pts) {
+        // A LOOP INSIDE ANOTHER LOOP IS A HOLE IN IT, not a second solid standing in the middle of
+        // the first. A plate drawn with four bolt circles on it used to extrude as five posts.
+        for (outer, holes) in Self::nest_loops(loops) {
+            if let Ok((profile, centre, w, d)) =
+                self.factory.model.add_profile_with_holes(&outer, &holes)
+            {
                 let placement = cad_solid::Placement { u: centre.x, v: centre.y, lift: 0.0, spin_deg: 0.0, pitch_deg: 0.0, roll_deg: 0.0 };
                 let id = self.factory.model.push(
                     cad_solid::BoolOp::Union, plane, placement,
@@ -57139,6 +57221,111 @@ mod the_quit_dialog_cannot_trap_the_app {
 /// installed binary put NOTHING back when a cutout edit was escaped: the openings stayed deleted,
 /// which is precisely the data loss the stash exists to prevent. Every test runs in a debug build,
 /// so no amount of testing the behaviour could have found it — only reading the code, or the user.
+
+/// A LOOP INSIDE ANOTHER LOOP IS A HOLE IN IT.
+///
+/// Every closed loop on a face sketch used to extrude as its own solid, so a plate drawn with four
+/// bolt circles came out as five posts and the drafter had to cut the holes back out by hand —
+/// four more features, each of which then had to be kept beside the plate for ever.
+#[cfg(test)]
+mod a_loop_inside_a_loop_is_a_hole {
+    use super::*;
+
+    fn square(cx: f32, cy: f32, half: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(cx - half, cy - half),
+            glam::Vec2::new(cx + half, cy - half),
+            glam::Vec2::new(cx + half, cy + half),
+            glam::Vec2::new(cx - half, cy + half),
+        ]
+    }
+
+    /// Two loops side by side are two objects, and must stay two — the case that would break if
+    /// nesting were decided by size alone.
+    #[test]
+    fn two_separate_shapes_stay_two_shapes() {
+        let out = CadApp::nest_loops(vec![square(0.0, 0.0, 4.0), square(20.0, 0.0, 1.0)]);
+        assert_eq!(out.len(), 2, "two disjoint loops became {} object(s)", out.len());
+        assert!(out.iter().all(|(_, h)| h.is_empty()), "a disjoint loop was taken as a hole");
+    }
+
+    /// The headline. One plate, four bolt holes, ONE object.
+    #[test]
+    fn a_plate_with_four_bolt_circles_is_one_object_with_four_holes() {
+        let mut loops = vec![square(0.0, 0.0, 8.0)];
+        for &(x, y) in &[(-4.0_f32, -4.0_f32), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)] {
+            loops.push(square(x, y, 1.0));
+        }
+        let out = CadApp::nest_loops(loops);
+        assert_eq!(out.len(), 1, "the plate and its bolt holes became {} objects", out.len());
+        assert_eq!(out[0].1.len(), 4, "the plate came out with {} holes", out[0].1.len());
+    }
+
+    /// ORDER MUST NOT MATTER. The loops arrive in whatever order the drafter drew them, and a
+    /// version that assumed the outline came first would work for everybody who drew the plate
+    /// before the holes and silently invert for everybody who did not.
+    #[test]
+    fn the_holes_are_found_whichever_order_they_were_drawn_in() {
+        let inner = square(0.0, 0.0, 1.0);
+        let outer = square(0.0, 0.0, 8.0);
+        for (a, b) in [(outer.clone(), inner.clone()), (inner.clone(), outer.clone())] {
+            let out = CadApp::nest_loops(vec![a, b]);
+            assert_eq!(out.len(), 1, "drawn in this order it made {} objects", out.len());
+            assert_eq!(out[0].1.len(), 1, "the hole was lost");
+            // And the OUTLINE is the big one, not the small one.
+            let span = out[0].0.iter().fold(0.0_f32, |m, p| m.max(p.x));
+            assert!((span - 8.0).abs() < 1e-4, "the hole was taken as the outline");
+        }
+    }
+
+    /// AN ISLAND IN A HOLE IS SOLID AGAIN. Even-odd nesting is the only rule that gets this
+    /// right: a washer with a pin standing in its bore is a washer with a hole AND a pin, not a
+    /// washer with two holes one of which is filled in.
+    #[test]
+    fn an_island_inside_a_hole_becomes_its_own_object() {
+        let out = CadApp::nest_loops(vec![
+            square(0.0, 0.0, 8.0),  // the plate
+            square(0.0, 0.0, 4.0),  // a hole in it
+            square(0.0, 0.0, 1.0),  // a pin standing in the hole
+        ]);
+        assert_eq!(out.len(), 2, "expected the plate and the pin, got {} objects", out.len());
+        let plate = out.iter().find(|(o, _)| o.iter().any(|p| p.x > 7.0)).expect("the plate");
+        assert_eq!(plate.1.len(), 1, "the plate must have exactly one hole");
+        let pin = out.iter().find(|(o, _)| o.iter().all(|p| p.x.abs() < 2.0)).expect("the pin");
+        assert!(pin.1.is_empty(), "the pin picked up a hole of its own");
+    }
+
+    /// A HOLE BELONGS TO THE LOOP THAT ACTUALLY CONTAINS IT, not to the biggest one on the sheet.
+    /// Two plates side by side, one hole in each: sorting by area and attaching every hole to the
+    /// largest outline would put both holes in one plate and leave the other solid.
+    #[test]
+    fn each_plate_keeps_its_own_hole() {
+        let out = CadApp::nest_loops(vec![
+            square(0.0, 0.0, 8.0),
+            square(0.0, 0.0, 1.0),
+            square(30.0, 0.0, 6.0),
+            square(30.0, 0.0, 1.0),
+        ]);
+        assert_eq!(out.len(), 2, "expected two plates, got {}", out.len());
+        for (outline, holes) in &out {
+            assert_eq!(holes.len(), 1, "a plate ended up with {} holes", holes.len());
+            let cx = outline.iter().map(|p| p.x).sum::<f32>() / outline.len() as f32;
+            let hx = holes[0].iter().map(|p| p.x).sum::<f32>() / holes[0].len() as f32;
+            assert!(
+                (cx - hx).abs() < 1.0,
+                "a hole at x = {hx} was attached to the plate at x = {cx}",
+            );
+        }
+    }
+
+    /// One loop on its own is one object with no holes — the ordinary case, and the early return.
+    #[test]
+    fn a_single_loop_is_one_object() {
+        let out = CadApp::nest_loops(vec![square(0.0, 0.0, 4.0)]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].1.is_empty());
+    }
+}
 #[cfg(test)]
 mod a_debug_assert_never_does_the_work {
     /// The rule is narrow on purpose. A `debug_assert!` over a pure predicate is fine and there
