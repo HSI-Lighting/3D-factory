@@ -8758,6 +8758,40 @@ impl FactoryState {
         (near, (far - near).normalize_or_zero())
     }
 
+    /// The world-space XY rectangle the camera can currently see ON the plane `z`, or `None` when
+    /// that cannot be bounded.
+    ///
+    /// Cast a ray through each of the four viewport corners and intersect it with the plane. When
+    /// every corner lands, their bbox contains everything visible on that plane and nothing
+    /// outside it needs drawing.
+    ///
+    /// `None` IS THE HONEST ANSWER WHEN A CORNER MISSES — a camera tilted toward the horizon has
+    /// corners whose rays run parallel to the plane or away from it, and the visible region is
+    /// then unbounded. Returning a bbox of the corners that did land would cull geometry that is
+    /// genuinely on screen, which is a rendering bug that looks like missing data. The caller
+    /// draws everything instead, which is merely slow.
+    pub fn ground_view_bounds(rect: egui::Rect, mvp: &[f32; 16], z: f32) -> Option<(Vec2, Vec2)> {
+        let corners = [
+            rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom(),
+        ];
+        let (mut mn, mut mx) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for c in corners {
+            let (o, d) = Self::ray(c, rect, mvp);
+            // Parallel to the plane, or pointing away from it — unbounded either way.
+            if d.z.abs() < 1e-6 {
+                return None;
+            }
+            let t = (z - o.z) / d.z;
+            if t < 0.0 || !t.is_finite() {
+                return None;
+            }
+            let p = o + d * t;
+            mn = mn.min(Vec2::new(p.x, p.y));
+            mx = mx.max(Vec2::new(p.x, p.y));
+        }
+        (mn.x.is_finite() && mx.x.is_finite()).then_some((mn, mx))
+    }
+
     /// Ray-pick the front-most FEATURE (solid) under `cursor`, by world AABB.
     /// This is what the LEFT button does in the 3D view — selection, never camera.
     pub fn pick_feature(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<u32> {

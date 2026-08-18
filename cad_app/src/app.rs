@@ -1912,6 +1912,21 @@ pub struct CadApp {
     cached_plan_lines: Vec<crate::light3d::V3>,
     /// `lines_sig()` when the two buffers above were built. `u64::MAX` = never built.
     cached_lines_sig: u64,
+    /// The cached plan lines, bucketed into world-space cells for view culling.
+    ///
+    /// `(min, max, start, end)` — the cell's XY bounds and the half-open range of
+    /// `cached_plan_lines` holding its segments. The buffer is SORTED by cell when it is built, so
+    /// each cell is one contiguous run and a visible cell is one `extend_from_slice`.
+    ///
+    /// WHY THIS EXISTS. With the line cache in place the per-frame cost is the memcpy of the whole
+    /// plan into the single list the renderer takes. Measured: 5.3 MB and 1.7 ms at 10k dobjects,
+    /// 26.7 MB and 6.2 ms at 50k, and 106.8 MB and 24.8 ms at 200k — past the entire 16.7 ms frame
+    /// budget, for a drawing that is not changing and mostly not on screen.
+    ///
+    /// Cells are part of the CACHED, geometry-keyed data. Which cells are copied is decided per
+    /// frame from the camera, so the cache stays camera-independent and the version check keeps
+    /// meaning what it meant.
+    cached_plan_cells: Vec<(glam::Vec2, glam::Vec2, usize, usize)>,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
     /// caching it means it runs once per doc change instead of every frame,
@@ -3833,6 +3848,7 @@ impl Default for CadApp {
             cached_sketch_lines: Vec::new(),
             cached_plan_lines: Vec::new(),
             cached_lines_sig: u64::MAX,
+            cached_plan_cells: Vec::new(),
             layer_panel_open:   true,
             layer_rename:       None,
             layer_rename_buf:   String::new(),
@@ -13399,7 +13415,16 @@ impl CadApp {
                 // Cached above, with the show_plan / x-ray / empty tests applied there — an empty
                 // buffer IS the "do not draw the plan" answer, rather than a second copy of the
                 // condition that could drift out of step with the one the cache used.
-                lines.extend_from_slice(&self.cached_plan_lines);
+                //
+                // AND CULLED TO WHAT THE CAMERA CAN SEE. Copying the whole plan every frame is
+                // 26.7 MB and 6.2 ms at 50k dobjects, 106.8 MB and 24.8 ms at 200k — past the
+                // entire frame budget for a drawing that is mostly off screen. `None` bounds mean
+                // the view reaches the horizon, and then everything is copied, which is correct
+                // and merely slow.
+                let plan_z = self.factory.active_base_z();
+                let view = crate::factory::FactoryState::ground_view_bounds(rect, &mvp, plan_z);
+                let culled = self.emit_plan_lines(&mut lines, view);
+                let _ = culled;
 
                 // ---- §0.6 PREVIEW — shade / ghost / marching-ants / blip -----
                 // The complete move, per BASIC_MODIFIERS_RULES §0.6 and §1:
@@ -34202,6 +34227,106 @@ impl CadApp {
         h.finish()
     }
 
+    /// Sort `lines` (GL_LINES vertex pairs) into world-space cells and return the cell index.
+    ///
+    /// Segments are grouped by the cell their MIDPOINT falls in, and each cell's recorded bounds
+    /// are the union of its segments' real extents — not the cell's nominal square. A long segment
+    /// whose midpoint sits in one cell still reaches into its neighbours, and culling on the
+    /// nominal square would drop it the moment its midpoint went off screen while most of it was
+    /// still visible.
+    fn bucket_lines(
+        lines: &mut Vec<crate::light3d::V3>,
+    ) -> Vec<(glam::Vec2, glam::Vec2, usize, usize)> {
+        if lines.len() < 2 {
+            return Vec::new();
+        }
+        let (mut mn, mut mx) = (glam::Vec2::splat(f32::INFINITY), glam::Vec2::splat(f32::NEG_INFINITY));
+        for v in lines.iter() {
+            mn = mn.min(glam::Vec2::new(v.x, v.y));
+            mx = mx.max(glam::Vec2::new(v.x, v.y));
+        }
+        let span = (mx - mn).max(glam::Vec2::splat(1e-3));
+        // ~32 x 32, so a zoomed-in view copies a few cells out of a thousand, and the index itself
+        // stays small enough to scan per frame without thinking about it.
+        const N: usize = 32;
+        let cell = glam::Vec2::new(span.x / N as f32, span.y / N as f32);
+        let idx_of = |p: glam::Vec2| -> usize {
+            let cx = (((p.x - mn.x) / cell.x) as usize).min(N - 1);
+            let cy = (((p.y - mn.y) / cell.y) as usize).min(N - 1);
+            cy * N + cx
+        };
+
+        // Segment -> cell, then a counting sort into one contiguous buffer per cell.
+        let segs = lines.len() / 2;
+        let mut key: Vec<usize> = Vec::with_capacity(segs);
+        for s in 0..segs {
+            let (a, b) = (&lines[s * 2], &lines[s * 2 + 1]);
+            key.push(idx_of(glam::Vec2::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5)));
+        }
+        let mut order: Vec<usize> = (0..segs).collect();
+        order.sort_unstable_by_key(|s| key[*s]);
+
+        let mut sorted: Vec<crate::light3d::V3> = Vec::with_capacity(lines.len());
+        let mut cells: Vec<(glam::Vec2, glam::Vec2, usize, usize)> = Vec::new();
+        let mut run: Option<(usize, usize, glam::Vec2, glam::Vec2)> = None; // (key, start, mn, mx)
+        for s in order {
+            let k = key[s];
+            let (a, b) = (lines[s * 2], lines[s * 2 + 1]);
+            let (smn, smx) = (
+                glam::Vec2::new(a.x.min(b.x), a.y.min(b.y)),
+                glam::Vec2::new(a.x.max(b.x), a.y.max(b.y)),
+            );
+            match &mut run {
+                Some((rk, _, rmn, rmx)) if *rk == k => {
+                    *rmn = rmn.min(smn);
+                    *rmx = rmx.max(smx);
+                }
+                _ => {
+                    if let Some((_, start, rmn, rmx)) = run.take() {
+                        cells.push((rmn, rmx, start, sorted.len()));
+                    }
+                    run = Some((k, sorted.len(), smn, smx));
+                }
+            }
+            sorted.push(a);
+            sorted.push(b);
+        }
+        if let Some((_, start, rmn, rmx)) = run.take() {
+            cells.push((rmn, rmx, start, sorted.len()));
+        }
+        *lines = sorted;
+        cells
+    }
+
+    /// Append the cached plan lines that can be SEEN into `out`.
+    ///
+    /// `view` is the world XY rectangle the camera covers on the plan's plane, or `None` when that
+    /// cannot be bounded — a camera tilted toward the horizon sees an unbounded region, and there
+    /// the honest answer is to draw everything rather than to invent a limit and cull geometry off
+    /// the screen edge.
+    ///
+    /// Returns how many vertices were skipped, which is what the perf report shows.
+    fn emit_plan_lines(&self, out: &mut Vec<crate::light3d::V3>, view: Option<(glam::Vec2, glam::Vec2)>) -> usize {
+        let Some((vmn, vmx)) = view else {
+            out.extend_from_slice(&self.cached_plan_lines);
+            return 0;
+        };
+        // No index (an empty or tiny plan) — copying it whole costs less than deciding not to.
+        if self.cached_plan_cells.is_empty() {
+            out.extend_from_slice(&self.cached_plan_lines);
+            return 0;
+        }
+        let mut drawn = 0usize;
+        for (cmn, cmx, start, end) in &self.cached_plan_cells {
+            if cmx.x < vmn.x || cmn.x > vmx.x || cmx.y < vmn.y || cmn.y > vmx.y {
+                continue;
+            }
+            out.extend_from_slice(&self.cached_plan_lines[*start..*end]);
+            drawn += end - start;
+        }
+        self.cached_plan_lines.len() - drawn
+    }
+
     /// Rebuild the cached line buffers if anything they read has changed. Returns whether it
     /// actually rebuilt — which is what the tests assert on.
     ///
@@ -34223,6 +34348,9 @@ impl CadApp {
             } else {
                 Vec::new()
             };
+        // Bucket for view culling — part of the CACHED, geometry-keyed data, so the per-frame work
+        // is only choosing which cells to copy and the signature keeps meaning what it meant.
+        self.cached_plan_cells = Self::bucket_lines(&mut self.cached_plan_lines);
         self.cached_lines_sig = sig;
         true
     }
@@ -53788,6 +53916,70 @@ mod counts_only_tests {
 mod perf_investigation {
     use super::*;
 
+/// HOW THE CACHED FRAME SCALES. The line cache removed the per-frame re-flattening; what is left
+/// is the memcpy of the cached buffer into the single list the renderer takes. This measures
+/// whether that residue is a rounding error or the next wall.
+#[test]
+#[ignore = "investigation: --ignored --nocapture"]
+fn how_the_cached_frame_scales() {
+    println!(
+        "\n{:>10}  {:>12}  {:>10}  {:>9}   |  {:>9}  {:>9}",
+        "dobjects", "cached verts", "MB/frame", "ms/frame", "MB culled", "ms culled",
+    );
+    for n in [1_000usize, 10_000, 50_000, 200_000] {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        // Polylines of 8 points, spread over a plan-sized area — the shape a traced drawing has.
+        for i in 0..n {
+            let (cx, cy) = ((i % 400) as f64 * 2.0, (i / 400) as f64 * 2.0);
+            let vertices: Vec<cad_kernel::PolyVertex> = (0..8)
+                .map(|k| cad_kernel::PolyVertex {
+                    pos: Vec2::new(cx + (k % 3) as f64 * 0.4, cy + (k / 3) as f64 * 0.4),
+                    bulge: 0.0,
+                })
+                .collect();
+            app.doc.push(DObject::new(Geom::Polyline(cad_kernel::Polyline {
+                vertices, closed: false, widths: Vec::new(),
+            })));
+        }
+        app.factory.show_plan = true;
+        app.refresh_cached_lines();
+        let verts = app.cached_plan_lines.len();
+
+        const N: u32 = 10;
+        let t = std::time::Instant::now();
+        let mut total = 0usize;
+        for _ in 0..N {
+            app.refresh_cached_lines();
+            let mut lines = app.factory.overlay_lines();
+            lines.extend_from_slice(&app.cached_sketch_lines);
+            lines.extend_from_slice(&app.cached_plan_lines);
+            total = lines.len();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / N as f64;
+
+        // …AND THE SAME FRAME CULLED to a 60 m window, which is what a designer working on one
+        // room actually has on screen.
+        let view = Some((glam::Vec2::new(0.0, 0.0), glam::Vec2::new(60.0, 60.0)));
+        let t = std::time::Instant::now();
+        let mut culled_total = 0usize;
+        for _ in 0..N {
+            let mut lines = app.factory.overlay_lines();
+            lines.extend_from_slice(&app.cached_sketch_lines);
+            app.emit_plan_lines(&mut lines, view);
+            culled_total = lines.len();
+        }
+        let cull_ms = t.elapsed().as_secs_f64() * 1000.0 / N as f64;
+
+        println!(
+            "{n:>10}  {verts:>12}  {:>10.1}  {ms:>9.2}   |  {:>9.1}  {cull_ms:>9.2}",
+            total as f64 * 40.0 / (1024.0 * 1024.0),
+            culled_total as f64 * 40.0 / (1024.0 * 1024.0),
+        );
+    }
+    println!("  (16.7 ms is one frame at 60 Hz)\n");
+}
+
     fn doc_with(n: usize) -> Document {
         let mut d = Document::default();
         d.dobjects.clear();
@@ -57879,12 +58071,21 @@ mod the_line_cache_cannot_go_stale {
 
         assert_eq!(app.cached_plan_lines.len(), fresh_plan.len(), "plan line count differs");
         assert_eq!(app.cached_sketch_lines.len(), fresh_sketch.len(), "sketch line count differs");
-        for (i, (c, f)) in app.cached_plan_lines.iter().zip(fresh_plan.iter()).enumerate() {
-            assert!(
-                (c.x - f.x).abs() < 1e-6 && (c.y - f.y).abs() < 1e-6 && (c.z - f.z).abs() < 1e-6,
-                "cached plan vertex {i} is not where the builder puts it",
-            );
-        }
+
+        // COMPARED AS A SET, NOT IN ORDER, and the change is deliberate. The cached plan is sorted
+        // into world-space cells for view culling, so a cell is one contiguous run — which
+        // reorders the buffer. Order carries no meaning within the plan: every line is the same
+        // colour at the same height. (It DOES carry meaning between builders — the picked-face
+        // outline has to be emitted after the sketches — and that ordering is still exact.)
+        //
+        // This assertion used to be positional and kept passing after the bucketing landed,
+        // because a fixture small enough to fall in one cell sorts stably. It was asserting a
+        // property the code no longer promises, and would have failed later for a reason that had
+        // nothing to do with whatever change tripped it.
+        let key = |v: &crate::light3d::V3| (v.x.to_bits(), v.y.to_bits(), v.z.to_bits());
+        let cached: std::collections::BTreeSet<_> = app.cached_plan_lines.iter().map(key).collect();
+        let built: std::collections::BTreeSet<_> = fresh_plan.iter().map(key).collect();
+        assert_eq!(cached, built, "the cached plan is not the geometry the builder produces");
     }
 
     // ---- one per input to `lines_sig` -------------------------------------------------------
@@ -58124,5 +58325,143 @@ mod the_undo_history_is_bounded_by_memory {
             _ => false,
         };
         assert!(!oldest_still_marked, "the oldest step survived while newer ones were dropped");
+    }
+}
+
+/// CULLING MUST NEVER DROP SOMETHING THAT IS ON SCREEN.
+///
+/// The failure mode is the worst kind this file has: geometry vanishes, nothing errors, and it
+/// reads as data loss rather than as a rendering bug. So the governing test compares the culled
+/// output against the whole buffer for a view that covers everything — they must be equal — and
+/// the rest check that a smaller view drops only what is genuinely outside it.
+#[cfg(test)]
+mod the_cull_never_drops_what_you_can_see {
+    use super::*;
+
+    /// A plan of short segments spread over a 400 x 400 m area.
+    fn app_with_spread_plan() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..2_000 {
+            let (x, y) = ((i % 50) as f64 * 8.0, (i / 50) as f64 * 8.0);
+            app.doc.push(DObject::new(Geom::Line(Line {
+                a: Vec2::new(x, y), b: Vec2::new(x + 3.0, y + 3.0),
+            })));
+        }
+        app.factory.show_plan = true;
+        app.refresh_cached_lines();
+        app
+    }
+
+    fn seg_set(v: &[crate::light3d::V3]) -> std::collections::BTreeSet<(u32, u32, u32, u32)> {
+        v.chunks_exact(2)
+            .map(|c| (c[0].x.to_bits(), c[0].y.to_bits(), c[1].x.to_bits(), c[1].y.to_bits()))
+            .collect()
+    }
+
+    /// THE BUCKETING KEEPS EVERY SEGMENT. It reorders the buffer — that is how a cell becomes one
+    /// contiguous run — so the comparison is on the SET of segments, not on their order. Order is
+    /// immaterial here: every plan line is the same colour at the same height.
+    #[test]
+    fn bucketing_preserves_every_segment() {
+        let app = app_with_spread_plan();
+        let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc);
+        let fresh = app.factory.plan_lines(plan, app.factory.active_base_z());
+
+        assert_eq!(app.cached_plan_lines.len(), fresh.len(), "bucketing changed the vertex count");
+        assert_eq!(
+            seg_set(&app.cached_plan_lines), seg_set(&fresh),
+            "bucketing lost or invented a segment",
+        );
+        assert!(!app.cached_plan_cells.is_empty(), "the fixture must actually bucket");
+    }
+
+    /// A VIEW THAT COVERS EVERYTHING CULLS NOTHING — the property that makes the whole scheme
+    /// safe, checked against the full buffer rather than against a count.
+    #[test]
+    fn a_view_covering_the_whole_plan_draws_the_whole_plan() {
+        let app = app_with_spread_plan();
+        let mut out = Vec::new();
+        let skipped = app.emit_plan_lines(
+            &mut out,
+            Some((glam::Vec2::new(-1e4, -1e4), glam::Vec2::new(1e4, 1e4))),
+        );
+        assert_eq!(skipped, 0, "a view containing everything skipped something");
+        assert_eq!(seg_set(&out), seg_set(&app.cached_plan_lines), "segments went missing");
+    }
+
+    /// UNBOUNDED VIEW ⇒ NO CULL. A camera tilted at the horizon sees a region that cannot be
+    /// bounded, and inventing a limit there would cull geometry off the screen edge.
+    #[test]
+    fn an_unbounded_view_draws_everything() {
+        let app = app_with_spread_plan();
+        let mut out = Vec::new();
+        let skipped = app.emit_plan_lines(&mut out, None);
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), app.cached_plan_lines.len(), "an unbounded view culled");
+    }
+
+    /// A SMALL VIEW CULLS — and everything it keeps genuinely touches that view. Both halves
+    /// matter: the first is the point, the second is what stops the first being achieved by
+    /// dropping the wrong things.
+    #[test]
+    fn a_small_view_keeps_only_what_reaches_it() {
+        let app = app_with_spread_plan();
+        let (vmn, vmx) = (glam::Vec2::new(0.0, 0.0), glam::Vec2::new(40.0, 40.0));
+        let mut out = Vec::new();
+        let skipped = app.emit_plan_lines(&mut out, Some((vmn, vmx)));
+
+        assert!(skipped > 0, "a 40 m window over a 400 m plan culled nothing");
+        assert!(!out.is_empty(), "…and it culled everything, which is the opposite failure");
+        // Every segment kept must be in a CELL that overlaps the view. Individual segments in a
+        // kept cell may sit outside it — that is the cost of bucketing, and it is why this asserts
+        // on cell overlap rather than on each segment.
+        for c in out.chunks_exact(2) {
+            let (sx, sy) = (c[0].x.min(c[1].x), c[0].y.min(c[1].y));
+            let (bx, by) = (c[0].x.max(c[1].x), c[0].y.max(c[1].y));
+            let in_a_kept_cell = app.cached_plan_cells.iter().any(|(cmn, cmx, _, _)| {
+                cmx.x >= vmn.x && cmn.x <= vmx.x && cmx.y >= vmn.y && cmn.y <= vmx.y
+                    && bx >= cmn.x && sx <= cmx.x && by >= cmn.y && sy <= cmx.y
+            });
+            assert!(in_a_kept_cell, "a segment was drawn from a cell that does not meet the view");
+        }
+    }
+
+    /// EVERY SEGMENT INSIDE THE VIEW IS DRAWN. The direct statement of the promise, checked
+    /// segment by segment rather than through the cell index that implements it.
+    #[test]
+    fn every_segment_inside_the_view_is_drawn() {
+        let app = app_with_spread_plan();
+        let (vmn, vmx) = (glam::Vec2::new(50.0, 50.0), glam::Vec2::new(150.0, 150.0));
+        let mut out = Vec::new();
+        app.emit_plan_lines(&mut out, Some((vmn, vmx)));
+        let drawn = seg_set(&out);
+
+        for c in app.cached_plan_lines.chunks_exact(2) {
+            let (sx, sy) = (c[0].x.min(c[1].x), c[0].y.min(c[1].y));
+            let (bx, by) = (c[0].x.max(c[1].x), c[0].y.max(c[1].y));
+            let touches = bx >= vmn.x && sx <= vmx.x && by >= vmn.y && sy <= vmx.y;
+            if touches {
+                let k = (c[0].x.to_bits(), c[0].y.to_bits(), c[1].x.to_bits(), c[1].y.to_bits());
+                assert!(drawn.contains(&k), "a segment inside the view was culled");
+            }
+        }
+    }
+
+    /// The camera maths: a plan view straight down bounds the ground; a view along the horizon
+    /// does not, and says so rather than guessing.
+    #[test]
+    fn ground_bounds_are_found_looking_down_and_refused_at_the_horizon() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let down = crate::light3d::mvp(0.0, -89.9_f32.to_radians(), 30.0, [0.0, 0.0, 0.0], 800.0 / 600.0, false);
+        let b = crate::factory::FactoryState::ground_view_bounds(rect, &down, 0.0);
+        let (mn, mx) = b.expect("looking straight down must bound the ground");
+        assert!(mx.x > mn.x && mx.y > mn.y, "degenerate bounds {mn:?}..{mx:?}");
+
+        let level = crate::light3d::mvp(0.0, 0.0, 30.0, [0.0, 0.0, 0.0], 800.0 / 600.0, false);
+        assert!(
+            crate::factory::FactoryState::ground_view_bounds(rect, &level, 0.0).is_none(),
+            "a level camera sees to the horizon — the region is unbounded and must not be guessed",
+        );
     }
 }
