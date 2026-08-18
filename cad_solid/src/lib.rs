@@ -1323,21 +1323,23 @@ impl Model {
         at
     }
 
-    /// Put `f` DIRECTLY BEHIND the feature `host_id` — the placement a cutter needs, stated once.
+    /// BIND `f` TO THE BODY `host_id`, and put it directly behind that body in the list.
     ///
-    /// A `Difference` cuts the most recent `Union` before it, so "which body does this open?" is
-    /// answered entirely by where the cutter sits. Appending instead of inserting reaches only the
-    /// LAST body in the model, which is how an opening ends up in someone else's wall.
+    /// The binding is what matters and the position is now belt-and-braces: `f.target` is stamped
+    /// with `host_id`, so the cutter opens that body from wherever it ends up, and it is inserted
+    /// behind the host as well so a reader of the feature list still sees a wall followed by its
+    /// own openings.
     ///
-    /// Appends when `host_id` is unknown, and reports which happened: `false` means the host was
-    /// not found and the feature is now at the end, bound to whatever precedes it. A caller that
-    /// cannot accept that — anything placing an opening — must check.
+    /// WHEN THE HOST IS NOT THERE, the feature is appended and `false` is returned — but it keeps
+    /// the target it was given, so it cuts NOTHING rather than opening whichever body happens to
+    /// be last. That is the whole change: the fallback used to be a silent hole in a stranger's
+    /// wall, and a missing opening is at least visible to the person who asked for it.
     ///
-    /// `#[must_use]`, because "reportable" and "reported" are not the same thing and the entire
-    /// failure mode here is silence. Discarding the result compiles perfectly and reinstates
-    /// exactly the mis-binding this method exists to name.
-    #[must_use = "false means the cutter was APPENDED and is now opening some other body"]
-    pub fn insert_after(&mut self, host_id: u32, f: Feature) -> bool {
+    /// `#[must_use]` all the same, because "the cut did not happen" is still news. Discarding the
+    /// result compiles perfectly and says nothing to anybody.
+    #[must_use = "false means the host body was not found, so this cutter opens nothing"]
+    pub fn insert_after(&mut self, host_id: u32, mut f: Feature) -> bool {
+        f.target = Some(host_id);
         match self.features.iter().position(|g| g.id == host_id) {
             Some(i) => {
                 self.features.insert(i + 1, f);
@@ -1830,11 +1832,11 @@ mod tests {
         assert_eq!(f.target, None, "an older feature must keep the positional binding");
     }
 
-    /// `insert_after` is where "a cutter sits directly behind the body it opens" is stated, so it
-    /// has to be true — including the part callers keep getting wrong, that a MISSING host means
-    /// the feature lands at the end bound to a stranger, and the caller must be told.
+    /// `insert_after` is where "this cutter opens THAT body" is stated, so it has to be true both
+    /// ways: the binding is recorded on the feature, AND the feature sits behind its host so the
+    /// list still reads as a wall followed by its own openings.
     #[test]
-    fn insert_after_places_a_cutter_behind_its_host_and_reports_a_missing_one() {
+    fn insert_after_binds_a_cutter_to_its_host_and_places_it_behind_it() {
         let mut m = Model::default();
         let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
         let b = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
@@ -1847,11 +1849,35 @@ mod tests {
         let at = |id: u32, m: &Model| m.features.iter().position(|f| f.id == id).expect("present");
         assert_eq!(at(900, &m), at(a, &m) + 1, "the cutter must sit directly behind body a");
         assert!(at(900, &m) < at(b, &m), "…and therefore before body b");
+        assert_eq!(m.get(900).and_then(|f| f.target), Some(a), "the binding was not recorded");
+    }
+
+    /// A MISSING HOST IS REPORTED, AND THE CUTTER OPENS NOTHING.
+    ///
+    /// It used to land at the end bound to whatever body was last — a silent hole in a stranger's
+    /// wall. It now keeps the target it was given, which no longer names anything, so the cut
+    /// simply does not happen. A missing opening is at least visible to the person who asked for
+    /// one; a hole in someone else's wall is not.
+    #[test]
+    fn a_cutter_whose_host_is_gone_is_reported_and_opens_nothing() {
+        let mut m = Model::default();
+        let a = m.push(BoolOp::Union, Plane::default(), Placement::default(), Primitive::Box { w: 1.0, d: 1.0, h: 1.0 });
 
         let mut stray = box_at(0.0, 0.0);
         stray.id = 901;
+        stray.op = BoolOp::Difference;
         assert!(!m.insert_after(4_242, stray), "an unknown host must be reported, not hidden");
-        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it appends when the host is gone");
+        assert_eq!(m.features.last().map(|f| f.id), Some(901), "it is kept, at the end");
+        assert_eq!(
+            m.get(901).and_then(|f| f.target), Some(4_242),
+            "it must keep naming the body it was meant for, so it cuts nothing rather than \
+             opening whichever body is last",
+        );
+
+        // And the geometry agrees: body `a` is a 1 m cube at the origin, and the stray cutter is
+        // a 1 m cube at the origin too — if it were ever applied, `a` would vanish.
+        let _ = a;
+        assert!(m.eval().bounds().is_some(), "the appended cutter dissolved the body it landed on");
     }
 
     #[test]
