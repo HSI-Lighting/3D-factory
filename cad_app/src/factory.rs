@@ -6594,6 +6594,34 @@ impl FactoryState {
     /// Boxes are dropped and fresh ones pushed (the segment count changes when a vertex is
     /// added or removed). Both rings follow the one footprint, so they stay coincident.
     /// Segment feature ids change — callers that track a selection must refresh it.
+    // KNOWN DEFECT — A WALL EDIT CAN MOVE ANOTHER WALL'S OPENINGS. Not yet fixed; the decision
+    // is made and the work is scoped. Read this before touching the function.
+    //
+    // MECHANISM. This removes the wall's segment features and rebuilds them, and the rebuild
+    // APPENDS (Model::push adds at the end). Openings are Difference features that must sit
+    // directly behind the body they cut — csg::eval folds each Difference onto the most recent
+    // Union, and factory_cut_sketch relies on that explicitly, re-inserting cutters at
+    // position(host) + 1. So moving a wall out from under its cutters re-binds them to whichever
+    // Union now precedes them: the NEIGHBOURING wall. Silent. Reached by an ordinary handle drag
+    // via wall_move_vertex, wall_insert_vertex and wall_delete_vertex.
+    //
+    // THE FIX IS NOT SYMMETRIC ACROSS THE THREE CALLERS.
+    //   wall_move_vertex   segment COUNT is unchanged, so the rebuilt features can simply be
+    //                      re-inserted at the indices the removed ones held. This case is
+    //                      self-contained and is the one to do first.
+    //   wall_insert_vertex / wall_delete_vertex   the count CHANGES, so there is no 1:1 mapping
+    //                      and an opening can be left with no host segment at all.
+    //
+    // DECIDED (owner, 2026-08-15): an orphaned opening is KEPT AND FLAGGED — never silently
+    // deleted, never silently re-bound. Needs a per-feature flag (Feature.enabled is the shape
+    // meshcut already uses) plus a visible marker on the body, because a missing window is
+    // invisible and an intact-looking wall is not.
+    //
+    // DO NOT take the cheap fix of "removing a Union also removes the Differences after it".
+    // That upgrades today's mis-binding into DELETING EVERY WINDOW IN THE WALL on a drag.
+    //
+    // Model has no insert-at API; app.rs reaches into model.features.insert(ti + 1, ..) directly
+    // at two sites. Adding one belongs with this work.
     fn rederive_wall(&mut self, wi: usize) {
         if wi >= self.walls.len() {
             return;
