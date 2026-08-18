@@ -166,6 +166,48 @@ impl Default for Document {
 }
 
 impl Document {
+    /// TAKE EVERY SHARED TABLE FROM `src` — everything a dobject refers to BY INDEX.
+    ///
+    /// A dobject is not self-contained. Its style names a layer id, a linetype id and maybe a
+    /// true-colour slot; a `Text` names a text style; a `Dimension` names a dimension style; a
+    /// `Wall` names a wall style; a `BlockRef` names a block. Every one is an index into a table
+    /// on the Document, so an object is only meaningful ALONGSIDE the tables it was drawn against.
+    /// Move it to a document with different tables and it keeps its numbers and changes its
+    /// meaning: index 3 was "Dashed" and is now "Center", index 2 was a 5 mm annotation style and
+    /// is now a 200 mm title style. No error — a drawing that is subtly and quietly wrong.
+    ///
+    /// This exists because a face sketch is a whole `Document` of its own, built from
+    /// `Document::default()`, so it starts with DEFAULT tables while the drawing it belongs to has
+    /// the user's. Layers were carried across when someone noticed their colours were wrong, and
+    /// blocks when someone noticed the Insert list was empty — one at a time, each after it broke.
+    /// The remaining six would have been found the same way.
+    ///
+    /// NOT `dobjects`, obviously. And NOT `units`: what one drawing unit means is a fact about a
+    /// FILE, and a sketch that adopted the plan's unit would rescale everything already drawn on
+    /// it. That is a real defect with a fix of its own; carrying it here as a side effect of a
+    /// table merge would be a silent rescale of existing work.
+    pub fn adopt_tables_from(&mut self, src: &Document) {
+        self.layers = src.layers.clone();
+        self.linetypes = src.linetypes.clone();
+        self.pens = src.pens.clone();
+        self.truecolors = src.truecolors.clone();
+        self.text_styles = src.text_styles.clone();
+        self.dim_styles = src.dim_styles.clone();
+        self.wall_styles = src.wall_styles.clone();
+        self.blocks = src.blocks.clone();
+    }
+
+    /// A document holding only this one's TABLES — no dobjects, no raster underlays.
+    ///
+    /// For carrying a table set across a swap, where cloning the whole document would copy every
+    /// object in it for nothing. Pair with [`Self::adopt_tables_from`].
+    pub fn clone_tables_only(&self) -> Document {
+        let mut d = Document::default();
+        d.adopt_tables_from(self);
+        d.units = self.units;
+        d
+    }
+
     /// Append a Dobject. Returns its new index in `dobjects`.
     /// Roughly how much memory this document occupies, in bytes.
     ///

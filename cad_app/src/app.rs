@@ -8393,18 +8393,14 @@ impl CadApp {
         // A layer is a property of the DRAWING, not of one plane of it. The table is carried in on
         // the way through, and carried back out again on exit so a layer created while sketching is
         // not lost. Ids stay valid because both sides share the one table.
-        sketch_doc.layers = self.doc.layers.clone();
-        // AND THE BLOCKS, for exactly the same reason.
-        //
-        // A `Sketch` is built from `Document::default()`, so its block table is EMPTY. That made
-        // inserting a block onto a plane impossible in the strict sense: the Insert list had
-        // nothing in it, and a `BlockRef` pushed there would name a definition that did not
-        // exist — an id resolving against a table of length zero.
-        //
-        // A block definition is a property of the DRAWING, not of one plane of it. Carried in
-        // here and carried back out on exit, so a block made while drawing on a face is not lost,
-        // and ids stay valid because both sides share the one table.
-        sketch_doc.blocks = self.doc.blocks.clone();
+        // AND SO IS EVERY OTHER TABLE — which is what `Document::adopt_tables_from` now says in
+        // one place. The block table followed the layers here after someone found the Insert list
+        // empty on a plane ("a BlockRef naming a definition that does not exist"); the linetypes,
+        // pens, true colours, text styles, dimension styles and wall styles were still default,
+        // and would have been found the same way, one complaint at a time. A dobject names all of
+        // them BY INDEX, so a Text drawn on a plane against the sketch's default table means
+        // something else the moment it is read against the drawing's.
+        sketch_doc.adopt_tables_from(&self.doc);
         let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
         let saved_undo = std::mem::take(&mut self.undo_stack);
         let saved_redo = std::mem::take(&mut self.redo_stack);
@@ -8470,18 +8466,14 @@ impl CadApp {
             self.factory_restore_stashed_cutters(edit);
         }
         if let Some(s) = self.factory.session.take() {
-            // …AND THE LAYER TABLE COMES BACK OUT. A layer created or recoloured while drawing on
-            // a face belongs to the drawing, not to that face — see the note on the way in. Taken
-            // BEFORE the swap, because after it `self.doc` is the plan again.
-            let layers = self.doc.layers.clone();
-            // …AND THE BLOCK TABLE COMES BACK OUT TOO. A block defined while drawing on a face
-            // belongs to the drawing, the same as a layer created there — see the note on the
-            // way in. Also taken BEFORE the swap, and kept on the sketch as well, so the
-            // `BlockRef`s left on the plane still resolve when it is drawn in 3D.
-            let blocks = self.doc.blocks.clone();
+            // …AND THE TABLES COME BACK OUT. A layer recoloured, a block defined, a text style
+            // added while drawing on a face belongs to the DRAWING, not to that face — see the
+            // note on the way in. Cloned BEFORE the swap, because after it `self.doc` is the plan
+            // again; and left on the sketch as well, so the ids on the plane still resolve when it
+            // is drawn in the plan and in 3D.
+            let edited = self.doc.clone_tables_only();
             let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
-            self.doc.layers = layers;
-            self.doc.blocks = blocks;
+            self.doc.adopt_tables_from(&edited);
             if let Some(sk) = self.factory.model.sketch_by_id_mut(s.plane) {
                 sk.doc = sketch_doc;
             }
@@ -57221,6 +57213,150 @@ mod the_quit_dialog_cannot_trap_the_app {
 /// installed binary put NOTHING back when a cutout edit was escaped: the openings stayed deleted,
 /// which is precisely the data loss the stash exists to prevent. Every test runs in a debug build,
 /// so no amount of testing the behaviour could have found it — only reading the code, or the user.
+
+/// A PLANE'S DRAWING IS PART OF THE DRAWING, AND SHARES ITS TABLES.
+///
+/// A face sketch is a whole `Document` of its own, built from `Document::default()` — so it
+/// starts with DEFAULT tables while the drawing it belongs to has the user's. Every dobject names
+/// its layer, linetype, colour slot, text style, dimension style, wall style and block BY INDEX,
+/// so an object drawn on a plane against default tables means something ELSE the moment it is
+/// read against the drawing's: index 3 was "Dashed" and is now "Center", index 2 was a 5 mm
+/// annotation style and is now a 200 mm title.
+///
+/// Layers were carried across when somebody noticed the colours were wrong. Blocks were carried
+/// across when somebody noticed the Insert list was empty. The other six were still default, and
+/// would have been found the same way, one complaint at a time.
+#[cfg(test)]
+mod a_plane_shares_the_drawings_tables {
+    use super::*;
+
+    /// A plan carrying one non-default entry in EVERY shared table, so a table that fails to
+    /// cross is visible as a missing name rather than as a subtly different number.
+    fn a_plan_with_its_own_tables() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.layers.add(cad_kernel::Layer { name: "SETTING OUT".into(), ..cad_kernel::Layer::layer_zero() });
+        app.doc.linetypes.add(cad_kernel::Linetype::new("Site boundary", &[9.0, 3.0]));
+        app.doc.text_styles.add(cad_kernel::TextStyle {
+            name: "Annotation".into(),
+            ..cad_kernel::TextStyle::standard()
+        });
+        app.doc.dim_styles.add(cad_kernel::DimStyle {
+            name: "Setting out".into(),
+            ..cad_kernel::DimStyle::standard()
+        });
+        app.doc.wall_styles.add(cad_kernel::WallStyle {
+            name: "Blockwork".into(),
+            ..cad_kernel::WallStyle::standard()
+        });
+        app.doc.blocks.add(cad_kernel::Block {
+            name: "DOOR".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: Vec::new(),
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        app
+    }
+
+    /// What every table in a document is called, as one set — so a test can say "the plane can
+    /// see all of this" without naming eight accessors.
+    fn table_names(d: &cad_kernel::Document) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        v.extend(d.layers.layers.iter().map(|x| format!("layer:{}", x.name)));
+        v.extend(d.linetypes.linetypes.iter().map(|x| format!("ltype:{}", x.name)));
+        v.extend(d.text_styles.styles.iter().map(|x| format!("text:{}", x.name)));
+        v.extend(d.dim_styles.styles.iter().map(|x| format!("dim:{}", x.name)));
+        v.extend(d.wall_styles.styles.iter().map(|x| format!("wall:{}", x.name)));
+        v.extend(d.blocks.blocks.iter().map(|x| format!("block:{}", x.name)));
+        v
+    }
+
+    /// THE WAY IN. Everything the drawing knows about, the plane knows about.
+    #[test]
+    fn a_plane_opens_with_the_drawings_tables() {
+        let mut app = a_plan_with_its_own_tables();
+        let want = table_names(&app.doc);
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let got = table_names(&app.doc); // `self.doc` IS the sketch while a session is open
+        assert_eq!(
+            want, got,
+            "the plane opened with different tables from the drawing it belongs to",
+        );
+    }
+
+    /// THE WAY OUT. A style added while drawing on a face belongs to the drawing — the same rule
+    /// layers and blocks already followed, and for the same reason: it is the drawing's.
+    #[test]
+    fn a_style_created_on_a_plane_comes_back_to_the_drawing() {
+        let mut app = a_plan_with_its_own_tables();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.doc.text_styles.add(cad_kernel::TextStyle {
+            name: "Drawn on a face".into(),
+            ..cad_kernel::TextStyle::standard()
+        });
+        app.doc.linetypes.add(cad_kernel::Linetype::new("Drawn on a face", &[1.0, 1.0]));
+        app.factory_exit_sketch();
+
+        assert!(
+            app.doc.text_styles.find("Drawn on a face").is_some(),
+            "a text style made while sketching was lost when the sketch closed",
+        );
+        assert!(
+            app.doc.linetypes.find("Drawn on a face").is_some(),
+            "a linetype made while sketching was lost when the sketch closed",
+        );
+    }
+
+    /// AND THE IDS STILL MEAN THE SAME THING. This is the point of sharing rather than merging:
+    /// an object drawn on the plane keeps its index, and that index answers to the same entry in
+    /// the drawing's table as it did in the sketch's.
+    #[test]
+    fn an_id_used_on_a_plane_resolves_to_the_same_entry_in_the_plan() {
+        let mut app = a_plan_with_its_own_tables();
+        let id = app.doc.linetypes.find("Site boundary").expect("the fixture linetype");
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let in_sketch = app.doc.linetypes.get(id).map(|l| l.name.clone());
+        app.factory_exit_sketch();
+        let in_plan = app.doc.linetypes.get(id).map(|l| l.name.clone());
+        assert_eq!(
+            in_sketch.as_deref(), Some("Site boundary"),
+            "linetype {id} means something else on a plane: {in_sketch:?}",
+        );
+        assert_eq!(in_sketch, in_plan, "the same id names two different linetypes");
+    }
+
+    /// THE PLANE KEEPS A COPY TOO. It is drawn in the plan and in 3D long after the session
+    /// closed, and a `BlockRef` or a styled Text left on it has to resolve then as well.
+    #[test]
+    fn the_plane_keeps_the_tables_after_the_session_closes() {
+        let mut app = a_plan_with_its_own_tables();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.factory_exit_sketch();
+        let sk = &app.factory.model.sketches[0];
+        assert!(
+            sk.doc.blocks.find("DOOR").is_some(),
+            "the plane's own document lost the block table, so a BlockRef on it resolves to \
+             nothing when the plane is drawn",
+        );
+    }
+
+    /// UNITS ARE NOT A TABLE AND DO NOT CROSS. What one drawing unit means is a fact about a
+    /// FILE. A sketch that adopted the plan's unit would rescale everything already drawn on it,
+    /// which is a silent rescale of the user's work arriving as a side effect of a style fix.
+    /// The unit mismatch between a plan and its planes is a real defect with a fix of its own.
+    #[test]
+    fn the_unit_is_not_carried_across_by_the_table_merge() {
+        let mut app = a_plan_with_its_own_tables();
+        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(
+            (app.doc.units.metres_per_unit - 1.0).abs() < 1e-12,
+            "the table merge silently rescaled the plane to {} m/unit",
+            app.doc.units.metres_per_unit,
+        );
+    }
+}
 
 /// A LOOP INSIDE ANOTHER LOOP IS A HOLE IN IT.
 ///
