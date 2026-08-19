@@ -4167,7 +4167,11 @@ impl CadApp {
             // The app's OWN picker — the same one the Radiance output folder and the PBR texture
             // set use. One dialog with three callers, rather than a second file-dialog crate.
             self.light_editor_wants_folder = true;
-            self.open_file_dialog(FileDialogMode::PickFolder, "");
+            // WITH A FILTER, so the browser shows what is in each folder. The answer is still the
+            // folder — but you are choosing it BECAUSE of the .ldt files in it, and a browser that
+            // showed a directory of thirty of them as empty is why this was reported as "its not
+            // detecting the ies/ldt files".
+            self.open_file_dialog(FileDialogMode::PickFolder, ".ies|.ldt");
         }
         if act.rescan {
             self.light.editor_scanned = crate::light_editor::scan_folder(&self.light.editor.folder);
@@ -28898,6 +28902,59 @@ impl CadApp {
         self.file_preview = Some(fp);
     }
 
+    /// Does the browser list the file `name` in `mode`, under the active filter `ext`?
+    ///
+    /// Split out of the directory walk so it can be tested — it is the whole of "why can I not see
+    /// my files", and until now it could only be checked by opening the app and looking.
+    ///
+    /// `PickFolder` is the interesting one. It used to be `false` outright, "folders only", which
+    /// is defensible when you are choosing where to WRITE — the Radiance output folder — and wrong
+    /// when you are choosing a folder BECAUSE OF WHAT IS IN IT. The Light Editor's photometry
+    /// folder is the second kind: reported as "when i try to import an ies/ldt file in the block to
+    /// fitting tab its not detecting the ies/ldt files in the folder", because the browser showed a
+    /// directory holding thirty .ldt files as completely empty. So a folder pick may now carry a
+    /// filter of its own, and files matching it are listed as CONTEXT — see the render, where they
+    /// are deliberately not clickable, since the answer is still the folder.
+    fn dialog_lists(mode: FileDialogMode, ext: &str, name: &str) -> bool {
+        let lname = name.to_ascii_lowercase();
+        let any = |exts: &[&str]| exts.iter().any(|x| lname.ends_with(x));
+        match mode {
+            // Open shows every readable drawing type; Save filters to the chosen output extension.
+            FileDialogMode::Open => any(&[".dxf", ".rsm", ".dwg"]),
+            FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+            | FileDialogMode::ImportTexture =>
+                any(&[".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]),
+            // HDR environments. `.hdr` is Radiance RGBE, `.exr` OpenEXR — the two formats HDRI
+            // libraries actually ship.
+            FileDialogMode::ImportHdri => any(&[".hdr", ".exr"]),
+            FileDialogMode::ImportObj => any(&[".obj", ".3ds", ".fbx", ".glb", ".gltf"]),
+            // Photometric files. `.ies` is LM-63, `.ldt` EULUMDAT — between them, what every
+            // manufacturer publishes.
+            FileDialogMode::ImportIes => any(&[".ies", ".ldt"]),
+            FileDialogMode::Save => !ext.is_empty() && lname.ends_with(ext),
+            // An EMPTY filter still means folders only, which is right for an output folder: the
+            // files already there are none of the caller's business.
+            FileDialogMode::PickFolder => {
+                !ext.is_empty() && ext.split('|').any(|x| !x.is_empty() && lname.ends_with(x))
+            }
+        }
+    }
+
+    /// What to call the folder browser, which is shared by three callers that want different
+    /// folders for different reasons.
+    ///
+    /// It was titled "Choose output folder · Radiance render" for all three, so asking the Light
+    /// Editor for a photometry folder opened a window announcing a render nobody had started.
+    fn folder_dialog_title(&self) -> &'static str {
+        if self.light_editor_wants_folder {
+            "Choose the folder your .ies / .ldt files are in"
+        } else if self.texset_target.is_some() {
+            "Choose a PBR texture-set folder"
+        } else {
+            "Choose output folder  ·  Radiance render"
+        }
+    }
+
     fn open_file_dialog(&mut self, mode: FileDialogMode, ext: &str) {
         let dir = self.file_dialog_dir.clone()
             .or_else(|| std::env::current_dir().ok())
@@ -28939,32 +28996,7 @@ impl CadApp {
                         }
                     }
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let lname = name.to_ascii_lowercase();
-                    // Open shows every readable drawing type (.dxf/.rsm/.dwg);
-                    // Save filters to the chosen output extension.
-                    let shows = match dlg.mode {
-                        FileDialogMode::Open =>
-                            lname.ends_with(".dxf") || lname.ends_with(".rsm")
-                            || lname.ends_with(".dwg"),
-                        FileDialogMode::ImportImage | FileDialogMode::ImportRaster
-                        | FileDialogMode::ImportTexture =>
-                            ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
-                                .iter().any(|x| lname.ends_with(&format!(".{x}"))),
-                        // HDR environments. `.hdr` is Radiance RGBE, `.exr` OpenEXR - the two
-                        // formats HDRI libraries actually ship.
-                        FileDialogMode::ImportHdri =>
-                            ["hdr", "exr"].iter().any(|x| lname.ends_with(&format!(".{x}"))),
-                        FileDialogMode::ImportObj =>
-                            lname.ends_with(".obj") || lname.ends_with(".3ds")
-                            || lname.ends_with(".fbx") || lname.ends_with(".glb")
-                            || lname.ends_with(".gltf"),
-                        // Photometric files. `.ies` is LM-63, `.ldt` EULUMDAT - between them,
-                        // what every manufacturer publishes.
-                        FileDialogMode::ImportIes =>
-                            lname.ends_with(".ies") || lname.ends_with(".ldt"),
-                        FileDialogMode::Save => lname.ends_with(&dlg.ext),
-                        FileDialogMode::PickFolder => false, // folders only
-                    };
+                    let shows = Self::dialog_lists(dlg.mode, &dlg.ext, &name);
                     if is_dir {
                         dirs.push(name);
                     } else if shows {
@@ -28986,7 +29018,7 @@ impl CadApp {
             FileDialogMode::ImportHdri => "Load environment  ·  HDR / EXR",
             FileDialogMode::ImportIes => "Import light file  ·  IES / EULUMDAT",
             FileDialogMode::Save => "Save As",
-            FileDialogMode::PickFolder => "Choose output folder  ·  Radiance render",
+            FileDialogMode::PickFolder => self.folder_dialog_title(),
         };
         // Cap the window to the screen so the bottom controls (Type / File /
         // Open / Cancel) are never pushed off-screen.
@@ -29149,6 +29181,16 @@ impl CadApp {
                                             }
                                         }
                                         for f in &files {
+                                            // IN A FOLDER PICK THE FILES ARE CONTEXT, NOT THE
+                                            // ANSWER — they say "yes, this is the folder you
+                                            // meant", and nothing more. Selecting one would put
+                                            // its name in `filename`, which a folder pick reads as
+                                            // the NEW SUBFOLDER TO CREATE: clicking `FONDO.LDT`
+                                            // would offer to make a directory called FONDO.LDT.
+                                            if dlg.mode == FileDialogMode::PickFolder {
+                                                ui.weak(format!("📄 {}", f));
+                                                continue;
+                                            }
                                             let selected = dlg.filename.eq_ignore_ascii_case(f);
                                             let resp = ui.selectable_label(
                                                 selected, format!("📄 {}", f));
@@ -29164,7 +29206,17 @@ impl CadApp {
                                             }
                                         }
                                         if dirs.is_empty() && files.is_empty() {
-                                            ui.weak(format!("(no folders or *{} files here)", dlg.ext));
+                                            // Naming the filter rather than printing it raw: the
+                                            // old line rendered an empty `ext` as "*", so an empty
+                                            // folder pick read "(no folders or * files here)" —
+                                            // which looks like a broken dialog rather than an
+                                            // empty directory.
+                                            let what = if dlg.ext.is_empty() {
+                                                "folders".to_string()
+                                            } else {
+                                                format!("folders or {} files", dlg.ext.replace('|', " / "))
+                                            };
+                                            ui.weak(format!("(no {what} here)"));
                                         }
                                     });
                             });
@@ -57610,6 +57662,7 @@ mod a_loop_inside_a_loop_is_a_hole {
         }
     }
 
+
     /// One loop on its own is one object with no holes — the ordinary case, and the early return.
     #[test]
     fn a_single_loop_is_one_object() {
@@ -57618,6 +57671,111 @@ mod a_loop_inside_a_loop_is_a_hole {
         assert!(out[0].1.is_empty());
     }
 }
+
+/// THE FOLDER BROWSER SHOWS YOU WHAT IS IN THE FOLDER.
+///
+/// Reported as: "when i try to import an ies/ldt file in the block to fitting tab its not
+/// detecting the ies/ldt files in the folder. instead its opening this" — with a screenshot of a
+/// window titled "Choose output folder · Radiance render", listing "(no folders or * files here)",
+/// pointed at a directory full of .ldt files.
+///
+/// Three separate things, one dialog:
+///   * `PickFolder` listed NO files at all, "folders only". Right for choosing where to WRITE,
+///     wrong for choosing a folder because of what is IN it.
+///   * the title was the Radiance one whichever of the three callers had opened it;
+///   * and the empty-list line printed the filter raw, so an empty filter read "* files".
+#[cfg(test)]
+mod the_folder_browser_shows_what_is_in_the_folder {
+    use super::*;
+
+    /// THE REPORTED CASE. A photometry folder pick must list photometry.
+    #[test]
+    fn a_photometry_folder_pick_lists_ies_and_ldt() {
+        for name in ["FONDO.ldt", "FONDO.LDT", "downlight.ies", "TRACK.IES"] {
+            assert!(
+                CadApp::dialog_lists(FileDialogMode::PickFolder, ".ies|.ldt", name),
+                "{name} was not listed, so the folder looks empty",
+            );
+        }
+    }
+
+    /// …AND NOTHING ELSE, or the list becomes every file on disk and says nothing.
+    #[test]
+    fn a_photometry_folder_pick_lists_only_photometry() {
+        for name in ["plan.dxf", "notes.txt", "render.hdr", "ldt", "ies.txt"] {
+            assert!(
+                !CadApp::dialog_lists(FileDialogMode::PickFolder, ".ies|.ldt", name),
+                "{name} has no business in a photometry list",
+            );
+        }
+    }
+
+    /// AN OUTPUT FOLDER STILL SHOWS FOLDERS ONLY. You are choosing where to WRITE, and what
+    /// happens to be there already is none of the caller's business — so an empty filter keeps the
+    /// old behaviour exactly, and the Radiance picker is unchanged.
+    #[test]
+    fn an_output_folder_pick_lists_no_files() {
+        for name in ["anything.ldt", "old_render.hdr", "plan.dxf"] {
+            assert!(
+                !CadApp::dialog_lists(FileDialogMode::PickFolder, "", name),
+                "{name} appeared in an output-folder pick",
+            );
+        }
+    }
+
+    /// EVERY OTHER MODE IS UNTOUCHED. The filter was moved out of the directory walk to make it
+    /// testable, and a refactor that quietly changed one of these would be worse than the defect.
+    #[test]
+    fn the_other_modes_filter_exactly_as_before() {
+        let cases: &[(FileDialogMode, &str, &[&str], &[&str])] = &[
+            (FileDialogMode::Open, "", &["a.dxf", "a.rsm", "a.DWG"], &["a.ies", "a.png"]),
+            (FileDialogMode::ImportIes, "", &["a.ies", "a.LDT"], &["a.dxf", "a.png"]),
+            (FileDialogMode::ImportHdri, "", &["sky.hdr", "sky.EXR"], &["sky.png", "sky.dxf"]),
+            (FileDialogMode::ImportObj, "", &["c.obj", "c.3ds", "c.fbx", "c.glb", "c.gltf"], &["c.dxf"]),
+            (FileDialogMode::ImportTexture, "", &["t.png", "t.JPG", "t.tiff"], &["t.dxf", "t.hdr"]),
+            (FileDialogMode::Save, ".rsm", &["out.rsm"], &["out.dxf"]),
+        ];
+        for (mode, ext, yes, no) in cases {
+            for n in *yes {
+                assert!(CadApp::dialog_lists(*mode, ext, n), "{mode:?} must list {n}");
+            }
+            for n in *no {
+                assert!(!CadApp::dialog_lists(*mode, ext, n), "{mode:?} must not list {n}");
+            }
+        }
+    }
+
+    /// A SAVE WITH NO EXTENSION LISTS NOTHING rather than everything. `ends_with("")` is true for
+    /// every string, so the empty-filter guard is load-bearing here as well as on the folder pick.
+    #[test]
+    fn an_empty_filter_never_matches_everything() {
+        assert!(!CadApp::dialog_lists(FileDialogMode::Save, "", "anything.at.all"));
+    }
+
+    /// THE TITLE NAMES THE FOLDER YOU ARE ACTUALLY CHOOSING. Three callers share one dialog mode,
+    /// and it announced a Radiance render to all three.
+    #[test]
+    fn the_folder_dialog_is_titled_for_whoever_asked() {
+        let mut app = CadApp::default();
+        assert!(
+            app.folder_dialog_title().contains("Radiance"),
+            "the default caller is the render output folder",
+        );
+
+        app.light_editor_wants_folder = true;
+        let t = app.folder_dialog_title();
+        assert!(
+            !t.contains("Radiance") && (t.contains(".ldt") || t.contains(".ies")),
+            "the photometry pick is titled {t:?}",
+        );
+
+        app.light_editor_wants_folder = false;
+        app.texset_target = Some(0);
+        let t = app.folder_dialog_title();
+        assert!(!t.contains("Radiance"), "the texture-set pick is titled {t:?}");
+    }
+}
+
 #[cfg(test)]
 mod a_debug_assert_never_does_the_work {
     /// The rule is narrow on purpose. A `debug_assert!` over a pure predicate is fine and there
