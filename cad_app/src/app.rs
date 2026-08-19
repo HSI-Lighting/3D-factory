@@ -4762,7 +4762,17 @@ impl CadApp {
         // Only while nothing has keyboard focus. `Context::input` reads RAW key state, which a
         // focused text field does not filter — without this guard, pressing Delete while editing
         // the command line or a fitting's name would quietly delete fixtures on the plan.
-        let typing = ctx.memory(|m| m.focused().is_some());
+        // A TEXT FIELD TAKING KEYSTROKES, not merely something being focused.
+        //
+        // `focused().is_some()` is true of ANY focused widget — a button, a list row, a checkbox —
+        // and egui leaves focus on the last thing clicked. So after any click in the Light Editor
+        // or the SIMLUX panel, Delete silently did nothing, which is exactly how it was reported:
+        // "delete does nothing when a light is selected".
+        //
+        // `wants_keyboard_input` is true only while something is actually consuming typing, which
+        // is the case this guard exists for — Delete while editing the command line or a fitting's
+        // name must edit the text rather than erase fixtures.
+        let typing = ctx.wants_keyboard_input();
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.light.place_mode {
                 self.light.place_mode = false;
