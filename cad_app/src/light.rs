@@ -469,6 +469,23 @@ pub struct LightState {
     /// Last computed grid + its plane + extruded scene.
     pub grid: Option<LuxGrid>,
     pub plane: Option<CalcPlane>,
+    /// THE SAME ROOM ON EN 12464-1's GRID — what a compliance figure rests on.
+    ///
+    /// Uniformity is not a property of a room. It is a property of a room AND the grid it was
+    /// sampled on, and the two grids that matter here are not the same grid: the WORKING one is at
+    /// whatever cell size the designer set, while the standard's spacing GROWS with the room —
+    /// 1.94 m across a 33 m hall, 5 m across a 100 m plan.
+    ///
+    /// The working grid is the finer of the two for every room down to about 3 m, so the figure
+    /// this panel has always shown is the CONSERVATIVE one: a finer grid has more chances to land
+    /// on the room's true minimum, and reports U₀ lower for it. Which is why the standard's figure
+    /// is reported BESIDE the working one and does not replace it — switching would raise every
+    /// uniformity number in every project, and that is the direction which passes an installation
+    /// that should have failed.
+    ///
+    /// `None` until a calculation has run, exactly like `grid`.
+    pub grid_en: Option<LuxGrid>,
+    pub plane_en: Option<CalcPlane>,
     pub meshes: Vec<Mesh>,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
@@ -556,6 +573,8 @@ impl LightState {
             mount_height: 3.0,
             grid: None,
             plane: None,
+            grid_en: None,
+            plane_en: None,
             meshes: Vec::new(),
             show_overlay: true,
             scale_max: None,
@@ -1627,6 +1646,30 @@ impl LightState {
             Self::apply_room_mask(&mut grid, &mask);
             self.grid_mask = mask;
         }
+        // THE SAME ROOM ON THE STANDARD'S GRID, computed BESIDE the working one rather than
+        // instead of it — see `LightState::grid_en` for why replacing it would be the wrong way
+        // round. It is cheap: EN 12464-1 asks 17 × 7 cells across a 33 m hall against the working
+        // grid's 132 × 52, so this is a few per cent on top of a calculation already run.
+        let plane_en = plane.on_standard_grid();
+        let mut grid_en = calc_lux(
+            &meshes,
+            &lums,
+            &self.profiles,
+            &self.materials,
+            &plane_en,
+            &self.settings,
+            self.maintenance,
+        );
+        // MASKED TO THE ROOM TOO, and to its OWN mask — these are different cells. Skipping it
+        // would reinstate exactly the defect the working grid was fixed for: on an L-shaped room
+        // the minimum becomes a point in the open air outside its own corner. It matters MORE
+        // here, because a coarse grid has fewer cells for one bad one to be diluted by.
+        if let Some(p) = room_poly.as_ref() {
+            let mask_en = Self::inside_mask(&plane_en, p);
+            if !mask_en.is_empty() {
+                Self::apply_room_mask(&mut grid_en, &mask_en);
+            }
+        }
         // MEAN CYLINDRICAL ILLUMINANCE at eye height — how well the space renders faces and solid
         // objects, which the horizontal grid cannot report at any resolution.
         //
@@ -1700,6 +1743,8 @@ impl LightState {
         }
         self.grid = Some(grid);
         self.plane = Some(plane);
+        self.grid_en = Some(grid_en);
+        self.plane_en = Some(plane_en);
         self.meshes = meshes;
         self.show_overlay = true;
 
@@ -2588,6 +2633,25 @@ impl LightState {
                     };
                     row(ui, "…measured on", note);
                 }
+                // AND THE SAME ROOM ON THE STANDARD'S OWN GRID.
+                //
+                // The row above says which grid the figure came from; this one gives the figure a
+                // compliance claim actually rests on, because EN 12464-1 specifies the grid it is
+                // to be assessed on and that grid is COARSER than the working one for every room
+                // down to about 3 m — 1.94 m across a 33 m hall.
+                //
+                // Reported BESIDE the working figure and never instead of it. The working grid is
+                // the finer of the two, so its U₀ is the conservative number; swapping them would
+                // raise every uniformity in every project at once, which is the direction that
+                // passes an installation it should not. A designer needs both: one says how even
+                // the room really is, the other says whether it complies.
+                if let (Some(ge), Some(pe)) = (self.grid_en.as_ref(), self.plane_en.as_ref()) {
+                    row(
+                        ui,
+                        "…to EN 12464-1",
+                        format!("U₀ {:.2}   on {}", ge.u0(), pe.grid_note()),
+                    );
+                }
                 if let Some(f) = g.direct_fraction() {
                     row(ui, "Direct / indirect", format!("{:.0}% / {:.0}%", f * 100.0, (1.0 - f) * 100.0));
                 }
@@ -2832,6 +2896,158 @@ pub fn legend_bar_with(ui: &mut egui::Ui, max: f64, ramp: LuxRamp) {
 /// Measured on the owner's real project — a 33 × 13 m gym at the default 0.25 m cell: 64 × 52
 /// cells, which is 0.52 m spacing along x and 0.25 m along y. Twice as coarse one way as the
 /// other, with the UI saying 0.25 throughout.
+
+/// UNIFORMITY IS QUOTED WITH THE GRID IT WAS MEASURED ON — both of them.
+///
+/// U₀ is not a property of a room. It is a property of a room AND the grid it was sampled on, and
+/// the two grids that matter here are not the same grid:
+///
+///   * the WORKING grid, at whatever cell size the designer set — 0.25 m by default;
+///   * the EN 12464-1 grid, whose spacing GROWS with the room (1.94 m across a 33 m hall).
+///
+/// The working grid is the finer of the two for every room down to about 3 m, so the figure the
+/// panel has always shown is the CONSERVATIVE one — a finer grid catches a lower minimum. The
+/// standard's figure is the one a compliance claim rests on, and it is the higher of the two.
+/// Neither replaces the other, which is why both are reported and each is labelled.
+///
+/// `CalcPlane::on_standard_grid` existed for this, documented as "deliberately SEPARATE from the
+/// plane you display", unit-tested inside `cad_light` — and called from nowhere in the app.
+#[cfg(test)]
+mod uniformity_is_quoted_with_its_grid {
+    use super::*;
+
+    /// A plain rectangular room, lit, with the working grid at `cell` metres.
+    fn lit_room(w: f32, d: f32, cell: f32) -> LightState {
+        let mut f = crate::factory::FactoryState::default();
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(w, 0.0),
+            glam::Vec2::new(w, d),
+            glam::Vec2::new(0.0, d),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.cell_size = cell;
+        // REAL FITTINGS, not the auto-centred stand-in. That one is a convenience for a first
+        // look and its height follows the room's; a uniformity test needs a layout it controls,
+        // and one that is deliberately NOT perfectly even — a room lit to a flat sheet has
+        // U₀ ≈ 1 on every grid and could not tell two grids apart at all.
+        s.auto_center_light = false;
+        for i in 0..3 {
+            for j in 0..2 {
+                s.luminaires.push(Luminaire {
+                    id: (i * 2 + j + 1) as u32,
+                    profile: BUILTIN.to_string(),
+                    position: Vertex::new(
+                        w * (i as f32 + 0.5) / 3.0,
+                        d * (j as f32 + 0.5) / 2.0,
+                        2.7,
+                    ),
+                    rotation_deg: 0.0,
+                    dimming: 1.0,
+                    watts_override: None,
+                    flux_override: None,
+                    from_block: None,
+                });
+            }
+        }
+        s.calculate(&cad_kernel::Document::default(), Some(&f));
+        s
+    }
+
+    /// THE SECOND GRID IS THE STANDARD'S, not a copy of the first at a different name.
+    #[test]
+    fn the_second_plane_is_the_one_en_12464_1_asks_for() {
+        let s = lit_room(20.0, 10.0, 0.25);
+        let p = s.plane.as_ref().expect("a working plane");
+        let e = s.plane_en.as_ref().expect("a standard plane");
+        let (wc, wr) = cad_light::en12464_cells(p.width, p.depth);
+        assert_eq!(
+            (e.cols, e.rows), (wc, wr),
+            "the standard plane is {} × {}, but EN 12464-1 asks {wc} × {wr}",
+            e.cols, e.rows,
+        );
+        assert_ne!(
+            (e.cols, e.rows), (p.cols, p.rows),
+            "the fixture must have two DIFFERENT grids or this test proves nothing",
+        );
+    }
+
+    /// THE WORKING FIGURE IS UNTOUCHED. The whole point of adding rather than switching: no number
+    /// anybody has already reported changes.
+    #[test]
+    fn the_working_uniformity_is_still_measured_on_the_working_grid() {
+        let s = lit_room(20.0, 10.0, 0.25);
+        let p = s.plane.as_ref().expect("a working plane");
+        let (cols, rows) = LightState::grid_for(p.width, p.depth, 0.25);
+        assert_eq!(
+            (p.cols, p.rows), (cols, rows),
+            "the working plane stopped being the one the cell size asks for",
+        );
+        let g = s.grid.as_ref().expect("a working grid");
+        assert_eq!(
+            (g.cols, g.rows), (cols, rows),
+            "the working figures are no longer computed on the working grid",
+        );
+    }
+
+    /// THE DIRECTION, ASSERTED RATHER THAN BELIEVED.
+    ///
+    /// The recommendation to report both rather than switch rests on the standard's grid being
+    /// COARSER, and a coarser grid reporting uniformity HIGHER — it has fewer chances to land on
+    /// the room's true minimum. If that is ever the other way round, quoting the EN figure is
+    /// tightening a design rather than flattering it, and the advice was wrong.
+    #[test]
+    fn the_standards_coarser_grid_reports_the_higher_uniformity() {
+        let s = lit_room(20.0, 10.0, 0.25);
+        let p = s.plane.as_ref().expect("plane");
+        let e = s.plane_en.as_ref().expect("standard plane");
+        assert!(
+            e.cols < p.cols && e.rows < p.rows,
+            "precondition: the standard's grid must be the coarser one — {} × {} against {} × {}",
+            e.cols, e.rows, p.cols, p.rows,
+        );
+        let (g, ge) = (s.grid.as_ref().expect("grid"), s.grid_en.as_ref().expect("standard grid"));
+        assert!(g.avg > 1.0, "precondition: the room is lit ({:.1} lx)", g.avg);
+        assert!(
+            ge.u0() >= g.u0() - 1e-6,
+            "the coarser standard grid reported U₀ {:.3}, BELOW the working grid's {:.3} — \
+             the direction this whole choice rests on is wrong",
+            ge.u0(), g.u0(),
+        );
+    }
+
+    /// AND IT IS MASKED TO THE ROOM TOO. The working grid drops cells outside an L-shaped room,
+    /// because averaging in the outside of its own corner made U₀'s minimum a point in open air.
+    /// A second grid that skipped that would carry exactly the defect the first one was fixed for.
+    #[test]
+    fn the_standard_grid_is_masked_to_the_room_like_the_working_one() {
+        let src = include_str!("light.rs");
+        let a = src.find("fn calculate(&mut self").expect("the calculation");
+        let b = src[a..].find("\n    pub fn ").map(|e| a + e).unwrap_or(src.len());
+        let body = &src[a..b];
+        assert!(
+            body.contains("apply_room_mask(&mut grid_en"),
+            "the standard grid is not masked to the room, so its minimum can be a point outside it",
+        );
+    }
+
+    /// A ROOM WHERE THE TWO GRIDS COINCIDE STILL REPORTS BOTH. At 3 m square the standard asks for
+    /// 0.25 m and the default working cell IS 0.25 m — the figures agree, and a reader who sees
+    /// only one line cannot tell that from a missing calculation.
+    #[test]
+    fn both_are_reported_even_when_the_two_grids_agree() {
+        let s = lit_room(3.0, 3.0, 0.25);
+        assert!(s.grid.is_some() && s.grid_en.is_some(), "both grids must be present");
+        let p = s.plane.as_ref().unwrap();
+        let e = s.plane_en.as_ref().unwrap();
+        assert_eq!((p.cols, p.rows), (e.cols, e.rows), "the fixture's two grids must coincide");
+    }
+}
 #[cfg(test)]
 mod the_grid_is_the_one_the_ui_says {
     use super::*;
