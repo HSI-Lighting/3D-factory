@@ -446,6 +446,55 @@ pub fn insert(doc: &mut Document, fitting: &Fitting, at: Vec2, doc_unit_m: f64) 
     block
 }
 
+
+/// How close a block instance has to be to a fixture to be the one it was placed as, in metres.
+///
+/// Positions make the round trip world-metres `f32` → drawing-units `f64` → back, so an exact
+/// comparison never matches. A millimetre is far below the spacing of any real layout and far
+/// above that error.
+pub const INSTANCE_TOL_M: f64 = 1e-3;
+
+/// The dobject indices of the block instances these fixtures were placed as.
+///
+/// `from_block` names the DEFINITION, which every instance of a fitting shares — fifty downlights
+/// are one definition and fifty references, which is the point of a block table. So the instance
+/// is found by POSITION as well: the reference to that definition standing where the fixture
+/// stands.
+///
+/// A FIXTURE THAT HAS BEEN DRAGGED AWAY FROM ITS SYMBOL MATCHES NOTHING, and that is deliberate.
+/// Dragging a marker moves the light and not the block, so the two genuinely are apart; taking the
+/// nearest instance instead would erase a DIFFERENT fitting's symbol and leave this one's, which
+/// is a worse answer than leaving both alone.
+///
+/// Indices come back sorted and unique, ready to remove from the highest down.
+pub fn instances_for<'a>(
+    doc: &Document,
+    fixtures: impl Iterator<Item = &'a cad_light::Luminaire>,
+    doc_unit_m: f64,
+) -> Vec<usize> {
+    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 { doc_unit_m } else { 1.0 };
+    let tol = INSTANCE_TOL_M / k; // the tolerance, in drawing units
+    let want: Vec<(u32, f64, f64)> = fixtures
+        .filter_map(|l| l.from_block.map(|b| (b, l.position.x as f64 / k, l.position.y as f64 / k)))
+        .collect();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<usize> = Vec::new();
+    for (i, d) in doc.dobjects.iter().enumerate() {
+        let Geom::BlockRef(br) = &d.geom else { continue };
+        let hit = want.iter().any(|(b, x, y)| {
+            *b == br.block
+                && (br.insert.x - x).abs() <= tol
+                && (br.insert.y - y).abs() <= tol
+        });
+        if hit {
+            out.push(i);
+        }
+    }
+    out
+}
+
 /// Scan `dir` for photometric files. Non-recursive, and it never fails loudly: an unreadable or
 /// missing folder is an empty list, because a typo'd path must not be an error dialog in front of
 /// a window whose other half still works.
@@ -787,6 +836,27 @@ fn figures_ui(ui: &mut egui::Ui, prof: &cad_light::IesProfile) {
     row(ui, "Beam", or_dash(f.beam_deg, "°", 0));
 }
 
+
+/// What `place_fitting` becomes when a tile is clicked: `Some(id)` to re-arm, `None` to leave it.
+///
+/// WHILE PLACING, PICKING A DIFFERENT FITTING SWITCHES TO IT. Reported as "i placed 3 different
+/// light yet they are all showing the same legend in the drawing", with a session dump showing
+/// four instances all pointing at `block=#0`.
+///
+/// Nothing was wrong with the placement. Arming was done ONLY by the Place button, so selecting
+/// another tile moved the highlight, the name, the photometry and the figures — everything the
+/// user reads as "this one is current" — while the next click on the plan still put down the
+/// fitting armed several minutes ago. Silent, and every symbol on the drawing wrong.
+///
+/// Clicking the fitting ALREADY being placed changes nothing: it must not toggle placement off,
+/// or clicking the highlighted tile to confirm what is armed would disarm it.
+pub fn rearm_on_select(placing: Option<u32>, clicked: u32) -> Option<u32> {
+    match placing {
+        Some(cur) if cur != clicked => Some(clicked),
+        _ => None,
+    }
+}
+
 /// One tile: the symbol and the distribution in a single rectangle, the name underneath.
 ///
 /// The two halves are drawn even when one is missing — an unlinked fitting shows its symbol beside
@@ -942,6 +1012,9 @@ pub fn window_ui(
                             *sel = Some(f.id);
                             name_buf.clear();
                             name_buf.push_str(&f.name);
+                            if let Some(id) = rearm_on_select(input.placing, f.id) {
+                                act.place = Some(id);
+                            }
                         }
                         if input.placing == Some(f.id) {
                             ui.painter().rect_stroke(
@@ -1604,6 +1677,76 @@ mod tests {
         let again = Library::load_from(&dir).expect("load again");
         assert_eq!(again.get(round).expect("there").symbol.len(), 1, "the rename lost the symbol");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// PICKING ANOTHER FITTING WHILE PLACING SWITCHES TO IT.
+    ///
+    /// The reported one: "i placed 3 different light yet they are all showing the same legend".
+    /// Selecting a tile moved every visible sign of which fitting was current, and left the armed
+    /// one alone — so the plan filled with the first fitting's symbol and nothing said so.
+    #[test]
+    fn selecting_another_fitting_while_placing_switches_to_it() {
+        assert_eq!(rearm_on_select(Some(3), 7), Some(7), "the new pick was not armed");
+    }
+
+    /// CLICKING THE ONE ALREADY BEING PLACED IS NOT A TOGGLE. Clicking the highlighted tile to
+    /// confirm what is armed must not disarm it.
+    #[test]
+    fn reselecting_the_armed_fitting_changes_nothing() {
+        assert_eq!(rearm_on_select(Some(7), 7), None);
+    }
+
+    /// AND BROWSING IS NOT PLACING. With nothing armed, clicking through the library to look at
+    /// each fitting's distribution must not start dropping them on the drawing.
+    #[test]
+    fn selecting_a_fitting_when_idle_does_not_start_placing() {
+        assert_eq!(rearm_on_select(None, 7), None, "browsing the library armed a placement");
+    }
+
+    /// TWO DIFFERENT FITTINGS GET TWO DIFFERENT DEFINITIONS.
+    ///
+    /// Reported as "i placed 3 different light yet they are all showing the same legend in the
+    /// drawing", with a session dump showing four instances all pointing at `block=#0`. The
+    /// definition is looked up BY NAME and reused when found, so a lookup that matched too
+    /// eagerly — or an `add` that did not return the new index — would give every fitting on the
+    /// plan the first one's symbol.
+    #[test]
+    fn different_fittings_do_not_share_a_definition() {
+        let mut doc = Document::default();
+        let names = ["NUCLEO", "LINEA W48X80 - (2M)", "VEGA", "OCULUS GRANDE 2.0", "PULSE MG"];
+        let ids: Vec<u32> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let mut f = fitting(n, 0.001, 100.0 + i as f64);
+                f.name = (*n).into();
+                insert(&mut doc, &f, Vec2::new(i as f64, 0.0), 0.001)
+            })
+            .collect();
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "fittings shared a definition: {ids:?}");
+        assert_eq!(doc.blocks.blocks.len(), names.len(), "the block table is the wrong size");
+        for (i, n) in names.iter().enumerate() {
+            assert_eq!(
+                doc.blocks.get(ids[i]).expect("the definition").name,
+                *n,
+                "definition {} is not {n}", ids[i],
+            );
+        }
+        // …and every instance points at its OWN definition, which is what the dump showed it did
+        // not: four references, all `block=#0`.
+        let refs: Vec<u32> = doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match d.geom {
+                Geom::BlockRef(b) => Some(b.block),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs, ids, "the instances do not match the definitions they were made from");
     }
 
     /// PLACING PUTS AN ORDINARY BLOCK REFERENCE ON THE DRAWING, at the point asked for.

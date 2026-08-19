@@ -4147,6 +4147,149 @@ impl CadApp {
             .is_some_and(|id| id != Self::cmd_line_id())
     }
 
+    /// Whether a Delete keypress belongs to the SIMLUX FIXTURE selection.
+    ///
+    /// Delete is the drafting ERASE key first, so this only claims it when the drawing has no
+    /// selection of its own — the two handlers are exact complements and cannot both fire.
+    ///
+    /// THE FOCUS TEST IS `typing_in_a_field`, NOT `wants_keyboard_input`. SIMLUX keeps the command
+    /// line focused so a typed command lands immediately ("reclaim the command line" on every
+    /// Esc), and `wants_keyboard_input` is true whenever ANY text field holds focus — including
+    /// that one, including when it is empty. So the guard was true essentially always and Delete
+    /// could never reach a selected fixture. Reported as "i cant delete the lights by selecting
+    /// them and clicking delete".
+    ///
+    /// `typing_in_a_field` asks the question actually meant: is a field OTHER than the command
+    /// line taking the keystroke. It is what the drafting Delete has always used, two hundred
+    /// lines away, which is why erase worked and this did not.
+    fn delete_targets_lights(&self) -> bool {
+        !self.typing_in_a_field()
+            && !self.light.selected.is_empty()
+            && self.selection.is_empty()
+            && self.selected.is_none()
+    }
+
+    /// Delete SIMLUX fixtures AND the block instances they were placed as. Returns (lights, blocks).
+    ///
+    /// A PLACED FITTING IS ONE THING IN TWO WORLDS — a symbol on the drawing and a light in the
+    /// calculation — so deleting it has to take both. Removing one and leaving the other is the
+    /// exact shape of what was reported: markers left behind with nothing to light, and symbols
+    /// left behind with nothing behind them.
+    ///
+    /// The drawing half is snapshotted for undo. THE FIXTURES ARE NOT, because SIMLUX state has
+    /// never been on the undo stack — the Delete key has always been final for them. Undo after
+    /// this brings the symbols back and not the markers, which is the pre-existing asymmetry
+    /// rather than a new one, and worth knowing before pressing it.
+    ///
+    /// A fixture placed by hand (`Place luminaire`) has no `from_block` at all and takes nothing
+    /// with it, which is right: there was never a symbol.
+    fn delete_fixtures(&mut self, ids: &[u32]) -> (usize, usize) {
+        if ids.is_empty() {
+            return (0, 0);
+        }
+        // The instances FIRST, while the fixtures that name them are still here.
+        //
+        // A face sketch swaps `self.doc` for the sketch plane's own document, and the blocks are
+        // on the PLAN — so the drawing half is skipped there rather than aimed at the wrong file.
+        let idx = if self.factory.session.is_some() {
+            Vec::new()
+        } else {
+            let doomed: Vec<&cad_light::Luminaire> =
+                self.light.luminaires.iter().filter(|l| ids.contains(&l.id)).collect();
+            crate::illuminaire::instances_for(
+                &self.doc,
+                doomed.into_iter(),
+                self.doc.units.metres_per_unit,
+            )
+        };
+
+        let before = self.light.luminaires.len();
+        self.light.luminaires.retain(|l| !ids.contains(&l.id));
+        self.light.selected.retain(|s| !ids.contains(s));
+        self.light.drag = None;
+        self.light.hover = None;
+        let lights = before - self.light.luminaires.len();
+
+        if !idx.is_empty() {
+            self.snapshot_doc();
+            // Highest index downward, so the earlier ones stay valid — the same rule ERASE
+            // follows, and for the same reason.
+            for &i in idx.iter().rev() {
+                if i < self.doc.dobjects.len() {
+                    self.doc.dobjects.remove(i);
+                }
+            }
+            // A pickfirst selection is a list of INDICES into the vector that just shifted under
+            // it, so it is dropped rather than left pointing at whatever slid into place.
+            self.selection.clear();
+            self.selected = None;
+            self.intersections.clear();
+            self.index_dirty = true;
+            self.touch_view();
+        }
+        (lights, idx.len())
+    }
+
+    /// The Delete key, on a SIMLUX fixture selection.
+    fn delete_selected_fixtures(&mut self) {
+        let ids = self.light.selected.clone();
+        let (lights, blocks) = self.delete_fixtures(&ids);
+        if lights == 0 {
+            return;
+        }
+        self.light.last_msg = format!(
+            "Deleted {lights} fixture(s){} — {} left.",
+            if blocks > 0 { format!(" and {blocks} symbol(s)") } else { String::new() },
+            self.light.luminaires.len(),
+        );
+    }
+
+    /// Remove a fitting from the library, and take what it placed on this project with it.
+    ///
+    /// Reported as "when i delete them from fitting it doesnt delete the markers and these
+    /// diamonds start showing up" — the library entry went and its fixtures stayed, drawn as the
+    /// hollow diamond that means "a point with no fitting". Seven of them, from a combo the user
+    /// had already deleted.
+    ///
+    /// SCOPED TO THIS DRAWING, which is all it can be: the library spans projects and the fixtures
+    /// do not. Removing a fitting used in a file that is not open leaves that file alone, and it
+    /// reopens with its symbols and its lights exactly as they were.
+    ///
+    /// Returns (fixtures, symbols) removed.
+    fn remove_fitting(&mut self, id: u32) -> (usize, usize) {
+        let Some(name) = self.light.library.get(id).map(|f| f.name.clone()) else {
+            return (0, 0);
+        };
+        // The fixtures are tied to the block DEFINITION they were placed as, which is looked up
+        // by the fitting's current name — the same name `ensure_block` writes.
+        let doomed: Vec<u32> = match self.doc.blocks.find(&name) {
+            Some(b) => self
+                .light
+                .luminaires
+                .iter()
+                .filter(|l| l.from_block == Some(b))
+                .map(|l| l.id)
+                .collect(),
+            None => Vec::new(),
+        };
+        let (lights, blocks) = self.delete_fixtures(&doomed);
+
+        self.light.library.remove(id);
+        if self.light.lib_sel == Some(id) {
+            self.light.lib_sel = None;
+            self.light.lib_name_buf.clear();
+        }
+        if self.light.place_fitting == Some(id) {
+            self.light.place_fitting = None;
+        }
+        self.light.last_msg = if lights == 0 {
+            format!("Removed \"{name}\" from the library.")
+        } else {
+            format!("Removed \"{name}\" — {lights} fixture(s) and {blocks} symbol(s) deleted.")
+        };
+        (lights, blocks)
+    }
+
 
     /// Read the Illuminaire library off disk and parse the photometry each fitting is linked to.
     ///
@@ -4244,6 +4387,17 @@ impl CadApp {
         self.light.lib_name_buf = name_buf;
         self.light.illuminaire_open = open;
 
+        self.apply_illuminaire_action(act);
+    }
+
+    /// Carry out what the Illuminaire window asked for.
+    ///
+    /// SPLIT FROM THE WINDOW so the wiring is testable. With the two halves fused, the only way to
+    /// reach this code in a test was to synthesise a pointer click on a particular tile — so
+    /// nothing did, and a handler that quietly stopped calling `remove_fitting` passed every test
+    /// while leaving markers on the plan. That is the bug this file is fixing; it should not be
+    /// possible to reintroduce it silently.
+    fn apply_illuminaire_action(&mut self, act: crate::illuminaire::Action) {
         // ---- carry out what it asked for ----
         let mut dirty = false;
 
@@ -4321,14 +4475,8 @@ impl CadApp {
             self.light.lib_name_buf = name;
         }
         if let Some(id) = act.remove {
-            self.light.library.remove(id);
-            if self.light.lib_sel == Some(id) {
-                self.light.lib_sel = None;
-                self.light.lib_name_buf.clear();
-            }
-            if self.light.place_fitting == Some(id) {
-                self.light.place_fitting = None;
-            }
+            self.remove_fitting(id);
+            self.history.push(format!("  illuminaire: {}", self.light.last_msg));
             dirty = true;
         }
         if let Some(id) = act.place {
@@ -5020,7 +5168,10 @@ impl CadApp {
         // `wants_keyboard_input` is true only while something is actually consuming typing, which
         // is the case this guard exists for — Delete while editing the command line or a fitting's
         // name must edit the text rather than erase fixtures.
-        let typing = ctx.wants_keyboard_input();
+        // Esc takes the same reading as Delete — see `delete_targets_lights` for why
+        // `wants_keyboard_input` is the wrong question in an app that keeps a command line
+        // focused.
+        let typing = self.typing_in_a_field();
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.light.place_fitting.is_some() {
                 self.light.place_fitting = None;
@@ -5032,16 +5183,8 @@ impl CadApp {
                 self.light.clear_selection();
             }
         }
-        // Delete is the drafting ERASE key, so it is only taken when the drawing has no selection
-        // of its own — otherwise a light selection left over from earlier would silently swallow
-        // an erase the user meant for the geometry.
-        if !typing
-            && !self.light.selected.is_empty()
-            && self.selection.is_empty()
-            && self.selected.is_none()
-            && ctx.input(|i| i.key_pressed(egui::Key::Delete))
-        {
-            self.light.delete_selected();
+        if self.delete_targets_lights() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.delete_selected_fixtures();
         }
 
         // Cursor + gesture ownership: while placing, the plan IS the placement tool, so clicks
@@ -60268,5 +60411,368 @@ mod the_illuminaire_window_runs {
         });
         assert!(!app.place_illuminaire_at(1.0, 1.0), "a face sketch accepted a fitting");
         assert!(app.light.luminaires.is_empty(), "a light landed during a face sketch");
+    }
+}
+
+/// DELETING A PLACED FITTING.
+///
+/// Both halves of this were reported together: "i cant delete the lights by selecting them and
+/// clicking delete", and "when i delete them from fitting it doesnt delete the markers and these
+/// diamonds start showing up in simlux". They are the same fault seen from two ends — a fixture
+/// and the symbol it was placed as are one thing, and every path that removes one has to remove
+/// the other.
+#[cfg(test)]
+mod deleting_a_placed_fitting {
+    use super::*;
+
+    /// A millimetre plan with `n` fittings placed on it, one metre apart.
+    fn placed(n: usize) -> (CadApp, Vec<u32>) {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 0.001;
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "OCULUS".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 47.5 },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(), // NOT linked — the state the diamonds were reported in
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            assert!(app.place_illuminaire_at(1.0 + i as f32, 2.0), "placement {i} refused");
+            ids.push(app.light.luminaires.last().expect("a light landed").id);
+        }
+        app.light.place_fitting = None;
+        (app, ids)
+    }
+
+    fn block_refs(app: &CadApp) -> usize {
+        app.doc
+            .dobjects
+            .iter()
+            .filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .count()
+    }
+
+    /// THE COMMAND LINE IS FOCUSED, AND DELETE STILL DELETES.
+    ///
+    /// This is the whole of the first bug. SIMLUX keeps the command line focused so a typed
+    /// command lands immediately, and the guard asked `wants_keyboard_input()` — true whenever any
+    /// text field holds focus, that one included, empty or not. So the condition was true
+    /// essentially always and the key never reached a fixture.
+    #[test]
+    fn delete_works_while_the_command_line_holds_focus() {
+        let (mut app, ids) = placed(3);
+        app.light.selected = vec![ids[0]];
+        app.focus_at_frame_start = Some(CadApp::cmd_line_id());
+        assert!(
+            app.delete_targets_lights(),
+            "Delete was refused with only the command line focused — this is the reported bug",
+        );
+    }
+
+    /// …but a REAL text field still takes the keystroke, which is what the guard is for.
+    #[test]
+    fn delete_is_refused_while_typing_in_a_field() {
+        let (mut app, ids) = placed(1);
+        app.light.selected = vec![ids[0]];
+        app.focus_at_frame_start = Some(egui::Id::new("some_name_field"));
+        assert!(
+            !app.delete_targets_lights(),
+            "Delete erased fixtures while a name was being typed",
+        );
+    }
+
+    /// And the drawing's own selection still wins — the two Delete handlers are complements and
+    /// must never both fire on one keystroke.
+    #[test]
+    fn the_drawings_selection_still_owns_delete() {
+        let (mut app, ids) = placed(1);
+        app.light.selected = vec![ids[0]];
+        app.focus_at_frame_start = Some(CadApp::cmd_line_id());
+        app.selection = vec![0];
+        assert!(!app.delete_targets_lights(), "a light selection swallowed a geometry erase");
+        app.selection.clear();
+        app.selected = Some(0);
+        assert!(!app.delete_targets_lights(), "a light selection swallowed a pickfirst erase");
+    }
+
+    /// DELETING A FIXTURE TAKES ITS SYMBOL WITH IT — and only its own.
+    #[test]
+    fn deleting_a_fixture_removes_the_block_it_was_placed_as() {
+        let (mut app, ids) = placed(3);
+        assert_eq!(block_refs(&app), 3, "fixture: three symbols on the plan");
+
+        let (lights, blocks) = app.delete_fixtures(&[ids[1]]);
+        assert_eq!(lights, 1, "the fixture did not go");
+        assert_eq!(blocks, 1, "the symbol was left on the plan with nothing behind it");
+        assert_eq!(app.light.luminaires.len(), 2);
+        assert_eq!(block_refs(&app), 2, "the wrong number of symbols was erased");
+
+        // The RIGHT one went: the survivors are the ones at 1.0 m and 3.0 m.
+        let mut xs: Vec<f64> = app
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b.insert.x),
+                _ => None,
+            })
+            .collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((xs[0] - 1000.0).abs() < 1e-6, "erased the wrong symbol; left {xs:?}");
+        assert!((xs[1] - 3000.0).abs() < 1e-6, "erased the wrong symbol; left {xs:?}");
+    }
+
+    /// A HAND-PLACED POINT HAS NO SYMBOL and must not take one.
+    ///
+    /// `Place luminaire (click plan)` puts a bare point down with no `from_block` at all. Erasing
+    /// some other fitting's block because a hand-placed light happened to sit on it would be a
+    /// silent edit to the drawing.
+    #[test]
+    fn a_hand_placed_point_takes_no_block_with_it() {
+        let (mut app, _) = placed(1);
+        let bare = app.light.place_point(1.0, 2.0); // exactly on top of the placed one
+        let (lights, blocks) = app.delete_fixtures(&[bare]);
+        assert_eq!(lights, 1);
+        assert_eq!(blocks, 0, "a bare point erased a symbol it never placed");
+        assert_eq!(block_refs(&app), 1, "the drawing lost a block to a hand-placed point");
+    }
+
+    /// REMOVING THE FITTING FROM THE LIBRARY TAKES ITS FIXTURES.
+    ///
+    /// The reported one: the library entry went, seven markers stayed, and because the fitting had
+    /// no photometry linked they drew as the hollow diamond that means "no fitting". Deleting the
+    /// combo has to delete what the combo put down.
+    #[test]
+    fn removing_a_fitting_takes_its_markers_and_symbols() {
+        let (mut app, _) = placed(7);
+        let fid = app.light.library.fittings[0].id;
+        assert_eq!(app.light.luminaires.len(), 7);
+        assert_eq!(block_refs(&app), 7);
+        // Every one of them is unassigned — this is the state the diamonds appear in.
+        assert_eq!(app.light.unassigned_count(), 7, "fixture: seven points with no fitting");
+
+        // THE REAL REMOVAL PATH, not a re-implementation of it. Working out the doomed fixtures
+        // here and calling the helper would have tested my arithmetic against my arithmetic — the
+        // handler could have stopped calling it entirely and this would still have passed.
+        let (lights, blocks) = app.remove_fitting(fid);
+
+        assert_eq!(lights, 7);
+        assert_eq!(blocks, 7);
+        assert!(app.light.luminaires.is_empty(), "markers were left behind");
+        assert_eq!(block_refs(&app), 0, "symbols were left behind");
+        assert_eq!(app.light.unassigned_count(), 0, "the diamonds are still there");
+        assert!(app.light.library.fittings.is_empty());
+    }
+
+    /// A FIXTURE DRAGGED AWAY FROM ITS SYMBOL MATCHES NOTHING.
+    ///
+    /// Dragging a marker moves the light and not the block, so they genuinely are apart. Taking
+    /// the nearest instance instead would erase a different fitting's symbol and leave this one's
+    /// — worse than leaving both.
+    #[test]
+    fn a_dragged_fixture_does_not_erase_a_neighbours_symbol() {
+        let (mut app, ids) = placed(3);
+        // Move the middle one on top of the last one's symbol.
+        if let Some(l) = app.light.luminaires.iter_mut().find(|l| l.id == ids[1]) {
+            l.position.x = 3.0;
+        }
+        let (lights, blocks) = app.delete_fixtures(&[ids[1]]);
+        assert_eq!(lights, 1);
+        assert_eq!(blocks, 1, "expected exactly the symbol it now stands on");
+        // …and the one it LEFT is still there, rather than both being taken.
+        assert_eq!(block_refs(&app), 2, "a drag cost the drawing two symbols");
+    }
+
+    /// CLICKING A TILE, FOR REAL — through egui, on the widget the user's mouse lands on.
+    ///
+    /// The pure rule is tested next door in `illuminaire`, and a pure rule nothing calls is worth
+    /// nothing: deleting the call site left every one of those tests green. This closes that gap
+    /// the only way it can be closed, by driving the actual widget.
+    ///
+    /// The tile's rect is read back from egui after a first frame rather than computed here — the
+    /// layout depends on the window chrome, the fonts and the scroll area, and a test that
+    /// hard-coded a position would break on any of them without the behaviour changing.
+    #[test]
+    fn clicking_a_tile_while_placing_switches_the_placement() {
+        let (mut app, _) = placed(1);
+        // A second fitting, so there is something to switch TO.
+        let first = app.light.library.fittings[0].id;
+        let second = app.light.library.add(crate::illuminaire::Fitting {
+            name: "VEGA".into(),
+            id: 0,
+            symbol: app.light.library.fittings[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.illuminaire_open = true;
+        app.light.place_fitting = Some(first);
+
+        let ctx = egui::Context::default();
+        let screen =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+        let raw = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+
+        // Frame one: lay the window out, then ask egui where the second fitting's tile ended up.
+        let _ = ctx.run(raw(Vec::new()), |ctx| app.render_illuminaire(ctx));
+        let tile = ctx
+            .read_response(egui::Id::new(("illum_tile", second)))
+            .expect("the second fitting has no tile on screen");
+        let at = tile.rect.center();
+        assert!(screen.contains(at), "the tile is off screen at {at:?}");
+
+        // Then a click, the way a mouse actually does it: move, press, release, each its own
+        // frame. egui decides hover from the pointer position it had when the widget was laid
+        // out, so a move and a press in the same frame land on a widget that is not there yet.
+        let btn = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [vec![egui::Event::PointerMoved(at)], vec![btn(true)], vec![btn(false)]] {
+            let _ = ctx.run(raw(events), |ctx| app.render_illuminaire(ctx));
+        }
+
+        assert_eq!(app.light.lib_sel, Some(second), "the click did not select the tile");
+        assert_eq!(
+            app.light.place_fitting,
+            Some(second),
+            "the click selected the fitting but kept placing the old one — this is the reported \
+             bug, where every symbol on the plan came out as the first fitting",
+        );
+    }
+
+    /// THE WINDOW'S ACTIONS ARE ACTUALLY CARRIED OUT.
+    ///
+    /// `remove` is the one that was reported, but the gap was structural: nothing drove the
+    /// handler at all, so any of these could have been dropped and every test would still pass.
+    #[test]
+    fn the_remove_action_takes_the_fixtures_with_it() {
+        let (mut app, _) = placed(7);
+        let fid = app.light.library.fittings[0].id;
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            remove: Some(fid),
+            ..Default::default()
+        });
+        assert!(app.light.library.fittings.is_empty(), "the fitting stayed in the library");
+        assert!(
+            app.light.luminaires.is_empty(),
+            "the markers stayed — {} left, which is the reported bug",
+            app.light.luminaires.len(),
+        );
+        assert_eq!(block_refs(&app), 0, "the symbols stayed on the plan");
+    }
+
+    /// ARMING AND DISARMING GO THROUGH THE SAME HANDLER, and arming must switch the bare-point
+    /// mode off — a click can only place one thing.
+    #[test]
+    fn the_place_action_arms_and_disarms() {
+        let (mut app, _) = placed(1);
+        let fid = app.light.library.fittings[0].id;
+        app.light.place_mode = true;
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            place: Some(fid),
+            ..Default::default()
+        });
+        assert_eq!(app.light.place_fitting, Some(fid), "the fitting was not armed");
+        assert!(!app.light.place_mode, "both placement modes are armed at once");
+
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            stop_placing: true,
+            ..Default::default()
+        });
+        assert_eq!(app.light.place_fitting, None, "stop did not disarm");
+    }
+
+    /// RENAMING GOES THROUGH, and a removed fitting cannot stay armed for placement — the next
+    /// click would look up an id that is no longer there.
+    #[test]
+    fn removing_the_armed_fitting_disarms_it() {
+        let (mut app, _) = placed(1);
+        let fid = app.light.library.fittings[0].id;
+        app.light.place_fitting = Some(fid);
+        app.light.lib_sel = Some(fid);
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            remove: Some(fid),
+            ..Default::default()
+        });
+        assert_eq!(app.light.place_fitting, None, "a deleted fitting is still armed");
+        assert_eq!(app.light.lib_sel, None, "a deleted fitting is still selected");
+    }
+
+    /// THE UNIT CHOICE REACHES THE STATE the next added fitting reads.
+    #[test]
+    fn the_unit_action_changes_what_a_new_fitting_records() {
+        let (mut app, _) = placed(1);
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            set_blocks_unit: Some(0.001),
+            ..Default::default()
+        });
+        assert!((app.light.lib_blocks_unit_m - 0.001).abs() < 1e-12);
+        // …and adding now records millimetres rather than whatever the file declared.
+        app.light.lib_blocks = crate::illuminaire::symbols_from(&app.doc.clone());
+        if !app.light.lib_blocks.is_empty() {
+            app.apply_illuminaire_action(crate::illuminaire::Action {
+                add: Some(0),
+                ..Default::default()
+            });
+            let f = app.light.library.fittings.last().expect("added");
+            assert!((f.symbol_unit_m - 0.001).abs() < 1e-12, "the chosen unit was not recorded");
+        }
+    }
+
+    /// THE SELECTION DOES NOT SURVIVE THE VECTOR IT INDEXES INTO.
+    ///
+    /// A pickfirst selection is a list of indices. Removing dobjects shifts everything after them,
+    /// so a selection kept across the removal points at whatever slid into place — and the next
+    /// Delete erases that.
+    #[test]
+    fn a_stale_index_selection_is_dropped() {
+        let (mut app, ids) = placed(3);
+        app.selection = vec![2];
+        app.selected = Some(2);
+        app.delete_fixtures(&[ids[0]]);
+        assert!(app.selection.is_empty(), "the selection still indexes a shifted vector");
+        assert!(app.selected.is_none());
+    }
+
+    /// THE DRAWING HALF IS UNDOABLE. The fixtures are not — SIMLUX state has never been on the
+    /// undo stack — but a snapshot has to be taken, or Undo silently steps past this edit to an
+    /// older one and takes the drawing with it.
+    #[test]
+    fn erasing_the_symbols_pushes_an_undo_step() {
+        let (mut app, ids) = placed(2);
+        let before = app.undo_stack.len();
+        app.delete_fixtures(&[ids[0]]);
+        assert_eq!(app.undo_stack.len(), before + 1, "no undo step was pushed for the erase");
+
+        // …and a delete that touches no geometry does NOT push one, or Undo becomes a no-op the
+        // user has to press twice.
+        let bare = app.light.place_point(40.0, 40.0);
+        let n = app.undo_stack.len();
+        app.delete_fixtures(&[bare]);
+        assert_eq!(app.undo_stack.len(), n, "a fixture-only delete pushed an empty undo step");
     }
 }
