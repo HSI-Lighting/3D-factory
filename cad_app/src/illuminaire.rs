@@ -295,11 +295,10 @@ pub fn symbols_from(doc: &Document) -> Vec<BlockRow> {
         .collect()
 }
 
-/// The bounding extent of a flattened symbol, in the units it was authored in.
+/// The bounding box of a flattened symbol, in its own units: `[min_x, min_y, max_x, max_y]`.
 ///
-/// Measured off the DISPLAY outlines, the same tessellation the preview draws, so a circle
-/// measures as its diameter rather than as the extent of its centre point.
-pub fn symbol_extent(sym: &[SymbolGeom]) -> [f64; 2] {
+/// `None` when there is nothing drawable — a block of pure text or attributes.
+pub fn symbol_bounds(sym: &[SymbolGeom]) -> Option<[f64; 4]> {
     let empty = Document::default();
     let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let mut any = false;
@@ -314,10 +313,40 @@ pub fn symbol_extent(sym: &[SymbolGeom]) -> [f64; 2] {
             }
         }
     }
-    if !any {
-        return [0.0, 0.0];
+    any.then_some([mnx as f64, mny as f64, mxx as f64, mxy as f64])
+}
+
+/// WHERE THE SYMBOL HANGS FROM — the centre of its own extents.
+///
+/// A block's insertion point is wherever its author left the origin, and in a real fixture library
+/// that is nowhere useful. In the file this was built for every block declares a base of `(0,0)`
+/// and none of the geometry is anywhere near it: VEGA's symbol is drawn 4.16 m away, LINEA's
+/// 1.22 m. They were made by selecting symbols laid out across a sheet and turning each into a
+/// block without first moving it to the origin — the commonest way a block library is built, and
+/// invisible in CAD because everyone inserts and then moves.
+///
+/// It is not invisible here. The luminaire marker goes exactly where the click was, and the
+/// CALCULATION uses the marker — so a symbol sitting a metre away is a plan that states the light
+/// is somewhere it is not. Reported as "the light block is getting placed away from the point of
+/// insertion. the user expect the light to be placed exactly at the place where they click."
+///
+/// ONE RULE, ALWAYS THE CENTRE — including when the author did set a base point. Honouring a base
+/// that is deliberately off-centre would put the symbol somewhere the calculation never used,
+/// which is the same bug wearing better intentions, and nothing on screen would say which rule had
+/// applied to which fitting.
+pub fn symbol_anchor(sym: &[SymbolGeom]) -> Vec2 {
+    match symbol_bounds(sym) {
+        Some([mnx, mny, mxx, mxy]) => Vec2::new((mnx + mxx) * 0.5, (mny + mxy) * 0.5),
+        None => Vec2::new(0.0, 0.0),
     }
-    [(mxx - mnx) as f64, (mxy - mny) as f64]
+}
+
+/// The extent of a symbol in its own units, `[width, height]`. Zero when nothing is drawable.
+pub fn symbol_extent(sym: &[SymbolGeom]) -> [f64; 2] {
+    match symbol_bounds(sym) {
+        Some([mnx, mny, mxx, mxy]) => [mxx - mnx, mxy - mny],
+        None => [0.0, 0.0],
+    }
 }
 
 /// The units a block file can be declared in, for the add panel's chooser.
@@ -430,11 +459,21 @@ fn scaled_dobjects(fitting: &Fitting, doc_unit_m: f64) -> Vec<DObject> {
     } else {
         1.0
     };
+    // CENTRED ON THE INSERTION POINT. The library keeps the symbol exactly as it was authored —
+    // that is the honest record of what came out of the file — and the anchor is applied here, on
+    // the way into a drawing. See [`symbol_anchor`] for why the centre and not the block's own
+    // base point.
+    let c = symbol_anchor(&fitting.symbol);
     fitting
         .symbol
         .iter()
         .map(|s| {
             let mut d = s.to_dobject();
+            // Translate FIRST, then scale about the origin: the anchor is measured in the symbol's
+            // own units, so moving it after scaling would shift by the wrong amount.
+            if c.x != 0.0 || c.y != 0.0 {
+                d.geom = d.geom.translated(Vec2::new(-c.x, -c.y));
+            }
             if (k - 1.0).abs() >= 1e-12 {
                 d.geom = d.geom.scaled(Vec2::new(0.0, 0.0), k);
             }
@@ -1857,6 +1896,107 @@ mod tests {
         assert_eq!(refs, ids, "the instances do not match the definitions they were made from");
     }
 
+    /// A SYMBOL LANDS ON THE POINT THAT WAS CLICKED.
+    ///
+    /// Reported as "the light block is getting placed away from the point of insertion. the user
+    /// expect the light to be placed exactly at the place where they click", with a session dump
+    /// showing every instance's bounding box STARTING at the insertion point instead of straddling
+    /// it.
+    ///
+    /// The cause is in the source file, not the click: every block in it declares a base of
+    /// `(0,0)` and none of the geometry is near it — they were made by selecting symbols laid out
+    /// across a sheet without first moving each to the origin. VEGA's is drawn 4.16 m away.
+    #[test]
+    fn a_symbol_is_centred_on_the_insertion_point() {
+        let mut doc = Document::default();
+        // A 100 x 60 rectangle drawn a long way from the origin, exactly as the real file has it.
+        let f = Fitting {
+            name: "OFFSET".into(),
+            id: 0,
+            symbol: vec![
+                SymbolGeom {
+                    geom: Geom::Line(Line {
+                        a: Vec2::new(4000.0, 500.0),
+                        b: Vec2::new(4100.0, 500.0),
+                    }),
+                    aci: None,
+                },
+                SymbolGeom {
+                    geom: Geom::Line(Line {
+                        a: Vec2::new(4000.0, 560.0),
+                        b: Vec2::new(4100.0, 560.0),
+                    }),
+                    aci: None,
+                },
+            ],
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        };
+        let id = insert(&mut doc, &f, Vec2::new(7.0, 3.0), 1.0); // a metre plan
+
+        let def = doc.blocks.get(id).expect("the definition");
+        let sym: Vec<SymbolGeom> =
+            def.dobjects.iter().map(|d| SymbolGeom { geom: d.geom.clone(), aci: None }).collect();
+        let [mnx, mny, mxx, mxy] = symbol_bounds(&sym).expect("it draws something");
+
+        // The DEFINITION straddles its own origin, so the reference's insertion point is the
+        // middle of the symbol rather than a corner of it.
+        // The bounds are measured off the display tessellation, which is `f32` — so the tolerance
+        // is a micron, not a machine epsilon. A micron is four orders below anything that could
+        // read as "away from the point of insertion".
+        assert!((mnx + mxx).abs() < 1e-6, "x is off-centre: {mnx} .. {mxx}");
+        assert!((mny + mxy).abs() < 1e-6, "y is off-centre: {mny} .. {mxy}");
+        // …at the right size: 100 x 60 mm in a metre drawing.
+        assert!((mxx - mnx - 0.1).abs() < 1e-6, "width {} m", mxx - mnx);
+        assert!((mxy - mny - 0.06).abs() < 1e-6, "height {} m", mxy - mny);
+    }
+
+    /// AND A SYMBOL ALREADY CENTRED IS LEFT ALONE — the anchor is idempotent, so a fitting whose
+    /// author did move it to the origin is not shifted by half its own size.
+    #[test]
+    fn a_centred_symbol_is_not_moved() {
+        let sym = vec![SymbolGeom {
+            geom: Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 50.0 }),
+            aci: None,
+        }];
+        let a = symbol_anchor(&sym);
+        assert!(a.x.abs() < 1e-9 && a.y.abs() < 1e-9, "a centred symbol anchored at {a:?}");
+    }
+
+    /// A SYMBOL WITH NOTHING DRAWABLE anchors at the origin rather than at a bounding box between
+    /// two infinities.
+    #[test]
+    fn an_empty_symbol_anchors_at_the_origin() {
+        let a = symbol_anchor(&[]);
+        assert!(a.x == 0.0 && a.y == 0.0, "an empty symbol anchored at {a:?}");
+        assert!(symbol_bounds(&[]).is_none());
+    }
+
+    /// THE ANCHOR IS THE MIDDLE OF THE EXTENTS, not the mean of the geometry.
+    ///
+    /// A fitting drawn as one big housing and twenty small lamps would be pulled towards the lamps
+    /// by an average, and the symbol would hang off the click by most of its own width.
+    #[test]
+    fn the_anchor_is_the_middle_of_the_extents() {
+        let mut sym = vec![SymbolGeom {
+            geom: Geom::Line(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(100.0, 0.0) }),
+            aci: None,
+        }];
+        for i in 0..20 {
+            sym.push(SymbolGeom {
+                geom: Geom::Circle(Circle {
+                    center: Vec2::new(1.0 + i as f64 * 0.1, 0.0),
+                    radius: 0.05,
+                }),
+                aci: None,
+            });
+        }
+        let a = symbol_anchor(&sym);
+        assert!((a.x - 50.0).abs() < 0.2, "the anchor was dragged to {} by the small parts", a.x);
+    }
+
     /// PLACING PUTS AN ORDINARY BLOCK REFERENCE ON THE DRAWING, at the point asked for.
     ///
     /// "in the drawing in the 2d we will treat as a normal block. just the block as it is in any
@@ -2124,5 +2264,6 @@ mod previews {
         assert_eq!(profile_figures(&p).beam_deg, None);
     }
 }
+
 
 

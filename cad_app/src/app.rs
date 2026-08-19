@@ -61010,6 +61010,70 @@ mod deleting_a_placed_fitting {
     }
 
     /// A PLACEMENT IS AN EDIT TO THE DRAWING, and has to announce itself as one.
+
+    /// THE SYMBOL AND THE MARKER LAND ON THE SAME SPOT — end to end, through the real placement.
+    ///
+    /// This is the one the user sees. The marker goes exactly where the click was and the
+    /// CALCULATION uses the marker, so a symbol sitting a metre away is a plan that states the
+    /// light is somewhere it is not — and every drawing issued from it is wrong in a way no number
+    /// on the sheet contradicts.
+    #[test]
+    fn the_symbol_lands_on_the_marker() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        // A symbol drawn far from its own origin, exactly as the real block file has them.
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: "VEGA".into(),
+            id: 0,
+            symbol: vec![crate::illuminaire::SymbolGeom {
+                geom: cad_kernel::Geom::Circle(cad_kernel::Circle {
+                    center: Vec2::new(4161.6, 567.3),
+                    radius: 72.5,
+                }),
+                aci: None,
+            }],
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+        assert!(app.place_illuminaire_at(-8.476, 6.425), "the placement was refused");
+
+        let l = &app.light.luminaires[0];
+        let br = app
+            .doc
+            .dobjects
+            .iter()
+            .find_map(|d| match d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b),
+                _ => None,
+            })
+            .expect("a block landed");
+
+        // Where the drawing actually shows the symbol: the definition's own bounds, carried to
+        // the insertion point.
+        let def = app.doc.blocks.get(br.block).expect("the definition");
+        let sym: Vec<crate::illuminaire::SymbolGeom> = def
+            .dobjects
+            .iter()
+            .map(|d| crate::illuminaire::SymbolGeom { geom: d.geom.clone(), aci: None })
+            .collect();
+        let [mnx, mny, mxx, mxy] =
+            crate::illuminaire::symbol_bounds(&sym).expect("it draws something");
+        let cx = br.insert.x + (mnx + mxx) * 0.5;
+        let cy = br.insert.y + (mny + mxy) * 0.5;
+
+        assert!(
+            (cx - l.position.x as f64).abs() < 1e-6 && (cy - l.position.y as f64).abs() < 1e-6,
+            "the symbol is centred at ({cx:.4}, {cy:.4}) and the light is at ({}, {}) — {:.3} m \
+             apart",
+            l.position.x,
+            l.position.y,
+            ((cx - l.position.x as f64).powi(2) + (cy - l.position.y as f64).powi(2)).sqrt(),
+        );
+        assert!((l.position.x - (-8.476)).abs() < 1e-4, "the light is not where the click was");
+    }
     ///
     /// Reported as "once i place a file ... still no blocks. the block shows up after i delete a
     /// light or 2". The blocks were on the drawing the whole time. Nothing had told the canvas its
