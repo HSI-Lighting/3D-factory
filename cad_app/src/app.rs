@@ -50205,6 +50205,17 @@ fn calculate_on_real_project() {
         app.light.grid.as_ref().map(|g| (g.cols, g.rows, g.avg)),
         app.light.last_msg,
     );
+    // WHERE IT WENT. A total is not a diagnosis: the question this harness exists to answer is
+    // WHICH PHASE is the one that does not come back.
+    println!();
+    println!("per phase:");
+    for (what, v) in &app.light.last_timings {
+        if *what == "scene_tris" {
+            println!("  {what:<14} {v:>12.0} triangles");
+        } else {
+            println!("  {what:<14} {v:>12.1} ms");
+        }
+    }
 }
     #[test]
     #[ignore = "needs SIMLUX_DIAG=<drawing path>"]

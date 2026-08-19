@@ -486,6 +486,14 @@ pub struct LightState {
     /// `None` until a calculation has run, exactly like `grid`.
     pub grid_en: Option<LuxGrid>,
     pub plane_en: Option<CalcPlane>,
+    /// WHERE THE LAST CALCULATION SPENT ITS TIME — `(phase, milliseconds)`, in order.
+    ///
+    /// A calculation that takes fifteen minutes and one that has hung look identical from outside:
+    /// a window that stopped repainting. Windows greys it out, calls it "not responding", and the
+    /// user reports a crash — which is what happened here, and why there was no crash log to find.
+    /// This is the readout that tells the two apart, and it is a field rather than a `println!` so
+    /// the app can show it as readily as the offline harness.
+    pub last_timings: Vec<(&'static str, f64)>,
     pub meshes: Vec<Mesh>,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
@@ -575,6 +583,7 @@ impl LightState {
             plane: None,
             grid_en: None,
             plane_en: None,
+            last_timings: Vec::new(),
             meshes: Vec::new(),
             show_overlay: true,
             scale_max: None,
@@ -1556,8 +1565,29 @@ impl LightState {
         ))
     }
 
+    /// Note that a calculation phase finished, and how long it took.
+    ///
+    /// ALSO PRINTS IT IMMEDIATELY when `SIMLUX_PHASE_LOG` is set, and that is the whole point: the
+    /// phase worth knowing about is the one that never returns, and a table printed at the END
+    /// says nothing whatever about a run that did not reach the end. Learning that cost two
+    /// fifteen-minute runs which produced no output at all.
+    fn note_phase(&mut self, what: &'static str, t: std::time::Instant) {
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        self.last_timings.push((what, ms));
+        if std::env::var_os("SIMLUX_PHASE_LOG").is_some() {
+            eprintln!("  [phase] {what:<14} {ms:>10.1} ms");
+        }
+    }
+
     pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
+        self.last_timings.clear();
+        let t_phase = std::time::Instant::now();
         let meshes = self.scene_meshes(doc, factory);
+        let scene_tris: usize = meshes.iter().map(|m| m.triangles.len()).sum();
+        if std::env::var_os("SIMLUX_PHASE_LOG").is_some() {
+            eprintln!("  [phase] scene is {scene_tris} triangles");
+        }
+        self.note_phase("scene", t_phase);
         // The calculation plane must cover whatever is actually being lit. With a 3D model that is
         // the MODEL's footprint, which need not match the 2D drawing's at all — a plan carries
         // dimensions, notes and title blocks that are not part of the building, and a building can
@@ -1626,6 +1656,7 @@ impl LightState {
             v.extend(generated);
             v
         };
+        let t_phase = std::time::Instant::now();
         let mut grid = calc_lux(
             &meshes,
             &lums,
@@ -1651,6 +1682,8 @@ impl LightState {
         // round. It is cheap: EN 12464-1 asks 17 × 7 cells across a 33 m hall against the working
         // grid's 132 × 52, so this is a few per cent on top of a calculation already run.
         let plane_en = plane.on_standard_grid();
+        self.note_phase("grid", t_phase);
+        let t_phase = std::time::Instant::now();
         let mut grid_en = calc_lux(
             &meshes,
             &lums,
@@ -1676,6 +1709,8 @@ impl LightState {
         // On a COARSE sub-grid deliberately: every point costs 24 azimuth evaluations, so measuring
         // it at the work plane's resolution would multiply the whole calculation by twenty-four to
         // refine a single room-average figure that a 12 × 12 sample already settles.
+        self.note_phase("grid_en", t_phase);
+        let t_phase = std::time::Instant::now();
         self.cylindrical_avg = {
             let ev = cad_light::Evaluator::new(
                 &meshes,
@@ -1702,6 +1737,8 @@ impl LightState {
         // 1 sample/m² and the same ray settings: this is a room-average figure per surface, and the
         // cost scales with the room's whole surface area rather than the grid, so a fine sample
         // here would dominate the calculation to refine a number quoted to the nearest lux.
+        self.note_phase("cylindrical", t_phase);
+        let t_phase = std::time::Instant::now();
         self.surfaces = cad_light::surface_report(
             &meshes,
             &lums,
@@ -1711,6 +1748,8 @@ impl LightState {
             self.maintenance,
             1.0,
         );
+        self.note_phase("surfaces", t_phase);
+        self.last_timings.push(("scene_tris", scene_tris as f64));
         // What the scheme costs to run, over the area actually assessed. The calculation plane's
         // extent, not the true floor area — for an L-shaped room those differ, and the honest thing
         // is to say which one the density is per, which the UI does.
