@@ -2206,6 +2206,13 @@ pub struct CadApp {
     /// Clipboard for Copy / Paste — clones of the copied dobjects. Paste
     /// re-adds them with fresh handles (via `DObject::with_style`).
     clipboard_dobjects: Vec<DObject>,
+    /// What one drawing unit was worth, in METRES, when those were copied.
+    ///
+    /// A face sketch is a document of its own measured in METRES while the plan may be in
+    /// millimetres, and Ctrl+C / Ctrl+V crosses freely between them. Without this a 3 m wall
+    /// copied off a millimetre plan — 3000 units — pastes into a sketch as a THREE KILOMETRE
+    /// wall: no error, the view simply jumps and the drawing is somewhere past the horizon.
+    clipboard_unit_m: f64,
     /// Active PASTE placement flow (base → destination); `Off` when idle.
     paste_state: PasteState,
     /// Active PEDIT (polyline edit) flow; `Off` when idle.
@@ -3945,6 +3952,7 @@ impl Default for CadApp {
             last_load_ms: 1200, // seeded; self-calibrates after the first real open/save
             last_save_ms: 400,
             clipboard_dobjects: Vec::new(),
+            clipboard_unit_m: 1.0,
             paste_state: PasteState::Off,
             pedit_state: PeditState::Off,
             groups: Vec::new(),
@@ -28434,6 +28442,29 @@ impl CadApp {
         }
     }
 
+
+    /// THE GRID SPACING, IN WHATEVER THE ACTIVE DOCUMENT MEASURES IN.
+    ///
+    /// `GrdSpc` is a length in the DRAWING's units — AutoCAD's GRIDUNIT, and 10 on a millimetre
+    /// plan means 10 mm. A face sketch is a document of its OWN and its units are metres, so that
+    /// same stored 10 became a TEN METRE grid: three orders of magnitude coarser than the wall
+    /// being drawn on, which is no grid at all, and a snap rounding every click to the nearest ten
+    /// metres.
+    ///
+    /// The ratio between the two documents is the whole of the fix, and it is deliberately NOT a
+    /// test on the unit VALUE: a metre-declared plan and a face sketch are byte-identical
+    /// `{1.0, Declared}`, so nothing about the number can tell them apart. With no sketch open the
+    /// plan IS the active document, the ratio is exactly 1, and the behaviour is unchanged to the
+    /// bit for every existing case.
+    fn grid_spacing(&self) -> f64 {
+        let plan_k =
+            Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).units.metres_per_unit;
+        let active_k = self.doc.units.metres_per_unit;
+        if !(plan_k.is_finite() && active_k.is_finite()) || active_k <= 0.0 {
+            return self.env.GrdSpc;
+        }
+        self.env.GrdSpc * plan_k / active_k
+    }
     fn do_save(&mut self, path: &str) {
         let est = self.last_save_ms.max(200);
         self.busy = Some(BusyOp {
@@ -28766,8 +28797,29 @@ impl CadApp {
         self.clipboard_dobjects = self.selection.iter()
             .filter_map(|&i| self.doc.dobjects.get(i).cloned())
             .collect();
+        // WHAT THE NUMBERS MEANT. Geometry is a pile of coordinates, and a coordinate is only a
+        // length alongside the unit it was measured in — see `clipboard_unit_m`.
+        self.clipboard_unit_m = self.doc.units.metres_per_unit;
         self.history.push(format!(
             "  ⎘ copied {} dobject(s)", self.clipboard_dobjects.len()));
+    }
+
+    /// The clipboard, expressed in the ACTIVE document's units.
+    ///
+    /// The IDENTITY when the two agree — which is every copy and paste inside one document, so
+    /// the ordinary case is unchanged to the bit. Only crossing between a plan and a face sketch
+    /// needs anything done, and that is exactly the crossing nothing used to notice.
+    fn clipboard_in_active_units(&self) -> Vec<DObject> {
+        let k = self.clipboard_unit_m / self.doc.units.metres_per_unit;
+        if !(k.is_finite() && k > 0.0) || (k - 1.0).abs() < 1e-12 {
+            return self.clipboard_dobjects.clone();
+        }
+        // About the ORIGIN, so this is a pure change of scale. Where the objects then land is the
+        // paste's own business, and it works that out from the converted geometry.
+        self.clipboard_dobjects
+            .iter()
+            .map(|d| DObject::with_style(d.geom.scaled(Vec2::new(0.0, 0.0), k), d.style))
+            .collect()
     }
 
     /// Edit ▸ Paste (Ctrl+V) — start the placement flow. The base point is
@@ -28778,9 +28830,11 @@ impl CadApp {
             self.history.push("  paste: clipboard is empty".into());
             return;
         }
-        // Auto base = lower-left of the clipboard's bounding box.
-        let mut base = self.clipboard_dobjects[0].bbox().0;
-        for d in &self.clipboard_dobjects[1..] {
+        // IN THE ACTIVE DOCUMENT'S UNITS, so the base point is a place in THIS drawing rather
+        // than a number that meant something in another one.
+        let clip = self.clipboard_in_active_units();
+        let mut base = clip[0].bbox().0;
+        for d in &clip[1..] {
             let a = d.bbox().0;
             if a.x < base.x { base.x = a.x; }
             if a.y < base.y { base.y = a.y; }
@@ -28798,7 +28852,7 @@ impl CadApp {
         let v = dest - base;
         self.snapshot_doc();
         let start = self.doc.dobjects.len();
-        let clones: Vec<DObject> = self.clipboard_dobjects.iter()
+        let clones: Vec<DObject> = self.clipboard_in_active_units().iter()
             .map(|d| DObject::with_style(d.geom.translated(v), d.style))
             .collect();
         let n = clones.len();
@@ -35075,8 +35129,9 @@ impl CadApp {
                 if dx >= dy { p.y = a.y; } else { p.x = a.x; }
             }
         }
-        if self.env.GrdSnp && self.env.GrdSpc > 0.0 {
-            let s = self.env.GrdSpc;
+        let grid_s = self.grid_spacing();
+        if self.env.GrdSnp && grid_s > 0.0 {
+            let s = grid_s;
             p.x = (p.x / s).round() * s;
             p.y = (p.y / s).round() * s;
         }
@@ -41487,8 +41542,9 @@ impl eframe::App for CadApp {
             // (zoomed too far out — would be a black smear anyway). Drawn
             // BEFORE dobjects so they sit on top of it. The same GrdSpc
             // value is what GrdSnp rounds to.
-            if self.env.GrdEnb && self.env.GrdSpc > 0.0 {
-                let s = self.env.GrdSpc;
+            let grid_s = self.grid_spacing();
+            if self.env.GrdEnb && grid_s > 0.0 {
+                let s = grid_s;
                 let bl = self.s2w(rect.left_bottom(), rect);
                 let tr = self.s2w(rect.right_top(),   rect);
                 let x0 = (bl.x / s).floor() * s;
@@ -57695,6 +57751,148 @@ mod a_loop_inside_a_loop_is_a_hole {
 
 /// THE FOLDER BROWSER SHOWS YOU WHAT IS IN THE FOLDER.
 ///
+
+/// TWO UNIT SPACES, ONE APP.
+///
+/// The 2D plan is measured in whatever the drawing declares — millimetres, for an architectural
+/// DXF. A face sketch is a `Document` of its OWN and its coordinates are METRES. `self.doc`
+/// alternates between the two as a sketch is opened and closed, and anything carried across
+/// without conversion changes meaning by a factor of a thousand with nothing to report it.
+///
+/// A metre-declared plan and a face sketch are byte-identical `{1.0, Declared}`, so NOTHING ABOUT
+/// THE NUMBER can tell them apart — every fix here works from the RATIO between the plan document
+/// and the active one, which is exactly 1 when no sketch is open.
+#[cfg(test)]
+mod two_unit_spaces {
+    use super::*;
+
+    /// A plan in millimetres with a wall on it, and nothing else.
+    fn mm_plan() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(3000.0, 0.0), // a 3 m wall, in millimetres
+        })));
+        app
+    }
+
+    // ── THE GRID ───────────────────────────────────────────────────────────────────────────
+
+    /// `GrdSpc` IS THE SAME PHYSICAL SPACING IN BOTH SPACES. 10 on a millimetre plan is 10 mm; on
+    /// a face sketch measured in metres the same stored 10 was a TEN METRE grid — three orders of
+    /// magnitude coarser than the wall being drawn on, and a snap rounding every click to the
+    /// nearest ten metres.
+    #[test]
+    fn the_grid_is_the_same_size_on_a_plane_as_on_the_plan() {
+        let mut app = mm_plan();
+        app.env.GrdSpc = 10.0; // 10 mm
+        let on_plan = app.grid_spacing();
+        assert!((on_plan - 10.0).abs() < 1e-9, "the plan's own grid changed: {on_plan}");
+
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let in_sketch = app.grid_spacing();
+        // The sketch is in metres, so the same 10 mm is 0.01 of a unit there.
+        assert!(
+            (in_sketch - 0.01).abs() < 1e-9,
+            "a 10 mm grid became {in_sketch} units in a face sketch — {}x out",
+            in_sketch / 0.01,
+        );
+    }
+
+    /// AND NOTHING CHANGES WHEN THERE IS NO SKETCH. The ratio is exactly 1, so every existing
+    /// drawing snaps and draws its grid precisely as before — the property that makes this safe
+    /// to add at all.
+    #[test]
+    fn the_grid_is_untouched_with_no_sketch_open() {
+        for unit in [1.0_f64, 0.001, 0.01, 25.4 / 1000.0] {
+            let mut app = CadApp::default();
+            app.doc.units = cad_kernel::DocUnits::new(unit, cad_kernel::UnitSource::Declared);
+            app.env.GrdSpc = 7.5;
+            assert_eq!(
+                app.grid_spacing(), 7.5,
+                "at {unit} m/unit the grid moved without a sketch being open",
+            );
+        }
+    }
+
+    // ── THE CLIPBOARD ──────────────────────────────────────────────────────────────────────
+
+    /// A 3 m WALL STAYS 3 m ACROSS THE SPACES. Copied off a millimetre plan it is 3000 units;
+    /// pasted into a metre-measured sketch unconverted it became a THREE KILOMETRE wall — no
+    /// error, the view simply jumps and the drawing is somewhere past the horizon.
+    #[test]
+    fn a_wall_copied_from_the_plan_keeps_its_size_on_a_plane() {
+        let mut app = mm_plan();
+        // The LAST index, not 0 — a default `CadApp` is not an empty drawing.
+        app.selection = vec![app.doc.dobjects.len() - 1];
+        app.copy_selection();
+        assert_eq!(app.clipboard_dobjects.len(), 1, "the fixture must copy something");
+
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        let before = app.doc.dobjects.len();
+        app.start_paste();
+        app.commit_paste(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0));
+        assert_eq!(app.doc.dobjects.len(), before + 1, "nothing was pasted");
+
+        let g = &app.doc.dobjects[before].geom;
+        let (mn, mx) = g.bbox();
+        let len = mx.x - mn.x;
+        assert!(
+            (len - 3.0).abs() < 1e-6,
+            "a 3 m wall pasted into a metre sketch as {len} units — {:.0}x out",
+            len / 3.0,
+        );
+    }
+
+    /// AND A PASTE INSIDE ONE DOCUMENT IS UNTOUCHED — the identity, which is every copy and paste
+    /// anybody has ever done in this app.
+    #[test]
+    fn pasting_within_one_drawing_is_unchanged() {
+        let mut app = mm_plan();
+        app.selection = vec![app.doc.dobjects.len() - 1];
+        app.copy_selection();
+        let before = app.doc.dobjects.len();
+        app.start_paste();
+        app.commit_paste(Vec2::new(0.0, 0.0), Vec2::new(500.0, 0.0));
+
+        let g = &app.doc.dobjects[before].geom;
+        let (mn, mx) = g.bbox();
+        assert!(
+            ((mx.x - mn.x) - 3000.0).abs() < 1e-6,
+            "a same-document paste rescaled the geometry to {}",
+            mx.x - mn.x,
+        );
+        assert!((mn.x - 500.0).abs() < 1e-6, "…and it landed at {}, not the destination", mn.x);
+    }
+
+    /// THE OTHER DIRECTION TOO. Drawn on a plane in metres, pasted onto a millimetre plan — the
+    /// conversion is a ratio, and a ratio that only works one way round is a coincidence.
+    #[test]
+    fn geometry_drawn_on_a_plane_keeps_its_size_back_on_the_plan() {
+        let mut app = mm_plan();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        // A 2 m line, drawn in the sketch's metres.
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(2.0, 0.0),
+        })));
+        let i = app.doc.dobjects.len() - 1;
+        app.selection = vec![i];
+        app.copy_selection();
+        app.factory_exit_sketch();
+
+        let before = app.doc.dobjects.len();
+        app.start_paste();
+        app.commit_paste(Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0));
+        let (mn, mx) = app.doc.dobjects[before].geom.bbox();
+        assert!(
+            ((mx.x - mn.x) - 2000.0).abs() < 1e-3,
+            "a 2 m line pasted onto a millimetre plan as {} units, not 2000",
+            mx.x - mn.x,
+        );
+    }
+}
 /// Reported as: "when i try to import an ies/ldt file in the block to fitting tab its not
 /// detecting the ies/ldt files in the folder. instead its opening this" — with a screenshot of a
 /// window titled "Choose output folder · Radiance render", listing "(no folders or * files here)",
