@@ -578,76 +578,120 @@ pub fn window_ui(
             );
             ui.separator();
 
-            // ---- THE PAIRS ---------------------------------------------------------------
+            // ---- THE PAIRS, AS TWO COLUMNS WITH A WIRE BETWEEN THEM --------------------
+            //
+            // Asked for as: "on the left below it the block name and on the right side i want the
+            // heading lights and below the light file names associated with block have a link
+            // going from 1 to the other like we have in material factory".
+            //
+            // It is the right shape for this: the window's whole subject is a PAIRING, and a line
+            // drawn between two names says "these two go together" without the reader having to
+            // hold a row's worth of text in their head. The same `CubicBezierShape` the node
+            // editor uses, so the two windows look like one application.
             let listed: Vec<&BlockRow> = rows
                 .iter()
                 .filter(|r| wiring.added.contains(&r.id) || wiring.links.contains_key(&r.id))
                 .collect();
-            ui.label(egui::RichText::new("WIRED PAIRS").small().strong());
-            egui::ScrollArea::vertical().id_source("le_pairs").max_height(220.0).show(ui, |ui| {
-                if listed.is_empty() {
-                    ui.label(
-                        egui::RichText::new(
-                            "Nothing paired yet — ＋ Add block to choose one from the drawing.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                }
-                for r in &listed {
-                    let linked = wiring.links.get(&r.id).cloned();
-                    ui.horizontal(|ui| {
-                        let mut t = egui::RichText::new(format!("{}  ×{}", r.name, r.instances));
-                        if linked.is_some() {
-                            t = t.color(WIRED);
-                        }
-                        if ui
-                            .selectable_label(*pick == Some(r.id), t)
-                            .on_hover_text("Select, then ＋ Add light to give it a fitting")
-                            .clicked()
-                        {
-                            *pick = if *pick == Some(r.id) { None } else { Some(r.id) };
-                        }
-                        match &linked {
-                            Some(p) => {
-                                ui.label(egui::RichText::new("⟶").small().weak());
-                                ui.label(egui::RichText::new(p).small().color(WIRED));
-                            }
-                            None => {
-                                ui.label(
-                                    egui::RichText::new("⟶  no fitting yet").small().weak(),
+
+            if listed.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Nothing paired yet — ＋ Add block to choose one from the drawing.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            } else {
+                // Both columns are laid out first and the wires are drawn AFTER, over the top:
+                // a wire needs the position of a row in each column, and the right-hand one does
+                // not exist yet while the left is being built.
+                let mut left: Vec<(u32, egui::Pos2)> = Vec::new();
+                let mut right: Vec<(u32, egui::Pos2)> = Vec::new();
+                let mut remove: Option<u32> = None;
+                let mut clear: Option<u32> = None;
+
+                egui::ScrollArea::vertical().id_source("le_pairs").max_height(240.0).show(
+                    ui,
+                    |ui| {
+                        ui.columns(2, |col| {
+                            col[0].label(egui::RichText::new("BLOCKS").small().strong());
+                            col[1].label(egui::RichText::new("LIGHTS").small().strong());
+                            for r in &listed {
+                                let linked = wiring.links.get(&r.id).cloned();
+                                // LEFT — the block.
+                                let resp = col[0].selectable_label(
+                                    *pick == Some(r.id),
+                                    egui::RichText::new(format!("{}  ×{}", r.name, r.instances))
+                                        .color(if linked.is_some() {
+                                            WIRED
+                                        } else {
+                                            egui::Color32::from_gray(190)
+                                        }),
                                 );
-                            }
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // REMOVE FROM THE LIST, NOT FROM THE DRAWING. The block table is never
-                            // touched here; this only stops the editor listing it.
-                            if ui
-                                .small_button("✖")
-                                .on_hover_text(
-                                    "Remove this pair from the list. The drawing and its block \
-                                     table are not changed",
-                                )
-                                .clicked()
-                            {
-                                wiring.added.remove(&r.id);
-                                wiring.links.remove(&r.id);
-                                if *pick == Some(r.id) {
-                                    *pick = None;
+                                if resp.clicked() {
+                                    *pick = if *pick == Some(r.id) { None } else { Some(r.id) };
+                                }
+                                resp.context_menu(|ui| {
+                                    if ui.button("Remove this pair").clicked() {
+                                        remove = Some(r.id);
+                                        ui.close_menu();
+                                    }
+                                    if linked.is_some()
+                                        && ui.button("Delete the fittings it placed").clicked()
+                                    {
+                                        clear = Some(r.id);
+                                        ui.close_menu();
+                                    }
+                                });
+                                left.push((r.id, resp.rect.right_center()));
+
+                                // RIGHT — the photometric file it is paired with.
+                                let rr = match &linked {
+                                    Some(p) => col[1].label(
+                                        egui::RichText::new(p.as_str()).color(WIRED),
+                                    ),
+                                    None => col[1].label(
+                                        egui::RichText::new("— no fitting yet —").small().weak(),
+                                    ),
+                                };
+                                if linked.is_some() {
+                                    right.push((r.id, rr.rect.left_center()));
                                 }
                             }
-                            if linked.is_some()
-                                && ui
-                                    .small_button("🗑")
-                                    .on_hover_text("Remove the fittings this block placed")
-                                    .clicked()
-                            {
-                                act.clear_block = Some(r.id);
-                            }
                         });
-                    });
+                    },
+                );
+
+                // THE WIRES. Drawn behind nothing and over nothing important — a thin curve in the
+                // gutter between the columns, which is the only space the layout leaves free.
+                let painter = ui.painter();
+                for (id, a) in &left {
+                    let Some((_, b)) = right.iter().find(|(k, _)| k == id) else { continue };
+                    let dx = (b.x - a.x).abs().max(24.0) * 0.5;
+                    painter.add(egui::epaint::CubicBezierShape::from_points_stroke(
+                        [
+                            *a,
+                            egui::pos2(a.x + dx, a.y),
+                            egui::pos2(b.x - dx, b.y),
+                            *b,
+                        ],
+                        false,
+                        egui::Color32::TRANSPARENT,
+                        egui::Stroke::new(1.6, WIRED.gamma_multiply(0.75)),
+                    ));
                 }
-            });
+
+                if let Some(id) = remove {
+                    wiring.added.remove(&id);
+                    wiring.links.remove(&id);
+                    if *pick == Some(id) {
+                        *pick = None;
+                    }
+                }
+                if let Some(id) = clear {
+                    act.clear_block = Some(id);
+                }
+            }
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -1397,5 +1441,125 @@ mod previews {
         // Uniform in every measured direction — a bare lamp.
         p.candela = vec![vec![1000.0; p.vertical_angles.len()]];
         assert_eq!(profile_figures(&p).beam_deg, None);
+    }
+}
+
+/// PLACING, DELETING AND SELECTING FITTINGS.
+///
+/// Reported together, because from outside they look like one thing: "when the lights are deleted
+/// this diamond shape is left behind", "delete does nothing when a light is selected", and "when i
+/// inserted lights to a block having multiple inserting points it just inserted 1 light in the
+/// middle".
+#[cfg(test)]
+mod fittings_from_blocks {
+    use super::*;
+    use cad_kernel::Vec2;
+
+    /// A drawing with one block placed at `pts`, plus a chair block that must never be touched.
+    fn plan_with(pts: &[(f64, f64)]) -> cad_kernel::Document {
+        let mut doc = cad_kernel::Document::default();
+        doc.dobjects.clear();
+        let b = doc.blocks.add(cad_kernel::Block {
+            name: "test".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(0.3, 0.0),
+            }))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        for &(x, y) in pts {
+            doc.push(cad_kernel::DObject::new(cad_kernel::Geom::BlockRef(cad_kernel::BlockRef {
+                block: b,
+                insert: Vec2::new(x, y),
+                scale: 1.0,
+                scale_y: 1.0,
+                rotation: 0.0,
+                mirror_x: false,
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            })));
+        }
+        doc
+    }
+
+    fn wired(doc: &cad_kernel::Document) -> crate::light_editor::Wiring {
+        let mut w = crate::light_editor::Wiring::default();
+        let id = crate::light_editor::Wiring::block_rows(doc)
+            .iter()
+            .find(|r| r.name == "test")
+            .expect("the block")
+            .id;
+        w.links.insert(id, crate::light::BUILTIN.to_string());
+        w
+    }
+
+    /// TWO INSERTION POINTS, TWO FITTINGS, AT THE TWO POINTS. Reported as one light in the middle
+    /// — which is what an empty placement looks like, because a calculation with no fittings at all
+    /// auto-places a stand-in at the centre of the room.
+    #[test]
+    fn a_block_placed_twice_gets_two_fittings_at_its_two_positions() {
+        let doc = plan_with(&[(2.0, 3.0), (8.0, 3.0)]);
+        let w = wired(&doc);
+        let mut s = crate::light::LightState::new();
+        let (placed, _) = s.apply_block_wiring(&doc, &w);
+
+        assert_eq!(placed, 2, "two insertion points must place two fittings");
+        assert_eq!(s.luminaires.len(), 2, "and both must be in the store");
+        let mut xs: Vec<f32> = s.luminaires.iter().map(|l| l.position.x).collect();
+        xs.sort_by(f32::total_cmp);
+        assert!(
+            (xs[0] - 2.0).abs() < 1e-4 && (xs[1] - 8.0).abs() < 1e-4,
+            "the fittings landed at {xs:?}, not at the block's own insertion points",
+        );
+    }
+
+    /// AND THEY ARE NOT STACKED IN THE MIDDLE. Stated separately from the positions above, because
+    /// "one light in the middle" is the symptom that was reported and a version that placed two
+    /// fittings on the same central point would satisfy a bare count.
+    #[test]
+    fn the_fittings_are_not_all_at_one_point() {
+        let doc = plan_with(&[(2.0, 3.0), (8.0, 3.0), (5.0, 9.0)]);
+        let mut s = crate::light::LightState::new();
+        s.apply_block_wiring(&doc, &wired(&doc));
+        let first = s.luminaires[0].position;
+        assert!(
+            s.luminaires.iter().any(|l| (l.position.x - first.x).abs() > 1e-3),
+            "every fitting landed on the same point",
+        );
+    }
+
+    /// DELETING A FITTING DELETES IT. `delete_selected` is what the Delete key runs, and the
+    /// leftover marker reported in the 3D view is drawn straight off this list — the viewport
+    /// rebuilds every frame and holds no cache of its own, so anything still visible is still
+    /// here.
+    #[test]
+    fn deleting_a_selected_fitting_removes_it_from_the_store() {
+        let doc = plan_with(&[(2.0, 3.0), (8.0, 3.0)]);
+        let mut s = crate::light::LightState::new();
+        s.apply_block_wiring(&doc, &wired(&doc));
+        assert_eq!(s.luminaires.len(), 2);
+
+        s.selected = vec![s.luminaires[0].id];
+        assert_eq!(s.delete_selected(), 1, "one selected, one deleted");
+        assert_eq!(s.luminaires.len(), 1, "the other must survive");
+        assert!(s.selected.is_empty(), "a selection of deleted fittings would be dangling");
+    }
+
+    /// SELECT ALL, DELETE, NOTHING LEFT. The whole-list case, which is what "delete the lights"
+    /// usually means and where a leftover would be most visible.
+    #[test]
+    fn deleting_every_fitting_leaves_none_behind() {
+        let doc = plan_with(&[(2.0, 3.0), (8.0, 3.0), (5.0, 9.0)]);
+        let mut s = crate::light::LightState::new();
+        s.apply_block_wiring(&doc, &wired(&doc));
+        s.select_all();
+        assert_eq!(s.delete_selected(), 3);
+        assert!(
+            s.luminaires.is_empty(),
+            "{} fitting(s) survived a select-all delete",
+            s.luminaires.len(),
+        );
     }
 }
