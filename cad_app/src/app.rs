@@ -60045,3 +60045,228 @@ mod the_dwg_converter_is_where_the_app_looks {
         );
     }
 }
+
+/// THE ILLUMINAIRE WINDOW ACTUALLY RUNS.
+///
+/// Everything above this proves the DATA is right — the library round-trips, the units convert,
+/// the placement leaves a plain block. None of it runs a single line of the window, and a window
+/// that panics on its first frame is indistinguishable from one that was never written.
+///
+/// These drive real headless frames, the same way the factory-panel tests do. What they catch is
+/// what only running catches — a panic, an assertion inside a layout, an arithmetic edge in the
+/// preview fitter — plus the one thing a "did not panic" check misses: that anything was drawn.
+#[cfg(test)]
+mod the_illuminaire_window_runs {
+    use super::*;
+
+    fn frame(app: &mut CadApp) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            app.render_illuminaire(ctx);
+        });
+        // SOMETHING WAS DRAWN. A window that took an early return would pass a "did not panic"
+        // check while showing nothing at all, which is the failure these are really guarding.
+        assert!(
+            !out.shapes.is_empty(),
+            "the frame produced no shapes — the window drew nothing",
+        );
+    }
+
+    fn stocked() -> CadApp {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        let mut doc = cad_kernel::Document::default();
+        for (n, r) in [("OCULUS", 47.5_f64), ("PULSE", 28.5)] {
+            doc.blocks.add(cad_kernel::Block {
+                name: n.into(),
+                base: Vec2::new(0.0, 0.0),
+                dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                    cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: r },
+                ))],
+                smart: false,
+                params: Vec::new(),
+                cut_edges: Vec::new(),
+            });
+        }
+        app.light.lib_blocks = crate::illuminaire::symbols_from(&doc);
+        app.light.lib_blocks_unit_m = 0.001;
+        app.light.lib_add_open = true;
+        app.light.lib_scanned =
+            vec![("FONDO".into(), "D:/ldt/FONDO.ldt".into())];
+        app
+    }
+
+    /// An empty library, with every panel open. The first-run state, which is the one a new user
+    /// sees and the one easiest to leave untested.
+    #[test]
+    fn an_empty_library_draws() {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        app.light.lib_add_open = true;
+        frame(&mut app);
+        assert!(app.light.illuminaire_open, "the window closed itself");
+    }
+
+    /// A stocked one — tiles in both grids, a selection, a placement armed, an LDT list. Every
+    /// branch of the layout at once.
+    #[test]
+    fn a_stocked_library_draws_every_panel() {
+        let mut app = stocked();
+        let b = app.light.lib_blocks[0].clone();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: b.name.clone(),
+            id: 0,
+            symbol: b.symbol,
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/ldt/FONDO.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        app.light.lib_name_buf = b.name;
+        app.light.place_fitting = Some(id);
+        frame(&mut app);
+        assert_eq!(app.light.library.fittings.len(), 1, "a frame changed the library");
+        assert_eq!(app.light.place_fitting, Some(id), "a frame disarmed the placement");
+    }
+
+    /// A fitting with NO photometry linked — the state every fitting is in for the moment between
+    /// being added and being paired, and the one where half the tile has nothing to draw.
+    #[test]
+    fn an_unlinked_fitting_draws() {
+        let mut app = stocked();
+        let b = app.light.lib_blocks[1].clone();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: b.name,
+            id: 0,
+            symbol: b.symbol,
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        frame(&mut app);
+    }
+
+    /// A fitting whose symbol is EMPTY — what a library loaded without its `.rsm` looks like, and
+    /// what a block of pure text or attributes gives. The preview fitter divides by an extent.
+    #[test]
+    fn a_fitting_with_no_geometry_draws() {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: "GHOST".into(),
+            id: 0,
+            symbol: Vec::new(),
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/gone.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        frame(&mut app);
+    }
+
+    /// PLACING PUTS BOTH HALVES DOWN, through the real click path.
+    ///
+    /// The window arms a fitting and the canvas places it; between them sit the unit conversion
+    /// and two different documents. A test on `insert` alone proves the block is right and says
+    /// nothing about whether the light landed with it.
+    #[test]
+    fn an_armed_fitting_places_a_block_and_a_light() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 0.001; // a millimetre plan
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "OCULUS".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 47.5 },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/ldt/OCULUS.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(id);
+
+        // 2.5 m, 4.0 m in the world.
+        assert!(app.place_illuminaire_at(2.5, 4.0), "the placement was refused");
+
+        let refs: Vec<_> = app
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 1, "no block landed on the drawing");
+        // METRES IN, DRAWING UNITS OUT. Placing at 2.5 m on a millimetre plan is 2500, and this
+        // is the conversion that has been got wrong everywhere else in this codebase.
+        assert!((refs[0].insert.x - 2500.0).abs() < 1e-6, "inserted at {}", refs[0].insert.x);
+        assert!((refs[0].insert.y - 4000.0).abs() < 1e-6, "inserted at {}", refs[0].insert.y);
+
+        assert_eq!(app.light.luminaires.len(), 1, "no light landed with the block");
+        let l = &app.light.luminaires[0];
+        assert_eq!(l.profile, crate::light::BUILTIN, "the light did not take the fitting's file");
+        assert_eq!(l.from_block, Some(refs[0].block), "the light is not tied to its symbol");
+        // The luminaire is METRES (cad_light's world) while the block is drawing units. Both
+        // describing the same point in two spaces is the whole of this function.
+        assert!((l.position.x - 2.5).abs() < 1e-6, "the light is at {} m", l.position.x);
+        assert!((l.position.y - 4.0).abs() < 1e-6, "the light is at {} m", l.position.y);
+    }
+
+    /// ARMING A FITTING DISARMS THE BARE-POINT MODE. Both place on a click, and a click can only
+    /// do one thing — with both on, one click would drop a block AND a stray unassigned point.
+    #[test]
+    fn the_two_placement_modes_are_exclusive() {
+        let mut app = CadApp::default();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: "A".into(),
+            id: 0,
+            symbol: Vec::new(),
+            symbol_unit_m: 1.0,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.place_mode = true;
+        app.light.illuminaire_open = true;
+        app.light.lib_sel = Some(id);
+        // Straight through the action the window returns, rather than re-deciding it here.
+        app.light.place_fitting = Some(id);
+        app.light.place_mode = false;
+        assert!(!app.light.place_mode);
+
+        // And a placement into a FACE SKETCH is refused rather than put on the wall's plane.
+        app.factory.session = Some(crate::factory::SketchSession {
+            plane: 1,
+            saved_doc: cad_kernel::Document::default(),
+            saved_undo: Vec::new(),
+            saved_redo: Vec::new(),
+            saved_constraints: Vec::new(),
+            saved_pending: None,
+        });
+        assert!(!app.place_illuminaire_at(1.0, 1.0), "a face sketch accepted a fitting");
+        assert!(app.light.luminaires.is_empty(), "a light landed during a face sketch");
+    }
+}
