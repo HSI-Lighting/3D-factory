@@ -59649,3 +59649,115 @@ mod the_cull_never_drops_what_you_can_see {
         );
     }
 }
+
+
+/// A SAVE FOLLOWED BY A LOAD GIVES BACK WHAT WAS SAVED.
+///
+/// Reported as "its not saving it properly ... when i load it, it loads an older version", with a
+/// sidecar on disk holding four features and `furniture_lib: []`, `furniture: []`, `textures: []`
+/// against a model carrying a 481,738-triangle import.
+///
+/// The pieces were tested one at a time and each was correct, which is exactly the situation where
+/// a round trip is worth more than the sum of them: this drives the REAL `save_file_worker` and
+/// `load_file_worker`, through a real file on disk, and asks the only question that matters —
+/// is what comes back what went in.
+#[cfg(test)]
+mod a_project_survives_a_save_and_a_load {
+    use super::*;
+
+    fn furnished_app() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1000.0, 0.0),
+        })));
+        app.factory.add_box();
+        let mesh = crate::mesh_io::parse_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n",
+        );
+        let a = app.factory.add_furniture_asset("model_20260805-163358".into(), mesh);
+        app.factory.place_furniture(a, glam::Vec3::new(2.99, 0.42, 0.68));
+        app.factory.add_texture("mat0".into(), 4, 4, vec![255; 4 * 4 * 4]);
+        app
+    }
+
+    /// THE WHOLE WAY ROUND, through a real file.
+    #[test]
+    fn the_furniture_and_textures_come_back_off_disk() {
+        let app = furnished_app();
+        assert_eq!(app.factory.furniture_lib.len(), 1, "fixture: one asset");
+        assert_eq!(app.factory.furniture.len(), 1, "fixture: placed once");
+        assert_eq!(app.factory.textures.len(), 1, "fixture: one texture");
+        let tris_in = app.factory.furniture_lib[0].positions.len();
+        assert!(tris_in > 0, "fixture: the asset has geometry");
+
+        let dir = std::env::temp_dir().join("simlux_roundtrip_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("roundtrip.dxf").to_string_lossy().into_owned();
+
+        // EXACTLY what the app does: a lite config plus the raw geometry, handed to the worker.
+        let doc = app.plan_doc().clone();
+        let cfg = app.build_simlux_config_lite();
+        let geom = app.factory.furniture_geom_flat();
+        assert_eq!(cfg.factory.furniture_lib.len(), 1, "the config leaving the UI thread has it");
+        save_file_worker(&path, doc, cfg, geom).expect("the save must succeed");
+
+        // …and exactly what an open does.
+        let payload = load_file_worker(&path).expect("the load must succeed");
+        let sidecar = payload.sidecar.as_ref().expect("a sidecar was written");
+        assert_eq!(
+            payload.furniture.len(), 1,
+            "the imported asset did not come back — the file reopens without it, which is what \
+             an older version of the same project looks like",
+        );
+        assert_eq!(
+            payload.furniture[0].positions.len(), tris_in,
+            "the asset came back with a different amount of geometry",
+        );
+        assert_eq!(sidecar.factory.furniture.len(), 1, "the PLACED instance did not come back");
+        assert_eq!(sidecar.factory.textures.len(), 1, "the texture did not come back");
+        assert!(
+            !sidecar.factory.model.features.is_empty(),
+            "the solid model did not come back",
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(std::path::Path::new(&path)));
+    }
+
+    /// AND THE SIDECAR ON DISK ACTUALLY CONTAINS IT. The assertion above reads what the loader
+    /// hands back; this reads the FILE, which is what the user's evidence was — an empty
+    /// `furniture_lib` in the JSON. A loader that reconstructed something from nothing would
+    /// satisfy the first test and still lose the project.
+    #[test]
+    fn the_file_on_disk_is_not_empty_of_imports() {
+        let app = furnished_app();
+        let dir = std::env::temp_dir().join("simlux_roundtrip_disk");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ondisk.dxf").to_string_lossy().into_owned();
+
+        save_file_worker(
+            &path,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+        )
+        .expect("save");
+
+        let side = crate::simlux_io::sidecar_path(std::path::Path::new(&path));
+        let json = std::fs::read_to_string(&side).expect("the sidecar");
+        assert!(
+            !json.contains("\"furniture_lib\": []"),
+            "the sidecar was written with an EMPTY furniture library — this is the exact text \
+             found in the reported file",
+        );
+        assert!(!json.contains("\"textures\": []"), "the sidecar was written with no textures");
+        assert!(
+            json.contains("model_20260805-163358"),
+            "the asset's name is not in the file at all",
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(std::path::Path::new(&path)));
+    }
+}
