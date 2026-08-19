@@ -2210,6 +2210,16 @@ pub struct Scene3dRenderer {
     taa_valid: bool,
     /// Everything about the last frame that could change the image — see [`FrameKey`].
     taa_key: FrameKey,
+    /// LAST FRAME'S KEY, BROKEN DOWN BY SECTION — the same inputs as `taa_key`, hashed in groups
+    /// so a restart can name WHICH group moved.
+    ///
+    /// A single whole-frame hash answers "did anything change" and nothing else, which is the one
+    /// question that is never in doubt when a viewport is grinding: of course something changed —
+    /// the point is what. On the reported project every frame was sample 1 of 16 at ~300 ms, and
+    /// telling a legitimate orbit from an input that will never settle needed exactly this.
+    taa_sections: [u64; Self::TAA_SECTIONS],
+    /// The section that last restarted the refinement — see [`Self::taa_reason`].
+    taa_why: &'static str,
     /// Whether the last frame's key MATCHED the one before it.
     ///
     /// The renderer only asks the caller to keep repainting once it has seen the frame hold still
@@ -2432,6 +2442,8 @@ impl Default for Scene3dRenderer {
             taa_n: 0,
             taa_valid: false,
             taa_key: FrameKey::default(),
+            taa_sections: [0; Self::TAA_SECTIONS],
+            taa_why: "",
             taa_stable: false,
             taa_dbg: String::new(),
             sky_u_tex: SkyUniforms::default(),
@@ -2822,18 +2834,45 @@ impl Scene3dRenderer {
         self.geom
     }
 
-    /// WHY THE REFINEMENT RESTARTED, or empty when it did not.
+
+    /// How many groups the frame key is hashed in — see [`Self::taa_sections`].
+    const TAA_SECTIONS: usize = 7;
+
+    /// What each group is called, in the order they are folded in.
+    const TAA_SECTION_NAMES: [&'static str; Self::TAA_SECTIONS] = [
+        "camera", "scene", "overlay/lines", "furniture", "textures", "sun/shadow/env", "materials",
+    ];
+
+    /// The FIRST section whose hash moved — the culprit.
+    ///
+    /// Each section hash folds in every earlier one, so once the camera moves every LATER section
+    /// differs too. Naming all of them would point at everything on every restart, which is the
+    /// same as pointing at nothing.
+    ///
+    /// A free function rather than an inline `find`, because the first version of its test
+    /// re-implemented the search instead of calling it — and then passed happily against a
+    /// renderer changed to report the LAST section that moved.
+    fn taa_first_changed(now: &[u64; Self::TAA_SECTIONS], was: &[u64; Self::TAA_SECTIONS]) -> &'static str {
+        Self::TAA_SECTION_NAMES
+            .iter()
+            .zip(now.iter().zip(was.iter()))
+            .find(|(_, (a, b))| a != b)
+            .map(|(name, _)| *name)
+            .unwrap_or("")
+    }
+
+    /// WHICH INPUT RESTARTED THE REFINEMENT, or empty when nothing did.
     ///
     /// Temporal accumulation only pays for itself if a still frame CONVERGES: sample 1 costs a
-    /// full render and sample 16 costs nothing, because the renderer re-presents the finished
-    /// buffer. A frame key that changes every frame inverts that — every frame is sample 1 for
-    /// ever, and a scene heavy enough to want TAA is exactly the scene that then grinds.
+    /// full render and sample 16 costs nothing, because the finished buffer is re-presented. A
+    /// frame key that never settles inverts that — every frame is sample 1, for ever — and a
+    /// scene heavy enough to want TAA is exactly the scene that then grinds.
     ///
-    /// From outside, a legitimately busy camera and a key that will never settle look identical:
-    /// `n=1/16` in the report, on every frame, at 300 ms each. This names which input moved, so
-    /// the two can be told apart from a session dump rather than guessed at.
+    /// From outside, an orbit in progress and a key that will never settle are the same line in a
+    /// report: `n=1/16`, every frame, at 300 ms each. This names the group that moved, which is
+    /// the difference between "you were dragging the camera" and a real defect.
     pub fn taa_reason(&self) -> &str {
-        if self.taa_stable { "" } else { self.taa_dbg.as_str() }
+        if self.taa_stable { "" } else { self.taa_why }
     }
 
     /// Record the frame's geometry for the session dump. Cheap: one `check_framebuffer_status`.
@@ -4283,17 +4322,30 @@ impl Scene3dRenderer {
         // Geometry it re-uploads every frame (overlays, lines, feature surfaces) is hashed whole.
         let taa_on = self.taa_max > 0;
         if taa_on {
-            let mut f = Fnv::new();
+            // HASHED IN SECTIONS, so a restart can say WHICH input moved.
+            //
+            // The whole-frame hash below is still the thing that decides — these are the same
+            // bytes, folded in groups on the way past. A single hash answers "did anything
+            // change", which is the one question never in doubt when a viewport is grinding.
+            let mut sec = [0u64; Self::TAA_SECTIONS];
             let mut dbg = std::mem::take(&mut self.taa_dbg);
+
+            let mut f = Fnv::new();
             f.f32s(mvp);
             f.f32s(&cam_pos);
+            sec[0] = f.0; // camera
+
             f.u64(self.env_version);
             match scene_ver {
                 Some(v) => f.u64(v),
                 None => f.bytes(bytes(verts)),
             }
+            sec[1] = f.0; // scene
+
             f.bytes(bytes(overlay));
             f.bytes(bytes(lines));
+            sec[2] = f.0; // overlay + lines
+
             for (k, m, mv, md) in furn {
                 f.u64(*k);
                 f.u64(m.len() as u64);
@@ -4308,6 +4360,8 @@ impl Scene3dRenderer {
                 // its camera·model changing would otherwise reuse a stale accumulation.
                 f.f32s(md);
             }
+            sec[3] = f.0; // furniture
+
             for (i, w, h, px) in tex_assets {
                 f.u64(*i as u64);
                 f.u64(((*w as u64) << 32) | *h as u64);
@@ -4324,7 +4378,11 @@ impl Scene3dRenderer {
                 f.u64(*ti as u64);
                 f.bytes(bytes(m));
             }
+            sec[4] = f.0; // textures
+
             f.dbg(&mut dbg, &(sun, shadow_mvp, clay, highlight, color, env));
+            sec[5] = f.0; // sun, shadow, colour, environment
+
             for e in tex_reflect {
                 f.dbg(&mut dbg, e);
             }
@@ -4334,10 +4392,25 @@ impl Scene3dRenderer {
             for e in tex_pbr {
                 f.dbg(&mut dbg, e);
             }
+            sec[6] = f.0; // material passes
+
             self.taa_dbg = dbg;
             let key = FrameKey { hash: f.0, size: (vp_w, vp_h) };
             self.taa_stable = key == self.taa_key;
             if !self.taa_stable {
+                // NAME THE SECTIONS THAT MOVED, before overwriting them. Each section hash folds
+                // in every earlier one, so the FIRST that differs is the culprit and the rest
+                // differ only because it did — reporting all of them would point at everything
+                // every time, which is the same as pointing at nothing.
+                let why = Self::taa_first_changed(&sec, &self.taa_sections);
+                self.taa_why = if !why.is_empty() {
+                    why
+                } else if (vp_w, vp_h) != self.taa_key.size {
+                    "viewport"
+                } else {
+                    "?"
+                };
+                self.taa_sections = sec;
                 self.taa_key = key;
                 self.taa_n = 0;
             }
@@ -6839,5 +6912,62 @@ mod a_luminaire_is_drawn_at_its_real_size {
         super::push_luminaire_body(&mut v, [0.0, 0.0, 3.0], Aperture::Rect { l: 0.6, w: 0.6 }, 0.0, 0.0);
         let (lo, hi) = aabb(&v);
         assert!(hi[2] - lo[2] > 0.0, "a flat fitting must still have some body");
+    }
+}
+
+/// THE SLOW-FRAME REPORT HAS TO BE RIGHT, or it sends the next investigation somewhere else.
+///
+/// A viewport grinding at `n=1/16` on every frame is temporal accumulation restarting for ever,
+/// and from outside that is indistinguishable from an orbit in progress. The report names which
+/// GROUP of inputs moved — so if the naming is wrong, the number it produces is worse than none.
+#[cfg(test)]
+mod the_restart_reason_names_the_right_input {
+    use super::*;
+
+    /// THE NAMES LINE UP WITH THE SECTIONS. The reason is chosen by zipping the names against the
+    /// hashes, so a name list one short would silently never report the last group — and the last
+    /// group is the material passes, which is where a per-frame `Debug` of a float would sit.
+    #[test]
+    fn there_is_exactly_one_name_per_section() {
+        assert_eq!(
+            Scene3dRenderer::TAA_SECTION_NAMES.len(),
+            Scene3dRenderer::TAA_SECTIONS,
+            "a section with no name can never be reported",
+        );
+        assert!(
+            Scene3dRenderer::TAA_SECTION_NAMES.iter().all(|n| !n.is_empty()),
+            "an empty name reads as 'no reason given'",
+        );
+    }
+
+    /// THE FIRST DIFFERENCE IS THE CULPRIT, and the rest follow from it.
+    ///
+    /// Each section hash folds in every earlier one, so once the camera moves EVERY later section
+    /// differs too. Reporting all of them would point at everything on every restart, which is the
+    /// same as pointing at nothing — the reason has to be the first.
+    ///
+    /// CALLS THE REAL FUNCTION. The first version of this test re-implemented the search, and
+    /// passed against a renderer changed to report the LAST section that moved.
+    #[test]
+    fn the_reason_is_the_first_section_that_moved_not_all_of_them() {
+        // Cumulative by construction: a change in group 1 changes 1..=6 and leaves 0 alone.
+        let was = [10u64, 20, 30, 40, 50, 60, 70];
+        let now = [10u64, 99, 98, 97, 96, 95, 94];
+        assert_eq!(
+            Scene3dRenderer::taa_first_changed(&now, &was),
+            Scene3dRenderer::TAA_SECTION_NAMES[1],
+            "the reason must be the FIRST group that changed",
+        );
+    }
+
+    /// AND A FRAME THAT DID NOT MOVE REPORTS NOTHING. An always-populated reason would make every
+    /// converged frame look like a restart.
+    #[test]
+    fn an_unchanged_frame_gives_no_reason() {
+        let same = [1u64, 2, 3, 4, 5, 6, 7];
+        assert_eq!(
+            Scene3dRenderer::taa_first_changed(&same, &same), "",
+            "an unchanged frame named a culprit",
+        );
     }
 }
