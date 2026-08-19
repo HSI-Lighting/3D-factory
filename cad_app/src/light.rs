@@ -1437,6 +1437,106 @@ impl LightState {
         out
     }
 
+    /// The fewest POINTS any plane gets, however small the room.
+    ///
+    /// A minimum and an average taken over one sample are the same number, and a uniformity
+    /// computed from them is 1.00. Sixty-four is the old 8 × 8 floor, restated as a total.
+    ///
+    /// AS A TOTAL, and that is the whole difference. The floor used to be 8 cells PER AXIS, which
+    /// on a 1 × 40 m corridor forced the short side to 8 cells — 0.125 m — while the long side sat
+    /// at the requested 0.25 m. The floor exists so a room yields statistics, and statistics come
+    /// from how many samples there are, not from how many lie along each edge; applying it per
+    /// axis bent the cell out of square in the one situation where nothing needed to change.
+    pub const MIN_GRID_POINTS: u64 = 64;
+
+    /// The fewest cells on either axis, so a plane always has at least one interior boundary.
+    pub const MIN_GRID_CELLS: u32 = 2;
+
+    /// The most points a calculation plane may carry, in total.
+    ///
+    /// MEASURED, not chosen for looking safe — see `cad_light/tests/grid_cost.rs`, which times the
+    /// real engine on a room the size of the owner's gym:
+    ///
+    ///     bare room (12 tris)          0.0285 ms per point
+    ///     with clutter (12,012 tris)   0.0780 ms per point
+    ///
+    /// The cost is flat in the number of points from 1,600 to 27,456 of them, and grows only
+    /// slowly with scene size because the tracer has a BVH. So this budget is about 0.5 s on a
+    /// bare room and about 1.3 s on a busy one — the range someone who has just pressed
+    /// ⚡ Calculate will wait through.
+    ///
+    /// It replaces a cap of 64 cells PER AXIS, i.e. 4,096 points ≈ 120 ms. That cap was costing
+    /// the owner's real 33 × 13 m gym its requested 0.25 m resolution to save about 80 ms.
+    pub const MAX_GRID_POINTS: u64 = 16_384;
+
+    /// The grid a `w` × `d` metre plane gets at a requested `cell` size, as `(cols, rows)`.
+    ///
+    /// THE CELL STAYS SQUARE. That is the rule the other two bend around, because a cell size is
+    /// ONE number and the UI shows one number.
+    ///
+    /// The old cap was 64 cells PER AXIS, so a room longer than 64 cells had its long side
+    /// coarsened and its short side left alone: the owner's 33 × 13 m gym came out at 0.52 m along
+    /// x and 0.25 m along y — a 2.06:1 cell, past even the 2:1 EN 12464-1 allows, while every
+    /// number on screen said 0.25 m. Average, minimum and uniformity were then taken over two
+    /// different resolutions at once.
+    ///
+    /// So both bounds scale BOTH axes by the same factor:
+    ///
+    ///   * below `MIN_GRID_POINTS` the grid is refined until there are enough samples to have
+    ///     statistics at all;
+    ///   * above `MAX_GRID_POINTS` it is coarsened, because every point is a full trace and an
+    ///     unbounded grid on a site plan is a calculation that never finishes. A bound is right;
+    ///     the previous one was set 4× too low.
+    pub fn grid_for(w: f32, d: f32, cell: f32) -> (u32, u32) {
+        let cell = cell.max(1e-3);
+        let want = |m: f32| {
+            let n = (m.max(0.0) / cell).round();
+            // Clamped before the cast: `f32 as u32` saturates rather than wrapping, but an
+            // intermediate of 1e12 would still make the product below meaningless.
+            (n.clamp(Self::MIN_GRID_CELLS as f32, 1e6) as u32).max(Self::MIN_GRID_CELLS)
+        };
+        let (cols, rows) = (want(w), want(d));
+        let points = cols as u64 * rows as u64;
+        // One factor, applied to both axes, whichever bound is being met — `sqrt` because the
+        // budget is on the PRODUCT and the shape has to be preserved.
+        //
+        // EACH DIRECTION ROUNDS THE WAY THAT KEEPS ITS OWN BOUND. Coarsening rounds DOWN, or a
+        // scaled-then-rounded pair lands just past the ceiling it was called to respect — 16,428
+        // points against a 16,384 budget, which a test caught. Refining rounds UP, or it stops
+        // short of the minimum it was called to reach. Rounding to nearest is wrong for both.
+        let (k, up) = if points > Self::MAX_GRID_POINTS {
+            ((Self::MAX_GRID_POINTS as f64 / points as f64).sqrt(), false)
+        } else if points < Self::MIN_GRID_POINTS {
+            ((Self::MIN_GRID_POINTS as f64 / points as f64).sqrt(), true)
+        } else {
+            return (cols, rows);
+        };
+        let scale = |n: u32| {
+            let s = n as f64 * k;
+            ((if up { s.ceil() } else { s.floor() }) as u32).max(Self::MIN_GRID_CELLS)
+        };
+        (scale(cols), scale(rows))
+    }
+
+    /// What to say when the grid is not the one that was asked for — `None` when it is.
+    ///
+    /// A note on every calculation is a note nobody reads, so this is silent in the ordinary case
+    /// and names both numbers in the case that matters: what was requested, and what was used.
+    pub fn grid_note(&self, w: f32, d: f32) -> Option<String> {
+        let (cols, rows) = Self::grid_for(w, d, self.cell_size);
+        let (sx, sy) = (w / cols as f32, d / rows as f32);
+        let used = sx.max(sy);
+        // A fifth of a cell — comfortably past rounding a room's extent onto a whole number of
+        // cells, and well short of the doubling this exists to report.
+        if (used - self.cell_size).abs() <= self.cell_size * 0.2 {
+            return None;
+        }
+        Some(format!(
+            "grid coarsened to {used:.2} m from the {:.2} m asked for — {} points is the limit",
+            self.cell_size, Self::MAX_GRID_POINTS,
+        ))
+    }
+
     pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
         let meshes = self.scene_meshes(doc, factory);
         // The calculation plane must cover whatever is actually being lit. With a 3D model that is
@@ -1470,8 +1570,8 @@ impl LightState {
             return;
         };
         let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
-        let cols = ((w / self.cell_size).round() as u32).clamp(8, 64);
-        let rows = ((d / self.cell_size).round() as u32).clamp(8, 64);
+        let (cols, rows) = Self::grid_for(w, d, self.cell_size);
+        let grid_note = self.grid_note(w, d);
         let plane = CalcPlane {
             origin: Vertex::new(min_x, min_y, self.plane_height),
             width: w,
@@ -1590,6 +1690,14 @@ impl LightState {
                 n => format!("  ⚠ {n} point(s) have no fitting and emit nothing — pick one in ▼ Fittings"),
             },
         );
+        // A COARSENED GRID SAYS SO. Every figure on this line moves with grid resolution, so
+        // presenting one computed at a spacing nobody asked for as though it were the requested
+        // one is the part that matters — a coarser grid is a defensible answer to an enormous
+        // room, and silence about it is not.
+        if let Some(note) = grid_note {
+            self.last_msg.push_str("  ⚠ ");
+            self.last_msg.push_str(&note);
+        }
         self.grid = Some(grid);
         self.plane = Some(plane);
         self.meshes = meshes;
@@ -2713,6 +2821,136 @@ pub fn legend_bar_with(ui: &mut egui::Ui, max: f64, ramp: LuxRamp) {
     });
 }
 
+
+/// THE GRID THE UI PROMISES IS THE GRID THAT GETS CALCULATED — or the app says otherwise.
+///
+/// The cell size was clamped PER AXIS to at most 64 cells. On a room longer than 64 cells that
+/// silently coarsened the long axis and left the short one alone, so the grid came out
+/// RECTANGULAR while every number on screen described a square one. Min, average and uniformity
+/// all move with grid resolution, so this changed figures people put in front of clients.
+///
+/// Measured on the owner's real project — a 33 × 13 m gym at the default 0.25 m cell: 64 × 52
+/// cells, which is 0.52 m spacing along x and 0.25 m along y. Twice as coarse one way as the
+/// other, with the UI saying 0.25 throughout.
+#[cfg(test)]
+mod the_grid_is_the_one_the_ui_says {
+    use super::*;
+
+    /// The two cell spacings a `w` × `d` plane actually gets, in metres.
+    fn spacing(w: f32, d: f32, cell: f32) -> (f32, f32) {
+        let (cols, rows) = LightState::grid_for(w, d, cell);
+        (w / cols as f32, d / rows as f32)
+    }
+
+    /// THE OWNER'S ROOM. Stated on its own, with its own numbers, because this is the case the
+    /// clamp was found on and a property test can drift away from it.
+    #[test]
+    fn the_gym_is_not_sampled_twice_as_coarsely_along_its_length() {
+        let (sx, sy) = spacing(33.0, 13.0, 0.25);
+        assert!(
+            (sx / sy - 1.0).abs() < 0.05,
+            "a 33 × 13 m room came out {sx:.3} m along x and {sy:.3} m along y — the grid is \
+             rectangular and every figure derived from it is an average over two resolutions",
+        );
+    }
+
+    /// SQUARE, WHATEVER THE ROOM. The general form: no aspect ratio may produce a grid whose two
+    /// spacings differ, because a cell size is one number and the UI shows one number.
+    #[test]
+    fn every_room_gets_a_square_grid() {
+        for (w, d) in [
+            (33.0_f32, 13.0_f32), (100.0, 4.0), (4.0, 100.0), (7.0, 7.0),
+            (250.0, 60.0), (1.0, 40.0), (0.5, 0.5),
+        ] {
+            let (sx, sy) = spacing(w, d, 0.25);
+            assert!(
+                (sx / sy - 1.0).abs() < 0.06,
+                "a {w} × {d} m room is sampled at {sx:.3} m by {sy:.3} m",
+            );
+        }
+    }
+
+    /// WHEN IT FITS, IT IS HONOURED EXACTLY. A budget that quietly coarsened everything would
+    /// satisfy "square" and still be wrong; this is the half that stops that.
+    #[test]
+    fn a_room_that_fits_gets_the_cell_size_it_asked_for() {
+        for (w, d, cell) in [(8.0_f32, 6.0_f32, 0.25_f32), (12.0, 10.0, 0.5), (33.0, 13.0, 1.0)] {
+            let (sx, sy) = spacing(w, d, cell);
+            assert!(
+                (sx - cell).abs() < cell * 0.05 && (sy - cell).abs() < cell * 0.05,
+                "a {w} × {d} m room asked for {cell} m and got {sx:.3} × {sy:.3}",
+            );
+        }
+    }
+
+    /// A TINY ROOM STILL GETS ENOUGH POINTS TO SAY ANYTHING. A 1 m cupboard at a 1 m cell would
+    /// otherwise be one sample, and a minimum and an average over one point are the same number.
+    #[test]
+    fn a_small_room_is_still_sampled_enough_to_have_statistics() {
+        let (cols, rows) = LightState::grid_for(1.0, 1.0, 1.0);
+        assert!(
+            cols as u64 * rows as u64 >= LightState::MIN_GRID_POINTS,
+            "a 1 m room got a {cols} × {rows} grid",
+        );
+    }
+
+    /// …AND THE FLOOR DOES NOT BEND THE CELL OUT OF SQUARE. It used to be 8 cells PER AXIS, so a
+    /// 1 × 40 m corridor had its short side forced to 0.125 m while its long side sat at the
+    /// requested 0.25 m — the floor firing in the one case where nothing needed to change, because
+    /// 4 × 160 is already 640 samples. Statistics come from how many samples there are, not from
+    /// how many lie along each edge.
+    #[test]
+    fn a_long_corridor_is_not_refined_on_its_short_side_alone() {
+        let (sx, sy) = spacing(1.0, 40.0, 0.25);
+        assert!(
+            (sx - 0.25).abs() < 0.02 && (sy - 0.25).abs() < 0.02,
+            "a 1 × 40 m corridor asked for 0.25 m and got {sx:.3} × {sy:.3}",
+        );
+    }
+
+    /// AND THE COST IS STILL BOUNDED. Every point is a full trace against the scene, so an
+    /// unbounded grid on a site plan is a calculation that never finishes — which is the reason
+    /// the per-axis clamp existed and is not the part that was wrong with it.
+    #[test]
+    fn a_site_sized_plan_cannot_ask_for_an_unbounded_calculation() {
+        let (cols, rows) = LightState::grid_for(400.0, 300.0, 0.05);
+        let points = cols as u64 * rows as u64;
+        assert!(
+            points <= LightState::MAX_GRID_POINTS,
+            "a 400 × 300 m plan at 50 mm asked for {points} points",
+        );
+    }
+
+    /// AND WHEN THE BUDGET BITES, THE APP SAYS SO. Silence is the actual defect here: a coarser
+    /// grid is a defensible answer to an enormous room, and presenting it as the requested one is
+    /// not. The message names the spacing that was really used.
+    #[test]
+    fn coarsening_the_grid_is_reported_not_hidden() {
+        let mut s = LightState::new();
+        s.cell_size = 0.05;
+        let note = s.grid_note(400.0, 300.0);
+        let note = note.expect("a 400 × 300 m plan at 50 mm must be coarsened, and must say so");
+        assert!(
+            note.contains("0.05") && note.contains('m'),
+            "the note must name the cell size that was asked for: {note:?}",
+        );
+        let (sx, sy) = spacing(400.0, 300.0, 0.05);
+        let used = format!("{:.2}", sx.max(sy));
+        assert!(
+            note.contains(&used),
+            "the note must name the spacing actually used ({used} m): {note:?}",
+        );
+    }
+
+    /// …AND SAYS NOTHING WHEN IT DID WHAT WAS ASKED. A note on every calculation is a note
+    /// nobody reads.
+    #[test]
+    fn a_grid_that_was_honoured_is_not_announced() {
+        let mut s = LightState::new();
+        s.cell_size = 0.25;
+        assert_eq!(s.grid_note(8.0, 6.0), None, "an ordinary room must not be flagged");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
