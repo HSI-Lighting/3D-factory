@@ -262,19 +262,80 @@ impl Library {
     }
 }
 
-/// Every block definition in `doc`, as library-ready symbols: `(block name, geometry)`.
+/// One block offered in the add panel: what it is called, what it is made of, and how big it is.
+#[derive(Clone, Debug, Default)]
+pub struct BlockRow {
+    pub name: String,
+    pub symbol: Vec<SymbolGeom>,
+    /// Extent in DRAWING units, `[width, height]`. Zero when there is nothing drawable in it.
+    ///
+    /// Shown beside the name so the unit can be CHECKED rather than trusted. The real block file
+    /// this feature was built for declares itself in inches and is drawn in millimetres — the
+    /// 2 m batten in it reads as 2000 units, and 2000 inches is 50 metres. Nothing in the
+    /// geometry can settle that; a person reading "2000 × 48 mm" against a product they know can,
+    /// in one glance, which is the whole reason the figure is on screen.
+    pub size: [f64; 2],
+}
+
+/// Every block definition in `doc`, as library-ready symbols.
 ///
 /// This is how a fixture library gets in — point Illuminaire at a drawing full of symbols and it
 /// reads the block table. Nested block references are EXPANDED rather than referenced, for the
 /// same reason a symbol carries its geometry at all: whatever a fitting is made of has to travel
 /// with it.
-pub fn symbols_from(doc: &Document) -> Vec<(String, Vec<SymbolGeom>)> {
+pub fn symbols_from(doc: &Document) -> Vec<BlockRow> {
     doc.blocks
         .blocks
         .iter()
         .enumerate()
-        .map(|(i, b)| (b.name.clone(), flatten_block(doc, i as u32, 0)))
+        .map(|(i, b)| {
+            let symbol = flatten_block(doc, i as u32, 0);
+            BlockRow { name: b.name.clone(), size: symbol_extent(&symbol), symbol }
+        })
         .collect()
+}
+
+/// The bounding extent of a flattened symbol, in the units it was authored in.
+///
+/// Measured off the DISPLAY outlines, the same tessellation the preview draws, so a circle
+/// measures as its diameter rather than as the extent of its centre point.
+pub fn symbol_extent(sym: &[SymbolGeom]) -> [f64; 2] {
+    let empty = Document::default();
+    let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let mut any = false;
+    for s in sym {
+        for path in cad_solid::geom_display_outlines_scaled(&s.geom, &empty, 1.0) {
+            for p in path {
+                any = true;
+                mnx = mnx.min(p.x);
+                mny = mny.min(p.y);
+                mxx = mxx.max(p.x);
+                mxy = mxy.max(p.y);
+            }
+        }
+    }
+    if !any {
+        return [0.0, 0.0];
+    }
+    [(mxx - mnx) as f64, (mxy - mny) as f64]
+}
+
+/// The units a block file can be declared in, for the add panel's chooser.
+///
+/// `$INSUNITS` IS OFTEN WRONG, and it is wrong in the file this was built against. A symbol that
+/// arrives 25.4 times too big is not subtle on the plan, but it is silent — nothing reports it,
+/// and the fitting is simply the wrong size in every drawing made from it afterwards. So the
+/// declared unit is the DEFAULT, not the answer.
+pub const UNIT_CHOICES: [(&str, f64); 4] =
+    [("mm", 0.001), ("cm", 0.01), ("m", 1.0), ("inch", 0.0254)];
+
+/// The label for a metres-per-unit value, or a bare figure when it is none of the usual ones.
+pub fn unit_label(m: f64) -> String {
+    UNIT_CHOICES
+        .iter()
+        .find(|(_, k)| (k - m).abs() < 1e-9)
+        .map(|(n, _)| (*n).to_string())
+        .unwrap_or_else(|| format!("{m} m/unit"))
 }
 
 /// Depth cap on nested block expansion. A drawing can describe a cycle — `read_blocks` resolves
@@ -596,6 +657,8 @@ pub struct Action {
     pub blocks_from_drawing: bool,
     /// Add a fitting from the block at this index of `blocks`.
     pub add: Option<usize>,
+    /// Reinterpret the loaded blocks as being drawn in this many metres per unit.
+    pub set_blocks_unit: Option<f64>,
     /// Link (or relink) this fitting to this photometric file.
     pub link: Option<(u32, String)>,
     /// Rename this fitting.
@@ -613,7 +676,7 @@ pub struct WindowInput<'a> {
     /// Blocks offered in the add panel, with their flattened symbols. Cached by the caller: a
     /// real plan has hundreds of block definitions and flattening them all every frame is work
     /// nobody asked for.
-    pub blocks: &'a [(String, Vec<SymbolGeom>)],
+    pub blocks: &'a [BlockRow],
     /// Where those blocks came from, for the panel's heading.
     pub blocks_from: &'a str,
     /// Photometric files found in the folder: (stem, full path).
@@ -624,6 +687,8 @@ pub struct WindowInput<'a> {
     pub profiles: &'a std::collections::HashMap<String, cad_light::IesProfile>,
     /// The fitting currently armed for placement, if any.
     pub placing: Option<u32>,
+    /// What one unit of those blocks is worth in metres.
+    pub blocks_unit_m: f64,
 }
 
 /// Paint a symbol's linework into `rect`, fitted and centred.
@@ -805,6 +870,8 @@ pub fn window_ui(
     let tile_h = 66.0_f32;
     let cell_w = tile_w + 8.0;
     let cell_h = tile_h + 22.0;
+    // The add panel carries a second line under each tile — the measured size.
+    let block_cell_h = cell_h + 11.0;
 
     egui::Window::new("Illuminaire")
         .id(egui::Id::new("illuminaire"))
@@ -962,8 +1029,7 @@ pub fn window_ui(
                         if ui
                             .button("📂  Load block file…")
                             .on_hover_text(
-                                "A .dxf of block definitions — e.g. LIGHT BLOCK.dwg converted to \
-                                 DXF",
+                                "Fixture symbols from a drawing’s block table — .dwg or .dxf. A .dwg is converted on the way in.",
                             )
                             .clicked()
                         {
@@ -973,6 +1039,29 @@ pub fn window_ui(
                             act.blocks_from_drawing = true;
                         }
                     });
+                });
+                // WHAT THE BLOCKS ARE DRAWN IN — offered, not assumed.
+                //
+                // A DXF states its unit and the statement is often wrong. The file this was built
+                // against declares inches and holds a 2 m batten drawn as 2000 units, which under
+                // its own declaration is a fifty-metre luminaire. Nothing downstream would report
+                // that; the fitting would simply be the wrong size in every drawing made from it.
+                // So the declared unit fills this in and the sizes beside each block let it be
+                // checked in one glance.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Drawn in").small().weak());
+                    for (label, m) in UNIT_CHOICES {
+                        let on = (input.blocks_unit_m - m).abs() < 1e-9;
+                        if ui.selectable_label(on, label).clicked() && !on {
+                            act.set_blocks_unit = Some(m);
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new("— sizes below are in this unit; if they look wrong, \
+                                             the file's declaration was wrong")
+                            .small()
+                            .weak(),
+                    );
                 });
                 ui.add_space(3.0);
                 if input.blocks.is_empty() {
@@ -986,27 +1075,36 @@ pub fn window_ui(
                         let cols = ((ui.available_width() / cell_w).floor() as usize).max(1);
                         let rows = input.blocks.len().div_ceil(cols).max(1);
                         let (alloc, _) = ui.allocate_exact_size(
-                            egui::vec2(cols as f32 * cell_w, rows as f32 * cell_h + 4.0),
+                            egui::vec2(cols as f32 * cell_w, rows as f32 * block_cell_h + 4.0),
                             egui::Sense::hover(),
                         );
                         let org = alloc.left_top();
-                        for (i, (name, geoms)) in input.blocks.iter().enumerate() {
+                        let u = unit_label(input.blocks_unit_m);
+                        for (i, b) in input.blocks.iter().enumerate() {
                             let r = egui::Rect::from_min_size(
                                 org + egui::vec2(
                                     (i % cols) as f32 * cell_w,
-                                    (i / cols) as f32 * cell_h,
+                                    (i / cols) as f32 * block_cell_h,
                                 ),
                                 egui::vec2(tile_w, tile_h),
                             );
-                            let paths = symbol_preview_paths(geoms);
+                            let paths = symbol_preview_paths(&b.symbol);
                             let resp = tile(
                                 ui,
                                 r,
                                 &paths,
                                 None,
-                                name,
+                                &b.name,
                                 false,
                                 egui::Id::new(("illum_block", i)),
+                            );
+                            // The measured size, under the tile, in whichever unit is selected.
+                            ui.painter().text(
+                                egui::pos2(r.center().x, r.bottom() + 20.0),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{:.0} × {:.0} {u}", b.size[0], b.size[1]),
+                                egui::FontId::proportional(9.0),
+                                egui::Color32::from_gray(130),
                             );
                             if resp.on_hover_text("Add this block as a fitting").clicked() {
                                 act.add = Some(i);
@@ -1211,8 +1309,82 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let syms = symbols_from(&doc);
-        let d = syms.iter().find(|(n, _)| n == "DOWNLIGHT").expect("the block");
-        assert_eq!(d.1.len(), 1, "the symbol lost its geometry");
+        let d = syms.iter().find(|b| b.name == "DOWNLIGHT").expect("the block");
+        assert_eq!(d.symbol.len(), 1, "the symbol lost its geometry");
+        // AND ITS MEASURED SIZE, which is what lets a wrong unit declaration be seen. A 50-unit
+        // radius circle is 100 across; reporting the radius, or the extent of its centre point,
+        // would put every round fitting at half size or at nothing.
+        assert!((d.size[0] - 100.0).abs() < 0.5, "the block measured {} across", d.size[0]);
+        assert!((d.size[1] - 100.0).abs() < 0.5, "the block measured {} tall", d.size[1]);
+    }
+
+    /// A BLOCK FILE'S DECLARED UNIT IS OFTEN WRONG, and the panel has to make that visible.
+    ///
+    /// The real file this was built against (`LIGHT BLOCK.dwg`) declares `$INSUNITS` = inches and
+    /// holds a batten named "(2M)" drawn as 2000 units — millimetres. Trusted, that fitting enters
+    /// the library at 2000 × 0.0254 = 50.8 metres long, and every plan drawn from it is wrong by a
+    /// factor of 25.4 with nothing anywhere reporting it.
+    ///
+    /// Nothing in the geometry can settle which unit is meant. What CAN settle it is a person
+    /// reading the measured size against a product they know — so the size is measured here, and
+    /// the label it is shown in is chosen, not assumed.
+    #[test]
+    fn a_block_reports_the_size_it_was_drawn_at() {
+        let mut doc = Document::default();
+        doc.blocks.add(Block {
+            name: "LINEA W48X80 - (2M)".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![DObject::new(Geom::Line(Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(2000.0, 0.0),
+            }))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = symbols_from(&doc);
+        let b = rows.iter().find(|b| b.name.starts_with("LINEA")).expect("the batten");
+        // The FIGURE is the drawn one — unconverted. Converting it here would fold the wrong
+        // declaration into the very number that exists to expose it.
+        assert!((b.size[0] - 2000.0).abs() < 1e-6, "the batten measured {}", b.size[0]);
+        assert!(b.size[1].abs() < 1e-6, "a single line has no height: {}", b.size[1]);
+    }
+
+    /// AN EMPTY BLOCK MEASURES NOTHING rather than a bounding box between two infinities.
+    #[test]
+    fn a_block_with_nothing_in_it_measures_zero() {
+        let mut doc = Document::default();
+        doc.blocks.add(Block {
+            name: "EMPTY".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: Vec::new(),
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = symbols_from(&doc);
+        assert_eq!(rows[0].size, [0.0, 0.0], "an empty block measured {:?}", rows[0].size);
+    }
+
+    /// THE UNIT CHOICES NAME REAL UNITS, and the label round-trips the value the file states.
+    ///
+    /// The chooser writes `metres_per_unit` straight onto the fitting, so a choice mislabelled by
+    /// a factor of ten is a silent tenfold error in every fitting added under it.
+    #[test]
+    fn the_unit_choices_are_what_they_say() {
+        for (label, m) in UNIT_CHOICES {
+            assert_eq!(unit_label(m), label, "{label} round-tripped wrong");
+        }
+        let by = |n: &str| UNIT_CHOICES.iter().find(|(l, _)| *l == n).expect(n).1;
+        assert!((by("mm") - 0.001).abs() < 1e-12);
+        assert!((by("cm") - 0.01).abs() < 1e-12);
+        assert!((by("m") - 1.0).abs() < 1e-12);
+        assert!((by("inch") - 0.0254).abs() < 1e-12, "an inch is 25.4 mm");
+        // The unit the real block file declares must be one of the offered ones, or the panel
+        // opens with nothing selected and the user cannot tell what it defaulted to.
+        assert_eq!(unit_label(0.0254), "inch");
+        // Anything else says so rather than silently reading as one of them.
+        assert!(unit_label(0.3048).contains("0.3048"), "a foot must not be labelled as an offer");
     }
 
     /// A NESTED BLOCK IS EXPANDED, not dropped. A fixture drawn as a housing block plus a lamp
@@ -1251,10 +1423,10 @@ mod tests {
             cut_edges: Vec::new(),
         });
         let syms = symbols_from(&doc);
-        let f = syms.iter().find(|(n, _)| n == "FIXTURE").expect("the fixture");
-        assert_eq!(f.1.len(), 2, "the nested lamp was dropped: {:?}", f.1.len());
+        let f = syms.iter().find(|b| b.name == "FIXTURE").expect("the fixture");
+        assert_eq!(f.symbol.len(), 2, "the nested lamp was dropped: {:?}", f.symbol.len());
         assert!(
-            f.1.iter().any(|g| matches!(g.geom, Geom::Circle(_))),
+            f.symbol.iter().any(|g| matches!(g.geom, Geom::Circle(_))),
             "the nested block came through as something other than its own geometry",
         );
     }
@@ -1701,4 +1873,5 @@ mod previews {
         assert_eq!(profile_figures(&p).beam_deg, None);
     }
 }
+
 

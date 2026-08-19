@@ -90,6 +90,18 @@ if (Test-Path $logo) {
     Copy-Item $logo (Join-Path $out 'assets\logo.svg')
 }
 
+# The DWG -> DXF wrapper. `dwg_converter` walks the ancestors of the EXECUTABLE looking for
+# `tools\dwgconv\dwgconv.cmd`, so it has to sit beside simlux.exe in the same shape it sits in the
+# repo. Ship the exe without it and opening a .dwg -- or loading a .dwg block library into
+# Illuminaire -- reports "no DWG converter found", which reads as a missing feature rather than a
+# missing file.
+$conv = Join-Path $repo 'tools\dwgconv'
+if (Test-Path $conv) {
+    Copy-Item -Recurse $conv (Join-Path $out 'tools\dwgconv')
+} else {
+    Write-Warning "tools\dwgconv is missing -- .dwg files will not open in this build"
+}
+
 Copy-Item (Join-Path $PSScriptRoot 'Install.ps1') $out
 Copy-Item (Join-Path $PSScriptRoot 'README.txt')  $out
 
@@ -108,7 +120,7 @@ Set-Content -Path (Join-Path $out 'BUILD-INFO.txt') -Value $info -Encoding ascii
 
 # A quick integrity check, so a broken package is caught HERE and not on the other machine.
 $missing = @()
-foreach ($f in @('simlux.exe', 'assets\apertures\window.obj', 'assets\handles\handles.json', 'Install.ps1', 'BUILD-INFO.txt')) {
+foreach ($f in @('simlux.exe', 'assets\apertures\window.obj', 'assets\handles\handles.json', 'tools\dwgconv\dwgconv.cmd', 'Install.ps1', 'BUILD-INFO.txt')) {
     if (-not (Test-Path (Join-Path $out $f))) { $missing += $f }
 }
 if ($missing.Count) { throw "package is incomplete, missing: $($missing -join ', ')" }

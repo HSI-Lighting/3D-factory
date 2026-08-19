@@ -4232,6 +4232,7 @@ impl CadApp {
                 folder: &self.light.lib_folder,
                 profiles: &profiles,
                 placing: self.light.place_fitting,
+                blocks_unit_m: self.light.lib_blocks_unit_m,
             },
         );
 
@@ -4277,12 +4278,13 @@ impl CadApp {
             // The symbol is copied in the units of whatever document it was read FROM — a block
             // file drawn in millimetres stays millimetres in the library, and the conversion
             // happens once, at placement, against the destination drawing.
-            if let Some((name, geoms)) = self.light.lib_blocks.get(i).cloned() {
+            if let Some(b) = self.light.lib_blocks.get(i).cloned() {
                 let unit = self.light.lib_blocks_unit_m;
+                let name = b.name.clone();
                 let id = self.light.library.add(crate::illuminaire::Fitting {
                     name: name.clone(),
                     id: 0,
-                    symbol: geoms,
+                    symbol: b.symbol,
                     symbol_unit_m: unit,
                     ldt_path: String::new(),
                     profile: String::new(),
@@ -4337,6 +4339,9 @@ impl CadApp {
             let what = self.light.library.get(id).map(|f| f.name.clone()).unwrap_or_default();
             self.light.last_msg = format!("Placing \"{what}\" — click the plan. Esc stops.");
         }
+        if let Some(m) = act.set_blocks_unit {
+            self.light.lib_blocks_unit_m = m;
+        }
         if act.stop_placing {
             self.light.place_fitting = None;
             self.light.last_msg = "Stopped placing.".into();
@@ -4360,6 +4365,23 @@ impl CadApp {
     /// symbols and nothing else. Opening it as a drawing would replace what the user is working
     /// on, which is the opposite of what picking a block library means.
     fn load_illuminaire_blocks(&mut self, path: &str) {
+        // A .dwg IS THE COMMON CASE HERE — the file this feature was asked for is "LIGHT
+        // BLOCK.dwg". Converting it in place is the same route `do_open` takes, so a block
+        // library needs no more preparation than a drawing does.
+        let converted;
+        let mut path = path;
+        if path.to_lowercase().ends_with(".dwg") {
+            match self.convert_dwg_to_dxf(path) {
+                Ok(p) => {
+                    converted = p.to_string_lossy().into_owned();
+                    path = &converted;
+                }
+                Err(e) => {
+                    self.history.push(format!("  illuminaire: {path} — {e}"));
+                    return;
+                }
+            }
+        }
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             // DXF is 7-bit in practice but not guaranteed; a Latin-1 drawing must not be an error.
@@ -4389,14 +4411,7 @@ impl CadApp {
                 ));
             }
             Err(e) => {
-                // A .dwg reaching here is the common case, and "expected 0, got SECTION" would
-                // send the user looking for a corrupt file rather than for a converter.
-                let hint = if path.to_lowercase().ends_with(".dwg") {
-                    "  — .dwg is not readable directly; save it as DXF first"
-                } else {
-                    ""
-                };
-                self.history.push(format!("  illuminaire: could not read {path} — {e}{hint}"));
+                self.history.push(format!("  illuminaire: could not read {path} — {e}"));
             }
         }
     }
@@ -59991,5 +60006,42 @@ mod a_project_survives_a_save_and_a_load {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(std::path::Path::new(&path)));
+    }
+}
+
+/// THE DWG CONVERTER IS FOUND WHERE THE APP LOOKS FOR IT.
+///
+/// `dwg_converter` walks the ancestors of the running executable for
+/// `tools/dwgconv/dwgconv.cmd`. That is a fact about the REPOSITORY LAYOUT — move the wrapper,
+/// or ship a build without it, and DWG open stops working with a message about setting an
+/// environment variable, which is a support call rather than a bug report.
+#[cfg(test)]
+mod the_dwg_converter_is_where_the_app_looks {
+    /// The wrapper is in the tree, next to where the search expects it.
+    #[test]
+    fn the_wrapper_is_in_the_repository() {
+        // The test binary lives in target/debug/deps, so the same ancestor walk finds the repo.
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let found = exe.ancestors().any(|a| a.join("tools/dwgconv/dwgconv.cmd").is_file()
+            || a.join("tools/dwgconv/dwgconv.sh").is_file());
+        assert!(
+            found,
+            "no tools/dwgconv wrapper above {} — DWG open will report 'no DWG converter found'",
+            exe.display(),
+        );
+    }
+
+    /// And `dwg_converter` actually returns it, rather than falling through to the PATH probe.
+    #[test]
+    fn the_search_returns_it() {
+        // The env override wins by design, so a machine that sets one is not being tested here.
+        if std::env::var("RUSTCAD_DWGCONV").is_ok() {
+            return;
+        }
+        let c = super::dwg_converter().expect("the converter search found nothing");
+        assert!(
+            c.to_lowercase().contains("dwgconv"),
+            "the search returned {c:?}, which is not the wrapper",
+        );
     }
 }

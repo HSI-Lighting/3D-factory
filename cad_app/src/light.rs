@@ -391,7 +391,7 @@ pub struct LightState {
     pub lib_scanned: Vec<(String, String)>,
     /// The blocks offered in the add panel, flattened once when the panel is filled rather than
     /// every frame — a real plan has hundreds of definitions.
-    pub lib_blocks: Vec<(String, Vec<crate::illuminaire::SymbolGeom>)>,
+    pub lib_blocks: Vec<crate::illuminaire::BlockRow>,
     /// Where those blocks came from, for the panel heading.
     pub lib_blocks_from: String,
     /// The unit those blocks were authored in, metres per drawing unit — carried onto a fitting
