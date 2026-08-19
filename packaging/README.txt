@@ -1,6 +1,133 @@
 SIMLUX -- Lighting Designer
 ==========================
 
+WHAT IS NEW SINCE BUILD 4
+-------------------------
+READ THE FIRST FOUR ITEMS EVEN IF YOU READ NOTHING ELSE. They change numbers you may already
+have quoted, and they change them for good reasons -- but a figure that moves without warning is
+worse than one that was wrong quietly.
+
+
+NUMBERS THAT HAVE MOVED
+
+  * THE LUX GRID IS NOW THE ONE THE PANEL SAYS IT IS.
+    The calculation plane was capped at 64 cells PER AXIS. On any room longer than 64 cells that
+    coarsened the long side and left the short one alone, so the grid came out RECTANGULAR while
+    the cell-size field said one number. A 33 x 13 m hall at the default 0.25 m was being sampled
+    at 0.52 m along its length and 0.25 m across -- and average, minimum and uniformity were all
+    taken over two resolutions at once.
+    Both axes are now coarsened together when a budget is reached, so a cell stays square, and the
+    budget is four times larger: measured at 0.03 ms per point on a bare room and 0.08 ms on a
+    busy one, so 16,384 points is about half a second. A 33 x 13 m hall now gets the 0.25 m it
+    asks for. EXPECT E-min AND U0 TO COME DOWN on rooms bigger than about 16 m: a finer grid finds
+    a lower minimum, which is the more honest number and not a worse design.
+    When a room IS too large for the budget, the results line now says the spacing that was
+    actually used instead of leaving you to assume.
+
+  * UNIFORMITY IS NOW QUOTED TWICE, on the grid you set and on EN 12464-1's.
+    U0 is not a property of a room. It is a property of a room AND the grid it was sampled on, and
+    the standard specifies its own -- which GROWS with the room: 1.94 m across a 33 m hall, 5 m
+    across a 100 m plan. Your working grid at 0.25 m is FINER than that for every room down to
+    about 3 m, so the figure this panel has always shown is the conservative one.
+    The Report panel now shows both, each labelled with its grid. The EN figure will be the HIGHER
+    of the two. Neither replaces the other: one says how even the room really is, the other is what
+    a compliance claim rests on.
+
+  * A ROOM TRACED WITH A SPLINE IS NOW LIT.
+    Splines were silently dropped by the lighting engine, so a curved wall drafted with one was
+    calculated as though it were not there -- open air, no error, a plausible-looking lux figure.
+    Any project with a spline-traced room will now report DIFFERENT and correct numbers.
+
+  * EVERY PROJECT REOPENS WITH FEWER TRIANGLES. THE SOLIDS ARE UNCHANGED.
+    The CSG library's bounding-box optimisation is now on. It feeds only the polygons that can
+    actually overlap into each boolean and passes the rest through whole, so it legitimately
+    produces fewer triangles for the SAME solid -- a wall that was split by a tree with no business
+    splitting it comes back in one piece. Measured on a real 172-feature project: total evaluation
+    1,759 ms to 165 ms, and triangles 10,275 to 5,623.
+    If you have a triangle count written down anywhere, it will not match. The shape will.
+
+
+THE CALCULATION USED TO FREEZE. IT DOES NOT NOW.
+
+    On a real project with furniture in it, pressing Calculate could stop the window responding for
+    fifteen minutes or more -- long enough that Windows greys it out and you close it. It was not a
+    crash, which is why there was never anything in a log.
+    The surface report was taking AT LEAST ONE ray-traced sample PER TRIANGLE, so a 450,000-triangle
+    chair covering two square metres took 450,000 measurements instead of two. On a seven-million-
+    triangle scene that is seven million. It now samples by AREA, capped.
+    Separately, every phase of the calculation was building its own copy of the scene's search tree
+    -- four times over, at 1.9 seconds each.
+
+        before   never returned
+        after    2.9 seconds, on the same project
+
+    If a calculation ever does hang again, run simlux.exe with SIMLUX_PHASE_LOG=1 and it will print
+    each phase as it finishes, so the one that did not come back is named rather than guessed at.
+
+
+DRAWING AND IMPORT
+
+  * MIRRORED DXF ENTITIES IMPORT THE RIGHT WAY ROUND.
+    AutoCAD writes a "-Z extrusion" on a circle, arc or block reference whenever it is mirrored,
+    and several exporters write it for whole drawings. It was being ignored, so those entities came
+    in back to front -- and only those, so a plan could arrive with half its blocks flipped and the
+    walls exactly where they should be. Arcs, polyline bulges and block rotations are all handled.
+    Checked against the DXFs in your own test folder: none of them carry a mirrored extrusion, so
+    nothing you already have will move.
+
+  * A PLATE WITH A BOLT HOLE IS ONE OBJECT.
+    Draw an outline with shapes inside it and Extrude: the inner loops are now HOLES rather than
+    separate solids standing in the middle of the first. A washer with a pin in its bore still
+    comes out as a washer with a hole AND a pin.
+
+  * A PLANE SHARES THE DRAWING'S LAYERS, STYLES AND BLOCKS -- all of them.
+    Layers and blocks already crossed into a face sketch. Linetypes, pens, true colours, text
+    styles, dimension styles and wall styles did not, so anything drawn on a plane against those
+    meant something else when read back in the plan.
+
+  * THE GRID AND THE CLIPBOARD KNOW WHICH SPACE THEY ARE IN.
+    A face sketch is measured in metres; your plan is probably in millimetres. A 10 mm grid became
+    a TEN METRE grid inside a sketch, and a 3 m wall copied from the plan pasted into a sketch as a
+    three kilometre one. Both convert now. Nothing changes when you are not in a sketch.
+
+
+3D MODELLING
+
+  * DELETING A BODY NO LONGER MOVES ANOTHER BODY'S HOLES.
+    An opening used to be bound to whichever solid happened to sit before it in the feature list,
+    so deleting or reordering anything could silently re-home every opening after it. An opening
+    now names the wall it is cut in.
+
+  * ESCAPING AN OPENING EDIT PUTS THE OPENING BACK -- in the installed build.
+    It always did in the development build. In the shipped one the restore was inside an assertion
+    that release builds compile away, so leaving an opening edit without pressing Apply destroyed
+    it. If you have lost a window that way, that is why.
+
+  * A PLANE HAS AN IDENTITY. Deleting one no longer renames or corrupts another.
+  * A PAINTED FACE KEEPS ITS PAINT when the object is rotated or scaled, not only moved.
+  * A CUT REMEMBERS WHETHER IT WAS MEANT TO GO THROUGH, so a recess is no longer reported as a
+    failed through-cut. On a real project 6 of 18 warnings were pockets working exactly as drawn.
+
+
+LIGHT EDITOR (SIMLUX menu)
+
+  * Pair a block in the drawing with a photometric file, and one fitting is placed at every
+    instance of it -- the positions are already in the drawing, so this is work you should not be
+    doing by hand.
+  * "+ Add block" shows every block in the drawing WITH ITS LINEWORK DRAWN, so you can see which
+    one is the downlight.
+  * "+ Add light" shows the photometry WITH ITS DISTRIBUTION CURVE, flux, power, efficacy, peak
+    candela and beam angle. A figure the file does not state is shown as a dash, never as a
+    plausible number.
+  * The folder picker lists your .ies / .ldt files, so you can see you are in the right folder.
+
+
+IF SOMETHING GOES WRONG
+
+    A crash now writes simlux-crash.log next to simlux.exe, with the build number and where it
+    happened. Send that file. If the app hangs rather than crashes, SIMLUX_PHASE_LOG=1 (above) is
+    the one to run.
+
 WHAT IS NEW IN BUILD 4
 ----------------------
 Everything in this section is 3D Factory. The lighting engine is unchanged since build 3, whose
