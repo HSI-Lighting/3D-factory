@@ -1660,16 +1660,28 @@ impl LightState {
             v.extend(generated);
             v
         };
+        // ONE EVALUATOR, FOUR QUESTIONS. Building it builds a BVH, and on the owner's real project
+        // that is 1.9 s over seven million triangles — against 1.9 s for the grid it exists to
+        // sample. The work plane, the EN 12464-1 plane, cylindrical illuminance and the room
+        // surfaces are four questions about ONE scene, and each used to build its own tree, so
+        // most of an 8.5 s calculation went on constructing the same thing four times.
+        //
+        // `Evaluator`'s own note has said so since it was written: "none of them should rebuild
+        // the BVH — hence a reusable evaluator rather than a function per metric."
+        //
+        // The two tables are CLONED rather than borrowed off `self`, so the evaluator does not
+        // hold a borrow on the whole state for the rest of the calculation — which would stop it
+        // recording its own timings. A handful of photometric profiles and four materials, once
+        // per calculation, against a tree over seven million triangles.
         let t_phase = std::time::Instant::now();
-        let mut grid = calc_lux(
-            &meshes,
-            &lums,
-            &self.profiles,
-            &self.materials,
-            &plane,
-            &self.settings,
-            self.maintenance,
+        let profiles = self.profiles.clone();
+        let materials = self.materials.clone();
+        let ev = cad_light::Evaluator::new(
+            &meshes, &lums, &profiles, &materials, self.settings, self.maintenance,
         );
+        self.note_phase("evaluator", t_phase);
+        let t_phase = std::time::Instant::now();
+        let mut grid = cad_light::calculate_on(&ev, &plane, self.maintenance);
         // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
         // this changes nothing — which is every case the engine is validated on.
         self.grid_mask = match &room_poly {
@@ -1688,15 +1700,7 @@ impl LightState {
         let plane_en = plane.on_standard_grid();
         self.note_phase("grid", t_phase);
         let t_phase = std::time::Instant::now();
-        let mut grid_en = calc_lux(
-            &meshes,
-            &lums,
-            &self.profiles,
-            &self.materials,
-            &plane_en,
-            &self.settings,
-            self.maintenance,
-        );
+        let mut grid_en = cad_light::calculate_on(&ev, &plane_en, self.maintenance);
         // MASKED TO THE ROOM TOO, and to its OWN mask — these are different cells. Skipping it
         // would reinstate exactly the defect the working grid was fixed for: on an L-shaped room
         // the minimum becomes a point in the open air outside its own corner. It matters MORE
@@ -1716,14 +1720,6 @@ impl LightState {
         self.note_phase("grid_en", t_phase);
         let t_phase = std::time::Instant::now();
         self.cylindrical_avg = {
-            let ev = cad_light::Evaluator::new(
-                &meshes,
-                &lums,
-                &self.profiles,
-                &self.materials,
-                self.settings,
-                self.maintenance,
-            );
             const N: u32 = 12;
             let mut sum = 0.0;
             for r in 0..N {
@@ -1743,13 +1739,11 @@ impl LightState {
         // here would dominate the calculation to refine a number quoted to the nearest lux.
         self.note_phase("cylindrical", t_phase);
         let t_phase = std::time::Instant::now();
-        self.surfaces = cad_light::surface_report(
+        self.surfaces = cad_light::surface_report_on(
+            &ev,
             &meshes,
             &lums,
-            &self.profiles,
             &self.materials,
-            &self.settings,
-            self.maintenance,
             1.0,
         );
         self.note_phase("surfaces", t_phase);

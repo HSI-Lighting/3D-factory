@@ -341,6 +341,21 @@ pub fn calculate_maintained(
     maintenance: Maintenance,
 ) -> LuxGrid {
     let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    calculate_on(&ev, plane, maintenance)
+}
+
+/// [`calculate_maintained`] against an EVALUATOR THAT ALREADY EXISTS.
+///
+/// Building an `Evaluator` builds a BVH, and on a real project that dominates the whole
+/// calculation: measured at 1.9 s over seven million triangles, against 1.9 s for the grid it was
+/// built to sample. A report asks four questions of one scene — the work plane, the EN 12464-1
+/// plane, cylindrical illuminance, the room surfaces — and each built its own, so most of the time
+/// went on constructing the same tree four times over.
+///
+/// `Evaluator`'s own note has said so since it was written: "none of them should rebuild the BVH —
+/// hence a reusable evaluator rather than a function per metric". This is the door that lets a
+/// caller outside this module act on it.
+pub fn calculate_on(ev: &Evaluator, plane: &CalcPlane, maintenance: Maintenance) -> LuxGrid {
     let cols = plane.cols.max(1);
     let rows = plane.rows.max(1);
     let normal = Vec3::Z;
@@ -802,6 +817,96 @@ mod tests {
         assert!(g.u1() <= g.u0() + 1e-12, "U1 {} must be <= U0 {}", g.u1(), g.u0());
         assert!(g.u0() > 0.0 && g.u0() <= 1.0);
     }
+
+    // ── ONE EVALUATOR, FOUR QUESTIONS ──────────────────────────────────────────────────────
+    //
+    // Building an `Evaluator` builds a BVH, and on a real project that is the dominant cost of the
+    // whole calculation: 1.9 s over seven million triangles, against 31 ms for the grid it exists
+    // to sample. A report asks four questions of ONE scene — the work plane, the EN 12464-1 plane,
+    // cylindrical illuminance, the room surfaces — and each used to build its own tree.
+    //
+    //     before   scene 205   grid 1959   grid_en 1840   cyl 2202   surf 2304   = 8.5 s
+    //     after    scene 205   evaluator 1889   grid 31   grid_en 1   cyl 296   surf 476   = 2.9 s
+
+    /// THE WRAPPER DELEGATES, AND KEEPS DELEGATING.
+    ///
+    /// BE CLEAR ABOUT WHAT THIS CANNOT DO. `calculate_maintained` now calls `calculate_on`, so the
+    /// two agree by construction and a fault inside the shared implementation moves both — a
+    /// mutation there does NOT fail this test, which was tried rather than assumed. What it
+    /// catches is the two paths DIVERGING: the moment somebody gives the wrapper an implementation
+    /// of its own, this pins them back together.
+    ///
+    /// The claim that sharing the evaluator did not change the ANSWER rests on
+    /// `validate-lighting.ps1`, which compares against DIALux on three fully specified rooms and
+    /// is independent of both routes. That is the check which means something here.
+    ///
+    /// Agreement is asserted to the BIT: the evaluator is deterministic by design, so anything
+    /// short of exact equality would be a real difference hiding behind a tolerance.
+    #[test]
+    fn sharing_the_evaluator_does_not_change_the_grid() {
+        let (meshes, profiles, lums, plane, settings) = scene(1);
+        let mats = default_materials();
+        let own = calculate_maintained(
+            &meshes, &lums, &profiles, &mats, &plane, &settings, Maintenance::INITIAL,
+        );
+        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let shared = calculate_on(&ev, &plane, Maintenance::INITIAL);
+
+        assert_eq!((own.cols, own.rows), (shared.cols, shared.rows));
+        assert_eq!(
+            own.values, shared.values,
+            "the shared evaluator produced a different grid, avg {:.4} against {:.4}",
+            shared.avg, own.avg,
+        );
+    }
+
+    /// AND THE SAME SURFACE REPORT — with the same caveat as above: `surface_report` delegates to
+    /// `surface_report_on`, so this pins that they stay one implementation rather than proving
+    /// that implementation right.
+    #[test]
+    fn sharing_the_evaluator_does_not_change_the_surface_report() {
+        let (meshes, profiles, lums, _plane, settings) = scene(1);
+        let mats = default_materials();
+        let own = surface_report(
+            &meshes, &lums, &profiles, &mats, &settings, Maintenance::INITIAL, 1.0,
+        );
+        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let shared = surface_report_on(&ev, &meshes, &lums, &mats, 1.0);
+
+        assert_eq!(own.len(), shared.len(), "a surface went missing");
+        for (a, b) in own.iter().zip(shared.iter()) {
+            assert_eq!(a.material, b.material);
+            assert_eq!(a.samples, b.samples, "{}: sample count differs", a.name);
+            assert!(
+                (a.e_avg - b.e_avg).abs() < 1e-9,
+                "{}: {:.6} lx against {:.6} lx",
+                a.name, a.e_avg, b.e_avg,
+            );
+        }
+    }
+
+    /// MAINTENANCE STILL REACHES THE ANSWER by the shared route. It is applied inside the
+    /// evaluator, so a caller passing it to the wrapper and not to `calculate_on` would get an
+    /// initial-condition grid labelled as maintained — and every number on it would be too high.
+    #[test]
+    fn the_maintenance_factor_survives_the_shared_route() {
+        let (meshes, profiles, lums, plane, settings) = scene(1);
+        let mats = default_materials();
+        let mf = Maintenance { llmf: 0.9, lsf: 1.0, lmf: 0.9, rsmf: 1.0 };
+        assert!(mf.factor() < 0.9, "the fixture must actually derate: {}", mf.factor());
+
+        let ev = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, mf);
+        let maintained = calculate_on(&ev, &plane, mf);
+        let ev0 = Evaluator::new(&meshes, &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        let initial = calculate_on(&ev0, &plane, Maintenance::INITIAL);
+
+        assert!(
+            (maintained.avg / initial.avg - mf.factor()).abs() < 1e-6,
+            "maintained/initial came to {:.4}, not the factor {:.4}",
+            maintained.avg / initial.avg, mf.factor(),
+        );
+        assert!((maintained.maintenance - mf.factor()).abs() < 1e-9, "the grid mislabels its MF");
+    }
 }
 
 /// What one room surface receives, and gives back.
@@ -880,6 +985,22 @@ pub fn surface_report(
     maintenance: Maintenance,
     samples_per_m2: f64,
 ) -> Vec<SurfaceResult> {
+    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    surface_report_on(&ev, meshes, luminaires, materials, samples_per_m2)
+}
+
+/// [`surface_report`] against an EVALUATOR THAT ALREADY EXISTS — see [`calculate_on`] for why that
+/// matters more than it looks.
+///
+/// `meshes` is still needed, and not as a duplicate of what the evaluator holds: this walks the
+/// triangles for their AREAS, which is a question about the geometry rather than about the light.
+pub fn surface_report_on(
+    ev: &Evaluator,
+    meshes: &[Mesh],
+    luminaires: &[Luminaire],
+    materials: &[Material],
+    samples_per_m2: f64,
+) -> Vec<SurfaceResult> {
     // PASS ONE: the areas, with no tracing at all. Cheap even at seven million triangles, and it
     // is what makes an area-proportional sample possible — you cannot weight by a total you have
     // not got yet.
@@ -904,7 +1025,6 @@ pub fn surface_report(
         }
     }
 
-    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
     // material id -> (area, sum of E*area, min, max, samples)
     let mut acc: std::collections::BTreeMap<u32, (f64, f64, f64, f64, usize)> = Default::default();
 
