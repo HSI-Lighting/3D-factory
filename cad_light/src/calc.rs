@@ -829,11 +829,48 @@ pub struct SurfaceResult {
     pub samples: usize,
 }
 
+/// The most points any ONE material's surfaces are sampled at, however much of it there is.
+///
+/// These are four room-average figures quoted to the nearest lux. A thousand stratified,
+/// area-weighted samples settle such a number long before the tracing cost stops mattering, and
+/// without a cap a site plan would ask for one per square metre of a hundred thousand.
+pub const MAX_SURFACE_SAMPLES: usize = 1_000;
+
+/// The `n`-th term of the van der Corput sequence in `base` — `n` written in that base, reflected
+/// about the point. A cheap, deterministic, low-discrepancy source: consecutive terms fall in the
+/// gaps the earlier ones left, so a handful of samples covers a surface far more evenly than the
+/// same number drawn at random, and two runs of the same scene agree exactly.
+fn radical_inverse(mut n: u64, base: u64) -> f64 {
+    let (mut out, mut inv) = (0.0_f64, 1.0_f64 / base as f64);
+    while n > 0 {
+        out += (n % base) as f64 * inv;
+        n /= base;
+        inv /= base as f64;
+    }
+    out
+}
+
 /// Illuminance and luminance on every room surface, grouped by material.
 ///
-/// `samples_per_m2` sets the density; every triangle gets at least one point. Points are placed on
-/// a stratified barycentric pattern rather than at centroids — a centroid-only sample of a large
-/// wall reports the middle of it and calls that the minimum.
+/// `samples_per_m2` sets the density. Points are placed on a stratified barycentric pattern rather
+/// than at centroids — a centroid-only sample of a large wall reports the middle of it and calls
+/// that the minimum.
+///
+/// THE COST IS SET BY AREA, NOT BY TRIANGLE COUNT, and it is worth saying because it used to be
+/// the other way round while this comment claimed otherwise. Every triangle got AT LEAST ONE
+/// sample — `clamp(ceil(area * samples_per_m2), 1, 64)`, and the floor of 1 was the whole defect.
+/// A 450,000-triangle chair covering 2 m² took 450,000 ray-traced evaluations instead of 2.
+///
+/// On the owner's real project that was 7,036,129 evaluations, each traced against a
+/// seven-million-triangle BVH, and the calculation simply never came back: fifteen minutes in a
+/// release build, which Windows greys out and a person reports as a crash.
+///
+/// So the triangles of a material are now sampled IN PROPORTION TO THEIR AREA, up to
+/// [`MAX_SURFACE_SAMPLES`]. Selection walks the cumulative area at evenly spaced offsets — a
+/// systematic area-weighted sample, deterministic and low-discrepancy, with no RNG to make one run
+/// disagree with the next. A triangle a thousand times bigger than its neighbour gets a thousand
+/// times the samples; one too small to earn a whole sample contributes its area and waits its turn
+/// rather than costing a full trace.
 pub fn surface_report(
     meshes: &[Mesh],
     luminaires: &[Luminaire],
@@ -843,55 +880,93 @@ pub fn surface_report(
     maintenance: Maintenance,
     samples_per_m2: f64,
 ) -> Vec<SurfaceResult> {
-    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
-    // material id -> (area, sum of E*area, min, max, samples)
-    let mut acc: std::collections::BTreeMap<u32, (f64, f64, f64, f64, usize)> = Default::default();
-
-    for mesh in meshes {
-        for tri in &mesh.triangles {
+    // PASS ONE: the areas, with no tracing at all. Cheap even at seven million triangles, and it
+    // is what makes an area-proportional sample possible — you cannot weight by a total you have
+    // not got yet.
+    //
+    // `(material, mesh index, triangle index, area, cumulative area within the material)`.
+    let mut by_mat: std::collections::BTreeMap<u32, (f64, Vec<(usize, usize, f64, f64)>)> =
+        Default::default();
+    for (mi, mesh) in meshes.iter().enumerate() {
+        for (ti, tri) in mesh.triangles.iter().enumerate() {
             let (a, b, c) = (
                 v3(mesh.vertices[tri.a as usize]),
                 v3(mesh.vertices[tri.b as usize]),
                 v3(mesh.vertices[tri.c as usize]),
             );
-            let cross = (b - a).cross(c - a);
-            let area = 0.5 * cross.length() as f64;
+            let area = 0.5 * (b - a).cross(c - a).length() as f64;
             if area <= 1e-9 {
                 continue;
             }
+            let e = by_mat.entry(mesh.material).or_default();
+            e.0 += area;
+            e.1.push((mi, ti, area, e.0));
+        }
+    }
+
+    let ev = Evaluator::new(meshes, luminaires, profiles, materials, *settings, maintenance);
+    // material id -> (area, sum of E*area, min, max, samples)
+    let mut acc: std::collections::BTreeMap<u32, (f64, f64, f64, f64, usize)> = Default::default();
+
+    for (mat, (total_area, tris)) in &by_mat {
+        if tris.is_empty() || *total_area <= 0.0 {
+            continue;
+        }
+        let want = ((total_area * samples_per_m2).ceil() as usize).clamp(1, MAX_SURFACE_SAMPLES);
+        let e = acc.entry(*mat).or_insert((0.0, 0.0, f64::MAX, 0.0, 0));
+        // Each sample stands for the same slice of area, because selection is area-weighted — so
+        // the weighted average is the plain mean of the samples, and the area reported is the
+        // material's REAL total rather than the part that happened to be sampled.
+        let share = total_area / want as f64;
+        for k in 0..want {
+            // Systematic sampling: one offset per stratum, at the stratum's midpoint. The k-th
+            // sample lands in whichever triangle spans that much cumulative area.
+            let target = total_area * (k as f64 + 0.5) / want as f64;
+            let idx = tris
+                .partition_point(|(_, _, _, cum)| *cum < target)
+                .min(tris.len() - 1);
+            let (mi, ti, _area, _) = tris[idx];
+            let mesh = &meshes[mi];
+            let tri = &mesh.triangles[ti];
+            let (a, b, c) = (
+                v3(mesh.vertices[tri.a as usize]),
+                v3(mesh.vertices[tri.b as usize]),
+                v3(mesh.vertices[tri.c as usize]),
+            );
             // The INWARD normal — the side facing the room, and so the side that receives light. A
             // surface sampled on its back reads zero and would quietly drag a wall's average down.
-            let mut n = cross.normalize_or_zero();
+            let mut n = (b - a).cross(c - a).normalize_or_zero();
             if let Some(l) = luminaires.first() {
                 let centroid = (a + b + c) / 3.0;
                 if (v3(l.position) - centroid).dot(n) < 0.0 {
                     n = -n;
                 }
             }
-
-            let want = ((area * samples_per_m2).ceil() as usize).clamp(1, 64);
-            let e = acc.entry(mesh.material).or_insert((0.0, 0.0, f64::MAX, 0.0, 0));
-            for k in 0..want {
-                // Stratified barycentric: spread over the triangle rather than clustered.
-                let t = (k as f64 + 0.5) / want as f64;
-                let s = ((k as f64 + 0.5) * 0.618_033_988_75).fract(); // golden ratio, low discrepancy
-                let (mut u, mut v) = (t.sqrt(), s);
-                if u + v > 1.0 {
-                    u = 1.0 - u;
-                    v = 1.0 - v;
-                }
-                let p = a + (b - a) * u as f32 + (c - a) * v as f32;
-                // Lifted off the surface, or the point is shadowed by the triangle it sits on.
-                let lx = ev.illuminance(p + n * 1.0e-3, n);
-                let share = area / want as f64;
-                e.0 += share;
-                e.1 += lx * share;
-                e.2 = e.2.min(lx);
-                e.3 = e.3.max(lx);
-                e.4 += 1;
-            }
+            // WHERE IN THE TRIANGLE, from a 2D low-discrepancy sequence in bases 2 and 3.
+            //
+            // NOT derived from `k / want`, which is what the area walk above already uses. Tying
+            // the two together correlates a point's position WITHIN its triangle to that
+            // triangle's position ALONG the surface, and the estimator stops being uniform over
+            // the area. Measured: a 4 × 4 m floor reported 197 lx, and 256 lx when the very same
+            // surface was subdivided — the tessellation changing the answer, which is the defect
+            // this function was being fixed for, arriving through a different door.
+            //
+            // The mapping is the standard one for a uniform point in a triangle. The `sqrt` on the
+            // first coordinate is what corrects for the triangle narrowing towards `a`.
+            let (u1, u2) = (radical_inverse(k as u64 + 1, 2), radical_inverse(k as u64 + 1, 3));
+            let su = u1.sqrt();
+            let (w0, w1, w2) = (1.0 - su, su * (1.0 - u2), su * u2);
+            let p = a * w0 as f32 + b * w1 as f32 + c * w2 as f32;
+            // Lifted off the surface, or the point is shadowed by the triangle it sits on.
+            let lx = ev.illuminance(p + n * 1.0e-3, n);
+            e.0 += share;
+            e.1 += lx * share;
+            e.2 = e.2.min(lx);
+            e.3 = e.3.max(lx);
+            e.4 += 1;
         }
     }
+
 
     acc.into_iter()
         .map(|(id, (area, sum, min, max, samples))| {
@@ -1075,6 +1150,182 @@ mod surface_tests {
                 "{}: min/avg/max out of order",
                 r.name
             );
+        }
+    }
+
+    // ── THE COST IS THE AREA, NOT THE TRIANGLE COUNT ───────────────────────────────────────
+    //
+    // Every triangle used to get AT LEAST ONE ray-traced sample — `clamp(…, 1, 64)`, and the floor
+    // of 1 was the defect. A 450,000-triangle chair covering 2 m² took 450,000 evaluations instead
+    // of 2, and on the owner's real 7,036,129-triangle project the calculation never came back:
+    // fifteen minutes in a release build, which Windows greys out and a person reports as a crash.
+
+    /// Split every triangle of `meshes` into 4 by mid-edge subdivision, `times` over — so the same
+    /// SURFACE arrives as 4^times as many triangles. The geometry is identical; only the
+    /// tessellation changes, which is exactly the thing the cost must not follow.
+    fn subdivide(meshes: &[Mesh], times: u32) -> Vec<Mesh> {
+        let mut out = meshes.to_vec();
+        for _ in 0..times {
+            out = out
+                .iter()
+                .map(|m| {
+                    let mut verts = m.vertices.clone();
+                    let mut tris = Vec::with_capacity(m.triangles.len() * 4);
+                    for t in &m.triangles {
+                        let (ia, ib, ic) = (t.a as usize, t.b as usize, t.c as usize);
+                        let mid = |p: Vertex, q: Vertex| {
+                            Vertex::new(
+                                0.5 * (p.x + q.x),
+                                0.5 * (p.y + q.y),
+                                0.5 * (p.z + q.z),
+                            )
+                        };
+                        let base = verts.len() as u32;
+                        verts.push(mid(m.vertices[ia], m.vertices[ib]));
+                        verts.push(mid(m.vertices[ib], m.vertices[ic]));
+                        verts.push(mid(m.vertices[ic], m.vertices[ia]));
+                        let (ab, bc, ca) = (base, base + 1, base + 2);
+                        for (a, b, c) in [
+                            (t.a, ab, ca), (ab, t.b, bc), (ca, bc, t.c), (ab, bc, ca),
+                        ] {
+                            tris.push(crate::types::Triangle { a, b, c });
+                        }
+                    }
+                    Mesh { vertices: verts, triangles: tris, material: m.material }
+                })
+                .collect();
+        }
+        out
+    }
+
+    fn report_at(meshes: &[Mesh], per_m2: f64) -> Vec<SurfaceResult> {
+        let mut profiles = HashMap::new();
+        profiles.insert("iso".to_string(), isotropic(1000.0));
+        surface_report(
+            meshes,
+            &lamp(2.0, 2.0, 2.5),
+            &profiles,
+            &default_materials(),
+            &RaySettings { rays_per_point: 16, max_bounces: 1, shadows: true },
+            Maintenance::INITIAL,
+            per_m2,
+        )
+    }
+
+    fn report_of(meshes: &[Mesh]) -> Vec<SurfaceResult> {
+        report_at(meshes, 1.0)
+    }
+
+    /// THE HEADLINE. The same room, tessellated 64× more finely, must not cost 64× more.
+    #[test]
+    fn subdividing_a_surface_does_not_multiply_the_work() {
+        let coarse = box_room(4.0, 4.0, 3.0);
+        let fine = subdivide(&coarse, 3); // 4^3 = 64x the triangles, the same room
+        let coarse_tris: usize = coarse.iter().map(|m| m.triangles.len()).sum();
+        let fine_tris: usize = fine.iter().map(|m| m.triangles.len()).sum();
+        assert_eq!(fine_tris, coarse_tris * 64, "the fixture must really subdivide");
+
+        let a: usize = report_of(&coarse).iter().map(|s| s.samples).sum();
+        let b: usize = report_of(&fine).iter().map(|s| s.samples).sum();
+        assert_eq!(
+            a, b,
+            "{coarse_tris} triangles took {a} samples and the SAME SURFACE at {fine_tris} \
+             triangles took {b} — the cost is following the tessellation, not the area",
+        );
+    }
+
+    /// AND IT DOES NOT CHANGE THE ANSWER EITHER. Cheap and wrong is not the goal: the same room
+    /// must report the same illuminance however finely it happens to be cut up.
+    ///
+    /// AT A DENSITY WHERE THE COMPARISON MEANS SOMETHING. At the default 1 sample/m² a 16 m² floor
+    /// gets sixteen points, and two sixteen-point estimates of a stochastic quantity differ by
+    /// more than any tolerance worth writing — so a loose tolerance here would pass whatever the
+    /// sampling did. Twenty per square metre puts 320 points on that floor, where a 2% band is a
+    /// real constraint. This is the tessellation-independence of the ESTIMATOR, not a statement
+    /// about how many samples the app happens to ask for.
+    #[test]
+    fn subdividing_a_surface_does_not_change_what_it_reports() {
+        let coarse = box_room(4.0, 4.0, 3.0);
+        let fine = subdivide(&coarse, 3);
+        let (a, b) = (report_at(&coarse, 20.0), report_at(&fine, 20.0));
+        assert_eq!(a.len(), b.len(), "the same materials must be reported");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(
+                (x.area_m2 - y.area_m2).abs() < 1e-3,
+                "{}: area {:.3} m² became {:.3} m² under subdivision",
+                x.name, x.area_m2, y.area_m2,
+            );
+            assert!(
+                (x.e_avg - y.e_avg).abs() <= 0.02 * x.e_avg.max(1.0),
+                "{}: {:.1} lx became {:.1} lx under subdivision",
+                x.name, x.e_avg, y.e_avg,
+            );
+        }
+    }
+
+    /// THE BUDGET IS A CEILING. Without one, a site plan asks for a sample per square metre of a
+    /// hundred thousand, and the cap is what stops the fix having its own runaway.
+    #[test]
+    fn no_material_is_sampled_past_the_budget() {
+        // A 200 x 200 m "room": 40,000 m² of floor alone, at 1 sample/m².
+        let huge = box_room(200.0, 200.0, 4.0);
+        for s in report_of(&huge) {
+            assert!(
+                s.samples <= MAX_SURFACE_SAMPLES,
+                "{} took {} samples against a budget of {}",
+                s.name, s.samples, MAX_SURFACE_SAMPLES,
+            );
+        }
+    }
+
+    /// THE AREA REPORTED IS THE REAL AREA, not the part that happened to be sampled. It is what
+    /// the average is weighted by and what the report prints, so a budget that quietly shrank it
+    /// would understate every surface in the building.
+    #[test]
+    fn the_area_reported_is_the_whole_surface_even_when_sampling_is_capped() {
+        let huge = box_room(200.0, 200.0, 4.0);
+        let floor = report_of(&huge)
+            .into_iter()
+            .find(|s| s.name.eq_ignore_ascii_case("floor"))
+            .expect("a floor");
+        assert!(
+            (floor.area_m2 - 40_000.0).abs() < 1.0,
+            "a 200 x 200 m floor reported {:.0} m²",
+            floor.area_m2,
+        );
+        assert!(floor.samples <= MAX_SURFACE_SAMPLES, "…and was still capped");
+    }
+
+    /// SAMPLES FOLLOW AREA. A wall ten times the size of its neighbour must get about ten times
+    /// the samples — otherwise "area-weighted" is a claim rather than a behaviour, and a big dark
+    /// surface would count for as little as a small bright one.
+    #[test]
+    fn a_bigger_surface_gets_proportionally_more_samples() {
+        let small = report_of(&box_room(2.0, 2.0, 3.0));
+        let big = report_of(&box_room(20.0, 20.0, 3.0));
+        let floor = |v: &[SurfaceResult]| {
+            v.iter().find(|s| s.name.eq_ignore_ascii_case("floor")).map(|s| (s.area_m2, s.samples))
+        };
+        let (sa, ss) = floor(&small).expect("small floor");
+        let (ba, bs) = floor(&big).expect("big floor");
+        assert!(ba > sa * 50.0, "precondition: {ba} m² against {sa} m²");
+        assert!(
+            bs > ss * 10,
+            "a {ba:.0} m² floor took {bs} samples and a {sa:.0} m² one took {ss} — samples are \
+             not following area",
+        );
+    }
+
+    /// DETERMINISTIC. Selection walks the cumulative area at fixed offsets rather than using an
+    /// RNG, so a designer who re-runs a calculation and sees a different number has changed
+    /// something — they are not looking at sampling noise.
+    #[test]
+    fn the_same_scene_reports_the_same_numbers_twice() {
+        let room = box_room(6.0, 4.0, 3.0);
+        let (a, b) = (report_of(&room), report_of(&room));
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.samples, y.samples, "{}: sample count wobbled", x.name);
+            assert!((x.e_avg - y.e_avg).abs() < 1e-9, "{}: {} vs {}", x.name, x.e_avg, y.e_avg);
         }
     }
 }
