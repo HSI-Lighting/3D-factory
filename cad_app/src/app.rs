@@ -41584,7 +41584,7 @@ impl eframe::App for CadApp {
         }
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
-        // Light Editor (SIMLUX menu ▸ Light Editor) — block ↔ photometry wiring. Bails if closed.
+        // Illuminaire (SIMLUX menu ▸ Illuminaire) — the fitting library. Bails if closed.
         self.render_illuminaire(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_shortcuts_window(ctx);
