@@ -2495,6 +2495,39 @@ pub struct FactorySnap {
 pub enum UndoStep {
     Doc(Document),
     Factory(FactorySnap),
+    /// SIMLUX FIXTURES ONLY — a drag, a delete, a fitting assignment.
+    ///
+    /// The lights used to be off the stack entirely, so Delete on a marker was final and Undo
+    /// stepped straight past it to an older drawing edit, taking the drawing with it.
+    Light(LightSnap),
+    /// A DRAWING EDIT AND A FIXTURE EDIT THAT ARE ONE ACT.
+    ///
+    /// Placing a fitting puts a block on the plan and a light at the same point; deleting one
+    /// takes both away. An undo that took back half of that would leave the project in a state
+    /// the user never made — a symbol with nothing behind it, or a marker with no symbol.
+    ///
+    /// A step carries ONLY what it changed, which is why this is a variant rather than a field on
+    /// `Doc`. Were every doc step to carry the fixtures, a later light-only edit would make those
+    /// copies stale, and undoing an unrelated line would silently rewind the lighting too.
+    Both(Document, LightSnap),
+}
+
+/// The SIMLUX fixtures as of one moment, for the undo stack.
+///
+/// `next_id` is deliberately NOT here. Ids are minted once and never reused — a drawing that still
+/// names a deleted fixture must resolve to nothing rather than to whatever took its place — so
+/// rewinding the counter is the one thing an undo must not do.
+#[derive(Clone)]
+pub struct LightSnap {
+    pub luminaires: Vec<cad_light::Luminaire>,
+}
+
+impl LightSnap {
+    fn approx_bytes(&self) -> usize {
+        // The profile NAME is the only heap in a `Luminaire`; the rest is a fixed struct.
+        self.luminaires.capacity() * std::mem::size_of::<cad_light::Luminaire>()
+            + self.luminaires.iter().map(|l| l.profile.capacity()).sum::<usize>()
+    }
 }
 
 impl UndoStep {
@@ -2507,6 +2540,8 @@ impl UndoStep {
     fn approx_bytes(&self) -> usize {
         match self {
             UndoStep::Doc(d) => d.approx_bytes(),
+            UndoStep::Light(l) => l.approx_bytes(),
+            UndoStep::Both(d, l) => d.approx_bytes() + l.approx_bytes(),
             UndoStep::Factory(f) => {
                 let m = &f.model;
                 std::mem::size_of::<FactorySnap>()
@@ -4176,10 +4211,10 @@ impl CadApp {
     /// exact shape of what was reported: markers left behind with nothing to light, and symbols
     /// left behind with nothing behind them.
     ///
-    /// The drawing half is snapshotted for undo. THE FIXTURES ARE NOT, because SIMLUX state has
-    /// never been on the undo stack — the Delete key has always been final for them. Undo after
-    /// this brings the symbols back and not the markers, which is the pre-existing asymmetry
-    /// rather than a new one, and worth knowing before pressing it.
+    /// BOTH HALVES ARE UNDOABLE, in one step. They were not: SIMLUX state was off the undo stack
+    /// entirely, so Undo after a delete brought the symbols back and not the markers — and Undo
+    /// after a fixture-only delete stepped straight past it to an older drawing edit, taking the
+    /// drawing with it.
     ///
     /// A fixture placed by hand (`Place luminaire`) has no `from_block` at all and takes nothing
     /// with it, which is right: there was never a symbol.
@@ -4203,6 +4238,15 @@ impl CadApp {
             )
         };
 
+        // ONE STEP, WHICHEVER HALVES IT TOUCHES. A fitting placed from the library has a symbol on
+        // the plan; a hand-placed point does not, and an undo step naming a drawing edit that
+        // never happened would take a second Undo press to get past.
+        if idx.is_empty() {
+            self.snapshot_lights();
+        } else {
+            self.snapshot_doc_and_lights();
+        }
+
         let before = self.light.luminaires.len();
         self.light.luminaires.retain(|l| !ids.contains(&l.id));
         self.light.selected.retain(|s| !ids.contains(s));
@@ -4211,7 +4255,6 @@ impl CadApp {
         let lights = before - self.light.luminaires.len();
 
         if !idx.is_empty() {
-            self.snapshot_doc();
             // Highest index downward, so the earlier ones stay valid — the same rule ERASE
             // follows, and for the same reason.
             for &i in idx.iter().rev() {
@@ -4621,10 +4664,11 @@ impl CadApp {
         // The blocks were there the whole time. Nothing had told the canvas its cached geometry
         // was stale (`touch_view`) or the spatial index that there was something new to pick
         // (`index_dirty`), so they were invisible and unclickable until an unrelated edit rebuilt
-        // both — deleting a light, in the report. Nor was an undo step taken, so a placement could
-        // not be undone and the file was never even marked unsaved: closing the app would have
-        // thrown the work away without asking.
-        self.snapshot_doc();
+        // both — deleting a light, in the report.
+        //
+        // ONE STEP FOR BOTH HALVES: a block lands on the plan and a light at the same point, and
+        // an Undo that took back one of them would leave a state the user never made.
+        self.snapshot_doc_and_lights();
         let block = crate::illuminaire::insert(&mut self.doc, &f, at, k);
         self.intersections.clear();
         self.index_dirty = true;
@@ -4635,6 +4679,10 @@ impl CadApp {
             l.profile.clone_from(&f.profile);
             l.from_block = Some(block);
         }
+        // `place_point` stages its own copy, and the step above already covers the whole act —
+        // block and light together. Left staged, it would be picked up by the NEXT snapshot as if
+        // it were that edit's "before", so one Undo would reach back through two placements.
+        self.light.discard_staged_undo();
         self.light.last_msg = format!(
             "Placed \"{}\"{} at ({x:.2}, {y:.2}).",
             f.name,
@@ -4683,6 +4731,20 @@ impl CadApp {
                 });
             });
         self.light.window_open = open;
+        // The panel edits fixtures inside its own closure, where `self.doc` is out of reach — so
+        // it leaves the copy it overwrote staged and this turns it into a step.
+        self.commit_light_undo();
+        // …and the two that delete go through the shared path, so a fixture placed from the
+        // library takes its symbol with it. Deleting here used to leave the block on the plan.
+        if let Some(id) = action.remove_fixture {
+            self.delete_fixtures(&[id]);
+        }
+        if action.clear_fixtures {
+            let all: Vec<u32> = self.light.luminaires.iter().map(|l| l.id).collect();
+            let (lights, blocks) = self.delete_fixtures(&all);
+            self.light.last_msg =
+                format!("Cleared {lights} fixture(s) and {blocks} symbol(s).");
+        }
         if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
         if let Some(id) = action.import_layer {
             let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
@@ -5142,6 +5204,16 @@ impl CadApp {
                 self.light.drag_to(a);
             }
             if ctx.input(|i| i.pointer.primary_released()) {
+                // A PRESS THAT NEVER MOVED IS A SELECTION, not an edit. `begin_drag` stages the
+                // fixtures either way because it cannot know yet; this is where that is settled,
+                // so clicking a marker to pick it costs no Undo press.
+                // ONLY WHAT WAS STAGED. By the time a drag ends the fixtures have already moved,
+                // so taking a snapshot here would capture the new positions and undo to them —
+                // a step that changes nothing. `commit_light_undo` pushes the copy `begin_drag`
+                // put aside, or nothing.
+                // Nothing to settle here any more: `drag_to` stages only once the drag has
+                // actually become a move, so a press that merely selected a marker has left
+                // nothing behind, and the frame-end drain commits whatever a real move did.
                 self.light.end_drag();
             }
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -5171,13 +5243,16 @@ impl CadApp {
                     if self.place_illuminaire_at(x, y) {
                         if let Some(&id) = self.light.selected.first() {
                             self.light.begin_drag(id, (x, y));
+                            // The placement step already covers this gesture — dropping and
+                            // positioning in one press is one act, and one Undo.
+                            self.light.discard_staged_undo();
                         }
                         self.light_gesture = true;
                     }
                     return true;
                 }
                 if self.light.place_mode {
-                    let id = self.light.place_point(x, y);
+                    let id = self.place_fixture_point(x, y);
                     // Placing arms a drag on the new point, so press-move-release puts it down
                     // AND positions it in one gesture — and a plain click leaves it where it fell.
                     self.light.begin_drag(id, (x, y));
@@ -29975,6 +30050,65 @@ impl CadApp {
             self.undo_stack.remove(0);
         }
     }
+
+    /// Snapshot for an edit that changes the FIXTURES only — a drag, a delete, an assignment.
+    ///
+    /// Uses the staged copy when there is one, because a method that has already mutated cannot
+    /// hand back what it overwrote. See [`crate::light::LightState::stage_undo`].
+    #[track_caller]
+    fn snapshot_lights(&mut self) {
+        let luminaires = self
+            .light
+            .undo_pending
+            .take()
+            .unwrap_or_else(|| self.light.luminaires.clone());
+        self.unsaved = true;
+        self.undo_stack.push(UndoStep::Light(LightSnap { luminaires }));
+        self.trim_undo_stack();
+        self.redo_stack.clear();
+    }
+
+    /// Snapshot for an edit that changes the DRAWING and the FIXTURES as one act.
+    ///
+    /// One step, not two: placing a fitting puts a block on the plan and a light at the same
+    /// point, and an Undo that took back half of it would leave a symbol with nothing behind it.
+    #[track_caller]
+    fn snapshot_doc_and_lights(&mut self) {
+        let luminaires = self
+            .light
+            .undo_pending
+            .take()
+            .unwrap_or_else(|| self.light.luminaires.clone());
+        self.unsaved = true;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.undo_stack.push(UndoStep::Both(self.doc.clone(), LightSnap { luminaires }));
+        self.trim_undo_stack();
+        self.redo_stack.clear();
+    }
+
+    /// Drop a bare fixture point on the plan, undoably.
+    ///
+    /// ONE PLACE THAT DOES BOTH HALVES, because a placement that is not committed to the undo
+    /// stack looks exactly like one that is until someone presses Ctrl+Z and loses a wall instead.
+    fn place_fixture_point(&mut self, x: f32, y: f32) -> u32 {
+        let id = self.light.place_point(x, y);
+        self.commit_light_undo();
+        id
+    }
+
+
+    /// Turn a snapshot staged inside the panel into an undo step, if one is still waiting.
+    ///
+    /// The panel's own edits — assigning a fitting, dropping one from the library — happen inside
+    /// a closure that cannot reach `self.doc`, so they leave the fixtures they overwrote here and
+    /// this collects them once the closure has gone. Everything driven from `CadApp` snapshots
+    /// directly and drains the staging as it goes, so there is nothing left for this to find.
+    fn commit_light_undo(&mut self) {
+        if self.light.undo_pending.is_some() {
+            self.snapshot_lights();
+        }
+    }
+
     #[track_caller]
     fn snapshot_doc(&mut self) {
         let t = std::time::Instant::now();
@@ -30082,9 +30216,46 @@ impl CadApp {
     /// Capture the CURRENT state in the same shape as the step being undone, so it can
     /// be pushed onto the opposite stack. Keeping this one function is what guarantees
     /// undo and redo stay exact inverses.
+
+    /// The fixtures as they are now, for an undo step.
+    fn light_snap(&self) -> LightSnap {
+        LightSnap { luminaires: self.light.luminaires.clone() }
+    }
+
+    /// Put the drawing back, and invalidate everything that was derived from it.
+    fn restore_doc(&mut self, doc: Document) {
+        self.doc = doc;
+        self.selection.clear();
+        self.selected = None;
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.touch_view();
+    }
+
+    /// Put the fixtures back.
+    ///
+    /// The SELECTION and any drag in flight go, for the same reason the drawing's selection does:
+    /// both name fixtures by id, and the set of ids has just changed underneath them. A drag left
+    /// pointing at a fixture that no longer exists would move nothing and never end.
+    ///
+    /// `next_id` is NOT rewound — see [`LightSnap`]. Nor is a result recalculated: the lux figures
+    /// on screen were computed from a layout that no longer holds, and quietly leaving stale
+    /// numbers under a restored layout would be worse than showing none, so the panel is told they
+    /// are stale rather than silently kept.
+    fn restore_lights(&mut self, snap: LightSnap) {
+        self.light.luminaires = snap.luminaires;
+        self.light.selected.clear();
+        self.light.drag = None;
+        self.light.hover = None;
+        self.light.undo_pending = None;
+        self.light.invalidate_result();
+    }
+
     fn counterpart_of(&self, step: &UndoStep) -> UndoStep {
         match step {
             UndoStep::Doc(_) => UndoStep::Doc(self.doc.clone()),
+            UndoStep::Light(_) => UndoStep::Light(self.light_snap()),
+            UndoStep::Both(_, _) => UndoStep::Both(self.doc.clone(), self.light_snap()),
             UndoStep::Factory(_) => UndoStep::Factory(FactorySnap {
                 // THE FIX: was , which records the open plane empty.
                 model: self.factory_model_for_snapshot(),
@@ -30109,13 +30280,11 @@ impl CadApp {
     /// leaves a stale render — hence one place that owns both.
     fn restore_step(&mut self, step: UndoStep) {
         match step {
-            UndoStep::Doc(doc) => {
-                self.doc = doc;
-                self.selection.clear();
-                self.selected = None;
-                self.intersections.clear();
-                self.index_dirty = true;
-                self.touch_view();
+            UndoStep::Doc(doc) => self.restore_doc(doc),
+            UndoStep::Light(l) => self.restore_lights(l),
+            UndoStep::Both(doc, l) => {
+                self.restore_doc(doc);
+                self.restore_lights(l);
             }
             UndoStep::Factory(snap) => {
                 self.factory.model = snap.model;
@@ -46507,6 +46676,18 @@ impl eframe::App for CadApp {
         }
 
         self.sweep_stale_prompt();
+
+        // ONE DRAIN FOR EVERY PATH. A fixture edit made inside a panel closure leaves the copy it
+        // overwrote staged; the panels that know about it drain their own, and this catches the
+        // rest — importing a photometric file assigns it to the points already marked out, and
+        // that is an edit nobody would think to wire up.
+        //
+        // NOT while a drag is in flight: `begin_drag` stages on the press and the step belongs to
+        // the whole gesture, so pushing it now would spend the copy and leave the release with
+        // nothing to commit.
+        if self.light.drag.is_none() {
+            self.commit_light_undo();
+        }
     }
 }
 
@@ -60800,22 +60981,32 @@ mod deleting_a_placed_fitting {
         assert!(app.selected.is_none());
     }
 
-    /// THE DRAWING HALF IS UNDOABLE. The fixtures are not — SIMLUX state has never been on the
-    /// undo stack — but a snapshot has to be taken, or Undo silently steps past this edit to an
-    /// older one and takes the drawing with it.
+    /// EVERY DELETE IS ONE UNDO STEP, of the kind that matches what it touched.
+    ///
+    /// A fitting placed from the library takes its symbol with it, so the step names both halves.
+    /// A hand-placed point has no symbol, so the step names the fixtures alone — and it is still a
+    /// step, or Undo reaches past the delete to an older drawing edit and takes the drawing with
+    /// it. That last case is the one that had no snapshot at all.
     #[test]
-    fn erasing_the_symbols_pushes_an_undo_step() {
+    fn every_delete_pushes_exactly_one_undo_step() {
         let (mut app, ids) = placed(2);
         let before = app.undo_stack.len();
         app.delete_fixtures(&[ids[0]]);
         assert_eq!(app.undo_stack.len(), before + 1, "no undo step was pushed for the erase");
+        assert!(
+            matches!(app.undo_stack.last(), Some(UndoStep::Both(_, _))),
+            "a delete that erased a symbol did not record the drawing half",
+        );
 
-        // …and a delete that touches no geometry does NOT push one, or Undo becomes a no-op the
-        // user has to press twice.
-        let bare = app.light.place_point(40.0, 40.0);
+        let bare = app.place_fixture_point(40.0, 40.0);
         let n = app.undo_stack.len();
         app.delete_fixtures(&[bare]);
-        assert_eq!(app.undo_stack.len(), n, "a fixture-only delete pushed an empty undo step");
+        assert_eq!(app.undo_stack.len(), n + 1, "a fixture-only delete pushed no undo step");
+        assert!(
+            matches!(app.undo_stack.last(), Some(UndoStep::Light(_))),
+            "a delete that touched no geometry claimed a drawing edit — Undo would take a second \
+             press to get past it, and the first would restore a document nothing had changed",
+        );
     }
 
     /// A PLACEMENT IS AN EDIT TO THE DRAWING, and has to announce itself as one.
@@ -61009,5 +61200,263 @@ mod deleting_a_placed_fitting {
             existing, after,
             "correcting a fitting this drawing has never seen rewrote another block's geometry",
         );
+    }
+}
+
+/// SIMLUX FIXTURES ARE ON THE UNDO STACK.
+///
+/// They were not, and it showed in two directions. A delete was final: Ctrl+Z after erasing a
+/// marker stepped straight past it to an older drawing edit and took the drawing with it. And a
+/// placement, which puts a block on the plan and a light at the same point, could only ever be
+/// half undone — the symbol came back and the marker did not.
+///
+/// The rule these all check is that a step carries exactly what its edit changed, and that one
+/// act is one step.
+#[cfg(test)]
+mod fixtures_are_undoable {
+    use super::*;
+
+    /// A millimetre plan with a fitting in the library, ready to place.
+    fn armed() -> (CadApp, u32) {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 0.001;
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "OCULUS".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 47.5 },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+        (app, fid)
+    }
+
+    fn blocks(app: &CadApp) -> usize {
+        app.doc
+            .dobjects
+            .iter()
+            .filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .count()
+    }
+
+    /// PLACING IS ONE ACT AND ONE UNDO — both halves, together.
+    #[test]
+    fn undoing_a_placement_takes_back_the_block_and_the_light() {
+        let (mut app, _) = armed();
+        app.place_illuminaire_at(1.0, 2.0);
+        app.place_illuminaire_at(3.0, 2.0);
+        assert_eq!(app.light.luminaires.len(), 2);
+        assert_eq!(blocks(&app), 2);
+
+        app.do_undo();
+        assert_eq!(app.light.luminaires.len(), 1, "the marker stayed after an undo");
+        assert_eq!(blocks(&app), 1, "the symbol stayed after an undo");
+
+        app.do_undo();
+        assert!(app.light.luminaires.is_empty(), "the first marker stayed");
+        assert_eq!(blocks(&app), 0, "the first symbol stayed");
+    }
+
+    /// …AND REDO PUTS BOTH BACK.
+    #[test]
+    fn redoing_a_placement_restores_both_halves() {
+        let (mut app, _) = armed();
+        app.place_illuminaire_at(1.0, 2.0);
+        app.do_undo();
+        assert!(app.light.luminaires.is_empty());
+
+        app.do_redo();
+        assert_eq!(app.light.luminaires.len(), 1, "redo did not bring the marker back");
+        assert_eq!(blocks(&app), 1, "redo did not bring the symbol back");
+        assert_eq!(
+            app.light.luminaires[0].from_block,
+            Some(0),
+            "the restored light is not tied to its restored symbol",
+        );
+    }
+
+    /// DELETING IS UNDOABLE, both halves together. This is the asymmetry that was reported: undo
+    /// brought the symbols back and not the markers.
+    #[test]
+    fn undoing_a_delete_brings_the_marker_back_with_its_symbol() {
+        let (mut app, _) = armed();
+        app.place_illuminaire_at(1.0, 2.0);
+        let id = app.light.luminaires[0].id;
+
+        app.delete_fixtures(&[id]);
+        assert!(app.light.luminaires.is_empty());
+        assert_eq!(blocks(&app), 0);
+
+        app.do_undo();
+        assert_eq!(app.light.luminaires.len(), 1, "the marker did not come back");
+        assert_eq!(blocks(&app), 1, "the symbol did not come back");
+        assert_eq!(app.light.luminaires[0].id, id, "a different fixture came back");
+    }
+
+    /// A FIXTURE-ONLY DELETE DOES NOT REACH PAST ITSELF INTO THE DRAWING.
+    ///
+    /// The sharpest version of the old bug: a hand-placed point has no symbol, so deleting it used
+    /// to push no step at all — and the next Ctrl+Z undid whatever drawing edit came before,
+    /// erasing geometry the user never touched.
+    #[test]
+    fn undoing_a_bare_point_delete_leaves_the_drawing_alone() {
+        let mut app = CadApp::default();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+        app.snapshot_doc();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 1.0),
+            b: Vec2::new(1.0, 1.0),
+        })));
+        let drawn = app.doc.dobjects.len();
+
+        let id = app.place_fixture_point(5.0, 5.0);
+        app.delete_fixtures(&[id]);
+        assert!(app.light.luminaires.is_empty());
+
+        app.do_undo();
+        assert_eq!(app.light.luminaires.len(), 1, "the point did not come back");
+        assert_eq!(
+            app.doc.dobjects.len(),
+            drawn,
+            "undoing a fixture delete erased geometry the user never touched",
+        );
+    }
+
+    /// A DRAG IS ONE UNDO, and the fixture goes back where it was.
+    #[test]
+    fn undoing_a_drag_puts_the_fixture_back() {
+        let mut app = CadApp::default();
+        let id = app.place_fixture_point(1.0, 1.0);
+        app.light.select(id, false);
+
+        app.light.begin_drag(id, (1.0, 1.0));
+        app.light.drag_to((4.0, 1.0));
+        assert!(app.light.end_drag(), "the drag reported no movement");
+        app.commit_light_undo(); // what the frame-end drain does
+
+        assert!((app.light.luminaires[0].position.x - 4.0).abs() < 1e-5);
+
+        app.do_undo();
+        assert!(
+            (app.light.luminaires[0].position.x - 1.0).abs() < 1e-5,
+            "the fixture is at {} after an undo",
+            app.light.luminaires[0].position.x,
+        );
+    }
+
+    /// A PRESS THAT NEVER MOVED IS A SELECTION and must not cost an Undo press.
+    #[test]
+    fn clicking_a_marker_costs_no_undo_step() {
+        let mut app = CadApp::default();
+        let id = app.place_fixture_point(1.0, 1.0);
+        let depth = app.undo_stack.len();
+
+        app.light.begin_drag(id, (1.0, 1.0));
+        // A REAL STATIONARY PRESS STILL DRAGS. The pointer reports its position every frame the
+        // button is down, so `drag_to` runs with a zero delta — which is exactly where staging
+        // must decline to happen.
+        for _ in 0..5 {
+            app.light.drag_to((1.0, 1.0));
+        }
+        assert!(!app.light.end_drag(), "a stationary press reported a move");
+        app.commit_light_undo();
+        assert_eq!(app.undo_stack.len(), depth, "selecting a marker pushed an undo step");
+    }
+
+    /// UNDOING A DRAWING EDIT LEAVES THE FIXTURES ALONE.
+    ///
+    /// A step carries only what its edit changed. Were every drawing step to carry a copy of the
+    /// fixtures, undoing an unrelated line would silently rewind the lighting with it — which is
+    /// the failure mode of the obvious implementation and the reason for separate variants.
+    #[test]
+    fn undoing_a_line_does_not_disturb_the_lighting() {
+        let mut app = CadApp::default();
+        app.place_fixture_point(1.0, 1.0);
+        app.place_fixture_point(2.0, 1.0);
+
+        // `CadApp::default()` opens with demo geometry, so count rather than assume.
+        let before_line = app.doc.dobjects.len();
+        app.snapshot_doc();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+
+        app.place_fixture_point(3.0, 1.0);
+        assert_eq!(app.light.luminaires.len(), 3);
+
+        // Undo the third point, then the line.
+        app.do_undo();
+        assert_eq!(app.light.luminaires.len(), 2);
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), before_line, "the line was not undone");
+        assert_eq!(
+            app.light.luminaires.len(),
+            2,
+            "undoing a line rewound the lighting to {} fixtures",
+            app.light.luminaires.len(),
+        );
+    }
+
+    /// IDS ARE NEVER REWOUND. `next_id` is deliberately not in a snapshot: a drawing that still
+    /// names a deleted fixture must resolve to nothing rather than to whatever took its place, and
+    /// an undo that rewound the counter would hand the next placement a live id.
+    #[test]
+    fn an_undone_placement_does_not_free_its_id() {
+        let mut app = CadApp::default();
+        let a = app.place_fixture_point(1.0, 1.0);
+        app.do_undo();
+        let b = app.place_fixture_point(2.0, 1.0);
+        assert_ne!(a, b, "the undone fixture's id was handed out again");
+    }
+
+    /// The same rule at the point it would actually be broken: `next_id` is not in a snapshot, so
+    /// restoring one must leave the counter alone. Putting it in is the obvious thing to do —
+    /// alongside the fixtures, in the same struct — and the damage is silent, because the collision
+    /// only shows up in a drawing saved before the undo and reopened after it.
+    #[test]
+    fn restoring_fixtures_does_not_rewind_the_id_counter() {
+        let mut app = CadApp::default();
+        let a = app.place_fixture_point(1.0, 1.0);
+        let b = app.place_fixture_point(2.0, 1.0);
+        let counter = app.light.next_id;
+
+        app.restore_lights(LightSnap { luminaires: Vec::new() });
+        assert_eq!(app.light.next_id, counter, "restoring rewound the id counter");
+
+        let c = app.place_fixture_point(3.0, 1.0);
+        assert!(c != a && c != b, "id {c} collides with one already handed out");
+    }
+
+    /// A RESTORED LAYOUT DOES NOT KEEP THE OLD RESULT.
+    ///
+    /// The lux figures were computed from a layout that no longer holds. Recalculating on every
+    /// undo would cost minutes on a real building; leaving them on screen is worse than both,
+    /// because a figure under a layout it was not computed from is one someone will issue.
+    #[test]
+    fn undoing_a_fixture_edit_drops_the_stale_result() {
+        let mut app = CadApp::default();
+        app.place_fixture_point(1.0, 1.0);
+        app.light.grid = Some(cad_light::LuxGrid::from_values(1, 1, vec![250.0]));
+        app.place_fixture_point(2.0, 1.0);
+        app.do_undo();
+        assert!(app.light.grid.is_none(), "a stale lux grid survived the undo");
     }
 }

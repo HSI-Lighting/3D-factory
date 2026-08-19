@@ -359,6 +359,13 @@ pub struct LightAction {
     /// Write the calculation out as a standalone HTML report. A result that lives only in a panel
     /// cannot be sent to a client or filed against a project.
     pub export_report: bool,
+    /// Delete this fixture. An ACTION rather than an edit in place, because a fixture placed from
+    /// the Illuminaire library also has a block on the drawing — and only `CadApp` can reach that.
+    /// Removing it here left the symbol behind, which is the bug the ✕ shares with everything else
+    /// that used to delete a marker on its own.
+    pub remove_fixture: Option<u32>,
+    /// Delete every fixture, symbols included.
+    pub clear_fixtures: bool,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -384,6 +391,9 @@ pub struct LightState {
     pub place_fitting: Option<u32>,
     /// The library row SELECTED — what the detail strip below the tiles is about.
     pub lib_sel: Option<u32>,
+    /// The fixtures as they were before an edit made inside the panel, waiting to become an undo
+    /// step. See [`LightState::stage_undo`].
+    pub undo_pending: Option<Vec<Luminaire>>,
     /// Folder scanned for .ldt / .ies files — where the LDT half of a combo is chosen from.
     /// Remembered across sessions, because a practice keeps its photometry in one place.
     pub lib_folder: String,
@@ -612,6 +622,7 @@ impl LightState {
             library: crate::illuminaire::Library::default(),
             place_fitting: None,
             lib_sel: None,
+            undo_pending: None,
             lib_folder: String::new(),
             lib_scanned: Vec::new(),
             lib_blocks: Vec::new(),
@@ -742,6 +753,10 @@ impl LightState {
     /// The point carries whatever fitting is currently chosen, which is usually nothing: marking
     /// out a layout does not require having decided on a product yet.
     pub fn place_point(&mut self, x: f32, y: f32) -> u32 {
+        // STAGED HERE, not at the call site. A snapshot every caller has to remember is one a new
+        // caller forgets, and the symptom is silent: the fixture appears and Ctrl+Z reaches past
+        // it to an older edit.
+        self.stage_undo();
         let (z, on_ceiling) = self.mount_z_at(x, y);
         let id = self.next_id;
         self.next_id += 1;
@@ -787,6 +802,40 @@ impl LightState {
         self.selected.clear();
     }
 
+
+    /// Remember the fixtures as they are, so the edit about to happen can be taken back.
+    ///
+    /// Staged rather than pushed, because these methods are called from inside the panel's own
+    /// closure — `self.doc` is not reachable there, and an undo step is `CadApp`'s to push.
+    /// `CadApp::commit_light_undo` drains this once the closure has gone.
+    ///
+    /// Staging TWICE in one frame keeps the FIRST copy: two edits between drains are one undo, and
+    /// the earlier state is the one a person means by "before".
+    pub fn stage_undo(&mut self) {
+        if self.undo_pending.is_none() {
+            self.undo_pending = Some(self.luminaires.clone());
+        }
+    }
+
+    /// Throw away a staged snapshot for an edit that turned out not to happen — a press on a
+    /// marker that never moved is a selection, and must not cost an Undo press.
+    pub fn discard_staged_undo(&mut self) {
+        self.undo_pending = None;
+    }
+
+    /// The lux figures on screen were computed from a layout that no longer holds.
+    ///
+    /// Dropped rather than recalculated: a calculation can take minutes on a real building, and
+    /// running one nobody asked for on every undo would be worse than the stale numbers. Leaving
+    /// them, though, is worse than both — a result under a layout it was not computed from is a
+    /// figure someone will read off and issue.
+    pub fn invalidate_result(&mut self) {
+        self.grid = None;
+        self.plane = None;
+        self.grid_en = None;
+        self.plane_en = None;
+    }
+
     pub fn select_all(&mut self) {
         self.selected = self.luminaires.iter().map(|l| l.id).collect();
     }
@@ -810,10 +859,18 @@ impl LightState {
     pub fn drag_to(&mut self, at: (f32, f32)) {
         let Some(d) = self.drag.as_mut() else { return };
         let (dx, dy) = (at.0 - d.from.0, at.1 - d.from.1);
-        if dx.abs() > 1e-4 || dy.abs() > 1e-4 {
+        // THE MOMENT IT BECOMES A MOVE is the moment worth remembering, and the last one at which
+        // the fixtures still hold their original positions. Staging on the PRESS instead would
+        // cost an Undo press for every click that merely selected a marker; staging on release
+        // would capture where they ended up.
+        let becomes_moved = !d.moved && (dx.abs() > 1e-4 || dy.abs() > 1e-4);
+        if becomes_moved {
             d.moved = true;
         }
         let start = d.start.clone();
+        if becomes_moved {
+            self.stage_undo();
+        }
         for (id, x0, y0) in start {
             if let Some(l) = self.luminaires.iter_mut().find(|l| l.id == id) {
                 l.position.x = x0 + dx;
@@ -885,6 +942,7 @@ impl LightState {
     /// user is actually in — some points picked out, a fresh layout to fill, or setting up before
     /// placing anything.
     pub fn assign_profile(&mut self, name: &str) -> usize {
+        self.stage_undo();
         self.active_profile = name.to_string();
         let known: Vec<String> = self.profiles.keys().cloned().collect();
         let targets: Vec<u32> = if !self.selected.is_empty() {
@@ -918,6 +976,7 @@ impl LightState {
         if name == BUILTIN {
             return; // the built-in is generated, not imported — there is nothing to remove
         }
+        self.stage_undo();
         self.profiles.remove(name);
         let mut orphaned = 0;
         for l in self.luminaires.iter_mut() {
@@ -2570,13 +2629,10 @@ impl LightState {
                 self.select(id, additive);
             }
             if let Some(id) = remove {
-                self.luminaires.retain(|l| l.id != id);
-                self.selected.retain(|&s| s != id);
+                action.remove_fixture = Some(id);
             }
             if ui.button("Clear all fixtures").clicked() {
-                self.luminaires.clear();
-                self.selected.clear();
-                self.drag = None;
+                action.clear_fixtures = true;
             }
         }
 
