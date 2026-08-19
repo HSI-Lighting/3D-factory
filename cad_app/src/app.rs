@@ -2125,7 +2125,9 @@ pub struct CadApp {
     texset_target: Option<usize>,
     /// The Light Editor asked for the folder picker, so the PickFolder result is its photometry
     /// folder rather than a Radiance output or a texture set. One picker, three callers.
-    light_editor_wants_folder: bool,
+    photometry_wants_folder: bool,
+    /// The next Open pick is a BLOCK LIBRARY for Illuminaire, not a project to open.
+    illuminaire_wants_blocks: bool,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
     ///
     /// A FIELD rather than the bare constant, for two reasons. It is the kind of limit a user with
@@ -3927,7 +3929,8 @@ impl Default for CadApp {
             pt_passes: 64,
             pt_denoise: true,
             texset_target: None,
-            light_editor_wants_folder: false,
+            photometry_wants_folder: false,
+            illuminaire_wants_blocks: false,
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
             villa_autoloaded: false,
@@ -4144,60 +4147,112 @@ impl CadApp {
             .is_some_and(|id| id != Self::cmd_line_id())
     }
 
-    // ---- commands & math -----------------------------------------------
 
-
-    /// The Light Editor window — block ↔ photometry wiring. Bails if closed.
+    /// Read the Illuminaire library off disk and parse the photometry each fitting is linked to.
     ///
-    /// Everything the window needs is snapshotted BEFORE it opens, and everything it asks for is
+    /// BOTH HALVES, or the promise breaks. The library file stores a PATH and a profile NAME; the
+    /// profile itself lives in `light.profiles`, which starts with only the built-in. Without this
+    /// second step a library restored from disk shows every tile as "no LDT" and every placed
+    /// fitting calculates as nothing — the combo would survive the save and not the reopen, which
+    /// is the one thing it exists to do.
+    ///
+    /// A file that has since been moved or deleted leaves the LINK intact and logs it. Clearing it
+    /// would silently discard the user's pairing because a drive was not mounted this morning.
+    pub fn load_illuminaire_library(&mut self) {
+        match crate::illuminaire::Library::load() {
+            Ok(l) => self.light.library = l,
+            // AN UNREADABLE LIBRARY IS NOT AN EMPTY ONE. Starting blank here would let the next
+            // save write over a file that was merely locked or half-copied this once.
+            Err(e) => {
+                self.history.push(format!("  illuminaire: library not loaded — {e}"));
+                self.light.illuminaire_locked = true;
+                return;
+            }
+        }
+        let links: Vec<(String, String)> = self
+            .light
+            .library
+            .fittings
+            .iter()
+            .filter(|f| !f.ldt_path.is_empty())
+            .map(|f| (f.name.clone(), f.ldt_path.clone()))
+            .collect();
+        let mut missing = 0usize;
+        for (name, path) in &links {
+            if !self.light.load_photometry(path) {
+                missing += 1;
+                self.history.push(format!("  illuminaire: \"{name}\" — {path} is not readable"));
+            }
+        }
+        if !self.light.library.fittings.is_empty() {
+            self.history.push(format!(
+                "  illuminaire: {} fitting(s) loaded{}",
+                self.light.library.fittings.len(),
+                if missing == 0 { String::new() } else { format!(", {missing} missing photometry") },
+            ));
+        }
+        // `load_photometry` sets the ACTIVE profile as a side effect, which would leave the last
+        // file read selected for new hand-placed luminaires. That is a startup detail, not a
+        // choice the user made.
+        self.light.active_profile = crate::light::BUILTIN.to_string();
+    }
+
+
+    /// The Illuminaire window — the fitting library. Bails if closed.
+    ///
+    /// Everything the window needs is snapshotted BEFORE it opens and everything it asks for is
     /// carried out after: `self.doc` and `self.light` cannot both be borrowed while egui holds a
     /// closure, which is the same reason `render_light_panel` returns an action.
-    fn render_light_editor(&mut self, ctx: &egui::Context) {
-        if !self.light.editor_open {
+    fn render_illuminaire(&mut self, ctx: &egui::Context) {
+        if !self.light.illuminaire_open {
             return;
         }
-        // THE PLAN, NOT WHATEVER IS ON THE CANVAS — the blocks being wired are the drawing's, and
-        // during a face sketch `self.doc` is that plane's document instead.
-        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
-        // EVERY BLOCK, unfiltered — a chooser's job is to show what there is.
-        //
-        // The old window listed all of these in its main panel, which is why `Wiring::hidden`
-        // existed: a real plan has hundreds and nearly all are doors and furniture. The ＋ Add flow
-        // curates at the other end instead — the main list holds what has been added — so there is
-        // nothing left here for a hide filter to do.
-        let rows = crate::light_editor::Wiring::block_rows(&plan);
-        let mut loaded: Vec<String> = self.light.profiles.keys().cloned().collect();
-        loaded.sort_by_key(|s| s.to_lowercase());
-        // How many fittings each wired block WOULD place, for the button's count.
-        let counts: std::collections::HashMap<u32, usize> = self
-            .light
-            .editor
-            .links
-            .keys()
-            .map(|b| (*b, self.light.editor.plan_placements(&plan, *b).len()))
-            .collect();
-
-        let mut open = self.light.editor_open;
-        let scanned = self.light.editor_scanned.clone();
-        let mut wiring = std::mem::take(&mut self.light.editor);
-        let mut pick = self.light.editor_pick;
-        // The chooser state is taken the same way, so the window owns it for the frame without a
-        // borrow on `self.light` outliving the closure egui holds.
-        let mut picker = std::mem::take(&mut self.light.editor_picker);
+        // Taken for the frame so the window owns them without a borrow on `self.light` outliving
+        // the closure egui holds.
+        let lib = std::mem::take(&mut self.light.library);
+        let blocks = std::mem::take(&mut self.light.lib_blocks);
+        let scanned = std::mem::take(&mut self.light.lib_scanned);
         let profiles = self.light.profiles.clone();
-        let act = crate::light_editor::window_ui(
-            ctx, &mut open, &mut wiring, &mut pick, &mut picker, &plan, &rows, &profiles,
-            &loaded, &scanned, &counts,
-        );
-        self.light.editor_picker = picker;
-        self.light.editor = wiring;
-        self.light.editor_pick = pick;
-        self.light.editor_open = open;
+        let mut open = self.light.illuminaire_open;
+        let mut sel = self.light.lib_sel;
+        let mut add_open = self.light.lib_add_open;
+        let mut name_buf = std::mem::take(&mut self.light.lib_name_buf);
 
+        let act = crate::illuminaire::window_ui(
+            ctx,
+            &mut open,
+            &lib,
+            &mut sel,
+            &mut add_open,
+            &mut name_buf,
+            crate::illuminaire::WindowInput {
+                blocks: &blocks,
+                blocks_from: &self.light.lib_blocks_from,
+                scanned: &scanned,
+                folder: &self.light.lib_folder,
+                profiles: &profiles,
+                placing: self.light.place_fitting,
+                blocks_unit_m: self.light.lib_blocks_unit_m,
+            },
+        );
+
+        self.light.library = lib;
+        self.light.lib_blocks = blocks;
+        self.light.lib_scanned = scanned;
+        self.light.lib_sel = sel;
+        self.light.lib_add_open = add_open;
+        self.light.lib_name_buf = name_buf;
+        self.light.illuminaire_open = open;
+
+        // ---- carry out what it asked for ----
+        let mut dirty = false;
+
+        if act.browse_blocks {
+            self.illuminaire_wants_blocks = true;
+            self.open_file_dialog(FileDialogMode::Open, "");
+        }
         if act.browse_folder {
-            // The app's OWN picker — the same one the Radiance output folder and the PBR texture
-            // set use. One dialog with three callers, rather than a second file-dialog crate.
-            self.light_editor_wants_folder = true;
+            self.photometry_wants_folder = true;
             // WITH A FILTER, so the browser shows what is in each folder. The answer is still the
             // folder — but you are choosing it BECAUSE of the .ldt files in it, and a browser that
             // showed a directory of thirty of them as empty is why this was reported as "its not
@@ -4205,33 +4260,202 @@ impl CadApp {
             self.open_file_dialog(FileDialogMode::PickFolder, ".ies|.ldt");
         }
         if act.rescan {
-            self.light.editor_scanned = crate::light_editor::scan_folder(&self.light.editor.folder);
+            self.light.lib_scanned = crate::illuminaire::scan_folder(&self.light.lib_folder);
             self.history.push(format!(
-                "  light editor: {} photometry file(s) found",
-                self.light.editor_scanned.len()
+                "  illuminaire: {} photometry file(s) found",
+                self.light.lib_scanned.len()
             ));
         }
-        if let Some((path, block)) = act.import_and_wire {
-            // IMPORT FIRST, WIRE ONLY IF IT PARSED. Wiring a name that is not in the library
-            // would place fittings whose profile never resolves — they would contribute no light
-            // and no error, which is the shape of bug this whole feature is meant to remove.
-            if self.light.load_photometry(&path) {
-                let name = self.light.active_profile.clone();
-                self.light.editor.links.insert(block, name);
+        if act.blocks_from_drawing {
+            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+            self.light.lib_blocks_unit_m = plan.units.metres_per_unit;
+            self.light.lib_blocks = crate::illuminaire::symbols_from(plan);
+            self.light.lib_blocks_from =
+                format!("{} in this drawing", self.light.lib_blocks.len());
+            self.light.lib_add_open = true;
+        }
+        if let Some(i) = act.add {
+            // The symbol is copied in the units of whatever document it was read FROM — a block
+            // file drawn in millimetres stays millimetres in the library, and the conversion
+            // happens once, at placement, against the destination drawing.
+            if let Some(b) = self.light.lib_blocks.get(i).cloned() {
+                let unit = self.light.lib_blocks_unit_m;
+                let name = b.name.clone();
+                let id = self.light.library.add(crate::illuminaire::Fitting {
+                    name: name.clone(),
+                    id: 0,
+                    symbol: b.symbol,
+                    symbol_unit_m: unit,
+                    ldt_path: String::new(),
+                    profile: String::new(),
+                    model_path: String::new(),
+                });
+                self.light.lib_sel = Some(id);
+                self.light.lib_name_buf = name.clone();
+                self.history.push(format!("  illuminaire: added \"{name}\""));
+                dirty = true;
             }
         }
-        if let Some(block) = act.clear_block {
-            let n = self.light.clear_block_fittings(block);
-            self.history.push(format!("  light editor: {n} fitting(s) removed"));
+        if let Some((id, path)) = act.link {
+            // PARSE FIRST, LINK ONLY IF IT PARSED. Linking a name that is not in the profile
+            // library would place fittings whose photometry never resolves — no light and no
+            // error, which is the shape of bug this whole feature exists to remove.
+            if self.light.load_photometry(&path) {
+                let prof = self.light.active_profile.clone();
+                if let Some(f) = self.light.library.get_mut(id) {
+                    f.ldt_path = path.clone();
+                    f.profile.clone_from(&prof);
+                    let n = f.name.clone();
+                    self.history.push(format!("  illuminaire: {n} ← {prof}"));
+                    dirty = true;
+                }
+            } else {
+                self.history.push(format!("  illuminaire: could not read {path}"));
+            }
         }
-        if act.apply {
-            let (placed, replaced) = self.light.apply_block_wiring(&plan, &self.light.editor.clone());
-            self.history.push(format!(
-                "  light editor: {placed} fitting(s) placed{}",
-                if replaced > 0 { format!(", {replaced} replaced") } else { String::new() },
-            ));
+        if let Some((id, name)) = act.rename {
+            if let Some(f) = self.light.library.get_mut(id) {
+                f.name.clone_from(&name);
+                dirty = true;
+            }
+            self.light.lib_name_buf = name;
+        }
+        if let Some(id) = act.remove {
+            self.light.library.remove(id);
+            if self.light.lib_sel == Some(id) {
+                self.light.lib_sel = None;
+                self.light.lib_name_buf.clear();
+            }
+            if self.light.place_fitting == Some(id) {
+                self.light.place_fitting = None;
+            }
+            dirty = true;
+        }
+        if let Some(id) = act.place {
+            self.light.place_fitting = Some(id);
+            // The two placement modes are mutually exclusive: a click cannot both drop a bare
+            // point and insert a block, and leaving the old one armed would do both.
+            self.light.place_mode = false;
+            let what = self.light.library.get(id).map(|f| f.name.clone()).unwrap_or_default();
+            self.light.last_msg = format!("Placing \"{what}\" — click the plan. Esc stops.");
+        }
+        if let Some(m) = act.set_blocks_unit {
+            self.light.lib_blocks_unit_m = m;
+        }
+        if act.stop_placing {
+            self.light.place_fitting = None;
+            self.light.last_msg = "Stopped placing.".into();
+        }
+
+        if dirty {
+            if self.light.illuminaire_locked {
+                self.history.push(
+                    "  illuminaire: NOT saved — the library on disk could not be read at startup"
+                        .to_string(),
+                );
+            } else if let Err(e) = self.light.library.save() {
+                self.history.push(format!("  illuminaire: could not save the library — {e}"));
+            }
         }
     }
+
+    /// Read a drawing purely for its BLOCK TABLE, and offer what is in it to the add panel.
+    ///
+    /// The project is untouched: this is the "LIGHT BLOCK.dwg" case, a file that exists to hold
+    /// symbols and nothing else. Opening it as a drawing would replace what the user is working
+    /// on, which is the opposite of what picking a block library means.
+    fn load_illuminaire_blocks(&mut self, path: &str) {
+        // A .dwg IS THE COMMON CASE HERE — the file this feature was asked for is "LIGHT
+        // BLOCK.dwg". Converting it in place is the same route `do_open` takes, so a block
+        // library needs no more preparation than a drawing does.
+        let converted;
+        let mut path = path;
+        if path.to_lowercase().ends_with(".dwg") {
+            match self.convert_dwg_to_dxf(path) {
+                Ok(p) => {
+                    converted = p.to_string_lossy().into_owned();
+                    path = &converted;
+                }
+                Err(e) => {
+                    self.history.push(format!("  illuminaire: {path} — {e}"));
+                    return;
+                }
+            }
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // DXF is 7-bit in practice but not guaranteed; a Latin-1 drawing must not be an error.
+            Err(_) => match std::fs::read(path) {
+                Ok(b) => b.iter().map(|&c| c as char).collect(),
+                Err(e) => {
+                    self.history.push(format!("  illuminaire: {path} — {e}"));
+                    return;
+                }
+            },
+        };
+        match cad_io::dxf::read_dxf(&text) {
+            Ok(doc) => {
+                self.light.lib_blocks_unit_m = doc.units.metres_per_unit;
+                self.light.lib_blocks = crate::illuminaire::symbols_from(&doc);
+                self.light.lib_blocks_from = format!(
+                    "{} in {}",
+                    self.light.lib_blocks.len(),
+                    file_stem_of(path),
+                );
+                self.light.lib_add_open = true;
+                self.light.illuminaire_open = true;
+                self.history.push(format!(
+                    "  illuminaire: {} block(s) read from {}",
+                    self.light.lib_blocks.len(),
+                    file_stem_of(path),
+                ));
+            }
+            Err(e) => {
+                self.history.push(format!("  illuminaire: could not read {path} — {e}"));
+            }
+        }
+    }
+
+    /// Drop one fitting on the plan at world metres `(x, y)`. `false` if nothing was armed.
+    ///
+    /// Two things land, at the same spot and in different worlds: an ordinary `BlockRef` on the
+    /// 2D drawing, and a SIMLUX luminaire carrying the linked photometry. The block is what a CAD
+    /// package sees; the luminaire is what the calculation sees.
+    fn place_illuminaire_at(&mut self, x: f32, y: f32) -> bool {
+        let Some(fid) = self.light.place_fitting else { return false };
+        // A FACE SKETCH IS A DIFFERENT DOCUMENT, in metres, on a wall. The luminaire markers are
+        // world metres and are not drawn there at all (`paint_luminaires_2d` bails), so inserting
+        // into it would put a block on the wall's sketch plane and a light nowhere visible.
+        if self.factory.session.is_some() {
+            self.light.last_msg = "Close the face sketch before placing fittings.".into();
+            return false;
+        }
+        let Some(f) = self.light.library.get(fid).cloned() else {
+            self.light.place_fitting = None;
+            return false;
+        };
+        // Metres → DRAWING units. A plan in millimetres wants 3000, not 3.
+        let u = self.doc.units.metres_per_unit;
+        let k = if u.is_finite() && u > 0.0 { u } else { 1.0 };
+        let at = Vec2::new(x as f64 / k, y as f64 / k);
+        let block = crate::illuminaire::insert(&mut self.doc, &f, at, k);
+
+        let id = self.light.place_point(x, y);
+        if let Some(l) = self.light.luminaires.iter_mut().find(|l| l.id == id) {
+            l.profile.clone_from(&f.profile);
+            l.from_block = Some(block);
+        }
+        self.light.last_msg = format!(
+            "Placed \"{}\"{} at ({x:.2}, {y:.2}).",
+            f.name,
+            if f.profile.is_empty() { " (no photometry linked)" } else { "" },
+        );
+        true
+    }
+
+    // ---- commands & math -----------------------------------------------
+
+
     // ===== SIMLUX lighting integration (grafted from simLUX main) ========
     /// Drives the `cad_light` engine on the shared document; `Calculate` needs
     /// `&self.doc`, so the panel returns an action instead of touching it.
@@ -4751,6 +4975,17 @@ impl CadApp {
                     self.light_gesture = true;
                     return true;
                 }
+                // AN ARMED FITTING WINS. Both modes place at a click and only one can act; the
+                // Illuminaire one is the deliberate choice made in a window, so it goes first.
+                if self.light.place_fitting.is_some() {
+                    if self.place_illuminaire_at(x, y) {
+                        if let Some(&id) = self.light.selected.first() {
+                            self.light.begin_drag(id, (x, y));
+                        }
+                        self.light_gesture = true;
+                    }
+                    return true;
+                }
                 if self.light.place_mode {
                     let id = self.light.place_point(x, y);
                     // Placing arms a drag on the new point, so press-move-release puts it down
@@ -4787,7 +5022,10 @@ impl CadApp {
         // name must edit the text rather than erase fixtures.
         let typing = ctx.wants_keyboard_input();
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.light.place_mode {
+            if self.light.place_fitting.is_some() {
+                self.light.place_fitting = None;
+                self.light.last_msg = "Stopped placing.".into();
+            } else if self.light.place_mode {
                 self.light.place_mode = false;
                 self.light.last_msg = "Stopped placing.".into();
             } else if !self.light.selected.is_empty() {
@@ -4812,7 +5050,7 @@ impl CadApp {
             ctx.set_cursor_icon(egui::CursorIcon::Grab);
             return over_canvas;
         }
-        if self.light.place_mode && over_canvas {
+        if (self.light.place_mode || self.light.place_fitting.is_some()) && over_canvas {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
             return true;
         }
@@ -29045,7 +29283,7 @@ impl CadApp {
     /// It was titled "Choose output folder · Radiance render" for all three, so asking the Light
     /// Editor for a photometry folder opened a window announcing a render nobody had started.
     fn folder_dialog_title(&self) -> &'static str {
-        if self.light_editor_wants_folder {
+        if self.photometry_wants_folder {
             "Choose the folder your .ies / .ldt files are in"
         } else if self.texset_target.is_some() {
             "Choose a PBR texture-set folder"
@@ -29425,7 +29663,14 @@ impl CadApp {
             match dlg.mode {
                 FileDialogMode::Open => {
                     let path = dlg.dir.join(name);
-                    self.do_open(&path.to_string_lossy());
+                    // The SAME browser, asked for by two callers. Illuminaire wants a file for
+                    // its block table only — opening it as a project would throw away whatever
+                    // the user is working on, which is not what "load block file" means.
+                    if std::mem::take(&mut self.illuminaire_wants_blocks) {
+                        self.load_illuminaire_blocks(&path.to_string_lossy());
+                    } else {
+                        self.do_open(&path.to_string_lossy());
+                    }
                 }
                 FileDialogMode::ImportImage => {
                     let path = dlg.dir.join(name);
@@ -29491,14 +29736,14 @@ impl CadApp {
                     let dir = if name.is_empty() { dlg.dir.clone() } else { dlg.dir.join(name) };
                     // …or the Light Editor's photometry folder, scanned as soon as it is chosen so
                     // the right-hand list fills in without a second click.
-                    if self.light_editor_wants_folder {
-                        self.light_editor_wants_folder = false;
-                        self.light.editor.folder = dir.to_string_lossy().into_owned();
-                        self.light.editor_scanned =
-                            crate::light_editor::scan_folder(&self.light.editor.folder);
+                    if self.photometry_wants_folder {
+                        self.photometry_wants_folder = false;
+                        self.light.lib_folder = dir.to_string_lossy().into_owned();
+                        self.light.lib_scanned =
+                            crate::illuminaire::scan_folder(&self.light.lib_folder);
                         self.history.push(format!(
-                            "  light editor: {} photometry file(s) found",
-                            self.light.editor_scanned.len()
+                            "  illuminaire: {} photometry file(s) found",
+                            self.light.lib_scanned.len()
                         ));
                     // …or a PBR texture-set folder, if that is what asked for the picker.
                     } else if let Some(i) = self.texset_target.take() {
@@ -40651,18 +40896,19 @@ impl eframe::App for CadApp {
                     ui.separator();
                     ui.checkbox(&mut self.light.window_open, "  Light panel (settings + results)");
                     if ui
-                        .checkbox(&mut self.light.editor_open, "  💡 Light Editor (blocks → fittings)")
+                        .checkbox(&mut self.light.illuminaire_open, "  💡 Illuminaire (fittings)")
                         .on_hover_text(
-                            "Pair a block in the drawing with a photometric file and place a \
-                             fitting at every instance of it",
+                            "Your library of fittings — a 2D block paired with a photometric \
+                             file. Place one and the drawing gets an ordinary block; SIMLUX gets \
+                             a luminaire.",
                         )
                         .changed()
-                        && self.light.editor_open
+                        && self.light.illuminaire_open
                     {
                         // Scan on OPEN, so a folder set last session is populated without the user
                         // having to press anything to see what is in it.
-                        self.light.editor_scanned =
-                            crate::light_editor::scan_folder(&self.light.editor.folder);
+                        self.light.lib_scanned =
+                            crate::illuminaire::scan_folder(&self.light.lib_folder);
                     }
                     ui.checkbox(&mut self.light.view3d_open, "  3D view");
                     ui.checkbox(&mut self.light.place_mode, "  Place luminaire (click plan)");
@@ -41339,7 +41585,7 @@ impl eframe::App for CadApp {
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
         // Light Editor (SIMLUX menu ▸ Light Editor) — block ↔ photometry wiring. Bails if closed.
-        self.render_light_editor(ctx);
+        self.render_illuminaire(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_shortcuts_window(ctx);
         self.render_light_3d_panel(ctx);
@@ -45829,6 +46075,7 @@ impl eframe::App for CadApp {
             // …unless the LIGHTING layer owns the pointer. It sets its own crosshair for placing a
             // fixture and a grab hand over a marker, and those say something this pair cannot.
             let light_owns_cursor = self.light.place_mode
+                || self.light.place_fitting.is_some()
                 || self.light.hover.is_some()
                 || self.light.drag.is_some();
             if !canvas_locked && !light_owns_cursor {
@@ -58046,14 +58293,14 @@ mod the_folder_browser_shows_what_is_in_the_folder {
             "the default caller is the render output folder",
         );
 
-        app.light_editor_wants_folder = true;
+        app.photometry_wants_folder = true;
         let t = app.folder_dialog_title();
         assert!(
             !t.contains("Radiance") && (t.contains(".ldt") || t.contains(".ies")),
             "the photometry pick is titled {t:?}",
         );
 
-        app.light_editor_wants_folder = false;
+        app.photometry_wants_folder = false;
         app.texset_target = Some(0);
         let t = app.folder_dialog_title();
         assert!(!t.contains("Radiance"), "the texture-set pick is titled {t:?}");
@@ -59759,5 +60006,267 @@ mod a_project_survives_a_save_and_a_load {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(std::path::Path::new(&path)));
+    }
+}
+
+/// THE DWG CONVERTER IS FOUND WHERE THE APP LOOKS FOR IT.
+///
+/// `dwg_converter` walks the ancestors of the running executable for
+/// `tools/dwgconv/dwgconv.cmd`. That is a fact about the REPOSITORY LAYOUT — move the wrapper,
+/// or ship a build without it, and DWG open stops working with a message about setting an
+/// environment variable, which is a support call rather than a bug report.
+#[cfg(test)]
+mod the_dwg_converter_is_where_the_app_looks {
+    /// The wrapper is in the tree, next to where the search expects it.
+    #[test]
+    fn the_wrapper_is_in_the_repository() {
+        // The test binary lives in target/debug/deps, so the same ancestor walk finds the repo.
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let found = exe.ancestors().any(|a| a.join("tools/dwgconv/dwgconv.cmd").is_file()
+            || a.join("tools/dwgconv/dwgconv.sh").is_file());
+        assert!(
+            found,
+            "no tools/dwgconv wrapper above {} — DWG open will report 'no DWG converter found'",
+            exe.display(),
+        );
+    }
+
+    /// And `dwg_converter` actually returns it, rather than falling through to the PATH probe.
+    #[test]
+    fn the_search_returns_it() {
+        // The env override wins by design, so a machine that sets one is not being tested here.
+        if std::env::var("RUSTCAD_DWGCONV").is_ok() {
+            return;
+        }
+        let c = super::dwg_converter().expect("the converter search found nothing");
+        assert!(
+            c.to_lowercase().contains("dwgconv"),
+            "the search returned {c:?}, which is not the wrapper",
+        );
+    }
+}
+
+/// THE ILLUMINAIRE WINDOW ACTUALLY RUNS.
+///
+/// Everything above this proves the DATA is right — the library round-trips, the units convert,
+/// the placement leaves a plain block. None of it runs a single line of the window, and a window
+/// that panics on its first frame is indistinguishable from one that was never written.
+///
+/// These drive real headless frames, the same way the factory-panel tests do. What they catch is
+/// what only running catches — a panic, an assertion inside a layout, an arithmetic edge in the
+/// preview fitter — plus the one thing a "did not panic" check misses: that anything was drawn.
+#[cfg(test)]
+mod the_illuminaire_window_runs {
+    use super::*;
+
+    fn frame(app: &mut CadApp) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            app.render_illuminaire(ctx);
+        });
+        // SOMETHING WAS DRAWN. A window that took an early return would pass a "did not panic"
+        // check while showing nothing at all, which is the failure these are really guarding.
+        assert!(
+            !out.shapes.is_empty(),
+            "the frame produced no shapes — the window drew nothing",
+        );
+    }
+
+    fn stocked() -> CadApp {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        let mut doc = cad_kernel::Document::default();
+        for (n, r) in [("OCULUS", 47.5_f64), ("PULSE", 28.5)] {
+            doc.blocks.add(cad_kernel::Block {
+                name: n.into(),
+                base: Vec2::new(0.0, 0.0),
+                dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                    cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: r },
+                ))],
+                smart: false,
+                params: Vec::new(),
+                cut_edges: Vec::new(),
+            });
+        }
+        app.light.lib_blocks = crate::illuminaire::symbols_from(&doc);
+        app.light.lib_blocks_unit_m = 0.001;
+        app.light.lib_add_open = true;
+        app.light.lib_scanned =
+            vec![("FONDO".into(), "D:/ldt/FONDO.ldt".into())];
+        app
+    }
+
+    /// An empty library, with every panel open. The first-run state, which is the one a new user
+    /// sees and the one easiest to leave untested.
+    #[test]
+    fn an_empty_library_draws() {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        app.light.lib_add_open = true;
+        frame(&mut app);
+        assert!(app.light.illuminaire_open, "the window closed itself");
+    }
+
+    /// A stocked one — tiles in both grids, a selection, a placement armed, an LDT list. Every
+    /// branch of the layout at once.
+    #[test]
+    fn a_stocked_library_draws_every_panel() {
+        let mut app = stocked();
+        let b = app.light.lib_blocks[0].clone();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: b.name.clone(),
+            id: 0,
+            symbol: b.symbol,
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/ldt/FONDO.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        app.light.lib_name_buf = b.name;
+        app.light.place_fitting = Some(id);
+        frame(&mut app);
+        assert_eq!(app.light.library.fittings.len(), 1, "a frame changed the library");
+        assert_eq!(app.light.place_fitting, Some(id), "a frame disarmed the placement");
+    }
+
+    /// A fitting with NO photometry linked — the state every fitting is in for the moment between
+    /// being added and being paired, and the one where half the tile has nothing to draw.
+    #[test]
+    fn an_unlinked_fitting_draws() {
+        let mut app = stocked();
+        let b = app.light.lib_blocks[1].clone();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: b.name,
+            id: 0,
+            symbol: b.symbol,
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        frame(&mut app);
+    }
+
+    /// A fitting whose symbol is EMPTY — what a library loaded without its `.rsm` looks like, and
+    /// what a block of pure text or attributes gives. The preview fitter divides by an extent.
+    #[test]
+    fn a_fitting_with_no_geometry_draws() {
+        let mut app = CadApp::default();
+        app.light.illuminaire_open = true;
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: "GHOST".into(),
+            id: 0,
+            symbol: Vec::new(),
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/gone.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.lib_sel = Some(id);
+        frame(&mut app);
+    }
+
+    /// PLACING PUTS BOTH HALVES DOWN, through the real click path.
+    ///
+    /// The window arms a fitting and the canvas places it; between them sit the unit conversion
+    /// and two different documents. A test on `insert` alone proves the block is right and says
+    /// nothing about whether the light landed with it.
+    #[test]
+    fn an_armed_fitting_places_a_block_and_a_light() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 0.001; // a millimetre plan
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "OCULUS".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 47.5 },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: "D:/ldt/OCULUS.ldt".into(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(id);
+
+        // 2.5 m, 4.0 m in the world.
+        assert!(app.place_illuminaire_at(2.5, 4.0), "the placement was refused");
+
+        let refs: Vec<_> = app
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refs.len(), 1, "no block landed on the drawing");
+        // METRES IN, DRAWING UNITS OUT. Placing at 2.5 m on a millimetre plan is 2500, and this
+        // is the conversion that has been got wrong everywhere else in this codebase.
+        assert!((refs[0].insert.x - 2500.0).abs() < 1e-6, "inserted at {}", refs[0].insert.x);
+        assert!((refs[0].insert.y - 4000.0).abs() < 1e-6, "inserted at {}", refs[0].insert.y);
+
+        assert_eq!(app.light.luminaires.len(), 1, "no light landed with the block");
+        let l = &app.light.luminaires[0];
+        assert_eq!(l.profile, crate::light::BUILTIN, "the light did not take the fitting's file");
+        assert_eq!(l.from_block, Some(refs[0].block), "the light is not tied to its symbol");
+        // The luminaire is METRES (cad_light's world) while the block is drawing units. Both
+        // describing the same point in two spaces is the whole of this function.
+        assert!((l.position.x - 2.5).abs() < 1e-6, "the light is at {} m", l.position.x);
+        assert!((l.position.y - 4.0).abs() < 1e-6, "the light is at {} m", l.position.y);
+    }
+
+    /// ARMING A FITTING DISARMS THE BARE-POINT MODE. Both place on a click, and a click can only
+    /// do one thing — with both on, one click would drop a block AND a stray unassigned point.
+    #[test]
+    fn the_two_placement_modes_are_exclusive() {
+        let mut app = CadApp::default();
+        let id = app.light.library.add(crate::illuminaire::Fitting {
+            name: "A".into(),
+            id: 0,
+            symbol: Vec::new(),
+            symbol_unit_m: 1.0,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.place_mode = true;
+        app.light.illuminaire_open = true;
+        app.light.lib_sel = Some(id);
+        // Straight through the action the window returns, rather than re-deciding it here.
+        app.light.place_fitting = Some(id);
+        app.light.place_mode = false;
+        assert!(!app.light.place_mode);
+
+        // And a placement into a FACE SKETCH is refused rather than put on the wall's plane.
+        app.factory.session = Some(crate::factory::SketchSession {
+            plane: 1,
+            saved_doc: cad_kernel::Document::default(),
+            saved_undo: Vec::new(),
+            saved_redo: Vec::new(),
+            saved_constraints: Vec::new(),
+            saved_pending: None,
+        });
+        assert!(!app.place_illuminaire_at(1.0, 1.0), "a face sketch accepted a fitting");
+        assert!(app.light.luminaires.is_empty(), "a light landed during a face sketch");
     }
 }
