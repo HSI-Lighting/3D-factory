@@ -384,6 +384,9 @@ pub struct LightState {
     /// two-click gesture — pick the block, pick the fitting — rather than a drag, because the two
     /// lists scroll independently and a drag between two scrolling lists is a fight.
     pub editor_pick: Option<u32>,
+    /// Which ＋ Add chooser is open, and what is highlighted in it. Not persisted: a chooser left
+    /// open is a moment in a session, not a property of the project.
+    pub editor_picker: crate::light_editor::Picker,
     /// Photometry files found by scanning [`crate::light_editor::Wiring::folder`].
     pub editor_scanned: Vec<(String, String)>,
     /// Loaded IES profiles, keyed by name; always contains [`BUILTIN`].
@@ -546,6 +549,7 @@ impl LightState {
             editor_open: false,
             editor: crate::light_editor::Wiring::default(),
             editor_pick: None,
+            editor_picker: Default::default(),
             editor_scanned: Vec::new(),
             profiles,
             // NOT the built-in. Starting with a fitting already chosen makes the second step of

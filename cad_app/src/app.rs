@@ -4138,9 +4138,13 @@ impl CadApp {
         // THE PLAN, NOT WHATEVER IS ON THE CANVAS — the blocks being wired are the drawing's, and
         // during a face sketch `self.doc` is that plane's document instead.
         let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
-        let all = crate::light_editor::Wiring::block_rows(&plan);
-        let (rows, hidden): (Vec<_>, Vec<_>) =
-            all.into_iter().partition(|r| !self.light.editor.hidden.contains(&r.id));
+        // EVERY BLOCK, unfiltered — a chooser's job is to show what there is.
+        //
+        // The old window listed all of these in its main panel, which is why `Wiring::hidden`
+        // existed: a real plan has hundreds and nearly all are doors and furniture. The ＋ Add flow
+        // curates at the other end instead — the main list holds what has been added — so there is
+        // nothing left here for a hide filter to do.
+        let rows = crate::light_editor::Wiring::block_rows(&plan);
         let mut loaded: Vec<String> = self.light.profiles.keys().cloned().collect();
         loaded.sort_by_key(|s| s.to_lowercase());
         // How many fittings each wired block WOULD place, for the button's count.
@@ -4156,9 +4160,15 @@ impl CadApp {
         let scanned = self.light.editor_scanned.clone();
         let mut wiring = std::mem::take(&mut self.light.editor);
         let mut pick = self.light.editor_pick;
+        // The chooser state is taken the same way, so the window owns it for the frame without a
+        // borrow on `self.light` outliving the closure egui holds.
+        let mut picker = std::mem::take(&mut self.light.editor_picker);
+        let profiles = self.light.profiles.clone();
         let act = crate::light_editor::window_ui(
-            ctx, &mut open, &mut wiring, &mut pick, &rows, &hidden, &loaded, &scanned, &counts,
+            ctx, &mut open, &mut wiring, &mut pick, &mut picker, &plan, &rows, &profiles,
+            &loaded, &scanned, &counts,
         );
+        self.light.editor_picker = picker;
         self.light.editor = wiring;
         self.light.editor_pick = pick;
         self.light.editor_open = open;
