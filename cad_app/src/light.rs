@@ -376,19 +376,34 @@ pub struct RoomLayer {
 pub struct LightState {
     /// Toggles the Light window (Tools ▸ SIMLUX Light).
     pub window_open: bool,
-    /// Toggles the Light Editor window — block ↔ photometry wiring.
-    pub editor_open: bool,
-    /// The block ↔ photometry pairing and its curation. See [`crate::light_editor`].
-    pub editor: crate::light_editor::Wiring,
-    /// Block picked on the left of the Light Editor, waiting for a file on the right. Wiring is a
-    /// two-click gesture — pick the block, pick the fitting — rather than a drag, because the two
-    /// lists scroll independently and a drag between two scrolling lists is a fight.
-    pub editor_pick: Option<u32>,
-    /// Which ＋ Add chooser is open, and what is highlighted in it. Not persisted: a chooser left
-    /// open is a moment in a session, not a property of the project.
-    pub editor_picker: crate::light_editor::Picker,
-    /// Photometry files found by scanning [`crate::light_editor::Wiring::folder`].
-    pub editor_scanned: Vec<(String, String)>,
+    /// Toggles the Illuminaire window — the fitting library (2D block + photometric file).
+    pub illuminaire_open: bool,
+    /// The library, loaded once at startup. App-wide, not per-project — see [`crate::illuminaire`].
+    pub library: crate::illuminaire::Library,
+    /// The fitting armed for placement: the next click in the plan puts one down. `None` = idle.
+    pub place_fitting: Option<u32>,
+    /// The library row SELECTED — what the detail strip below the tiles is about.
+    pub lib_sel: Option<u32>,
+    /// Folder scanned for .ldt / .ies files — where the LDT half of a combo is chosen from.
+    /// Remembered across sessions, because a practice keeps its photometry in one place.
+    pub lib_folder: String,
+    /// What that scan found: (stem, full path), sorted. Rebuilt on demand, never persisted.
+    pub lib_scanned: Vec<(String, String)>,
+    /// The blocks offered in the add panel, flattened once when the panel is filled rather than
+    /// every frame — a real plan has hundreds of definitions.
+    pub lib_blocks: Vec<(String, Vec<crate::illuminaire::SymbolGeom>)>,
+    /// Where those blocks came from, for the panel heading.
+    pub lib_blocks_from: String,
+    /// The unit those blocks were authored in, metres per drawing unit — carried onto a fitting
+    /// when one is added, because the destination drawing is usually a different one.
+    pub lib_blocks_unit_m: f64,
+    /// The library on disk could not be read, so nothing here may be written back over it. Set
+    /// once at startup; the window says so and refuses to save.
+    pub illuminaire_locked: bool,
+    /// Whether the add panel is open.
+    pub lib_add_open: bool,
+    /// The name field for the selected fitting, buffered so typing does not fight the library.
+    pub lib_name_buf: String,
     /// Loaded IES profiles, keyed by name; always contains [`BUILTIN`].
     pub profiles: HashMap<String, IesProfile>,
     /// Profile used for auto-placed / new luminaires.
@@ -540,17 +555,71 @@ impl Default for LightState {
     }
 }
 
+
+/// Re-point `from_block` after a reopen, from the name-keyed map the sidecar carries.
+///
+/// A `from_block` is a POSITION in the block table, and positions do not survive a drawing that
+/// gained or lost a definition between sessions — the same reason everything else here is keyed by
+/// name. The luminaire's own `profile` is what the calculation uses and it round-trips intact, so
+/// what is being repaired is the LINK back to the symbol on the plan: which block on the drawing
+/// this light is.
+///
+/// Only an UNAMBIGUOUS answer is written. Two blocks sharing one profile is a legitimate thing to
+/// draw — the same downlight in a square and a round housing — and guessing between them would
+/// quietly attach a light to the wrong symbol, which no one would ever see and everyone would
+/// inherit. Returns how many were repaired.
+pub fn repair_from_blocks(
+    lums: &mut [Luminaire],
+    doc: &Document,
+    block_ies: &std::collections::BTreeMap<String, String>,
+) -> usize {
+    // Profile → the block ids in THIS document that claim it.
+    let mut by_profile: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (name, profile) in block_ies {
+        if let Some(id) = doc.blocks.find(name) {
+            by_profile.entry(profile.as_str()).or_default().push(id);
+        }
+    }
+    let mut fixed = 0;
+    for l in lums.iter_mut() {
+        // Already pointing at a block that agrees with it — nothing to do. Checking the NAME
+        // rather than merely that the index resolves is the point: after a table shifts, the old
+        // index still resolves, just to the wrong definition.
+        let ok = l.from_block.and_then(|b| doc.blocks.get(b)).is_some_and(|blk| {
+            block_ies.get(&blk.name).is_some_and(|p| *p == l.profile)
+        });
+        if ok {
+            continue;
+        }
+        match by_profile.get(l.profile.as_str()) {
+            Some(ids) if ids.len() == 1 => {
+                l.from_block = Some(ids[0]);
+                fixed += 1;
+            }
+            _ => {}
+        }
+    }
+    fixed
+}
+
 impl LightState {
     pub fn new() -> Self {
         let mut profiles = HashMap::new();
         profiles.insert(BUILTIN.to_string(), builtin_downlight());
         Self {
             window_open: false,
-            editor_open: false,
-            editor: crate::light_editor::Wiring::default(),
-            editor_pick: None,
-            editor_picker: Default::default(),
-            editor_scanned: Vec::new(),
+            illuminaire_open: false,
+            library: crate::illuminaire::Library::default(),
+            place_fitting: None,
+            lib_sel: None,
+            lib_folder: String::new(),
+            lib_scanned: Vec::new(),
+            lib_blocks: Vec::new(),
+            lib_blocks_from: String::new(),
+            lib_blocks_unit_m: 1.0,
+            illuminaire_locked: false,
+            lib_add_open: false,
+            lib_name_buf: String::new(),
             profiles,
             // NOT the built-in. Starting with a fitting already chosen makes the second step of
             // the workflow invisible: every point silently becomes a generic downlight and the
@@ -667,62 +736,6 @@ impl LightState {
         best.map(|(_, id)| id)
     }
 
-    /// APPLY A LIGHT-EDITOR WIRING: place one fitting per block instance, replacing whatever the
-    /// same blocks placed last time. Returns `(placed, replaced)`.
-    ///
-    /// REPLACE, NOT ADD, and that is the whole reason `Luminaire::from_block` exists. Pressing
-    /// Apply twice, or changing which photometric file a block points at, must not double the
-    /// installation — and it must not disturb a fitting the user placed by hand, which carries no
-    /// provenance and is therefore never touched.
-    ///
-    /// Only the blocks in THIS wiring are cleared. Unwiring a block deliberately leaves its
-    /// fittings alone: they are real fittings in a real layout, and removing them is a decision
-    /// the user makes with the ✖ on the row, not a side effect of editing something else.
-    pub fn apply_block_wiring(
-        &mut self,
-        doc: &cad_kernel::Document,
-        wiring: &crate::light_editor::Wiring,
-    ) -> (usize, usize) {
-        let wired: std::collections::HashSet<u32> = wiring.links.keys().copied().collect();
-        let before = self.luminaires.len();
-        self.luminaires.retain(|l| !l.from_block.is_some_and(|b| wired.contains(&b)));
-        let replaced = before - self.luminaires.len();
-
-        let mut placed = 0usize;
-        for (p, profile) in wiring.all_placements(doc) {
-            let (z, _) = self.mount_z_at(p.x, p.y);
-            let id = self.next_id;
-            self.next_id += 1;
-            self.luminaires.push(cad_light::Luminaire {
-                id,
-                profile: profile.clone(),
-                position: cad_light::Vertex::new(p.x, p.y, z),
-                rotation_deg: p.rotation_deg,
-                dimming: 1.0,
-                watts_override: None,
-                flux_override: None,
-                from_block: Some(p.block),
-            });
-            placed += 1;
-        }
-        // A selection made of fittings that no longer exist would panic the panel that reads it.
-        self.selected.clear();
-        self.last_msg = format!(
-            "Light Editor: {placed} fitting(s) placed from {} block(s){}.",
-            wiring.links.len(),
-            if replaced > 0 { format!(", replacing {replaced}") } else { String::new() },
-        );
-        (placed, replaced)
-    }
-
-    /// Remove every fitting a given block placed — the ✖ on a wired row. Returns how many went.
-    pub fn clear_block_fittings(&mut self, block: u32) -> usize {
-        let before = self.luminaires.len();
-        self.luminaires.retain(|l| l.from_block != Some(block));
-        let gone = before - self.luminaires.len();
-        self.selected.clear();
-        gone
-    }
 
     /// Drop a light POINT at `(x, y)` — step ② of the workflow. Returns its id.
     ///
@@ -1846,15 +1859,30 @@ impl LightState {
                 ies_library.insert(k.clone(), v.clone());
             }
         }
+        // WHICH BLOCKS IN THIS DRAWING ARE FITTINGS, by block NAME → profile name.
+        //
+        // The library itself is app-wide; this is the per-project half. Without it, reopening a
+        // plan gives back blocks the drawing understands and SIMLUX does not — the symbols would
+        // be there and nothing would emit light.
+        //
+        // Taken from the PLACED luminaires rather than from the library, because that is what the
+        // project actually contains: a fitting deleted from the library after it was used must
+        // still resolve in the drawings that used it.
+        let mut lux_block_ies = BTreeMap::new();
+        for l in &self.luminaires {
+            let Some(b) = l.from_block else { continue };
+            if l.profile.is_empty() {
+                continue;
+            }
+            if let Some(blk) = doc.blocks.get(b) {
+                lux_block_ies.insert(blk.name.clone(), l.profile.clone());
+            }
+        }
         crate::simlux_io::SimluxConfig {
             layers_3d,
             ies_library,
+            lux_block_ies,
             active_profile: self.active_profile.clone(),
-            // THE LIGHT EDITOR'S WIRING, translated from block ids to block NAMES on the way out
-            // — ids are positions in the block table and do not survive a reopen.
-            lux_block_ies: self.editor.to_named(doc),
-            light_editor_hidden: self.editor.hidden_named(doc),
-            light_editor_folder: self.editor.folder.clone(),
             materials: self.materials.clone(),
             settings: self.settings,
             room_height: self.room_height,
@@ -1884,16 +1912,6 @@ impl LightState {
         if cfg.active_profile.is_empty() || self.profiles.contains_key(&cfg.active_profile) {
             self.active_profile = cfg.active_profile;
         }
-        // THE LIGHT EDITOR'S WIRING, resolved from names back to THIS document's block ids. A name
-        // the drawing no longer has is dropped: the drawing is the authority on what blocks exist,
-        // and a pairing to one nobody can see is not recoverable state.
-        self.editor = crate::light_editor::Wiring::from_named(
-            doc,
-            &cfg.lux_block_ies,
-            &cfg.light_editor_hidden,
-            cfg.light_editor_folder,
-        );
-        self.editor_scanned = crate::light_editor::scan_folder(&self.editor.folder);
         // The placed layout. A fixture whose fitting did not come back with the library is left
         // unassigned — visible as a hollow marker and counted in the toolbar — rather than kept
         // pointing at a name that resolves to nothing and silently emits no light.
@@ -1908,6 +1926,7 @@ impl LightState {
             self.drag = None;
             let highest = self.luminaires.iter().map(|l| l.id).max().unwrap_or(0);
             self.next_id = cfg.next_luminaire_id.max(highest + 1);
+            repair_from_blocks(&mut self.luminaires, doc, &cfg.lux_block_ies);
         }
         if !cfg.materials.is_empty() {
             self.materials = cfg.materials;
@@ -4659,103 +4678,137 @@ mod the_plane_is_the_room {
     }
 }
 
-/// APPLYING A LIGHT-EDITOR WIRING places one fitting per block instance — and applying it twice
-/// must not place them twice. A doubled installation is not a visible bug: the markers overlap
-/// exactly, and the only symptom is a lux result and a power density that are both twice what the
-/// design actually is.
+/// REOPENING A PROJECT MUST STILL KNOW WHICH BLOCKS ARE FITTINGS.
+///
+/// A `from_block` is an INDEX into the block table, and an index is a position. Between sessions a
+/// drawing gains a door block, loses a furniture block, is round-tripped through another package —
+/// and every stored index means something else. The sidecar carries the map by NAME for exactly
+/// this; these are the cases it has to get right, including the one where it must refuse.
 #[cfg(test)]
-mod light_editor_apply {
+mod reopening_relinks_fittings_to_their_blocks {
     use super::*;
-    use crate::light_editor::Wiring;
-    use cad_kernel::{Block, BlockRef, DObject, Document, Geom, Vec2, MAX_BLOCK_PARAMS};
+    use cad_kernel::{Block, Vec2};
 
-    fn plan(n: usize) -> (Document, u32) {
-        let mut doc = Document::default();
-        doc.dobjects.clear();
-        doc.units = cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
-        let id = doc.blocks.add(Block {
-            name: "DOWNLIGHT".into(), base: Vec2::ZERO, dobjects: Vec::new(),
-            smart: false, params: Vec::new(), cut_edges: Vec::new(),
-        });
-        for i in 0..n {
-            doc.push(DObject::new(Geom::BlockRef(BlockRef {
-                block: id, insert: Vec2::new(i as f64 * 2.0, 1.0), scale: 1.0, scale_y: 1.0,
-                rotation: 0.0, mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
-            })));
+    fn doc_with(names: &[&str]) -> Document {
+        let mut d = Document::default();
+        for n in names {
+            d.blocks.add(Block {
+                name: (*n).to_string(),
+                base: Vec2::new(0.0, 0.0),
+                dobjects: Vec::new(),
+                smart: false,
+                params: Vec::new(),
+                cut_edges: Vec::new(),
+            });
         }
-        (doc, id)
+        d
     }
 
-    fn wired(block: u32, profile: &str) -> Wiring {
-        let mut w = Wiring::default();
-        w.links.insert(block, profile.to_string());
-        w
+    fn map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
 
+    fn lum(id: u32, profile: &str, from: Option<u32>) -> Luminaire {
+        Luminaire {
+            id,
+            profile: profile.to_string(),
+            position: Vertex::new(0.0, 0.0, 3.0),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: from,
+        }
+    }
+
+    /// THE TABLE SHIFTED UNDER IT. The light was saved pointing at index 0; a block was inserted
+    /// ahead of it, so index 0 is now a door. Nothing about the stored index looks broken — it
+    /// resolves, to the wrong thing — which is why the name is what decides.
     #[test]
-    fn applying_a_wiring_places_one_fitting_per_instance() {
-        let (doc, b) = plan(12);
-        let mut s = LightState::default();
-        let (placed, replaced) = s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        assert_eq!((placed, replaced), (12, 0));
-        assert_eq!(s.luminaires.len(), 12);
-        assert!(s.luminaires.iter().all(|l| l.from_block == Some(b)), "provenance is recorded");
-        assert!(s.luminaires.iter().all(|l| l.profile == "PULSE"));
+    fn a_shifted_block_table_is_repaired_by_name() {
+        let doc = doc_with(&["DOOR", "OCULUS"]);
+        let mut lums = vec![lum(1, "OCULUS 3000K", Some(0))];
+        let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
+        assert_eq!(fixed, 1, "the stale index was not repaired");
+        assert_eq!(lums[0].from_block, Some(1), "the light points at the wrong block");
     }
 
-    /// THE ONE THAT MATTERS. Twice must be the same as once.
+    /// AN INDEX THAT IS ALREADY RIGHT IS LEFT ALONE — and counted as untouched, so the log does
+    /// not report work on every reopen of a file nothing has happened to.
     #[test]
-    fn applying_twice_does_not_double_the_installation() {
-        let (doc, b) = plan(12);
-        let mut s = LightState::default();
-        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        let (placed, replaced) = s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        assert_eq!(placed, 12, "it places the same twelve again");
-        assert_eq!(replaced, 12, "…having removed the twelve it placed before");
-        assert_eq!(s.luminaires.len(), 12, "the installation was doubled");
+    fn a_correct_link_is_not_touched() {
+        let doc = doc_with(&["OCULUS", "DOOR"]);
+        let mut lums = vec![lum(1, "OCULUS 3000K", Some(0))];
+        let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
+        assert_eq!(fixed, 0, "a correct link was rewritten");
+        assert_eq!(lums[0].from_block, Some(0));
     }
 
-    /// Re-wiring to a different file UPDATES the fittings rather than adding a second set beside
-    /// them — which would leave the old product still lighting the room.
+    /// TWO BLOCKS SHARING ONE PROFILE IS AMBIGUOUS, so nothing is written.
+    ///
+    /// The same downlight in a square and a round housing is a legitimate thing to draw. Picking
+    /// one would attach a light to the wrong symbol — invisible on the plan, wrong in every
+    /// schedule produced from it afterwards, and inherited by whoever opens the file next.
     #[test]
-    fn changing_the_wired_profile_updates_in_place() {
-        let (doc, b) = plan(6);
-        let mut s = LightState::default();
-        s.apply_block_wiring(&doc, &wired(b, "OLD"));
-        s.apply_block_wiring(&doc, &wired(b, "NEW"));
-        assert_eq!(s.luminaires.len(), 6, "a re-wire added a second set");
-        assert!(s.luminaires.iter().all(|l| l.profile == "NEW"), "the fittings kept the old file");
-    }
-
-    /// HAND-PLACED FITTINGS ARE NEVER TOUCHED. They carry no provenance, and a layout is usually
-    /// part generated and part drawn by the designer.
-    #[test]
-    fn a_hand_placed_fitting_survives_every_apply() {
-        let (doc, b) = plan(4);
-        let mut s = LightState::default();
-        let hand = s.place_point(99.0, 99.0);
-        assert!(s.luminaires.iter().find(|l| l.id == hand).unwrap().from_block.is_none());
-
-        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        assert!(
-            s.luminaires.iter().any(|l| l.id == hand),
-            "an Apply deleted a fitting the user placed by hand",
+    fn an_ambiguous_profile_is_left_unresolved() {
+        let doc = doc_with(&["SQUARE", "ROUND"]);
+        let mut lums = vec![lum(1, "OCULUS 3000K", None)];
+        let fixed = repair_from_blocks(
+            &mut lums,
+            &doc,
+            &map(&[("SQUARE", "OCULUS 3000K"), ("ROUND", "OCULUS 3000K")]),
         );
-        assert_eq!(s.luminaires.len(), 5, "four generated plus the one by hand");
+        assert_eq!(fixed, 0, "a guess was made between two equally good candidates");
+        assert_eq!(lums[0].from_block, None, "a guess was written: {:?}", lums[0].from_block);
     }
 
-    /// Unwiring leaves the fittings alone — they are real fittings, and removing them is the ✖ on
-    /// the row, not a side effect of editing a different block.
+    /// A BLOCK THE DRAWING NO LONGER HAS resolves to nothing rather than to whatever now sits at
+    /// that index. The light keeps its photometry and calculates exactly as before — only the
+    /// link to a symbol that is not there any more is dropped.
     #[test]
-    fn unwiring_a_block_leaves_its_fittings_until_they_are_cleared() {
-        let (doc, b) = plan(5);
-        let mut s = LightState::default();
-        s.apply_block_wiring(&doc, &wired(b, "PULSE"));
-        s.apply_block_wiring(&doc, &Wiring::default()); // nothing wired now
-        assert_eq!(s.luminaires.len(), 5, "unwiring silently deleted the layout");
+    fn a_deleted_block_does_not_resolve_to_its_neighbour() {
+        let doc = doc_with(&["DOOR", "DESK"]);
+        let mut lums = vec![lum(1, "OCULUS 3000K", Some(1))];
+        let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
+        assert_eq!(fixed, 0);
+        assert_eq!(
+            lums[0].from_block,
+            Some(1),
+            "an unresolvable link must be left as it was, not pointed at DESK",
+        );
+        assert_eq!(lums[0].profile, "OCULUS 3000K", "the photometry must not be disturbed");
+    }
 
-        assert_eq!(s.clear_block_fittings(b), 5, "the explicit clear removes them");
-        assert!(s.luminaires.is_empty());
+    /// EACH LIGHT IS ANSWERED SEPARATELY — a plan has several fittings on it, and repairing the
+    /// first must not decide the rest.
+    #[test]
+    fn several_fittings_are_each_repaired_to_their_own_block() {
+        let doc = doc_with(&["WALL", "OCULUS", "LINEAR"]);
+        let mut lums = vec![
+            lum(1, "OCULUS 3000K", Some(0)),
+            lum(2, "LINEAR 4000K", Some(0)),
+            lum(3, "OCULUS 3000K", Some(0)),
+        ];
+        let fixed = repair_from_blocks(
+            &mut lums,
+            &doc,
+            &map(&[("OCULUS", "OCULUS 3000K"), ("LINEAR", "LINEAR 4000K")]),
+        );
+        assert_eq!(fixed, 3);
+        assert_eq!(lums[0].from_block, Some(1));
+        assert_eq!(lums[1].from_block, Some(2), "the second fitting took the first one's block");
+        assert_eq!(lums[2].from_block, Some(1));
+    }
+
+    /// A HAND-PLACED LIGHT IS NOT A BLOCK and must not be given one. `place_luminaire` puts a
+    /// bare point on the plan with no symbol at all; inventing a `from_block` for it would make
+    /// a schedule count symbols that were never drawn.
+    #[test]
+    fn a_light_with_no_block_of_its_own_is_left_alone() {
+        let doc = doc_with(&["OCULUS"]);
+        let mut lums = vec![lum(1, "SOMETHING ELSE", None)];
+        let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
+        assert_eq!(fixed, 0);
+        assert_eq!(lums[0].from_block, None);
     }
 }

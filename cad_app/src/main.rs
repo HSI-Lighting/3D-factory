@@ -13,7 +13,7 @@ mod assets; // where bundled data lives at runtime — see the module docs
 mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
 mod light;
-mod light_editor; // Light Editor — wire drawing blocks to photometry, place a fitting per instance
+mod illuminaire; // Illuminaire — a library of fittings: a 2D block + a photometric file
 mod light_report; // the SIMLUX calculation written out as a standalone HTML report
 mod light3d;
 mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
@@ -126,7 +126,12 @@ fn main() -> Result<(), eframe::Error> {
             if (zoom - 1.0).abs() > f32::EPSILON {
                 cc.egui_ctx.set_zoom_factor(zoom);
             }
-            Ok(Box::new(app::CadApp::default()))
+            let mut a = app::CadApp::default();
+            // THE LIBRARY IS THE APP'S, so it is read once here rather than in `default()` —
+            // which the test suite calls hundreds of times and must not have the developer's
+            // own fittings leaking into.
+            a.load_illuminaire_library();
+            Ok(Box::new(a))
         }),
     )
 }
