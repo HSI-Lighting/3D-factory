@@ -2822,6 +2822,20 @@ impl Scene3dRenderer {
         self.geom
     }
 
+    /// WHY THE REFINEMENT RESTARTED, or empty when it did not.
+    ///
+    /// Temporal accumulation only pays for itself if a still frame CONVERGES: sample 1 costs a
+    /// full render and sample 16 costs nothing, because the renderer re-presents the finished
+    /// buffer. A frame key that changes every frame inverts that — every frame is sample 1 for
+    /// ever, and a scene heavy enough to want TAA is exactly the scene that then grinds.
+    ///
+    /// From outside, a legitimately busy camera and a key that will never settle look identical:
+    /// `n=1/16` in the report, on every frame, at 300 ms each. This names which input moved, so
+    /// the two can be told apart from a session dump rather than guessed at.
+    pub fn taa_reason(&self) -> &str {
+        if self.taa_stable { "" } else { self.taa_dbg.as_str() }
+    }
+
     /// Record the frame's geometry for the session dump. Cheap: one `check_framebuffer_status`.
     unsafe fn note_geom(
         &mut self, gl: &glow::Context, vp: (i32, i32, i32, i32), screen: (i32, i32),

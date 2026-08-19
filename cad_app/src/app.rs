@@ -848,11 +848,24 @@ fn save_file_worker(
     // the 3D model. Any sidecar failure is reported but does not fail the drawing save.
     let solids = cfg.factory.model.features.len();
     let walls = cfg.factory.walls.len();
+    // WHAT WENT INTO THE FILE, COUNTED — including the imports, which are the expensive half of a
+    // project and the half that says nothing at all when it goes missing.
+    //
+    // Reported as "its not saving it properly ... when i load it, it loads an older version". The
+    // sidecar on disk held four features and `furniture_lib: []`, `furniture: []`, `textures: []`
+    // — the model saved and everything imported into it did not, which reopens looking exactly
+    // like an older version of the same file. Every step of the save chain is tested and keeps
+    // them, so a file that still comes out empty was empty BEFORE the save; this line says so at
+    // the moment it happens rather than a week later.
+    let furn = cfg.factory.furniture_lib.len();
+    let insts = cfg.factory.furniture.len();
+    let texs = cfg.factory.textures.len();
+    let imports = format!(", {furn} asset(s)/{insts} placed, {texs} texture(s)");
     let note = match crate::simlux_io::save(std::path::Path::new(path), &cfg) {
         Ok(_) if solids > 0 => format!(
-            "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s)",
+            "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s){imports}",
             path, bytes.len(), solids, walls),
-        Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX", path, bytes.len()),
+        Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX{imports}", path, bytes.len()),
         Err(e) => format!("  saved '{}'  ({} bytes) · ! SIMLUX save: {}", path, bytes.len(), e),
     };
     Ok(SavePayload { bytes: bytes.len(), note })
@@ -13512,7 +13525,19 @@ impl CadApp {
                             .light3d_renderer
                             .lock()
                             .ok()
-                            .map(|r| (r.shader_failures().join(","), r.last_geom().to_string()))
+                            .map(|r| {
+                                // …AND WHY THE REFINEMENT RESTARTED, when it did. `n=1/16` on
+                                // every frame is either an orbit in progress or a frame key that
+                                // will never settle — the same line in a report, very different
+                                // problems.
+                                let why = r.taa_reason();
+                                let geom = if why.is_empty() {
+                                    r.last_geom().to_string()
+                                } else {
+                                    format!("{} taa-reset[{why}]", r.last_geom())
+                                };
+                                (r.shader_failures().join(","), geom)
+                            })
                             .unwrap_or_default();
                         let phase = match (rebuilt, bad.is_empty()) {
                             (_, false) => format!("SHADERS-FAILED[{bad}] {geom}"),
