@@ -15853,3 +15853,78 @@ mod a_painted_face_keeps_its_paint {
         );
     }
 }
+
+/// SAVING KEEPS THE FURNITURE AND THE TEXTURES.
+///
+/// Reported as "its not saving it properly i saved this file a number of times yet when i load it,
+/// it loads an older version". The file on disk says exactly what happened: a model carrying one
+/// 481,738-triangle asset and one 2048×2048 texture wrote a 30 KB sidecar with
+///
+///     "furniture_lib": [],  "furniture": [],  "textures": []
+///
+/// so reopening it gives the model MINUS everything imported into it — which is indistinguishable
+/// from an older version of the file.
+#[cfg(test)]
+mod a_save_keeps_the_furniture {
+    use super::*;
+
+    /// A state with one imported asset placed once, and one pasted texture — built through the
+    /// app's own constructors, so the fixture is what an import really produces.
+    fn furnished() -> FactoryState {
+        let mut st = FactoryState::default();
+        let mesh = crate::mesh_io::parse_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n",
+        );
+        let a = st.add_furniture_asset("model_20260805-163358".into(), mesh);
+        st.place_furniture(a, Vec3::new(2.99, 0.42, 0.68));
+        st.add_texture("mat0".into(), 4, 4, vec![255; 4 * 4 * 4]);
+        assert!(!st.furniture_lib.is_empty() && !st.furniture.is_empty() && !st.textures.is_empty());
+        st
+    }
+
+    /// THE FULL SAVE keeps all three. This is the path a plain Save As takes.
+    #[test]
+    fn a_full_save_keeps_the_furniture_and_textures() {
+        let st = furnished();
+        let d = st.to_persist();
+        assert_eq!(d.furniture_lib.len(), 1, "the imported asset was dropped");
+        assert_eq!(d.furniture.len(), 1, "the placed instance was dropped");
+        assert_eq!(d.textures.len(), 1, "the texture was dropped");
+        assert!(
+            !d.furniture_lib[0].pos_b64.is_empty(),
+            "the asset is listed but its geometry is empty — it reopens as nothing",
+        );
+    }
+
+    /// AND SO DOES THE LITE SAVE, which is the one the app actually uses: the UI thread builds a
+    /// config with the geometry LEFT OUT and a worker fills the blobs, to keep the deflate off the
+    /// frame. Leaving the blobs empty is the point of it — dropping the ENTRIES is not.
+    #[test]
+    fn the_lite_save_still_lists_the_furniture_and_textures() {
+        let st = furnished();
+        let d = st.to_persist_lite();
+        assert_eq!(
+            d.furniture_lib.len(), 1,
+            "the lite path dropped the asset itself, not just its geometry — so the worker has \
+             nothing to fill in and the file reopens without it",
+        );
+        assert_eq!(d.furniture.len(), 1, "the placed instance was dropped");
+        assert_eq!(d.textures.len(), 1, "the texture was dropped");
+    }
+
+    /// AND THE WORKER HAS SOMETHING TO FILL FROM. The two lists are paired by INDEX — blob `i` is
+    /// filled from raw `i` — so a mismatch in length silently pairs one asset's geometry with
+    /// another's name.
+    #[test]
+    fn the_raw_geometry_lines_up_with_the_lite_list() {
+        let st = furnished();
+        let d = st.to_persist_lite();
+        let raw = st.furniture_geom_flat();
+        assert_eq!(
+            raw.len(), d.furniture_lib.len(),
+            "{} asset(s) listed but {} set(s) of geometry — the worker pairs these by index",
+            d.furniture_lib.len(), raw.len(),
+        );
+        assert!(!raw.is_empty() && !raw[0].pos.is_empty(), "the geometry handed over is empty");
+    }
+}
