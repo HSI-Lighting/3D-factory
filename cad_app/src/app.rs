@@ -29245,14 +29245,35 @@ impl CadApp {
                                             }
                                         }
                                         for f in &files {
-                                            // IN A FOLDER PICK THE FILES ARE CONTEXT, NOT THE
-                                            // ANSWER — they say "yes, this is the folder you
-                                            // meant", and nothing more. Selecting one would put
-                                            // its name in `filename`, which a folder pick reads as
-                                            // the NEW SUBFOLDER TO CREATE: clicking `FONDO.LDT`
-                                            // would offer to make a directory called FONDO.LDT.
+                                            // IN A FOLDER PICK, CLICKING A FILE TAKES ITS FOLDER.
+                                            //
+                                            // Reported as "why cant i select it", looking at a
+                                            // list with FONDO.ldt in it. The files were drawn as
+                                            // read-only context on the reasoning that the answer
+                                            // is the FOLDER — true, and beside the point: someone
+                                            // pointing at the file they came for is saying exactly
+                                            // which folder they mean, and a list that ignores a
+                                            // click reads as broken rather than as informative.
+                                            //
+                                            // It must NOT go through `filename`, which is why it
+                                            // was inert to begin with: a folder pick reads that as
+                                            // the NEW SUBFOLDER TO CREATE, so clicking FONDO.ldt
+                                            // would have offered to make a directory called
+                                            // FONDO.ldt. Confirming directly skips it, and the
+                                            // clear() is belt-and-braces on the same hazard.
                                             if dlg.mode == FileDialogMode::PickFolder {
-                                                ui.weak(format!("📄 {}", f));
+                                                if ui
+                                                    .selectable_label(
+                                                        false,
+                                                        egui::RichText::new(format!("📄 {}", f))
+                                                            .weak(),
+                                                    )
+                                                    .on_hover_text("Use the folder this is in")
+                                                    .clicked()
+                                                {
+                                                    dlg.filename.clear();
+                                                    do_confirm = true;
+                                                }
                                                 continue;
                                             }
                                             let selected = dlg.filename.eq_ignore_ascii_case(f);
@@ -29315,8 +29336,17 @@ impl CadApp {
                                             egui::Color32::from_rgb(24, 28, 34));
                                         ui.painter().rect_stroke(prect, 2.0,
                                             egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
+                                        // SAY WHAT THIS MODE ACTUALLY WANTS. "(select a file)" is
+                                        // right for an Open, and in a FOLDER pick it invites the
+                                        // one action that does nothing — which is exactly how it
+                                        // was reported: "why cant i select it".
+                                        let hint = if dlg.mode == FileDialogMode::PickFolder {
+                                            "the files are what is in this folder"
+                                        } else {
+                                            "(select a file)"
+                                        };
                                         ui.painter().text(prect.center(),
-                                            egui::Align2::CENTER_CENTER, "(select a file)",
+                                            egui::Align2::CENTER_CENTER, hint,
                                             crate::theme::typ::data_code(),
                                             egui::Color32::from_gray(140));
                                     }
@@ -57992,6 +58022,58 @@ mod the_folder_browser_shows_what_is_in_the_folder {
         app.texset_target = Some(0);
         let t = app.folder_dialog_title();
         assert!(!t.contains("Radiance"), "the texture-set pick is titled {t:?}");
+    }
+
+    /// CLICKING A FILE IN A FOLDER PICK MUST NOT GO THROUGH `filename`.
+    ///
+    /// Reported as "why cant i select it", looking at a browser listing FONDO.ldt. The files were
+    /// deliberately inert, because a folder pick reads `filename` as the NEW SUBFOLDER TO CREATE —
+    /// so selecting FONDO.ldt would have offered to make a directory called FONDO.ldt inside the
+    /// folder the user was trying to choose.
+    ///
+    /// Clicking one now confirms the FOLDER directly, and the `clear()` before it is the whole of
+    /// what keeps the old hazard shut. Asserted on the source because the click needs a live egui
+    /// context, and because the thing worth protecting is the ORDER of two statements — which no
+    /// behavioural test of the finished dialog would notice until somebody had already lost a
+    /// folder to it.
+    #[test]
+    fn a_folder_pick_never_confirms_with_a_file_name_in_the_subfolder_field() {
+        let src = include_str!("app.rs");
+        let anchor = "IN A FOLDER PICK, CLICKING A FILE TAKES ITS FOLDER.";
+        let a = src.find(anchor).expect("the folder-pick file row");
+        // The row ends where the ordinary (non-folder) rows resume.
+        let b = src[a..]
+            .find("let selected = dlg.filename.eq_ignore_ascii_case(f);")
+            .map(|e| a + e)
+            .expect("the ordinary file row follows it");
+        let body = &src[a..b];
+
+        assert!(
+            body.contains("do_confirm = true;"),
+            "clicking a file in a folder pick does nothing — which is what was reported",
+        );
+        let clear = body.find("dlg.filename.clear();").expect(
+            "the file name must be cleared, or the folder pick treats it as a subfolder to create",
+        );
+        let confirm = body.find("do_confirm = true;").expect("checked above");
+        assert!(
+            clear < confirm,
+            "the clear must come BEFORE the confirm, or FONDO.ldt is read as a new subfolder",
+        );
+    }
+
+    /// AND THE PREVIEW PANE STOPS ASKING FOR SOMETHING THIS MODE CANNOT DO. "(select a file)" is
+    /// right for an Open and, in a folder pick, invites the one action that used to do nothing.
+    #[test]
+    fn a_folder_pick_does_not_ask_you_to_select_a_file() {
+        let src = include_str!("app.rs");
+        let a = src.find("SAY WHAT THIS MODE ACTUALLY WANTS").expect("the preview hint");
+        let b = src[a..].find("crate::theme::typ::data_code()").map(|e| a + e).unwrap();
+        let body = &src[a..b];
+        assert!(
+            body.contains("FileDialogMode::PickFolder"),
+            "the preview hint no longer distinguishes a folder pick",
+        );
     }
 }
 
