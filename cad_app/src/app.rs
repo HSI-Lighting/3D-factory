@@ -4490,7 +4490,34 @@ impl CadApp {
         if let Some(m) = act.set_blocks_unit {
             self.light.lib_blocks_unit_m = m;
         }
+        if let Some((id, m)) = act.set_fitting_unit {
+            if let Some(f) = self.light.library.get_mut(id) {
+                f.symbol_unit_m = m;
+            }
+            // AND THE DRAWING FOLLOWS. The block definition is a cache of the library entry, and
+            // `ensure_block` reuses it by name — so correcting the unit without rebuilding it
+            // would leave every instance already placed at the old scale, with the panel now
+            // stating a size the plan does not show.
+            if self.factory.session.is_none() {
+                if let Some(f) = self.light.library.get(id).cloned() {
+                    let u = self.doc.units.metres_per_unit;
+                    let k = if u.is_finite() && u > 0.0 { u } else { 1.0 };
+                    // Only when this drawing HAS one — a fitting never placed here has nothing
+                    // to correct, and an undo step for an edit that did not happen is a press
+                    // the user has to spend twice.
+                    if self.doc.blocks.find(&f.name).is_some() {
+                        self.snapshot_doc();
+                        crate::illuminaire::rebuild_block(&mut self.doc, &f, k);
+                        self.intersections.clear();
+                        self.index_dirty = true;
+                        self.touch_view();
+                    }
+                }
+            }
+            dirty = true;
+        }
         if act.stop_placing {
+
             self.light.place_fitting = None;
             self.light.last_msg = "Stopped placing.".into();
         }
@@ -4586,7 +4613,22 @@ impl CadApp {
         let u = self.doc.units.metres_per_unit;
         let k = if u.is_finite() && u > 0.0 { u } else { 1.0 };
         let at = Vec2::new(x as f64 / k, y as f64 / k);
+
+        // AN EDIT TO THE DRAWING IS AN EDIT TO THE DRAWING, and has to announce itself the same
+        // way every other one does. This did not, and the symptom was reported as "once i place a
+        // file ... still no blocks. the block shows up after i delete a light or 2".
+        //
+        // The blocks were there the whole time. Nothing had told the canvas its cached geometry
+        // was stale (`touch_view`) or the spatial index that there was something new to pick
+        // (`index_dirty`), so they were invisible and unclickable until an unrelated edit rebuilt
+        // both — deleting a light, in the report. Nor was an undo step taken, so a placement could
+        // not be undone and the file was never even marked unsaved: closing the app would have
+        // thrown the work away without asking.
+        self.snapshot_doc();
         let block = crate::illuminaire::insert(&mut self.doc, &f, at, k);
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.touch_view();
 
         let id = self.light.place_point(x, y);
         if let Some(l) = self.light.luminaires.iter_mut().find(|l| l.id == id) {
@@ -60774,5 +60816,198 @@ mod deleting_a_placed_fitting {
         let n = app.undo_stack.len();
         app.delete_fixtures(&[bare]);
         assert_eq!(app.undo_stack.len(), n, "a fixture-only delete pushed an empty undo step");
+    }
+
+    /// A PLACEMENT IS AN EDIT TO THE DRAWING, and has to announce itself as one.
+    ///
+    /// Reported as "once i place a file ... still no blocks. the block shows up after i delete a
+    /// light or 2". The blocks were on the drawing the whole time. Nothing had told the canvas its
+    /// cached geometry was stale, or the spatial index that there was something new to pick — so
+    /// they were invisible and unclickable until an unrelated edit rebuilt both. The session dump
+    /// showed it exactly: `INDEX REBUILD` fired on every delete and on no placement.
+    ///
+    /// The undo step matters as much. Without it a placement could not be undone AND the file was
+    /// never marked unsaved, so closing the app would have discarded the work without asking.
+    #[test]
+    fn placing_marks_the_drawing_changed() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "OCULUS".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Circle(
+                cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 47.5 },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.001,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+
+        // A clean slate: the index freshly built, the view settled, nothing unsaved.
+        app.index_dirty = false;
+        app.unsaved = false;
+        let seq = app.view_seq;
+        let undo = app.undo_stack.len();
+
+        assert!(app.place_illuminaire_at(2.0, 3.0), "the placement was refused");
+
+        assert!(
+            app.index_dirty,
+            "the spatial index was not invalidated — the block is on the drawing and cannot be \
+             picked, which is what \"no blocks\" looked like",
+        );
+        assert_ne!(app.view_seq, seq, "the canvas was not told to redraw");
+        assert_eq!(app.undo_stack.len(), undo + 1, "a placement cannot be undone");
+        assert!(app.unsaved, "the drawing was not marked unsaved — closing would discard it");
+    }
+
+    /// CORRECTING THE UNIT REDRAWS WHAT IS ALREADY ON THE PLAN.
+    ///
+    /// The block file this was built for declares inches and is drawn in millimetres, so a library
+    /// built from it places a 2 m batten 50.8 m long. The definition is a CACHE of the library
+    /// entry and `ensure_block` reuses it by name — so correcting the unit without rebuilding it
+    /// would leave every instance already placed at the old scale, with the panel stating a size
+    /// the drawing does not show.
+    #[test]
+    fn correcting_the_unit_rescales_what_is_already_placed() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0; // a metre plan
+        let mut src = cad_kernel::Document::default();
+        src.blocks.add(cad_kernel::Block {
+            name: "LINEA W48X80 - (2M)".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![cad_kernel::DObject::new(cad_kernel::Geom::Line(
+                cad_kernel::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(2000.0, 0.0) },
+            ))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let rows = crate::illuminaire::symbols_from(&src);
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: rows[0].name.clone(),
+            id: 0,
+            symbol: rows[0].symbol.clone(),
+            symbol_unit_m: 0.0254, // what the file WRONGLY declares
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+        assert!(app.place_illuminaire_at(0.0, 0.0));
+
+        let length = |app: &CadApp| -> f64 {
+            let b = app.doc.blocks.find("LINEA W48X80 - (2M)").expect("the definition");
+            match &app.doc.blocks.get(b).expect("there").dobjects[0].geom {
+                cad_kernel::Geom::Line(l) => (l.b - l.a).len(),
+                g => panic!("the definition holds {g:?}"),
+            }
+        };
+        // Under the file's own declaration a 2 m batten is fifty metres long. This is the bug the
+        // user saw as blocks "showing up on places the lights werent marked".
+        assert!((length(&app) - 50.8).abs() < 1e-6, "fixture: got {} m", length(&app));
+
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            set_fitting_unit: Some((fid, 0.001)),
+            ..Default::default()
+        });
+        assert!(
+            (app.light.library.get(fid).expect("there").symbol_unit_m - 0.001).abs() < 1e-12,
+            "the library entry was not corrected",
+        );
+        assert!(
+            (length(&app) - 2.0).abs() < 1e-6,
+            "the block already on the plan is still {} m — the correction did not reach it",
+            length(&app),
+        );
+        assert!(app.index_dirty, "the rescaled block was not re-indexed");
+    }
+
+    /// …and the instances are left exactly where they were. Rebuilding the DEFINITION must not
+    /// disturb the references: same count, same insertion points, same ids.
+    #[test]
+    fn correcting_the_unit_does_not_move_anything() {
+        let (mut app, _) = placed(3);
+        let fid = app.light.library.fittings[0].id;
+        let before: Vec<(u32, f64, f64)> = app
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some((b.block, b.insert.x, b.insert.y)),
+                _ => None,
+            })
+            .collect();
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            set_fitting_unit: Some((fid, 1.0)),
+            ..Default::default()
+        });
+        let after: Vec<(u32, f64, f64)> = app
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some((b.block, b.insert.x, b.insert.y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(before, after, "rebuilding the definition moved the instances");
+        assert_eq!(app.light.luminaires.len(), 3, "a unit change cost a fixture");
+    }
+
+    /// A FITTING NEVER PLACED IN THIS DRAWING costs no undo step — an Undo the user has to press
+    /// twice is its own bug.
+    #[test]
+    fn correcting_an_unplaced_fittings_unit_touches_no_drawing() {
+        // A drawing that already HAS blocks, so a lookup that fell back to an index instead of
+        // reporting "not here" would rewrite one of them. An empty block table hides that.
+        let (mut app, _) = placed(1);
+        let existing: Vec<usize> =
+            app.doc.blocks.blocks.iter().map(|b| b.dobjects.len()).collect();
+        assert!(!existing.is_empty(), "fixture: the drawing has a block table");
+
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: "NEVER PLACED".into(),
+            id: 0,
+            symbol: vec![crate::illuminaire::SymbolGeom {
+                geom: cad_kernel::Geom::Line(cad_kernel::Line {
+                    a: Vec2::new(0.0, 0.0),
+                    b: Vec2::new(9.0, 0.0),
+                }),
+                aci: None,
+            }],
+            symbol_unit_m: 0.0254,
+            ldt_path: String::new(),
+            profile: String::new(),
+            model_path: String::new(),
+        });
+        let undo = app.undo_stack.len();
+        app.apply_illuminaire_action(crate::illuminaire::Action {
+            set_fitting_unit: Some((fid, 0.001)),
+            ..Default::default()
+        });
+        assert!(
+            (app.light.library.get(fid).expect("there").symbol_unit_m - 0.001).abs() < 1e-12,
+            "the library entry was not corrected",
+        );
+        assert_eq!(app.undo_stack.len(), undo, "an undo step was pushed for an edit never made");
+        let after: Vec<usize> =
+            app.doc.blocks.blocks.iter().map(|b| b.dobjects.len()).collect();
+        assert_eq!(
+            existing, after,
+            "correcting a fitting this drawing has never seen rewrote another block's geometry",
+        );
     }
 }

@@ -390,35 +390,57 @@ pub fn ensure_block(doc: &mut Document, fitting: &Fitting, doc_unit_m: f64) -> u
     if let Some(id) = doc.blocks.find(&fitting.name) {
         return id;
     }
+    doc.blocks.add(Block {
+        name: fitting.name.clone(),
+        base: Vec2::new(0.0, 0.0),
+        dobjects: scaled_dobjects(fitting, doc_unit_m),
+        smart: false,
+        params: Vec::new(),
+        cut_edges: Vec::new(),
+    })
+}
+
+/// Rewrite a fitting's block definition in `doc` from its CURRENT symbol and unit.
+///
+/// `ensure_block` reuses an existing definition by name, which is what keeps fifty placements to
+/// one definition. The cost is that the definition is a CACHE — and correcting a fitting's unit
+/// afterwards would leave every instance already on the plan drawn at the old scale, with the
+/// library and the drawing quietly disagreeing.
+///
+/// So changing the unit rebuilds it. Nothing else in the drawing is touched: the references keep
+/// their ids, their insertion points and their rotations, and simply draw the corrected symbol.
+///
+/// Returns the block id, or `None` when this drawing has no definition of that name — a fitting
+/// that has never been placed here has nothing to correct.
+pub fn rebuild_block(doc: &mut Document, fitting: &Fitting, doc_unit_m: f64) -> Option<u32> {
+    let id = doc.blocks.find(&fitting.name)?;
+    let dobjects = scaled_dobjects(fitting, doc_unit_m);
+    let b = doc.blocks.get_mut(id)?;
+    b.dobjects = dobjects;
+    Some(id)
+}
+
+/// The fitting's symbol as drawing objects, converted from its own unit into the drawing's.
+///
+/// One definition of the conversion, used by the first placement and by every later correction —
+/// two would eventually disagree, and the disagreement would be a plan drawn at two scales.
+fn scaled_dobjects(fitting: &Fitting, doc_unit_m: f64) -> Vec<DObject> {
     let k = if doc_unit_m > 0.0 && fitting.symbol_unit_m > 0.0 {
         fitting.symbol_unit_m / doc_unit_m
     } else {
         1.0
     };
-    let dobjects = fitting
+    fitting
         .symbol
         .iter()
         .map(|s| {
-            let g = if (k - 1.0).abs() < 1e-12 {
-                s.geom.clone()
-            } else {
-                s.geom.scaled(Vec2::new(0.0, 0.0), k)
-            };
-            let mut d = DObject::new(g);
-            if let Some(a) = s.aci {
-                d.style.color = cad_kernel::Color::Aci(a);
+            let mut d = s.to_dobject();
+            if (k - 1.0).abs() >= 1e-12 {
+                d.geom = d.geom.scaled(Vec2::new(0.0, 0.0), k);
             }
             d
         })
-        .collect();
-    doc.blocks.add(Block {
-        name: fitting.name.clone(),
-        base: Vec2::new(0.0, 0.0),
-        dobjects,
-        smart: false,
-        params: Vec::new(),
-        cut_edges: Vec::new(),
-    })
+        .collect()
 }
 
 /// Put one instance of `fitting` into the drawing at `at`, in DRAWING units.
@@ -708,6 +730,8 @@ pub struct Action {
     pub add: Option<usize>,
     /// Reinterpret the loaded blocks as being drawn in this many metres per unit.
     pub set_blocks_unit: Option<f64>,
+    /// Correct the unit an EXISTING library fitting was drawn in.
+    pub set_fitting_unit: Option<(u32, f64)>,
     /// Link (or relink) this fitting to this photometric file.
     pub link: Option<(u32, String)>,
     /// Rename this fitting.
@@ -1068,6 +1092,41 @@ pub fn window_ui(
                             act.remove = Some(f.id);
                         }
                     });
+                });
+                // THE UNIT IT WAS DRAWN IN, correctable after the fact.
+                //
+                // The block file this was built for declares inches and is drawn in millimetres,
+                // so a library built from it lands 25.4 times too big — a 2 m batten placed 50 m
+                // long. That was reported as blocks "showing up on places the lights werent
+                // marked": they were the right blocks in the right place, reaching half way
+                // across the drawing.
+                //
+                // Offered here as well as in the add panel because the mistake is only obvious
+                // once something has been placed, and by then re-adding every fitting to correct
+                // it would cost the photometry links too.
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Drawn in").small().weak());
+                    for (label, m) in UNIT_CHOICES {
+                        let on = (f.symbol_unit_m - m).abs() < 1e-9;
+                        if ui.selectable_label(on, label).clicked() && !on {
+                            act.set_fitting_unit = Some((f.id, m));
+                        }
+                    }
+                    // WHAT THAT MEANS ON THE PLAN. The drawn figure alone reads as plausible under
+                    // any unit; the real-world size does not — "50.80 × 1.22 m" is obviously not a
+                    // light fitting, and "2.00 × 0.05 m" obviously is.
+                    let s = symbol_extent(&f.symbol);
+                    if s[0] > 0.0 || s[1] > 0.0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "→ {:.3} × {:.3} m on the plan",
+                                s[0] * f.symbol_unit_m,
+                                s[1] * f.symbol_unit_m,
+                            ))
+                            .small()
+                            .color(WIRED),
+                        );
+                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Photometry").small().weak());
@@ -1704,6 +1763,55 @@ mod tests {
         assert_eq!(rearm_on_select(None, 7), None, "browsing the library armed a placement");
     }
 
+
+    /// REBUILDING A DEFINITION THIS DRAWING DOES NOT HAVE IS A NO-OP, not an edit to whatever sits
+    /// at index zero.
+    ///
+    /// The caller happens to check first, so this can only be reached by calling it directly — and
+    /// a public function whose safety depends on every caller remembering a guard is one refactor
+    /// from rewriting a stranger's geometry.
+    #[test]
+    fn rebuilding_an_absent_definition_changes_nothing() {
+        let mut doc = Document::default();
+        doc.blocks.add(Block {
+            name: "SOMEONE ELSE".into(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: vec![DObject::new(Geom::Line(Line {
+                a: Vec2::new(0.0, 0.0),
+                b: Vec2::new(1.0, 0.0),
+            }))],
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        let f = fitting("NEVER PLACED", 0.001, 5000.0);
+        assert!(rebuild_block(&mut doc, &f, 1.0).is_none(), "it claimed to rebuild something");
+        let len = match &doc.blocks.get(0).expect("still there").dobjects[0].geom {
+            Geom::Line(l) => (l.b - l.a).len(),
+            g => panic!("the definition holds {g:?}"),
+        };
+        assert!((len - 1.0).abs() < 1e-12, "another block's geometry was rewritten: {len}");
+    }
+
+    /// AND REBUILDING ONE IT DOES HAVE REPLACES ITS GEOMETRY at the corrected scale, leaving the
+    /// name and the id alone so every reference on the plan still resolves.
+    #[test]
+    fn rebuilding_a_definition_rescales_it_in_place() {
+        let mut doc = Document::default();
+        let mut f = fitting("LINEA", 0.0254, 2000.0);
+        let id = insert(&mut doc, &f, Vec2::new(0.0, 0.0), 1.0);
+        let len = |doc: &Document| match &doc.blocks.get(id).expect("there").dobjects[0].geom {
+            Geom::Line(l) => (l.b - l.a).len(),
+            g => panic!("the definition holds {g:?}"),
+        };
+        assert!((len(&doc) - 50.8).abs() < 1e-9, "fixture: {}", len(&doc));
+
+        f.symbol_unit_m = 0.001;
+        assert_eq!(rebuild_block(&mut doc, &f, 1.0), Some(id), "it did not find the definition");
+        assert!((len(&doc) - 2.0).abs() < 1e-9, "still {} m after the correction", len(&doc));
+        assert_eq!(doc.blocks.blocks.len(), 1, "a second definition was created instead");
+        assert_eq!(doc.blocks.get(id).expect("there").name, "LINEA", "the name changed");
+    }
     /// TWO DIFFERENT FITTINGS GET TWO DIFFERENT DEFINITIONS.
     ///
     /// Reported as "i placed 3 different light yet they are all showing the same legend in the
