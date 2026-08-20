@@ -122,6 +122,9 @@ pub fn window_ui(
     page: &mut usize,
     tex: &[Option<egui::TextureHandle>],
     can_capture: bool,
+    // The brightest value the room reached — what "auto" means, shown so the number is not a
+    // mystery when it is the one in force.
+    room_max: f64,
 ) -> Action {
     let mut act = Action::default();
     *page = (*page).min(doc.pages.len().saturating_sub(1));
@@ -205,6 +208,71 @@ pub fn window_ui(
                         });
 
                         ui.add_space(8.0);
+                        ui.label(egui::RichText::new("False-colour scale").strong());
+                        ui.horizontal(|ui| {
+                            let mut pinned = opt.scale.top.is_some();
+                            if ui.checkbox(&mut pinned, "Pin top").changed() {
+                                // Pinning starts from whatever the room reached, so the first
+                                // click changes nothing and the number can be edited from there.
+                                opt.scale.top = if pinned { Some(room_max.max(1.0)) } else { None };
+                            }
+                            if let Some(t) = opt.scale.top.as_mut() {
+                                ui.add(
+                                    egui::DragValue::new(t)
+                                        .speed(10.0)
+                                        .range(1.0..=100_000.0)
+                                        .suffix(" lx"),
+                                );
+                            } else {
+                                ui.label(
+                                    egui::RichText::new(format!("auto — {room_max:.0} lx"))
+                                        .small()
+                                        .weak(),
+                                );
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            let mut banded = !opt.scale.bands.is_empty();
+                            if ui
+                                .checkbox(&mut banded, "Bands")
+                                .on_hover_text(
+                                    "Discrete steps rather than a gradient — which parts of the \
+                                     room meet which requirement",
+                                )
+                                .changed()
+                            {
+                                opt.scale.bands =
+                                    if banded { vec![25.0, 100.0, 300.0, 500.0] } else { Vec::new() };
+                            }
+                            if !opt.scale.bands.is_empty() && ui.small_button("＋").clicked() {
+                                let last = opt.scale.bands.last().copied().unwrap_or(0.0);
+                                opt.scale.bands.push(last * 2.0 + 1.0);
+                            }
+                        });
+                        let mut drop_band: Option<usize> = None;
+                        for i in 0..opt.scale.bands.len() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("✕").clicked() {
+                                    drop_band = Some(i);
+                                }
+                                ui.add(
+                                    egui::DragValue::new(&mut opt.scale.bands[i])
+                                        .speed(5.0)
+                                        .range(1.0..=100_000.0)
+                                        .suffix(" lx"),
+                                );
+                            });
+                        }
+                        if let Some(i) = drop_band {
+                            opt.scale.bands.remove(i);
+                        }
+                        // Out of order the bands would draw as overlapping blocks with their
+                        // labels crossing, so they are kept sorted rather than validated later.
+                        opt.scale
+                            .bands
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                        ui.add_space(8.0);
                         ui.label(egui::RichText::new("Header & footer").strong());
                         ui.add(
                             egui::TextEdit::singleline(&mut opt.header)
@@ -217,6 +285,53 @@ pub fn window_ui(
                                 .hint_text("footer"),
                         );
                         ui.checkbox(&mut opt.page_numbers, "Page numbers");
+                        // THE SIZE IS STATED, because a logo is prepared before it is chosen and
+                        // "it came out tiny" is the alternative to saying so. It is a BOX: the
+                        // image keeps its proportions inside it, so a tall logo is 24 pt high and
+                        // narrow rather than squashed.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Logos fit a {:.0} × {:.0} pt box ({:.0} × {:.0} mm, about {} × {} \
+                                 px at 150 dpi). Wider or taller is scaled down, never stretched.",
+                                crate::report::layout::LOGO_W,
+                                crate::report::layout::LOGO_H,
+                                crate::report::layout::LOGO_W * 25.4 / 72.0,
+                                crate::report::layout::LOGO_H * 25.4 / 72.0,
+                                (crate::report::layout::LOGO_W * 150.0 / 72.0) as i32,
+                                (crate::report::layout::LOGO_H * 150.0 / 72.0) as i32,
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                        for (label, slot) in [
+                            ("Header logo", 0usize),
+                            ("Footer logo", 1usize),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(label).small().weak());
+                                let cur = *if slot == 0 { &opt.header_image } else { &opt.footer_image };
+                                let text = cur
+                                    .and_then(|i| opt.images.get(i))
+                                    .map(|i| i.caption_or_file())
+                                    .unwrap_or_else(|| "none".to_string());
+                                let mut pick = cur;
+                                egui::ComboBox::from_id_salt(("logo", slot))
+                                    .selected_text(text)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut pick, None, "none");
+                                        for i in 0..opt.images.len() {
+                                            let l = opt.images[i].caption_or_file();
+                                            ui.selectable_value(&mut pick, Some(i), l);
+                                        }
+                                    });
+                                if slot == 0 {
+                                    opt.header_image = pick;
+                                } else {
+                                    opt.footer_image = pick;
+                                }
+                            });
+                        }
+
 
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {

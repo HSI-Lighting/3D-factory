@@ -176,19 +176,25 @@ fn char_width(c: char, font: Font) -> f64 {
     }
 }
 
-/// PDF string escaping. A room called `Smith (Ltd)\` must not close the literal early.
-fn pdf_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
+/// PDF string escaping, in BYTES.
+///
+/// A room called `Smith (Ltd)\` must not close the literal early — and the result has to be bytes
+/// rather than a `String`, because a PDF string IS a byte sequence in WinAnsiEncoding while Rust
+/// writes a `String` out as UTF-8. That is not a subtle difference: the em dash in "Illuminance —
+/// false colour" is the single byte 0x96, and encoded as UTF-8 it becomes 0xC2 0x96 — which a
+/// reader shows as "Â–". It shipped that way once, and the report said "Illuminance Â– false
+/// colour" on every page it appeared.
+fn pdf_str(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
-            '\\' => out.push_str("\\\\"),
-            '(' => out.push_str("\\("),
-            ')' => out.push_str("\\)"),
-            // WinAnsi is a single-byte encoding: anything outside it has no code point to emit, and
-            // a raw multi-byte UTF-8 character would come out as mojibake. A question mark is
-            // obviously a substitution; mojibake looks like a corrupt file.
-            c if (c as u32) < 32 => out.push(' '),
-            c if (c as u32) < 127 => out.push(c),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '(' => out.extend_from_slice(b"\\("),
+            ')' => out.extend_from_slice(b"\\)"),
+            // A control byte would be a literal newline inside a string, which some readers take
+            // as the end of the line and others as content.
+            c if (c as u32) < 32 => out.push(b' '),
+            c if (c as u32) < 127 => out.push(c as u8),
             c => out.push(winansi(c)),
         }
     }
@@ -198,20 +204,21 @@ fn pdf_str(s: &str) -> String {
 /// Map the few non-ASCII characters this report actually emits into WinAnsiEncoding.
 ///
 /// The list is short because it is exactly what the numbers and headings use: degrees, the middle
-/// dot between fields, the subscript-free micro sign, and the dashes. Everything else becomes `?`.
-fn winansi(c: char) -> char {
+/// dot between fields, the micro sign, and the dashes. Everything else becomes `?` — obviously a
+/// substitution, where mojibake looks like a corrupt file.
+fn winansi(c: char) -> u8 {
     match c {
-        '°' => '\u{b0}',
-        '·' => '\u{b7}',
-        '–' | '—' => '\u{96}',
-        '’' | '\'' => '\u{92}',
-        '“' | '”' => '"',
-        '×' => '\u{d7}',
-        '²' => '\u{b2}',
-        '³' => '\u{b3}',
-        'µ' => '\u{b5}',
-        '€' => '\u{80}',
-        _ => '?',
+        '°' => 0xb0,
+        '·' => 0xb7,
+        '–' | '—' => 0x96,
+        '’' | '\'' => 0x92,
+        '“' | '”' => b'"',
+        '×' => 0xd7,
+        '²' => 0xb2,
+        '³' => 0xb3,
+        'µ' => 0xb5,
+        '€' => 0x80,
+        _ => b'?',
     }
 }
 
@@ -236,8 +243,8 @@ impl Doc {
     }
 
     /// The content stream for one page, with y flipped into PDF's upward axis.
-    fn stream(&self, page: &Page) -> String {
-        let mut s = String::with_capacity(4096);
+    fn stream(&self, page: &Page) -> Vec<u8> {
+        let mut s: Vec<u8> = Vec::with_capacity(4096);
         let flip = |y: f64| self.height - y;
         for it in &page.items {
             match it {
@@ -248,39 +255,48 @@ impl Doc {
                     if *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
-                    s.push_str(&format!(
-                        "{} rg {:.3} {:.3} {:.3} {:.3} re f\n",
-                        col(*fill),
-                        x,
-                        flip(y + h),
-                        w,
-                        h
-                    ));
+                    s.extend_from_slice(
+                        format!(
+                            "{} rg {:.3} {:.3} {:.3} {:.3} re f\n",
+                            col(*fill),
+                            x,
+                            flip(y + h),
+                            w,
+                            h
+                        )
+                        .as_bytes(),
+                    );
                 }
                 Item::Frame { x, y, w, h, rgb, width } => {
                     if *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
-                    s.push_str(&format!(
-                        "{} RG {:.3} w {:.3} {:.3} {:.3} {:.3} re S\n",
-                        col(*rgb),
-                        width,
-                        x,
-                        flip(y + h),
-                        w,
-                        h
-                    ));
+                    s.extend_from_slice(
+                        format!(
+                            "{} RG {:.3} w {:.3} {:.3} {:.3} {:.3} re S\n",
+                            col(*rgb),
+                            width,
+                            x,
+                            flip(y + h),
+                            w,
+                            h
+                        )
+                        .as_bytes(),
+                    );
                 }
                 Item::Line { x1, y1, x2, y2, rgb, width } => {
-                    s.push_str(&format!(
-                        "{} RG {:.3} w {:.3} {:.3} m {:.3} {:.3} l S\n",
-                        col(*rgb),
-                        width,
-                        x1,
-                        flip(*y1),
-                        x2,
-                        flip(*y2)
-                    ));
+                    s.extend_from_slice(
+                        format!(
+                            "{} RG {:.3} w {:.3} {:.3} m {:.3} {:.3} l S\n",
+                            col(*rgb),
+                            width,
+                            x1,
+                            flip(*y1),
+                            x2,
+                            flip(*y2)
+                        )
+                        .as_bytes(),
+                    );
                 }
                 Item::Text { x, y, size, font, rgb, align, text } => {
                     if text.is_empty() {
@@ -292,29 +308,39 @@ impl Doc {
                         Align::Right => x - w,
                         Align::Centre => x - w * 0.5,
                     };
-                    s.push_str(&format!(
-                        "BT /{} {:.2} Tf {} rg {:.3} {:.3} Td ({}) Tj ET\n",
-                        font.res(),
-                        size,
-                        col(*rgb),
-                        x0,
-                        flip(*y),
-                        pdf_str(text)
-                    ));
+                    // THE TEXT IS SPLICED IN AS BYTES, not formatted into the string. `pdf_str`
+                    // returns WinAnsi bytes, and putting them through `format!` would re-encode
+                    // them as UTF-8 — which is the whole bug it exists to avoid.
+                    s.extend_from_slice(
+                        format!(
+                            "BT /{} {:.2} Tf {} rg {:.3} {:.3} Td (",
+                            font.res(),
+                            size,
+                            col(*rgb),
+                            x0,
+                            flip(*y),
+                        )
+                        .as_bytes(),
+                    );
+                    s.extend_from_slice(&pdf_str(text));
+                    s.extend_from_slice(b") Tj ET\n");
                 }
                 Item::Image { x, y, w, h, idx } => {
                     if *idx >= self.images.len() || *w <= 0.0 || *h <= 0.0 {
                         continue;
                     }
                     // An image is drawn by scaling the unit square, so the matrix IS the placement.
-                    s.push_str(&format!(
-                        "q {:.3} 0 0 {:.3} {:.3} {:.3} cm /Im{} Do Q\n",
-                        w,
-                        h,
-                        x,
-                        flip(y + h),
-                        idx
-                    ));
+                    s.extend_from_slice(
+                        format!(
+                            "q {:.3} 0 0 {:.3} {:.3} {:.3} cm /Im{} Do Q\n",
+                            w,
+                            h,
+                            x,
+                            flip(y + h),
+                            idx
+                        )
+                        .as_bytes(),
+                    );
                 }
             }
         }
@@ -386,8 +412,10 @@ impl Doc {
         let blank = Page::default();
         for i in 0..n_pages {
             let s = self.stream(self.pages.get(i).unwrap_or(&blank));
-            let body = format!("<< /Length {} >>\nstream\n{s}endstream", s.len());
-            obj(&mut out, &mut offsets, first_content + i, body.as_bytes());
+            let mut body = format!("<< /Length {} >>\nstream\n", s.len()).into_bytes();
+            body.extend_from_slice(&s);
+            body.extend_from_slice(b"endstream");
+            obj(&mut out, &mut offsets, first_content + i, &body);
         }
 
         for (n, f) in [(font_regular, Font::Regular), (font_bold, Font::Bold)] {
@@ -424,11 +452,12 @@ impl Doc {
             out.extend_from_slice(format!("{:010} 00000 n \n", offsets[n]).as_bytes());
         }
         out.extend_from_slice(
+            format!("trailer\n<< /Size {} /Root 1 0 R /Info << /Title (", n_objects + 1).as_bytes(),
+        );
+        out.extend_from_slice(&pdf_str(&self.title));
+        out.extend_from_slice(
             format!(
-                "trailer\n<< /Size {} /Root 1 0 R /Info << /Title ({}) /Producer (SIMLUX {}) >> >>\n\
-                 startxref\n{xref}\n%%EOF\n",
-                n_objects + 1,
-                pdf_str(&self.title),
+                ") /Producer (SIMLUX {}) >> >>\nstartxref\n{xref}\n%%EOF\n",
                 env!("SIMLUX_BUILD"),
             )
             .as_bytes(),
@@ -571,8 +600,8 @@ mod tests {
     /// it becomes operators — which is a corrupt page, not a stray character.
     #[test]
     fn brackets_and_backslashes_survive() {
-        assert_eq!(pdf_str("Smith (Ltd)"), "Smith \\(Ltd\\)");
-        assert_eq!(pdf_str(r"C:\plans"), r"C:\\plans");
+        assert_eq!(pdf_str("Smith (Ltd)"), b"Smith \\(Ltd\\)".to_vec());
+        assert_eq!(pdf_str(r"C:\plans"), br"C:\\plans".to_vec());
         let mut d = Doc::new(A4, "x");
         d.pages.push(Page {
             items: vec![Item::Text {
@@ -589,15 +618,102 @@ mod tests {
         assert!(text.contains("(a \\(b\\) c) Tj"));
     }
 
+
+    /// A NON-ASCII HEADING REACHES THE FILE AS THE BYTES A READER EXPECTS.
+    ///
+    /// The reported symptom was a page reading "Illuminance Â– false colour". The heading is right,
+    /// the escaping is right, and the encoding table is right — what was wrong is that the content
+    /// stream was assembled as a Rust `String` and written out as UTF-8, so every WinAnsi byte
+    /// above 127 became two. This drives the WHOLE writer, because that is where the fault was:
+    /// checking `pdf_str` alone would have passed throughout.
+    #[test]
+    fn a_dash_in_a_heading_is_one_byte_in_the_file() {
+        let mut d = Doc::new(A4, "Gym — level 2");
+        d.pages.push(Page {
+            items: vec![Item::Text {
+                x: 40.0,
+                y: 40.0,
+                size: 12.0,
+                font: Font::Bold,
+                rgb: [0, 0, 0],
+                align: Align::Left,
+                text: "Illuminance — false colour".into(),
+            }],
+        });
+        let out = d.write();
+        let want: Vec<u8> = {
+            let mut v = b"Illuminance ".to_vec();
+            v.push(0x96);
+            v.extend_from_slice(b" false colour");
+            v
+        };
+        assert!(
+            out.windows(want.len()).any(|w| w == want.as_slice()),
+            "the heading is not in the file as WinAnsi bytes",
+        );
+        // And the UTF-8 form must NOT be there — that is exactly what the reader showed as "Â–".
+        let utf8 = "Illuminance — false colour".as_bytes();
+        assert!(
+            !out.windows(utf8.len()).any(|w| w == utf8),
+            "the heading went in as UTF-8, which reads as mojibake",
+        );
+        // The title in the trailer goes the same way.
+        let title: Vec<u8> = {
+            let mut v = b"Gym ".to_vec();
+            v.push(0x96);
+            v.extend_from_slice(b" level 2");
+            v
+        };
+        assert!(
+            out.windows(title.len()).any(|w| w == title.as_slice()),
+            "the document title was not encoded the same way",
+        );
+    }
+
+    /// THE STREAM LENGTH COUNTS THE BYTES THAT ARE THERE. `/Length` is how a reader knows where the
+    /// stream ends; a count taken before the encoding changed the byte count would truncate the
+    /// last operators on the page, losing whatever was drawn last.
+    #[test]
+    fn the_stream_length_matches_the_stream() {
+        let mut d = Doc::new(A4, "x");
+        d.pages.push(Page {
+            items: vec![Item::Text {
+                x: 10.0,
+                y: 10.0,
+                size: 9.0,
+                font: Font::Regular,
+                rgb: [0, 0, 0],
+                align: Align::Left,
+                text: "40° · 2 × 3".into(),
+            }],
+        });
+        let out = d.write();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let len: usize = text
+            .split("/Length ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("a stream length");
+        let start = out.windows(8).position(|w| w == b"stream\n\x71").map(|i| i + 7);
+        let start = start.or_else(|| out.windows(7).position(|w| w == b"stream\n").map(|i| i + 7))
+            .expect("a stream");
+        let end = out
+            .windows(9)
+            .position(|w| w == b"endstream")
+            .expect("the stream must be closed");
+        assert_eq!(end - start, len, "/Length says {len}, the stream holds {}", end - start);
+    }
     /// A CHARACTER WITH NO CODE POINT BECOMES A QUESTION MARK, not mojibake. Raw UTF-8 in a
     /// WinAnsi string comes out as two wrong glyphs, which reads as a corrupt file; `?` reads as a
     /// substitution.
     #[test]
     fn text_outside_the_encoding_is_substituted() {
-        assert_eq!(pdf_str("36°"), "36\u{b0}", "degrees are in WinAnsi and must survive");
-        assert_eq!(pdf_str("a·b"), "a\u{b7}b");
-        assert_eq!(pdf_str("日"), "?");
-        assert!(!pdf_str("日").is_empty(), "a substitution, not a deletion");
+        // ONE BYTE PER CHARACTER, which is the whole of it: `°` is 0xB0 and nothing else. A
+        // two-byte answer here is the mojibake that shipped.
+        assert_eq!(pdf_str("36°"), vec![b'3', b'6', 0xb0]);
+        assert_eq!(pdf_str("a·b"), vec![b'a', 0xb7, b'b']);
+        assert_eq!(pdf_str("日"), vec![b'?'], "a substitution, not a deletion");
     }
 
     /// ALIGNMENT IS RESOLVED HERE, because PDF has none. A right-aligned number that was emitted

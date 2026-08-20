@@ -97,6 +97,93 @@ impl Section {
     }
 }
 
+
+/// How the false-colour plot's scale is decided.
+///
+/// THE APP USED TO DECIDE IT and the report simply followed. Two reports of the same room at
+/// different auto-scales are not comparable and nothing on either page says so — which is why the
+/// scale is a report decision, not a viewport one.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Scale {
+    /// Top of the ramp in lux. `None` follows the app — this room's maximum.
+    pub top: Option<f64>,
+    /// Discrete bands, in lux, low to high. Empty = a continuous ramp.
+    ///
+    /// BANDS ARE WHAT A LIGHTING DRAWING USES. "0 · 25 · 100 · 300 · 500" says which parts of the
+    /// room meet which requirement; a continuous gradient says only that some parts are brighter,
+    /// and the eye cannot read a value off it. The reference the user gave is banded.
+    pub bands: Vec<f64>,
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        // The EN 12464-1 steps a lighting drawing is normally banded at.
+        Self { top: None, bands: vec![25.0, 100.0, 300.0, 500.0] }
+    }
+}
+
+impl Scale {
+    /// The top of the ramp, given what the room actually reached.
+    pub fn top_lx(&self, room_max: f64) -> f64 {
+        match self.top {
+            Some(t) if t > 0.0 => t,
+            _ => {
+                // With bands, the ramp runs to the highest band OR the room's maximum, whichever
+                // is greater — a room that overshoots the top band must not be clipped to it.
+                let band_top = self.bands.last().copied().unwrap_or(0.0);
+                room_max.max(band_top).max(1.0)
+            }
+        }
+    }
+
+    /// The colour a value takes, as a ramp position in `0..=1`.
+    ///
+    /// Banded, the value is snapped to the MIDDLE of the band it falls in, so every reading in a
+    /// band gets the same colour — which is what makes a band readable as one region rather than a
+    /// gradient with lines drawn on it.
+    pub fn t_for(&self, v: f64, room_max: f64) -> f32 {
+        let top = self.top_lx(room_max);
+        if self.bands.is_empty() {
+            return (v / top).clamp(0.0, 1.0) as f32;
+        }
+        let edges = self.edges(room_max);
+        let n = edges.len();
+        for (i, pair) in edges.windows(2).enumerate() {
+            let (lo, hi) = (pair[0], pair[1]);
+            // The LAST band is closed at the top, so a value sitting exactly on the ceiling still
+            // lands in a band rather than falling off the end of the list.
+            if v < hi || i + 2 == n {
+                return (((lo + hi) * 0.5) / top).clamp(0.0, 1.0) as f32;
+            }
+        }
+        1.0
+    }
+
+    /// Band edges including 0 and the top, low to high.
+    pub fn edges(&self, room_max: f64) -> Vec<f64> {
+        let top = self.top_lx(room_max);
+        let mut e = vec![0.0];
+        for b in &self.bands {
+            if *b > 0.0 && *b < top {
+                e.push(*b);
+            }
+        }
+        e.push(top);
+        e.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        e
+    }
+
+    /// What the legend says under the plot.
+    pub fn caption(&self, room_max: f64) -> String {
+        let mode = if self.top.is_some() { "pinned" } else { "auto" };
+        if self.bands.is_empty() {
+            format!("0 to {:.0} lx — {mode}", self.top_lx(room_max))
+        } else {
+            format!("banded to {:.0} lx — {mode}", self.top_lx(room_max))
+        }
+    }
+}
+
 /// An image the user added: where it came from, and what to call it.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ReportImage {
@@ -125,6 +212,15 @@ pub struct Options {
     pub header: String,
     pub footer: String,
     pub page_numbers: bool,
+    /// The false-colour scale, chosen here rather than followed from the viewport.
+    #[serde(default)]
+    pub scale: Scale,
+    /// A logo for the header, by index into `images`.
+    #[serde(default)]
+    pub header_image: Option<usize>,
+    /// A logo for the footer.
+    #[serde(default)]
+    pub footer_image: Option<usize>,
     /// The sections to include, IN ORDER. Moving `Renders` within this list is what "decide the
     /// position of the page" means.
     pub sections: Vec<Section>,
@@ -152,6 +248,9 @@ impl Default for Options {
             header: String::new(),
             footer: String::new(),
             page_numbers: true,
+            scale: Scale::default(),
+            header_image: None,
+            footer_image: None,
             sections: Section::all(),
             hidden: Vec::new(),
             images: Vec::new(),

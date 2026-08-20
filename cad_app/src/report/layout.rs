@@ -48,6 +48,9 @@ struct Cursor {
     page: Page,
     pages: Vec<Page>,
     y: f64,
+    /// The whole page, for things sized against it rather than against what is left.
+    page_w: f64,
+    page_h: f64,
     /// Content box.
     left: f64,
     right: f64,
@@ -63,6 +66,8 @@ impl Cursor {
             page: Page::default(),
             pages: Vec::new(),
             y: top,
+            page_w: w,
+            page_h: h,
             left: MARGIN,
             right: w - MARGIN,
             top,
@@ -78,6 +83,17 @@ impl Cursor {
     fn brk(&mut self) {
         self.pages.push(std::mem::take(&mut self.page));
         self.y = self.top;
+    }
+
+    /// Break to a new page unless `h` points are available AND something is already on this one.
+    ///
+    /// A figure that will not fit gets a page of its own rather than being shrunk into the gap at
+    /// the bottom of this one — but an EMPTY page is never broken, or a figure taller than the
+    /// content box would break for ever.
+    fn need_or_break(&mut self, h: f64) {
+        if self.y + h > self.bottom && !self.page.items.is_empty() {
+            self.brk();
+        }
     }
 
     /// Make sure `h` points are available, breaking the page if not.
@@ -140,8 +156,9 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
         }
     }
 
-    let has_head = !opt.header.trim().is_empty();
-    let has_foot = !opt.footer.trim().is_empty() || opt.page_numbers;
+    let has_head = !opt.header.trim().is_empty() || opt.header_image.is_some();
+    let has_foot =
+        !opt.footer.trim().is_empty() || opt.page_numbers || opt.footer_image.is_some();
 
     let mut cover_pages = Vec::new();
     if opt.cover {
@@ -155,7 +172,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
             Section::Installation => installation(&mut c, inp),
             Section::Materials => materials(&mut c, inp),
             Section::WorkingPlane => working_plane(&mut c, inp),
-            Section::FalseColour => false_colour(&mut c, inp),
+            Section::FalseColour => false_colour(&mut c, inp, opt),
             Section::NumericGrid => numeric_grid(&mut c, inp),
             Section::Surfaces => surfaces(&mut c, inp),
             Section::Renders => renders(&mut c, opt, &doc),
@@ -176,6 +193,20 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
             continue;
         }
         if has_head {
+            // The logo sits at the OUTER edge, opposite the text, which is where a letterhead puts
+            // it and what leaves the middle of the line free for a long project name.
+            if let Some(i) = opt.header_image {
+                if let Some(im) = doc.images.get(i) {
+                    let (iw, ih) = fit(im.w as f64, im.h as f64, LOGO_W, LOGO_H);
+                    p.items.push(Item::Image {
+                        x: w - MARGIN - iw,
+                        y: MARGIN + 10.0 - ih,
+                        w: iw,
+                        h: ih,
+                        idx: i,
+                    });
+                }
+            }
             p.items.push(Item::Text {
                 x: MARGIN,
                 y: MARGIN + 8.0,
@@ -214,6 +245,18 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
                     align: Align::Left,
                     text: opt.footer.trim().to_string(),
                 });
+            }
+            if let Some(i) = opt.footer_image {
+                if let Some(im) = doc.images.get(i) {
+                    let (iw, ih) = fit(im.w as f64, im.h as f64, LOGO_W, LOGO_H);
+                    p.items.push(Item::Image {
+                        x: (w - iw) * 0.5,
+                        y: fy - ih + 1.0,
+                        w: iw,
+                        h: ih,
+                        idx: i,
+                    });
+                }
             }
             if opt.page_numbers {
                 p.items.push(Item::Text {
@@ -389,50 +432,61 @@ fn working_plane(c: &mut Cursor, inp: &Input) {
     }
 }
 
-/// THE FALSE-COLOUR FIELD, SCALED TO THE PAGE.
+/// THE FALSE-COLOUR FIELD, GIVEN THE PAGE.
 ///
-/// This is the section the complaint was about. The cell size is whatever makes the whole plot fit
-/// the content box in BOTH directions, so a 33 x 40 grid and a 4 x 4 one both arrive whole. Values
-/// are printed in the cells only when a cell is wide enough to hold one at a legible size — a plot
-/// of unreadable smudges is worse than a plot with no numbers on it, and the numeric grid carries
-/// the exact figures anyway.
-fn false_colour(c: &mut Cursor, inp: &Input) {
+/// Two complaints shaped this. The plot came out as a stamp in the middle of a page — "the layout
+/// is too small it should occupy 2/3 of the pages real estate while maintaining proportions" — and
+/// the scale was whatever the viewport happened to be set to.
+///
+/// So the plot is sized to fill TWO THIRDS OF THE PAGE, keeping the plane's proportions, and it
+/// starts a fresh page when what is left of this one cannot hold that. The room is the subject of
+/// the page it is on, which is what the reference drawing does.
+fn false_colour(c: &mut Cursor, inp: &Input, opt: &Options) {
     let g = inp.grid;
     if g.cols == 0 || g.rows == 0 {
         return;
     }
-    c.heading("Illuminance — false colour");
-
-    let avail_w = c.width();
-    // Leave room for the legend under the plot, and never take more than one page.
-    let avail_h = (c.bottom - c.y - 46.0).max(60.0);
-    let cell = (avail_w / g.cols as f64).min(avail_h / g.rows as f64);
+    // The target: two thirds of the page in each direction, which is two thirds of its area at the
+    // plane's own aspect and reads as a figure rather than a thumbnail.
+    let target_w = c.page_w * TWO_THIRDS;
+    let target_h = c.page_h * TWO_THIRDS;
+    let cell = (target_w / g.cols as f64).min(target_h / g.rows as f64);
     let plot_w = cell * g.cols as f64;
     let plot_h = cell * g.rows as f64;
 
-    // The plot is one indivisible object: if what is left on this page is too little to read it at
-    // even a third of the width, start a fresh page rather than shrink it into a stamp.
-    if cell < (avail_w / g.cols as f64) / 3.0 {
-        c.brk();
-        return false_colour_at(c, inp);
-    }
-    false_colour_body(c, inp, cell, plot_w, plot_h);
+    // Heading, plot, legend. If they will not fit below what is already on the page, the plot gets
+    // a page of its own rather than being shrunk to whatever is left.
+    let needed = 40.0 + plot_h + LEGEND_H;
+    c.need_or_break(needed);
+    c.heading("Illuminance — false colour");
+    false_colour_body(c, inp, opt, cell, plot_w, plot_h);
 }
 
-fn false_colour_at(c: &mut Cursor, inp: &Input) {
-    let g = inp.grid;
-    let avail_w = c.width();
-    let avail_h = (c.bottom - c.y - 46.0).max(60.0);
-    let cell = (avail_w / g.cols as f64).min(avail_h / g.rows as f64);
-    false_colour_body(c, inp, cell, cell * g.cols as f64, cell * g.rows as f64);
-}
+/// The box a header or footer logo is fitted into, in points — 120 x 24 pt, about 42 x 8.5 mm.
+///
+/// It is a BOX, not a size: the image keeps its own proportions inside it, so a tall logo comes out
+/// 24 pt high and narrow rather than squashed. The height is what the band can hold without the
+/// running text moving; the width is what is left beside a project name on A4.
+pub const LOGO_W: f64 = 120.0;
+pub const LOGO_H: f64 = 24.0;
 
-fn false_colour_body(c: &mut Cursor, inp: &Input, cell: f64, plot_w: f64, plot_h: f64) {
+/// Two thirds, as asked for.
+const TWO_THIRDS: f64 = 0.666;
+/// Height of the banded legend and its labels.
+const LEGEND_H: f64 = 46.0;
+
+fn false_colour_body(
+    c: &mut Cursor,
+    inp: &Input,
+    opt: &Options,
+    cell: f64,
+    plot_w: f64,
+    plot_h: f64,
+) {
     let g = inp.grid;
     let x0 = c.left + (c.width() - plot_w) * 0.5;
     let y0 = c.y;
-    let top = inp.scale_top.max(1e-6);
-    // A value needs about 4.2 points per digit at 5 pt, plus a point of air each side.
+    let room_max = g.max;
     let label = cell >= 22.0;
 
     for r in 0..g.rows as usize {
@@ -444,26 +498,20 @@ fn false_colour_body(c: &mut Cursor, inp: &Input, cell: f64, plot_w: f64, plot_h
             if inp.mask.get(i).is_some_and(|inside| !inside) {
                 // Outside the room: blank, not coloured. Colouring it would report illuminance on
                 // ground the room does not occupy.
-                c.push(Item::Frame { x, y, w: cell, h: cell, rgb: [238, 238, 238], width: 0.3 });
                 continue;
             }
-            let t = (v / top).clamp(0.0, 1.0) as f32;
-            let (rr, gg, bb) = (inp.ramp)(t);
-            let fill = [
-                (rr.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (gg.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (bb.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ];
+            let t = opt.scale.t_for(*v, room_max);
+            let fill = ramp_rgb(inp.ramp, t);
             c.push(Item::Rect { x, y, w: cell, h: cell, fill });
             if label {
                 // Black on light, white on dark — a fixed ink colour is unreadable over half the
                 // ramp, and this plot exists to be read.
-                let lum = 0.299 * rr + 0.587 * gg + 0.114 * bb;
-                let ink = if lum > 0.55 { [20, 20, 20] } else { [245, 245, 245] };
+                let lum = 0.299 * fill[0] as f64 + 0.587 * fill[1] as f64 + 0.114 * fill[2] as f64;
+                let ink = if lum > 140.0 { [20, 20, 20] } else { [245, 245, 245] };
                 c.push(Item::Text {
                     x: x + cell * 0.5,
                     y: y + cell * 0.5 + 2.0,
-                    size: 5.5,
+                    size: (cell * 0.26).clamp(4.0, 8.0),
                     font: Font::Regular,
                     rgb: ink,
                     align: Align::Centre,
@@ -472,54 +520,118 @@ fn false_colour_body(c: &mut Cursor, inp: &Input, cell: f64, plot_w: f64, plot_h
             }
         }
     }
-    c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [170, 170, 170], width: 0.6 });
-    c.y = y0 + plot_h + 14.0;
+    c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [140, 140, 140], width: 0.7 });
 
-    // The legend, in the same ramp — without it the colours mean nothing.
-    let lw = (c.width() * 0.6).min(240.0);
-    let lx = c.left;
-    let n = 48;
-    for i in 0..n {
-        let t = i as f32 / (n - 1) as f32;
-        let (rr, gg, bb) = (inp.ramp)(t);
-        c.push(Item::Rect {
-            x: lx + lw * i as f64 / n as f64,
-            y: c.y,
-            w: lw / n as f64 + 0.4,
-            h: 7.0,
-            fill: [
-                (rr.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (gg.clamp(0.0, 1.0) * 255.0).round() as u8,
-                (bb.clamp(0.0, 1.0) * 255.0).round() as u8,
-            ],
-        });
-    }
-    c.y += 16.0;
-    c.text(lx, 7.5, Font::Regular, Align::Left, FAINT, "0 lx");
+    // The dimensions of the plane, along the bottom — the reference drawing carries an axis, and
+    // without one a picture of a room states no size.
     c.push(Item::Text {
-        x: lx + lw,
-        y: c.y,
+        x: x0 + plot_w * 0.5,
+        y: y0 + plot_h + 11.0,
         size: 7.5,
         font: Font::Regular,
         rgb: FAINT,
-        align: Align::Right,
-        text: format!(
-            "{:.0} lx — scale {}",
-            inp.scale_top,
-            if inp.scale_auto { "auto" } else { "pinned" }
-        ),
+        align: Align::Centre,
+        text: format!("{:.2} × {:.2} m", inp.plane.width, inp.plane.depth),
     });
-    c.y += 6.0;
+    c.y = y0 + plot_h + 24.0;
+
+    legend(c, inp, opt, room_max);
     if !label {
         c.note("Cell values are omitted at this grid size — the exact figures are in the grid table.");
     }
 }
 
-/// The numbers, split into column blocks that fit the page.
+fn ramp_rgb(ramp: fn(f32) -> (f32, f32, f32), t: f32) -> [u8; 3] {
+    let (r, g, b) = ramp(t.clamp(0.0, 1.0));
+    [
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+/// The legend: banded blocks with their edges written under them, or a smooth bar when the scale
+/// has no bands.
 ///
-/// A 33-column grid is 33 columns wide whatever the paper is, so it is cut into blocks and each
-/// block is labelled with the columns it covers. Dropping the table instead would lose the only
-/// part of the report that is checkable.
+/// A BANDED LEGEND CAN BE READ; a gradient can only be compared. "0 · 25 · 100 · 300 · 500" says
+/// which parts of the room meet which requirement, which is the question a lighting drawing is
+/// looked at to answer.
+fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
+    let w = c.width().min(360.0);
+    let x = c.left + (c.width() - w) * 0.5;
+    let y = c.y;
+    let h = 12.0;
+
+    let edges = opt.scale.edges(room_max);
+    if opt.scale.bands.is_empty() {
+        let n = 60;
+        for i in 0..n {
+            let t = i as f32 / (n - 1) as f32;
+            c.push(Item::Rect {
+                x: x + w * i as f64 / n as f64,
+                y,
+                w: w / n as f64 + 0.4,
+                h,
+                fill: ramp_rgb(inp.ramp, t),
+            });
+        }
+        c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
+        c.y = y + h + 11.0;
+        c.text(x, 7.5, Font::Regular, Align::Left, FAINT, "0 lx");
+        c.push(Item::Text {
+            x: x + w,
+            y: c.y,
+            size: 7.5,
+            font: Font::Regular,
+            rgb: FAINT,
+            align: Align::Right,
+            text: format!("{:.0} lx", opt.scale.top_lx(room_max)),
+        });
+    } else {
+        // Equal-width blocks, not proportional ones: the bands a drawing is read at are not evenly
+        // spaced in lux (25, 100, 300, 500), and a proportional bar would squeeze the low ones —
+        // which are the bands that decide whether a space passes.
+        let n = edges.len() - 1;
+        let bw = w / n as f64;
+        for i in 0..n {
+            let mid = (edges[i] + edges[i + 1]) * 0.5;
+            let t = (mid / opt.scale.top_lx(room_max)).clamp(0.0, 1.0) as f32;
+            c.push(Item::Rect { x: x + bw * i as f64, y, w: bw, h, fill: ramp_rgb(inp.ramp, t) });
+        }
+        c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
+        c.y = y + h + 10.0;
+        for (i, e) in edges.iter().enumerate() {
+            c.push(Item::Text {
+                x: x + bw * i as f64,
+                y: c.y,
+                size: 7.0,
+                font: Font::Regular,
+                rgb: FAINT,
+                align: if i == 0 { Align::Left } else { Align::Centre },
+                text: format!("{e:.0}"),
+            });
+        }
+    }
+    c.y += 12.0;
+    c.text(
+        c.left,
+        7.0,
+        Font::Regular,
+        Align::Left,
+        FAINT,
+        &format!("Illuminance [lx] — {}", opt.scale.caption(room_max)),
+    );
+    c.y += 4.0;
+}
+
+/// The numbers, on ONE page.
+///
+/// "the illuminance grid comes in multiple pages. it should all be shown in a single page." A
+/// 70-column field was coming out as 23 pages of column blocks, which is not a table anybody reads.
+///
+/// So the type is sized to the grid: whatever makes all of it fit the page, down to a floor. Below
+/// that floor it would be a grey texture rather than numbers, so the page says so and gives the
+/// figures that can still be read — the false-colour plot and the HTML report both carry the field.
 fn numeric_grid(c: &mut Cursor, inp: &Input) {
     let g = inp.grid;
     if g.cols == 0 || g.rows == 0 {
@@ -527,48 +639,57 @@ fn numeric_grid(c: &mut Cursor, inp: &Input) {
     }
     c.heading("Illuminance grid (lx)");
 
-    let colw = 34.0_f64;
-    let rowh = 11.0_f64;
-    let per_block = ((c.width() / colw).floor() as usize).max(1);
-    let blocks = (g.cols as usize).div_ceil(per_block);
+    let cols = g.cols as f64;
+    let rows = g.rows as f64;
+    let avail_w = c.width();
+    let avail_h = (c.bottom - c.y - 12.0).max(40.0);
 
-    for b in 0..blocks {
-        let c0 = b * per_block;
-        let c1 = ((b + 1) * per_block).min(g.cols as usize);
-        if blocks > 1 {
-            c.need(rowh * 3.0);
-            c.y += 10.0;
-            c.text(
-                c.left,
-                8.0,
-                Font::Bold,
-                Align::Left,
-                FAINT,
-                &format!("Columns {}–{}", c0 + 1, c1),
-            );
-            c.y += 6.0;
-        }
-        for r in 0..g.rows as usize {
-            c.need(rowh + 2.0);
-            c.y += rowh;
-            for (k, col) in (c0..c1).enumerate() {
-                let i = r * g.cols as usize + col;
-                let Some(v) = g.values.get(i) else { continue };
-                let inside = inp.mask.get(i).copied().unwrap_or(true);
-                c.push(Item::Text {
-                    x: c.left + (k as f64 + 1.0) * colw - 4.0,
-                    y: c.y,
-                    size: 7.0,
-                    font: Font::Regular,
-                    rgb: if inside { INK } else { [190, 190, 190] },
-                    align: Align::Right,
-                    text: if inside { format!("{v:.0}") } else { "—".into() },
-                });
-            }
-        }
-        c.y += 6.0;
+    // The widest figure decides the column, and four digits is the practical worst case.
+    let by_w = avail_w / (cols * 4.6);
+    let by_h = avail_h / (rows * 1.45);
+    let size = by_w.min(by_h);
+
+    if size < MIN_GRID_PT {
+        c.note(&format!(
+            "This grid is {} × {} = {} values. Printed on one page the figures would be {:.1} pt, \
+             which is below the {MIN_GRID_PT:.0} pt this report will set — so it is left out here \
+             rather than printed as a grey texture.",
+            g.cols,
+            g.rows,
+            g.values.len(),
+            size,
+        ));
+        c.note(
+            "The false-colour plot above carries the same field, and the HTML report prints every \
+             value at a size a screen can zoom.",
+        );
+        return;
     }
+
+    let colw = avail_w / cols;
+    let rowh = size * 1.45;
+    let y0 = c.y;
+    for r in 0..g.rows as usize {
+        for col in 0..g.cols as usize {
+            let i = r * g.cols as usize + col;
+            let Some(v) = g.values.get(i) else { continue };
+            let inside = inp.mask.get(i).copied().unwrap_or(true);
+            c.push(Item::Text {
+                x: c.left + (col as f64 + 1.0) * colw - colw * 0.12,
+                y: y0 + (r as f64 + 1.0) * rowh,
+                size,
+                font: Font::Regular,
+                rgb: if inside { INK } else { [190, 190, 190] },
+                align: Align::Right,
+                text: if inside { format!("{v:.0}") } else { "-".into() },
+            });
+        }
+    }
+    c.y = y0 + rows * rowh + 6.0;
 }
+
+/// Below this the figures stop being numbers and become a texture.
+const MIN_GRID_PT: f64 = 3.2;
 
 fn surfaces(c: &mut Cursor, inp: &Input) {
     if inp.surfaces.is_empty() {
@@ -749,31 +870,50 @@ mod tests {
         }
     }
 
-    /// THE PLOT IS SCALED TO FIT, WHATEVER THE GRID. A 33-column field and a 4-column one both
-    /// arrive whole and within the content box — which is what "scale the layout so it fits the
-    /// page" asks for.
+    /// The plot's cells, told apart from the legend by their size.
+    fn plot_cells(d: &Doc, cols: u32, rows: u32) -> Vec<(f64, f64, f64, f64)> {
+        let mut r = rects(d);
+        // The plot is square cells; the legend is 12 pt tall blocks. Keeping only the squares is
+        // enough, and the count is asserted against the grid so a mistake here cannot pass.
+        r.retain(|(_, _, w, h)| (w - h).abs() < 1e-6);
+        let _ = (cols, rows);
+        r
+    }
+
+    /// THE PLOT TAKES TWO THIRDS OF THE PAGE.
+    ///
+    /// "the layout is too small it should occupy 2/3 of the pages real estate while maintaining
+    /// proportions". It used to be sized to whatever was left below the heading, which on a busy
+    /// page was a stamp in the middle of white space.
     #[test]
-    fn the_false_colour_plot_fits_the_content_box() {
-        for (cols, rows) in [(4u32, 4u32), (33, 40), (80, 3)] {
+    fn the_plot_fills_two_thirds_of_the_page() {
+        let (pw, ph) = PageSize::A4.points();
+        for (cols, rows) in [(4u32, 4u32), (33, 40), (80, 3), (3, 80)] {
             let g = grid(cols, rows);
             let p = plane();
             let mut o = opts();
-            o.sections = vec![Section::FalseColour];
             o.cover = false;
+            o.sections = vec![Section::FalseColour];
             let d = layout(&input(&g, &p), &o);
-            let r = rects(&d);
-            // The plot's cells, ignoring the legend swatches (which are 7 points tall).
-            let cells: Vec<_> = r.iter().filter(|(_, _, _, h)| (*h - 7.0).abs() > 0.01).collect();
-            assert_eq!(
-                cells.len(),
-                (cols * rows) as usize,
-                "{cols}x{rows}: expected a cell per grid point",
-            );
+            let cells = plot_cells(&d, cols, rows);
+            assert_eq!(cells.len(), (cols * rows) as usize, "{cols}x{rows}: a cell per point");
+
             let minx = cells.iter().map(|c| c.0).fold(f64::MAX, f64::min);
             let maxx = cells.iter().map(|c| c.0 + c.2).fold(f64::MIN, f64::max);
-            let (pw, _) = PageSize::A4.points();
-            assert!(minx >= MARGIN - 0.5, "{cols}x{rows}: plot starts at {minx:.1}");
-            assert!(maxx <= pw - MARGIN + 0.5, "{cols}x{rows}: plot ends at {maxx:.1}");
+            let miny = cells.iter().map(|c| c.1).fold(f64::MAX, f64::min);
+            let maxy = cells.iter().map(|c| c.1 + c.3).fold(f64::MIN, f64::max);
+            let (w, h) = (maxx - minx, maxy - miny);
+
+            // ONE of the two directions must reach two thirds — whichever the plane's aspect makes
+            // the binding one. Both would only happen for a square plot on square paper.
+            let fills_w = w >= pw * 0.66 - 1.0;
+            let fills_h = h >= ph * 0.66 - 1.0;
+            assert!(
+                fills_w || fills_h,
+                "{cols}x{rows}: plot is {w:.0}x{h:.0} on {pw:.0}x{ph:.0} — neither side reaches \
+                 two thirds",
+            );
+            assert!(w <= pw * TWO_THIRDS + 1.0 && h <= ph * TWO_THIRDS + 1.0, "{cols}x{rows}: too big");
             // Square cells, or the field is stretched and the picture lies about the room.
             for (_, _, cw, ch) in &cells {
                 assert!((cw - ch).abs() < 1e-6, "{cols}x{rows}: cell {cw:.2}x{ch:.2} is not square");
@@ -781,31 +921,21 @@ mod tests {
         }
     }
 
-    /// VALUES APPEAR WHEN THERE IS ROOM AND NOT WHEN THERE IS NOT — and when they are dropped the
-    /// page says so, rather than leaving a reader to wonder whether the plot is the whole story.
+    /// …AND IT STILL LANDS ON THE PAPER. Two thirds of the page is only useful if it is the right
+    /// two thirds.
     #[test]
-    fn cell_values_are_printed_only_when_legible() {
-        let mut o = opts();
-        o.sections = vec![Section::FalseColour];
-        o.cover = false;
-
-        let small = grid(4, 4);
+    fn the_plot_stays_within_the_margins() {
+        let (pw, _) = PageSize::A4.points();
+        let g = grid(33, 40);
         let p = plane();
-        let d = layout(&input(&small, &p), &o);
-        let t = texts(&d);
-        assert!(t.iter().any(|s| s == "100"), "a 4x4 plot has room for its values: {t:?}");
-
-        let big = grid(40, 40);
-        let d = layout(&input(&big, &p), &o);
-        let t = texts(&d);
-        assert!(
-            !t.iter().any(|s| s == "100"),
-            "a 40x40 plot printed values that cannot be read at that size",
-        );
-        assert!(
-            t.iter().any(|s| s.contains("omitted")),
-            "the page must say the values were left off: {t:?}",
-        );
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::FalseColour];
+        let d = layout(&input(&g, &p), &o);
+        let cells = plot_cells(&d, 33, 40);
+        let minx = cells.iter().map(|c| c.0).fold(f64::MAX, f64::min);
+        let maxx = cells.iter().map(|c| c.0 + c.2).fold(f64::MIN, f64::max);
+        assert!(minx >= 0.0 && maxx <= pw, "plot spans {minx:.1}..{maxx:.1} on a {pw:.0} page");
     }
 
     /// A MASKED CELL IS BLANK, not coloured — colouring it reports illuminance on ground the room
@@ -817,19 +947,182 @@ mod tests {
         let mut i = input(&g, &p);
         i.mask = vec![true, false];
         let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::FalseColour];
+        let d = layout(&i, &o);
+        assert_eq!(plot_cells(&d, 2, 1).len(), 1, "only the inside cell is filled");
+    }
+
+    /// VALUES APPEAR WHEN THERE IS ROOM AND NOT WHEN THERE IS NOT — and when they are dropped the
+    /// page says so, rather than leaving a reader to wonder whether the plot is the whole story.
+    #[test]
+    fn cell_values_are_printed_only_when_legible() {
+        let mut o = opts();
         o.sections = vec![Section::FalseColour];
         o.cover = false;
-        let d = layout(&i, &o);
-        let cells: Vec<_> =
-            rects(&d).into_iter().filter(|(_, _, _, h)| (*h - 7.0).abs() > 0.01).collect();
-        assert_eq!(cells.len(), 1, "only the inside cell is filled");
-        let frames = d
-            .pages
+        // A CONTINUOUS SCALE, so the only "100" on the page can be a cell value. With the default
+        // bands the legend writes "100" under itself, and this test would pass on that instead —
+        // which is a test that cannot fail for the reason it names.
+        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
+
+        let small = grid(4, 4);
+        let p = plane();
+        let d = layout(&input(&small, &p), &o);
+        let t = texts(&d);
+        assert!(t.iter().any(|s| s == "100"), "a 4x4 plot has room for its values: {t:?}");
+
+        let big = grid(60, 60);
+        let d = layout(&input(&big, &p), &o);
+        let t = texts(&d);
+        assert!(
+            !t.iter().any(|s| s == "100"),
+            "a 60x60 plot printed values that cannot be read at that size",
+        );
+        assert!(
+            t.iter().any(|s| s.contains("omitted")),
+            "the page must say the values were left off: {t:?}",
+        );
+    }
+
+    /// THE NUMERIC GRID IS ONE PAGE, ALWAYS.
+    ///
+    /// "the illuminance grid comes in multiple pages. it should all be shown in a single page." A
+    /// 70-column field was coming out as 23 pages of column blocks.
+    #[test]
+    fn the_numeric_grid_never_spans_pages() {
+        for (cols, rows) in [(4u32, 4u32), (20, 20), (33, 40)] {
+            let g = grid(cols, rows);
+            let p = plane();
+            let mut o = opts();
+            o.cover = false;
+            o.page_numbers = false;
+            o.sections = vec![Section::NumericGrid];
+            let d = layout(&input(&g, &p), &o);
+            assert_eq!(d.pages.len(), 1, "{cols}x{rows}: the grid took {} pages", d.pages.len());
+            let t = texts(&d);
+            assert!(!t.iter().any(|s| s.starts_with("Columns ")), "{cols}x{rows}: still in blocks");
+        }
+    }
+
+    /// A GRID TOO BIG TO READ SAYS SO rather than printing a grey texture or spilling over.
+    #[test]
+    fn an_unprintable_grid_explains_itself() {
+        let g = grid(200, 200);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.page_numbers = false;
+        o.sections = vec![Section::NumericGrid];
+        let d = layout(&input(&g, &p), &o);
+        assert_eq!(d.pages.len(), 1, "it must not paginate its way out of this");
+        let t = texts(&d);
+        assert!(
+            t.iter().any(|s| s.contains("pt") && s.contains("200")),
+            "the page must state the size and why it was left out: {t:?}",
+        );
+        // …and nothing was printed as a texture.
+        assert!(!t.iter().any(|s| s.parse::<f64>().is_ok()), "values were printed anyway");
+    }
+
+    /// THE SCALE IS THE REPORT'S DECISION, not the viewport's.
+    ///
+    /// Pinning the top changes the colours, and a report that ignored the setting would file a
+    /// picture drawn at a scale nobody chose.
+    #[test]
+    fn pinning_the_scale_changes_the_colours() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::FalseColour];
+        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
+        let auto = plot_cells(&layout(&input(&g, &p), &o), 4, 4);
+
+        o.scale = crate::report::options::Scale { top: Some(5000.0), bands: Vec::new() };
+        let d = layout(&input(&g, &p), &o);
+        let pinned = plot_cells(&d, 4, 4);
+        assert_eq!(auto.len(), pinned.len());
+
+        let fills = |d: &Doc| -> Vec<[u8; 3]> {
+            d.pages
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .filter_map(|i| match i {
+                    Item::Rect { w, h, fill, .. } if (w - h).abs() < 1e-6 => Some(*fill),
+                    _ => None,
+                })
+                .collect()
+        };
+        let a = fills(&layout(
+            &input(&g, &p),
+            &Options {
+                scale: crate::report::options::Scale { top: None, bands: Vec::new() },
+                ..o.clone()
+            },
+        ));
+        let b = fills(&d);
+        assert_ne!(a, b, "pinning the top to 5000 lx left every colour unchanged");
+        assert!(
+            t_sum(&b) < t_sum(&a),
+            "a higher ceiling must push the same room DOWN the ramp, not up",
+        );
+    }
+
+    /// Rough "how far up the ramp" — brighter ramp positions are lighter overall.
+    fn t_sum(c: &[[u8; 3]]) -> u32 {
+        c.iter().map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32).sum()
+    }
+
+    /// A BANDED SCALE DRAWS A BANDED LEGEND, with its edges written out — which is the thing that
+    /// makes a lighting drawing readable rather than merely colourful.
+    #[test]
+    fn a_banded_scale_labels_its_edges() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::FalseColour];
+        o.scale = crate::report::options::Scale { top: Some(500.0), bands: vec![25.0, 100.0, 300.0] };
+        let d = layout(&input(&g, &p), &o);
+        let t = texts(&d);
+        for e in ["0", "25", "100", "300", "500"] {
+            assert!(t.iter().any(|s| s == e), "band edge {e} is not written under the legend: {t:?}");
+        }
+        assert!(t.iter().any(|s| s.contains("Illuminance [lx]")), "the legend is unlabelled");
+    }
+
+    /// A LOGO GOES IN THE HEADER AND THE FOOTER, fitted to a stated box and never stretched.
+    #[test]
+    fn header_and_footer_logos_are_fitted_not_stretched() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.header = "HSI Lighting".into();
+        o.images = vec![ReportImage {
+            path: "logo.png".into(),
+            caption: "logo".into(),
+            // Deliberately not the box's aspect: 4:1 against a 5:1 box.
+            jpeg: Some((vec![0xFF, 0xD8], 800, 200)),
+        }];
+        o.header_image = Some(0);
+        o.footer_image = Some(0);
+        let d = layout(&input(&g, &p), &o);
+
+        // The cover carries neither, so look at a body page.
+        let body = &d.pages[1];
+        let imgs: Vec<(f64, f64)> = body
+            .items
             .iter()
-            .flat_map(|p| p.items.iter())
-            .filter(|i| matches!(i, Item::Frame { .. }))
-            .count();
-        assert!(frames >= 2, "the outside cell is outlined, and the plot has its border");
+            .filter_map(|i| match i {
+                Item::Image { w, h, .. } => Some((*w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imgs.len(), 2, "a header logo and a footer logo");
+        for (w, h) in imgs {
+            assert!(w <= LOGO_W + 1e-6 && h <= LOGO_H + 1e-6, "logo {w}x{h} escapes its box");
+            assert!((w / h - 4.0).abs() < 1e-6, "logo {w}x{h} was stretched from 4:1");
+        }
     }
 
     /// THE SECTION ORDER IS THE DOCUMENT'S ORDER. Moving the renders page is the whole reason the
@@ -938,27 +1231,6 @@ mod tests {
             last.iter().any(|s| *s == format!("{n} / {n}")),
             "the last page is not numbered {n} of {n}: {last:?}",
         );
-    }
-
-    /// THE NUMERIC GRID IS SPLIT, NOT DROPPED. A 33-column table does not fit any paper, and
-    /// losing it would lose the only part of the report that can be checked against another tool.
-    #[test]
-    fn a_wide_numeric_grid_is_split_into_labelled_blocks() {
-        let g = grid(33, 4);
-        let p = plane();
-        let mut o = opts();
-        o.cover = false;
-        o.sections = vec![Section::NumericGrid];
-        let d = layout(&input(&g, &p), &o);
-        let t = texts(&d);
-        assert!(t.iter().any(|s| s.starts_with("Columns 1")), "the first block is unlabelled: {t:?}");
-        assert!(
-            t.iter().filter(|s| s.starts_with("Columns ")).count() >= 2,
-            "33 columns must be split across blocks",
-        );
-        // Every value is still present somewhere.
-        let numbers = t.iter().filter(|s| s.parse::<f64>().is_ok()).count();
-        assert!(numbers >= (33 * 4), "values went missing: only {numbers} printed");
     }
 
     /// RENDERS GET A PAGE OF THEIR OWN, wherever the user put the section.

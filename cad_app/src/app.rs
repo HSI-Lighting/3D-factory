@@ -26472,6 +26472,10 @@ impl CadApp {
             return;
         };
         let doc = crate::report::layout::layout(&inp, &self.report_opts);
+        // Copied out before the borrow ends — the document is built, the numbers it needed are
+        // done with, and what follows edits the state the input borrowed.
+        let room_max = inp.grid.max;
+        drop(inp);
 
         let mut opts = std::mem::take(&mut self.report_opts);
         let mut open = self.report_open;
@@ -26486,6 +26490,7 @@ impl CadApp {
             &mut page,
             &tex,
             can_capture,
+            room_max,
         );
         self.report_opts = opts;
         self.report_tex = tex;
@@ -26524,11 +26529,16 @@ impl CadApp {
         if i < self.report_tex.len() {
             self.report_tex.remove(i);
         }
-        self.report_opts.cover_image = match self.report_opts.cover_image {
+        // EVERY slot that names an image by index, not just the cover — a header logo left
+        // pointing at the old number would put a different picture on every page.
+        let repoint = |cur: Option<usize>| match cur {
             Some(c) if c == i => None,
             Some(c) if c > i => Some(c - 1),
             other => other,
         };
+        self.report_opts.cover_image = repoint(self.report_opts.cover_image);
+        self.report_opts.header_image = repoint(self.report_opts.header_image);
+        self.report_opts.footer_image = repoint(self.report_opts.footer_image);
     }
 
 
@@ -61894,9 +61904,11 @@ mod the_report_is_asked_about_before_it_is_written {
 
         // Removing an EARLIER image slides the chosen one down.
         app.report_opts.cover_image = Some(2);
+        app.report_opts.header_image = Some(2);
         app.report_open = true;
         app.report_remove_image(0);
         assert_eq!(app.report_opts.cover_image, Some(1), "the cover follows its image");
+        assert_eq!(app.report_opts.header_image, Some(1), "the header logo follows its image too");
         assert_eq!(app.report_opts.images[1].caption, "c");
 
         // Removing the chosen one clears it rather than pointing somewhere arbitrary.
