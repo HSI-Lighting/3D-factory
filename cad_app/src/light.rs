@@ -411,8 +411,14 @@ pub struct RoomResult {
     pub grid_en: LuxGrid,
     pub cylindrical_avg: Option<f64>,
     pub installation: Option<Installation>,
-    /// The fixtures standing in this room, by id.
-    pub fixtures: Vec<u32>,
+    /// The fixtures standing in this room — the RECORDS, not their ids.
+    ///
+    /// Ids alone were not enough: a room contains user-placed fixtures AND the lights the model
+    /// generates (a curved luminaire is a real fitting), and the generated ones exist only for the
+    /// length of a calculation. Resolving ids against `LightState::luminaires` afterwards found
+    /// the placed ones and silently dropped the rest — so a room's Installation section counted
+    /// 89 fittings its schedule did not list.
+    pub fixtures: Vec<Luminaire>,
     /// A note about a coarsened grid, if this room needed one.
     pub grid_note: Option<String>,
 }
@@ -1526,10 +1532,8 @@ impl LightState {
         // THE ROOM'S OWN FITTINGS, and its own load. A power density taken over every fitting in
         // the building and divided by one room's floor is not a figure about anything.
         let fixtures = Self::fixtures_in(poly, lums);
-        let mine: Vec<Luminaire> =
-            lums.iter().filter(|l| fixtures.contains(&l.id)).cloned().collect();
         let installation =
-            Some(installation_summary(&mine, &self.profiles, (w * d) as f64));
+            Some(installation_summary(&fixtures, &self.profiles, (w * d) as f64));
 
         RoomResult {
             name: name.to_string(),
@@ -1581,13 +1585,13 @@ impl LightState {
     }
 
     /// Which fixtures stand inside `poly`. Every fixture when there is no footprint.
-    fn fixtures_in(poly: &[glam::Vec2], lums: &[Luminaire]) -> Vec<u32> {
+    fn fixtures_in(poly: &[glam::Vec2], lums: &[Luminaire]) -> Vec<Luminaire> {
         if poly.len() < 3 {
-            return lums.iter().map(|l| l.id).collect();
+            return lums.to_vec();
         }
         lums.iter()
             .filter(|l| crate::factory::point_in_poly(poly, l.position.x, l.position.y))
-            .map(|l| l.id)
+            .cloned()
             .collect()
     }
 
@@ -5214,6 +5218,68 @@ mod every_room_is_calculated {
             let i = r.installation.as_ref().expect("an installation summary");
             assert_eq!(i.count, 2, "{}'s load is over {} fittings", r.name, i.count);
         }
+    }
+
+
+    /// A ROOM'S FIXTURES INCLUDE THE LIGHTS THE MODEL GENERATES.
+    ///
+    /// A curved luminaire is a real fitting, and it exists only for the length of a calculation —
+    /// it is derived from the model rather than stored. Carrying ids and resolving them against
+    /// `luminaires` afterwards found the placed ones and silently dropped the rest, so a room's
+    /// Installation section counted fittings its schedule did not list. Found on the owner's own
+    /// three-room plan: 112 fixtures claimed against 23 placed.
+    #[test]
+    fn a_room_keeps_the_records_of_lights_that_outlive_nothing() {
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 10.0),
+            glam::Vec2::new(0.0, 10.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let placed = Luminaire {
+            id: 3,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(2.0, 2.0, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        };
+        // The id range generated lights use, so one can never collide with a user's.
+        let generated = Luminaire { id: 1_000_000, position: Vertex::new(8.0, 8.0, 2.7), ..placed.clone() };
+        let outside = Luminaire { id: 4, position: Vertex::new(50.0, 50.0, 2.7), ..placed.clone() };
+
+        let got = LightState::fixtures_in(&poly, &[placed.clone(), generated.clone(), outside]);
+        assert_eq!(got.len(), 2, "the room holds the placed one and the generated one");
+        assert!(got.iter().any(|l| l.id == 3), "the placed fixture is missing");
+        assert!(
+            got.iter().any(|l| l.id == 1_000_000),
+            "the generated fixture was dropped — its record is the only copy there is",
+        );
+        assert!(!got.iter().any(|l| l.id == 4), "a fixture outside the room was claimed");
+
+        // The RECORD, not the id — that is the whole point. A schedule built from ids could not
+        // describe the generated one, because it is in no list to look up.
+        let g = got.iter().find(|l| l.id == 1_000_000).expect("there");
+        assert!((g.position.x - 8.0).abs() < 1e-6, "the record came back wrong");
+    }
+
+    /// NO FOOTPRINT MEANS EVERY FIXTURE — the whole-model fallback a 2D-only project uses.
+    #[test]
+    fn a_room_with_no_footprint_claims_everything() {
+        let l = Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(999.0, 999.0, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        };
+        assert_eq!(LightState::fixtures_in(&[], std::slice::from_ref(&l)).len(), 1);
     }
 
     /// A SELECTION STILL DECIDES WHICH ROOM THE PANEL SHOWS — the gesture people already have —

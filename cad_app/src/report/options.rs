@@ -219,10 +219,10 @@ pub struct Options {
     /// The false-colour scale, chosen here rather than followed from the viewport.
     #[serde(default)]
     pub scale: Scale,
-    /// A logo for the header, by index into `images`.
+    /// A logo for the header, by index into `logos`.
     #[serde(default)]
     pub header_image: Option<usize>,
-    /// A logo for the footer.
+    /// A logo for the footer, by index into `logos`.
     #[serde(default)]
     pub footer_image: Option<usize>,
     /// The sections to include, IN ORDER. Moving `Renders` within this list is what "decide the
@@ -235,6 +235,13 @@ pub struct Options {
     pub hidden: Vec<(Section, usize)>,
     #[serde(skip)]
     pub images: Vec<ReportImage>,
+    /// LOGOS, kept apart from the renders.
+    ///
+    /// They shared one list, so putting a logo in the header meant first adding it as a RENDER —
+    /// where it then appeared, full width, on the renders page. They are different things used in
+    /// different places and are chosen from different buttons.
+    #[serde(skip)]
+    pub logos: Vec<ReportImage>,
     /// Where the file goes. Empty until chosen.
     pub out_dir: String,
     pub file_stem: String,
@@ -258,6 +265,7 @@ impl Default for Options {
             sections: Section::all(),
             hidden: Vec::new(),
             images: Vec::new(),
+            logos: Vec::new(),
             out_dir: String::new(),
             file_stem: String::new(),
         }

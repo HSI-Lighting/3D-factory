@@ -2138,8 +2138,10 @@ pub struct CadApp {
     report_tex_dirty: bool,
     /// The next folder pick is the report's output directory.
     report_wants_dir: bool,
-    /// The next image pick is a report render.
-    report_wants_images: bool,
+    /// The next image pick is a report image: `Some(false)` a render, `Some(true)` a logo.
+    report_wants_images: Option<bool>,
+    /// A preview texture per LOGO, parallel to `report_opts.logos`.
+    report_logo_tex: Vec<Option<egui::TextureHandle>>,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
     ///
     /// A FIELD rather than the bare constant, for two reasons. It is the kind of limit a user with
@@ -3984,7 +3986,8 @@ impl Default for CadApp {
             report_tex: Vec::new(),
             report_tex_dirty: false,
             report_wants_dir: false,
-            report_wants_images: false,
+            report_wants_images: None,
+            report_logo_tex: Vec::new(),
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
             villa_autoloaded: false,
@@ -26410,9 +26413,9 @@ impl CadApp {
     /// states an illuminance without saying what produced it cannot be checked, ordered from, or
     /// handed to an installer. A file that declares no manufacturer shows a dash, which is that
     /// file's omission rather than the report's.
-    fn schedule_for(&self, ids: &[u32]) -> Vec<crate::report::layout::ScheduleRow> {
+    fn schedule_for(&self, fixtures: &[cad_light::Luminaire]) -> Vec<crate::report::layout::ScheduleRow> {
         let mut out: Vec<crate::report::layout::ScheduleRow> = Vec::new();
-        for l in self.light.luminaires.iter().filter(|l| ids.contains(&l.id)) {
+        for l in fixtures {
             if let Some(row) = out.iter_mut().find(|r| r.profile == l.profile) {
                 row.count += 1;
                 continue;
@@ -26529,7 +26532,10 @@ impl CadApp {
         let mut opts = std::mem::take(&mut self.report_opts);
         let mut open = self.report_open;
         let mut page = self.report_page;
-        let tex = std::mem::take(&mut self.report_tex);
+        // The preview reads ONE table, in the same order the PDF builds it: renders then logos.
+        let mut tex = std::mem::take(&mut self.report_tex);
+        let logo_tex = std::mem::take(&mut self.report_logo_tex);
+        tex.extend(logo_tex.iter().cloned());
         let can_capture = self.pt_job.is_some();
         let act = crate::report::ui::window_ui(
             ctx,
@@ -26542,6 +26548,9 @@ impl CadApp {
             room_max,
         );
         self.report_opts = opts;
+        let n = self.report_opts.images.len().min(tex.len());
+        self.report_logo_tex = logo_tex;
+        tex.truncate(n);
         self.report_tex = tex;
         self.report_page = page;
         self.report_open = open;
@@ -26551,11 +26560,32 @@ impl CadApp {
             self.open_file_dialog(FileDialogMode::PickFolder, "");
         }
         if act.add_images {
-            self.report_wants_images = true;
+            self.report_wants_images = Some(false);
+            self.open_file_dialog(FileDialogMode::ImportImage, "");
+        }
+        if act.add_logos {
+            self.report_wants_images = Some(true);
             self.open_file_dialog(FileDialogMode::ImportImage, "");
         }
         if let Some(i) = act.remove_image {
             self.report_remove_image(i);
+        }
+        if let Some(i) = act.remove_logo {
+            if i < self.report_opts.logos.len() {
+                self.report_opts.logos.remove(i);
+                if i < self.report_logo_tex.len() {
+                    self.report_logo_tex.remove(i);
+                }
+                // The header and footer name a logo by INDEX, and everything after the removed
+                // one has moved down.
+                let repoint = |cur: Option<usize>| match cur {
+                    Some(c) if c == i => None,
+                    Some(c) if c > i => Some(c - 1),
+                    other => other,
+                };
+                self.report_opts.header_image = repoint(self.report_opts.header_image);
+                self.report_opts.footer_image = repoint(self.report_opts.footer_image);
+            }
         }
         if act.capture_render {
             self.report_capture_render();
@@ -26592,7 +26622,7 @@ impl CadApp {
 
 
     /// Load an image file for the report, as JPEG bytes plus a preview texture.
-    fn report_add_image(&mut self, path: &str, ctx: Option<&egui::Context>) {
+    fn report_add_image(&mut self, path: &str, ctx: Option<&egui::Context>, is_logo: bool) {
         let img = match image::open(path) {
             Ok(i) => i.to_rgb8(),
             Err(e) => {
@@ -26601,7 +26631,7 @@ impl CadApp {
             }
         };
         let (w, h) = (img.width(), img.height());
-        self.report_push_image(path.to_string(), img.into_raw(), w, h, ctx);
+        self.report_push_image(path.to_string(), img.into_raw(), w, h, ctx, is_logo);
     }
 
     /// Shared by the file loader and the render capture: RGB8 in, report image out.
@@ -26612,6 +26642,7 @@ impl CadApp {
         w: u32,
         h: u32,
         ctx: Option<&egui::Context>,
+        is_logo: bool,
     ) {
         // A REPORT IMAGE IS RESIZED ON THE WAY IN. A 6000-pixel render embedded whole makes a
         // 40 MB PDF nobody can email, and it is being printed into a box a few inches across —
@@ -26635,17 +26666,29 @@ impl CadApp {
             return;
         }
 
+        let kind = if is_logo { "logo" } else { "img" };
+        let n = if is_logo { self.report_opts.logos.len() } else { self.report_opts.images.len() };
         let tex = ctx.map(|c| {
             let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
-            c.load_texture(format!("report_img_{}", self.report_opts.images.len()), img, Default::default())
+            c.load_texture(format!("report_{kind}_{n}"), img, Default::default())
         });
-        self.report_opts.images.push(crate::report::ReportImage {
+        let entry = crate::report::ReportImage {
             caption: String::new(),
             path: path.clone(),
             jpeg: Some((jpeg, w, h)),
-        });
-        self.report_tex.push(tex);
-        self.history.push(format!("  report: added {} ({w}×{h})", file_stem_of(&path)));
+        };
+        if is_logo {
+            self.report_opts.logos.push(entry);
+            self.report_logo_tex.push(tex);
+        } else {
+            self.report_opts.images.push(entry);
+            self.report_tex.push(tex);
+        }
+        self.history.push(format!(
+            "  report: added {} {} ({w}×{h})",
+            if is_logo { "logo" } else { "render" },
+            file_stem_of(&path),
+        ));
     }
 
     /// Take the current path-traced render as a report image.
@@ -26659,7 +26702,7 @@ impl CadApp {
             return;
         };
         let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-        self.report_push_image("render".into(), rgb, w as u32, h as u32, None);
+        self.report_push_image("render".into(), rgb, w as u32, h as u32, None, false);
         self.report_tex_dirty = true;
     }
 
@@ -30223,10 +30266,11 @@ impl CadApp {
                     let path = dlg.dir.join(name);
                     // The same browser, asked for by two callers — a raster to trace, or a render
                     // for the report.
-                    if std::mem::take(&mut self.report_wants_images) {
-                        self.report_add_image(&path.to_string_lossy(), Some(ctx));
-                    } else {
-                        self.do_import_image(&path.to_string_lossy());
+                    match std::mem::take(&mut self.report_wants_images) {
+                        Some(is_logo) => {
+                            self.report_add_image(&path.to_string_lossy(), Some(ctx), is_logo)
+                        }
+                        None => self.do_import_image(&path.to_string_lossy()),
                     }
                 }
                 FileDialogMode::ImportRaster => {
@@ -62000,5 +62044,92 @@ mod the_report_is_asked_about_before_it_is_written {
         assert_eq!(app.report_opts.cover_image, None, "the cover kept a dead index");
         assert_eq!(app.report_opts.images.len(), 1);
         assert_eq!(app.report_tex.len(), 1, "the preview textures went out of step");
+    }
+}
+
+/// THE OWNER'S OWN THREE-ROOM FILE.
+///
+/// `testfile2.dxf` is the plan the multi-room work was reported against — three rooms, 23 fittings
+/// of one type. Ignored by default because it lives in the owner's Dropbox rather than the repo;
+/// run it with the path when the calculation's room handling changes:
+///
+/// ```text
+/// $env:SIMLUX_PROJECT="D:\Dropbox\YASEEN\3d factory\tests\initial test result\testfile2"
+/// cargo test -p cad_app the_owners_three_room_plan -- --ignored --nocapture
+/// ```
+///
+/// What it checks is what the synthetic rooms cannot: that a REAL plan's rooms are found, that its
+/// fittings land in them, and that every room comes back lit.
+#[cfg(test)]
+mod the_owners_three_room_plan {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn every_room_is_calculated_and_lit() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf))
+            .expect("the sidecar must read")
+            .expect("the project must have a sidecar");
+
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+        app.light.apply_config(cfg, &app.doc);
+
+        let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc).clone();
+        app.light.calculate(&plan, Some(&app.factory));
+
+        println!("rooms calculated: {}", app.light.rooms.len());
+        let mut placed = 0usize;
+        let mut generated = 0usize;
+        for r in &app.light.rooms {
+            println!(
+                "  {:10} {:>3}x{:<3} plane {:6.2} x {:6.2} m  avg {:7.1} lx  min {:6.1}  U0 {:.2}  \
+                 {:2} fitting(s)",
+                r.name,
+                r.plane.cols,
+                r.plane.rows,
+                r.plane.width,
+                r.plane.depth,
+                r.grid.avg,
+                r.grid.min,
+                r.grid.u0(),
+                r.fixtures.len(),
+            );
+            // A room holds user-placed fixtures AND the lights the model generates — a curved
+            // luminaire is a real fitting. Generated ids start at a million, which is how they
+            // are told apart.
+            placed += r.fixtures.iter().filter(|l| l.id < 1_000_000).count();
+            generated += r.fixtures.iter().filter(|l| l.id >= 1_000_000).count();
+        }
+        println!("placed {placed}, generated {generated}");
+
+        assert_eq!(app.light.rooms.len(), 3, "this plan has three rooms");
+        for r in &app.light.rooms {
+            assert!(r.grid.avg > 1.0, "{} came out at {:.2} lx — unlit", r.name, r.grid.avg);
+            assert!(!r.fixtures.is_empty(), "{} has no fittings in it", r.name);
+        }
+        assert_eq!(
+            placed,
+            app.light.luminaires.len(),
+            "{} of {} PLACED fittings were claimed by a room",
+            placed,
+            app.light.luminaires.len(),
+        );
+        // Every fixture a room claims must be one the schedule can describe. Ids alone could not
+        // do this: the generated lights exist only for the length of a calculation.
+        for r in &app.light.rooms {
+            let sched = app.schedule_for(&r.fixtures);
+            let listed: usize = sched.iter().map(|s| s.count).sum();
+            assert_eq!(
+                listed,
+                r.fixtures.len(),
+                "{}: the schedule lists {listed} of {} fittings",
+                r.name,
+                r.fixtures.len(),
+            );
+        }
     }
 }

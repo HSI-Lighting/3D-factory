@@ -211,11 +211,16 @@ impl Cursor {
 pub fn layout(inp: &Input, opt: &Options) -> Doc {
     let (w, h) = opt.page.points();
     let mut doc = Doc::new((w, h), opt.title.clone());
-    for im in &opt.images {
+    // ONE IMAGE TABLE, TWO LISTS. The PDF holds a single table of images, so the renders go in
+    // first and the logos after them — a logo's index into the table is `logo_base + i`. Kept
+    // apart in the options because they are different things chosen from different buttons; kept
+    // together here because the file format has one place to put them.
+    for im in opt.images.iter().chain(opt.logos.iter()) {
         if let Some((bytes, iw, ih)) = &im.jpeg {
             doc.images.push(Jpeg { bytes: bytes.clone(), w: *iw, h: *ih });
         }
     }
+    let logo_base = opt.images.iter().filter(|i| i.jpeg.is_some()).count();
 
     let has_head = !opt.header.trim().is_empty() || opt.header_image.is_some();
     let has_foot =
@@ -298,7 +303,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
         if has_head {
             // The logo sits at the OUTER edge, opposite the text, which is where a letterhead puts
             // it and what leaves the middle of the line free for a long project name.
-            if let Some(i) = opt.header_image {
+            if let Some(i) = opt.header_image.map(|i| logo_base + i) {
                 if let Some(im) = doc.images.get(i) {
                     let (iw, ih) = fit(im.w as f64, im.h as f64, LOGO_W, LOGO_H);
                     p.items.push(Item::Image {
@@ -349,7 +354,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
                     text: opt.footer.trim().to_string(),
                 });
             }
-            if let Some(i) = opt.footer_image {
+            if let Some(i) = opt.footer_image.map(|i| logo_base + i) {
                 if let Some(im) = doc.images.get(i) {
                     let (iw, ih) = fit(im.w as f64, im.h as f64, LOGO_W, LOGO_H);
                     p.items.push(Item::Image {
@@ -907,34 +912,39 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     if g.cols == 0 || g.rows == 0 {
         return;
     }
-    c.heading("Illuminance grid (lx)");
-
     let cols = g.cols as f64;
     let rows = g.rows as f64;
     let avail_w = c.width();
-    let avail_h = (c.bottom - c.y - 12.0).max(40.0);
+    // MEASURED AGAINST A WHOLE PAGE, not against what is left of this one. The grid gets a fresh
+    // page if it needs one, so sizing it to the tail end of the previous page would reject a table
+    // that fits perfectly well.
+    let full_h = c.bottom - c.top - 30.0;
 
     // The widest figure decides the column, and four digits is the practical worst case.
-    let by_w = avail_w / (cols * 4.6);
-    let by_h = avail_h / (rows * 1.45);
-    let size = by_w.min(by_h);
+    let size = (avail_w / (cols * 4.6)).min(full_h / (rows * 1.45));
 
+    // DECIDED BEFORE ANYTHING IS PUT DOWN.
+    //
+    // This used to print the heading first and then discover the grid was unprintable, so an
+    // apology got a page of its own with 700 points of white under it. Reported as "the
+    // illumination grid is show empty page". A section that has nothing to say says it in one
+    // line, where the reader already is.
     if size < MIN_GRID_PT {
         c.note(&format!(
-            "This grid is {} × {} = {} values. Printed on one page the figures would be {:.1} pt, \
-             which is below the {MIN_GRID_PT:.0} pt this report will set — so it is left out here \
-             rather than printed as a grey texture.",
+            "Illuminance grid: {} × {} = {} values. At one page that is {:.1} pt type, below the \
+             {MIN_GRID_PT:.0} pt this report will set — the false-colour plot above carries the \
+             same field, and the HTML report prints every value at a size a screen can zoom.",
             g.cols,
             g.rows,
             g.values.len(),
             size,
         ));
-        c.note(
-            "The false-colour plot above carries the same field, and the HTML report prints every \
-             value at a size a screen can zoom.",
-        );
         return;
     }
+
+    // It fits — but it needs the room. Take a fresh page rather than start it in a corner.
+    c.need_or_break(30.0 + rows * size * 1.45);
+    c.heading("Illuminance grid (lx)");
 
     let colw = avail_w / cols;
     let rowh = size * 1.45;
@@ -1375,7 +1385,8 @@ mod tests {
         let p = plane();
         let mut o = opts();
         o.header = "HSI Lighting".into();
-        o.images = vec![ReportImage {
+        // LOGOS, not renders — they are separate lists.
+        o.logos = vec![ReportImage {
             path: "logo.png".into(),
             caption: "logo".into(),
             // Deliberately not the box's aspect: 4:1 against a 5:1 box.
@@ -1402,6 +1413,142 @@ mod tests {
         }
     }
 
+
+
+    /// AN UNPRINTABLE GRID DOES NOT COST A PAGE.
+    ///
+    /// Reported as "the illumination grid is show empty page": the heading went down first, the
+    /// grid then turned out to be unprintable, and the apology got a page of its own with 700
+    /// points of white under it. The decision has to come before anything is put on the page.
+    #[test]
+    fn an_unprintable_grid_costs_no_page_and_no_heading() {
+        let g = grid(125, 38); // the owner's Room 1 — 4,750 values
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.page_numbers = false;
+        o.sections = vec![Section::Summary, Section::NumericGrid];
+        let d = layout(&input(&g, &p), &o);
+
+        assert_eq!(d.pages.len(), 1, "the note took {} pages", d.pages.len());
+        let t = texts(&d);
+        assert!(
+            !t.iter().any(|s| s == "Illuminance grid (lx)"),
+            "a heading was printed over a section with nothing under it: {t:?}",
+        );
+        assert!(
+            t.iter().any(|s| s.contains("125") && s.contains("pt")),
+            "the note must still say what was left out and why: {t:?}",
+        );
+    }
+
+    /// A GRID THAT FITS IS STILL PRINTED, and still gets its heading. The fix must not have turned
+    /// the section off.
+    #[test]
+    fn a_grid_that_fits_is_printed_with_its_heading() {
+        let g = grid(10, 10);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::NumericGrid];
+        let t = texts(&layout(&input(&g, &p), &o));
+        assert!(t.iter().any(|s| s == "Illuminance grid (lx)"), "the heading went missing");
+        let numbers = t.iter().filter(|s| s.parse::<f64>().is_ok()).count();
+        assert!(numbers >= 100, "only {numbers} of 100 values were printed");
+    }
+
+    /// THE GRID IS SIZED AGAINST A WHOLE PAGE, not the tail of the previous one.
+    ///
+    /// Measuring against what is left would reject a table that fits perfectly well simply because
+    /// a plot happened to run to the bottom of the page above it.
+    #[test]
+    fn a_grid_after_a_full_page_still_prints() {
+        // Tall enough that it does NOT fit in the sliver left under a two-thirds plot, and small
+        // enough that it fits a page of its own — which is the whole distinction being tested.
+        let g = grid(20, 60);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        // The plot fills two thirds of the page, so the grid starts near the bottom.
+        o.sections = vec![Section::FalseColour, Section::NumericGrid];
+        let t = texts(&layout(&input(&g, &p), &o));
+        assert!(
+            t.iter().any(|s| s == "Illuminance grid (lx)"),
+            "the grid was rejected for want of space on a page it does not have to share: {t:?}",
+        );
+    }
+
+    /// LOGOS ARE THEIR OWN LIST, and a logo is not a render.
+    ///
+    /// They shared one list, so putting a logo in the header meant adding it as a RENDER first —
+    /// where it then appeared, full width, on the renders page. Reported as "i have to add image
+    /// at the render image addition then add them in the logo. i need it to be seperate".
+    #[test]
+    fn a_logo_is_not_a_render() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.header = "HSI Lighting".into();
+        o.sections = vec![Section::Summary, Section::Renders];
+        o.logos = vec![ReportImage {
+            path: "logo.png".into(),
+            caption: "logo".into(),
+            jpeg: Some((vec![0xFF, 0xD8], 800, 200)),
+        }];
+        o.header_image = Some(0);
+        let d = layout(&input(&g, &p), &o);
+
+        // The logo is on the page furniture…
+        let body_imgs = d.pages[1].items.iter().filter(|i| matches!(i, Item::Image { .. })).count();
+        assert_eq!(body_imgs, 1, "the header logo is not on the body page");
+        // …and there is NO renders page, because no render was added.
+        assert!(
+            !texts(&d).iter().any(|s| s == "Renders"),
+            "a logo produced a renders page",
+        );
+    }
+
+    /// AND THE TWO LISTS SHARE ONE IMAGE TABLE without crossing over. A logo's index has to be
+    /// offset past the renders, or the header shows the first render instead.
+    #[test]
+    fn a_logo_index_does_not_point_at_a_render() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.header = "HSI".into();
+        o.sections = vec![Section::Summary, Section::Renders];
+        o.images = vec![ReportImage {
+            path: "render.jpg".into(),
+            caption: "the room".into(),
+            // 2:1, deliberately unlike the logo below.
+            jpeg: Some((vec![0xFF, 0xD8], 2000, 1000)),
+        }];
+        o.logos = vec![ReportImage {
+            path: "logo.png".into(),
+            caption: "logo".into(),
+            jpeg: Some((vec![0xFF, 0xD9], 800, 200)), // 4:1
+        }];
+        o.header_image = Some(0);
+        let d = layout(&input(&g, &p), &o);
+
+        assert_eq!(d.images.len(), 2, "both lists reach the file's image table");
+        // The header image must be the LOGO — told apart by its aspect, since the two differ.
+        let header = d.pages[1]
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Image { w, h, idx, .. } => Some((*w, *h, *idx)),
+                _ => None,
+            })
+            .expect("a header image");
+        assert_eq!(header.2, 1, "the header points at image {} — the render", header.2);
+        assert!(
+            (header.0 / header.1 - 4.0).abs() < 1e-6,
+            "the header image is {:.0}x{:.0}, which is the render's shape",
+            header.0,
+            header.1,
+        );
+    }
 
     /// A CHAPTER PER ROOM.
     ///

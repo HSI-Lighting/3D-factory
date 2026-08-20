@@ -19,6 +19,10 @@ pub struct Action {
     pub add_images: bool,
     /// Drop this image.
     pub remove_image: Option<usize>,
+    /// Add logo images — a list of their own, not the renders.
+    pub add_logos: bool,
+    /// Drop this logo.
+    pub remove_logo: Option<usize>,
     /// Take the current path-tracer render as an image.
     pub capture_render: bool,
 }
@@ -303,15 +307,12 @@ pub fn window_ui(
                             .small()
                             .weak(),
                         );
-                        for (label, slot) in [
-                            ("Header logo", 0usize),
-                            ("Footer logo", 1usize),
-                        ] {
+                        for (label, slot) in [("Header logo", 0usize), ("Footer logo", 1usize)] {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(label).small().weak());
-                                let cur = *if slot == 0 { &opt.header_image } else { &opt.footer_image };
+                                let cur = if slot == 0 { opt.header_image } else { opt.footer_image };
                                 let text = cur
-                                    .and_then(|i| opt.images.get(i))
+                                    .and_then(|i| opt.logos.get(i))
                                     .map(|i| i.caption_or_file())
                                     .unwrap_or_else(|| "none".to_string());
                                 let mut pick = cur;
@@ -319,8 +320,8 @@ pub fn window_ui(
                                     .selected_text(text)
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut pick, None, "none");
-                                        for i in 0..opt.images.len() {
-                                            let l = opt.images[i].caption_or_file();
+                                        for i in 0..opt.logos.len() {
+                                            let l = opt.logos[i].caption_or_file();
                                             ui.selectable_value(&mut pick, Some(i), l);
                                         }
                                     });
@@ -329,6 +330,32 @@ pub fn window_ui(
                                 } else {
                                     opt.footer_image = pick;
                                 }
+                            });
+                        }
+                        // THE LOGOS ARE THEIR OWN LIST. They used to share the renders list, so a
+                        // header logo had to be added as a render first — where it then appeared,
+                        // full width, on the renders page.
+                        ui.horizontal(|ui| {
+                            if ui.button("＋ Add logo…").clicked() {
+                                act.add_logos = true;
+                            }
+                            if opt.logos.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("no logos loaded").small().weak(),
+                                );
+                            }
+                        });
+                        for i in 0..opt.logos.len() {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("✕").clicked() {
+                                    act.remove_logo = Some(i);
+                                }
+                                let hint = short(&opt.logos[i].path);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut opt.logos[i].caption)
+                                        .desired_width(180.0)
+                                        .hint_text(hint),
+                                );
                             });
                         }
 
