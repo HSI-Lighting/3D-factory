@@ -62059,13 +62059,128 @@ mod the_report_is_asked_about_before_it_is_written {
         assert!(app.light.last_msg.contains("Calculate"), "and it must say why");
     }
 
+
+    /// Every piece of text the dialog actually painted.
+    ///
+    /// Reading the LABELS off a rendered frame, rather than searching the binary for the literals:
+    /// an optimised build is free to merge, split and re-order string constants, so "the bytes are
+    /// in the file" answers a question nobody asked. What matters is whether the control is on
+    /// screen.
+    fn dialog_text(app: &mut CadApp) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            // Big enough that nothing is scrolled out of the frame and culled.
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1800.0, 2400.0),
+            )),
+            ..Default::default()
+        };
+        // SEVERAL FRAMES, and the options column SCROLLED THROUGH.
+        //
+        // egui lays a window out before it paints it — frame one comes back as two dozen `Noop`
+        // shapes and nothing else, which is what an earlier test counted and passed on. And the
+        // options are taller than their panel, so anything below the fold is culled and never
+        // painted at all: reading one frame answers "what is visible", not "what is there".
+        let mut all: Vec<String> = Vec::new();
+        let mut collect = |out: egui::FullOutput, all: &mut Vec<String>| {
+            fn walk(s: &egui::Shape, into: &mut Vec<String>) {
+                match s {
+                    egui::Shape::Text(t) => into.push(t.galley.text().to_string()),
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes {
+                walk(&cs.shape, all);
+            }
+        };
+        for _ in 0..3 {
+            let out = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+            collect(out, &mut all);
+        }
+        // Then wheel the options column down, a screenful at a time, gathering as we go.
+        for _ in 0..12 {
+            let mut ri = input();
+            ri.events.push(egui::Event::PointerMoved(egui::pos2(140.0, 400.0)));
+            ri.events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -180.0),
+                modifiers: Default::default(),
+            });
+            let out = ctx.run(ri, |ctx| app.render_report_dialog(ctx));
+            collect(out, &mut all);
+        }
+        all.sort();
+        all.dedup();
+        return all;
+        #[allow(unreachable_code)]
+        let out = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+        fn walk(s: &egui::Shape, into: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => into.push(t.galley.text().to_string()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                _ => {}
+            }
+        }
+        let mut v = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut v);
+        }
+        v
+    }
+
+    /// THE DIALOG SHOWS EVERY CONTROL IT IS SUPPOSED TO.
+    ///
+    /// "is everything wired in?" — asked after several rounds of additions, and the honest way to
+    /// answer is to render the thing and read it back rather than to remember.
+    #[test]
+    fn every_control_is_on_screen() {
+        let mut app = calculated();
+        app.export_light_report();
+        let t = dialog_text(&mut app);
+        let has = |needle: &str| t.iter().any(|s| s.contains(needle));
+
+        for want in [
+            "Format", "PDF", "HTML", "A4", "Letter",
+            "Cover", "Cover page", "Project", "Line 2", "Image",
+            "Header & footer", "Page numbers", "Header logo", "Footer logo", "Add logo",
+            "Logos fit a",
+            "False-colour scale", "Pin top", "Bands",
+            "Sections",
+            "Renders", "Add", "Folder", "choose a folder", "Preview", "Save PDF",
+        ] {
+            assert!(has(want), "the dialog never painted {want:?}\npainted: {t:?}");
+        }
+    }
+
+    /// AND EVERY SECTION IS TICKABLE — all ten, by the label the user reads.
+    #[test]
+    fn every_section_has_a_tick_box() {
+        let mut app = calculated();
+        app.export_light_report();
+        let t = dialog_text(&mut app);
+        for s in crate::report::Section::all() {
+            assert!(
+                t.iter().any(|x| x == s.label()),
+                "no tick box for {:?} ({:?})",
+                s,
+                s.label(),
+            );
+        }
+    }
+
     /// THE DIALOG DRAWS — every panel, with a preview of a real document.
     #[test]
     fn the_dialog_and_its_preview_run() {
         let mut app = calculated();
         app.export_light_report();
-        let shapes = frame(&mut app);
-        assert!(shapes > 0, "the dialog drew nothing");
+        // NOT A SHAPE COUNT. This used to assert `shapes > 0`, and egui returns two dozen `Noop`
+        // shapes on the frame it lays a window out in — so the test passed on a dialog that had
+        // painted nothing whatever, and went on passing while controls were added to it.
+        let t = dialog_text(&mut app);
+        assert!(t.iter().any(|s| s == "Format"), "the dialog painted nothing: {t:?}");
+        assert!(t.iter().any(|s| s.contains("Preview")), "the preview column is missing");
         assert!(app.report_open, "it closed itself");
     }
 

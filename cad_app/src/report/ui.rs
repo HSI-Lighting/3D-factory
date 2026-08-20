@@ -439,27 +439,6 @@ pub fn window_ui(
                             });
                         }
 
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Save to").strong());
-                        ui.horizontal(|ui| {
-                            if ui.button("📂 Folder…").clicked() {
-                                act.browse_dir = true;
-                            }
-                            ui.add(
-                                egui::TextEdit::singleline(&mut opt.file_stem)
-                                    .desired_width(150.0)
-                                    .hint_text("file name"),
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(if opt.out_dir.trim().is_empty() {
-                                "choose a folder".to_string()
-                            } else {
-                                opt.out_path().to_string_lossy().into_owned()
-                            })
-                            .small()
-                            .weak(),
-                        );
                     });
                 });
 
@@ -493,9 +472,31 @@ pub fn window_ui(
                     );
                     painter.rect_filled(resp.rect, 0.0, egui::Color32::from_gray(40));
                     paint_page(&painter, resp.rect.shrink(8.0), doc, *page, tex);
-
                     ui.add_space(4.0);
+                    // WHERE IT GOES, BESIDE THE BUTTON THAT NEEDS IT. This sat at the bottom of
+                    // the options column, below the fold — so the Save button said "Choose a
+                    // folder first" about a control the user could not see without scrolling.
                     ui.horizontal(|ui| {
+                        if ui.button("📂  Folder…").clicked() {
+                            act.browse_dir = true;
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(&mut opt.file_stem)
+                                .desired_width(160.0)
+                                .hint_text("file name"),
+                        );
+                        ui.label(
+                            egui::RichText::new(if opt.out_dir.trim().is_empty() {
+                                "choose a folder".to_string()
+                            } else {
+                                opt.out_path().to_string_lossy().into_owned()
+                            })
+                            .small()
+                            .weak(),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+
                         let ready = !opt.out_dir.trim().is_empty();
                         ui.add_enabled_ui(ready, |ui| {
                             if ui
