@@ -143,6 +143,10 @@ pub fn window_ui(
         .id(egui::Id::new("report_dialog"))
         .open(open)
         .default_size(egui::vec2(980.0, 680.0))
+        // A BACKSTOP, not the mechanism. The preview reserves room for the buttons below it, so
+        // this should never bind; it is here so that a font size, a longer path or a warning line
+        // nobody anticipated cannot push the dialog past the bottom of the display.
+        .max_height((ctx.screen_rect().height() - 24.0).max(320.0))
         .resizable(true)
         .collapsible(true)
         .show(ctx, |ui| {
@@ -503,7 +507,18 @@ pub fn window_ui(
                     // Height first, because a page is taller than it is wide and height is the
                     // scarcer dimension; then the width that height implies, pulled back if it
                     // would crowd the options column beside it.
-                    let ph = (screen.y as f64 * 0.66).clamp(220.0, 1100.0);
+                    //
+                    // THE ROWS UNDERNEATH ARE RESERVED FIRST. Reported as "theres no option to
+                    // export the report" — and the option was there, it had simply been pushed off
+                    // the bottom of the screen. The folder, the file name and the Save button sit
+                    // below the preview, so a preview that takes whatever height it likes takes
+                    // theirs, and a dialog whose Save button is past the edge of the display is a
+                    // report dialog that cannot produce a report. The growth bug above made that
+                    // certain to happen eventually; this makes it impossible however tall the
+                    // preview would otherwise want to be.
+                    const BELOW: f64 = 190.0;
+                    let ph =
+                        ((screen.y as f64 * 0.72).min(screen.y as f64 - BELOW)).clamp(220.0, 1100.0);
                     let pw = (ph / aspect).min(screen.x as f64 * 0.42).max(180.0);
                     let (resp, painter) = ui.allocate_painter(
                         egui::vec2(pw as f32, (pw * aspect) as f32),

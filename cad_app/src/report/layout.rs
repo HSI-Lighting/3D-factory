@@ -21,7 +21,7 @@ use cad_light::{CalcPlane, Installation, LuxGrid, Maintenance, SurfaceResult};
 ///
 /// A schedule is by type, not by fixture. "48 × OCULUS GRANDE 2.0" is what gets ordered, wired and
 /// checked on site; forty-eight identical rows are not a schedule, they are a dump.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ScheduleRow {
     pub profile: String,
     pub count: usize,
@@ -84,6 +84,79 @@ pub struct Input<'a> {
 }
 
 impl<'a> Input<'a> {
+    /// A KEY THAT CHANGES WHEN THE DOCUMENT WOULD — so the preview can be laid out once and kept.
+    ///
+    /// Reported as: *"the app starts lagging once the report window is open."* Laying the document
+    /// out is 123 ms on the owner's three-room plan, in a release build, and it was being done on
+    /// EVERY FRAME the dialog was open — eight frames a second before the dialog has drawn a single
+    /// widget. The preview is the document, which is the right design and the reason it is
+    /// trustworthy; it is not a reason to rebuild it sixty times a second when nothing has moved.
+    ///
+    /// `calc` is [`crate::light::CalcJob::fingerprint`] of the calculation on screen, and it stands
+    /// in for the per-cell arrays. Hashing those directly would be tens of thousands of values per
+    /// frame to detect a change that can only happen when a calculation lands — and a calculation
+    /// landing always brings a new fingerprint with it.
+    ///
+    /// THE DESTRUCTURES BELOW HAVE NO `..`, for the same reason the calculation's fingerprint has
+    /// none: a field added to the report's input must not compile until somebody has decided
+    /// whether the preview should redraw for it. The failure otherwise is quiet and maddening —
+    /// a control that does nothing until you close the dialog and open it again.
+    pub fn preview_key(&self, opt: &Options, calc: u64) -> u64 {
+        let Input { rooms, surfaces, maintenance, eye_height, room_height, materials, unassigned, ramp, mask } =
+            self;
+        let mut h = crate::light::Fnv::new();
+        h.u64(calc);
+        // Every control in the dialog lives in `Options`, so its serialisation covers all of them
+        // at once — including the ones added next month.
+        crate::light::hash_json(&mut h, "opt", opt);
+        // …except the image BYTES, which `Options` deliberately does not serialise. Whether they
+        // have arrived changes the document: an image the writer has not loaded yet is drawn as an
+        // empty box, and it must stop being one the moment it loads.
+        h.u64(opt.images.iter().filter(|i| i.jpeg.is_some()).count() as u64);
+        h.u64(opt.logos.iter().filter(|i| i.jpeg.is_some()).count() as u64);
+
+        crate::light::hash_json(&mut h, "maint", maintenance);
+        h.f32(*eye_height);
+        h.f32(*room_height);
+        crate::light::hash_json(&mut h, "materials", materials);
+        h.u64(*unassigned as u64);
+        h.u64(mask.len() as u64);
+        // A FUNCTION POINTER — which palette the false colours are read through. It is not in
+        // `Options` (it belongs to the light panel) and it repaints every field in the report.
+        h.u64(*ramp as *const () as usize as u64);
+
+        crate::light::hash_json(&mut h, "surfaces", surfaces);
+        h.u64(rooms.len() as u64);
+        for r in rooms {
+            let RoomInput {
+                name,
+                grid,
+                plane,
+                mask,
+                poly,
+                fixtures,
+                installation,
+                cylindrical_avg,
+                schedule,
+            } = r;
+            h.str(name);
+            // The cells are `calc`'s business; the SHAPE of the grid is cheap and worth having.
+            h.u64(grid.cols as u64);
+            h.u64(grid.rows as u64);
+            h.f64(grid.avg);
+            h.f64(grid.min);
+            h.f64(grid.max);
+            crate::light::hash_json(&mut h, "plane", plane);
+            h.u64(mask.len() as u64);
+            h.u64(poly.len() as u64);
+            crate::light::hash_json(&mut h, "fixtures", fixtures);
+            crate::light::hash_json(&mut h, "installation", installation);
+            crate::light::hash_json(&mut h, "ez", cylindrical_avg);
+            crate::light::hash_json(&mut h, "schedule", schedule);
+        }
+        h.finish()
+    }
+
     /// The whole scheme's schedule, rooms merged.
     pub fn total_schedule(&self) -> Vec<ScheduleRow> {
         let mut out: Vec<ScheduleRow> = Vec::new();
@@ -284,8 +357,28 @@ impl Cursor {
     }
 }
 
+thread_local! {
+    /// HOW MANY TIMES THIS THREAD HAS LAID A DOCUMENT OUT.
+    ///
+    /// The only way to observe that something did NOT happen. The preview cache exists to stop
+    /// `layout` running sixty times a second, and a test that watches the cache KEY cannot see the
+    /// difference: a key that never matches is just as stable as one that always does, so a cache
+    /// missing on every single frame looks identical from outside. That is not hypothetical — the
+    /// first version of the test here watched the key and passed against a deliberately broken
+    /// cache. This counts the actual work.
+    ///
+    /// Thread-local rather than global because tests run in parallel in one process, and a shared
+    /// counter would have every test measuring every other test's work.
+    ///
+    /// One increment on a function that costs a hundred milliseconds is not worth hiding behind
+    /// `#[cfg(test)]` — and a counter that exists only in test builds is one nobody can read while
+    /// actually debugging a slow dialog.
+    pub static LAYOUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Lay the whole report out.
 pub fn layout(inp: &Input, opt: &Options) -> Doc {
+    LAYOUTS.with(|n| n.set(n.get() + 1));
     let (w, h) = opt.page.points();
     let mut doc = Doc::new((w, h), opt.title.clone());
     // ONE IMAGE TABLE, TWO LISTS. The PDF holds a single table of images, so the renders go in
@@ -1022,20 +1115,97 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
         c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [190, 40, 40], width: 1.4 });
     }
 
-    // Every fitting, where it stands.
+    // EVERY FITTING, AT ITS OWN SIZE AND FACING THE WAY IT FACES.
+    //
+    // Reported as: "why are the lights shown as circular downlights even though these are linear
+    // linear light." Every fitting was drawn as the same little cross-and-square, 2.6 pt across,
+    // whatever it actually was. On a plan of 2 m linear luminaires that is not a simplification,
+    // it is wrong: a 2 m batten and a 100 mm downlight light a room in completely different
+    // shapes, and this page exists to be read against the field beside it. Nobody can ask "is that
+    // dark strip between the two runs?" of a drawing that has drawn every run as a dot.
+    //
+    // The sizes come from THIS ROOM'S SCHEDULE, keyed by profile name — the same figures the
+    // schedule prints as "2000 × 48 × 80 mm" — so the drawing and the table cannot disagree.
+    let size_of = |name: &str| -> Option<(f64, f64)> {
+        room.schedule
+            .iter()
+            .find(|s| s.profile == name)
+            .map(|s| (s.size_m.0, s.size_m.1))
+            .filter(|(l, w)| *l > 0.0 && *w > 0.0)
+    };
     for l in room.fixtures {
         let (x, y) = to_page(l.position.x as f64, l.position.y as f64);
-        let r = 2.6;
-        c.push(Item::Line { x1: x - r, y1: y, x2: x + r, y2: y, rgb: [30, 30, 30], width: 0.8 });
-        c.push(Item::Line { x1: x, y1: y - r, x2: x, y2: y + r, rgb: [30, 30, 30], width: 0.8 });
-        c.push(Item::Frame {
-            x: x - r * 0.66,
-            y: y - r * 0.66,
-            w: r * 1.32,
-            h: r * 1.32,
-            rgb: [200, 150, 40],
-            width: 0.9,
+        // Below a couple of points a true-to-scale outline is a smudge that says less than a
+        // marker does, so a genuinely small fitting keeps the marker. The rule is about
+        // LEGIBILITY rather than about type: the same 100 mm downlight gets an outline on a plan
+        // of one room and a marker on a site plan.
+        let outline = size_of(&l.profile).and_then(|(len, wid)| {
+            let (hl, hw) = (len * 0.5, wid * 0.5);
+            ((hl.max(hw) * k) >= 2.0).then_some((hl, hw))
         });
+        match outline {
+            // Half-extents in METRES: rotated in world coordinates and only then mapped to the
+            // page. Rotating on the page instead would silently mirror every fitting that is not
+            // on an axis, because the page's y runs the other way.
+            Some((u, v)) => {
+                let a = (l.rotation_deg as f64).to_radians();
+                let (sa, ca) = (a.sin(), a.cos());
+                let corner = |du: f64, dv: f64| -> (f64, f64) {
+                    let (dx, dy) = (ca * du - sa * dv, sa * du + ca * dv);
+                    (x + dx * k, y - dy * k)
+                };
+                let p = [corner(-u, -v), corner(u, -v), corner(u, v), corner(-u, v)];
+                for i in 0..4 {
+                    let (s, e) = (p[i], p[(i + 1) % 4]);
+                    c.push(Item::Line {
+                        x1: s.0,
+                        y1: s.1,
+                        x2: e.0,
+                        y2: e.1,
+                        rgb: [200, 150, 40],
+                        width: 0.9,
+                    });
+                }
+                // A tick along the fitting, so it reads as a luminaire rather than as a hole in
+                // the ceiling — and so a nearly square one still shows which way it is turned.
+                let (m0, m1) = (corner(-u, 0.0), corner(u, 0.0));
+                c.push(Item::Line {
+                    x1: m0.0,
+                    y1: m0.1,
+                    x2: m1.0,
+                    y2: m1.1,
+                    rgb: [30, 30, 30],
+                    width: 0.6,
+                });
+            }
+            None => {
+                let r = 2.6;
+                c.push(Item::Line {
+                    x1: x - r,
+                    y1: y,
+                    x2: x + r,
+                    y2: y,
+                    rgb: [30, 30, 30],
+                    width: 0.8,
+                });
+                c.push(Item::Line {
+                    x1: x,
+                    y1: y - r,
+                    x2: x,
+                    y2: y + r,
+                    rgb: [30, 30, 30],
+                    width: 0.8,
+                });
+                c.push(Item::Frame {
+                    x: x - r * 0.66,
+                    y: y - r * 0.66,
+                    w: r * 1.32,
+                    h: r * 1.32,
+                    rgb: [200, 150, 40],
+                    width: 0.9,
+                });
+            }
+        }
     }
 
     c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [215, 215, 215], width: 0.5 });
@@ -1619,6 +1789,251 @@ mod tests {
             "the table starts at {table_x:.0} and the field at {field_x:.0} — a table the shape of \
              the room, printed somewhere else on the page",
         );
+    }
+
+    /// A LINEAR LUMINAIRE IS DRAWN AS A LINE, NOT AS A DOT.
+    ///
+    /// Reported as: *"why are the lights shown as circular downlights even though these are linear
+    /// linear light."* Every fitting was drawn as the same 2.6 pt cross-and-square whatever it
+    /// was. On a plan of 2 m battens that is not a simplification but a wrong drawing: a 2 m
+    /// batten and a 100 mm downlight light a room in completely different shapes, and this page
+    /// exists to be read against the field beside it.
+    #[test]
+    fn a_two_metre_batten_is_drawn_two_metres_long() {
+        let g = grid(8, 6);
+        let p = plane(); // 8.00 x 6.00 m
+        let lum = |x: f32, y: f32, rot: f32| cad_light::Luminaire {
+            id: 1,
+            profile: "BATTEN 2.0".into(),
+            position: cad_light::Vertex::new(x, y, 2.9),
+            rotation_deg: rot,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        };
+        let fixtures = vec![lum(4.0, 3.0, 0.0)];
+        let sched = vec![ScheduleRow {
+            profile: "BATTEN 2.0".into(),
+            count: 1,
+            size_m: (2.0, 0.048, 0.08),
+            ..Default::default()
+        }];
+
+        let mut room = one_room(&g, &p, "");
+        room.fixtures = &fixtures;
+        room.schedule = sched;
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![room];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&inp, &o);
+
+        // The fitting is drawn in its own gold. A MARKER uses a Frame; an OUTLINE uses Lines.
+        let gold_frames = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
+            .count();
+        assert_eq!(gold_frames, 0, "the fitting was still drawn as the little square marker");
+
+        let lines: Vec<(f64, f64, f64, f64)> = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Line { x1, y1, x2, y2, rgb, .. } if *rgb == [200, 150, 40] => {
+                    Some((*x1, *y1, *x2, *y2))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lines.len(), 4, "expected a four-sided outline, got {} lines", lines.len());
+
+        let xs: Vec<f64> = lines.iter().flat_map(|l| [l.0, l.2]).collect();
+        let ys: Vec<f64> = lines.iter().flat_map(|l| [l.1, l.3]).collect();
+        let span = |v: &[f64]| {
+            let (lo, hi) = v.iter().fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
+            hi - lo
+        };
+        // The report's own scale, from the room that set it — the same number the drawing used.
+        let (pw, ph) = PageSize::A4.points();
+        let k = ((pw * TWO_THIRDS) / 8.0).min((ph * TWO_THIRDS) / 6.0);
+        assert!(
+            (span(&xs) - 2.0 * k).abs() < 0.5,
+            "the outline is {:.1} pt long where 2.00 m is {:.1} pt",
+            span(&xs),
+            2.0 * k,
+        );
+        assert!(
+            (span(&ys) - 0.048 * k).abs() < 0.5,
+            "the outline is {:.2} pt across where 48 mm is {:.2} pt",
+            span(&ys),
+            0.048 * k,
+        );
+    }
+
+    /// AND IT POINTS THE WAY THE FITTING POINTS — INCLUDING OFF THE AXES.
+    ///
+    /// Rotation is applied in WORLD coordinates and only then mapped to the page. Doing it the
+    /// other way round MIRRORS every fitting, and that is a bug which hides: at 0° and at 90° the
+    /// two orderings give the same answer, so a plan of battens all laid the same way looks
+    /// perfectly correct either way. This test used ninety degrees at first and passed against the
+    /// mirrored version; thirty is where the two part company.
+    ///
+    /// A plan reads with +y up and a page with +y down, so a fitting turned COUNTER-CLOCKWISE in
+    /// the drawing must rise to the right on the page — the end with the larger x has the smaller
+    /// y. That is the assertion the bounding box alone cannot make.
+    #[test]
+    fn a_rotated_batten_turns_with_the_room() {
+        let g = grid(8, 6);
+        let p = plane();
+        let fixtures = vec![cad_light::Luminaire {
+            id: 1,
+            profile: "BATTEN 2.0".into(),
+            position: cad_light::Vertex::new(4.0, 3.0, 2.9),
+            rotation_deg: 30.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let mut room = one_room(&g, &p, "");
+        room.fixtures = &fixtures;
+        room.schedule = vec![ScheduleRow {
+            profile: "BATTEN 2.0".into(),
+            count: 1,
+            size_m: (2.0, 0.048, 0.08),
+            ..Default::default()
+        }];
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![room];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&inp, &o);
+
+        // The tick down the middle of the fitting, which is the one line whose two ends say which
+        // way round it is — a bounding box cannot, since a shape and its mirror share one.
+        let tick = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .find_map(|i| match i {
+                Item::Line { x1, y1, x2, y2, rgb, width } if *rgb == [30, 30, 30] && *width < 0.7 => {
+                    Some((*x1, *y1, *x2, *y2))
+                }
+                _ => None,
+            })
+            .expect("the fitting drew no centre tick");
+        let (near, far) = if tick.0 < tick.2 {
+            ((tick.0, tick.1), (tick.2, tick.3))
+        } else {
+            ((tick.2, tick.3), (tick.0, tick.1))
+        };
+        assert!(
+            far.1 < near.1,
+            "turned 30° counter-clockwise in plan, the fitting falls to the right on the page \
+             ({:.1},{:.1}) → ({:.1},{:.1}) — it has been mirrored",
+            near.0,
+            near.1,
+            far.0,
+            far.1,
+        );
+        // And it is tilted, not axis-aligned: at 30° the rise is about tan(30°) of the run.
+        let (run, rise) = (far.0 - near.0, near.1 - far.1);
+        let got = rise / run;
+        assert!(
+            (got - (30.0_f64).to_radians().tan()).abs() < 0.02,
+            "the fitting sits at a slope of {got:.3} where 30° is {:.3}",
+            (30.0_f64).to_radians().tan(),
+        );
+    }
+
+    /// A FITTING TOO SMALL TO DRAW KEEPS ITS MARKER.
+    ///
+    /// True-to-scale is not the goal on its own — being READABLE is. A 60 mm downlight at a site
+    /// plan's scale is a third of a point across, which prints as a smudge and says less than a
+    /// marker does. The rule is about size on the page, not about the type of fitting.
+    #[test]
+    fn a_fitting_too_small_to_see_keeps_the_marker() {
+        let g = grid(8, 6);
+        let p = plane();
+        let fixtures = vec![cad_light::Luminaire {
+            id: 1,
+            profile: "DOWNLIGHT".into(),
+            position: cad_light::Vertex::new(4.0, 3.0, 2.9),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let mut room = one_room(&g, &p, "");
+        room.fixtures = &fixtures;
+        room.schedule = vec![ScheduleRow {
+            profile: "DOWNLIGHT".into(),
+            count: 1,
+            size_m: (0.06, 0.06, 0.05),
+            ..Default::default()
+        }];
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![room];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&inp, &o);
+
+        let gold_frames = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
+            .count();
+        assert_eq!(gold_frames, 1, "a 60 mm downlight lost its marker and drew nothing readable");
+    }
+
+    /// AND A FITTING WHOSE FILE DECLARES NO SIZE KEEPS IT TOO — rather than being drawn at some
+    /// invented dimension. A manufacturer file with no geometry is common, and a plan that guessed
+    /// would be stating something nobody supplied.
+    #[test]
+    fn a_fitting_with_no_declared_size_keeps_the_marker() {
+        let g = grid(8, 6);
+        let p = plane();
+        let fixtures = vec![cad_light::Luminaire {
+            id: 1,
+            profile: "UNKNOWN".into(),
+            position: cad_light::Vertex::new(4.0, 3.0, 2.9),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let mut room = one_room(&g, &p, "");
+        room.fixtures = &fixtures;
+        room.schedule = vec![ScheduleRow {
+            profile: "UNKNOWN".into(),
+            count: 1,
+            size_m: (0.0, 0.0, 0.0),
+            ..Default::default()
+        }];
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![room];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&inp, &o);
+
+        let gold_frames = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter(|i| matches!(i, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
+            .count();
+        assert_eq!(gold_frames, 1, "a fitting with no declared size was drawn at a made-up one");
     }
 
     /// EVERY ROOM AT ONE SCALE, so two rooms in one report can be compared.

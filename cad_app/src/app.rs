@@ -2149,6 +2149,15 @@ pub struct CadApp {
     calc_started: Option<std::time::Instant>,
     /// The saved report settings have been read, and their logo images with them.
     report_prefs_loaded: bool,
+    /// THE LAID-OUT DOCUMENT THE PREVIEW IS PAINTING, kept between frames.
+    ///
+    /// Laying it out is 123 ms on a real three-room plan in a release build, and it was being done
+    /// on every frame the dialog was open — reported as "the app starts lagging once the report
+    /// window is open". The preview IS the document and that is the right design; rebuilding it
+    /// sixty times a second when nothing has moved is not part of it.
+    report_doc: Option<crate::report::pdf::Doc>,
+    /// What that document was built from — see [`crate::report::layout::Input::preview_key`].
+    report_doc_key: Option<u64>,
     /// A preview texture per LOGO, parallel to `report_opts.logos`.
     report_logo_tex: Vec<Option<egui::TextureHandle>>,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
@@ -4001,6 +4010,8 @@ impl Default for CadApp {
             calc_selected: None,
             calc_started: None,
             report_prefs_loaded: false,
+            report_doc: None,
+            report_doc_key: None,
             report_logo_tex: Vec::new(),
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
@@ -26730,15 +26741,36 @@ impl CadApp {
         if !self.report_prefs_loaded {
             self.load_report_prefs(Some(ctx));
         }
+        // Taken OUT before the input borrows `self`, and put back at the end. The input holds a
+        // shared borrow of the light state for as long as it lives, so the cache cannot be written
+        // to while it is alive.
+        let cached = self.report_doc.take();
+        let cached_key = self.report_doc_key;
+        let calc = self.light.results_fingerprint.unwrap_or(0);
         let Some(inp) = self.report_input() else {
             self.report_open = false;
+            self.report_doc = cached;
             return;
         };
-        let doc = crate::report::layout::layout(&inp, &self.report_opts);
+        // LAID OUT WHEN IT WOULD COME OUT DIFFERENT, not every frame.
+        //
+        // Reported as "the app starts lagging once the report window is open". Measured at 123 ms
+        // a frame on the owner's three-room plan in a RELEASE build — eight frames a second spent
+        // rebuilding a document that had not changed. Gathering the input, by contrast, is under
+        // a tenth of a millisecond, so it still happens every frame and the key is taken from it.
+        //
+        // Only the PREVIEW reads this. `write_report` lays the document out again from the state
+        // as it stands when Save is pressed, so nothing that leaves the app can be stale here.
+        let key = inp.preview_key(&self.report_opts, calc);
+        let doc = match cached {
+            Some(d) if cached_key == Some(key) => d,
+            _ => crate::report::layout::layout(&inp, &self.report_opts),
+        };
         // Copied out before the borrow ends — the document is built, the numbers it needed are
         // done with, and what follows edits the state the input borrowed.
         let room_max = inp.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
         drop(inp);
+        self.report_doc_key = Some(key);
 
         let mut opts = std::mem::take(&mut self.report_opts);
         let mut open = self.report_open;
@@ -26765,6 +26797,10 @@ impl CadApp {
         tex.truncate(n);
         self.report_tex = tex;
         self.report_page = page;
+        // Back into the cache, so the next frame does not lay it out again. The key was taken
+        // BEFORE the dialog ran, so an option changed in this frame gives a different key on the
+        // next one and the document is rebuilt exactly once for it.
+        self.report_doc = Some(doc);
         // CLOSING IS WHEN THEY ARE KEPT. Saving on every frame would rewrite the file sixty times
         // a second while someone types a header; saving only on Save would lose the settings of
         // anyone who set them up and then thought better of the report.
@@ -26882,14 +26918,36 @@ impl CadApp {
     /// Load an image file for the report, as JPEG bytes plus a preview texture.
     fn report_add_image(&mut self, path: &str, ctx: Option<&egui::Context>, is_logo: bool) {
         let img = match image::open(path) {
-            Ok(i) => i.to_rgb8(),
+            // RGBA, AND FLATTENED ONTO WHITE BELOW — not `to_rgb8()`.
+            //
+            // Reported as: "the logo image i uploaded are png images without background the but in
+            // the report they came with black background." `to_rgb8` DISCARDS the alpha channel
+            // rather than resolving it, so every transparent pixel keeps whatever colour was
+            // sitting underneath it — and PNG writers almost always leave that as black. A logo
+            // exported with a transparent background therefore arrived as a black rectangle with
+            // the mark cut out of it, which is the exact opposite of what transparency was for.
+            Ok(i) => i.to_rgba8(),
             Err(e) => {
                 self.history.push(format!("  ! report: could not read {path} — {e}"));
                 return;
             }
         };
         let (w, h) = (img.width(), img.height());
-        self.report_push_image(path.to_string(), img.into_raw(), w, h, ctx, is_logo);
+        // ONTO WHITE, because the page is white. A report image ends up as JPEG, which has no
+        // alpha at all, so transparency has to be resolved against SOMETHING before it is encoded
+        // — and the only honest choice is the paper the logo will be printed on. Composited
+        // properly (`src·α + white·(1−α)`) rather than thresholded, so an anti-aliased edge stays
+        // smooth instead of turning into a jagged cut-out.
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for px in img.pixels() {
+            let [r, g, b, a] = px.0;
+            let a = a as u32;
+            let over = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
+            rgb.push(over(r));
+            rgb.push(over(g));
+            rgb.push(over(b));
+        }
+        self.report_push_image(path.to_string(), rgb, w, h, ctx, is_logo);
     }
 
     /// Shared by the file loader and the render capture: RGB8 in, report image out.
@@ -62147,6 +62205,18 @@ mod the_report_is_asked_about_before_it_is_written {
 
     fn calculated() -> CadApp {
         let mut app = CadApp::default();
+        // THE SAVED SETTINGS ARE NOT READ IN A TEST.
+        //
+        // The dialog loads `~/.config/rust_cad/report.json` on the first frame it opens, which is
+        // correct behaviour and made every test in here depend on whatever sat in a real person's
+        // home directory. It bit exactly as you would expect: `every_control_is_on_screen` looked
+        // for the "Save PDF" button and found "Save HTML", because a preferences file on this
+        // machine happened to say HTML. A suite whose result depends on a file no test wrote is a
+        // suite that fails for one developer and passes for another, over nothing.
+        //
+        // Set here rather than in `CadApp::default`, because reading them is real behaviour and
+        // should keep happening everywhere except where it is deliberately being kept out.
+        app.report_prefs_loaded = true;
         app.light.grid = Some(cad_light::LuxGrid {
             cols: 4,
             rows: 4,
@@ -62435,6 +62505,214 @@ mod the_report_is_asked_about_before_it_is_written {
         assert_eq!(app.report_tex.len(), 1, "the preview textures went out of step");
     }
 
+
+    /// THE DOCUMENT IS LAID OUT ONCE, NOT ONCE A FRAME.
+    ///
+    /// Reported as: *"the app starts lagging once the report window is open."* Laying it out is
+    /// 123 ms on the owner's three-room plan in a RELEASE build, and it was happening on every
+    /// frame the dialog was open — eight frames a second before a single widget had been drawn.
+    ///
+    /// Counted by LAYOUTS RUN — not by clock, and not by cache key. A timing assertion measures
+    /// the build machine. And watching the cache KEY, which is what this test did first, cannot
+    /// see the failure at all: a key that never matches is exactly as stable as one that always
+    /// does, so the first version of this test passed against a cache deliberately broken to miss
+    /// on every single frame. Counting the work is the only thing that answers the question.
+    #[test]
+    fn the_preview_is_not_rebuilt_every_frame() {
+        let mut app = calculated();
+        app.export_light_report();
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1600.0, 1000.0),
+            )),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+        let after_first = crate::report::layout::LAYOUTS.with(|n| n.get());
+        assert!(after_first > 0, "the dialog never laid a document out at all");
+        for _ in 0..10 {
+            let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+        }
+        let after_ten_more = crate::report::layout::LAYOUTS.with(|n| n.get());
+        assert_eq!(
+            after_ten_more, after_first,
+            "ten idle frames laid the document out {} more time(s)",
+            after_ten_more - after_first,
+        );
+        assert!(app.report_doc.is_some(), "the document was not kept");
+    }
+
+    /// AND IT IS REBUILT THE MOMENT SOMETHING WOULD CHANGE IT.
+    ///
+    /// The other half, and the one that decides whether the cache is worth having: a preview that
+    /// does not follow the options is worse than a slow one, because it is wrong. Each of these is
+    /// a different route into the document — the section list, the page size, the false-colour
+    /// scale, a caption, and the calculation underneath.
+    #[test]
+    fn the_preview_follows_every_option() {
+        let changes: Vec<(&str, fn(&mut CadApp))> = vec![
+            ("a section switched off", |a: &mut CadApp| {
+                a.report_opts.set(crate::report::Section::Schedule, false);
+            }),
+            ("the section order", |a: &mut CadApp| {
+                a.report_opts.move_section(crate::report::Section::Renders, -1);
+            }),
+            ("the paper size", |a: &mut CadApp| {
+                a.report_opts.page = crate::report::PageSize::Letter;
+            }),
+            ("the cover switched off", |a: &mut CadApp| a.report_opts.cover = false),
+            ("the project name", |a: &mut CadApp| a.report_opts.title = "Gym".into()),
+            ("the header text", |a: &mut CadApp| a.report_opts.header = "HSI".into()),
+            ("the scale ceiling", |a: &mut CadApp| a.report_opts.scale.top = Some(750.0)),
+            ("the scale bands", |a: &mut CadApp| a.report_opts.scale.bands = vec![50.0, 200.0]),
+            ("the maintenance factor", |a: &mut CadApp| a.light.maintenance.llmf = 0.5),
+            ("the eye height", |a: &mut CadApp| a.light.eye_height = 1.6),
+            ("a wall reflectance", |a: &mut CadApp| a.light.materials[1].reflectance = 0.9),
+            ("the palette", |a: &mut CadApp| a.light.ramp = crate::light::LuxRamp::Grey),
+            ("a room renamed", |a: &mut CadApp| a.light.rooms[0].name = "Hall".into()),
+            ("a new calculation", |a: &mut CadApp| {
+                a.light.results_fingerprint = Some(1234);
+            }),
+        ];
+
+        for (what, apply) in changes {
+            let mut app = calculated();
+            app.export_light_report();
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1600.0, 1000.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+            let before_key = app.report_doc_key.expect("a document");
+            let before_n = crate::report::layout::LAYOUTS.with(|n| n.get());
+
+            apply(&mut app);
+            let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+            assert_ne!(
+                app.report_doc_key,
+                Some(before_key),
+                "{what}: the key did not move, so the preview would not have redrawn",
+            );
+            assert!(
+                crate::report::layout::LAYOUTS.with(|n| n.get()) > before_n,
+                "{what}: the key moved but the document was not laid out again",
+            );
+        }
+    }
+
+    /// A LOGO WITH A TRANSPARENT BACKGROUND ARRIVES ON WHITE, NOT ON BLACK.
+    ///
+    /// Reported as: *"the logo image i uploaded are png images without background the but in the
+    /// report they came with black background."* `to_rgb8` DISCARDS the alpha channel rather than
+    /// resolving it, so a transparent pixel kept whatever colour sat underneath — which PNG
+    /// writers leave as black. A logo exported with a transparent background therefore arrived as
+    /// a black rectangle with the mark cut out of it.
+    ///
+    /// The fixture is the real case: a mark on a fully transparent field, with a half-transparent
+    /// band, which is what anti-aliasing produces and what a threshold would ruin.
+    ///
+    /// IT IS 96 PIXELS WIDE FOR A REASON. The first version was four pixels across, and passed
+    /// against a build with the fix removed — JPEG works in 8 × 8 blocks, and on an image smaller
+    /// than one block the decoded values are a smear of everything in it rather than the pixels
+    /// that went in. The bands here are wide enough that their centres come back as themselves.
+    #[test]
+    fn a_transparent_logo_is_flattened_onto_white() {
+        let dir = std::env::temp_dir().join("simlux_logo_alpha");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("mark.png");
+
+        // Three wide bands: fully transparent over black (what an exporter leaves behind), a
+        // half-covered band, and the opaque mark itself.
+        let img = image::RgbaImage::from_fn(96, 64, |x, _| match x {
+            0..=31 => image::Rgba([0, 0, 0, 0]),
+            32..=63 => image::Rgba([0, 0, 0, 128]),
+            _ => image::Rgba([220, 40, 40, 255]),
+        });
+        img.save(&path).expect("write the fixture");
+
+        let mut app = CadApp::default();
+        app.report_add_image(&path.to_string_lossy(), None, true);
+        assert_eq!(app.report_opts.logos.len(), 1, "the logo was not taken: {:?}", app.history);
+
+        // Read the ENCODED bytes back, because that is what the PDF embeds.
+        let (bytes, _, _) = app.report_opts.logos[0].jpeg.clone().expect("encoded");
+        let back = image::load_from_memory(&bytes).expect("valid jpeg").to_rgb8();
+        let px = |x: u32| back.get_pixel(x, 32).0;
+
+        let clear = px(16);
+        assert!(
+            clear[0] > 235 && clear[1] > 235 && clear[2] > 235,
+            "the transparent background came back as {clear:?} — it became a solid one",
+        );
+        let ink = px(80);
+        assert!(ink[0] > 180 && ink[1] < 90, "the mark itself was lost: {ink:?}");
+        // Half-covered black over white is mid grey. A threshold would have made it black or white
+        // and left every logo in the report with a jagged edge.
+        let edge = px(48);
+        assert!(
+            (100..=155).contains(&edge[0]),
+            "the half-transparent band came back as {edge:?} rather than blended to mid grey",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// THE SAVE BUTTON IS ON THE SCREEN — on a small display as well as a large one.
+    ///
+    /// Reported as: *"theres no option to export the report."* The option was there. It had been
+    /// pushed off the bottom of the display by a preview that grew every frame, and a dialog whose
+    /// Save button is past the edge of the screen is a report dialog that cannot produce a report.
+    ///
+    /// So this is not a test that the button EXISTS — `every_control_is_on_screen` covers that,
+    /// and covered it while the bug was live, because a culled widget and an off-screen one are
+    /// different things. It is a test of WHERE it is, at three display sizes including one small
+    /// enough that a careless layout would overflow it.
+    #[test]
+    fn the_save_button_is_reachable_on_a_small_screen() {
+        for (w, h) in [(1280.0_f32, 720.0_f32), (1600.0, 1025.0), (3440.0, 1349.0)] {
+            let mut app = calculated();
+            app.export_light_report();
+            let ctx = egui::Context::default();
+            let screen =
+                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+            let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+
+            // The button's own label, and where it was actually painted.
+            let mut found: Option<egui::Rect> = None;
+            for _ in 0..12 {
+                let out = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+                fn walk(s: &egui::Shape, into: &mut Option<egui::Rect>) {
+                    match s {
+                        egui::Shape::Text(t) if t.galley.text().trim().starts_with("Save ") => {
+                            *into = Some(egui::Rect::from_min_size(t.pos, t.galley.size()));
+                        }
+                        egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                        _ => {}
+                    }
+                }
+                let mut this = None;
+                for cs in &out.shapes {
+                    walk(&cs.shape, &mut this);
+                }
+                if this.is_some() {
+                    found = this;
+                }
+            }
+            let r = found.unwrap_or_else(|| panic!("{w}x{h}: the Save button never painted"));
+            assert!(
+                screen.contains_rect(r),
+                "{w}x{h}: the Save button is at {:?}, off a screen of {:?}",
+                r,
+                screen,
+            );
+        }
+    }
+
     /// A REPORT BUILT ON AN OUT-OF-DATE CALCULATION SAYS SO, IN THE DIALOG.
     ///
     /// The report is the one thing this app produces that leaves the building, and on paper a lux
@@ -62645,6 +62923,22 @@ mod the_owners_three_room_plan {
         println!("cores: {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
         for (k, v) in &app.light.last_timings {
             println!("  phase {k:<12} {v:>10.1}");
+        }
+
+        // WHAT ONE FRAME OF THE REPORT DIALOG COSTS. The preview is the document, laid out from
+        // scratch; on a plan this size that is the difference between a dialog and a slideshow.
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let inp = app.report_input().expect("a report input");
+            let gather = t.elapsed().as_secs_f64() * 1000.0;
+            let t2 = std::time::Instant::now();
+            let doc = crate::report::layout::layout(&inp, &app.report_opts);
+            println!(
+                "  report frame: gather {:>7.1} ms   layout {:>7.1} ms   → {} pages",
+                gather,
+                t2.elapsed().as_secs_f64() * 1000.0,
+                doc.pages.len(),
+            );
         }
 
         assert_eq!(app.light.rooms.len(), 3, "this plan has three rooms");

@@ -439,37 +439,37 @@ impl CalcProgress {
 /// the scene rather than a modification time: a file's clock says when it was touched, not whether
 /// anything in it changed.
 #[derive(Clone, Copy)]
-struct Fnv(u64);
+pub(crate) struct Fnv(u64);
 
 impl Fnv {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Fnv(0xcbf2_9ce4_8422_2325)
     }
     fn byte(&mut self, b: u8) {
         self.0 ^= b as u64;
         self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    fn u64(&mut self, v: u64) {
+    pub(crate) fn u64(&mut self, v: u64) {
         for b in v.to_le_bytes() {
             self.byte(b);
         }
     }
-    fn f32(&mut self, v: f32) {
+    pub(crate) fn f32(&mut self, v: f32) {
         // Through the BITS, so this stays exact. Rounding first would make a fixture nudged by a
         // hundredth of a millimetre look unmoved, and the answer it produced look still true.
         self.u64(v.to_bits() as u64);
     }
-    fn f64(&mut self, v: f64) {
+    pub(crate) fn f64(&mut self, v: f64) {
         self.u64(v.to_bits());
     }
     /// LENGTH FIRST, so `["ab", "c"]` and `["a", "bc"]` are not the same scene.
-    fn str(&mut self, s: &str) {
+    pub(crate) fn str(&mut self, s: &str) {
         self.u64(s.len() as u64);
         for b in s.as_bytes() {
             self.byte(*b);
         }
     }
-    fn finish(self) -> u64 {
+    pub(crate) fn finish(self) -> u64 {
         self.0
     }
 }
@@ -483,7 +483,7 @@ impl Fnv {
 ///
 /// A value that will not serialise hashes as the ERROR rather than as an empty string, so two
 /// different scenes cannot come out identical because both failed.
-fn hash_json<T: serde::Serialize + ?Sized>(h: &mut Fnv, tag: &str, v: &T) {
+pub(crate) fn hash_json<T: serde::Serialize + ?Sized>(h: &mut Fnv, tag: &str, v: &T) {
     h.str(tag);
     match serde_json::to_string(v) {
         Ok(s) => h.str(&s),
