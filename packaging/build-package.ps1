@@ -21,12 +21,17 @@
   Advance packaging\build-number.txt before packaging, i.e. cut the NEXT build.
   Without it the current number is re-used, so re-packaging the same code does not burn a number.
 
+.PARAMETER NoInstall
+  Do NOT update the desktop app on this machine. By default packaging also installs, and verifies
+  that what landed in %LOCALAPPDATA%\Programs\SIMLUX is byte-for-byte the build just cut -- see the
+  note above that step. Pass this when cutting a package purely to send elsewhere.
+
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1
   powershell -ExecutionPolicy Bypass -File packaging\build-package.ps1 -NewBuild
 #>
 [CmdletBinding()]
-param([switch]$SkipBuild, [switch]$NewBuild)
+param([switch]$SkipBuild, [switch]$NewBuild, [switch]$NoInstall)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -134,6 +139,50 @@ Write-Host ""
 Write-Host "Build $build ready:" -ForegroundColor Green
 Write-Host "  $zip  ($mb MB)"
 Write-Host "  commit $commit"
+
+# ---------------------------------------------------------------------------------------------
+# INSTALL IT. Cutting a build and running a build are now ONE step.
+#
+# They used to be two, and the second was the one that got forgotten. Builds 29 and 30 were built,
+# zipped and copied to Dropbox while the desktop shortcut still pointed at build 28 -- so four
+# already-fixed bugs were reported as still broken, twice over, and the `build=28` line in a
+# session dump was the only reason anyone worked out why. A step a person has to remember after
+# every build is a step that will eventually be missed, and this one fails SILENTLY: an app that
+# is one build behind looks exactly like a fix that did not work.
+#
+# Asked for as "make sure the desktop app is always updated to the latest build".
+# ---------------------------------------------------------------------------------------------
+if (-not $NoInstall) {
+    Write-Host ""
+    $running = Get-Process simlux -ErrorAction SilentlyContinue
+    if ($running) {
+        # NOT a warning buried in the output. This is the one condition under which the desktop app
+        # is left behind, so it has to be impossible to scroll past.
+        Write-Host "  !! NOT INSTALLED -- SIMLUX is running (PID $($running.Id -join ', '))" -ForegroundColor Red
+        Write-Host "     Close it and re-run with -SkipBuild, or the desktop app stays on the OLD build." -ForegroundColor Red
+    } else {
+        & (Join-Path $out 'Install.ps1') | Out-Null
+        # AND PROVE IT. What is being guarded against is believing an install happened when it did
+        # not, so comparing the actual bytes is the whole point: a line of output saying
+        # "installed" is exactly what was there before, and it was not true.
+        $installed = Join-Path $env:LOCALAPPDATA 'Programs\SIMLUX\simlux.exe'
+        if (-not (Test-Path $installed)) { throw "install reported success but $installed is not there" }
+        $a = (Get-FileHash $installed -Algorithm SHA256).Hash
+        $b = (Get-FileHash (Join-Path $out 'simlux.exe') -Algorithm SHA256).Hash
+        if ($a -ne $b) { throw "the installed exe is NOT the build just cut ($a vs $b)" }
+        Write-Host "  desktop app updated: $installed" -ForegroundColor Green
+        Write-Host "  verified byte-for-byte identical to build $build ($commit)"
+    }
+}
+
+# The standing arrangement: every installer build also goes to Dropbox. Conditional on the folder
+# existing, so this script still runs on a machine with no such share.
+$drop = 'D:\Dropbox\YASEEN\3d factory'
+if (Test-Path $drop) {
+    Copy-Item $zip $drop -Force
+    Write-Host "  copied to $drop" -ForegroundColor Green
+}
+
 Write-Host ""
 Write-Host "On the other PC: unzip, then right-click Install.ps1 -> Run with PowerShell"
 Write-Host "(or just run simlux.exe from the unzipped folder -- it is portable)"

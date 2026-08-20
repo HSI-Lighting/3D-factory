@@ -62879,6 +62879,111 @@ mod the_report_is_asked_about_before_it_is_written {
 mod the_owners_three_room_plan {
     use super::*;
 
+    /// WHAT THE PHOTOMETRY IN THIS PROJECT ACTUALLY SAYS.
+    ///
+    /// Asked as: "why does it look like point sources here is it because somethings wrong with the
+    /// ldt file or our fault?" — about a results page showing perfectly circular pools under what
+    /// are 2 m linear luminaires. There are two candidate answers and they need telling apart
+    /// before anything is changed:
+    ///
+    ///   1. THE FILE. A distribution with one C-plane, or with every C-plane identical, IS
+    ///      rotationally symmetric — it describes a fitting that throws the same light in every
+    ///      direction around its axis, and a correct engine draws circles for it.
+    ///   2. US. Every luminaire is treated as a POINT at its centre (`calc::direct` is a plain
+    ///      inverse-square sum). The usual rule is that a point approximation holds beyond about
+    ///      five times the largest luminous dimension — 10 m for a 2 m batten — and this plan
+    ///      measures 2.1 m below the fittings, well inside that.
+    ///
+    /// This prints the evidence rather than arguing from either.
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_the_photometry_says() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf))
+            .expect("the sidecar must read")
+            .expect("the project must have a sidecar");
+
+        println!("profiles in this project: {}", cfg.ies_library.len());
+        for (name, p) in &cfg.ies_library {
+            let planes = p.horizontal_angles.len();
+            // Do the C-planes actually DIFFER? A file can carry twelve of them and repeat one.
+            let mut spread = 0.0_f64;
+            if planes > 1 {
+                let n = p.candela.first().map(|r| r.len()).unwrap_or(0);
+                for i in 0..n {
+                    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+                    for row in &p.candela {
+                        if let Some(v) = row.get(i) {
+                            lo = lo.min(*v);
+                            hi = hi.max(*v);
+                        }
+                    }
+                    if hi > 0.0 {
+                        spread = spread.max((hi - lo) / hi);
+                    }
+                }
+            }
+            println!(
+                "  {name:<34} C-planes {planes:>3}  γ {:>3}  peak {:>8.1} cd  \
+                 luminous {:.3} × {:.3} m  overall {:.3} × {:.3} m",
+                p.vertical_angles.len(),
+                p.peak_candela(),
+                p.luminous_length,
+                p.luminous_width,
+                p.length,
+                p.width,
+            );
+            println!(
+                "  {:<34} C-plane spread {:.1}%  →  {}",
+                "",
+                spread * 100.0,
+                if planes <= 1 || spread < 0.02 {
+                    "AXIALLY SYMMETRIC — this file describes a round distribution"
+                } else {
+                    "asymmetric — the file does distinguish along/across"
+                },
+            );
+            // The near-field question, for the mounting height this project uses.
+            let biggest = p.luminous_length.max(p.luminous_width).max(p.length).max(p.width) as f64;
+            if biggest > 0.0 {
+                println!(
+                    "  {:<34} point-source approximation needs ≥ {:.1} m; this plan measures at \
+                     about 2.1 m",
+                    "",
+                    biggest * 5.0,
+                );
+            }
+        }
+
+        // WHICH FITTINGS ARE WHERE. A round pool under a 36° downlight is correct and a round pool
+        // under a 2 m batten is not, so the answer depends entirely on which room is being looked
+        // at. Grouped by profile with the extent they cover, which is enough to name the room.
+        println!("\nplaced fittings by type:");
+        let mut by: std::collections::BTreeMap<String, Vec<&cad_light::Luminaire>> =
+            Default::default();
+        for l in &cfg.luminaires {
+            by.entry(l.profile.clone()).or_default().push(l);
+        }
+        for (name, ls) in &by {
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for l in ls {
+                x0 = x0.min(l.position.x);
+                y0 = y0.min(l.position.y);
+                x1 = x1.max(l.position.x);
+                y1 = y1.max(l.position.y);
+            }
+            let rots: std::collections::BTreeSet<i32> =
+                ls.iter().map(|l| l.rotation_deg.round() as i32).collect();
+            println!(
+                "  {:>3} × {name:<34} over x {x0:>7.2}..{x1:<7.2} y {y0:>7.2}..{y1:<7.2}  \
+                 z {:.2}  rotations {rots:?}",
+                ls.len(),
+                ls.first().map(|l| l.position.z).unwrap_or(0.0),
+            );
+        }
+    }
+
     #[test]
     #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
     fn every_room_is_calculated_and_lit() {

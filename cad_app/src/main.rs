@@ -109,7 +109,7 @@ fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
-            .with_title("SIMLUX — Lighting Designer"),
+            .with_title(window_title()),
         ..Default::default()
     };
     eframe::run_native(
@@ -166,4 +166,67 @@ fn desktop_text_scale() -> f32 {
 #[cfg(not(target_os = "linux"))]
 fn desktop_text_scale() -> f32 {
     1.0
+}
+
+/// THE BUILD, IN THE TITLE BAR.
+///
+/// It was already on the first line of stderr, in every session dump and at the top of every
+/// report — and not one of those is in front of somebody who has just double-clicked a shortcut.
+/// Four fixed bugs were reported as still broken, twice over, because the desktop app was three
+/// commits behind and nothing on screen said so. A stale build looks exactly like a fix that did
+/// not work; the difference is one glance, if the number is somewhere a person actually looks.
+///
+/// Packaging now installs as it builds, so this should never disagree with the latest cut. It is
+/// here for the day something goes wrong with that — an old shortcut, a second copy on another
+/// drive, an install that half-finished — because that is precisely when nobody thinks to check.
+///
+/// `dev` rather than `?` for the commit when there is none: a binary built straight from `cargo
+/// run` is not a build anybody cut, and saying so is more useful than a question mark.
+fn window_title() -> String {
+    format!(
+        "SIMLUX — Lighting Designer   ·   build {} ({})",
+        option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
+        option_env!("SIMLUX_BUILD").unwrap_or("dev"),
+    )
+}
+
+/// THE WINDOW SAYS WHICH BUILD IT IS.
+#[cfg(test)]
+mod the_window_names_its_build {
+    /// The stamp is PRESENT and is the real one — not a placeholder, and not a hard-coded string
+    /// that would go on saying "build 30" for ever.
+    ///
+    /// `build.rs` reads `packaging/build-number.txt` and the git hash, so on any checkout with a
+    /// repo these are real values; the test asserts against the same environment the binary was
+    /// compiled with rather than against a literal.
+    #[test]
+    fn the_title_carries_the_build_number_and_the_commit() {
+        let t = super::window_title();
+        assert!(t.starts_with("SIMLUX"), "the app lost its name: {t:?}");
+        let n = option_env!("SIMLUX_BUILD_NO").unwrap_or("?");
+        let c = option_env!("SIMLUX_BUILD").unwrap_or("dev");
+        assert!(t.contains(n), "the title does not name the build number ({n}): {t:?}");
+        assert!(t.contains(c), "the title does not name the commit ({c}): {t:?}");
+    }
+
+    /// AND `build.rs` ACTUALLY STAMPED IT. A title that faithfully prints "?" and "dev" would pass
+    /// the test above while telling a user nothing — which is the state this whole thing exists to
+    /// make impossible. Skipped where there is no git checkout to read, since that is a legitimate
+    /// way to build and must not fail.
+    #[test]
+    fn the_stamp_is_a_real_one_in_this_repo() {
+        if !std::path::Path::new("../.git").exists() {
+            return;
+        }
+        assert_ne!(
+            option_env!("SIMLUX_BUILD"),
+            Some("unknown"),
+            "build.rs did not resolve the commit in a checkout that has one",
+        );
+        let n = option_env!("SIMLUX_BUILD_NO").unwrap_or("?");
+        assert!(
+            n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty(),
+            "the build number came through as {n:?} rather than a number",
+        );
+    }
 }
