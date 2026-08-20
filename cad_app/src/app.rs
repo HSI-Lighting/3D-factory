@@ -26789,6 +26789,7 @@ impl CadApp {
             &tex,
             can_capture,
             room_max,
+            self.light.ramp.rgb_fn(),
             self.light.results_stale,
         );
         self.report_opts = opts;
@@ -62530,17 +62531,23 @@ mod the_report_is_asked_about_before_it_is_written {
             ..Default::default()
         };
 
-        let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
-        let after_first = crate::report::layout::LAYOUTS.with(|n| n.get());
-        assert!(after_first > 0, "the dialog never laid a document out at all");
+        // A FEW FRAMES TO SETTLE FIRST. The dialog is allowed to reach its resting state over the
+        // opening frames — egui lays a window out before it paints it, and a setting may resolve
+        // itself once on the way in. What is under test is that it STOPS; "rebuilt exactly once"
+        // would fail on any harmless one-off while proving nothing extra.
+        for _ in 0..3 {
+            let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+        }
+        let settled = crate::report::layout::LAYOUTS.with(|n| n.get());
+        assert!(settled > 0, "the dialog never laid a document out at all");
         for _ in 0..10 {
             let _ = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
         }
         let after_ten_more = crate::report::layout::LAYOUTS.with(|n| n.get());
         assert_eq!(
-            after_ten_more, after_first,
+            after_ten_more, settled,
             "ten idle frames laid the document out {} more time(s)",
-            after_ten_more - after_first,
+            after_ten_more - settled,
         );
         assert!(app.report_doc.is_some(), "the document was not kept");
     }

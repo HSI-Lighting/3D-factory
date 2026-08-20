@@ -32,6 +32,19 @@ pub enum Item {
     Text { x: f64, y: f64, size: f64, font: Font, rgb: [u8; 3], align: Align, text: String },
     /// An image already encoded as JPEG, by index into the document's image table.
     Image { x: f64, y: f64, w: f64, h: f64, idx: usize },
+    /// A FILLED POLYGON — which is what a false-colour band actually is.
+    ///
+    /// Reported as: "the false color is still way too coarse make it smooth. it looks all
+    /// pixelated around the edges." A band drawn as a mosaic of axis-aligned rectangles has
+    /// STAIRCASED edges by construction: every boundary must land on a raster row, so the diagonal
+    /// edge of a pool of light comes out as a flight of steps the size of the raster — and raising
+    /// the raster does not remove them, it only makes the steps smaller and the file bigger. The
+    /// reference plots are contours, and a contour is a polygon.
+    ///
+    /// Several rings, because one band is usually several disjoint pools and may enclose a
+    /// brighter one. Filled with the EVEN-ODD rule so an inner ring reads as a hole rather than
+    /// painting over the band inside it.
+    Poly { rings: Vec<Vec<(f64, f64)>>, fill: [u8; 3] },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,6 +279,28 @@ impl Doc {
                         )
                         .as_bytes(),
                     );
+                }
+                Item::Poly { rings, fill } => {
+                    // A ring of fewer than three points encloses nothing; emitting it would leave
+                    // a stray `f` operator acting on whatever path came before.
+                    let usable: Vec<&Vec<(f64, f64)>> =
+                        rings.iter().filter(|r| r.len() >= 3).collect();
+                    if usable.is_empty() {
+                        continue;
+                    }
+                    s.extend_from_slice(format!("{} rg\n", col(*fill)).as_bytes());
+                    for r in usable {
+                        let (x, y) = r[0];
+                        s.extend_from_slice(format!("{x:.3} {:.3} m\n", flip(y)).as_bytes());
+                        for (x, y) in &r[1..] {
+                            s.extend_from_slice(format!("{x:.3} {:.3} l\n", flip(*y)).as_bytes());
+                        }
+                        s.extend_from_slice(b"h\n");
+                    }
+                    // `f*` — even-odd. See `Item::Poly`: a band that encloses a brighter one needs
+                    // the inner ring to become a hole, and the non-zero rule would fill it solid
+                    // whenever the two rings happened to wind the same way.
+                    s.extend_from_slice(b"f*\n");
                 }
                 Item::Frame { x, y, w, h, rgb, width } => {
                     if *w <= 0.0 || *h <= 0.0 {

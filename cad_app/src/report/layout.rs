@@ -430,7 +430,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
         for s in opt.sections.iter().filter(|s| is_per_room(**s)) {
             match s {
                 Section::Summary => summary(&mut c, room, inp.unassigned),
-                Section::Installation => installation(&mut c, room, inp.maintenance),
+                Section::Installation => installation(&mut c, room, inp.maintenance, inp),
                 Section::WorkingPlane => working_plane(&mut c, room, inp.eye_height),
                 Section::Layout => layout_page(&mut c, room),
                 Section::Results => results(&mut c, inp, room, opt),
@@ -690,8 +690,60 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
     }
 }
 
-fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance) {
+fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
     let Some(i) = room.installation else { return };
+
+    // ---- General ----------------------------------------------------------------------------
+    //
+    // What the answer was computed UNDER, before the answer itself — the block a lighting report
+    // is expected to open a room with, and the one the reference hands over under that heading.
+    // Asked for as "make sure we also displaying these info in each room".
+    //
+    // PER ROOM, not once for the building. Mounting height, connected load and power density are
+    // properties of a room's own installation; one figure quoted over three rooms describes none
+    // of them.
+    c.heading("General");
+    c.row("Calculation algorithm", "Ray-traced, 5 diffuse bounces");
+    c.row(
+        "Height of luminaire plane",
+        &room
+            .fixtures
+            .first()
+            .map(|l| format!("{:.2} m", l.position.z))
+            .unwrap_or_else(|| "—".into()),
+    );
+    c.row("Working plane height", &format!("{:.2} m", room.plane.origin.z));
+    c.row("Room height", &format!("{:.2} m", inp.room_height));
+    c.row("Maintenance factor", &format!("{:.2}", m.factor()));
+    c.row("Luminaire luminous flux", &format!("{:.0} lm", i.total_lumens));
+    c.row("Total power", &format!("{:.1} W", i.total_watts));
+    // W/m² AND W/m² PER 100 LX. The second is what a scheme is actually judged on: 10 W/m² holding
+    // a room at 200 lx and 10 W/m² holding one at 600 lx are not comparable installations, and
+    // regulations are written against the normalised figure for exactly that reason.
+    let per_100 = if room.grid.avg > 0.0 {
+        format!("   ({:.2} W/m2 per 100 lx)", i.power_density * 100.0 / room.grid.avg)
+    } else {
+        String::new()
+    };
+    c.row(
+        &format!("Total power per area ({:.2} m2)", i.area_m2),
+        &format!("{:.2} W/m2{per_100}", i.power_density),
+    );
+
+    // ---- the room these numbers are about ----------------------------------------------------
+    //
+    // "the room details need to there for each rooms result." These were printed ONCE for the
+    // whole scheme, which is where they come from — but a reader working through one room's
+    // chapter should not have to leaf back to a page at the front to learn what reflectance the
+    // walls were given. They are the stated conditions of THIS room's figures.
+    c.heading("Room & materials");
+    c.row("Room size", &format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth));
+    c.row("Floor area", &format!("{:.2} m2", i.area_m2));
+    for (name, r) in &inp.materials {
+        c.row(&format!("Reflectance — {name}"), &format!("{:.0} %", r * 100.0));
+    }
+
+    // ---- and the detail ----------------------------------------------------------------------
     c.heading("Installation");
     c.row("Luminaires", &format!("{}", i.count));
     c.row("Connected load", &format!("{:.1} W", i.total_watts));
@@ -911,9 +963,14 @@ fn results(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
     results_body(c, inp, room, opt, plot_w, plot_h);
 }
 
-/// How many raster samples across the plot, at most. 900 is well past what 300 dpi resolves on an
-/// A4 content width, and past it the only thing that grows is the file.
-const MAX_SAMPLES: usize = 900;
+/// How finely the field is resampled before the bands are traced, in samples across the plot.
+///
+/// The contour is drawn as one straight segment per raster cell, so this decides how faceted a
+/// curve looks — not how coarse the colours are, which the bands decide. At 480 across an A4
+/// content width a segment is under a point long, which is past what any reader resolves; the old
+/// value of 900 was chosen when every sample became its own rectangle and it bought nothing but
+/// file size.
+const CONTOUR_RES: usize = 480;
 
 fn results_body(
     c: &mut Cursor,
@@ -929,35 +986,132 @@ fn results_body(
     let y0 = c.y;
     let room_max = g.max;
 
-    // Enough samples to hide the grid, never more than the page can show.
-    let nx = (gc * 8).clamp(gc, MAX_SAMPLES);
-    let ny = ((nx as f64) * (plot_h / plot_w)).round().max(1.0) as usize;
+    // ---- the field, resampled ------------------------------------------------------------
+    //
+    // Bilinear onto a raster fine enough that a contour segment is sub-point. Sampled at raster
+    // CORNERS rather than centres, because the contour runs between corners.
+    let nx = (gc * 4).clamp(2, CONTOUR_RES);
+    let ny = ((nx as f64 * plot_h / plot_w).round() as usize).clamp(2, CONTOUR_RES);
+    let mut f = vec![0.0_f64; (nx + 1) * (ny + 1)];
+    for j in 0..=ny {
+        for i in 0..=nx {
+            // THE PAGE'S y RUNS DOWN AND A PLAN'S RUNS UP.
+            //
+            // Reported as: "it looks like the result with false color are flipped compared to the
+            // lighting layout." It was. Grid row 0 is the plane's MINIMUM y — the bottom of the
+            // room — and this drew it at the top of the page, while the layout page has always
+            // flipped correctly. The two pages showed the same room mirrored, which is worse than
+            // either being wrong alone: a reader checks one against the other, and both looked
+            // plausible.
+            let gy = (1.0 - j as f64 / ny as f64) * (gr - 1) as f64;
+            let gx = (i as f64 / nx as f64) * (gc - 1) as f64;
+            f[j * (nx + 1) + i] = bilinear(g, gx, gy);
+        }
+    }
+
+    // ---- the bands, lowest first ------------------------------------------------------------
+    //
+    // Each band is painted as the whole region at or above its floor, over the top of the bands
+    // below it. Painting SUPERSETS in order is what removes the need for holes: a bright pool
+    // inside a dimmer band is simply painted later, so no band has to know what is inside it.
+    // A CONTINUOUS SCALE IS DRAWN AS MANY BANDS. `Scale::edges` returns just `[0, top]` when no
+    // bands are set — one band, which through a contour renderer is one flat colour over the whole
+    // room. That is not "continuous", it is the field erased, and it is exactly what the first
+    // version of this did. Quantising into enough levels that the steps fall below what anyone can
+    // see gives a gradient and keeps ONE code path for both kinds of scale.
+    const SMOOTH_LEVELS: usize = 48;
+    let edges: Vec<f64> = if opt.scale.bands.is_empty() {
+        let top = opt.scale.top_lx(room_max);
+        (0..=SMOOTH_LEVELS).map(|k| top * k as f64 / SMOOTH_LEVELS as f64).collect()
+    } else {
+        opt.scale.edges(room_max)
+    };
     let sw = plot_w / nx as f64;
     let sh = plot_h / ny as f64;
+    let at = |i: f64, j: f64| (x0 + i * sw, y0 + j * sh);
+    for (k, pair) in edges.windows(2).enumerate() {
+        let mid = (pair[0] + pair[1]) * 0.5;
+        let fill = band_fill(inp, opt, k, opt.scale.t_for(mid, room_max));
+        if k == 0 {
+            // The floor band is the whole plot. Everything above it is painted on top, and the
+            // part outside the room is covered at the end.
+            c.push(Item::Rect { x: x0, y: y0, w: plot_w, h: plot_h, fill });
+            continue;
+        }
+        let t = pair[0];
+        paint_above(c, &f, nx, ny, t, fill, &at);
+    }
 
-    for j in 0..ny {
-        // Sample at the CENTRE of each raster cell, in grid coordinates.
-        let gy = ((j as f64 + 0.5) / ny as f64) * gr as f64 - 0.5;
-        let mut run: Option<([u8; 3], usize)> = None;
-        for i in 0..=nx {
-            let colour = if i == nx {
-                None
-            } else {
-                let gx = ((i as f64 + 0.5) / nx as f64) * gc as f64 - 0.5;
-                sample(inp, room, opt, gx, gy, room_max)
-            };
-            match (&mut run, colour) {
-                (Some((c0, start)), Some(cc)) if *c0 == cc => {}
-                (Some((c0, start)), _) => {
-                    // Half a sample of overlap, so neighbouring runs meet rather than leaving a
-                    // hairline of white paper between them at the reader's rendering resolution.
-                    let x = x0 + *start as f64 * sw;
-                    let w = (i - *start) as f64 * sw + 0.15;
-                    c.push(Item::Rect { x, y: y0 + j as f64 * sh, w, h: sh + 0.15, fill: *c0 });
-                    run = colour.map(|cc| (cc, i));
+    // ---- and everything outside the room is not part of the answer --------------------------
+    //
+    // Covered rather than clipped: the bands are traced over the whole rectangle, and a single
+    // white shape with the plot's rectangle and the room's OUTLINE as its two rings hides the rest
+    // under the even-odd rule. That gives the room's real edge — the polygon itself, exactly —
+    // instead of the staircase a per-cell mask leaves, which is the jaggedness that shows up worst
+    // because it runs down the one line the eye follows.
+    if room.poly.len() >= 3 {
+        let p = room.plane;
+        let to_page = |v: &glam::Vec2| -> (f64, f64) {
+            (
+                x0 + (v.x as f64 - p.origin.x as f64) / p.width as f64 * plot_w,
+                y0 + plot_h - (v.y as f64 - p.origin.y as f64) / p.depth as f64 * plot_h,
+            )
+        };
+        let ring: Vec<(f64, f64)> = room.poly.iter().map(to_page).collect();
+        c.push(Item::Poly {
+            rings: vec![
+                vec![
+                    (x0, y0),
+                    (x0 + plot_w, y0),
+                    (x0 + plot_w, y0 + plot_h),
+                    (x0, y0 + plot_h),
+                ],
+                ring.clone(),
+            ],
+            fill: [255, 255, 255],
+        });
+        // The outline itself, so the room reads as a room and not as the edge of the colour.
+        for w in ring.windows(2) {
+            c.push(Item::Line {
+                x1: w[0].0,
+                y1: w[0].1,
+                x2: w[1].0,
+                y2: w[1].1,
+                rgb: [150, 150, 150],
+                width: 0.6,
+            });
+        }
+        if let (Some(a), Some(b)) = (ring.first(), ring.last()) {
+            c.push(Item::Line {
+                x1: b.0,
+                y1: b.1,
+                x2: a.0,
+                y2: a.1,
+                rgb: [150, 150, 150],
+                width: 0.6,
+            });
+        }
+    } else if !room.mask.is_empty() {
+        // NO OUTLINE, BUT A MASK. In a real calculation a mask only exists where an outline does,
+        // so this is the belt to that braces — but the cost of getting it wrong is colour claiming
+        // there is light on ground the room does not cover, and that is not a thing to leave to an
+        // invariant holding somewhere else. Cell by cell, which is a staircase; a staircase in the
+        // right place beats a smooth edge in the wrong one.
+        let cw = plot_w / gc as f64;
+        let ch = plot_h / gr as f64;
+        for j in 0..gr {
+            for i in 0..gc {
+                if room.mask.get(j * gc + i).copied().unwrap_or(true) {
+                    continue;
                 }
-                (None, Some(cc)) => run = Some((cc, i)),
-                (None, None) => {}
+                c.push(Item::Rect {
+                    x: x0 + i as f64 * cw,
+                    // Flipped with the field: mask row 0 is the room's minimum y.
+                    y: y0 + plot_h - (j + 1) as f64 * ch,
+                    w: cw + 0.12,
+                    h: ch + 0.12,
+                    fill: [255, 255, 255],
+                });
             }
         }
     }
@@ -966,7 +1120,8 @@ fn results_body(
     // the light; the numbers make it checkable, and on a small room there is room for both.
     let cell_w = plot_w / gc as f64;
     let cell_h = plot_h / gr as f64;
-    if cell_w.min(cell_h) >= 22.0 {
+    let values_shown = cell_w.min(cell_h) >= 22.0;
+    if values_shown {
         for j in 0..gr {
             for i in 0..gc {
                 let Some(v) = g.values.get(j * gc + i) else { continue };
@@ -978,7 +1133,9 @@ fn results_body(
                 let lum = 0.299 * fill[0] as f64 + 0.587 * fill[1] as f64 + 0.114 * fill[2] as f64;
                 c.push(Item::Text {
                     x: x0 + (i as f64 + 0.5) * cell_w,
-                    y: y0 + (j as f64 + 0.5) * cell_h + 2.0,
+                    // Flipped with the field above it, or the numbers would describe the mirror
+                    // image of the picture they are printed on.
+                    y: y0 + plot_h - (j as f64 + 0.5) * cell_h + 2.0,
                     size: (cell_w.min(cell_h) * 0.26).clamp(4.0, 8.0),
                     font: Font::Regular,
                     rgb: if lum > 140.0 { [20, 20, 20] } else { [245, 245, 245] },
@@ -988,7 +1145,6 @@ fn results_body(
             }
         }
     }
-    let values_shown = cell_w.min(cell_h) >= 22.0;
 
     c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [140, 140, 140], width: 0.7 });
     c.push(Item::Text {
@@ -1015,6 +1171,114 @@ fn results_body(
         // the sentence across the field it is describing.
         c.note("Point values are omitted at this grid size — the grid table carries every figure.");
     }
+}
+
+/// Paint every part of the field at or above `t`.
+///
+/// MARCHING SQUARES, cell by cell. For each raster cell the part at or above the threshold is a
+/// polygon with three to six corners, found by walking the cell's four corners and interpolating
+/// wherever an edge crosses the threshold — so the boundary is a straight segment across one raster
+/// cell rather than a step the size of one. That is the whole difference between the pixelated
+/// edges reported and a contour.
+///
+/// Cells wholly above the threshold are merged into horizontal RUNS and emitted as rectangles. A
+/// polygon each would be thousands of identical squares: the same picture, several times the file,
+/// and slower to open. The interesting shapes are only ever at the boundary.
+fn paint_above(
+    c: &mut Cursor,
+    f: &[f64],
+    nx: usize,
+    ny: usize,
+    t: f64,
+    fill: [u8; 3],
+    at: &dyn Fn(f64, f64) -> (f64, f64),
+) {
+    let v = |i: usize, j: usize| f[j * (nx + 1) + i];
+    for j in 0..ny {
+        // A run of whole cells, closed off as soon as a cell is not whole.
+        let mut run: Option<usize> = None;
+        let mut close = |run: &mut Option<usize>, end: usize, c: &mut Cursor| {
+            if let Some(s) = run.take() {
+                let (ax, ay) = at(s as f64, j as f64);
+                let (bx, by) = at(end as f64, (j + 1) as f64);
+                // A whisker of overlap, so neighbouring runs meet instead of leaving a hairline of
+                // paper between them at the reader's rendering resolution.
+                c.push(Item::Rect {
+                    x: ax,
+                    y: ay,
+                    w: bx - ax + 0.12,
+                    h: by - ay + 0.12,
+                    fill,
+                });
+            }
+        };
+        for i in 0..nx {
+            // Corners, anticlockwise from the cell's top-left in PAGE terms. The order only has to
+            // be consistent: the polygon comes out with the same winding either way.
+            let corners = [
+                (i as f64, j as f64, v(i, j)),
+                ((i + 1) as f64, j as f64, v(i + 1, j)),
+                ((i + 1) as f64, (j + 1) as f64, v(i + 1, j + 1)),
+                (i as f64, (j + 1) as f64, v(i, j + 1)),
+            ];
+            let n_in = corners.iter().filter(|(_, _, a)| *a >= t).count();
+            if n_in == 4 {
+                run.get_or_insert(i);
+                continue;
+            }
+            close(&mut run, i, c);
+            if n_in == 0 {
+                continue;
+            }
+            // Sutherland–Hodgman against the half-space `value >= t`, with the value taken as
+            // linear along each edge. Four corners in, three to five points out.
+            let mut poly: Vec<(f64, f64)> = Vec::with_capacity(6);
+            for k in 0..4 {
+                let (ax, ay, av) = corners[k];
+                let (bx, by, bv) = corners[(k + 1) % 4];
+                let a_in = av >= t;
+                let b_in = bv >= t;
+                if a_in {
+                    poly.push(at(ax, ay));
+                }
+                if a_in != b_in {
+                    // Where the edge crosses. Guarded against a zero denominator, which happens
+                    // when two corners hold exactly the same value straddling the threshold.
+                    let d = bv - av;
+                    let s = if d.abs() > 1e-12 { ((t - av) / d).clamp(0.0, 1.0) } else { 0.5 };
+                    poly.push(at(ax + (bx - ax) * s, ay + (by - ay) * s));
+                }
+            }
+            if poly.len() >= 3 {
+                c.push(Item::Poly { rings: vec![poly], fill });
+            }
+        }
+        close(&mut run, nx, c);
+    }
+}
+
+/// Bilinear illuminance at a point in GRID coordinates, with no room test.
+///
+/// Separate from [`sample`], which also decides colour and whether the point is inside the room.
+/// The contour tracer wants the raw field over the WHOLE plane: it traces bands across the entire
+/// rectangle and covers the outside afterwards with the room's own outline, which is what keeps
+/// the room edge smooth instead of stepped.
+fn bilinear(g: &LuxGrid, gx: f64, gy: f64) -> f64 {
+    let (gc, gr) = (g.cols as usize, g.rows as usize);
+    if gc == 0 || gr == 0 {
+        return 0.0;
+    }
+    let x0 = gx.floor().clamp(0.0, (gc - 1) as f64) as usize;
+    let y0 = gy.floor().clamp(0.0, (gr - 1) as f64) as usize;
+    let x1 = (x0 + 1).min(gc - 1);
+    let y1 = (y0 + 1).min(gr - 1);
+    let tx = (gx - x0 as f64).clamp(0.0, 1.0);
+    let ty = (gy - y0 as f64).clamp(0.0, 1.0);
+    let at = |x: usize, y: usize| g.values.get(y * gc + x).copied().unwrap_or(0.0);
+    at(x0, y0) * (1.0 - tx) * (1.0 - ty)
+        + at(x1, y0) * tx * (1.0 - ty)
+        + at(x0, y1) * (1.0 - tx) * ty
+        + at(x1, y1) * tx * ty
 }
 
 /// The colour at a point in GRID coordinates, or `None` outside the room.
@@ -1061,7 +1325,12 @@ fn sample(
         + at(x0, y1) * (1.0 - tx) * ty
         + at(x1, y1) * tx * ty;
 
-    Some(ramp_rgb(inp.ramp, opt.scale.t_for(v, room_max)))
+    // Through the SAME band the field is painted with, so a printed point value picks its ink
+    // against the colour it is actually sitting on rather than against the palette's idea of it —
+    // a dark number on a dark band chosen by hand would be unreadable. `usize::MAX` on a
+    // continuous scale, which no band index can be, so it falls through to the ramp.
+    let k = if opt.scale.bands.is_empty() { usize::MAX } else { opt.scale.band_index(v, room_max) };
+    Some(band_fill(inp, opt, k, opt.scale.t_for(v, room_max)))
 }
 
 /// THE LIGHTING LAYOUT — the room and what is in it, before the result.
@@ -1227,6 +1496,23 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
     c.y += 6.0;
 }
 
+/// THE COLOUR BAND `k` IS DRAWN IN — the practice's own choice where it has made one, the palette
+/// where it has not.
+///
+/// Asked for as: *"in the band add a band color picker … so this color band will come for all
+/// future report generation."* A practice's drawings are read by people who have learned what its
+/// colours mean, and which colours those are is not the app's decision to make.
+///
+/// One function, called by the FIELD, the LEGEND and the printed point values alike. A legend in
+/// different colours from the picture it explains is worse than no legend, and that is exactly what
+/// three call sites reading the palette their own way would eventually produce.
+fn band_fill(inp: &Input, opt: &Options, k: usize, t: f32) -> [u8; 3] {
+    match opt.band_colours.get(k) {
+        Some(c) => *c,
+        None => ramp_rgb(inp.ramp, t),
+    }
+}
+
 fn ramp_rgb(ramp: fn(f32) -> (f32, f32, f32), t: f32) -> [u8; 3] {
     let (r, g, b) = ramp(t.clamp(0.0, 1.0));
     [
@@ -1282,7 +1568,7 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
         for i in 0..n {
             let mid = (edges[i] + edges[i + 1]) * 0.5;
             let t = (mid / opt.scale.top_lx(room_max)).clamp(0.0, 1.0) as f32;
-            c.push(Item::Rect { x: x + bw * i as f64, y, w: bw, h, fill: ramp_rgb(inp.ramp, t) });
+            c.push(Item::Rect { x: x + bw * i as f64, y, w: bw, h, fill: band_fill(inp, opt, i, t) });
         }
         c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
         c.y = y + h + 10.0;
@@ -1638,6 +1924,24 @@ mod tests {
                             (x1.min(*x2), y1.min(*y2), (x2 - x1).abs(), (y2 - y1).abs())
                         }
                         Item::Text { x, y, .. } => (*x, *y - 8.0, 0.0, 8.0),
+                        // A contour band, as its bounding box — the same question is being asked
+                        // of it as of everything else: does any of it fall off the page.
+                        Item::Poly { rings, .. } => {
+                            let (mut ax, mut ay, mut bx, mut by) =
+                                (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+                            for r in rings {
+                                for (px, py) in r {
+                                    ax = ax.min(*px);
+                                    ay = ay.min(*py);
+                                    bx = bx.max(*px);
+                                    by = by.max(*py);
+                                }
+                            }
+                            if ax > bx {
+                                continue; // no points at all
+                            }
+                            (ax, ay, bx - ax, by - ay)
+                        }
                     };
                     assert!(
                         x >= -0.5 && y >= -0.5 && x + iw <= w + 0.5 && y + ih <= h + 0.5,
@@ -1676,6 +1980,67 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Every fill the field puts down, rectangles and contour bands alike.
+    ///
+    /// The field is no longer only rectangles: flat interiors merge into runs and the BOUNDARIES
+    /// are polygons, which is the whole point of the contour rewrite. A helper that looked only at
+    /// rectangles would quietly stop seeing the interesting half.
+    fn field_fills(d: &Doc) -> Vec<[u8; 3]> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Rect { h, fill, .. } if (*h - 12.0).abs() > 0.01 => Some(*fill),
+                Item::Poly { fill, .. } => Some(*fill),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE COLOUR A READER ACTUALLY SEES at a point on the page.
+    ///
+    /// A painter's algorithm over the item list, and the only honest oracle now that the field is
+    /// drawn as overlapping bands with the outside covered afterwards. "Is any coloured shape
+    /// drawn out here" stopped being the right question the moment bands began to be traced across
+    /// the whole rectangle and hidden by a later shape: shapes DO extend past the room now, and
+    /// none of them shows. Asking what is on top asks what the reader sees.
+    ///
+    /// Even-odd across every ring together, which is exactly how the PDF fills a `Poly`.
+    fn colour_at(d: &Doc, x: f64, y: f64) -> Option<[u8; 3]> {
+        let mut seen = None;
+        for pg in &d.pages {
+            for it in &pg.items {
+                match it {
+                    Item::Rect { x: rx, y: ry, w, h, fill } => {
+                        if x >= *rx && x <= rx + w && y >= *ry && y <= ry + h {
+                            seen = Some(*fill);
+                        }
+                    }
+                    Item::Poly { rings, fill } => {
+                        let mut crossings = 0usize;
+                        for r in rings {
+                            for k in 0..r.len() {
+                                let (x1, y1) = r[k];
+                                let (x2, y2) = r[(k + 1) % r.len()];
+                                if (y1 > y) != (y2 > y) {
+                                    let t = (y - y1) / (y2 - y1);
+                                    if x1 + t * (x2 - x1) > x {
+                                        crossings += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if crossings % 2 == 1 {
+                            seen = Some(*fill);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        seen
     }
 
     /// THE PLOT TAKES TWO THIRDS OF THE PAGE.
@@ -1726,6 +2091,90 @@ mod tests {
                 "{cols}x{rows}: the field is {got:.4} wide-to-tall for a room that is {want:.4}",
             );
         }
+    }
+
+    /// A BAND IS DRAWN IN THE COLOUR THE PRACTICE CHOSE FOR IT.
+    ///
+    /// Asked for as: *"in the band add a band color picker … so this color band will come for all
+    /// future report generation."* A practice's drawings are read by people who have learned what
+    /// its colours mean, and which colours those are is not the app's decision.
+    ///
+    /// The FIELD, the LEGEND and the printed point values are all checked, because three call
+    /// sites reading the palette their own way is how a legend ends up in different colours from
+    /// the picture it explains.
+    #[test]
+    fn a_chosen_band_colour_is_used_everywhere() {
+        let g = grid(4, 4); // 100..250 lx — spans the 100 and 300 bands
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+        o.scale = crate::report::options::Scale { top: Some(500.0), bands: vec![100.0, 300.0] };
+
+        // Three bands: 0–100, 100–300, 300–500. Colours nothing a palette would produce.
+        let mine = [[7u8, 11, 13], [201, 17, 19], [23, 197, 29]];
+        o.band_colours = mine.to_vec();
+        let d = layout(&input(&g, &p), &o);
+
+        let fills: std::collections::BTreeSet<[u8; 3]> = field_fills(&d).into_iter().collect();
+        assert!(
+            fills.contains(&mine[1]),
+            "the 100–300 band was not drawn in the chosen colour: {fills:?}",
+        );
+        // The legend blocks are 12 pt tall — the one height `field_fills` filters out — so they
+        // are gathered separately. A legend that disagrees with its own plot is the failure this
+        // guards against.
+        let legend: Vec<[u8; 3]> = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Rect { h, fill, .. } if (*h - 12.0).abs() < 0.01 => Some(*fill),
+                _ => None,
+            })
+            .collect();
+        for (k, c) in mine.iter().enumerate() {
+            assert!(
+                legend.contains(c),
+                "band {k} is missing from the legend, which shows {legend:?}",
+            );
+        }
+    }
+
+    /// AN EMPTY LIST MEANS THE PALETTE — so a project made before the picker existed, and a
+    /// settings file that never held one, both draw exactly as they did.
+    #[test]
+    fn without_a_choice_the_palette_still_decides() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+
+        let palette = field_fills(&layout(&input(&g, &p), &o));
+        o.band_colours = Vec::new();
+        let same = field_fills(&layout(&input(&g, &p), &o));
+        assert_eq!(palette, same, "an empty list changed the drawing");
+
+        // And a SHORT list falls back for the bands past its end rather than running off it.
+        o.band_colours = vec![[1, 2, 3]];
+        let short = field_fills(&layout(&input(&g, &p), &o));
+        assert!(short.contains(&[1, 2, 3]), "the one chosen colour was not used");
+        assert!(
+            short.iter().any(|c| palette.contains(c)),
+            "a short list threw away the palette for every other band",
+        );
+    }
+
+    /// THE COLOURS TRAVEL WITH THE SETTINGS. "so this color band will come for all future report
+    /// generation" — a house style re-entered on every job is not a house style.
+    #[test]
+    fn the_chosen_colours_are_kept_between_sessions() {
+        let mut src = Options::default();
+        src.band_colours = vec![[9, 8, 7], [6, 5, 4]];
+        let mut back = Options::default();
+        crate::report::Prefs::of(&src).apply(&mut back);
+        assert_eq!(back.band_colours, src.band_colours, "the band colours were not kept");
     }
 
     /// THE NUMERIC GRID IS THE SHAPE OF THE ROOM TOO, at the same scale as the field above it.
@@ -2133,12 +2582,18 @@ mod tests {
         }
     }
 
-    /// THE FIELD IS DRAWN SMOOTH, not as one rectangle per measured point.
+    /// THE BAND EDGES ARE CONTOURS, not a staircase of rectangles.
     ///
-    /// "see how the false color shows up as grid make it smooth like in the reference." Drawn at
-    /// grid resolution, a 33-column room came out as visible cross-hatching — the sampling grid
-    /// rather than the light. It is resampled onto a much finer raster, and runs of one colour are
-    /// merged, so a banded scale gives smooth curved band edges.
+    /// "the false color is still way too coarse make it smooth. it looks all pixelated around the
+    /// edges." A band drawn as a mosaic of axis-aligned rectangles has stepped edges BY
+    /// CONSTRUCTION — every boundary has to land on a raster row — and raising the raster only
+    /// makes the steps smaller. The edges are now traced with linear interpolation and emitted as
+    /// polygons.
+    ///
+    /// THIS USED TO ASSERT "no rectangle taller than half a grid cell", which was the old
+    /// implementation's shape rather than the requirement: a flat interior legitimately merges into
+    /// one big rectangle now, and that is a smaller file drawing the same picture. What has to be
+    /// true is that the BOUNDARY is finer than the grid.
     #[test]
     fn the_field_is_finer_than_the_grid_it_came_from() {
         let g = grid(8, 8);
@@ -2151,13 +2606,55 @@ mod tests {
         let r = field_rects(&d);
         assert!(!r.is_empty(), "nothing was drawn");
 
-        // Every run is at most one raster row tall, which is far thinner than a grid cell.
+        // The contour polygons, and how long their edges are.
+        let polys: Vec<&Vec<Vec<(f64, f64)>>> = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Poly { rings, .. } => Some(rings),
+                _ => None,
+            })
+            .collect();
+        assert!(!polys.is_empty(), "the band edges are not being traced at all");
         let cell_h = ph / 8.0;
-        let tallest = r.iter().map(|x| x.3).fold(0.0_f64, f64::max);
+        let mut longest = 0.0_f64;
+        // THE DIVERSITY OF EDGE DIRECTIONS is what tells a traced contour from a stepped one.
+        //
+        // "Some edge is not axis-aligned" was the first version of this check and it does not
+        // discriminate: snapping every crossing to the nearest cell CORNER — a staircase by any
+        // reading — still throws 45° diagonals across corner cells, and that check passed against
+        // it. A boundary interpolated to where the threshold actually falls takes a continuum of
+        // angles; one snapped to the lattice can only ever take a handful.
+        let mut angles: std::collections::BTreeSet<i64> = Default::default();
+        for rings in &polys {
+            for r in rings.iter() {
+                for k in 0..r.len() {
+                    let (x1, y1) = r[k];
+                    let (x2, y2) = r[(k + 1) % r.len()];
+                    let (dx, dy) = (x2 - x1, y2 - y1);
+                    let len = dx.hypot(dy);
+                    longest = longest.max(len);
+                    if len > 1e-9 {
+                        let mut a = dy.atan2(dx).to_degrees();
+                        if a < 0.0 {
+                            a += 180.0; // a direction, not an orientation
+                        }
+                        angles.insert((a / 3.0).round() as i64);
+                    }
+                }
+            }
+        }
         assert!(
-            tallest < cell_h * 0.5,
-            "the tallest run is {tallest:.2} pt against a {cell_h:.2} pt grid cell — this is still \
-             being drawn one rectangle per measured point",
+            longest < cell_h * 0.5,
+            "a band edge runs {longest:.2} pt in one straight piece, against a {cell_h:.2} pt grid \
+             cell — the boundary is no finer than the measurements",
+        );
+        assert!(
+            angles.len() > 8,
+            "the band edges take only {} distinct directions — a contour interpolated to where the \
+             threshold falls takes many; this is snapped to the raster",
+            angles.len(),
         );
         // …and the rows cover the plot from top to bottom.
         let top = r.iter().map(|x| x.1).fold(f64::MAX, f64::min);
@@ -2239,29 +2736,236 @@ mod tests {
         assert!(r.len() < 20_000, "{} rectangles is not a merged field", r.len());
     }
 
-    /// GROUND OUTSIDE THE ROOM IS NOT COLOURED — colouring it reports illuminance where the room
-    /// is not.
+    /// EVERY ROOM CARRIES ITS OWN CONDITIONS.
+    ///
+    /// Asked for as: *"the room details need to there for each rooms result"* and *"make sure we
+    /// also displaying these info in each room"*. The room height, the reflectances and the
+    /// installation's headline figures were printed ONCE at the front of the report, which is
+    /// where they come from — but they are the stated conditions of every room's numbers, and a
+    /// reader working through one room's chapter should not have to leaf backwards to find out
+    /// what the walls were given.
+    ///
+    /// Counted PER ROOM rather than merely "present": one copy at the front would satisfy "the
+    /// report mentions reflectance" while leaving the complaint exactly as it was.
     #[test]
-    fn cells_outside_the_room_are_not_coloured() {
-        let g = grid(2, 1);
+    fn each_room_states_its_own_conditions() {
+        let g = grid(8, 6);
         let p = plane();
-        let mut i = input(&g, &p);
-        i.rooms[0].mask = &[true, false];
+        let fixtures = vec![cad_light::Luminaire {
+            id: 1,
+            profile: "F".into(),
+            position: cad_light::Vertex::new(4.0, 3.0, 2.9),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let inst = Installation {
+            count: 1,
+            total_watts: 52.0,
+            total_lumens: 4160.0,
+            area_m2: 48.0,
+            power_density: 1.08,
+            efficacy: 80.0,
+            missing_watts: 0,
+            missing_lumens: 0,
+        };
+        let mut rooms = Vec::new();
+        for name in ["Store", "Hall"] {
+            let mut r = one_room(&g, &p, name);
+            r.fixtures = &fixtures;
+            r.installation = Some(&inst);
+            rooms.push(r);
+        }
+        let mut inp = input(&g, &p);
+        inp.rooms = rooms;
         let mut o = opts();
         o.cover = false;
-        o.sections = vec![Section::Results];
-        let d = layout(&i, &o);
-        let (px, _, pw, _) = plot_frames(&d)[0];
-        let r = field_rects(&d);
-        assert!(!r.is_empty());
-        // Everything drawn sits in the LEFT half — the right cell is outside the room.
-        let rightmost = r.iter().map(|x| x.0 + x.2).fold(f64::MIN, f64::max);
-        assert!(
-            rightmost < px + pw * 0.6,
-            "the field reaches {:.1}, past the half-way mark at {:.1}",
-            rightmost,
-            px + pw * 0.5,
+        o.sections = vec![Section::Installation];
+        let d = layout(&inp, &o);
+        let t = texts(&d);
+        // EXACT, not `contains`. "Total power" is a substring of "Total power per area (48.00 m2)",
+        // and counting loosely made a row that appears twice look like four.
+        let count = |needle: &str| t.iter().filter(|s| s.as_str() == needle).count();
+
+        for want in [
+            "General",
+            "Calculation algorithm",
+            "Height of luminaire plane",
+            "Working plane height",
+            "Room height",
+            "Maintenance factor",
+            "Luminaire luminous flux",
+            "Total power",
+            "Room & materials",
+            "Room size",
+            "Reflectance — Floor",
+        ] {
+            assert_eq!(
+                count(want),
+                2,
+                "{want:?} appears {} time(s) across two rooms — it belongs in each chapter",
+                count(want),
+            );
+        }
+        // The area is written into the label, so this one is matched by its stem.
+        assert_eq!(
+            t.iter().filter(|s| s.starts_with("Total power per area")).count(),
+            2,
+            "the power density is not stated in each room's chapter",
         );
+        // The normalised figure, which is the one a scheme is actually judged on.
+        assert!(
+            t.iter().any(|s| s.contains("per 100 lx")),
+            "the power density is not given per 100 lx: {t:?}",
+        );
+        // The luminaire plane is the FITTINGS' height, not the working plane's.
+        assert!(t.iter().any(|s| s == "2.90 m"), "the mounting height is not stated: {t:?}");
+    }
+
+    /// THE FIELD AND THE LAYOUT SHOW THE ROOM THE SAME WAY UP.
+    ///
+    /// Reported as: *"it looks like the result with false color are flipped compared to the
+    /// lighting layout. make sure both in the same orientation."* They were. A plan reads with +y
+    /// UP and a page with +y DOWN; the layout page has always flipped, and the field did not — so
+    /// grid row 0, which is the plane's MINIMUM y, was drawn at the top of the page.
+    ///
+    /// That is worse than either page being wrong on its own. The two exist to be read against
+    /// each other — "which fitting is over that dark patch" — and mirrored, both look entirely
+    /// plausible while every answer taken from the pair is wrong.
+    ///
+    /// The fixture is deliberately asymmetric in y: bright along the room's NORTH edge, dark along
+    /// its south. On the page the bright band must be at the TOP.
+    #[test]
+    fn the_field_is_the_same_way_up_as_the_layout() {
+        let (cols, rows) = (8u32, 8u32);
+        // Row 0 is the minimum y — the SOUTH edge — so brightness must rise with the row index.
+        let vals: Vec<f64> =
+            (0..(cols * rows)).map(|i| 10.0 + (i / cols) as f64 * 120.0).collect();
+        let g = LuxGrid::from_values(cols, rows, vals);
+        let p = plane();
+        // A fitting hard against the north edge, so the layout page is asymmetric the same way.
+        let fixtures = vec![cad_light::Luminaire {
+            id: 1,
+            profile: "F".into(),
+            position: cad_light::Vertex::new(4.0, 5.5, 2.9),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let mut room = one_room(&g, &p, "");
+        room.fixtures = &fixtures;
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![room];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout, Section::Results];
+        let d = layout(&inp, &o);
+
+        let field = plot_frames(&d).first().copied().expect("a field");
+        let (fx, fy, fw, fh) = field;
+        let top = colour_at(&d, fx + fw * 0.5, fy + fh * 0.12).expect("the top of the field");
+        let bottom = colour_at(&d, fx + fw * 0.5, fy + fh * 0.88).expect("the bottom of the field");
+        let bright = |c: [u8; 3]| c[0] as u32 + c[1] as u32 + c[2] as u32;
+        assert_ne!(top, bottom, "the fixture is not asymmetric enough to tell either way up");
+
+        // The brightest end of a CLASSIC ramp is the warm end; compare through the same ramp the
+        // page used rather than by eye.
+        let t_top = crate::light::lux_rgb(1.0);
+        let warm = [
+            (t_top.0 * 255.0) as i32,
+            (t_top.1 * 255.0) as i32,
+            (t_top.2 * 255.0) as i32,
+        ];
+        let near_warm = |c: [u8; 3]| {
+            ((c[0] as i32 - warm[0]).pow(2)
+                + (c[1] as i32 - warm[1]).pow(2)
+                + (c[2] as i32 - warm[2]).pow(2)) as f64
+        };
+        assert!(
+            near_warm(top) < near_warm(bottom),
+            "the bright end of the room is at the BOTTOM of the page ({top:?} over {bottom:?}) — \
+             the field is upside down against the layout",
+        );
+        let _ = bright;
+
+        // And the fitting, which is near the north edge, is likewise drawn in the top half.
+        let marker_y = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Frame { y, h, rgb, .. } if *rgb == [200, 150, 40] => Some(y + h * 0.5),
+                _ => None,
+            })
+            .next()
+            .expect("the fitting's marker");
+        let outline = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .find_map(|i| match i {
+                Item::Frame { y, h, rgb, .. } if *rgb == [190, 40, 40] => Some((*y, *h)),
+                _ => None,
+            })
+            .expect("the layout outline");
+        assert!(
+            marker_y < outline.0 + outline.1 * 0.5,
+            "a fitting near the room's north edge was drawn in the bottom half of the layout",
+        );
+    }
+
+    /// GROUND OUTSIDE THE ROOM IS NOT COLOURED — colouring it reports illuminance where the room
+    /// is not.
+    ///
+    /// ASKED OF THE FINISHED PAGE, not of the shape list. This used to check that no coloured
+    /// rectangle was drawn beyond the room, which was true of the old renderer and is no longer
+    /// the question: bands are now traced across the whole rectangle and the outside is hidden by
+    /// a shape drawn afterwards, so coloured geometry does extend past the room and none of it
+    /// shows. What matters is what is on top — see `colour_at`.
+    #[test]
+    fn cells_outside_the_room_are_not_coloured() {
+        // Both halves of this: a room given as an OUTLINE, which is the real case and gets the
+        // smooth cover, and a room given only as a cell MASK, which gets the stepped one.
+        for by_outline in [true, false] {
+            let g = grid(2, 1);
+            let p = plane();
+            let mut i = input(&g, &p);
+            // The LEFT half of the plane only.
+            let poly = [
+                glam::Vec2::new(0.0, 0.0),
+                glam::Vec2::new(4.0, 0.0),
+                glam::Vec2::new(4.0, 6.0),
+                glam::Vec2::new(0.0, 6.0),
+            ];
+            if by_outline {
+                i.rooms[0].poly = &poly;
+            } else {
+                i.rooms[0].mask = &[true, false];
+            }
+            let mut o = opts();
+            o.cover = false;
+            o.sections = vec![Section::Results];
+            let d = layout(&i, &o);
+            let (px, py, pw, ph) = plot_frames(&d)[0];
+
+            let inside = colour_at(&d, px + pw * 0.25, py + ph * 0.5);
+            let outside = colour_at(&d, px + pw * 0.75, py + ph * 0.5);
+            let how = if by_outline { "outline" } else { "mask" };
+            assert!(
+                inside.is_some_and(|c| c != [255, 255, 255]),
+                "{how}: inside the room came out {inside:?} — the field is not painted",
+            );
+            assert_eq!(
+                outside,
+                Some([255, 255, 255]),
+                "{how}: ground outside the room shows {outside:?}, which reports illuminance where \
+                 the room is not",
+            );
+        }
     }
 
     /// VALUES APPEAR WHEN THERE IS ROOM AND NOT WHEN THERE IS NOT — and when they are dropped the
@@ -2303,12 +3007,10 @@ mod tests {
         o.sections = vec![Section::Results];
 
         o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
-        let auto: Vec<[u8; 3]> =
-            field_rects(&layout(&input(&g, &p), &o)).iter().map(|x| x.4).collect();
+        let auto: Vec<[u8; 3]> = field_fills(&layout(&input(&g, &p), &o));
 
         o.scale = crate::report::options::Scale { top: Some(5000.0), bands: Vec::new() };
-        let pinned: Vec<[u8; 3]> =
-            field_rects(&layout(&input(&g, &p), &o)).iter().map(|x| x.4).collect();
+        let pinned: Vec<[u8; 3]> = field_fills(&layout(&input(&g, &p), &o));
 
         assert_ne!(auto, pinned, "pinning the top to 5000 lx left every colour unchanged");
         let mean = |v: &[[u8; 3]]| -> u64 {

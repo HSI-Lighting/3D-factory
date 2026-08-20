@@ -182,6 +182,25 @@ impl Scale {
         e
     }
 
+    /// Which band a reading falls in — the index into [`edges`](Self::edges)' pairs.
+    ///
+    /// The ONE place this is worked out. The field, the legend and the printed point values all
+    /// have to agree about which band a value belongs to, and three loops with the same comparison
+    /// written out separately is three chances to disagree by an epsilon at a boundary — which
+    /// shows up as one cell in the wrong colour and is close to impossible to explain afterwards.
+    pub fn band_index(&self, v: f64, room_max: f64) -> usize {
+        let edges = self.edges(room_max);
+        let n = edges.len();
+        for (i, pair) in edges.windows(2).enumerate() {
+            // The LAST band is closed at the top, so a reading sitting exactly on the ceiling
+            // lands in a band rather than falling off the end of the list.
+            if v < pair[1] || i + 2 == n {
+                return i;
+            }
+        }
+        0
+    }
+
     /// What the legend says under the plot.
     pub fn caption(&self, room_max: f64) -> String {
         let mode = if self.top.is_some() { "pinned" } else { "auto" };
@@ -224,6 +243,23 @@ pub struct Options {
     /// The false-colour scale, chosen here rather than followed from the viewport.
     #[serde(default)]
     pub scale: Scale,
+    /// A COLOUR PER BAND, chosen by hand, overriding the palette.
+    ///
+    /// Asked for as: *"the false colors are now picked by the app. the user has choice to select
+    /// the colors. in the band add a band color picker."* A practice's drawings are read by people
+    /// who have learned what its colours mean, and a house style is not something an app gets to
+    /// decide — nor is it something to re-enter on every job, which is why this travels in the
+    /// saved settings.
+    ///
+    /// EMPTY MEANS THE PALETTE, and a short list means the palette for every band past its end. So
+    /// this stays out of the way until somebody uses it: an existing project, a fresh install and
+    /// a settings file written before the field existed all draw exactly as they did.
+    ///
+    /// Indexed by BAND, matching [`Scale::band_index`] — band 0 is everything below the first
+    /// threshold. Adding or removing a threshold therefore shifts the colours above it, which is
+    /// visible in the dialog the moment it happens rather than a surprise in the output.
+    #[serde(default)]
+    pub band_colours: Vec<[u8; 3]>,
     /// A logo for the header, by index into `logos`.
     #[serde(default)]
     pub header_image: Option<usize>,
@@ -265,6 +301,7 @@ impl Default for Options {
             footer: String::new(),
             page_numbers: true,
             scale: Scale::default(),
+            band_colours: Vec::new(),
             header_image: None,
             footer_image: None,
             sections: Section::all(),
@@ -363,6 +400,11 @@ pub struct Prefs {
     pub page_numbers: Option<bool>,
     #[serde(default)]
     pub scale: Option<Scale>,
+    /// A colour per band — the practice house style, which is exactly the kind of thing that must
+    /// not be re-entered on every job. Empty means the palette, so a settings file written before
+    /// this existed restores as it always did.
+    #[serde(default)]
+    pub band_colours: Vec<[u8; 3]>,
     #[serde(default)]
     pub sections: Vec<Section>,
     #[serde(default)]
@@ -387,6 +429,7 @@ impl Prefs {
             footer: o.footer.clone(),
             page_numbers: Some(o.page_numbers),
             scale: Some(o.scale.clone()),
+            band_colours: o.band_colours.clone(),
             sections: o.sections.clone(),
             hidden: o.hidden.clone(),
             logos: o.logos.iter().map(|l| (l.path.clone(), l.caption.clone())).collect(),
@@ -416,6 +459,7 @@ impl Prefs {
         if let Some(v) = self.scale {
             o.scale = v;
         }
+        o.band_colours = self.band_colours;
         o.header = self.header;
         o.footer = self.footer;
         // An EMPTY section list is not a preference, it is a file that never held one — restoring

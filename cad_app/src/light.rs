@@ -402,6 +402,17 @@ pub struct CalcProgress {
     /// Set by the UI to ask the worker to stop. Checked between rooms — a job you cannot stop is
     /// not much better than one that freezes the window.
     pub cancel: std::sync::atomic::AtomicBool,
+    /// EVERY PHASE THE JOB ENTERED, in order.
+    ///
+    /// `phase` holds only the CURRENT one. That is all a progress bar needs and is not something
+    /// anything else can rely on: a phase that begins and ends between two reads never existed as
+    /// far as a reader is concerned. A test that POLLED for "did it reach the working plane?"
+    /// therefore passed or failed on how fast the machine was — and one did, the day the engine
+    /// grew a near-field correction and the phase timings moved.
+    ///
+    /// Worth having outside a test, too: this is the record of what a calculation actually did,
+    /// for the run that took fifteen minutes and for the one that stopped early.
+    pub log: std::sync::Mutex<Vec<String>>,
 }
 
 impl CalcProgress {
@@ -412,6 +423,14 @@ impl CalcProgress {
             p.clear();
             p.push_str(phase);
         }
+        if let Ok(mut l) = self.log.lock() {
+            l.push(phase.to_string());
+        }
+    }
+
+    /// Every phase entered so far — a handful of strings per calculation.
+    pub fn phases(&self) -> Vec<String> {
+        self.log.lock().map(|l| l.clone()).unwrap_or_default()
     }
     pub fn fraction(&self) -> f32 {
         use std::sync::atomic::Ordering;
@@ -6011,30 +6030,17 @@ mod the_calculation_can_leave_the_ui_thread {
     fn the_phase_names_the_room_it_is_on() {
         let (f, mut s) = room();
         let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
-        let p = std::sync::Arc::new(CalcProgress::default());
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-
-        let p2 = p.clone();
-        let seen2 = seen.clone();
-        let watcher = std::thread::spawn(move || {
-            for _ in 0..2000 {
-                let l = p2.label();
-                if !l.is_empty() {
-                    let mut v = seen2.lock().expect("lock");
-                    if v.last().map(|x: &String| x != &l).unwrap_or(true) {
-                        v.push(l);
-                    }
-                }
-                if p2.fraction() >= 1.0 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        });
+        let p = CalcProgress::default();
         let _ = job.run(&p);
-        let _ = watcher.join();
 
-        let labels = seen.lock().expect("lock").clone();
+        // READ FROM THE LOG, not sampled from a watcher thread.
+        //
+        // This used to poll `label()` every millisecond from a second thread, which measures the
+        // MACHINE: a phase that starts and finishes between two polls is invisible, and the test
+        // fails on a fast computer or after any change to how long a phase takes. It duly failed
+        // the day the engine gained its near-field correction — reporting that the working plane
+        // was never calculated, on a run that calculated it perfectly well.
+        let labels = p.phases();
         assert!(
             labels.iter().any(|l| l.contains("working plane")),
             "no phase named the working plane: {labels:?}",

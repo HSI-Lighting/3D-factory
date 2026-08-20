@@ -61,6 +61,24 @@ pub fn paint_page(
                     c32(*fill),
                 );
             }
+            // THE PREVIEW PAINTS THE SAME POLYGONS THE PDF DOES. egui has no even-odd fill, and a
+            // convex-only tessellator would mangle the concave rings a contour produces — so each
+            // ring is triangulated by ear clipping, which handles any simple polygon. The holes a
+            // band can carry are drawn as their own rings by the caller in painting order,
+            // brightest last, so the preview shows the same picture without needing the rule.
+            Item::Poly { rings, fill } => {
+                for r in rings {
+                    let pts: Vec<egui::Pos2> =
+                        r.iter().map(|(x, y)| at(*x, *y)).collect();
+                    for tri in ear_clip(&pts) {
+                        clip.add(egui::Shape::convex_polygon(
+                            tri.to_vec(),
+                            c32(*fill),
+                            egui::Stroke::NONE,
+                        ));
+                    }
+                }
+            }
             Item::Frame { x, y, w, h, rgb, width } => {
                 clip.rect_stroke(
                     egui::Rect::from_min_size(at(*x, *y), egui::vec2(*w as f32 * k, *h as f32 * k)),
@@ -129,6 +147,10 @@ pub fn window_ui(
     // The brightest value the room reached — what "auto" means, shown so the number is not a
     // mystery when it is the one in force.
     room_max: f64,
+    // The palette the app is showing, so an untouched swatch shows the colour the report will
+    // ACTUALLY use rather than a placeholder. A picker whose swatches do not match the plot beside
+    // them is worse than no picker.
+    ramp: fn(f32) -> (f32, f32, f32),
     // THE CALCULATION THESE PAGES ARE BUILT FROM NO LONGER DESCRIBES THE SCENE.
     //
     // Said HERE, at the moment somebody is about to turn it into a document that leaves the
@@ -263,11 +285,87 @@ pub fn window_ui(
                                 opt.scale.bands.push(last * 2.0 + 1.0);
                             }
                         });
+                        // A COLOUR PER BAND, from a wheel, kept with the settings.
+                        //
+                        // Asked for as "in the band add a band color picker … so this color band
+                        // will come for all future report generation."
+                        //
+                        // The list is filled from the PALETTE the first time it is touched, not
+                        // left blank: a swatch that does not show the colour the report will
+                        // actually use is a picker that lies, and the first thing anybody does is
+                        // compare it against the plot beside it.
+                        //
+                        // NOTHING IS WRITTEN UNTIL SOMEBODY PICKS A COLOUR. The obvious
+                        // implementation fills the list from the palette as soon as the dialog
+                        // opens, so the swatches have something to point at — and then merely
+                        // LOOKING at the dialog has silently made every band an explicit choice,
+                        // saved it to the settings, and cut the report off from the palette for
+                        // ever. Changing the app's colour scheme afterwards would do nothing and
+                        // nothing would say why.
+                        //
+                        // So each swatch shows the colour the report will actually use, edits a
+                        // COPY, and only writes back when it changed.
+                        let top = opt.scale.top_lx(room_max);
+                        let edges = opt.scale.edges(room_max);
+                        let n_bands = edges.len().saturating_sub(1);
+                        let shown = |opt: &Options, k: usize| -> [u8; 3] {
+                            if let Some(c) = opt.band_colours.get(k) {
+                                return *c;
+                            }
+                            let mid = match edges.get(k..k + 2) {
+                                Some(p) => (p[0] + p[1]) * 0.5,
+                                None => top,
+                            };
+                            let (r, g, b) = ramp((mid / top).clamp(0.0, 1.0) as f32);
+                            [
+                                (r * 255.0).round() as u8,
+                                (g * 255.0).round() as u8,
+                                (b * 255.0).round() as u8,
+                            ]
+                        };
+                        // Writing one band's colour has to make the others explicit too, or the
+                        // list would be short and every band past the end would silently fall back
+                        // to the palette — which is not what "I chose this one" means.
+                        let mut set_band: Option<(usize, [u8; 3])> = None;
+                        if !opt.scale.bands.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Band colours").small().weak());
+                                if ui
+                                    .small_button("reset")
+                                    .on_hover_text("Back to the palette")
+                                    .clicked()
+                                {
+                                    opt.band_colours.clear();
+                                }
+                            });
+                            // Band 0 has no threshold row of its own — it is everything BELOW the
+                            // first step — so it gets a row here, or it could never be recoloured.
+                            ui.horizontal(|ui| {
+                                let mut c = shown(opt, 0);
+                                if ui.color_edit_button_srgb(&mut c).changed() {
+                                    set_band = Some((0, c));
+                                }
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "0 – {:.0} lx",
+                                        opt.scale.bands.first().copied().unwrap_or(top),
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            });
+                        }
                         let mut drop_band: Option<usize> = None;
                         for i in 0..opt.scale.bands.len() {
                             ui.horizontal(|ui| {
                                 if ui.small_button("✕").clicked() {
                                     drop_band = Some(i);
+                                }
+                                // The band STARTING at this threshold, so the swatch sits beside
+                                // the number that is its floor.
+                                let mut c = shown(opt, i + 1);
+                                if ui.color_edit_button_srgb(&mut c).changed() {
+                                    set_band = Some((i + 1, c));
                                 }
                                 ui.add(
                                     egui::DragValue::new(&mut opt.scale.bands[i])
@@ -277,8 +375,19 @@ pub fn window_ui(
                                 );
                             });
                         }
+                        if let Some((k, c)) = set_band {
+                            let mut all: Vec<[u8; 3]> =
+                                (0..n_bands.max(k + 1)).map(|j| shown(opt, j)).collect();
+                            all[k] = c;
+                            opt.band_colours = all;
+                        }
                         if let Some(i) = drop_band {
                             opt.scale.bands.remove(i);
+                            // The colour of the band that has just lost its floor goes with it, or
+                            // every colour above the gap would shift down by one.
+                            if i + 1 < opt.band_colours.len() {
+                                opt.band_colours.remove(i + 1);
+                            }
                         }
                         // Out of order the bands would draw as overlapping blocks with their
                         // labels crossing, so they are kept sorted rather than validated later.
@@ -613,4 +722,70 @@ mod tests {
         im.caption = "  Entrance  ".into();
         assert_eq!(im.caption_or_file(), "Entrance", "the caption wins, trimmed");
     }
+}
+
+/// Triangulate a simple polygon by EAR CLIPPING.
+///
+/// egui can fill a CONVEX polygon and nothing else, and a contour band is reliably concave — a
+/// pool of light with a bite out of it, an L-shaped room, a band wrapping round a brighter one.
+/// Handing such a ring to `convex_polygon` does not fail, it draws the convex hull, which paints
+/// over the very shape the contour was computed to show.
+///
+/// O(n²) and that is fine: the rings here are the output of a contour trace, tens to low hundreds
+/// of points, and this runs only when the preview is rebuilt — which, since the cache, is when
+/// something actually changed rather than sixty times a second.
+///
+/// A ring that cannot be reduced — self-intersecting, or degenerate to a sliver — stops early
+/// rather than looping: an unfillable polygon is a missing patch of colour, and a hung preview is
+/// a hung app.
+fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
+    let mut out = Vec::new();
+    if pts.len() < 3 {
+        return out;
+    }
+    let area2 = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
+        (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
+    };
+    // Work in a known winding, so "convex vertex" has one meaning below.
+    let mut v: Vec<egui::Pos2> = pts.to_vec();
+    let signed: f32 = v
+        .windows(2)
+        .map(|w| w[0].x * w[1].y - w[1].x * w[0].y)
+        .sum::<f32>()
+        + (v[v.len() - 1].x * v[0].y - v[0].x * v[v.len() - 1].y);
+    if signed < 0.0 {
+        v.reverse();
+    }
+
+    let mut guard = v.len() * v.len() + 8;
+    while v.len() > 3 && guard > 0 {
+        guard -= 1;
+        let n = v.len();
+        let mut clipped = false;
+        for i in 0..n {
+            let (a, b, c) = (v[(i + n - 1) % n], v[i], v[(i + 1) % n]);
+            if area2(a, b, c) <= 0.0 {
+                continue; // reflex or collinear — not an ear
+            }
+            // No other vertex may lie inside the candidate ear.
+            let inside = (0..n).filter(|k| ![(i + n - 1) % n, i, (i + 1) % n].contains(k)).any(|k| {
+                let p = v[k];
+                area2(a, b, p) >= 0.0 && area2(b, c, p) >= 0.0 && area2(c, a, p) >= 0.0
+            });
+            if inside {
+                continue;
+            }
+            out.push([a, b, c]);
+            v.remove(i);
+            clipped = true;
+            break;
+        }
+        if !clipped {
+            break; // not a simple polygon — draw what was clipped and stop
+        }
+    }
+    if v.len() == 3 {
+        out.push([v[0], v[1], v[2]]);
+    }
+    out
 }

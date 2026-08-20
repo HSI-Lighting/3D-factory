@@ -181,6 +181,44 @@ fn intensity_toward(prof: &IesProfile, lum: &Luminaire, point: Vec3) -> f64 {
     prof.intensity(gamma, phi) * lum.output_scale(prof)
 }
 
+/// HOW MANY PIECES A LUMINAIRE IS BROKEN INTO, at most.
+///
+/// A luminaire is not a point. Photometric data is FAR-FIELD data — it describes what the fitting
+/// looks like from far enough away that its size stops mattering — and the usual working rule is
+/// that "far enough" means about five times the largest luminous dimension. A 2 m batten therefore
+/// wants 10 m of clearance before it may be treated as a point, and a lighting plan measures the
+/// work plane about 2 m below the ceiling. Five times closer than the rule allows.
+///
+/// Reported as: "why does it look like point sources here is it because somethings wrong with the
+/// ldt file or our fault?" — about perfectly round pools of light under 2 m linear luminaires. The
+/// file was blameless: 144 C-planes, 38.5% variation between them. It was this. All the flux was
+/// being emitted from the fitting's midpoint, so the plan showed round pools where a 2 m line
+/// source lays down a 2 m ridge.
+///
+/// Sixteen is a ceiling, not a count — [`segments_for`] asks for far fewer where the distance
+/// makes them pointless, which is nearly everywhere in a real scene.
+const MAX_SEGMENTS: usize = 16;
+
+/// How many pieces this fitting needs, seen from `dist` metres away.
+///
+/// Zero size, or far enough away, means ONE — the point treatment, unchanged and free. This matters
+/// as much as the subdivision does: a downlight is 60 mm across and a point at any distance a room
+/// contains, and paying sixteen times over for every downlight in a building to fix battens would
+/// be a poor trade.
+///
+/// Roughly one segment per half-length of distance, so the pieces are never much longer than they
+/// are far away — which is the condition the point approximation needs of each piece.
+fn segments_for(luminous_len: f64, dist: f64) -> usize {
+    if luminous_len <= 1e-4 || dist <= 1e-6 {
+        return 1;
+    }
+    let ratio = luminous_len / dist;
+    if ratio < 0.2 {
+        return 1; // five times its own size away: the far field, where the file is measured
+    }
+    ((ratio * 5.0).ceil() as usize).clamp(2, MAX_SEGMENTS)
+}
+
 /// Direct illuminance (lux) at a surface point with the given outward `normal`.
 fn direct(ev: &Evaluator, point: Vec3, normal: Vec3) -> f64 {
     let mut e = 0.0;
@@ -194,18 +232,71 @@ fn direct(ev: &Evaluator, point: Vec3, normal: Vec3) -> f64 {
         if dist < 1e-6 {
             continue;
         }
-        let cos_inc = normal.dot(to_light / dist) as f64;
-        if cos_inc <= 0.0 {
+
+        // THE FITTING'S OWN LENGTH, along its own axis.
+        //
+        // `luminous_length` is the emitting body — what a photometric file declares as the size of
+        // the light itself — and it is what the near-field correction is about. The overall
+        // dimension includes housing that emits nothing, so falling back to it would spread flux
+        // over end caps.
+        let len = if prof.luminous_length > 0.0 {
+            prof.luminous_length as f64
+        } else {
+            prof.length as f64
+        };
+        let n = segments_for(len, dist as f64);
+        if n == 1 {
+            let cos_inc = normal.dot(to_light / dist) as f64;
+            if cos_inc <= 0.0 {
+                continue;
+            }
+            let intensity = intensity_toward(prof, lum, point);
+            if intensity <= 0.0 {
+                continue;
+            }
+            if ev.settings.shadows && ev.scene.occluded(point + normal * EPS, lpos) {
+                continue;
+            }
+            e += intensity * cos_inc / (dist as f64 * dist as f64);
             continue;
         }
-        let intensity = intensity_toward(prof, lum, point);
-        if intensity <= 0.0 {
-            continue;
+
+        // Broken into `n` equal pieces along the fitting, each carrying `1/n` of the flux and each
+        // treated as a point — which it now is, being `len/n` long and at least its own length
+        // away. The axis is the fitting's local x, turned by its rotation, matching the convention
+        // `intensity_toward` already uses for the C-planes.
+        let a = (lum.rotation_deg as f64).to_radians();
+        let axis = Vec3::new(a.cos() as f32, a.sin() as f32, 0.0);
+        for k in 0..n {
+            // Piece centres, spread symmetrically about the fitting's own centre.
+            let t = (k as f64 + 0.5) / n as f64 - 0.5;
+            let seg = lpos + axis * (t * len) as f32;
+            let to_seg = seg - point;
+            let d = to_seg.length();
+            if d < 1e-6 {
+                continue;
+            }
+            let cos_inc = normal.dot(to_seg / d) as f64;
+            if cos_inc <= 0.0 {
+                continue;
+            }
+            // THE DISTRIBUTION IS STILL THE WHOLE FITTING'S, asked in the direction from THIS
+            // PIECE to the receiver, then given its share. The file describes one luminaire and
+            // there is no per-segment photometry to be had.
+            //
+            // `intensity_toward` measures from the luminaire's own position, so the point handed
+            // to it is displaced to put the piece's direction where the fitting's centre would
+            // have been: `q - lpos == point - seg`.
+            let q = lpos + (point - seg);
+            let intensity = intensity_toward(prof, lum, q) / n as f64;
+            if intensity <= 0.0 {
+                continue;
+            }
+            if ev.settings.shadows && ev.scene.occluded(point + normal * EPS, seg) {
+                continue;
+            }
+            e += intensity * cos_inc / (d as f64 * d as f64);
         }
-        if ev.settings.shadows && ev.scene.occluded(point + normal * EPS, lpos) {
-            continue;
-        }
-        e += intensity * cos_inc / (dist as f64 * dist as f64);
     }
     e
 }
@@ -1459,3 +1550,226 @@ mod surface_tests {
         }
     }
 }
+
+/// A LUMINAIRE IS NOT A POINT.
+///
+/// Asked as: *"why does it look like point sources here is it because somethings wrong with the ldt
+/// file or our fault?"* — about perfectly round pools of light under 2 m linear luminaires. The
+/// file was blameless: 144 C-planes with 38.5% variation between them, a proper linear
+/// distribution. It was this. Every fitting radiated from its midpoint, so a 2 m line source laid
+/// down a circle where it should lay down a ridge.
+///
+/// Photometric data is FAR-FIELD data. It describes what a fitting looks like from far enough away
+/// that its size has stopped mattering, and the working rule is about five times the largest
+/// luminous dimension — 10 m for a 2 m batten, against the 2 m a lighting plan actually measures
+/// at. Five times closer than the data is valid for.
+///
+/// EVERY TEST HERE USES AN AXIALLY SYMMETRIC DISTRIBUTION, which is the point: with a symmetric
+/// file, a point source can only ever produce a circular pool. Anything that is not a circle came
+/// from the fitting's GEOMETRY, so these separate the near-field correction from the photometry
+/// completely.
+#[cfg(test)]
+mod a_luminaire_is_not_a_point {
+    use super::*;
+    use crate::ies::PhotometryType;
+    use crate::types::default_materials;
+
+    /// A cosine distribution, axially symmetric, with a declared luminous length.
+    fn linear(luminous_length: f64) -> IesProfile {
+        let va: Vec<f64> = (0..=90).map(|d| d as f64).collect();
+        let cd: Vec<f64> = va.iter().map(|g| 1000.0 * g.to_radians().cos()).collect();
+        IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
+            name: "linear".into(),
+            photometry: PhotometryType::C,
+            lumens: -1.0,
+            multiplier: 1.0,
+            vertical_angles: va,
+            horizontal_angles: vec![0.0],
+            candela: vec![cd],
+            watts: 0.0,
+            width: 0.0,
+            length: luminous_length,
+            height: 0.0,
+            luminous_length,
+            luminous_width: 0.048,
+        }
+    }
+
+    /// Direct illuminance on a horizontal surface at `p`, from one fitting at `at`, in free space.
+    ///
+    /// NO ROOM, and no bounces: the near-field question is about the direct term alone, and walls
+    /// would put interreflection into an answer that is supposed to isolate geometry.
+    fn lit(luminous_length: f64, at: Vertex, rotation_deg: f32, p: Vec3) -> f64 {
+        let mut profiles = HashMap::new();
+        profiles.insert("linear".to_string(), linear(luminous_length));
+        let lums = vec![Luminaire {
+            id: 1,
+            profile: "linear".into(),
+            position: at,
+            rotation_deg,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }];
+        let settings = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+        let mats = default_materials();
+        let ev =
+            Evaluator::new(&[], &lums, &profiles, &mats, settings, Maintenance::INITIAL);
+        ev.illuminance(p, Vec3::Z)
+    }
+
+    /// THE POOL UNDER A 2 m BATTEN IS LONGER THAN IT IS WIDE.
+    ///
+    /// The reported symptom, made into a measurement. The distribution is symmetric, so a point
+    /// source gives EXACTLY equal readings along and across; anything else is the fitting's length.
+    #[test]
+    fn a_two_metre_batten_lights_an_ellipse_not_a_circle() {
+        let at = Vertex::new(0.0, 0.0, 2.0); // 2 m above the plane, as a real ceiling is
+        // 1.5 m out, where the ridge is unmistakable. Measured: 112.6 lx along against 93.3 lx
+        // across, a ratio of 1.21. Directly underneath the two are equal by symmetry, which is
+        // correct and says nothing — a test taken there could not fail.
+        let along = lit(2.0, at, 0.0, Vec3::new(1.5, 0.0, 0.0));
+        let across = lit(2.0, at, 0.0, Vec3::new(0.0, 1.5, 0.0));
+        assert!(
+            along > across * 1.15,
+            "0.9 m along the fitting reads {along:.1} lx and 0.9 m across it {across:.1} lx — \
+             {:.1}% apart, which is a round pool under a 2 m line",
+            (along / across - 1.0) * 100.0,
+        );
+    }
+
+    /// THE SUBDIVISION HAS CONVERGED — checked against a sum worked out from first principles.
+    ///
+    /// The engine chooses how many pieces to break a fitting into, and "it is more elongated than
+    /// before" says nothing about whether the NUMBER is right: too few pieces is its own wrong
+    /// answer, and a plausible one. So this compares against an independent reference — four
+    /// hundred point sources along the line, each with its share of the intensity, summed here in
+    /// the test rather than by the code under examination.
+    ///
+    /// The arithmetic is closed form. The distribution is `1000 cos γ`, the fitting faces down and
+    /// the surface faces up, so both `cos γ` and the incidence cosine are `h/d`, and each piece
+    /// contributes `1000·(h/d)·(h/d)/(N·d²)` = `1000·h²/(N·d⁴)`.
+    #[test]
+    fn the_subdivision_agrees_with_a_first_principles_sum() {
+        const H: f64 = 2.0;
+        const LEN: f64 = 2.0;
+        let reference = |p: Vec3| -> f64 {
+            const N: usize = 400;
+            let mut e = 0.0;
+            for k in 0..N {
+                let t = (k as f64 + 0.5) / N as f64 - 0.5;
+                let (sx, sy, sz) = (t * LEN, 0.0, H);
+                let d2 = (p.x as f64 - sx).powi(2) + (p.y as f64 - sy).powi(2) + sz * sz;
+                e += 1000.0 * H * H / (N as f64 * d2 * d2);
+            }
+            e
+        };
+        let at = Vertex::new(0.0, 0.0, H as f32);
+        for (x, y) in [(0.0_f32, 0.0_f32), (0.9, 0.0), (0.0, 0.9), (1.5, 0.0), (0.0, 1.5), (1.2, 1.2)] {
+            let p = Vec3::new(x, y, 0.0);
+            let got = lit(LEN, at, 0.0, p);
+            let want = reference(p);
+            assert!(
+                (got - want).abs() < want * 0.02,
+                "at ({x}, {y}) the engine gives {got:.2} lx and a 400-piece sum {want:.2} lx — \
+                 {:.1}% apart, so the subdivision has not converged",
+                (got / want - 1.0) * 100.0,
+            );
+        }
+    }
+
+    /// AND IT TURNS WITH THE FITTING. The elongation must follow `rotation_deg`, or a plan of
+    /// battens laid the other way would be lit at right angles to the truth.
+    #[test]
+    fn the_pool_turns_with_the_luminaire() {
+        let at = Vertex::new(0.0, 0.0, 2.0);
+        let along_x = lit(2.0, at, 90.0, Vec3::new(1.5, 0.0, 0.0));
+        let along_y = lit(2.0, at, 90.0, Vec3::new(0.0, 1.5, 0.0));
+        assert!(
+            along_y > along_x * 1.15,
+            "turned through a right angle, the pool still runs along x ({along_x:.1} lx against \
+             {along_y:.1} lx across)",
+        );
+    }
+
+    /// A SMALL FITTING IS STILL A POINT, and costs exactly what it always did.
+    ///
+    /// This half matters as much as the other. A downlight is 60 mm across and a point at any
+    /// distance a room contains; paying sixteen times over for every downlight in a building in
+    /// order to fix battens would be a poor trade, and subdividing something that small changes no
+    /// figure anybody can read.
+    #[test]
+    fn a_downlight_is_not_subdivided() {
+        assert_eq!(segments_for(0.06, 2.0), 1, "a 60 mm downlight at 2 m was broken up");
+        assert_eq!(segments_for(0.0, 2.0), 1, "a fitting with no declared size was broken up");
+        assert_eq!(segments_for(2.0, 20.0), 1, "a 2 m batten 20 m away is a point");
+        assert!(segments_for(2.0, 2.0) > 1, "a 2 m batten at 2 m must be broken up");
+        assert!(
+            segments_for(2.0, 0.5) <= MAX_SEGMENTS,
+            "the subdivision is unbounded — a point directly on the fitting would spin",
+        );
+    }
+
+    /// FAR AWAY, THE CORRECTION DISAPPEARS.
+    ///
+    /// The far field is where the photometric file is measured and where the point treatment is
+    /// exactly right, so the two must agree there. This is what says the correction is a NEAR-field
+    /// refinement and not a change to what the file means — if it moved the answer at distance, it
+    /// would be quietly re-scaling every fitting in every project.
+    #[test]
+    fn at_a_distance_it_agrees_with_the_point_answer() {
+        let at = Vertex::new(0.0, 0.0, 30.0);
+        let long = lit(2.0, at, 0.0, Vec3::new(0.0, 0.0, 0.0));
+        let point = lit(0.0, at, 0.0, Vec3::new(0.0, 0.0, 0.0));
+        assert!(
+            (long - point).abs() < point * 1e-9,
+            "at 30 m a 2 m fitting reads {long:.6} lx and a point {point:.6} lx",
+        );
+    }
+
+    /// AND THE LIGHT IS NOT INVENTED OR LOST.
+    ///
+    /// Subdividing shares the flux out; it must not create any. Directly beneath the fitting the
+    /// near-field answer is LOWER than the point answer — that is the physics, since half the
+    /// fitting has moved further away and the inverse square is convex — but the total falling on a
+    /// wide plane underneath must be very nearly unchanged, because the same flux is being
+    /// emitted.
+    #[test]
+    fn breaking_it_up_moves_light_without_making_any() {
+        let at = Vertex::new(0.0, 0.0, 2.0);
+        let under_long = lit(2.0, at, 0.0, Vec3::ZERO);
+        let under_point = lit(0.0, at, 0.0, Vec3::ZERO);
+        assert!(
+            under_long < under_point,
+            "directly under a 2 m fitting reads {under_long:.1} lx against a point's \
+             {under_point:.1} lx — spreading a source over 2 m cannot raise its peak",
+        );
+
+        // Summed over a 12 x 12 m plane at 5 cm pitch: the same flux, differently arranged.
+        let total = |len: f64| -> f64 {
+            let n = 240;
+            let step = 12.0 / n as f64;
+            let mut s = 0.0;
+            for j in 0..n {
+                for i in 0..n {
+                    let x = -6.0 + (i as f64 + 0.5) * step;
+                    let y = -6.0 + (j as f64 + 0.5) * step;
+                    s += lit(len, at, 0.0, Vec3::new(x as f32, y as f32, 0.0)) * step * step;
+                }
+            }
+            s
+        };
+        let (a, b) = (total(2.0), total(0.0));
+        assert!(
+            (a - b).abs() < b * 0.02,
+            "the flux landing on the plane changed by {:.1}% ({a:.0} against {b:.0} lm) — \
+             subdivision moved light rather than sharing it",
+            (a / b - 1.0) * 100.0,
+        );
+    }
+}
+
