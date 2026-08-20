@@ -5050,24 +5050,27 @@ impl CadApp {
         if self.factory.session.is_some() {
             return;
         }
-        let (Some(grid), Some(plane)) = (self.light.grid.as_ref(), self.light.plane.as_ref())
-        else {
-            return;
-        };
-        if grid.values.is_empty() {
+        if self.light.rooms.is_empty() {
             return;
         }
         let maxv = self.light.scale_ceiling();
+        let clip = painter.with_clip_rect(rect);
+        // EVERY ROOM, not just the one in the panel. A plan with two rooms used to show one lit
+        // and one dark, which reads as a room that failed rather than a room nobody calculated.
+        for room in &self.light.rooms {
+        let (grid, plane) = (&room.grid, &room.plane);
+        if grid.values.is_empty() {
+            continue;
+        }
         let dx = plane.width / plane.cols.max(1) as f32;
         let dy = plane.depth / plane.rows.max(1) as f32;
-        let clip = painter.with_clip_rect(rect);
         for row in 0..plane.rows {
             for col in 0..plane.cols {
                 let i = (row * plane.cols + col) as usize;
                 // Cells outside the room are not the room's result and are not painted. A grid is
                 // a rectangle and a room need not be; those cells were computed, but colouring them
                 // reports illuminance on ground the room does not occupy.
-                if self.light.grid_mask.get(i).is_some_and(|inside| !inside) {
+                if room.mask.get(i).is_some_and(|inside| !inside) {
                     continue;
                 }
                 let v = grid.values[i];
@@ -5084,6 +5087,7 @@ impl CadApp {
                 let p1 = self.w2s_m(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
                 clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0, color);
             }
+        }
         }
     }
 

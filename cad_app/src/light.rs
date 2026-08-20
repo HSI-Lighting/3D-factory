@@ -379,6 +379,45 @@ pub struct RoomLayer {
     pub handles: Vec<u64>,
 }
 
+
+/// One room's answer, whole.
+///
+/// A CALCULATION USED TO PRODUCE ONE OF THESE and the app held it in loose fields. With two rooms
+/// on the plan that meant the second calculation overwrote the first — reported as "when i make a
+/// building after doing a calculation for another building the app only generates the calculation
+/// for the last building". Worse, which room you got depended on what happened to be SELECTED,
+/// because `calc_room_polygon` picked the selected room and fell back to "the only one" — so with
+/// two rooms and nothing selected it produced neither, and lit the whole model's bounding box.
+///
+/// So a calculation now produces a LIST of these, one per room, from one shared evaluator. Light
+/// crosses between rooms through openings, which is why the evaluator is built over the whole model
+/// and not per room: the rooms are separate QUESTIONS about one scene, not separate scenes.
+#[derive(Clone)]
+pub struct RoomResult {
+    pub name: String,
+    /// The room's footprint. Empty for a project with no rooms — the whole-model fallback.
+    pub poly: Vec<glam::Vec2>,
+    pub plane: CalcPlane,
+    pub grid: LuxGrid,
+    /// Which cells of `plane` are inside `poly`. Empty when the plane IS the room.
+    pub mask: Vec<bool>,
+    pub plane_en: CalcPlane,
+    pub grid_en: LuxGrid,
+    pub cylindrical_avg: Option<f64>,
+    pub installation: Option<Installation>,
+    /// The fixtures standing in this room, by id.
+    pub fixtures: Vec<u32>,
+    /// A note about a coarsened grid, if this room needed one.
+    pub grid_note: Option<String>,
+}
+
+impl RoomResult {
+    /// The area the density is quoted over, m².
+    pub fn area_m2(&self) -> f64 {
+        (self.plane.width * self.plane.depth) as f64
+    }
+}
+
 /// All lighting UI + engine state, owned by `CadApp`.
 pub struct LightState {
     /// Toggles the Light window (Tools ▸ SIMLUX Light).
@@ -414,6 +453,8 @@ pub struct LightState {
     pub lib_add_open: bool,
     /// The name field for the selected fitting, buffered so typing does not fight the library.
     pub lib_name_buf: String,
+    /// One result per room, in the order the rooms are drawn. See [`RoomResult`].
+    pub rooms: Vec<RoomResult>,
     /// Loaded IES profiles, keyed by name; always contains [`BUILTIN`].
     pub profiles: HashMap<String, IesProfile>,
     /// Profile used for auto-placed / new luminaires.
@@ -631,6 +672,7 @@ impl LightState {
             illuminaire_locked: false,
             lib_add_open: false,
             lib_name_buf: String::new(),
+            rooms: Vec::new(),
             profiles,
             // NOT the built-in. Starting with a fitting already chosen makes the second step of
             // the workflow invisible: every point silently becomes a generic downlight and the
@@ -1415,6 +1457,134 @@ impl LightState {
         }
     }
 
+
+
+    /// Everything about ONE room, from an evaluator already built over the whole scene.
+    ///
+    /// The evaluator is shared deliberately: light crosses between rooms through openings, so the
+    /// rooms are separate QUESTIONS about one scene rather than separate scenes. Building a tree
+    /// per room would be both slower and wrong.
+    fn room_result(
+        &self,
+        ev: &cad_light::Evaluator,
+        lums: &[Luminaire],
+        name: &str,
+        poly: &[glam::Vec2],
+        fallback: (f32, f32, f32, f32),
+    ) -> RoomResult {
+        let (min_x, min_y, max_x, max_y) =
+            if poly.len() >= 3 { self.inset_bounds(poly_bounds(poly)) } else { fallback };
+        let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
+        let (cols, rows) = Self::grid_for(w, d, self.cell_size);
+        let grid_note = self.grid_note(w, d);
+        let plane = CalcPlane {
+            origin: Vertex::new(min_x, min_y, self.plane_height),
+            width: w,
+            depth: d,
+            cols,
+            rows,
+        };
+        let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
+        // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
+        // this changes nothing — which is every case the engine is validated on.
+        let mask = if poly.len() >= 3 { Self::inside_mask(&plane, poly) } else { Vec::new() };
+        if !mask.is_empty() {
+            Self::apply_room_mask(&mut grid, &mask);
+        }
+
+        let plane_en = plane.on_standard_grid();
+        let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
+        if poly.len() >= 3 {
+            let mask_en = Self::inside_mask(&plane_en, poly);
+            if !mask_en.is_empty() {
+                Self::apply_room_mask(&mut grid_en, &mask_en);
+            }
+        }
+
+        // Mean cylindrical illuminance at eye height, on a coarse sub-grid — every point costs 24
+        // azimuth evaluations, so measuring it at the work plane's resolution would multiply the
+        // calculation by twenty-four to refine one room-average figure.
+        let cylindrical_avg = {
+            const N: u32 = 12;
+            let mut sum = 0.0;
+            for r in 0..N {
+                for c in 0..N {
+                    let x = min_x + w * (c as f32 + 0.5) / N as f32;
+                    let y = min_y + d * (r as f32 + 0.5) / N as f32;
+                    sum += ev.cylindrical(glam::Vec3::new(x, y, self.eye_height));
+                }
+            }
+            Some(sum / (N * N) as f64)
+        };
+
+        // THE ROOM'S OWN FITTINGS, and its own load. A power density taken over every fitting in
+        // the building and divided by one room's floor is not a figure about anything.
+        let fixtures = Self::fixtures_in(poly, lums);
+        let mine: Vec<Luminaire> =
+            lums.iter().filter(|l| fixtures.contains(&l.id)).cloned().collect();
+        let installation =
+            Some(installation_summary(&mine, &self.profiles, (w * d) as f64));
+
+        RoomResult {
+            name: name.to_string(),
+            poly: poly.to_vec(),
+            plane,
+            grid,
+            mask,
+            plane_en,
+            grid_en,
+            cylindrical_avg,
+            installation,
+            fixtures,
+            grid_note,
+        }
+    }
+
+    /// Every room to calculate, as `(name, footprint)`.
+    ///
+    /// ALL OF THEM, not the selected one. The old rule — the selected room, or the only room, or
+    /// nothing — meant a plan with two rooms and no selection lit the whole model's bounding box,
+    /// and a plan with a selection lit whichever room the user last clicked. Neither is what
+    /// "Calculate" says it does.
+    ///
+    /// A project with no rooms gets one unnamed target with no footprint, which is the whole-model
+    /// fallback the 2D-only path has always used.
+    fn calc_targets(f: Option<&crate::factory::FactoryState>) -> Vec<(String, Vec<glam::Vec2>)> {
+        let rooms: Vec<(String, Vec<glam::Vec2>)> = f
+            .map(|f| {
+                f.rooms
+                    .iter()
+                    .filter(|r| r.footprint.len() >= 3)
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let name = if r.name.trim().is_empty() {
+                            format!("Room {}", i + 1)
+                        } else {
+                            r.name.trim().to_string()
+                        };
+                        (name, r.footprint.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if rooms.is_empty() {
+            vec![(String::new(), Vec::new())]
+        } else {
+            rooms
+        }
+    }
+
+    /// Which fixtures stand inside `poly`. Every fixture when there is no footprint.
+    fn fixtures_in(poly: &[glam::Vec2], lums: &[Luminaire]) -> Vec<u32> {
+        if poly.len() < 3 {
+            return lums.iter().map(|l| l.id).collect();
+        }
+        lums.iter()
+            .filter(|l| crate::factory::point_in_poly(poly, l.position.x, l.position.y))
+            .map(|l| l.id)
+            .collect()
+    }
+
     /// The polygon the working plane belongs to: the SELECTED room's footprint, else the only
     /// room's, else `None` (a 2D-only project, or a model with no rooms defined).
     ///
@@ -1752,114 +1922,118 @@ impl LightState {
             &meshes, &lums, &profiles, &materials, self.settings, self.maintenance,
         );
         self.note_phase("evaluator", t_phase);
+
+        // EVERY ROOM, from the one evaluator.
         let t_phase = std::time::Instant::now();
-        let mut grid = cad_light::calculate_on(&ev, &plane, self.maintenance);
-        // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
-        // this changes nothing — which is every case the engine is validated on.
-        self.grid_mask = match &room_poly {
-            Some(p) => Self::inside_mask(&plane, p),
-            None => Vec::new(),
-        };
-        if !self.grid_mask.is_empty() {
-            let mask = std::mem::take(&mut self.grid_mask);
-            Self::apply_room_mask(&mut grid, &mask);
-            self.grid_mask = mask;
-        }
-        // THE SAME ROOM ON THE STANDARD'S GRID, computed BESIDE the working one rather than
-        // instead of it — see `LightState::grid_en` for why replacing it would be the wrong way
-        // round. It is cheap: EN 12464-1 asks 17 × 7 cells across a 33 m hall against the working
-        // grid's 132 × 52, so this is a few per cent on top of a calculation already run.
-        let plane_en = plane.on_standard_grid();
+        let targets = Self::calc_targets(factory);
+        let mut results: Vec<RoomResult> = targets
+            .iter()
+            .map(|(name, poly)| {
+                self.room_result(&ev, &lums, name, poly, (min_x, min_y, max_x, max_y))
+            })
+            .collect();
         self.note_phase("grid", t_phase);
-        let t_phase = std::time::Instant::now();
-        let mut grid_en = cad_light::calculate_on(&ev, &plane_en, self.maintenance);
-        // MASKED TO THE ROOM TOO, and to its OWN mask — these are different cells. Skipping it
-        // would reinstate exactly the defect the working grid was fixed for: on an L-shaped room
-        // the minimum becomes a point in the open air outside its own corner. It matters MORE
-        // here, because a coarse grid has fewer cells for one bad one to be diluted by.
-        if let Some(p) = room_poly.as_ref() {
-            let mask_en = Self::inside_mask(&plane_en, p);
-            if !mask_en.is_empty() {
-                Self::apply_room_mask(&mut grid_en, &mask_en);
-            }
-        }
-        // MEAN CYLINDRICAL ILLUMINANCE at eye height — how well the space renders faces and solid
-        // objects, which the horizontal grid cannot report at any resolution.
-        //
-        // On a COARSE sub-grid deliberately: every point costs 24 azimuth evaluations, so measuring
-        // it at the work plane's resolution would multiply the whole calculation by twenty-four to
-        // refine a single room-average figure that a 12 × 12 sample already settles.
-        self.note_phase("grid_en", t_phase);
-        let t_phase = std::time::Instant::now();
-        self.cylindrical_avg = {
-            const N: u32 = 12;
-            let mut sum = 0.0;
-            for r in 0..N {
-                for c in 0..N {
-                    let x = min_x + w * (c as f32 + 0.5) / N as f32;
-                    let y = min_y + d * (r as f32 + 0.5) / N as f32;
-                    sum += ev.cylindrical(glam::Vec3::new(x, y, self.eye_height));
-                }
-            }
-            Some(sum / (N * N) as f64)
-        };
+
         // ROOM SURFACES — walls and ceiling, which EN 12464-1 sets levels for and which the work
         // plane says nothing about.
         //
-        // 1 sample/m² and the same ray settings: this is a room-average figure per surface, and the
-        // cost scales with the room's whole surface area rather than the grid, so a fine sample
-        // here would dominate the calculation to refine a number quoted to the nearest lux.
-        self.note_phase("cylindrical", t_phase);
+        // OVER THE WHOLE MODEL, once. `surface_report_on` groups by MATERIAL, not by room, so
+        // there is no per-room answer to be had from it — the ceiling of a two-room building is one
+        // ceiling as far as the material table is concerned. Reported as its own section rather
+        // than repeated under each room, which would state the same building-wide figure twice as
+        // though it were two measurements.
         let t_phase = std::time::Instant::now();
-        self.surfaces = cad_light::surface_report_on(
-            &ev,
-            &meshes,
-            &lums,
-            &self.materials,
-            1.0,
-        );
+        self.surfaces = cad_light::surface_report_on(&ev, &meshes, &lums, &self.materials, 1.0);
         self.note_phase("surfaces", t_phase);
         self.last_timings.push(("scene_tris", scene_tris as f64));
-        // What the scheme costs to run, over the area actually assessed. The calculation plane's
-        // extent, not the true floor area — for an L-shaped room those differ, and the honest thing
-        // is to say which one the density is per, which the UI does.
-        self.installation =
-            Some(installation_summary(&lums, &self.profiles, (w * d) as f64));
-        // A point with no fitting emits nothing, and a result computed from half a layout looks
-        // exactly like a result computed from all of it. Say so, on the same line as the numbers.
+
+        // THE PRIMARY RESULT is what the single-room panel, the 3D view and the overlay legend all
+        // read. The room whose geometry is selected, else the first — so clicking a room and
+        // pressing Calculate still puts that room in the panel, which is the gesture people have.
+        let primary = factory
+            .and_then(|f| {
+                results.iter().position(|r| {
+                    f.rooms.iter().any(|room| {
+                        room.name.trim() == r.name.trim()
+                            && room
+                                .floor
+                                .iter()
+                                .chain(room.ceiling.iter())
+                                .chain(room.walls.iter())
+                                .chain(room.carve.iter())
+                                .any(|id| f.selection.contains(id))
+                    })
+                })
+            })
+            .unwrap_or(0);
+
         let waiting = self.unassigned_count();
-        self.last_msg = format!(
-            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx maintained (MF {:.2}) · U₀ {:.2}{}",
-            cols,
-            rows,
-            grid.avg,
-            grid.min,
-            grid.max,
-            grid.maintenance,
-            grid.u0(),
-            match waiting {
-                0 => String::new(),
-                n => format!("  ⚠ {n} point(s) have no fitting and emit nothing — pick one in ▼ Fittings"),
-            },
-        );
-        // A COARSENED GRID SAYS SO. Every figure on this line moves with grid resolution, so
-        // presenting one computed at a spacing nobody asked for as though it were the requested
-        // one is the part that matters — a coarser grid is a defensible answer to an enormous
-        // room, and silence about it is not.
-        if let Some(note) = grid_note {
+        let p = &results[primary];
+        self.last_msg = if results.len() > 1 {
+            format!(
+                "{} rooms · {}",
+                results.len(),
+                results
+                    .iter()
+                    .map(|r| format!("{}: {:.0} lx avg, U0 {:.2}", r.name, r.grid.avg, r.grid.u0()))
+                    .collect::<Vec<_>>()
+                    .join("  ·  "),
+            )
+        } else {
+            format!(
+                "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx maintained (MF {:.2}) · U₀ {:.2}",
+                p.plane.cols,
+                p.plane.rows,
+                p.grid.avg,
+                p.grid.min,
+                p.grid.max,
+                p.grid.maintenance,
+                p.grid.u0(),
+            )
+        };
+        if waiting > 0 {
+            self.last_msg.push_str(&format!(
+                "  ⚠ {waiting} point(s) have no fitting and emit nothing — pick one in ▼ Fittings"
+            ));
+        }
+        // A COARSENED GRID SAYS SO. Every figure moves with grid resolution, so presenting one
+        // computed at a spacing nobody asked for as though it were the requested one is the part
+        // that matters.
+        if let Some(note) = results.iter().find_map(|r| r.grid_note.clone()) {
             self.last_msg.push_str("  ⚠ ");
             self.last_msg.push_str(&note);
         }
-        self.grid = Some(grid);
-        self.plane = Some(plane);
-        self.grid_en = Some(grid_en);
-        self.plane_en = Some(plane_en);
+
+        let p = results.swap_remove(primary);
+        self.grid = Some(p.grid.clone());
+        self.plane = Some(p.plane);
+        self.grid_en = Some(p.grid_en.clone());
+        self.plane_en = Some(p.plane_en);
+        self.grid_mask = p.mask.clone();
+        self.cylindrical_avg = p.cylindrical_avg;
+        self.installation = p.installation.clone();
+        // Put it back where it was, so the report reads the rooms in the order they are drawn
+        // rather than in the order the panel happened to want one of them.
+        results.insert(primary, p);
+        self.rooms = results;
+
         self.meshes = meshes;
         self.show_overlay = true;
 
-        // Fit the orbit camera to the room.
-        self.cam_target = [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * self.room_height];
-        let diag = (w * w + d * d + self.room_height * self.room_height).sqrt();
+        // Fit the orbit camera to everything calculated, not to one room of it.
+        let (cx, cy) = {
+            let n = self.rooms.len().max(1) as f32;
+            let sx: f32 = self.rooms.iter().map(|r| r.plane.origin.x + r.plane.width * 0.5).sum();
+            let sy: f32 = self.rooms.iter().map(|r| r.plane.origin.y + r.plane.depth * 0.5).sum();
+            (sx / n, sy / n)
+        };
+        self.cam_target = [cx, cy, 0.5 * self.room_height];
+        let span = self
+            .rooms
+            .iter()
+            .map(|r| (r.plane.width * r.plane.width + r.plane.depth * r.plane.depth).sqrt())
+            .fold(0.0_f32, f32::max);
+        let diag = (span * span + self.room_height * self.room_height).sqrt();
         self.cam_dist = (diag * 1.3).max(3.0);
     }
 
@@ -3136,15 +3310,81 @@ mod uniformity_is_quoted_with_its_grid {
     /// AND IT IS MASKED TO THE ROOM TOO. The working grid drops cells outside an L-shaped room,
     /// because averaging in the outside of its own corner made U₀'s minimum a point in open air.
     /// A second grid that skipped that would carry exactly the defect the first one was fixed for.
+    ///
+    /// TESTED BY CALCULATING, not by reading the source. This used to search the text of
+    /// `calculate` for `apply_room_mask(&mut grid_en` — which passed for the right reason until
+    /// the calculation was split to handle several rooms, and then failed while the masking it
+    /// names was still happening, one function along. A test that greps for an implementation can
+    /// only ever report where the code is, not what it does.
     #[test]
     fn the_standard_grid_is_masked_to_the_room_like_the_working_one() {
-        let src = include_str!("light.rs");
-        let a = src.find("fn calculate(&mut self").expect("the calculation");
-        let b = src[a..].find("\n    pub fn ").map(|e| a + e).unwrap_or(src.len());
-        let body = &src[a..b];
+        // An L: 12 x 12 with the top-right 6 x 6 removed, lit only in the tall leg — so the
+        // missing corner is the darkest ground the rectangle covers.
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(12.0, 0.0),
+            glam::Vec2::new(12.0, 6.0),
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(6.0, 12.0),
+            glam::Vec2::new(0.0, 12.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&poly, 3.0).expect("building");
+        f.add_room(&poly).expect("room");
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.5;
+        for (i, (x, y)) in [(3.0, 3.0), (9.0, 3.0), (3.0, 9.0)].into_iter().enumerate() {
+            s.luminaires.push(Luminaire {
+                id: i as u32 + 1,
+                profile: BUILTIN.to_string(),
+                position: Vertex::new(x, y, 2.7),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        s.calculate(&Document::default(), Some(&f));
+
+        let ge = s.grid_en.as_ref().expect("a standard grid");
+        let en = s.plane_en.as_ref().expect("a standard plane");
+        // The cut-out corner is inside the RECTANGLE and outside the ROOM. Its cells are the
+        // darkest the rectangle covers, so an unmasked minimum lands there.
+        let mask = LightState::inside_mask(en, &poly);
         assert!(
-            body.contains("apply_room_mask(&mut grid_en"),
-            "the standard grid is not masked to the room, so its minimum can be a point outside it",
+            mask.iter().any(|k| !*k),
+            "precondition: the standard grid must cover ground outside the L",
+        );
+        let outside_min = ge
+            .values
+            .iter()
+            .zip(mask.iter())
+            .filter(|(_, inside)| !**inside)
+            .map(|(v, _)| *v)
+            .fold(f64::MAX, f64::min);
+        assert!(
+            ge.min > outside_min + 1e-9,
+            "the standard grid's minimum is {:.3} lx, which is the darkest cell OUTSIDE the room \
+             ({outside_min:.3} lx) — it was not masked",
+            ge.min,
+        );
+        // …and the room's own minimum is what it reports.
+        let inside_min = ge
+            .values
+            .iter()
+            .zip(mask.iter())
+            .filter(|(_, inside)| **inside)
+            .map(|(v, _)| *v)
+            .fold(f64::MAX, f64::min);
+        assert!(
+            (ge.min - inside_min).abs() < 1e-6,
+            "reported {:.3} lx, the room's darkest cell is {inside_min:.3} lx",
+            ge.min,
         );
     }
 
@@ -4866,5 +5106,153 @@ mod reopening_relinks_fittings_to_their_blocks {
         let fixed = repair_from_blocks(&mut lums, &doc, &map(&[("OCULUS", "OCULUS 3000K")]));
         assert_eq!(fixed, 0);
         assert_eq!(lums[0].from_block, None);
+    }
+}
+
+/// EVERY ROOM IS CALCULATED, not the last one.
+///
+/// Reported as "when i make a building after doing a calculation for another building the app only
+/// generates the calculation for the last building. i when i hit calculate it should calculate for
+/// all." The cause was `calc_room_polygon`: the room whose geometry is SELECTED, else the only
+/// room, else nothing. Two rooms and a selection gave whichever was clicked; two rooms and no
+/// selection gave neither, and lit the whole model's bounding box instead.
+#[cfg(test)]
+mod every_room_is_calculated {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, d: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(x, y),
+            glam::Vec2::new(x + w, y),
+            glam::Vec2::new(x + w, y + d),
+            glam::Vec2::new(x, y + d),
+            glam::Vec2::new(x, y),
+        ]
+    }
+
+    /// Two rooms side by side, each with its own fittings.
+    fn two_rooms() -> (crate::factory::FactoryState, LightState) {
+        let a = rect(0.0, 0.0, 8.0, 6.0);
+        let b = rect(14.0, 0.0, 6.0, 6.0);
+        let mut f = crate::factory::FactoryState::default();
+        for r in [&a, &b] {
+            f.add_building_outline(r, 3.0).expect("building");
+            f.add_room(r).expect("room");
+        }
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.5;
+        let mut id = 0;
+        for (cx, cy) in [(2.0, 3.0), (6.0, 3.0), (16.0, 2.0), (18.0, 4.0)] {
+            id += 1;
+            s.luminaires.push(Luminaire {
+                id,
+                profile: BUILTIN.to_string(),
+                position: Vertex::new(cx, cy, 2.7),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        (f, s)
+    }
+
+    /// BOTH ROOMS GET AN ANSWER, and each is a lit room rather than a bounding box.
+    #[test]
+    fn two_rooms_produce_two_results() {
+        let (f, mut s) = two_rooms();
+        s.calculate(&Document::default(), Some(&f));
+        assert_eq!(s.rooms.len(), 2, "a calculation produced {} result(s)", s.rooms.len());
+        for r in &s.rooms {
+            assert!(r.grid.avg > 1.0, "{} came out at {:.2} lx — it was not lit", r.name, r.grid.avg);
+            assert!(r.plane.cols > 0 && r.plane.rows > 0, "{} has no grid", r.name);
+        }
+    }
+
+    /// EACH RESULT IS THAT ROOM, not the whole model. Two rooms 14 m apart have planes that do not
+    /// overlap; a bounding-box calculation would give both of them the same span.
+    #[test]
+    fn each_result_covers_its_own_room() {
+        let (f, mut s) = two_rooms();
+        s.calculate(&Document::default(), Some(&f));
+        let spans: Vec<(f32, f32)> = s
+            .rooms
+            .iter()
+            .map(|r| (r.plane.origin.x, r.plane.origin.x + r.plane.width))
+            .collect();
+        assert_eq!(spans.len(), 2);
+        let (a, b) = (spans[0], spans[1]);
+        assert!(
+            a.1 < b.0 + 1e-3 || b.1 < a.0 + 1e-3,
+            "the two planes overlap ({a:?} and {b:?}) — this is one bounding box, not two rooms",
+        );
+        for (lo, hi) in spans {
+            assert!(hi - lo < 12.0, "a plane spans {:.1} m — wider than either room", hi - lo);
+        }
+    }
+
+    /// THE FITTINGS ARE SPLIT BETWEEN THEM. A power density taken over every fitting in the
+    /// building and divided by one room's floor is not a figure about anything.
+    #[test]
+    fn each_room_counts_only_its_own_fittings() {
+        let (f, mut s) = two_rooms();
+        s.calculate(&Document::default(), Some(&f));
+        let total: usize = s.rooms.iter().map(|r| r.fixtures.len()).sum();
+        assert_eq!(total, 4, "the four fittings were counted {total} times between the rooms");
+        for r in &s.rooms {
+            assert_eq!(r.fixtures.len(), 2, "{} claims {} fittings", r.name, r.fixtures.len());
+            let i = r.installation.as_ref().expect("an installation summary");
+            assert_eq!(i.count, 2, "{}'s load is over {} fittings", r.name, i.count);
+        }
+    }
+
+    /// A SELECTION STILL DECIDES WHICH ROOM THE PANEL SHOWS — the gesture people already have —
+    /// but it no longer decides which rooms are CALCULATED.
+    #[test]
+    fn selecting_a_room_chooses_the_panel_not_the_scope() {
+        let (mut f, mut s) = two_rooms();
+        // Select the second room's floor.
+        let second = f.rooms[1].floor.expect("a floor");
+        f.selection = vec![second];
+        s.calculate(&Document::default(), Some(&f));
+
+        assert_eq!(s.rooms.len(), 2, "selecting a room narrowed the calculation to it");
+        let panel = s.plane.as_ref().expect("a primary plane");
+        assert!(
+            (panel.origin.x - s.rooms[1].plane.origin.x).abs() < 1e-6,
+            "the panel is showing the room that was not selected",
+        );
+        // …and the rooms stay in drawing order, so a report does not shuffle when one is clicked.
+        assert!(s.rooms[0].plane.origin.x < s.rooms[1].plane.origin.x, "the rooms were reordered");
+    }
+
+    /// A PROJECT WITH NO ROOMS still gets exactly one answer — the whole-model fallback the 2D-only
+    /// path has always used. This is the case the 1,600 tests before it all exercise.
+    #[test]
+    fn a_project_with_no_rooms_still_gets_one_result() {
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.luminaires.push(Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(2.0, 2.0, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        let mut doc = Document::default();
+        doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: cad_kernel::Vec2::new(0.0, 0.0),
+            b: cad_kernel::Vec2::new(4.0, 4.0),
+        })));
+        s.calculate(&doc, None);
+        assert_eq!(s.rooms.len(), 1);
+        assert!(s.grid.is_some(), "the primary result is still filled in");
     }
 }
