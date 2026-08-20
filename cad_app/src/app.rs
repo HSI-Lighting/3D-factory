@@ -2128,6 +2128,18 @@ pub struct CadApp {
     photometry_wants_folder: bool,
     /// The next Open pick is a BLOCK LIBRARY for Illuminaire, not a project to open.
     illuminaire_wants_blocks: bool,
+    // ---- report ----
+    report_open: bool,
+    report_opts: crate::report::Options,
+    report_page: usize,
+    /// A preview texture per report image, parallel to `report_opts.images`.
+    report_tex: Vec<Option<egui::TextureHandle>>,
+    /// An image was added without a `Context` to make its texture from — the next frame has one.
+    report_tex_dirty: bool,
+    /// The next folder pick is the report's output directory.
+    report_wants_dir: bool,
+    /// The next image pick is a report render.
+    report_wants_images: bool,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
     ///
     /// A FIELD rather than the bare constant, for two reasons. It is the kind of limit a user with
@@ -3966,6 +3978,13 @@ impl Default for CadApp {
             texset_target: None,
             photometry_wants_folder: false,
             illuminaire_wants_blocks: false,
+            report_open: false,
+            report_opts: crate::report::Options::default(),
+            report_page: 0,
+            report_tex: Vec::new(),
+            report_tex_dirty: false,
+            report_wants_dir: false,
+            report_wants_images: false,
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
             villa_autoloaded: false,
@@ -26379,27 +26398,12 @@ impl CadApp {
         }
     }
 
-    /// Write the SIMLUX calculation out as a standalone HTML report.
-    ///
-    /// Beside the drawing when there is one, so the report files itself with the project it belongs
-    /// to; on the Desktop otherwise, because a report written somewhere the user cannot find is the
-    /// same as no report.
-    fn export_light_report(&mut self) {
-        let Some(grid) = self.light.grid.as_ref() else {
-            self.light.last_msg = "Nothing to report — press Calculate first.".into();
-            return;
-        };
-        let Some(plane) = self.light.plane.as_ref() else { return };
 
-        let title = self
-            .current_file
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Untitled".to_string());
-
-        let html = crate::light_report::render(&crate::light_report::ReportInput {
-            title: title.clone(),
+    /// Gather the state the report is built from. `None` when nothing has been calculated.
+    fn report_input(&self) -> Option<crate::report::layout::Input<'_>> {
+        let grid = self.light.grid.as_ref()?;
+        let plane = self.light.plane.as_ref()?;
+        Some(crate::report::layout::Input {
             grid,
             plane,
             maintenance: self.light.maintenance,
@@ -26416,30 +26420,233 @@ impl CadApp {
                 .collect(),
             unassigned: self.light.unassigned_count(),
             // The report is drawn in the SAME palette and at the SAME scale as the screen, so what
-            // gets filed matches what was looked at. Both are stated on the page — a false-colour
-            // plot whose top is unstated is a picture, not a result.
+            // gets filed matches what was looked at.
             ramp: self.light.ramp.rgb_fn(),
             scale_top: self.light.scale_ceiling(),
             scale_auto: self.light.scale_max.is_none(),
             mask: self.light.grid_mask.clone(),
-        });
+        })
+    }
 
-        let out = match self.current_file.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
-            Some(dir) => dir.join(format!("{title}-simlux-report.html")),
-            None => {
-                let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into());
-                std::path::PathBuf::from(home).join("Desktop").join("simlux-report.html")
+    /// Open the report dialog. Replaces the old behaviour, which wrote an HTML file to the Desktop
+    /// and told you afterwards.
+    fn export_light_report(&mut self) {
+        if self.light.grid.is_none() {
+            self.light.last_msg = "Nothing to report — press Calculate first.".into();
+            return;
+        }
+        // Fill in what can be known without asking, so the dialog opens ready rather than blank.
+        if self.report_opts.title.trim().is_empty() {
+            self.report_opts.title = self.report_default_name();
+        }
+        if self.report_opts.file_stem.trim().is_empty() {
+            self.report_opts.file_stem = format!("{}-lighting", self.report_default_name());
+        }
+        if self.report_opts.out_dir.trim().is_empty() {
+            // Beside the drawing, which is where a report belongs — with the project, not in the
+            // pile on someone's Desktop.
+            if let Some(d) = self.current_file.as_ref().and_then(|p| p.parent()) {
+                self.report_opts.out_dir = d.to_string_lossy().into_owned();
+            }
+        }
+        self.report_open = true;
+    }
+
+    fn report_default_name(&self) -> String {
+        self.current_file
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".to_string())
+    }
+
+    /// The report dialog. Bails if closed.
+    fn render_report_dialog(&mut self, ctx: &egui::Context) {
+        if !self.report_open {
+            return;
+        }
+        // THE PREVIEW IS THE DOCUMENT, so it is laid out from the same state and the same options
+        // the writer will use — every frame, because every option changes it.
+        let Some(inp) = self.report_input() else {
+            self.report_open = false;
+            return;
+        };
+        let doc = crate::report::layout::layout(&inp, &self.report_opts);
+
+        let mut opts = std::mem::take(&mut self.report_opts);
+        let mut open = self.report_open;
+        let mut page = self.report_page;
+        let tex = std::mem::take(&mut self.report_tex);
+        let can_capture = self.pt_job.is_some();
+        let act = crate::report::ui::window_ui(
+            ctx,
+            &mut open,
+            &mut opts,
+            &doc,
+            &mut page,
+            &tex,
+            can_capture,
+        );
+        self.report_opts = opts;
+        self.report_tex = tex;
+        self.report_page = page;
+        self.report_open = open;
+
+        if act.browse_dir {
+            self.report_wants_dir = true;
+            self.open_file_dialog(FileDialogMode::PickFolder, "");
+        }
+        if act.add_images {
+            self.report_wants_images = true;
+            self.open_file_dialog(FileDialogMode::ImportImage, "");
+        }
+        if let Some(i) = act.remove_image {
+            self.report_remove_image(i);
+        }
+        if act.capture_render {
+            self.report_capture_render();
+        }
+        if act.save {
+            self.write_report();
+        }
+    }
+
+    /// Drop a report image, keeping everything that points at one pointing at the right one.
+    ///
+    /// The cover names an image by INDEX, and every index after the removed one moves down — so a
+    /// cover left alone would quietly show a different picture, which is the kind of mistake that
+    /// reaches a client. The preview textures are a parallel list and go the same way.
+    fn report_remove_image(&mut self, i: usize) {
+        if i >= self.report_opts.images.len() {
+            return;
+        }
+        self.report_opts.images.remove(i);
+        if i < self.report_tex.len() {
+            self.report_tex.remove(i);
+        }
+        self.report_opts.cover_image = match self.report_opts.cover_image {
+            Some(c) if c == i => None,
+            Some(c) if c > i => Some(c - 1),
+            other => other,
+        };
+    }
+
+
+    /// Load an image file for the report, as JPEG bytes plus a preview texture.
+    fn report_add_image(&mut self, path: &str, ctx: Option<&egui::Context>) {
+        let img = match image::open(path) {
+            Ok(i) => i.to_rgb8(),
+            Err(e) => {
+                self.history.push(format!("  ! report: could not read {path} — {e}"));
+                return;
             }
         };
-        match std::fs::write(&out, html) {
+        let (w, h) = (img.width(), img.height());
+        self.report_push_image(path.to_string(), img.into_raw(), w, h, ctx);
+    }
+
+    /// Shared by the file loader and the render capture: RGB8 in, report image out.
+    fn report_push_image(
+        &mut self,
+        path: String,
+        rgb: Vec<u8>,
+        w: u32,
+        h: u32,
+        ctx: Option<&egui::Context>,
+    ) {
+        // A REPORT IMAGE IS RESIZED ON THE WAY IN. A 6000-pixel render embedded whole makes a
+        // 40 MB PDF nobody can email, and it is being printed into a box a few inches across —
+        // 1600 across is more than any of that can show.
+        const MAX: u32 = 1600;
+        let (rgb, w, h) = if w > MAX || h > MAX {
+            let k = (MAX as f32 / w as f32).min(MAX as f32 / h as f32);
+            let (nw, nh) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+            let src = image::RgbImage::from_raw(w, h, rgb).expect("rgb buffer matches its size");
+            let dst = image::imageops::resize(&src, nw, nh, image::imageops::FilterType::Triangle);
+            (dst.into_raw(), nw, nh)
+        } else {
+            (rgb, w, h)
+        };
+
+        let mut jpeg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 88);
+        let mut enc = enc;
+        if let Err(e) = enc.encode(&rgb, w, h, image::ExtendedColorType::Rgb8) {
+            self.history.push(format!("  ! report: could not encode {path} — {e}"));
+            return;
+        }
+
+        let tex = ctx.map(|c| {
+            let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
+            c.load_texture(format!("report_img_{}", self.report_opts.images.len()), img, Default::default())
+        });
+        self.report_opts.images.push(crate::report::ReportImage {
+            caption: String::new(),
+            path: path.clone(),
+            jpeg: Some((jpeg, w, h)),
+        });
+        self.report_tex.push(tex);
+        self.history.push(format!("  report: added {} ({w}×{h})", file_stem_of(&path)));
+    }
+
+    /// Take the current path-traced render as a report image.
+    fn report_capture_render(&mut self) {
+        let Some(job) = self.pt_job.as_ref() else {
+            self.light.last_msg = "No render to capture — start one first.".into();
+            return;
+        };
+        let Some((w, h, rgba)) = job.snapshot_rgba() else {
+            self.light.last_msg = "The render has not produced a frame yet.".into();
+            return;
+        };
+        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+        self.report_push_image("render".into(), rgb, w as u32, h as u32, None);
+        self.report_tex_dirty = true;
+    }
+
+    /// Write the report where the dialog says.
+    fn write_report(&mut self) {
+        let Some(inp) = self.report_input() else { return };
+        let path = self.report_opts.out_path();
+        let bytes: Vec<u8> = match self.report_opts.format {
+            crate::report::Format::Pdf => {
+                crate::report::layout::layout(&inp, &self.report_opts).write()
+            }
+            crate::report::Format::Html => crate::light_report::render(&crate::light_report::ReportInput {
+                title: self.report_opts.title.clone(),
+                grid: inp.grid,
+                plane: inp.plane,
+                maintenance: inp.maintenance,
+                installation: inp.installation,
+                surfaces: inp.surfaces,
+                cylindrical_avg: inp.cylindrical_avg,
+                eye_height: inp.eye_height,
+                room_height: inp.room_height,
+                materials: inp.materials.clone(),
+                unassigned: inp.unassigned,
+                ramp: inp.ramp,
+                scale_top: inp.scale_top,
+                scale_auto: inp.scale_auto,
+                mask: inp.mask.clone(),
+                sections: self.report_opts.sections.clone(),
+                images: self
+                    .report_opts
+                    .images
+                    .iter()
+                    .filter_map(|i| i.jpeg.as_ref().map(|(b, _, _)| (b.clone(), i.caption.clone())))
+                    .collect(),
+            })
+            .into_bytes(),
+        };
+        match std::fs::write(&path, bytes) {
             Ok(()) => {
-                let msg = format!("Report written to {}", out.display());
+                let msg = format!("Report written to {}", path.display());
                 self.history.push(format!("  {msg}"));
                 self.light.last_msg = msg;
+                self.report_open = false;
             }
             Err(e) => {
-                let msg = format!("Could not write {}: {e}", out.display());
+                let msg = format!("Could not write {}: {e}", path.display());
                 self.history.push(format!("  ! {msg}"));
                 self.light.last_msg = msg;
             }
@@ -29543,7 +29750,9 @@ impl CadApp {
     /// It was titled "Choose output folder · Radiance render" for all three, so asking the Light
     /// Editor for a photometry folder opened a window announcing a render nobody had started.
     fn folder_dialog_title(&self) -> &'static str {
-        if self.photometry_wants_folder {
+        if self.report_wants_dir {
+            "Choose where the report goes"
+        } else if self.photometry_wants_folder {
             "Choose the folder your .ies / .ldt files are in"
         } else if self.texset_target.is_some() {
             "Choose a PBR texture-set folder"
@@ -29934,7 +30143,13 @@ impl CadApp {
                 }
                 FileDialogMode::ImportImage => {
                     let path = dlg.dir.join(name);
-                    self.do_import_image(&path.to_string_lossy());
+                    // The same browser, asked for by two callers — a raster to trace, or a render
+                    // for the report.
+                    if std::mem::take(&mut self.report_wants_images) {
+                        self.report_add_image(&path.to_string_lossy(), Some(ctx));
+                    } else {
+                        self.do_import_image(&path.to_string_lossy());
+                    }
                 }
                 FileDialogMode::ImportRaster => {
                     let path = dlg.dir.join(name);
@@ -29996,7 +30211,9 @@ impl CadApp {
                     let dir = if name.is_empty() { dlg.dir.clone() } else { dlg.dir.join(name) };
                     // …or the Light Editor's photometry folder, scanned as soon as it is chosen so
                     // the right-hand list fills in without a second click.
-                    if self.photometry_wants_folder {
+                    if std::mem::take(&mut self.report_wants_dir) {
+                        self.report_opts.out_dir = dir.to_string_lossy().into_owned();
+                    } else if self.photometry_wants_folder {
                         self.photometry_wants_folder = false;
                         self.light.lib_folder = dir.to_string_lossy().into_owned();
                         self.light.lib_scanned =
@@ -41940,6 +42157,7 @@ impl eframe::App for CadApp {
         self.render_light_panel(ctx);
         // Illuminaire (SIMLUX menu ▸ Illuminaire) — the fitting library. Bails if closed.
         self.render_illuminaire(ctx);
+        self.render_report_dialog(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_shortcuts_window(ctx);
         self.render_light_3d_panel(ctx);
@@ -61522,5 +61740,170 @@ mod fixtures_are_undoable {
         app.place_fixture_point(2.0, 1.0);
         app.do_undo();
         assert!(app.light.grid.is_none(), "a stale lux grid survived the undo");
+    }
+}
+
+/// THE REPORT BUTTON OPENS A DIALOG. It used to write an HTML file to the Desktop and tell you
+/// afterwards, which is neither a choice nor a place anyone keeps a project.
+#[cfg(test)]
+mod the_report_is_asked_about_before_it_is_written {
+    use super::*;
+
+    fn calculated() -> CadApp {
+        let mut app = CadApp::default();
+        app.light.grid = Some(cad_light::LuxGrid {
+            cols: 4,
+            rows: 4,
+            values: (0..16).map(|i| 100.0 + i as f64 * 10.0).collect(),
+            min: 100.0,
+            max: 250.0,
+            avg: 175.0,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        });
+        app.light.plane = Some(cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 4.0,
+            cols: 4,
+            rows: 4,
+        });
+        app
+    }
+
+    fn frame(app: &mut CadApp) -> usize {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| app.render_report_dialog(ctx));
+        out.shapes.len()
+    }
+
+    /// NOTHING IS WRITTEN UNTIL IT IS ASKED FOR, and the button opens the dialog instead.
+    #[test]
+    fn pressing_report_opens_the_dialog_and_writes_nothing() {
+        let mut app = calculated();
+        assert!(!app.report_open);
+        app.export_light_report();
+        assert!(app.report_open, "the dialog did not open");
+        // No output path has been chosen, so there is nothing it could have written to.
+        assert!(app.report_opts.out_dir.is_empty() || app.current_file.is_some());
+    }
+
+    /// WITH NOTHING CALCULATED IT SAYS SO rather than opening a dialog over an empty document.
+    #[test]
+    fn without_a_calculation_the_dialog_stays_shut() {
+        let mut app = CadApp::default();
+        app.export_light_report();
+        assert!(!app.report_open, "the dialog opened with nothing to report");
+        assert!(app.light.last_msg.contains("Calculate"), "and it must say why");
+    }
+
+    /// THE DIALOG DRAWS — every panel, with a preview of a real document.
+    #[test]
+    fn the_dialog_and_its_preview_run() {
+        let mut app = calculated();
+        app.export_light_report();
+        let shapes = frame(&mut app);
+        assert!(shapes > 0, "the dialog drew nothing");
+        assert!(app.report_open, "it closed itself");
+    }
+
+    /// THE PREVIEW IS THE DOCUMENT. Turning a section off has to change the pages on screen, or
+    /// the preview is a picture of a report rather than of THIS report.
+    #[test]
+    fn the_preview_follows_the_options() {
+        let mut app = calculated();
+        app.export_light_report();
+        let inp = app.report_input().expect("a calculation");
+        let with_grid = crate::report::layout::layout(&inp, &app.report_opts).pages.len();
+        drop(inp);
+
+        app.report_opts.set(crate::report::Section::NumericGrid, false);
+        app.report_opts.set(crate::report::Section::FalseColour, false);
+        let inp = app.report_input().expect("a calculation");
+        let without = crate::report::layout::layout(&inp, &app.report_opts);
+        assert!(
+            !without
+                .pages
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .any(|i| matches!(i, crate::report::pdf::Item::Text { text, .. }
+                                  if text == "Illuminance grid (lx)")),
+            "the grid is still in the document after being switched off",
+        );
+        assert!(without.pages.len() <= with_grid, "dropping sections made it longer");
+    }
+
+    /// THE FILE GOES WHERE THE DIALOG SAYS, in the format it says.
+    #[test]
+    fn the_report_is_written_where_it_was_asked_for() {
+        let dir = std::env::temp_dir().join("simlux_report_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+
+        let mut app = calculated();
+        app.export_light_report();
+        app.report_opts.out_dir = dir.to_string_lossy().into_owned();
+        app.report_opts.file_stem = "gym".into();
+        app.report_opts.title = "Gym".into();
+
+        app.report_opts.format = crate::report::Format::Pdf;
+        app.write_report();
+        let pdf = dir.join("gym.pdf");
+        assert!(pdf.is_file(), "no PDF was written");
+        let bytes = std::fs::read(&pdf).expect("read");
+        assert!(bytes.starts_with(b"%PDF-"), "the PDF is not a PDF");
+        assert!(bytes.ends_with(b"%%EOF\n"), "the PDF did not finish");
+        assert!(!app.report_open, "the dialog stayed open after a successful save");
+
+        app.report_open = true;
+        app.report_opts.format = crate::report::Format::Html;
+        app.write_report();
+        let html = dir.join("gym.html");
+        assert!(html.is_file(), "no HTML was written");
+        let text = std::fs::read_to_string(&html).expect("read");
+        assert!(text.starts_with("<!doctype html>"), "the HTML is not HTML");
+        assert!(text.contains("Gym"), "the title did not reach the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REMOVING AN IMAGE DOES NOT LEAVE THE COVER POINTING AT ANOTHER ONE.
+    ///
+    /// The cover names an image by INDEX, and every index after the removed one moves down — so a
+    /// cover left alone would quietly show a different picture, which is the kind of mistake that
+    /// reaches a client.
+    #[test]
+    fn removing_an_image_repoints_the_cover() {
+        let mut app = calculated();
+        for n in ["a", "b", "c"] {
+            app.report_opts.images.push(crate::report::ReportImage {
+                path: format!("{n}.jpg"),
+                caption: n.into(),
+                jpeg: Some((vec![0xFF, 0xD8], 10, 10)),
+            });
+            app.report_tex.push(None);
+        }
+
+        // Removing an EARLIER image slides the chosen one down.
+        app.report_opts.cover_image = Some(2);
+        app.report_open = true;
+        app.report_remove_image(0);
+        assert_eq!(app.report_opts.cover_image, Some(1), "the cover follows its image");
+        assert_eq!(app.report_opts.images[1].caption, "c");
+
+        // Removing the chosen one clears it rather than pointing somewhere arbitrary.
+        app.report_opts.cover_image = Some(1);
+        app.report_remove_image(1);
+        assert_eq!(app.report_opts.cover_image, None, "the cover kept a dead index");
+        assert_eq!(app.report_opts.images.len(), 1);
+        assert_eq!(app.report_tex.len(), 1, "the preview textures went out of step");
     }
 }

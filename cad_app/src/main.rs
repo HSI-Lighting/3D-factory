@@ -15,6 +15,7 @@ mod hatch_trace;
 mod light;
 mod illuminaire; // Illuminaire — a library of fittings: a 2D block + a photometric file
 mod light_report; // the SIMLUX calculation written out as a standalone HTML report
+mod report; // report generation — page layout, PDF output, and the options that drive them
 mod light3d;
 mod material_graph; // Materials Factory — node-based material authoring (compiles to renderer params)
 mod mesh_io;      // OBJ furniture import

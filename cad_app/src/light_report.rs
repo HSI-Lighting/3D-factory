@@ -36,6 +36,11 @@ pub struct ReportInput<'a> {
     pub scale_auto: bool,
     /// Which cells are inside the room; empty when the plane was not placed on one.
     pub mask: Vec<bool>,
+    /// The sections to keep. The title and the headline figures are never dropped — see
+    /// `filter_sections`.
+    pub sections: Vec<crate::report::Section>,
+    /// Render images as `(JPEG bytes, caption)`, embedded as data URIs.
+    pub images: Vec<(Vec<u8>, String)>,
 }
 
 /// Minimal HTML escaping — a room called `Smith & Sons <Ltd>` must not break the document.
@@ -81,6 +86,7 @@ pub fn render(inp: &ReportInput) -> String {
     }
 
     // ---- conditions -------------------------------------------------------------------------
+    mark(&mut h, Section::Materials);
     h.push_str("<h2>Conditions</h2><table>");
     h.push_str(&tr2("Room height", &format!("{:.3} m", inp.room_height)));
     h.push_str(&tr2("Working plane", &format!("{:.3} m", p.origin.z)));
@@ -123,6 +129,7 @@ pub fn render(inp: &ReportInput) -> String {
     h.push_str("</table>");
 
     // ---- work plane -------------------------------------------------------------------------
+    mark(&mut h, Section::WorkingPlane);
     h.push_str("<h2>Working plane</h2><table>");
     h.push_str(&tr2("Average  Ē", &format!("{:.0} lx", g.avg)));
     h.push_str(&tr2("Minimum  E<sub>min</sub>", &format!("{:.0} lx", g.min)));
@@ -160,8 +167,10 @@ pub fn render(inp: &ReportInput) -> String {
     // The scale is stated WITH the picture. A false-colour plot whose top is unstated says nothing:
     // the same room reads "mostly red" or "mostly blue" depending on a number in a menu.
     let top = inp.scale_top.max(1.0);
+    mark(&mut h, Section::FalseColour);
     h.push_str("<h2>Illuminance — false colour</h2>");
-    h.push_str("<div class=\"scroll\"><table class=\"fc\">");
+    // NOT `.scroll` any more — the plot fits the page rather than running off it. See the CSS.
+    h.push_str("<div class=\"fcwrap\"><table class=\"fc\">");
     for r in (0..p.rows).rev() {
         h.push_str("<tr>");
         for c in 0..p.cols {
@@ -208,6 +217,7 @@ pub fn render(inp: &ReportInput) -> String {
     // ---- the field, as numbers ------------------------------------------------------------------
     // The whole grid, not a picture of it: a report has to be checkable, and a colour ramp cannot
     // be read back into numbers.
+    mark(&mut h, Section::NumericGrid);
     h.push_str("<h2>Illuminance grid (lx)</h2><div class=\"scroll\"><table class=\"grid\">");
     for r in (0..p.rows).rev() {
         h.push_str("<tr>");
@@ -221,6 +231,7 @@ pub fn render(inp: &ReportInput) -> String {
     h.push_str("<p class=\"note\">Rows run from the far edge of the plane to the near one, matching the plan.</p>");
 
     // ---- surfaces ---------------------------------------------------------------------------
+    mark(&mut h, Section::Surfaces);
     if !inp.surfaces.is_empty() {
         h.push_str("<h2>Room surfaces</h2><table><tr><th>Surface</th><th class=\"n\">Area</th>");
         h.push_str("<th class=\"n\">Ē</th><th class=\"n\">E<sub>min</sub></th>");
@@ -246,6 +257,7 @@ pub fn render(inp: &ReportInput) -> String {
     }
 
     // ---- load -------------------------------------------------------------------------------
+    mark(&mut h, Section::Installation);
     if let Some(i) = inp.installation {
         h.push_str("<h2>Connected load</h2><table>");
         h.push_str(&tr2("Fittings", &format!("{}", i.count)));
@@ -271,8 +283,74 @@ pub fn render(inp: &ReportInput) -> String {
         }
     }
 
+    // The renders, if any were added and the section is on. Embedded as data URIs so the file
+    // stays what it has always been: one self-contained document that survives being emailed.
+    mark(&mut h, Section::Renders);
+    if !inp.images.is_empty() {
+        h.push_str("<h2>Renders</h2><div class=\"renders\">");
+        for (jpeg, caption) in &inp.images {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+            h.push_str(&format!(
+                "<figure><img src=\"data:image/jpeg;base64,{b64}\" alt=\"{}\">{}</figure>",
+                esc(caption),
+                if caption.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("<figcaption>{}</figcaption>", esc(caption))
+                },
+            ));
+        }
+        h.push_str("</div>");
+    }
+
+    // THE CLOSING TAGS ARE NOT A SECTION. Left inside the last marked run they would be dropped
+    // along with it, and unticking one box would produce a document that never closes.
+    h.push_str(END_MARK);
     h.push_str("</div></body></html>");
-    h
+    filter_sections(h, &inp.sections)
+}
+
+use crate::report::Section;
+
+/// The marker a section filter cuts on.
+///
+/// AN HTML REPORT IS A FLOW, not a tree of pages, and it is written as one long push — which is
+/// what makes it a good web page and a poor thing to slice. Rather than restructure a renderer
+/// whose every number is already under test, each section is announced by a comment, and the
+/// filter keeps the runs the user asked for. The markers are inert in a browser and visible to
+/// anyone reading the file, which is more than a CSS class would be.
+const END_MARK: &str = "<!--SEC:END-->";
+
+fn mark(h: &mut String, s: Section) {
+    h.push_str(&format!("<!--SEC:{:?}-->", s));
+}
+
+/// Keep only the marked runs whose section is selected.
+///
+/// Everything BEFORE the first marker is the title and the headline figures, which are the report
+/// identifying itself and are never dropped — a page with no title is not a shorter report, it is
+/// an anonymous one.
+fn filter_sections(html: String, keep: &[Section]) -> String {
+    let Some(first) = html.find("<!--SEC:") else { return html };
+    let mut out = String::with_capacity(html.len());
+    out.push_str(&html[..first]);
+    let mut rest = &html[first..];
+    while let Some(start) = rest.find("<!--SEC:") {
+        let name_at = start + 8;
+        let Some(end_tag) = rest[name_at..].find("-->") else { break };
+        let name = &rest[name_at..name_at + end_tag];
+        let body_at = name_at + end_tag + 3;
+        let body_end = rest[body_at..].find("<!--SEC:").map(|i| body_at + i).unwrap_or(rest.len());
+        // "END" is not a section: it marks the closing tags, which are part of the document
+        // rather than part of any of its contents.
+        let on = name == "END" || keep.iter().any(|s| format!("{s:?}") == name);
+        if on {
+            out.push_str(&rest[body_at..body_end]);
+        }
+        rest = &rest[body_end..];
+    }
+    out
 }
 
 fn kpi(value: &str, label: &str) -> String {
@@ -297,12 +375,26 @@ th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04
 td.v,td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 table.grid td.g{text-align:right;font-variant-numeric:tabular-nums;padding:4px 7px;font-size:12.5px}
 /* FALSE COLOUR: the cell carries the colour AND the number, so the field can be read at a glance
-   and checked value by value. Fixed cell size so the plot keeps the plane's proportions. */
-table.fc{border-collapse:collapse;margin:2px 0}
-table.fc td.fc{width:44px;height:30px;text-align:center;vertical-align:middle;
-  font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-  font-variant-numeric:tabular-nums;border:1px solid rgba(0,0,0,.18)}
+   and checked value by value.
+
+   THE PLOT FITS THE PAGE. It used to be a fixed 44px per cell, so a 33-column field was 1,450px
+   wide and had to be scrolled sideways to be seen at all — reported as "the user have to go an
+   scroll to see the layout with is not intuitive". `table-layout:fixed` with a 100% width makes
+   the browser divide the page between the columns instead, and the cells stay square-ish because
+   the row height follows. `max-width` on the wrapper keeps a 2x2 grid from being blown up to the
+   width of the window, which would be the same mistake in the other direction. */
+table.fc{border-collapse:collapse;margin:2px 0;table-layout:fixed;width:100%}
+.fcwrap{max-width:100%;overflow:hidden}
+table.fc td.fc{text-align:center;vertical-align:middle;padding:0;
+  font:600 clamp(5px,1.1vw,11px)/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-variant-numeric:tabular-nums;border:1px solid rgba(0,0,0,.18);
+  overflow:hidden;white-space:nowrap}
 table.fc td.out{background:transparent;border:1px dashed rgba(128,128,128,.35)}
+/* Renders: one per row when there is one, side by side when there are more. */
+.renders{display:flex;flex-wrap:wrap;gap:14px;margin:12px 0}
+.renders figure{flex:1 1 320px;margin:0}
+.renders img{width:100%;height:auto;border:1px solid var(--line);border-radius:6px;display:block}
+.renders figcaption{font-size:12px;color:#667;margin-top:5px;text-align:center}
 /* The legend is the scale the plot was drawn at; without it the picture states nothing. */
 .legend{display:flex;align-items:center;gap:8px;margin:6px 0 2px}
 .legend .lgbar{display:flex;flex:0 0 320px;height:14px;border:1px solid rgba(128,128,128,.5)}
@@ -343,7 +435,7 @@ mod tests {
         CalcPlane { origin: Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols, rows }
     }
 
-    fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
+    pub(super) fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
         ReportInput {
             title: "Test room".into(),
             grid: g,
@@ -360,6 +452,8 @@ mod tests {
             scale_top: 500.0,
             scale_auto: true,
             mask: Vec::new(),
+            sections: crate::report::Section::all(),
+            images: Vec::new(),
         }
     }
 
@@ -492,6 +586,8 @@ mod the_report_carries_the_false_colour_field {
             installation: None, surfaces: &[], cylindrical_avg: None,
             eye_height: 1.2, room_height: 3.0, materials: Vec::new(), unassigned: 0,
             ramp: crate::light::lux_rgb, scale_top: 500.0, scale_auto: true, mask: Vec::new(),
+            sections: crate::report::Section::all(),
+            images: Vec::new(),
         }
     }
 
@@ -578,5 +674,86 @@ mod the_report_carries_the_false_colour_field {
         let html = render(&base(&g, &p));
         assert!(html.contains("class=\"legend\""), "the plot needs its scale drawn");
         assert!(html.matches("<i style=\"background:rgb(").count() >= 20, "sampled across the ramp");
+    }
+}
+
+/// UNTICKING A SECTION LEAVES IT OUT OF THE HTML TOO.
+///
+/// Asked for as "the user will be able to unselect info that they dont need to be generated" —
+/// which has to mean both formats, or the choice is a property of the button you pressed.
+#[cfg(test)]
+mod the_html_honours_the_chosen_sections {
+    use super::*;
+    use crate::report::Section;
+
+    fn grid() -> LuxGrid {
+        LuxGrid {
+            cols: 2,
+            rows: 2,
+            values: vec![100.0, 200.0, 300.0, 400.0],
+            min: 100.0,
+            max: 400.0,
+            avg: 250.0,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        }
+    }
+
+    fn plane() -> CalcPlane {
+        CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 4.0, depth: 4.0, cols: 2, rows: 2 }
+    }
+
+    fn with<'a>(g: &'a LuxGrid, p: &'a CalcPlane, keep: Vec<Section>) -> ReportInput<'a> {
+        let mut i = tests::input(g, p);
+        i.sections = keep;
+        i
+    }
+
+    /// Everything on is the report as it always was.
+    #[test]
+    fn all_sections_selected_changes_nothing() {
+        let (g, p) = (grid(), plane());
+        let html = render(&with(&g, &p, Section::all()));
+        for h in ["Conditions", "Working plane", "Illuminance grid (lx)"] {
+            assert!(html.contains(h), "{h} went missing with everything selected");
+        }
+        assert!(!html.contains("<!--SEC:"), "the markers must not survive into the file");
+    }
+
+    /// A SECTION SWITCHED OFF IS GONE — heading, table and all.
+    #[test]
+    fn an_unselected_section_is_absent() {
+        let (g, p) = (grid(), plane());
+        let html = render(&with(&g, &p, vec![Section::WorkingPlane]));
+        assert!(html.contains("Working plane"), "the one that was kept is missing");
+        assert!(!html.contains("Illuminance grid (lx)"), "the grid heading survived");
+        assert!(!html.contains("<h2>Conditions</h2>"), "the conditions table survived");
+        // …and the numbers that only that section prints went with it.
+        assert!(!html.contains("class=\"grid\""), "the grid table survived its heading");
+    }
+
+    /// THE TITLE AND THE HEADLINE ARE NEVER DROPPED. A report with no sections is a shorter
+    /// report; a report with no title is an anonymous one, and nobody can file it.
+    #[test]
+    fn the_masthead_survives_an_empty_selection() {
+        let (g, p) = (grid(), plane());
+        let html = render(&with(&g, &p, Vec::new()));
+        assert!(html.contains("Test room"), "the title went with the sections");
+        assert!(html.contains("average maintained"), "the headline figures went too");
+        assert!(html.ends_with("</html>"), "the document did not close");
+        assert!(!html.contains("<h2>"), "no section should have been printed");
+    }
+
+    /// THE MARKERS ARE INERT. They are HTML comments, so a file that somehow kept one would still
+    /// render — but they are removed, and a stray one in the output would mean the filter had
+    /// stopped running.
+    #[test]
+    fn the_markers_never_reach_the_file() {
+        let (g, p) = (grid(), plane());
+        for keep in [Section::all(), vec![Section::Surfaces], Vec::new()] {
+            let html = render(&with(&g, &p, keep));
+            assert!(!html.contains("SEC:"), "a marker was left in the output");
+        }
     }
 }
