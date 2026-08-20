@@ -137,6 +137,60 @@ struct Cursor {
     right: f64,
     top: f64,
     bottom: f64,
+    /// ONE SCALE FOR THE WHOLE REPORT — points per metre.
+    ///
+    /// Asked for as: *"make the grids scale proportional to that of the layout. since we are
+    /// showing the rooms illuminance in the grid format they should be comparable."*
+    ///
+    /// Every drawing used to be fitted to two thirds of the page on its own, which meant a 4 m
+    /// store cupboard and a 40 m hall came out THE SAME SIZE ON THE PAGE. Bound together in one
+    /// document that is actively misleading: the eye reads two drawings of the same size as two
+    /// spaces of the same size, and the only thing saying otherwise is a dimension in small type
+    /// underneath. The results field was worse — it was fitted by CELL COUNT rather than by metres,
+    /// so the same room calculated at a finer grid drew LARGER THAN ITSELF.
+    ///
+    /// So the scale is chosen ONCE, from the room that needs the most, and every drawing in the
+    /// report is set at it: the layout, the results field and the numeric grid, which is what makes
+    /// a room's three pages line up with each other as well as with the other rooms. A room half
+    /// the size draws half the size. It is stated on each drawing, so nobody has to infer it.
+    scale: f64,
+}
+
+/// The scale every drawing in the report is set at, points per metre.
+///
+/// Chosen from the LARGEST room — the one that has to fit — so nothing overflows and everything
+/// else comes out proportionally smaller. Room extents are the working plane's, which is the
+/// rectangle the results field and the grid are actually drawn over.
+fn common_scale(inp: &Input, page_w: f64, page_h: f64) -> f64 {
+    let (target_w, target_h) = (page_w * TWO_THIRDS, page_h * TWO_THIRDS);
+    let mut k = f64::INFINITY;
+    for r in &inp.rooms {
+        let (w, d) = (r.plane.width as f64, r.plane.depth as f64);
+        if w > 0.0 && d > 0.0 {
+            k = k.min((target_w / w).min(target_h / d));
+        }
+    }
+    // No room with a size — nothing will be drawn, and any finite number will do.
+    if k.is_finite() && k > 0.0 {
+        k
+    } else {
+        1.0
+    }
+}
+
+/// The scale as a ratio a drafter reads — `1:200`, rounded to something sayable.
+///
+/// A drawing on a page is not to a round scale by construction, and quoting `1:187` implies a
+/// precision that is not there. Rounded UP through the usual series so the stated ratio is never
+/// finer than the drawing actually is.
+fn scale_note(k: f64) -> String {
+    // points per metre → metres per point → the denominator, since 1 pt = 1/72 inch = 0.352778 mm.
+    let denom = 1000.0 / (k * (25.4 / 72.0));
+    const SERIES: [f64; 14] = [
+        1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 5000.0,
+    ];
+    let pick = SERIES.iter().copied().find(|s| *s >= denom).unwrap_or(10_000.0);
+    format!("1:{pick:.0}")
 }
 
 impl Cursor {
@@ -153,6 +207,9 @@ impl Cursor {
             right: w - MARGIN,
             top,
             bottom,
+            // Replaced by `layout` once it has seen the rooms; a cursor built for anything else
+            // draws nothing scaled.
+            scale: 1.0,
         }
     }
 
@@ -252,6 +309,8 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     }
 
     let mut c = Cursor::new(w, h, has_head, has_foot);
+    // Chosen before anything is drawn, from every room at once — see `Cursor::scale`.
+    c.scale = common_scale(inp, w, h);
     // A CHAPTER PER ROOM, then the building-wide sections once.
     //
     // Three rooms used to come out as one plot with a bounding box round them, because a
@@ -745,11 +804,14 @@ fn results(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
     if g.cols == 0 || g.rows == 0 {
         return;
     }
-    let target_w = c.page_w * TWO_THIRDS;
-    let target_h = c.page_h * TWO_THIRDS;
-    let cell = (target_w / g.cols as f64).min(target_h / g.rows as f64);
-    let plot_w = cell * g.cols as f64;
-    let plot_h = cell * g.rows as f64;
+    // IN METRES, AT THE REPORT'S SCALE — not fitted to the page by cell count, which drew the same
+    // room larger when it was calculated on a finer grid, and drew every room the same size
+    // whatever its actual dimensions. See `Cursor::scale`.
+    let plot_w = room.plane.width as f64 * c.scale;
+    let plot_h = room.plane.depth as f64 * c.scale;
+    if plot_w <= 0.0 || plot_h <= 0.0 {
+        return;
+    }
 
     c.need_or_break(40.0 + plot_h + LEGEND_H);
     c.heading("Results — illuminance");
@@ -843,7 +905,15 @@ fn results_body(
         font: Font::Regular,
         rgb: FAINT,
         align: Align::Centre,
-        text: format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth),
+        // THE SCALE IS PART OF THE CAPTION. Every drawing in the report is set at this one scale,
+        // which is what lets a reader hold two rooms against each other — but only if it is said,
+        // and said on the drawing rather than once in a preamble nobody reads twice.
+        text: format!(
+            "{:.2} × {:.2} m   ·   {} — the same scale on every drawing here",
+            room.plane.width,
+            room.plane.depth,
+            scale_note(c.scale),
+        ),
     });
     c.y = y0 + plot_h + 24.0;
     legend(c, inp, opt, room_max);
@@ -911,9 +981,9 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
     if p.width <= 0.0 || p.depth <= 0.0 {
         return;
     }
-    let target_w = c.page_w * TWO_THIRDS;
-    let target_h = c.page_h * TWO_THIRDS;
-    let k = (target_w / p.width as f64).min(target_h / p.depth as f64);
+    // The report's one scale, so this page and the results field that follows it are the same room
+    // at the same size — and so are the other rooms' pages. See `Cursor::scale`.
+    let k = c.scale;
     let (dw, dh) = (p.width as f64 * k, p.depth as f64 * k);
 
     c.need_or_break(40.0 + dh + 40.0);
@@ -1090,19 +1160,34 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     if gc == 0 || gr == 0 {
         return;
     }
-    let avail_w = c.width();
+    // THE TABLE IS THE ROOM, at the report's scale — the same box the results field above it is
+    // drawn in, and the same box every other room's table is drawn in.
+    //
+    // It used to be stretched across the full content width whatever shape the room was, so a
+    // 31 × 9 m hall printed as a table nothing like the hall: the numbers did not sit where the
+    // points they describe are, and the reader could not lay the table against the field and read
+    // one from the other. Since the whole reason for printing figures next to a picture is to
+    // check the picture, that is the table failing at its only job.
+    //
+    // Clamped to what is actually available, so a room drawn wider than the content box — possible
+    // when the scale is set by a room with a very different aspect — is not printed off the page.
+    let table_w = (room.plane.width as f64 * c.scale).min(c.width()).max(1.0);
     // MEASURED AGAINST A WHOLE PAGE, not against what is left of this one. The grid gets a fresh
     // page if it needs one, so sizing it to the tail end of the previous page would reject a table
     // that fits perfectly well.
     let full_h = c.bottom - c.top - 60.0;
+    let table_h = (room.plane.depth as f64 * c.scale).min(full_h).max(1.0);
 
-    // The smallest stride that lands the type at a readable size. Stride 1 is the whole grid.
+    // The smallest stride that lands the type at a readable size, inside THAT box. Stride 1 is the
+    // whole grid. Coarsening further is the right trade: a table shaped like the room with fewer
+    // figures on it still reads as the room, and `extremes` below prints the darkest and brightest
+    // points whether or not the stride happened to land on them.
     let mut stride = 1usize;
     let (mut cols, mut rows, mut size) = (gc, gr, 0.0_f64);
     loop {
         cols = gc.div_ceil(stride);
         rows = gr.div_ceil(stride);
-        size = (avail_w / (cols as f64 * 4.6)).min(full_h / (rows as f64 * 1.45));
+        size = (table_w / (cols as f64 * 4.6)).min(table_h / (rows as f64 * 1.45));
         if size >= GRID_PT || (cols <= 2 && rows <= 2) {
             break;
         }
@@ -1110,6 +1195,7 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     }
     // Never smaller than the type this report will set, even at the coarsest useful stride.
     let size = size.min(9.0);
+    let avail_w = table_w;
 
     c.need_or_break(46.0 + rows as f64 * size * 1.45);
     c.heading("Illuminance grid (lx)");
@@ -1134,13 +1220,17 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     let colw = avail_w / cols as f64;
     let rowh = size * 1.45;
     let y0 = c.y;
+    // Centred like the drawings it belongs with, rather than pinned to the left margin — a table
+    // the shape of the room and a field the shape of the room, sitting under different parts of the
+    // page, are harder to read together than either alone.
+    let tx = c.left + (c.width() - avail_w) * 0.5;
     for (rr, r) in (0..gr).step_by(stride).enumerate() {
         for (cc, col) in (0..gc).step_by(stride).enumerate() {
             let i = r * gc + col;
             let Some(v) = g.values.get(i) else { continue };
             let inside = room.mask.get(i).copied().unwrap_or(true);
             c.push(Item::Text {
-                x: c.left + (cc as f64 + 1.0) * colw - colw * 0.12,
+                x: tx + (cc as f64 + 1.0) * colw - colw * 0.12,
                 y: y0 + (rr as f64 + 1.0) * rowh,
                 size,
                 font: Font::Regular,
@@ -1450,11 +1540,180 @@ mod tests {
                 "{cols}x{rows}: too big",
             );
             assert!(x >= 0.0 && x + w <= pw, "{cols}x{rows}: spans {x:.1}..{:.1}", x + w);
-            // The field keeps the plane's proportions: cell aspect follows the grid, not the page.
-            let cell_aspect = (w / cols as f64) / (h / rows as f64);
+            // THE FIELD IS THE SHAPE OF THE ROOM — the plane's proportions, whatever grid it
+            // happened to be sampled on.
+            //
+            // This used to assert SQUARE CELLS, which is a different and wrong thing: it made the
+            // drawn field `cols : rows` rather than `width : depth`, so the same room came out a
+            // slightly different shape depending on how many points it was calculated at, and a
+            // different shape again from its own layout page, which has always been drawn in
+            // metres. That is why the same four grids are run here against one fixed plane — under
+            // the old rule each produced a different rectangle for one room.
+            let want = p.width as f64 / p.depth as f64;
+            let got = w / h;
             assert!(
-                (cell_aspect - 1.0).abs() < 1e-6,
-                "{cols}x{rows}: the field is stretched, cell aspect {cell_aspect:.4}",
+                (got - want).abs() < 1e-6,
+                "{cols}x{rows}: the field is {got:.4} wide-to-tall for a room that is {want:.4}",
+            );
+        }
+    }
+
+    /// THE NUMERIC GRID IS THE SHAPE OF THE ROOM TOO, at the same scale as the field above it.
+    ///
+    /// This is the half that was actually complained about: *"make the grids scale proportional to
+    /// that of the layout."* The table was stretched across the full content width whatever shape
+    /// the room was, so a 30 × 4 m corridor printed as a table nothing like a corridor. The numbers
+    /// did not sit where the points they describe are, and a reader could not lay the table against
+    /// the field and read one from the other — which is the only reason to print figures beside a
+    /// picture at all.
+    #[test]
+    fn the_grid_table_is_the_shape_of_the_room() {
+        let g = grid(30, 4);
+        let p = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 30.0,
+            depth: 4.0,
+            cols: 30,
+            rows: 4,
+        };
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results, Section::NumericGrid];
+        let d = layout(&input(&g, &p), &o);
+
+        let (field_x, field_w) = plot_frames(&d).first().map(|f| (f.0, f.2)).expect("a field");
+
+        // The cells are the right-aligned items that read as a plain lux figure — the heading, the
+        // note and the extremes rows all carry words.
+        let mut xs: Vec<f64> = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { x, text, align: Align::Right, .. }
+                    if text.parse::<u32>().is_ok() || text == "-" =>
+                {
+                    Some(*x)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(xs.len() > 8, "only {} grid cells were printed", xs.len());
+        xs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        xs.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(xs.len() >= 2, "the table has one column — nothing to measure");
+
+        // Reconstruct the table's box from the column pitch, and hold it against the field's.
+        let colw = (xs[xs.len() - 1] - xs[0]) / (xs.len() - 1) as f64;
+        let table_w = colw * xs.len() as f64;
+        assert!(
+            (table_w - field_w).abs() < 1.0,
+            "the table is {table_w:.0} pt wide under a field {field_w:.0} pt wide — a table the \
+             shape of the page rather than the shape of the room",
+        );
+        // AND IT SITS UNDER THE FIELD, not off to one side. The first cell's anchor is its RIGHT
+        // edge, one column in from the table's left, so the table starts a column-and-a-bit back.
+        let table_x = xs[0] - colw * 0.88;
+        assert!(
+            (table_x - field_x).abs() < 1.0,
+            "the table starts at {table_x:.0} and the field at {field_x:.0} — a table the shape of \
+             the room, printed somewhere else on the page",
+        );
+    }
+
+    /// EVERY ROOM AT ONE SCALE, so two rooms in one report can be compared.
+    ///
+    /// "make the grids scale proportional to that of the layout. since we are showing the rooms
+    /// illuminance in the grid format they should be comparable." A 4 m cupboard and a 40 m hall
+    /// used to print the same size, each fitted to two thirds of its own page. Nothing on the page
+    /// contradicted the impression that they were comparable spaces except a dimension in small
+    /// type, and the drawings themselves said the opposite of the truth.
+    #[test]
+    fn a_room_twice_the_size_draws_twice_the_size() {
+        let (pw, ph) = PageSize::A4.points();
+        let small = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 4.0,
+            depth: 3.0,
+            cols: 8,
+            rows: 6,
+        };
+        let big = CalcPlane { width: 8.0, depth: 6.0, ..small };
+        let g = grid(8, 6);
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+
+        let mut inp = input(&g, &small);
+        inp.rooms = vec![one_room(&g, &small, "Store"), one_room(&g, &big, "Hall")];
+        let d = layout(&inp, &o);
+        let f = plot_frames(&d);
+        assert_eq!(f.len(), 2, "expected a field per room");
+
+        let (_, _, w_small, h_small) = f[0];
+        let (_, _, w_big, h_big) = f[1];
+        assert!(
+            (w_big / w_small - 2.0).abs() < 1e-6 && (h_big / h_small - 2.0).abs() < 1e-6,
+            "a room twice the size drew {:.2}× wide and {:.2}× tall",
+            w_big / w_small,
+            h_big / h_small,
+        );
+        // And the LARGER one is the one that fills the page — the scale is set by the room that
+        // needs the most, so nothing is drawn off the edge.
+        assert!(w_big >= pw * 0.66 - 1.0 || h_big >= ph * 0.66 - 1.0, "the big room is not filling");
+        assert!(w_big <= pw * TWO_THIRDS + 1.0 && h_big <= ph * TWO_THIRDS + 1.0, "and not more");
+    }
+
+    /// THE LAYOUT PAGE AND THE RESULTS PAGE ARE THE SAME ROOM AT THE SAME SIZE.
+    ///
+    /// They are read against each other — "which fitting is over that dark patch" is the question
+    /// the pair exists to answer — and it cannot be answered by eye if one is drawn larger than
+    /// the other. The results field used to be sized by cell count and the layout in metres, so
+    /// they agreed only by coincidence.
+    ///
+    /// TWO ROOMS, AND THE SMALL ONE IS THE ONE CHECKED. With one room the shared scale and a
+    /// page-fit are the same number, so a single-room fixture cannot tell the two rules apart —
+    /// it passes just as happily against the behaviour this replaces. The small room is the case
+    /// where they differ: the report's scale is set by the LARGE room, so a layout page still
+    /// fitting itself to the page would draw the small room bigger than its own field.
+    #[test]
+    fn the_layout_and_the_field_line_up() {
+        let g = grid(37, 11); // deliberately NOT proportional to either plane below
+        let p = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 9.0,
+            depth: 7.0,
+            cols: 37,
+            rows: 11,
+        };
+        let big = CalcPlane { width: 30.0, depth: 22.0, ..p };
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout, Section::Results];
+        let mut inp = input(&g, &p);
+        inp.rooms = vec![one_room(&g, &p, "Store"), one_room(&g, &big, "Hall")];
+        let d = layout(&inp, &o);
+        // The two are drawn in different colours — the layout's room outline red, the field's
+        // border grey — so they are collected by colour rather than by their order on the page.
+        let outline: Vec<(f64, f64)> = d
+            .pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Frame { w, h, rgb, .. } if *rgb == [190, 40, 40] => Some((*w, *h)),
+                _ => None,
+            })
+            .collect();
+        let field = plot_frames(&d);
+        assert_eq!(outline.len(), 2, "expected a layout outline per room");
+        assert_eq!(field.len(), 2, "expected a field per room");
+        for (i, room) in ["Store", "Hall"].iter().enumerate() {
+            let (w1, h1) = outline[i];
+            let (_, _, w2, h2) = field[i];
+            assert!(
+                (w1 - w2).abs() < 1e-6 && (h1 - h2).abs() < 1e-6,
+                "{room}: the layout is {w1:.1}×{h1:.1} and the field {w2:.1}×{h2:.1} — one room, \
+                 two sizes",
             );
         }
     }

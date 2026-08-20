@@ -129,6 +129,12 @@ pub fn window_ui(
     // The brightest value the room reached — what "auto" means, shown so the number is not a
     // mystery when it is the one in force.
     room_max: f64,
+    // THE CALCULATION THESE PAGES ARE BUILT FROM NO LONGER DESCRIBES THE SCENE.
+    //
+    // Said HERE, at the moment somebody is about to turn it into a document that leaves the
+    // building. A report is the one output of this app that reaches a client, and a lux figure for
+    // a layout that has since changed is indistinguishable, on paper, from one that is right.
+    stale: bool,
 ) -> Action {
     let mut act = Action::default();
     *page = (*page).min(doc.pages.len().saturating_sub(1));
@@ -465,9 +471,42 @@ pub fn window_ui(
                             );
                         }
                     });
-                    let avail = ui.available_size();
+                    if stale {
+                        ui.label(
+                            egui::RichText::new(
+                                "⚠ These pages are built from a calculation that is OUT OF DATE — \
+                                 the lights, the model or the settings have changed since it ran. \
+                                 Recalculate before issuing this.",
+                            )
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(235, 140, 90)),
+                        );
+                    }
+                    // A SIZE THAT DOES NOT DEPEND ON THE WINDOW THE PREVIEW IS IN.
+                    //
+                    // Reported as: "when the calculation preview sort of loads and expands as its
+                    // opened. its looks very buggy." It was a feedback loop, and not a settling
+                    // one: this took `ui.available_size()`, the window sized itself to hold its
+                    // contents, so every frame the preview grew to fill the window and the window
+                    // grew to fit the preview — measured at twelve pixels a frame, for as long as
+                    // the dialog stayed open. From outside, a panel inflating without end after it
+                    // appears reads as a rendering fault rather than as layout.
+                    //
+                    // Breaking the loop means sizing it from something already known before any
+                    // layout happens. Two such things: the PAGE, whose proportions the preview
+                    // should have anyway — a page letterboxed inside a box shaped by leftover space
+                    // shows a band of nothing that reads as part of the document — and the SCREEN,
+                    // which decides how much of it a preview may reasonably take.
+                    let aspect = if doc.width > 0.0 { doc.height / doc.width } else { 1.414 };
+                    let screen = ui.ctx().screen_rect().size();
+                    // Height first, because a page is taller than it is wide and height is the
+                    // scarcer dimension; then the width that height implies, pulled back if it
+                    // would crowd the options column beside it.
+                    let ph = (screen.y as f64 * 0.66).clamp(220.0, 1100.0);
+                    let pw = (ph / aspect).min(screen.x as f64 * 0.42).max(180.0);
                     let (resp, painter) = ui.allocate_painter(
-                        egui::vec2(avail.x.max(200.0), (avail.y - 34.0).max(200.0)),
+                        egui::vec2(pw as f32, (pw * aspect) as f32),
                         egui::Sense::hover(),
                     );
                     painter.rect_filled(resp.rect, 0.0, egui::Color32::from_gray(40));

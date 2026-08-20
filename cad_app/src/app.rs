@@ -26757,6 +26757,7 @@ impl CadApp {
             &tex,
             can_capture,
             room_max,
+            self.light.results_stale,
         );
         self.report_opts = opts;
         let n = self.report_opts.images.len().min(tex.len());
@@ -62432,6 +62433,154 @@ mod the_report_is_asked_about_before_it_is_written {
         assert_eq!(app.report_opts.cover_image, None, "the cover kept a dead index");
         assert_eq!(app.report_opts.images.len(), 1);
         assert_eq!(app.report_tex.len(), 1, "the preview textures went out of step");
+    }
+
+    /// A REPORT BUILT ON AN OUT-OF-DATE CALCULATION SAYS SO, IN THE DIALOG.
+    ///
+    /// The report is the one thing this app produces that leaves the building, and on paper a lux
+    /// figure for a layout somebody has since changed is indistinguishable from one that is right.
+    /// The panel's own warning is not enough: it is possible to open the report dialog without
+    /// having looked at the panel at all.
+    #[test]
+    fn the_dialog_warns_when_the_calculation_is_out_of_date() {
+        let mut app = calculated();
+        app.export_light_report();
+        let fresh = dialog_text(&mut app);
+        assert!(
+            !fresh.iter().any(|s| s.contains("OUT OF DATE")),
+            "a current calculation was labelled out of date",
+        );
+
+        let mut app = calculated();
+        app.light.results_stale = true;
+        app.export_light_report();
+        let t = dialog_text(&mut app);
+        assert!(
+            t.iter().any(|s| s.contains("OUT OF DATE")),
+            "the dialog said nothing about a stale calculation: {t:?}",
+        );
+    }
+
+    /// THE PREVIEW IS THE SAME SIZE ON EVERY FRAME IT IS OPEN.
+    ///
+    /// Reported as: *"when the calculation preview sort of loads and expands as its opened. its
+    /// looks very buggy."*
+    ///
+    /// It was a feedback loop. The preview took `ui.available_size()` and the window sized itself
+    /// to its contents, so each frame the preview grew to whatever the window had become and the
+    /// window grew to fit the preview — visible as a panel inflating for several frames after the
+    /// dialog opens, which reads as a rendering fault rather than as a layout settling.
+    ///
+    /// The frames are compared against EACH OTHER rather than against an expected size: what was
+    /// wrong was the growing, and pinning a number here would only record today's dimensions.
+    #[test]
+    fn the_preview_does_not_grow_after_it_opens() {
+        let mut app = calculated();
+        app.export_light_report();
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1600.0, 1000.0),
+            )),
+            ..Default::default()
+        };
+        // The preview's backing rectangle — the one thing on the dialog painted in this grey.
+        fn preview_rect(out: &egui::FullOutput) -> Option<egui::Rect> {
+            fn walk(s: &egui::Shape, into: &mut Vec<egui::Rect>) {
+                match s {
+                    egui::Shape::Rect(r) if r.fill == egui::Color32::from_gray(40) => {
+                        into.push(r.rect)
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut found);
+            }
+            found.into_iter().next()
+        }
+
+        // TWELVE FRAMES. egui does not paint a window on the frame it first lays out, and this one
+        // carries a scroll area that settles over a few more, so the preview does not appear at all
+        // for the first handful — which is itself part of what the report is about.
+        let mut sizes: Vec<egui::Vec2> = Vec::new();
+        for _ in 0..12 {
+            let out = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+            if let Some(r) = preview_rect(&out) {
+                sizes.push(r.size());
+            }
+        }
+        assert!(sizes.len() >= 4, "the preview painted on only {} frames", sizes.len());
+        let first = sizes[0];
+        for (i, s) in sizes.iter().enumerate() {
+            assert!(
+                (s.x - first.x).abs() < 0.5 && (s.y - first.y).abs() < 0.5,
+                "the preview was {:.0}x{:.0} on the first painted frame and {:.0}x{:.0} on frame \
+                 {i} — it is still growing after it opened: {sizes:?}",
+                first.x,
+                first.y,
+                s.x,
+                s.y,
+            );
+        }
+    }
+
+    /// AND IT IS THE SHAPE OF THE PAGE IT IS PREVIEWING.
+    ///
+    /// A preview box shaped by whatever space was left over shows an A4 page letterboxed inside
+    /// it, with the wasted band reading as part of the document. Sizing the box from the page's
+    /// own proportions is also what makes the size deterministic — it depends on the document,
+    /// which is known before anything is laid out, rather than on the window, which is not.
+    #[test]
+    fn the_preview_has_the_proportions_of_the_page() {
+        let mut app = calculated();
+        app.report_opts.page = crate::report::PageSize::A4;
+        app.export_light_report();
+
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1600.0, 1000.0),
+            )),
+            ..Default::default()
+        };
+        fn preview_rect(out: &egui::FullOutput) -> Option<egui::Rect> {
+            fn walk(s: &egui::Shape, into: &mut Vec<egui::Rect>) {
+                match s {
+                    egui::Shape::Rect(r) if r.fill == egui::Color32::from_gray(40) => {
+                        into.push(r.rect)
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            for cs in &out.shapes {
+                walk(&cs.shape, &mut found);
+            }
+            found.into_iter().next()
+        }
+
+        let mut last = None;
+        for _ in 0..12 {
+            let out = ctx.run(input(), |ctx| app.render_report_dialog(ctx));
+            if let Some(r) = preview_rect(&out) {
+                last = Some(r);
+            }
+        }
+        let r = last.expect("the preview painted");
+        let (pw, ph) = crate::report::PageSize::A4.points();
+        let want = ph / pw;
+        let got = (r.height() / r.width()) as f64;
+        assert!(
+            (got - want).abs() < 0.05,
+            "the preview is {got:.3} tall-to-wide for a page that is {want:.3}",
+        );
     }
 }
 
