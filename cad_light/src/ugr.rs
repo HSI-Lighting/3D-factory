@@ -225,6 +225,9 @@ mod tests {
     /// formula can be checked by hand.
     fn flat_source(cd: f64, side: f64) -> IesProfile {
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "test".into(),
             photometry: PhotometryType::C,
             lumens: 1000.0,

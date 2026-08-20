@@ -26403,17 +26403,64 @@ impl CadApp {
     }
 
 
+
+    /// The fittings standing in one room, gathered BY TYPE for the schedule.
+    ///
+    /// Everything here comes out of the photometric file the fitting is linked to — a report that
+    /// states an illuminance without saying what produced it cannot be checked, ordered from, or
+    /// handed to an installer. A file that declares no manufacturer shows a dash, which is that
+    /// file's omission rather than the report's.
+    fn schedule_for(&self, ids: &[u32]) -> Vec<crate::report::layout::ScheduleRow> {
+        let mut out: Vec<crate::report::layout::ScheduleRow> = Vec::new();
+        for l in self.light.luminaires.iter().filter(|l| ids.contains(&l.id)) {
+            if let Some(row) = out.iter_mut().find(|r| r.profile == l.profile) {
+                row.count += 1;
+                continue;
+            }
+            let p = self.light.profiles.get(&l.profile);
+            out.push(crate::report::layout::ScheduleRow {
+                profile: if l.profile.trim().is_empty() {
+                    "— no fitting assigned —".to_string()
+                } else {
+                    l.profile.clone()
+                },
+                count: 1,
+                manufacturer: p.map(|p| p.manufacturer.clone()).unwrap_or_default(),
+                catalogue: p.map(|p| p.catalogue.clone()).unwrap_or_default(),
+                lamp: p.map(|p| p.lamp.clone()).unwrap_or_default(),
+                watts: p.map(|p| p.watts).unwrap_or(0.0),
+                lumens: p.map(|p| p.lumens).unwrap_or(0.0),
+                size_m: p.map(|p| (p.length, p.width, p.height)).unwrap_or((0.0, 0.0, 0.0)),
+            });
+        }
+        // Most of a type first — a schedule is read to find what the room is mostly made of.
+        out.sort_by(|a, b| b.count.cmp(&a.count).then(a.profile.cmp(&b.profile)));
+        out
+    }
+
     /// Gather the state the report is built from. `None` when nothing has been calculated.
     fn report_input(&self) -> Option<crate::report::layout::Input<'_>> {
-        let grid = self.light.grid.as_ref()?;
-        let plane = self.light.plane.as_ref()?;
+        if self.light.rooms.is_empty() {
+            return None;
+        }
+        let rooms = self
+            .light
+            .rooms
+            .iter()
+            .map(|r| crate::report::layout::RoomInput {
+                name: r.name.clone(),
+                grid: &r.grid,
+                plane: &r.plane,
+                mask: &r.mask,
+                installation: r.installation.as_ref(),
+                cylindrical_avg: r.cylindrical_avg,
+                schedule: self.schedule_for(&r.fixtures),
+            })
+            .collect();
         Some(crate::report::layout::Input {
-            grid,
-            plane,
-            maintenance: self.light.maintenance,
-            installation: self.light.installation.as_ref(),
+            rooms,
             surfaces: &self.light.surfaces,
-            cylindrical_avg: self.light.cylindrical_avg,
+            maintenance: self.light.maintenance,
             eye_height: self.light.eye_height,
             room_height: self.light.room_height,
             materials: self
@@ -26423,12 +26470,10 @@ impl CadApp {
                 .map(|m| (m.name.clone(), m.reflectance))
                 .collect(),
             unassigned: self.light.unassigned_count(),
-            // The report is drawn in the SAME palette and at the SAME scale as the screen, so what
-            // gets filed matches what was looked at.
+            // The report is drawn in the SAME palette as the screen, so what gets filed matches
+            // what was looked at. The SCALE is the report's own — see `report::options::Scale`.
             ramp: self.light.ramp.rgb_fn(),
-            scale_top: self.light.scale_ceiling(),
-            scale_auto: self.light.scale_max.is_none(),
-            mask: self.light.grid_mask.clone(),
+            mask: Vec::new(),
         })
     }
 
@@ -26478,7 +26523,7 @@ impl CadApp {
         let doc = crate::report::layout::layout(&inp, &self.report_opts);
         // Copied out before the borrow ends — the document is built, the numbers it needed are
         // done with, and what follows edits the state the input borrowed.
-        let room_max = inp.grid.max;
+        let room_max = inp.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
         drop(inp);
 
         let mut opts = std::mem::take(&mut self.report_opts);
@@ -26626,31 +26671,50 @@ impl CadApp {
             crate::report::Format::Pdf => {
                 crate::report::layout::layout(&inp, &self.report_opts).write()
             }
-            crate::report::Format::Html => crate::light_report::render(&crate::light_report::ReportInput {
-                title: self.report_opts.title.clone(),
-                grid: inp.grid,
-                plane: inp.plane,
-                maintenance: inp.maintenance,
-                installation: inp.installation,
-                surfaces: inp.surfaces,
-                cylindrical_avg: inp.cylindrical_avg,
-                eye_height: inp.eye_height,
-                room_height: inp.room_height,
-                materials: inp.materials.clone(),
-                unassigned: inp.unassigned,
-                ramp: inp.ramp,
-                scale_top: inp.scale_top,
-                scale_auto: inp.scale_auto,
-                mask: inp.mask.clone(),
-                sections: self.report_opts.sections.clone(),
-                images: self
+            crate::report::Format::Html => {
+                // ONE ROOM PER SECTION, in the same order the PDF puts them — a format that
+                // silently reported the first room would be a trap, not a shorter report.
+                let room_max = inp.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
+                let images: Vec<(Vec<u8>, String)> = self
                     .report_opts
                     .images
                     .iter()
                     .filter_map(|i| i.jpeg.as_ref().map(|(b, _, _)| (b.clone(), i.caption.clone())))
-                    .collect(),
-            })
-            .into_bytes(),
+                    .collect();
+                let last = inp.rooms.len().saturating_sub(1);
+                let per: Vec<crate::light_report::ReportInput> = inp
+                    .rooms
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| crate::light_report::ReportInput {
+                        title: if r.name.trim().is_empty() {
+                            self.report_opts.title.clone()
+                        } else {
+                            r.name.clone()
+                        },
+                        grid: r.grid,
+                        plane: r.plane,
+                        maintenance: inp.maintenance,
+                        installation: r.installation,
+                        surfaces: inp.surfaces,
+                        cylindrical_avg: r.cylindrical_avg,
+                        eye_height: inp.eye_height,
+                        room_height: inp.room_height,
+                        materials: inp.materials.clone(),
+                        unassigned: inp.unassigned,
+                        ramp: inp.ramp,
+                        scale_top: self.report_opts.scale.top_lx(room_max),
+                        scale_auto: self.report_opts.scale.top.is_none(),
+                        mask: r.mask.to_vec(),
+                        sections: self.report_opts.sections.clone(),
+                        // The renders belong to the DOCUMENT, so they go on the last room rather
+                        // than once per room.
+                        images: if i == last { images.clone() } else { Vec::new() },
+                        schedule: r.schedule.clone(),
+                    })
+                    .collect();
+                crate::light_report::render_all(&self.report_opts.title, &per).into_bytes()
+            }
         };
         match std::fs::write(&path, bytes) {
             Ok(()) => {
@@ -61783,6 +61847,21 @@ mod the_report_is_asked_about_before_it_is_written {
             cols: 4,
             rows: 4,
         });
+        // A calculation produces a LIST of room results, and the report reads that list — the
+        // loose fields are what the single-room PANEL shows.
+        app.light.rooms = vec![crate::light::RoomResult {
+            name: "Test room".into(),
+            poly: Vec::new(),
+            plane: app.light.plane.clone().expect("plane"),
+            grid: app.light.grid.clone().expect("grid"),
+            mask: Vec::new(),
+            plane_en: app.light.plane.clone().expect("plane"),
+            grid_en: app.light.grid.clone().expect("grid"),
+            cylindrical_avg: None,
+            installation: None,
+            fixtures: Vec::new(),
+            grid_note: None,
+        }];
         app
     }
 

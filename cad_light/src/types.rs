@@ -574,6 +574,9 @@ mod metric_tests {
 
     fn profile(name: &str, watts: f64, lumens: f64) -> IesProfile {
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: name.into(),
             photometry: PhotometryType::C,
             lumens,
@@ -791,6 +794,9 @@ mod a_fitting_may_be_re_rated {
 
     fn profile(lumens: f64, watts: f64) -> crate::IesProfile {
         crate::IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "p".into(),
             photometry: crate::PhotometryType::C,
             lumens,

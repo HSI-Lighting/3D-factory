@@ -44,6 +44,22 @@ pub struct IesProfile {
     pub luminous_length: f64,
     #[serde(default)]
     pub luminous_width: f64,
+    /// WHO MADE IT, from the file's own header — `[MANUFAC]` in IES, record 1 in EULUMDAT.
+    ///
+    /// Carried because a report has to say what produced the illuminance it states: a lighting
+    /// report without a schedule cannot be checked, ordered from, or handed to an installer.
+    /// Empty when the file declares none, which is that file's omission and is shown as one.
+    ///
+    /// `#[serde(default)]` for the same reason the luminous dimensions have it — projects were
+    /// already being saved before these existed, and serde refuses a missing field.
+    #[serde(default)]
+    pub manufacturer: String,
+    /// Catalogue number — `[LUMCAT]` in IES, record 9 in EULUMDAT.
+    #[serde(default)]
+    pub catalogue: String,
+    /// What is in it: lamp type, and the colour data where the file gives it.
+    #[serde(default)]
+    pub lamp: String,
 }
 
 impl IesProfile {
@@ -175,6 +191,12 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
     let err = |m: &str| m.to_string();
 
     let mut name = String::new();
+    // THE HEADER KEYWORDS A SCHEDULE NEEDS. LM-63 puts them before TILT=, one per line, as
+    // `[KEYWORD] value` — so they are read in the same pass that finds TILT rather than in a
+    // second walk of the file.
+    let mut manufacturer = String::new();
+    let mut catalogue = String::new();
+    let mut lamp = String::new();
     let mut tilt_line: Option<&str> = None;
     let mut body_start = 0usize;
     let lines: Vec<&str> = contents.lines().collect();
@@ -185,8 +207,15 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
             body_start = i + 1;
             break;
         }
-        if let Some(rest) = line.strip_prefix("[LUMINAIRE]") {
-            name = rest.trim().to_string();
+        for (key, slot) in [
+            ("[LUMINAIRE]", &mut name),
+            ("[MANUFAC]", &mut manufacturer),
+            ("[LUMCAT]", &mut catalogue),
+            ("[LAMP]", &mut lamp),
+        ] {
+            if let Some(rest) = line.strip_prefix(key) {
+                *slot = rest.trim().to_string();
+            }
         }
     }
     let tilt = tilt_line.ok_or_else(|| err("missing TILT= line"))?;
@@ -275,6 +304,9 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         // separately. So there is nothing else to read here.
         luminous_length: l_m,
         luminous_width: w_m,
+        manufacturer,
+        catalogue,
+        lamp,
     })
 }
 
@@ -389,6 +421,9 @@ mod the_glare_area_is_unchanged {
 
     fn prof(luminous_length: f64, luminous_width: f64) -> IesProfile {
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "t".into(),
             photometry: PhotometryType::C,
             lumens: 1000.0,
@@ -505,5 +540,58 @@ mod a_negative_ies_dimension_means_round {
         assert!(p.aperture().is_none());
         assert!(p.housing().is_none());
         assert!(p.projected_luminous_area(0.0).is_none());
+    }
+}
+
+/// THE HEADER A SCHEDULE NEEDS, from LM-63's keywords.
+#[cfg(test)]
+mod the_keywords_reach_the_schedule {
+    use super::*;
+
+    const WITH_KEYWORDS: &str = "IESNA:LM-63-1995\n\
+        [TEST] TR-1234\n\
+        [MANUFAC] HSI Lighting\n\
+        [LUMCAT] OG20-36\n\
+        [LUMINAIRE] OCULUS GRANDE 2.0\n\
+        [LAMP] LED 3000K CRI90\n\
+        TILT=NONE\n\
+        1 -1 1.0 2 1 1 2 0 0 0\n\
+        1.0 1.0 100\n\
+        0.0 90.0\n\
+        0.0\n\
+        1000.0 10.0\n";
+
+    /// EACH KEYWORD LANDS IN ITS OWN FIELD. They are read in one pass with TILT, and a scan that
+    /// matched the wrong prefix would put the test number where the manufacturer goes.
+    #[test]
+    fn manufacturer_catalogue_and_lamp_are_read() {
+        let p = parse(WITH_KEYWORDS).expect("a valid IES file");
+        assert_eq!(p.manufacturer, "HSI Lighting");
+        assert_eq!(p.catalogue, "OG20-36");
+        assert_eq!(p.name, "OCULUS GRANDE 2.0", "the luminaire name is still the name");
+        assert_eq!(p.lamp, "LED 3000K CRI90");
+        assert!(
+            !p.manufacturer.contains("TR-1234"),
+            "the test number leaked into the manufacturer",
+        );
+    }
+
+    /// A FILE WITH NO KEYWORDS still parses, and leaves them empty rather than inventing any — the
+    /// report shows a dash, which is that file's omission.
+    #[test]
+    fn a_file_without_keywords_leaves_them_empty() {
+        const BARE: &str = "IESNA:LM-63-1995
+TILT=NONE
+1 -1 1.0 2 1 1 2 0 0 0
+\n            1.0 1.0 100
+0.0 90.0
+0.0
+1000.0 10.0
+";
+        let p = parse(BARE).expect("the bare sample still parses");
+        assert!(p.manufacturer.is_empty());
+        assert!(p.catalogue.is_empty());
+        assert!(p.lamp.is_empty());
+        assert_eq!(p.name, "Luminaire", "and the name still falls back");
     }
 }

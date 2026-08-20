@@ -2162,6 +2162,9 @@ mod previews {
         let candela: Vec<f64> =
             vertical_angles.iter().map(|g| 1000.0 * g.to_radians().cos().max(0.0)).collect();
         cad_light::IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "d".into(),
             photometry: cad_light::PhotometryType::C,
             lumens: 3140.0,

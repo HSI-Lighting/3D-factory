@@ -312,6 +312,9 @@ fn lambertian_profile(name: &str, lumens: f64, watts: f64) -> IesProfile {
         // which is right, because a fabricated area here would produce a fabricated UGR.
         luminous_length: 0.0,
         luminous_width: 0.0,
+        manufacturer: String::new(),
+        catalogue: String::new(),
+        lamp: String::new(),
     }
 }
 
@@ -340,6 +343,9 @@ fn builtin_downlight() -> IesProfile {
         // put a fabricated glare figure next to the real ones.
         luminous_length: 0.0,
         luminous_width: 0.0,
+        manufacturer: String::new(),
+        catalogue: String::new(),
+        lamp: String::new(),
     }
 }
 

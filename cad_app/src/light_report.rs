@@ -41,6 +41,8 @@ pub struct ReportInput<'a> {
     pub sections: Vec<crate::report::Section>,
     /// Render images as `(JPEG bytes, caption)`, embedded as data URIs.
     pub images: Vec<(Vec<u8>, String)>,
+    /// What this room is lit WITH, by fitting type.
+    pub schedule: Vec<crate::report::layout::ScheduleRow>,
 }
 
 /// Minimal HTML escaping — a room called `Smith & Sons <Ltd>` must not break the document.
@@ -50,14 +52,42 @@ fn esc(s: &str) -> String {
 
 /// Render the report. Self-contained: the returned string IS the file.
 pub fn render(inp: &ReportInput) -> String {
+    render_all(&inp.title.clone(), std::slice::from_ref(inp))
+}
+
+/// SEVERAL ROOMS IN ONE DOCUMENT.
+///
+/// A calculation produces one result per room, and a report that merged three of them stated an
+/// average over ground that is not one space. The head and the closing tags belong to the
+/// DOCUMENT; everything between them is written once per room.
+pub fn render_all(doc_title: &str, rooms: &[ReportInput]) -> String {
+    let Some(first) = rooms.first() else { return String::new() };
+    // THE DOCUMENT IS THE PROJECT; each room is a section of it. Titling the file after the first
+    // room means a three-room report opens in a browser tab called after one of them.
+    let title = if doc_title.trim().is_empty() { first.title.as_str() } else { doc_title.trim() };
+    let mut h = String::with_capacity(16 * 1024);
+    h.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    h.push_str(&format!("<title>{} — SIMLUX</title>", esc(title)));
+    h.push_str(STYLE);
+    h.push_str("</head><body><div class=\"wrap\">");
+    for (i, inp) in rooms.iter().enumerate() {
+        if i > 0 {
+            h.push_str("<hr class=\"roomrule\">");
+        }
+        h.push_str(&body(inp, rooms.len() > 1));
+    }
+    h.push_str("</div></body></html>");
+    h
+}
+
+/// One room's worth of the document.
+fn body(inp: &ReportInput, named: bool) -> String {
     let g = inp.grid;
     let p = inp.plane;
     let mut h = String::with_capacity(16 * 1024);
-
-    h.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    h.push_str(&format!("<title>{} — SIMLUX</title>", esc(&inp.title)));
-    h.push_str(STYLE);
-    h.push_str("</head><body><div class=\"wrap\">");
+    if named {
+        h.push_str(&format!("<h1 class=\"room\">{}</h1>", esc(&inp.title)));
+    }
     h.push_str(&format!("<h1>{}</h1>", esc(&inp.title)));
     h.push_str(&format!(
         "<p class=\"sub\">SIMLUX {} · maintained values, maintenance factor {:.2}</p>",
@@ -307,7 +337,6 @@ pub fn render(inp: &ReportInput) -> String {
     // THE CLOSING TAGS ARE NOT A SECTION. Left inside the last marked run they would be dropped
     // along with it, and unticking one box would produce a document that never closes.
     h.push_str(END_MARK);
-    h.push_str("</div></body></html>");
     filter_sections(h, &inp.sections)
 }
 
@@ -454,6 +483,7 @@ mod tests {
             mask: Vec::new(),
             sections: crate::report::Section::all(),
             images: Vec::new(),
+            schedule: Vec::new(),
         }
     }
 
@@ -588,6 +618,7 @@ mod the_report_carries_the_false_colour_field {
             ramp: crate::light::lux_rgb, scale_top: 500.0, scale_auto: true, mask: Vec::new(),
             sections: crate::report::Section::all(),
             images: Vec::new(),
+            schedule: Vec::new(),
         }
     }
 

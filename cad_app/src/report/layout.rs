@@ -17,22 +17,83 @@ use super::options::{Options, ReportImage, Section};
 use super::pdf::{Align, Doc, Font, Item, Jpeg, Page};
 use cad_light::{CalcPlane, Installation, LuxGrid, Maintenance, SurfaceResult};
 
-/// Everything the layout needs, gathered so it touches no UI types.
-pub struct Input<'a> {
+/// One row of the luminaire schedule: a fitting TYPE and how many of it there are.
+///
+/// A schedule is by type, not by fixture. "48 × OCULUS GRANDE 2.0" is what gets ordered, wired and
+/// checked on site; forty-eight identical rows are not a schedule, they are a dump.
+#[derive(Clone, Debug, Default)]
+pub struct ScheduleRow {
+    pub profile: String,
+    pub count: usize,
+    pub manufacturer: String,
+    pub catalogue: String,
+    pub lamp: String,
+    /// Per fitting.
+    pub watts: f64,
+    pub lumens: f64,
+    /// Overall size in metres, `(length, width, height)`. Zero where the file declares none.
+    pub size_m: (f64, f64, f64),
+}
+
+impl ScheduleRow {
+    pub fn total_watts(&self) -> f64 {
+        self.watts * self.count as f64
+    }
+    pub fn total_lumens(&self) -> f64 {
+        self.lumens * self.count as f64
+    }
+    /// Efficacy of this type, lm/W. `None` when the file declares no wattage.
+    pub fn efficacy(&self) -> Option<f64> {
+        (self.watts > 0.0).then(|| self.lumens / self.watts)
+    }
+}
+
+/// One room's answer, as the report needs it.
+pub struct RoomInput<'a> {
+    pub name: String,
     pub grid: &'a LuxGrid,
     pub plane: &'a CalcPlane,
-    pub maintenance: Maintenance,
+    pub mask: &'a [bool],
     pub installation: Option<&'a Installation>,
-    pub surfaces: &'a [SurfaceResult],
     pub cylindrical_avg: Option<f64>,
+    /// The fittings standing in THIS room, by type.
+    pub schedule: Vec<ScheduleRow>,
+}
+
+/// Everything the layout needs, gathered so it touches no UI types.
+///
+/// THE ROOMS ARE A LIST. A report used to be one room's numbers, because a calculation used to
+/// produce one room's numbers — and a plan with three rooms came out as one plot spanning all
+/// three with a bounding box around them.
+pub struct Input<'a> {
+    pub rooms: Vec<RoomInput<'a>>,
+    /// Building-wide: `surface_report_on` groups by MATERIAL, so there is no per-room answer to be
+    /// had from it.
+    pub surfaces: &'a [SurfaceResult],
+    pub maintenance: Maintenance,
     pub eye_height: f32,
     pub room_height: f32,
     pub materials: Vec<(String, f32)>,
     pub unassigned: usize,
     pub ramp: fn(f32) -> (f32, f32, f32),
-    pub scale_top: f64,
-    pub scale_auto: bool,
     pub mask: Vec<bool>,
+}
+
+impl<'a> Input<'a> {
+    /// The whole scheme's schedule, rooms merged.
+    pub fn total_schedule(&self) -> Vec<ScheduleRow> {
+        let mut out: Vec<ScheduleRow> = Vec::new();
+        for r in &self.rooms {
+            for row in &r.schedule {
+                match out.iter_mut().find(|x| x.profile == row.profile) {
+                    Some(x) => x.count += row.count,
+                    None => out.push(row.clone()),
+                }
+            }
+        }
+        out.sort_by(|a, b| b.count.cmp(&a.count).then(a.profile.cmp(&b.profile)));
+        out
+    }
 }
 
 const INK: [u8; 3] = [17, 17, 17];
@@ -166,16 +227,58 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     }
 
     let mut c = Cursor::new(w, h, has_head, has_foot);
-    for s in &opt.sections {
+    // A CHAPTER PER ROOM, then the building-wide sections once.
+    //
+    // Three rooms used to come out as one plot with a bounding box round them, because a
+    // calculation produced one room's numbers. They are separate rooms with separate fittings and
+    // separate answers, and a report that merges them states an average over ground that is not
+    // one space.
+    let many = inp.rooms.len() > 1;
+    // A BUILDING-WIDE SECTION KEEPS ITS PLACE relative to the room chapters. The order IS the
+    // document, so a report with Surfaces listed first prints Surfaces first — the chapters go
+    // where the first per-room section sits in the list, not always at the top.
+    let first_room_at = opt.sections.iter().position(|s| is_per_room(*s)).unwrap_or(usize::MAX);
+    for s in opt.sections.iter().enumerate().filter(|(i, s)| *i < first_room_at && !is_per_room(**s)).map(|(_, s)| s) {
         match s {
-            Section::Summary => summary(&mut c, inp),
-            Section::Installation => installation(&mut c, inp),
             Section::Materials => materials(&mut c, inp),
-            Section::WorkingPlane => working_plane(&mut c, inp),
-            Section::FalseColour => false_colour(&mut c, inp, opt),
-            Section::NumericGrid => numeric_grid(&mut c, inp),
             Section::Surfaces => surfaces(&mut c, inp),
             Section::Renders => renders(&mut c, opt, &doc),
+            _ => {}
+        }
+    }
+    for room in &inp.rooms {
+        if many || !room.name.trim().is_empty() {
+            chapter(&mut c, if room.name.trim().is_empty() { "Results" } else { room.name.trim() });
+        }
+        for s in opt.sections.iter().filter(|s| is_per_room(**s)) {
+            match s {
+                Section::Summary => summary(&mut c, room, inp.unassigned),
+                Section::Installation => installation(&mut c, room, inp.maintenance),
+                Section::WorkingPlane => working_plane(&mut c, room, inp.eye_height),
+                Section::FalseColour => false_colour(&mut c, inp, room, opt),
+                Section::NumericGrid => numeric_grid(&mut c, room),
+                Section::Schedule => schedule(&mut c, &room.schedule, "Luminaire schedule"),
+                _ => {}
+            }
+        }
+    }
+    // The whole scheme's totals, once, when there is more than one room to total.
+    if many && opt.has(Section::Schedule) {
+        chapter(&mut c, "Whole scheme");
+        schedule(&mut c, &inp.total_schedule(), "Luminaire schedule — all rooms");
+    }
+    for s in opt
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i > first_room_at && !is_per_room(**s))
+        .map(|(_, s)| s)
+    {
+        match s {
+            Section::Materials => materials(&mut c, inp),
+            Section::Surfaces => surfaces(&mut c, inp),
+            Section::Renders => renders(&mut c, opt, &doc),
+            _ => {}
         }
     }
     let mut body = c.finish();
@@ -338,7 +441,7 @@ fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc) -> Page {
         text: format!(
             "SIMLUX {} · maintained values, maintenance factor {:.2}",
             env!("SIMLUX_BUILD"),
-            inp.grid.maintenance
+            inp.rooms.first().map(|r| r.grid.maintenance).unwrap_or(1.0)
         ),
     });
     p
@@ -353,8 +456,37 @@ fn fit(iw: f64, ih: f64, bw: f64, bh: f64) -> (f64, f64) {
     (iw * k, ih * k)
 }
 
-fn summary(c: &mut Cursor, inp: &Input) {
-    let g = inp.grid;
+
+/// Sections that describe ONE room, and so repeat inside each room's chapter.
+fn is_per_room(s: Section) -> bool {
+    matches!(
+        s,
+        Section::Summary
+            | Section::Installation
+            | Section::WorkingPlane
+            | Section::FalseColour
+            | Section::NumericGrid
+            | Section::Schedule
+    )
+}
+
+/// A room's chapter heading — only when there is more than one, or it is noise on a single-room
+/// report that already says which room it is about on the cover.
+fn chapter(c: &mut Cursor, name: &str) {
+    c.need_or_break(60.0);
+    if !c.page.items.is_empty() {
+        c.brk();
+    }
+    c.y += 8.0;
+    c.text(c.left, 17.0, Font::Bold, Align::Left, INK, name);
+    c.y += 7.0;
+    let (l, r, y) = (c.left, c.right, c.y);
+    c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [120, 120, 120], width: 1.2 });
+    c.y += 10.0;
+}
+
+fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
+    let g = room.grid;
     c.heading("Summary");
     c.row("Average E", &format!("{:.0} lx", g.avg));
     c.row("Minimum E", &format!("{:.0} lx", g.min));
@@ -366,26 +498,28 @@ fn summary(c: &mut Cursor, inp: &Input) {
     c.row("Grid", &format!("{} x {} points", g.cols, g.rows));
     c.row(
         "Plane",
-        &format!("{:.2} x {:.2} m at {:.2} m", inp.plane.width, inp.plane.depth, inp.plane.origin.z),
+        &format!(
+            "{:.2} x {:.2} m at {:.2} m",
+            room.plane.width, room.plane.depth, room.plane.origin.z
+        ),
     );
-    if inp.unassigned > 0 {
+    if unassigned > 0 {
         c.note(&format!(
-            "{} fixture(s) have no photometric file assigned and contribute nothing.",
-            inp.unassigned
+            "{unassigned} fixture(s) in this project have no photometric file assigned and \
+             contribute nothing.",
         ));
     }
 }
 
-fn installation(c: &mut Cursor, inp: &Input) {
-    let Some(i) = inp.installation else { return };
+fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance) {
+    let Some(i) = room.installation else { return };
     c.heading("Installation");
     c.row("Luminaires", &format!("{}", i.count));
-    c.row("Total load", &format!("{:.1} W", i.total_watts));
+    c.row("Connected load", &format!("{:.1} W", i.total_watts));
     c.row("Installed flux", &format!("{:.0} lm", i.total_lumens));
     c.row("Area", &format!("{:.2} m2", i.area_m2));
     c.row("Power density", &format!("{:.2} W/m2", i.power_density));
     c.row("Efficacy", &format!("{:.0} lm/W", i.efficacy));
-    let m = inp.maintenance;
     c.row(
         "Maintenance",
         &format!(
@@ -399,6 +533,141 @@ fn installation(c: &mut Cursor, inp: &Input) {
     );
 }
 
+/// THE LUMINAIRE SCHEDULE — what is in this room, by type.
+///
+/// Asked for as "the report should also show information of all the lights, like there
+/// manufacturer, their specifications etc." A lighting report that states an illuminance without
+/// saying what produced it cannot be checked, ordered from, or handed to an installer.
+///
+/// BY TYPE, not by fixture: "48 × OCULUS GRANDE 2.0" is what gets ordered and wired. Manufacturer
+/// and catalogue number come out of the photometric file's own header — so a file that declares
+/// none shows a dash, which is the file's omission rather than the report's.
+fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
+    if rows.is_empty() {
+        return;
+    }
+    c.heading(title);
+
+    let cols = [0.06, 0.34, 0.50, 0.62, 0.72, 0.84, 1.0];
+    let w = c.width();
+    let left = c.left;
+    // Captured by VALUE, not borrowed from the cursor — the cursor is written to on every row.
+    let at = move |f: f64| left + w * f;
+
+    c.need(20.0);
+    c.y += 10.0;
+    for (i, (h, a)) in [
+        ("Qty", Align::Right),
+        ("Fitting", Align::Left),
+        ("Manufacturer", Align::Left),
+        ("Watts", Align::Right),
+        ("Flux", Align::Right),
+        ("lm/W", Align::Right),
+        ("Size (mm)", Align::Right),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = if a == Align::Right { at(cols[i]) } else { at(if i == 0 { 0.0 } else { cols[i - 1] }) };
+        c.push(Item::Text {
+            x,
+            y: c.y,
+            size: 8.0,
+            font: Font::Bold,
+            rgb: FAINT,
+            align: a,
+            text: h.to_string(),
+        });
+    }
+    c.y += 4.0;
+    let (l, r, y) = (c.left, c.right, c.y);
+    c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: RULE, width: 0.6 });
+
+    for row in rows {
+        c.need(24.0);
+        c.y += 11.0;
+        let dash = |v: f64, unit: &str, dp: usize| -> String {
+            if v > 0.0 {
+                format!("{v:.dp$}{unit}")
+            } else {
+                "—".into()
+            }
+        };
+        let cells: [(f64, Align, String); 7] = [
+            (at(cols[0]), Align::Right, format!("{}", row.count)),
+            (at(cols[0]), Align::Left, row.profile.clone()),
+            (at(cols[1]), Align::Left, if row.manufacturer.trim().is_empty() {
+                "—".into()
+            } else {
+                row.manufacturer.trim().to_string()
+            }),
+            (at(cols[3]), Align::Right, dash(row.watts, " W", 1)),
+            (at(cols[4]), Align::Right, dash(row.lumens, " lm", 0)),
+            (at(cols[5]), Align::Right, row.efficacy().map(|e| format!("{e:.0}")).unwrap_or_else(|| "—".into())),
+            (at(cols[6]), Align::Right, {
+                let (l, w2, h2) = row.size_m;
+                if l > 0.0 || w2 > 0.0 {
+                    format!("{:.0} × {:.0} × {:.0}", l * 1000.0, w2 * 1000.0, h2 * 1000.0)
+                } else {
+                    "—".into()
+                }
+            }),
+        ];
+        for (i, (x, a, t)) in cells.into_iter().enumerate() {
+            let xx = if i == 1 { at(cols[0]) + 6.0 } else { x };
+            c.push(Item::Text {
+                x: xx,
+                y: c.y,
+                size: 8.0,
+                font: if i == 1 { Font::Bold } else { Font::Regular },
+                rgb: INK,
+                align: a,
+                text: t,
+            });
+        }
+        // The catalogue number and lamp under the name, where there is one — they belong to the
+        // fitting rather than to a column of their own, and a schedule of eight columns on A4 is
+        // a schedule nobody can read.
+        let mut sub = Vec::new();
+        if !row.catalogue.trim().is_empty() && row.catalogue.trim() != row.profile.trim() {
+            sub.push(format!("cat. {}", row.catalogue.trim()));
+        }
+        if !row.lamp.trim().is_empty() {
+            sub.push(row.lamp.trim().to_string());
+        }
+        if !sub.is_empty() {
+            c.y += 9.0;
+            c.push(Item::Text {
+                x: at(cols[0]) + 6.0,
+                y: c.y,
+                size: 7.0,
+                font: Font::Regular,
+                rgb: FAINT,
+                align: Align::Left,
+                text: sub.join(" · "),
+            });
+        }
+        c.y += 3.0;
+        let (l, r, y) = (c.left, c.right, c.y);
+        c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [235, 235, 235], width: 0.4 });
+    }
+
+    let total_w: f64 = rows.iter().map(|r| r.total_watts()).sum();
+    let total_n: usize = rows.iter().map(|r| r.count).sum();
+    c.y += 10.0;
+    c.text(c.left, 8.0, Font::Bold, Align::Left, INK, &format!("{total_n} fitting(s)"));
+    c.push(Item::Text {
+        x: c.right,
+        y: c.y,
+        size: 8.0,
+        font: Font::Bold,
+        rgb: INK,
+        align: Align::Right,
+        text: format!("{total_w:.1} W connected"),
+    });
+    c.y += 4.0;
+}
+
 fn materials(c: &mut Cursor, inp: &Input) {
     if inp.materials.is_empty() {
         return;
@@ -410,8 +679,8 @@ fn materials(c: &mut Cursor, inp: &Input) {
     }
 }
 
-fn working_plane(c: &mut Cursor, inp: &Input) {
-    let g = inp.grid;
+fn working_plane(c: &mut Cursor, room: &RoomInput, eye_height: f32) {
+    let g = room.grid;
     c.heading("Working plane");
     let mut v: Vec<f64> = g.values.clone();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -427,8 +696,8 @@ fn working_plane(c: &mut Cursor, inp: &Input) {
         "Diversity Ud = Emin/Emax",
         &if g.max > 0.0 { format!("{:.2}", g.min / g.max) } else { "—".into() },
     );
-    if let Some(cy) = inp.cylindrical_avg {
-        c.row(&format!("Cylindrical E at {:.1} m", inp.eye_height), &format!("{cy:.0} lx"));
+    if let Some(cy) = room.cylindrical_avg {
+        c.row(&format!("Cylindrical E at {eye_height:.1} m"), &format!("{cy:.0} lx"));
     }
 }
 
@@ -441,8 +710,8 @@ fn working_plane(c: &mut Cursor, inp: &Input) {
 /// So the plot is sized to fill TWO THIRDS OF THE PAGE, keeping the plane's proportions, and it
 /// starts a fresh page when what is left of this one cannot hold that. The room is the subject of
 /// the page it is on, which is what the reference drawing does.
-fn false_colour(c: &mut Cursor, inp: &Input, opt: &Options) {
-    let g = inp.grid;
+fn false_colour(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
+    let g = room.grid;
     if g.cols == 0 || g.rows == 0 {
         return;
     }
@@ -459,7 +728,7 @@ fn false_colour(c: &mut Cursor, inp: &Input, opt: &Options) {
     let needed = 40.0 + plot_h + LEGEND_H;
     c.need_or_break(needed);
     c.heading("Illuminance — false colour");
-    false_colour_body(c, inp, opt, cell, plot_w, plot_h);
+    false_colour_body(c, inp, room, opt, cell, plot_w, plot_h);
 }
 
 /// The box a header or footer logo is fitted into, in points — 120 x 24 pt, about 42 x 8.5 mm.
@@ -478,12 +747,13 @@ const LEGEND_H: f64 = 46.0;
 fn false_colour_body(
     c: &mut Cursor,
     inp: &Input,
+    room: &RoomInput,
     opt: &Options,
     cell: f64,
     plot_w: f64,
     plot_h: f64,
 ) {
-    let g = inp.grid;
+    let g = room.grid;
     let x0 = c.left + (c.width() - plot_w) * 0.5;
     let y0 = c.y;
     let room_max = g.max;
@@ -495,7 +765,7 @@ fn false_colour_body(
             let Some(v) = g.values.get(i) else { continue };
             let x = x0 + col as f64 * cell;
             let y = y0 + r as f64 * cell;
-            if inp.mask.get(i).is_some_and(|inside| !inside) {
+            if room.mask.get(i).is_some_and(|inside| !inside) {
                 // Outside the room: blank, not coloured. Colouring it would report illuminance on
                 // ground the room does not occupy.
                 continue;
@@ -531,7 +801,7 @@ fn false_colour_body(
         font: Font::Regular,
         rgb: FAINT,
         align: Align::Centre,
-        text: format!("{:.2} × {:.2} m", inp.plane.width, inp.plane.depth),
+        text: format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth),
     });
     c.y = y0 + plot_h + 24.0;
 
@@ -632,8 +902,8 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
 /// So the type is sized to the grid: whatever makes all of it fit the page, down to a floor. Below
 /// that floor it would be a grey texture rather than numbers, so the page says so and gives the
 /// figures that can still be read — the false-colour plot and the HTML report both carry the field.
-fn numeric_grid(c: &mut Cursor, inp: &Input) {
-    let g = inp.grid;
+fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
+    let g = room.grid;
     if g.cols == 0 || g.rows == 0 {
         return;
     }
@@ -673,7 +943,7 @@ fn numeric_grid(c: &mut Cursor, inp: &Input) {
         for col in 0..g.cols as usize {
             let i = r * g.cols as usize + col;
             let Some(v) = g.values.get(i) else { continue };
-            let inside = inp.mask.get(i).copied().unwrap_or(true);
+            let inside = room.mask.get(i).copied().unwrap_or(true);
             c.push(Item::Text {
                 x: c.left + (col as f64 + 1.0) * colw - colw * 0.12,
                 y: y0 + (r as f64 + 1.0) * rowh,
@@ -793,21 +1063,28 @@ mod tests {
         }
     }
 
-    fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> Input<'a> {
-        Input {
+    fn one_room<'a>(g: &'a LuxGrid, p: &'a CalcPlane, name: &str) -> RoomInput<'a> {
+        RoomInput {
+            name: name.to_string(),
             grid: g,
             plane: p,
-            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
+            mask: &[],
             installation: None,
-            surfaces: &[],
             cylindrical_avg: None,
+            schedule: Vec::new(),
+        }
+    }
+
+    fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> Input<'a> {
+        Input {
+            rooms: vec![one_room(g, p, "")],
+            maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
+            surfaces: &[],
             eye_height: 1.2,
             room_height: 3.0,
             materials: vec![("Floor".into(), 0.2)],
             unassigned: 0,
             ramp: crate::light::lux_rgb,
-            scale_top: 500.0,
-            scale_auto: true,
             mask: Vec::new(),
         }
     }
@@ -945,7 +1222,7 @@ mod tests {
         let g = grid(2, 1);
         let p = plane();
         let mut i = input(&g, &p);
-        i.mask = vec![true, false];
+        i.rooms[0].mask = &[true, false];
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::FalseColour];
@@ -1123,6 +1400,168 @@ mod tests {
             assert!(w <= LOGO_W + 1e-6 && h <= LOGO_H + 1e-6, "logo {w}x{h} escapes its box");
             assert!((w / h - 4.0).abs() < 1e-6, "logo {w}x{h} was stretched from 4:1");
         }
+    }
+
+
+    /// A CHAPTER PER ROOM.
+    ///
+    /// "if theres multiple rooms does it generate report for all the rooms seperately and show the
+    /// lights used in that room" — it did not: three rooms came out as one plot with a bounding
+    /// box around them, because a calculation produced one room's numbers.
+    #[test]
+    fn each_room_gets_its_own_chapter_and_plot() {
+        let g = grid(6, 6);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Summary, Section::FalseColour];
+        let mut i = input(&g, &p);
+        i.rooms = vec![one_room(&g, &p, "Office"), one_room(&g, &p, "Store")];
+        let d = layout(&i, &o);
+        let t = texts(&d);
+
+        for name in ["Office", "Store"] {
+            assert!(t.iter().any(|s| s == name), "no chapter for {name}: {t:?}");
+        }
+        // Two plots, not one — a cell per point, twice.
+        let cells = plot_cells(&d, 6, 6);
+        assert_eq!(cells.len(), 6 * 6 * 2, "expected a plot per room, got {} cells", cells.len());
+        // …and two Summary headings, one under each chapter.
+        assert_eq!(t.iter().filter(|s| *s == "Summary").count(), 2);
+    }
+
+    /// A SINGLE-ROOM REPORT IS UNCHANGED — no chapter heading for a room that is the whole report.
+    #[test]
+    fn one_unnamed_room_gets_no_chapter_heading() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Summary];
+        let d = layout(&input(&g, &p), &o);
+        let t = texts(&d);
+        assert!(t.iter().any(|s| s == "Summary"));
+        assert_eq!(d.pages.len(), 1, "a one-room summary should not need a chapter page");
+    }
+
+    /// THE SCHEDULE SAYS WHAT THE ROOM IS LIT WITH — by type, with the manufacturer the file
+    /// declares. A report that states an illuminance without saying what produced it cannot be
+    /// checked, ordered from, or handed to an installer.
+    #[test]
+    fn the_schedule_lists_the_fittings_by_type() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Schedule];
+        let mut i = input(&g, &p);
+        i.rooms[0].schedule = vec![
+            ScheduleRow {
+                profile: "OCULUS GRANDE 2.0".into(),
+                count: 12,
+                manufacturer: "HSI Lighting".into(),
+                catalogue: "OG20-36".into(),
+                lamp: "LED 3000K · CRI 90".into(),
+                watts: 22.0,
+                lumens: 2400.0,
+                size_m: (0.095, 0.095, 0.06),
+            },
+            ScheduleRow {
+                profile: "LINEA W48".into(),
+                count: 3,
+                manufacturer: String::new(),
+                catalogue: String::new(),
+                lamp: String::new(),
+                watts: 52.0,
+                lumens: 5600.0,
+                size_m: (2.0, 0.048, 0.08),
+            },
+        ];
+        let d = layout(&i, &o);
+        let t = texts(&d);
+
+        assert!(t.iter().any(|s| s == "OCULUS GRANDE 2.0"), "the fitting is not named: {t:?}");
+        assert!(t.iter().any(|s| s == "12"), "the quantity is missing");
+        assert!(t.iter().any(|s| s == "HSI Lighting"), "the manufacturer is missing");
+        assert!(t.iter().any(|s| s.contains("OG20-36")), "the catalogue number is missing");
+        assert!(t.iter().any(|s| s.contains("CRI 90")), "the lamp description is missing");
+        assert!(t.iter().any(|s| s == "22.0 W"), "the wattage is missing");
+        assert!(t.iter().any(|s| s == "2400 lm"), "the flux is missing");
+        assert!(t.iter().any(|s| s == "109"), "the efficacy is missing (2400/22)");
+        assert!(t.iter().any(|s| s.contains("95 × 95 × 60")), "the size is missing: {t:?}");
+
+        // A FILE THAT DECLARES NO MANUFACTURER SHOWS A DASH — that is the file's omission, not the
+        // report's, and inventing one would be worse than saying nothing.
+        assert!(t.iter().any(|s| s == "—"), "a missing manufacturer must read as absent");
+
+        // The totals, which is what a schedule is read for.
+        assert!(t.iter().any(|s| s == "15 fitting(s)"), "no total count: {t:?}");
+        assert!(
+            t.iter().any(|s| s.starts_with("420.0 W")),
+            "no connected load — 12×22 + 3×52 = 420 W: {t:?}",
+        );
+    }
+
+    /// SEVERAL ROOMS ALSO GET A WHOLE-SCHEME TOTAL, because the order goes out as one job.
+    #[test]
+    fn many_rooms_get_a_combined_schedule() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Schedule];
+        let row = |n: usize| ScheduleRow {
+            profile: "OCULUS".into(),
+            count: n,
+            manufacturer: "HSI".into(),
+            catalogue: String::new(),
+            lamp: String::new(),
+            watts: 20.0,
+            lumens: 2000.0,
+            size_m: (0.1, 0.1, 0.05),
+        };
+        let mut i = input(&g, &p);
+        i.rooms = vec![one_room(&g, &p, "A"), one_room(&g, &p, "B")];
+        i.rooms[0].schedule = vec![row(4)];
+        i.rooms[1].schedule = vec![row(6)];
+
+        let merged = i.total_schedule();
+        assert_eq!(merged.len(), 1, "one type across both rooms");
+        assert_eq!(merged[0].count, 10, "4 + 6");
+
+        let t = texts(&layout(&i, &o));
+        assert!(t.iter().any(|s| s == "10"), "the combined quantity is not on the page: {t:?}");
+        assert!(
+            t.iter().any(|s| s.contains("all rooms")),
+            "the combined schedule is not labelled as such",
+        );
+    }
+
+    /// A BUILDING-WIDE SECTION KEEPS ITS PLACE. The order IS the document, so listing Surfaces
+    /// first must print it first rather than sweeping it to the end behind the room chapters.
+    #[test]
+    fn a_building_wide_section_keeps_its_position() {
+        let g = grid(4, 4);
+        let p = plane();
+        let surf = [SurfaceResult {
+            material: 0,
+            name: "Ceiling".into(),
+            area_m2: 10.0,
+            e_avg: 120.0,
+            e_min: 80.0,
+            e_max: 200.0,
+            l_avg: 26.0,
+            u0: 0.67,
+            samples: 64,
+        }];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Surfaces, Section::Summary];
+        let mut i = input(&g, &p);
+        i.surfaces = &surf;
+        let t = texts(&layout(&i, &o));
+        let at = |s: &str| t.iter().position(|x| x == s).unwrap_or(usize::MAX);
+        assert!(at("Surfaces") < at("Summary"), "Surfaces was swept behind the rooms: {t:?}");
     }
 
     /// THE SECTION ORDER IS THE DOCUMENT'S ORDER. Moving the renders page is the whole reason the

@@ -184,6 +184,27 @@ pub fn parse(contents: &str) -> Result<IesProfile, String> {
         luminous_width: lum_wid_mm / 1000.0,
         length: length_mm / 1000.0,
         height: height_mm / 1000.0,
+        // EULUMDAT IS FIXED-ORDER: the line index IS the field name, so every one of these is an
+        // off-by-one waiting to happen — and an off-by-one here does not fail, it prints the
+        // neighbouring field, which looks like data. Record 1 is the company; record 10 is the
+        // luminaire NUMBER, record 9 being the name that is already read above.
+        manufacturer: at(0).to_string(),
+        catalogue: at(9).to_string(),
+        lamp: {
+            // The lamp set, RELATIVE TO `base` exactly like the flux and the wattage above —
+            // record 28 is the type, 30 the colour temperature, 31 the CRI. Written with absolute
+            // indices this read the number of lamps and the flux instead, and a schedule saying
+            // "1 · 2400" where the lamp should be looks like a lamp.
+            //
+            // Joined into one description rather than given three columns: a schedule reads them
+            // as one line, and a file that omits some must not leave a row of dashes.
+            let parts: Vec<String> = [at(base + 1), at(base + 3), at(base + 4)]
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && s != "0")
+                .collect();
+            parts.join(" · ")
+        },
     })
 }
 
@@ -385,4 +406,90 @@ fn ldt_probe_real_files() {
         }
     }
     println!("\n{n_ok} parsed, {n_bad} failed");
+}
+
+/// THE HEADER A SCHEDULE NEEDS.
+///
+/// A report has to say what produced the illuminance it states — "the report should also show
+/// information of all the lights, like there manufacturer, their specifications etc." EULUMDAT
+/// carries that in its first records, and the parser used to read past them.
+#[cfg(test)]
+mod the_header_reaches_the_schedule {
+    use super::*;
+
+    /// A minimal EULUMDAT: 1 C-plane, 2 gamma angles, with the header records filled in.
+    fn file() -> String {
+        let mut l: Vec<String> = Vec::new();
+        l.push("HSI Lighting".into()); // 1  company
+        l.push("1".into()); // 2  Ityp
+        l.push("1".into()); // 3  Isym — symmetry about the vertical axis
+        l.push("1".into()); // 4  Mc
+        l.push("0".into()); // 5  Dc
+        l.push("2".into()); // 6  Ng
+        l.push("90".into()); // 7  Dg
+        l.push("rep-001".into()); // 8  measurement report number
+        l.push("OCULUS GRANDE 2.0".into()); // 9  luminaire name
+        l.push("OG20-36".into()); // 10 luminaire number
+        l.push("oculus.ldt".into()); // 11 file name
+        l.push("2026-08-20".into()); // 12 date/user
+        l.push("95".into()); // 13 length/diameter mm
+        l.push("95".into()); // 14 width mm
+        l.push("60".into()); // 15 height mm
+        l.push("95".into()); // 16 luminous length
+        l.push("95".into()); // 17 luminous width
+        for _ in 0..6 {
+            l.push("0".into()); // 18-23: four luminous heights, DFF, LORL
+        }
+        l.push("1".into()); // 24 conversion factor
+        l.push("0".into()); // 25 tilt
+        l.push("1".into()); // 26 number of lamp sets
+        l.push("1".into()); // 27 number of lamps
+        l.push("LED".into()); // 28 type of lamps
+        l.push("2400".into()); // 29 total luminous flux
+        l.push("3000K".into()); // 30 colour temperature
+        l.push("CRI 90".into()); // 31 colour rendering index
+        l.push("22".into()); // 32 wattage
+        for _ in 0..10 {
+            l.push("1".into()); // 32-41 direct ratios
+        }
+        l.push("1".into()); // C-plane angle
+        l.push("0".into()); // gamma 0
+        l.push("90".into()); // gamma 90
+        l.push("1000".into()); // candela at 0
+        l.push("0".into()); // candela at 90
+        while l.len() < 44 {
+            l.push("0".into());
+        }
+        l.join("\n")
+    }
+
+    /// THE MANUFACTURER AND THE CATALOGUE NUMBER COME OUT OF THE FILE.
+    ///
+    /// Read by RECORD NUMBER: EULUMDAT is fixed-order, so record 1 is the company and record 9 the
+    /// luminaire number. Reading the wrong index gives a plausible-looking string from the wrong
+    /// field — a schedule listing "rep-001" as the manufacturer looks like data.
+    #[test]
+    fn the_company_and_catalogue_are_read() {
+        let p = parse(&file()).expect("a valid EULUMDAT");
+        assert_eq!(p.manufacturer, "HSI Lighting", "record 1 is the company");
+        assert_eq!(p.catalogue, "OG20-36", "record 10 is the luminaire NUMBER");
+        assert_eq!(p.name, "OCULUS GRANDE 2.0", "record 9 is the name, and stays the name");
+        assert!(
+            p.lamp.contains("LED") && p.lamp.contains("3000K") && p.lamp.contains("CRI 90"),
+            "the lamp description is {:?}",
+            p.lamp,
+        );
+    }
+
+    /// A FILE THAT DECLARES NONE LEAVES THEM EMPTY, so the report can show a dash rather than
+    /// invent a manufacturer.
+    #[test]
+    fn a_file_with_no_company_leaves_it_empty() {
+        let mut lines: Vec<String> = file().lines().map(|s| s.to_string()).collect();
+        lines[0] = String::new();
+        lines[10 - 1] = String::new();
+        let p = parse(&lines.join("\n")).expect("still valid");
+        assert!(p.manufacturer.is_empty(), "invented a manufacturer: {:?}", p.manufacturer);
+        assert!(p.catalogue.is_empty(), "invented a catalogue number: {:?}", p.catalogue);
+    }
 }

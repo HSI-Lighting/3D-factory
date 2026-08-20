@@ -75,6 +75,9 @@ fn downlight() -> IesProfile {
     let candela: Vec<f64> =
         vertical_angles.iter().map(|g| 1000.0 * g.to_radians().cos().max(0.0)).collect();
     IesProfile {
+        manufacturer: String::new(),
+        catalogue: String::new(),
+        lamp: String::new(),
         name: "builtin".into(),
         photometry: PhotometryType::C,
         lumens: -1.0,

@@ -386,6 +386,9 @@ mod tests {
     fn flat_1000cd() -> IesProfile {
         let va: Vec<f64> = (0..=90).map(|d| d as f64).collect();
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "flat".into(),
             photometry: PhotometryType::C,
             lumens: -1.0,
@@ -493,6 +496,9 @@ mod tests {
         let va: Vec<f64> = (0..=36).map(|k| k as f64 * 5.0).collect(); // 0..180
         let n = va.len();
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "isotropic".into(),
             photometry: PhotometryType::C,
             lumens: 4.0 * PI * i,
@@ -1121,6 +1127,9 @@ mod surface_tests {
 
     fn isotropic(cd: f64) -> IesProfile {
         IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
             name: "iso".into(),
             photometry: crate::ies::PhotometryType::C,
             lumens: 4.0 * PI * cd,

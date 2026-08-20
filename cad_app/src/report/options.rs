@@ -64,6 +64,8 @@ pub enum Section {
     FalseColour,
     NumericGrid,
     Surfaces,
+    /// What the room is lit WITH — manufacturer, catalogue number, load, per fitting type.
+    Schedule,
     /// The render images, on a page of their own.
     Renders,
 }
@@ -78,6 +80,7 @@ impl Section {
             Section::FalseColour => "Illuminance — false colour",
             Section::NumericGrid => "Illuminance grid (lx)",
             Section::Surfaces => "Surfaces",
+            Section::Schedule => "Luminaire schedule",
             Section::Renders => "Renders",
         }
     }
@@ -90,6 +93,7 @@ impl Section {
             Section::Materials,
             Section::WorkingPlane,
             Section::FalseColour,
+            Section::Schedule,
             Section::Renders,
             Section::NumericGrid,
             Section::Surfaces,
