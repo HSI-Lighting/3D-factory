@@ -921,7 +921,8 @@ mod tests {
 /// WALLS and CEILINGS too — an office wants roughly 50 lx on walls and 30 lx on the ceiling, each
 /// at U₀ ≥ 0.10 — and a scheme that passes on the desk can still fail on those. Luminance is the
 /// quantity the appearance clauses are written in, and for a Lambertian surface it is `ρE/π`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SurfaceResult {
     pub material: crate::types::MaterialId,
     pub name: String,

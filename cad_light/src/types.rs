@@ -155,7 +155,8 @@ impl Luminaire {
 /// are read from both IES and EULUMDAT and were never used for anything. Power density is the
 /// figure building regulations are written in terms of, and the one a lighting scheme is rejected
 /// on after it has passed on lux.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Installation {
     /// Fixtures counted (those whose profile resolves).
     pub count: usize,
@@ -217,7 +218,7 @@ pub fn installation_summary(
 /// The horizontal work plane on which illuminance is sampled. A `rows x cols`
 /// grid spans `width` (x) by `depth` (y), anchored at `origin` (min corner), at
 /// height `origin.z`. Engine world is Z-up.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CalcPlane {
     pub origin: Vertex,
     pub width: f32,

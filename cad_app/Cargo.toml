@@ -14,7 +14,14 @@ cad_wall   = { path = "../cad_wall" }
 cad_raster = { path = "../cad_raster" }
 cad_param  = { path = "../cad_param" }
 serde      = { version = "1", features = ["derive"] }   # SIMLUX sidecar (drawing.simlux.json)
-serde_json = "1"
+# `float_roundtrip` IS NOT DECORATION HERE. serde_json's default float parser is fast and is NOT
+# always correctly rounded — it can hand back a value one ULP from the one that was written.
+# Writing is exact, so a number survives being saved and comes back very slightly different, which
+# is the kind of drift nobody notices and nobody can explain: a stored calculation reloaded with a
+# minimum of 11.000000000000002 lx instead of 11, a sidecar dimension that moves in its last digit
+# each time a project is opened and closed. Caught by the stored-result round trip, which compares
+# the restored figures BIT FOR BIT against the ones the calculation produced.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 cad_light  = { path = "../cad_light" }   # SIMLUX lighting engine (IES + lux + Document extrude)
 # 3D_FACTORY: the 3D solid layer (Model/Feature/Plane/Frame + parametric CSG via csgrs) and
 # the 3D modifiers. UI-agnostic, so the app drives it the same way it drives cad_light.

@@ -426,6 +426,71 @@ impl CalcProgress {
     }
 }
 
+/// FNV-1a, written out.
+///
+/// NOT `std::collections::hash_map::DefaultHasher`, whose algorithm is documented as unspecified
+/// and free to change between Rust releases. That is fine for a hash map, which never outlives the
+/// process, and wrong for a fingerprint written to disk: every saved result in every project would
+/// read as out of date the first morning after a toolchain upgrade, with nothing on screen to say
+/// why, and the only cure would be re-running calculations that were never actually stale.
+///
+/// Sixty-four bits, so two genuinely different scenes colliding — and a stale result being shown as
+/// current — is a one-in-1.8×10¹⁹ event. The consequence of a collision is the reason this hashes
+/// the scene rather than a modification time: a file's clock says when it was touched, not whether
+/// anything in it changed.
+#[derive(Clone, Copy)]
+struct Fnv(u64);
+
+impl Fnv {
+    fn new() -> Self {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+    fn byte(&mut self, b: u8) {
+        self.0 ^= b as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn u64(&mut self, v: u64) {
+        for b in v.to_le_bytes() {
+            self.byte(b);
+        }
+    }
+    fn f32(&mut self, v: f32) {
+        // Through the BITS, so this stays exact. Rounding first would make a fixture nudged by a
+        // hundredth of a millimetre look unmoved, and the answer it produced look still true.
+        self.u64(v.to_bits() as u64);
+    }
+    fn f64(&mut self, v: f64) {
+        self.u64(v.to_bits());
+    }
+    /// LENGTH FIRST, so `["ab", "c"]` and `["a", "bc"]` are not the same scene.
+    fn str(&mut self, s: &str) {
+        self.u64(s.len() as u64);
+        for b in s.as_bytes() {
+            self.byte(*b);
+        }
+    }
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Fold a serialisable value into a fingerprint, through its JSON.
+///
+/// Field by field would be faster and is what a hash normally does. It is not what is wanted here:
+/// these are the tables that gain fields most often, and a hand-written list of them is a list that
+/// falls behind without saying so — the failure being an out-of-date result shown as current.
+/// Serialisation covers every field a type has, including the ones added next year.
+///
+/// A value that will not serialise hashes as the ERROR rather than as an empty string, so two
+/// different scenes cannot come out identical because both failed.
+fn hash_json<T: serde::Serialize + ?Sized>(h: &mut Fnv, tag: &str, v: &T) {
+    h.str(tag);
+    match serde_json::to_string(v) {
+        Ok(s) => h.str(&s),
+        Err(e) => h.str(&format!("<unserialisable {tag}: {e}>")),
+    }
+}
+
 /// Everything a calculation needs, OWNED — so it can cross a thread.
 ///
 /// Split out so the expensive part touches no `&self`: the app hands this to a worker and keeps
@@ -457,9 +522,114 @@ pub struct CalcOutcome {
     pub timings: Vec<(&'static str, f64)>,
     /// True when the worker was asked to stop and did.
     pub cancelled: bool,
+    /// The scene this answer belongs to — [`CalcJob::fingerprint`], taken from the job the worker
+    /// was actually handed rather than from the app afterwards. Between pressing Calculate and the
+    /// answer coming back there are minutes in which somebody can move a fixture, and a result
+    /// stamped with the scene as it looked on ARRIVAL would claim to describe a building it was
+    /// never computed from.
+    pub fingerprint: u64,
 }
 
 impl CalcJob {
+    /// A HASH OF EVERY INPUT TO THE ANSWER — the thing that decides whether a saved result is
+    /// still true.
+    ///
+    /// A result is worth keeping only for as long as the scene that produced it is unchanged, and
+    /// "unchanged" has to mean something precise. It cannot mean a modification time, which says
+    /// when a file was touched and not whether anything in it moved. It cannot mean a flag set by
+    /// hand at each of the places that edit a fixture, a wall, a reflectance or a ray count,
+    /// because that list is long, it grows, and the day somebody adds an edit path and forgets the
+    /// flag the app shows an out-of-date answer as a current one. **A wrong lux figure presented
+    /// confidently is worse than no figure at all** — nothing on the page says which it is.
+    ///
+    /// So it is hashed from the job itself, which IS the calculation's input by construction: if a
+    /// value is not in `CalcJob` it cannot have reached the engine.
+    ///
+    /// THE `let CalcJob { .. }` BELOW HAS NO `..` AND THAT IS THE POINT. Adding a field to the job
+    /// stops this compiling until somebody has decided whether it changes the answer. The guarantee
+    /// is a compile error rather than a test, so it cannot be left for later.
+    pub fn fingerprint(&self) -> u64 {
+        let CalcJob {
+            meshes,
+            lums,
+            profiles,
+            materials,
+            settings,
+            maintenance,
+            targets,
+            fallback,
+            cell_size,
+            plane_height,
+            eye_height,
+            wall_zone,
+            // Derived from `meshes`, and reported rather than used — but hashing it costs one word
+            // and removes the question.
+            scene_tris,
+        } = self;
+
+        let mut h = Fnv::new();
+        h.u64(*scene_tris as u64);
+
+        // ---- the room, as the engine sees it ---------------------------------------------
+        h.u64(meshes.len() as u64);
+        for m in meshes {
+            h.u64(m.material as u64);
+            h.u64(m.vertices.len() as u64);
+            for v in &m.vertices {
+                h.f32(v.x);
+                h.f32(v.y);
+                h.f32(v.z);
+            }
+            h.u64(m.triangles.len() as u64);
+            for t in &m.triangles {
+                h.u64(t.a as u64);
+                h.u64(t.b as u64);
+                h.u64(t.c as u64);
+            }
+        }
+
+        // ---- everything that already serialises ------------------------------------------
+        //
+        // Through JSON rather than field by field, because these are the tables that change most
+        // often and a hand-written list of their fields is a list that goes out of date silently.
+        // Serialisation covers every field a type has, today and after the next one is added.
+        hash_json(&mut h, "lums", lums);
+        hash_json(&mut h, "materials", materials);
+        hash_json(&mut h, "settings", settings);
+        hash_json(&mut h, "maintenance", maintenance);
+        // A `HashMap` iterates in a DIFFERENT ORDER EACH RUN, so hashing it directly would make
+        // every result look stale roughly always. Sorted by name, which is how they are referenced.
+        h.str("profiles");
+        let mut names: Vec<&String> = profiles.keys().collect();
+        names.sort();
+        h.u64(names.len() as u64);
+        for n in names {
+            h.str(n);
+            hash_json(&mut h, "profile", &profiles[n]);
+        }
+
+        // ---- what is being asked -----------------------------------------------------------
+        h.u64(targets.len() as u64);
+        for (name, poly) in targets {
+            h.str(name);
+            h.u64(poly.len() as u64);
+            for v in poly {
+                h.f32(v.x);
+                h.f32(v.y);
+            }
+        }
+        let (x0, y0, x1, y1) = *fallback;
+        h.f32(x0);
+        h.f32(y0);
+        h.f32(x1);
+        h.f32(y1);
+        h.f32(*cell_size);
+        h.f32(*plane_height);
+        h.f32(*eye_height);
+        h.f32(*wall_zone);
+        h.finish()
+    }
+
     /// How many steps [`run`](Self::run) will report.
     pub fn steps(&self) -> u32 {
         // The evaluator, then three phases per room, then the surfaces.
@@ -481,6 +651,12 @@ impl CalcJob {
         p.total.store(self.steps(), Ordering::Relaxed);
         let mut timings: Vec<(&'static str, f64)> = Vec::new();
         let mut t = std::time::Instant::now();
+        // Taken HERE, from the job, and carried through both exits below — the answer is stamped
+        // with the scene it was computed from, not with whatever the plan looks like by the time it
+        // finishes.
+        let fingerprint = self.fingerprint();
+        timings.push(("fingerprint", t.elapsed().as_secs_f64() * 1000.0));
+        t = std::time::Instant::now();
 
         // ONE EVALUATOR, EVERY ROOM. Building it builds a BVH over the whole scene, and light
         // crosses between rooms through openings — so the rooms are separate questions about one
@@ -506,6 +682,7 @@ impl CalcJob {
                     meshes: self.meshes,
                     timings,
                     cancelled: true,
+                    fingerprint,
                 };
             }
             let label = if name.is_empty() {
@@ -524,7 +701,7 @@ impl CalcJob {
         timings.push(("surfaces", t.elapsed().as_secs_f64() * 1000.0));
         timings.push(("scene_tris", self.scene_tris as f64));
 
-        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false }
+        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false, fingerprint }
     }
 
     /// Everything about ONE room, from an evaluator already built over the whole scene.
@@ -796,6 +973,28 @@ pub struct LightState {
     /// This is the readout that tells the two apart, and it is a field rather than a `println!` so
     /// the app can show it as readily as the offline harness.
     pub last_timings: Vec<(&'static str, f64)>,
+    /// THE SCENE THE ANSWER ON SCREEN BELONGS TO — [`CalcJob::fingerprint`], or `None` when
+    /// nothing has been calculated.
+    ///
+    /// A lighting result stops being true the moment anything it was computed from moves, and
+    /// there is nothing about the numbers themselves that says so: 412 lx from yesterday's layout
+    /// and 412 lx from today's look identical on the page. This is what tells them apart, and it is
+    /// what makes writing the result to disk safe at all — without it, reopening a project would
+    /// show a figure with no way to know which building it describes.
+    pub results_fingerprint: Option<u64>,
+    /// The scene has moved on since the answer on screen was computed.
+    ///
+    /// The result is KEPT and clearly marked rather than thrown away. Somebody who nudges a fixture
+    /// and instantly loses a seventy-second answer has lost the very thing they were comparing
+    /// against — and the change may well be the nudge they are about to undo.
+    pub results_stale: bool,
+    /// When staleness was last checked. Asking costs what building the scene triangles costs, so it
+    /// is asked a few times a second rather than sixty.
+    pub stale_checked: Option<std::time::Instant>,
+    /// The answer on screen was READ BACK from disk rather than computed this session. Said out
+    /// loud in the panel: "where did this number come from" has exactly one honest answer, and it
+    /// is not always "you just pressed Calculate".
+    pub results_restored: bool,
     pub meshes: Vec<Mesh>,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
@@ -943,6 +1142,10 @@ impl LightState {
             grid_en: None,
             plane_en: None,
             last_timings: Vec::new(),
+            results_fingerprint: None,
+            results_stale: false,
+            stale_checked: None,
+            results_restored: false,
             meshes: Vec::new(),
             show_overlay: true,
             scale_max: None,
@@ -2076,11 +2279,136 @@ impl LightState {
         factory: Option<&crate::factory::FactoryState>,
     ) -> Option<CalcJob> {
         self.last_timings.clear();
+        let job = self.build_job(doc, factory);
+        if job.is_none() {
+            self.grid = None;
+            self.plane = None;
+            self.rooms.clear();
+            self.last_msg =
+                "No geometry — draw a closed room, or build one in the 3D Factory.".to_string();
+        }
+        if let Some(j) = &job {
+            if std::env::var_os("SIMLUX_PHASE_LOG").is_some() {
+                eprintln!("  [phase] scene is {} triangles", j.scene_tris);
+            }
+        }
+        job
+    }
+
+    /// THE FINGERPRINT OF THE SCENE AS IT STANDS — what a saved result is checked against.
+    ///
+    /// Separate from [`prepare`](Self::prepare) because asking "is the answer on screen still
+    /// true?" must not have opinions about the answer on screen: `prepare` clears the results and
+    /// rewrites the status line when a project has nothing to calculate, which is the correct
+    /// thing for a calculation to do and a destructive thing for a QUESTION to do. A project
+    /// somebody has emptied down to nothing simply has no fingerprint.
+    ///
+    /// Costs what building a job costs — the scene triangles — which is why the caller throttles
+    /// it rather than asking every frame.
+    pub fn current_fingerprint(
+        &mut self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> Option<u64> {
+        self.build_job(doc, factory).map(|j| j.fingerprint())
+    }
+
+    /// How often the "is this still true?" question is asked, at most.
+    ///
+    /// It costs what building the scene triangles costs — a few milliseconds on a real building —
+    /// so asking it every frame would spend a chunk of every frame on it for no gain. A quarter of
+    /// a second is faster than anyone can move a fixture and read the panel.
+    pub const STALE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Ask whether the answer on screen still describes the scene, at most a few times a second.
+    ///
+    /// Returns whether anything about the answer's standing CHANGED, so the caller can repaint
+    /// without repainting continuously.
+    ///
+    /// A DIRTY FLAG SET BY EACH EDITING PATH WOULD BE CHEAPER AND WRONG. There are dozens of ways
+    /// to change a calculation's inputs — drag a fixture, delete one, edit a reflectance, pull a
+    /// wall, change the ray count, import furniture, undo any of it — and every one of them would
+    /// have to remember. The day somebody adds a path and forgets, the app shows an out-of-date
+    /// result as a current one, silently, and there is nothing on the page to say which it is.
+    /// Comparing the scene against itself cannot be forgotten.
+    pub fn refresh_staleness(
+        &mut self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> bool {
+        let Some(was) = self.results_fingerprint else {
+            return false; // nothing calculated — nothing to be stale
+        };
+        let now = std::time::Instant::now();
+        if let Some(t) = self.stale_checked {
+            if now.duration_since(t) < Self::STALE_CHECK_INTERVAL {
+                return false;
+            }
+        }
+        self.stale_checked = Some(now);
+        // A project with nothing left to calculate is NOT evidence that the answer moved on — it
+        // is most often a momentary state mid-edit. Leave the standing verdict alone.
+        let Some(is) = self.current_fingerprint(doc, factory) else {
+            return false;
+        };
+        let stale = is != was;
+        let changed = stale != self.results_stale;
+        self.results_stale = stale;
+        changed
+    }
+
+    /// Adopt an answer read back from disk — but ONLY if it is about this scene.
+    ///
+    /// The check is exact and the failure is total: a result whose fingerprint does not match is
+    /// not shown at all, not shown greyed, not shown with the rooms it still recognises. Within a
+    /// session, going out of date is something the user just did and can undo, so the numbers stay
+    /// on screen marked. Across a restart nobody remembers what changed, the stored rooms may not
+    /// even be the rooms on the plan any more, and a wrong lux figure with a caption is still a
+    /// wrong lux figure. Pressing Calculate is the cost of being sure.
+    pub fn restore_results(
+        &mut self,
+        stored: &crate::light_store::StoredResults,
+        current: u64,
+    ) -> bool {
+        if stored.fingerprint != current {
+            return false;
+        }
+        let Some(rooms) = stored.rooms() else {
+            return false;
+        };
+        let primary = &rooms[0];
+        self.grid = Some(primary.grid.clone());
+        self.plane = Some(primary.plane);
+        self.grid_en = Some(primary.grid_en.clone());
+        self.plane_en = Some(primary.plane_en);
+        self.grid_mask = primary.mask.clone();
+        self.cylindrical_avg = primary.cylindrical_avg;
+        self.installation = primary.installation;
+        self.surfaces = stored.surfaces.clone();
+        self.last_timings.clear();
+        self.rooms = rooms;
+        self.results_fingerprint = Some(stored.fingerprint);
+        self.results_stale = false;
+        self.results_restored = true;
+        self.stale_checked = None;
+        self.last_msg = format!(
+            "Saved result restored — {} room(s), {:.0} lx avg, U₀ {:.2}. Nothing has changed since \
+             it was calculated.",
+            self.rooms.len(),
+            self.rooms[0].grid.avg,
+            self.rooms[0].grid.u0(),
+        );
+        true
+    }
+
+    /// Gather the job, with no side effects on the results or the status line.
+    fn build_job(
+        &mut self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> Option<CalcJob> {
         let meshes = self.scene_meshes(doc, factory);
         let scene_tris: usize = meshes.iter().map(|m| m.triangles.len()).sum();
-        if std::env::var_os("SIMLUX_PHASE_LOG").is_some() {
-            eprintln!("  [phase] scene is {scene_tris} triangles");
-        }
 
         // THE ROOM INTERIOR, NOT THE BUILDING'S BOUNDING BOX.
         //
@@ -2098,14 +2426,7 @@ impl LightState {
         } else {
             (if meshes.is_empty() { None } else { mesh_bbox(&meshes) }).or_else(|| bbox(doc))
         };
-        let Some(fallback) = bounds else {
-            self.grid = None;
-            self.plane = None;
-            self.rooms.clear();
-            self.last_msg =
-                "No geometry — draw a closed room, or build one in the 3D Factory.".to_string();
-            return None;
-        };
+        let fallback = bounds?;
 
         // Lights the MODEL carries — a curved light is a real fitting, not a glowing texture.
         // Derived here rather than stored, so moving or deleting the fixture takes its light along.
@@ -2176,6 +2497,12 @@ impl LightState {
         }
         self.surfaces = out.surfaces;
         self.last_timings = out.timings;
+        // This answer now belongs to a known scene — which is what makes it worth writing down, and
+        // what lets the next session tell whether it is still about this building.
+        self.results_fingerprint = Some(out.fingerprint);
+        self.results_stale = false;
+        self.results_restored = false;
+        self.stale_checked = None;
 
         let primary = selected.filter(|i| *i < results.len()).unwrap_or(0);
         let waiting = self.unassigned_count();
@@ -3128,6 +3455,33 @@ impl LightState {
                 })
                 .strong(),
             );
+            // OUT OF DATE, SAID BEFORE THE NUMBERS AND NOT AFTER THEM.
+            //
+            // A stale result and a current one are the same numbers in the same places; nothing
+            // about 412 lx says which building it came from. Since the result is KEPT rather than
+            // wiped — so an accidental nudge does not cost a seventy-second answer — this label is
+            // the only thing standing between somebody and quoting a figure for a layout they have
+            // already changed. It goes above the figures because a caption underneath is a caption
+            // read after the number has been written down.
+            if self.results_stale {
+                ui.label(
+                    egui::RichText::new(
+                        "⚠ OUT OF DATE — the lights, the model or the settings have changed since \
+                         this was calculated. Press Calculate to bring it up to date.",
+                    )
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(235, 140, 90)),
+                );
+            } else if self.results_restored {
+                ui.label(
+                    egui::RichText::new(
+                        "Restored from the last saved calculation — nothing has changed since.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
             egui::Grid::new("simlux_results").num_columns(2).spacing([12.0, 3.0]).show(ui, |ui| {
                 let mut row = |ui: &mut egui::Ui, k: &str, v: String| {
                     ui.label(egui::RichText::new(k).small().weak());
@@ -5734,5 +6088,497 @@ mod the_calculation_can_leave_the_ui_thread {
         s.auto_center_light = false;
         assert!(s.prepare(&Document::default(), None).is_none());
         assert!(s.last_msg.contains("No geometry"), "it must say why: {:?}", s.last_msg);
+    }
+}
+
+/// A CALCULATION IS KEPT, AND STOPS BEING KEPT WHEN IT STOPS BEING TRUE.
+///
+/// Asked for as: *"once a calculation is run the app should save it. the calculation should only be
+/// invalidated if any of the lights, the 3d objects or anything related with the calculation is
+/// changed. if the user closed the app after a calculation the they should not lose the result."*
+///
+/// Both halves are load-bearing and they pull in opposite directions. Keeping a result too eagerly
+/// shows a figure for a building somebody has since changed; discarding it too eagerly throws away
+/// a seventy-second answer because a light moved a millimetre and back. What decides between them
+/// is [`CalcJob::fingerprint`], so that is what most of this exercises.
+#[cfg(test)]
+mod a_calculation_is_kept_while_it_is_still_true {
+    use super::*;
+
+    fn rect(w: f32, d: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(w, 0.0),
+            glam::Vec2::new(w, d),
+            glam::Vec2::new(0.0, d),
+            glam::Vec2::new(0.0, 0.0),
+        ]
+    }
+
+    fn room_of(poly: &[glam::Vec2]) -> (crate::factory::FactoryState, LightState) {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(poly, 3.0).expect("building");
+        f.add_room(poly).expect("room");
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.5;
+        s.luminaires.push(Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(3.0, 2.5, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        (f, s)
+    }
+
+    fn room() -> (crate::factory::FactoryState, LightState) {
+        room_of(&rect(6.0, 5.0))
+    }
+
+    fn fp(s: &mut LightState, f: &crate::factory::FactoryState) -> u64 {
+        s.current_fingerprint(&Document::default(), Some(f)).expect("a scene to fingerprint")
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // what the fingerprint must NOT notice
+    // -----------------------------------------------------------------------------------------
+
+    /// THE SAME SCENE HASHES THE SAME, twice in a row and on a fresh `LightState`.
+    ///
+    /// The first thing to prove, and not obvious: `profiles` is a `HashMap`, whose iteration order
+    /// differs between runs of the same program. Hashed in that order, every result in every
+    /// project would read as out of date roughly always, and the feature would be worse than not
+    /// having it at all.
+    #[test]
+    fn an_unchanged_scene_keeps_its_fingerprint() {
+        let (f, mut s) = room();
+        let a = fp(&mut s, &f);
+        let b = fp(&mut s, &f);
+        assert_eq!(a, b, "the same scene hashed two different ways in one process");
+
+        let (f2, mut s2) = room();
+        assert_eq!(a, fp(&mut s2, &f2), "an identical scene built again hashed differently");
+    }
+
+    /// AND IT SURVIVES THE PROFILE TABLE BEING BUILT IN A DIFFERENT ORDER — the `HashMap` case
+    /// above, made to actually happen rather than hoped about.
+    #[test]
+    fn the_order_profiles_were_loaded_in_does_not_matter() {
+        let ies = |name: &str, cd: f64| {
+            let mut p = builtin_downlight();
+            p.name = name.to_string();
+            p.multiplier = cd / 1000.0;
+            p
+        };
+        let (f, mut a) = room();
+        a.profiles.insert("alpha".into(), ies("alpha", 1000.0));
+        a.profiles.insert("beta".into(), ies("beta", 2000.0));
+        a.profiles.insert("gamma".into(), ies("gamma", 3000.0));
+
+        let (f2, mut b) = room();
+        b.profiles.insert("gamma".into(), ies("gamma", 3000.0));
+        b.profiles.insert("alpha".into(), ies("alpha", 1000.0));
+        b.profiles.insert("beta".into(), ies("beta", 2000.0));
+
+        assert_eq!(
+            fp(&mut a, &f),
+            fp(&mut b, &f2),
+            "the same fittings loaded in a different order looked like a different building",
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // what it MUST notice
+    // -----------------------------------------------------------------------------------------
+
+    /// EVERY INPUT MOVES IT. One case per thing a person can change, because the failure this
+    /// guards against is specific: an input nobody hashed, and a stale answer shown as current.
+    #[test]
+    fn every_input_to_the_answer_moves_the_fingerprint() {
+        let (f, mut base) = room();
+        let was = fp(&mut base, &f);
+
+        // A LIGHT MOVED — by a millimetre, which is the point: this is a hash, not a tolerance.
+        let (f1, mut s) = room();
+        s.luminaires[0].position.x += 0.001;
+        assert_ne!(was, fp(&mut s, &f1), "a fixture moved and the answer still looked current");
+
+        // A LIGHT DIMMED.
+        let (f2, mut s) = room();
+        s.luminaires[0].dimming = 0.5;
+        assert_ne!(was, fp(&mut s, &f2), "a fixture was dimmed");
+
+        // A LIGHT ADDED.
+        let (f3, mut s) = room();
+        let extra = s.luminaires[0].clone();
+        s.luminaires.push(Luminaire { id: 2, position: Vertex::new(1.0, 1.0, 2.7), ..extra });
+        assert_ne!(was, fp(&mut s, &f3), "a fixture was added");
+
+        // A SURFACE REPAINTED. Reflectance is not a cosmetic setting — five bounces off a lighter
+        // wall is most of the difference between a room that passes and one that does not.
+        let (f4, mut s) = room();
+        s.materials[1].reflectance = 0.8;
+        assert_ne!(was, fp(&mut s, &f4), "a wall reflectance changed");
+
+        // THE TRACER RETUNED.
+        let (f5, mut s) = room();
+        s.settings.rays_per_point *= 2;
+        assert_ne!(was, fp(&mut s, &f5), "the ray count changed");
+        let (f6, mut s) = room();
+        s.settings.max_bounces += 1;
+        assert_ne!(was, fp(&mut s, &f6), "the bounce count changed");
+
+        // THE MAINTENANCE FACTOR — it multiplies every figure reported.
+        let (f7, mut s) = room();
+        s.maintenance.llmf = 0.7;
+        assert_ne!(was, fp(&mut s, &f7), "the maintenance factor changed");
+
+        // THE GRID AND THE PLANE IT SITS ON.
+        let (f8, mut s) = room();
+        s.cell_size = 0.25;
+        assert_ne!(was, fp(&mut s, &f8), "the grid spacing changed");
+        let (f9, mut s) = room();
+        s.plane_height = 0.9;
+        assert_ne!(was, fp(&mut s, &f9), "the working plane moved");
+        let (f10, mut s) = room();
+        s.wall_zone = 0.5;
+        assert_ne!(was, fp(&mut s, &f10), "the wall zone changed");
+        let (f11, mut s) = room();
+        s.eye_height = 1.6;
+        assert_ne!(was, fp(&mut s, &f11), "the eye height changed");
+
+        // THE BUILDING ITSELF.
+        let (f12, mut s) = room_of(&rect(6.5, 5.0));
+        assert_ne!(was, fp(&mut s, &f12), "the room changed shape");
+    }
+
+    /// A PROFILE REPLACED UNDER THE SAME NAME. The subtle one: the fixture list, the model and
+    /// every setting are untouched, and only the photometry behind a name is different — which is
+    /// exactly what re-importing a manufacturer's corrected file does.
+    #[test]
+    fn re_importing_a_photometric_file_moves_the_fingerprint() {
+        let (f, mut a) = room();
+        a.profiles.insert(BUILTIN.into(), builtin_downlight());
+        let was = fp(&mut a, &f);
+
+        let (f2, mut b) = room();
+        let mut brighter = builtin_downlight();
+        brighter.multiplier = 2.0;
+        b.profiles.insert(BUILTIN.into(), brighter);
+        assert_ne!(
+            was,
+            fp(&mut b, &f2),
+            "a fitting twice as bright under the same name looked like the same building",
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // the answer's standing
+    // -----------------------------------------------------------------------------------------
+
+    /// A FRESH ANSWER IS NOT STALE, AND A MOVED LIGHT MAKES IT SO.
+    #[test]
+    fn moving_a_light_puts_the_answer_out_of_date() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        assert!(s.results_fingerprint.is_some(), "a calculation left no fingerprint");
+        assert!(!s.results_stale, "a result was stale the moment it was computed");
+
+        s.stale_checked = None; // the throttle is not what is under test here
+        assert!(!s.refresh_staleness(&Document::default(), Some(&f)), "an untouched scene moved");
+        assert!(!s.results_stale, "an untouched scene was called out of date");
+
+        s.luminaires[0].position.x += 0.4;
+        s.stale_checked = None;
+        assert!(s.refresh_staleness(&Document::default(), Some(&f)), "the change was not reported");
+        assert!(s.results_stale, "a fixture moved and the answer still claimed to be current");
+
+        // AND THE NUMBERS ARE STILL THERE. Wiping them would take away the very thing somebody is
+        // comparing the change against — and the change may be the nudge they are about to undo.
+        assert!(s.grid.is_some(), "the result was thrown away rather than marked");
+        assert_eq!(s.rooms.len(), 1);
+    }
+
+    /// PUT BACK, IT IS CURRENT AGAIN. Staleness is a question about the scene, not a one-way latch:
+    /// an undone change has to un-stale the answer, or the flag would only ever accumulate.
+    #[test]
+    fn undoing_the_change_makes_it_current_again() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let home = s.luminaires[0].position.x;
+
+        s.luminaires[0].position.x += 0.4;
+        s.stale_checked = None;
+        s.refresh_staleness(&Document::default(), Some(&f));
+        assert!(s.results_stale);
+
+        s.luminaires[0].position.x = home;
+        s.stale_checked = None;
+        s.refresh_staleness(&Document::default(), Some(&f));
+        assert!(!s.results_stale, "the change was undone and the answer stayed marked out of date");
+    }
+
+    /// THE CHECK IS THROTTLED. It costs what building the scene triangles costs; at sixty frames a
+    /// second on a real building that is a measurable slice of every frame, spent to re-answer a
+    /// question whose answer cannot have changed in sixteen milliseconds.
+    #[test]
+    fn the_check_does_not_run_every_frame() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        s.stale_checked = None;
+
+        s.refresh_staleness(&Document::default(), Some(&f));
+        let first = s.stale_checked.expect("the first check ran");
+
+        s.luminaires[0].position.x += 5.0; // a change it would certainly notice, if it looked
+        s.refresh_staleness(&Document::default(), Some(&f));
+        assert_eq!(s.stale_checked, Some(first), "the check ran again immediately");
+        assert!(!s.results_stale, "the throttle did not hold");
+
+        s.stale_checked = None;
+        s.refresh_staleness(&Document::default(), Some(&f));
+        assert!(s.results_stale, "and once the interval passes it notices");
+    }
+
+    /// A PROJECT EMPTIED TO NOTHING DOES NOT CONDEMN THE ANSWER.
+    ///
+    /// `current_fingerprint` returns `None` when there is nothing to calculate, and the tempting
+    /// reading of that is "the scene changed". It is not: it is most often a momentary state
+    /// during an edit, and treating it as a change would flash the warning on and off.
+    #[test]
+    fn a_scene_with_nothing_in_it_leaves_the_verdict_alone() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        s.stale_checked = None;
+        assert!(!s.refresh_staleness(&Document::default(), None), "an empty scene was a change");
+        assert!(!s.results_stale);
+    }
+
+    /// AND NOTHING CALCULATED IS NOT STALE EITHER. There is no answer to be out of date.
+    #[test]
+    fn an_uncalculated_project_is_never_out_of_date() {
+        let (f, mut s) = room();
+        s.stale_checked = None;
+        assert!(!s.refresh_staleness(&Document::default(), Some(&f)));
+        assert!(!s.results_stale);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // the round trip
+    // -----------------------------------------------------------------------------------------
+
+    /// CLOSING THE APP DOES NOT LOSE THE RESULT — the whole request, end to end.
+    ///
+    /// Calculated in one `LightState`, written out, and read back into a DIFFERENT one that has
+    /// never calculated anything, which is exactly how a restart does it.
+    #[test]
+    fn a_result_survives_being_written_out_and_read_back() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let before = s.rooms[0].grid.clone();
+        let fingerprint = s.results_fingerprint.expect("a fingerprint");
+
+        let dir = std::env::temp_dir().join("simlux_result_roundtrip");
+        let _ = std::fs::create_dir_all(&dir);
+        let drawing = dir.join("project.rsm");
+        let stored = crate::light_store::StoredResults::of(
+            &s.rooms,
+            &s.surfaces,
+            &s.last_timings,
+            fingerprint,
+            "test",
+        );
+        crate::light_store::save(&drawing, &stored).expect("written");
+
+        let read = crate::light_store::load(&drawing).expect("read back");
+        let (f2, mut fresh) = room();
+        let current = fp(&mut fresh, &f2);
+        assert!(fresh.restore_results(&read, current), "the result was refused for its own scene");
+
+        // THE FIGURES ARE THE FIGURES, digit for digit. A result that shifts in its last decimal
+        // on reload is a result nobody can quote — and rounding the cells to `f32` on the way to
+        // disk would do exactly that, if the statistics were recomputed from them.
+        let after = &fresh.rooms[0].grid;
+        assert_eq!(
+            after.avg.to_bits(),
+            before.avg.to_bits(),
+            "the average moved: {} to {}",
+            before.avg,
+            after.avg,
+        );
+        assert_eq!(after.min.to_bits(), before.min.to_bits(), "the minimum moved");
+        assert_eq!(after.max.to_bits(), before.max.to_bits(), "the maximum moved");
+        assert_eq!(after.u0().to_bits(), before.u0().to_bits(), "the uniformity moved");
+        assert_eq!(after.values.len(), before.values.len(), "cells were lost");
+        assert!(!fresh.results_stale, "a restored result was born out of date");
+        assert!(fresh.results_restored, "it does not say where it came from");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AND THE CELLS THEMSELVES COME BACK, not just the summary.
+    ///
+    /// The overlay, the report's false-colour page and the grid table are all drawn from the cells;
+    /// a file that restored four statistics and an empty grid would look right in the panel and be
+    /// empty everywhere it matters.
+    #[test]
+    fn the_cells_come_back_too() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let before = s.rooms[0].grid.values.clone();
+        assert!(before.len() > 50, "the fixture is too small to prove anything");
+
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let rooms = stored.rooms().expect("rebuilt");
+        let after = &rooms[0].grid.values;
+        assert_eq!(after.len(), before.len());
+        for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+            // `f32` on the way to disk: about seven significant figures, against a quantity that
+            // is quoted to the nearest lux.
+            assert!(
+                (a - b).abs() <= b.abs() * 1e-6 + 1e-6,
+                "cell {i} came back as {a} instead of {b}",
+            );
+        }
+    }
+
+    /// A ROOM MASK SURVIVES. An L-shaped room's grid necessarily covers ground outside it, and the
+    /// mask is what keeps those cells out of the average. Lose it and the room silently starts
+    /// averaging the courtyard — the numbers still look like numbers.
+    #[test]
+    fn the_room_mask_survives_the_round_trip() {
+        let l = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 3.0),
+            glam::Vec2::new(3.0, 3.0),
+            glam::Vec2::new(3.0, 7.0),
+            glam::Vec2::new(0.0, 7.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let (f, mut s) = room_of(&l);
+        s.calculate(&Document::default(), Some(&f));
+        let before = s.rooms[0].mask.clone();
+        assert!(
+            before.iter().any(|b| !b) && before.iter().any(|b| *b),
+            "the fixture is not L-shaped — the mask is all one value",
+        );
+
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let rooms = stored.rooms().expect("rebuilt");
+        assert_eq!(rooms[0].mask, before, "the room mask did not survive");
+    }
+
+    /// A RESULT FOR A DIFFERENT BUILDING IS REFUSED OUTRIGHT.
+    ///
+    /// Not shown greyed, not shown for the rooms it still recognises. Within a session, going out
+    /// of date is something the user just did and can undo; across a restart nobody remembers what
+    /// changed, and a wrong lux figure with a caption is still a wrong lux figure.
+    #[test]
+    fn a_result_from_a_changed_project_is_not_restored() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let stored = crate::light_store::StoredResults::of(
+            &s.rooms,
+            &s.surfaces,
+            &[],
+            s.results_fingerprint.expect("a fingerprint"),
+            "test",
+        );
+
+        // The same project, with a wall moved.
+        let (f2, mut moved) = room_of(&rect(7.0, 5.0));
+        let current = fp(&mut moved, &f2);
+        assert!(!moved.restore_results(&stored, current), "a stale result was restored");
+        assert!(moved.rooms.is_empty(), "and it left the results behind anyway");
+        assert!(moved.grid.is_none());
+        assert!(moved.results_fingerprint.is_none());
+    }
+
+    /// A DAMAGED FILE IS REFUSED, WHOLE. Half a calculation looks exactly like a whole one on
+    /// screen; the cost of refusing is that somebody presses Calculate.
+    #[test]
+    fn a_damaged_file_restores_nothing() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let good = crate::light_store::StoredResults::of(
+            &s.rooms,
+            &s.surfaces,
+            &[],
+            s.results_fingerprint.expect("a fingerprint"),
+            "test",
+        );
+
+        // The cells gone, everything else intact — the shape a truncated write leaves.
+        let mut torn = good.clone();
+        torn.rooms[0].grid.values.clear();
+        assert!(torn.rooms().is_none(), "a room with no cells rebuilt anyway");
+
+        // The mask gone, which would silently widen an L-shaped room's average.
+        if good.rooms[0].mask_len > 0 {
+            let mut unmasked = good.clone();
+            unmasked.rooms[0].mask_bits.clear();
+            assert!(unmasked.rooms().is_none(), "a room lost its mask and rebuilt anyway");
+        }
+
+        // A file from a future format.
+        let mut newer = good.clone();
+        newer.version = crate::light_store::VERSION + 1;
+        assert!(newer.rooms().is_none(), "a file from an unknown version was guessed at");
+
+        // And nothing at all.
+        assert!(crate::light_store::StoredResults::default().rooms().is_none());
+    }
+
+    /// UNREADABLE BYTES ARE "NO SAVED RESULT", not an error in front of somebody opening a
+    /// drawing. It is a cache: the worst case is the wait.
+    #[test]
+    fn rubbish_on_disk_reads_as_nothing_saved() {
+        let dir = std::env::temp_dir().join("simlux_result_rubbish");
+        let _ = std::fs::create_dir_all(&dir);
+        let drawing = dir.join("project.rsm");
+        std::fs::write(crate::light_store::result_path(&drawing), b"{ not json at all")
+            .expect("write");
+        assert!(crate::light_store::load(&drawing).is_none());
+        assert!(crate::light_store::load(&dir.join("never-existed.rsm")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE FILE IS NOT ENORMOUS. This is the reason the cells are packed rather than written as
+    /// JSON numbers: a real project's grids run to hundreds of thousands of cells, and a result
+    /// file that takes longer to parse than the calculation took to run is not a saving.
+    #[test]
+    fn the_stored_result_is_compact() {
+        let (f, mut s) = room();
+        s.cell_size = 0.1; // ~3,000 cells: small next to a real plan, enough to show the ratio
+        s.calculate(&Document::default(), Some(&f));
+        let cells: usize = s.rooms.iter().map(|r| r.grid.values.len()).sum();
+        assert!(cells > 2_000, "only {cells} cells — too few to measure against");
+
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let bytes = serde_json::to_string(&stored).expect("serialises").len();
+        // MEASURED AGAINST THE ACTUAL ALTERNATIVE, not against a constant chosen to pass. What the
+        // packing is INSTEAD OF is these same cells written as JSON numbers, so that is what it is
+        // compared against — a hard-coded byte count would have to be re-guessed every time the
+        // fixture changed, and would stop meaning anything the first time somebody did.
+        let plain: usize = s
+            .rooms
+            .iter()
+            .map(|r| {
+                serde_json::to_string(&r.grid.values).unwrap_or_default().len()
+                    + serde_json::to_string(&r.grid.direct).unwrap_or_default().len()
+                    + serde_json::to_string(&r.grid.indirect).unwrap_or_default().len()
+            })
+            .sum();
+        assert!(
+            bytes * 3 < plain,
+            "{bytes} bytes against {plain} as plain JSON ({cells} cells) — the packing is barely \
+             earning its complexity",
+        );
     }
 }

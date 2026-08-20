@@ -26567,6 +26567,90 @@ impl CadApp {
     }
 
     /// Collect a finished calculation, and show how the running one is getting on.
+    /// Ask whether the result on screen still describes the scene.
+    ///
+    /// The borrow is the only reason this is not one line at the call site: the check needs the
+    /// plan document and the factory while holding `&mut self.light`, and the plan is chosen by a
+    /// method on `self`. Cloning it once every quarter second is the price; the check bails on the
+    /// throttle before the clone whenever there is nothing to check.
+    fn refresh_light_staleness(&mut self) {
+        if self.light.results_fingerprint.is_none() || self.calc_rx.is_some() {
+            // Nothing calculated, or a calculation is in flight — mid-run the scene is allowed to
+            // differ from the last answer, and saying so would flash a warning about a result that
+            // is being replaced anyway.
+            return;
+        }
+        if let Some(t) = self.light.stale_checked {
+            if t.elapsed() < crate::light::LightState::STALE_CHECK_INTERVAL {
+                return;
+            }
+        }
+        let plan = self.plan_doc().clone();
+        if self.light.refresh_staleness(&plan, Some(&self.factory)) {
+            self.touch_view(); // the overlay's caption changed
+        }
+    }
+
+    /// Write the current calculation beside the drawing.
+    ///
+    /// Quiet when there is nothing to write or nowhere to write it. An UNSAVED drawing has no
+    /// path, so its result has nowhere to live — it is picked up by the next save instead, which
+    /// is where the project gets a name.
+    fn save_light_results(&mut self) {
+        let Some(path) = self.current_file.clone() else { return };
+        let Some(fp) = self.light.results_fingerprint else { return };
+        if self.light.rooms.is_empty() || self.light.results_stale {
+            return;
+        }
+        let stored = crate::light_store::StoredResults::of(
+            &self.light.rooms,
+            &self.light.surfaces,
+            &self.light.last_timings,
+            fp,
+            &format!(
+                "{} ({})",
+                option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
+                option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
+            ),
+        );
+        match crate::light_store::save(&path, &stored) {
+            Ok(p) => self.history.push(format!(
+                "  calculation saved → '{}' ({} room(s))",
+                p.display(),
+                stored.rooms.len(),
+            )),
+            // Never silent. Somebody who is told their result is kept and then loses it has been
+            // misled, which is worse than not offering to keep it.
+            Err(e) => self.history.push(format!("  ! calculation not saved: {e}")),
+        }
+    }
+
+    /// Read back the calculation saved beside `drawing`, if it still describes this scene.
+    ///
+    /// Called after the project is fully installed — the model has to be standing before the
+    /// fingerprint means anything, since it is mostly a hash of the model.
+    fn restore_light_results(&mut self, drawing: &std::path::Path) {
+        let Some(stored) = crate::light_store::load(drawing) else { return };
+        let plan = self.plan_doc().clone();
+        let Some(current) = self.light.current_fingerprint(&plan, Some(&self.factory)) else {
+            return;
+        };
+        if self.light.restore_results(&stored, current) {
+            self.history.push(format!(
+                "  saved calculation restored ({} room(s), computed by build {})",
+                self.light.rooms.len(),
+                if stored.build.is_empty() { "?" } else { &stored.build },
+            ));
+        } else {
+            // SAID OUT LOUD, because the alternative is a project that used to show a result and
+            // now shows none, with nothing to explain the difference.
+            self.history.push(
+                "  a saved calculation was found but the project has changed since — recalculate"
+                    .into(),
+            );
+        }
+    }
+
     fn poll_calculation(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.calc_rx.as_ref() else { return };
         match rx.try_recv() {
@@ -26579,6 +26663,11 @@ impl CadApp {
                 self.calc_started = None;
                 if !cancelled {
                     self.history.push(format!("  calculated in {:.1} s", took.as_secs_f64()));
+                    // WRITTEN OUT AS SOON AS IT EXISTS, not on the next project save. What this
+                    // protects against is the app never reaching a save — a crash, a power cut, or
+                    // somebody closing the window on a result they were still reading — and a
+                    // minutes-long answer held only in memory is exactly what those lose.
+                    self.save_light_results();
                 }
                 self.touch_view();
                 return;
@@ -29617,6 +29706,11 @@ impl CadApp {
         if let Some(cfg) = sidecar {
             self.install_simlux_config(cfg, furniture);
         }
+        // AFTER the sidecar, never before: the fingerprint a stored result is checked against is
+        // mostly a hash of the 3D model, and until `install_simlux_config` has rebuilt it this
+        // project looks like an empty one — every saved result would read as belonging to a
+        // different building and be refused.
+        self.restore_light_results(std::path::Path::new(path));
         self.unsaved = false; // freshly opened → matches the file on disk
         self.history.push(format!(
             "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l));
@@ -29661,6 +29755,10 @@ impl CadApp {
         self.unsaved = false; // now matches disk
         self.last_autosave = std::time::Instant::now(); // an explicit save resets the autosave clock
         self.history.push(payload.note);
+        // A result computed before the drawing had a name had nowhere to go; this is where the
+        // project gets one. Also what carries the result along on a Save As, so the copy opens
+        // showing what the original showed instead of an empty panel.
+        self.save_light_results();
         // If this save was requested to complete a close, close now that the bytes are on disk.
         if self.close_after_save {
             self.close_after_save = false;
@@ -42445,6 +42543,9 @@ impl eframe::App for CadApp {
         if self.info_panel_open {
             self.render_info_panel(ctx);
         }
+        // Is the answer on screen still an answer about THIS building? Asked before anything draws
+        // it, and throttled inside — see `LightState::refresh_staleness`.
+        self.refresh_light_staleness();
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
         // Illuminaire (SIMLUX menu ▸ Illuminaire) — the fitting library. Bails if closed.
