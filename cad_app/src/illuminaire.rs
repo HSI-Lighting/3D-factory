@@ -522,10 +522,14 @@ pub const INSTANCE_TOL_M: f64 = 1e-3;
 /// is found by POSITION as well: the reference to that definition standing where the fixture
 /// stands.
 ///
-/// A FIXTURE THAT HAS BEEN DRAGGED AWAY FROM ITS SYMBOL MATCHES NOTHING, and that is deliberate.
-/// Dragging a marker moves the light and not the block, so the two genuinely are apart; taking the
-/// nearest instance instead would erase a DIFFERENT fitting's symbol and leave this one's, which
-/// is a worse answer than leaving both alone.
+/// A FIXTURE THAT HAS BEEN DRAGGED AWAY FROM ITS SYMBOL MATCHES NOTHING, and taking the nearest
+/// instance instead would erase a DIFFERENT fitting's symbol while leaving this one's — a worse
+/// answer than leaving both alone.
+///
+/// That used to be a standing condition of the app, because dragging a marker moved the light and
+/// left the block where it was. It no longer is: a drag carries the symbol with it, so the two stay
+/// together and matching by position stays exact. The guard is still right for the case it is now
+/// actually about — a symbol somebody deleted from the drawing directly.
 ///
 /// Indices come back sorted and unique, ready to remove from the highest down.
 pub fn instances_for<'a>(
@@ -554,6 +558,63 @@ pub fn instances_for<'a>(
         }
     }
     out
+}
+
+/// Pair each fixture with the ONE block instance standing where it stands.
+///
+/// [`instances_for`] answers "which dobjects should go" for a delete, where many-to-many is
+/// harmless because each index is removed once either way. A DRAG needs the other thing: a fixture
+/// has to carry exactly one symbol, and two fixtures of the same fitting dropped at the same point
+/// must not both grab the same block and leave one behind.
+///
+/// So an instance is CLAIMED. Each fixture takes the first unclaimed reference to its own block
+/// definition standing at its own position, and a fixture that finds none — a symbol deleted from
+/// the drawing by hand — is simply left out rather than given somebody else's.
+///
+/// Returned as `(fixture id, dobject index)`, in the order the fixtures were given.
+pub fn claim_instances<'a>(
+    doc: &Document,
+    fixtures: impl Iterator<Item = &'a cad_light::Luminaire>,
+    doc_unit_m: f64,
+) -> Vec<(u32, usize)> {
+    let k = if doc_unit_m.is_finite() && doc_unit_m > 0.0 { doc_unit_m } else { 1.0 };
+    let tol = INSTANCE_TOL_M / k; // the tolerance, in drawing units
+    let mut taken: std::collections::HashSet<usize> = Default::default();
+    let mut out = Vec::new();
+    for l in fixtures {
+        let Some(b) = l.from_block else { continue };
+        let (x, y) = (l.position.x as f64 / k, l.position.y as f64 / k);
+        let found = doc.dobjects.iter().enumerate().position(|(i, d)| {
+            if taken.contains(&i) {
+                return false;
+            }
+            match &d.geom {
+                Geom::BlockRef(br) => {
+                    br.block == b
+                        && (br.insert.x - x).abs() <= tol
+                        && (br.insert.y - y).abs() <= tol
+                }
+                _ => false,
+            }
+        });
+        if let Some(i) = found {
+            taken.insert(i);
+            out.push((l.id, i));
+        }
+    }
+    out
+}
+
+/// Move a block instance to `at`, in DRAWING units. `false` if that dobject is not a block
+/// reference any more — which a drag treats as "the symbol is gone", not as an error.
+pub fn move_instance(doc: &mut Document, index: usize, at: Vec2) -> bool {
+    match doc.dobjects.get_mut(index).map(|d| &mut d.geom) {
+        Some(Geom::BlockRef(br)) => {
+            br.insert = at;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Scan `dir` for photometric files. Non-recursive, and it never fails loudly: an unreadable or

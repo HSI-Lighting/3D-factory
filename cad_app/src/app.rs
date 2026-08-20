@@ -2147,6 +2147,12 @@ pub struct CadApp {
     /// the selection can change while it runs.
     calc_selected: Option<usize>,
     calc_started: Option<std::time::Instant>,
+    /// The symbol each dragged fixture is carrying — `(fixture id, dobject index)`.
+    ///
+    /// Paired at the PRESS, while the marker and its block are still in the same place, and held
+    /// for the gesture. See `begin_fixture_drag`: the link between a fixture and its symbol is by
+    /// position, so it can only be established before the fixture moves.
+    light_drag_symbols: Vec<(u32, usize)>,
     /// The saved report settings have been read, and their logo images with them.
     report_prefs_loaded: bool,
     /// THE LAID-OUT DOCUMENT THE PREVIEW IS PAINTING, kept between frames.
@@ -4009,6 +4015,7 @@ impl Default for CadApp {
             calc_progress: None,
             calc_selected: None,
             calc_started: None,
+            light_drag_symbols: Vec::new(),
             report_prefs_loaded: false,
             report_doc: None,
             report_doc_key: None,
@@ -5251,7 +5258,19 @@ impl CadApp {
         // ---- a drag in progress owns everything until the button comes up ----
         if self.light.drag.is_some() {
             if let Some(a) = at {
+                // THE MOMENT THE DRAG BECOMES A MOVE, caught either side of `drag_to`.
+                //
+                // The drawing has not been touched yet here, so it is still the "before" — and the
+                // fixtures' own "before" is what `drag_to` has just staged. ONE step covering both,
+                // because a marker and its symbol move together and an Undo that took back one of
+                // them would leave a state nobody ever made.
+                let was_moved = self.light.drag.as_ref().is_some_and(|d| d.moved);
                 self.light.drag_to(a);
+                let now_moved = self.light.drag.as_ref().is_some_and(|d| d.moved);
+                if now_moved && !was_moved {
+                    self.snapshot_doc_and_lights();
+                }
+                self.drag_fixture_symbols();
             }
             if ctx.input(|i| i.pointer.primary_released()) {
                 // A PRESS THAT NEVER MOVED IS A SELECTION, not an edit. `begin_drag` stages the
@@ -5265,6 +5284,10 @@ impl CadApp {
                 // actually become a move, so a press that merely selected a marker has left
                 // nothing behind, and the frame-end drain commits whatever a real move did.
                 self.light.end_drag();
+                // The claim belongs to the gesture. Kept past it, the indices go stale the moment
+                // anything else edits the drawing, and the next drag would move whatever had
+                // drifted into those slots.
+                self.light_drag_symbols.clear();
             }
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
             self.light_gesture = true;
@@ -5282,7 +5305,7 @@ impl CadApp {
                         // A press on a marker starts a drag AND selects it. A press that never
                         // moves ends as a plain selection (`end_drag` reports it did nothing), so
                         // one gesture covers both "pick this one" and "move this one".
-                        self.light.begin_drag(id, (x, y));
+                        self.begin_fixture_drag(id, (x, y));
                     }
                     self.light_gesture = true;
                     return true;
@@ -5292,7 +5315,7 @@ impl CadApp {
                 if self.light.place_fitting.is_some() {
                     if self.place_illuminaire_at(x, y) {
                         if let Some(&id) = self.light.selected.first() {
-                            self.light.begin_drag(id, (x, y));
+                            self.begin_fixture_drag(id, (x, y));
                             // The placement step already covers this gesture — dropping and
                             // positioning in one press is one act, and one Undo.
                             self.light.discard_staged_undo();
@@ -5305,7 +5328,7 @@ impl CadApp {
                     let id = self.place_fixture_point(x, y);
                     // Placing arms a drag on the new point, so press-move-release puts it down
                     // AND positions it in one gesture — and a plain click leaves it where it fell.
-                    self.light.begin_drag(id, (x, y));
+                    self.begin_fixture_drag(id, (x, y));
                     self.light_gesture = true;
                     return true;
                 }
@@ -30764,6 +30787,56 @@ impl CadApp {
         id
     }
 
+
+    /// Start dragging a fixture, and take its SYMBOL along.
+    ///
+    /// Reported as: dragging a fixture moves the light but not its symbol. It did — `from_block`
+    /// names the block DEFINITION, which every instance of a fitting shares, so the drawing had no
+    /// idea which of fifty identical downlights belonged to the marker under the pointer. The link
+    /// is by POSITION, and the one moment the two are certainly still together is the press.
+    ///
+    /// So the pairing is made HERE, before anything moves, and held for the length of the gesture.
+    /// Re-deriving it mid-drag would find nothing, because by then the fixture has moved away from
+    /// the symbol it is supposed to be carrying — which is precisely the bug.
+    fn begin_fixture_drag(&mut self, id: u32, at: (f32, f32)) {
+        self.light.begin_drag(id, at);
+        let k = self.doc.units.metres_per_unit;
+        let ids: Vec<u32> = self.light.selected.clone();
+        let dragged: Vec<cad_light::Luminaire> = self
+            .light
+            .luminaires
+            .iter()
+            .filter(|l| ids.contains(&l.id))
+            .cloned()
+            .collect();
+        self.light_drag_symbols = crate::illuminaire::claim_instances(&self.doc, dragged.iter(), k);
+    }
+
+    /// Put every claimed symbol back under its fixture.
+    ///
+    /// Called on each frame OF the drag rather than once at the end: a symbol that jumped to its
+    /// new home only on release would leave the drag looking exactly as broken as it did before,
+    /// for the whole time anybody is watching it.
+    fn drag_fixture_symbols(&mut self) {
+        if self.light_drag_symbols.is_empty() {
+            return;
+        }
+        let ku = self.doc.units.metres_per_unit;
+        let k = if ku.is_finite() && ku > 0.0 { ku } else { 1.0 };
+        let mut moved = false;
+        for (id, index) in self.light_drag_symbols.clone() {
+            let Some(l) = self.light.luminaires.iter().find(|l| l.id == id) else { continue };
+            let at = Vec2::new(l.position.x as f64 / k, l.position.y as f64 / k);
+            moved |= crate::illuminaire::move_instance(&mut self.doc, index, at);
+        }
+        if moved {
+            // The same three the placement path needs, and for the same reason: without them the
+            // symbol is drawn from stale cached geometry and cannot be picked where it now is.
+            self.intersections.clear();
+            self.index_dirty = true;
+            self.touch_view();
+        }
+    }
 
     /// Turn a snapshot staged inside the panel into an undo step, if one is still waiting.
     ///
@@ -62076,6 +62149,216 @@ mod fixtures_are_undoable {
         );
     }
 
+
+    /// A DRAGGED FIXTURE TAKES ITS SYMBOL WITH IT.
+    ///
+    /// Reported as: dragging a fixture moves the light but not its symbol. It did — `from_block`
+    /// names the block DEFINITION, shared by every instance of a fitting, so the drawing had no way
+    /// to know which of fifty identical downlights belonged to the marker under the pointer. The
+    /// pairing is by POSITION, and the one moment the two are certainly together is the press.
+    ///
+    /// A plan whose symbols say one thing and whose calculation says another is worse than either
+    /// alone: the drawing is what gets issued, and the lux figures are what it is signed off on.
+    fn placed(app: &mut CadApp, at: (f32, f32)) -> u32 {
+        let fid = app.light.library.add(crate::illuminaire::Fitting {
+            name: "VEGA".into(),
+            id: 0,
+            symbol: vec![crate::illuminaire::SymbolGeom {
+                geom: cad_kernel::Geom::Circle(cad_kernel::Circle {
+                    center: Vec2::new(0.0, 0.0),
+                    radius: 0.2,
+                }),
+                aci: None,
+            }],
+            symbol_unit_m: 1.0,
+            ldt_path: String::new(),
+            profile: crate::light::BUILTIN.into(),
+            model_path: String::new(),
+        });
+        app.light.place_fitting = Some(fid);
+        assert!(app.place_illuminaire_at(at.0, at.1), "the placement was refused");
+        app.light.luminaires.last().expect("a fixture").id
+    }
+
+    /// Every block insertion point on the drawing, in drawing units.
+    fn inserts(app: &CadApp) -> Vec<(f64, f64)> {
+        app.doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some((b.insert.x, b.insert.y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dragging_a_fixture_moves_its_symbol_too() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        let before = inserts(&app);
+        assert_eq!(before.len(), 1, "expected one symbol on the drawing");
+
+        app.begin_fixture_drag(id, (1.0, 1.0));
+        app.light.drag_to((4.0, 2.5));
+        app.drag_fixture_symbols();
+        app.light.end_drag();
+
+        let l = app.light.luminaires.iter().find(|l| l.id == id).expect("the fixture");
+        assert!((l.position.x - 4.0).abs() < 1e-5 && (l.position.y - 2.5).abs() < 1e-5);
+        let after = inserts(&app);
+        assert_eq!(after.len(), 1, "the drag added or removed a symbol");
+        let moved = (after[0].0 - before[0].0, after[0].1 - before[0].1);
+        assert!(
+            (moved.0 - 3.0).abs() < 1e-6 && (moved.1 - 1.5).abs() < 1e-6,
+            "the light moved by (3.0, 1.5) and its symbol by ({:.3}, {:.3})",
+            moved.0,
+            moved.1,
+        );
+    }
+
+    /// AND IT IS STILL ITS SYMBOL AFTERWARDS.
+    ///
+    /// The link is by position, so a drag that left the block behind did not merely look wrong —
+    /// it BROKE the link, and deleting the fixture then left an orphaned symbol on the plan. That
+    /// was the second half of an earlier report ("when i delete them from fitting it doesnt delete
+    /// the markers"), and it is only truly fixed once the two travel together.
+    #[test]
+    fn a_dragged_fixture_can_still_be_deleted_cleanly() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+
+        app.begin_fixture_drag(id, (1.0, 1.0));
+        app.light.drag_to((6.0, 3.0));
+        app.drag_fixture_symbols();
+        app.light.end_drag();
+
+        app.delete_fixtures(&[id]);
+        assert!(app.light.luminaires.is_empty(), "the fixture was not deleted");
+        assert!(
+            inserts(&app).is_empty(),
+            "the symbol was left on the drawing after its fixture went",
+        );
+    }
+
+    /// TWO FIXTURES OF THE SAME FITTING KEEP THEIR OWN SYMBOLS.
+    ///
+    /// The case a naive "find a block of this definition nearby" gets wrong: fifty downlights share
+    /// one definition, so a claim has to be one-to-one or dragging one marker would pick up its
+    /// neighbour's symbol and leave its own where it was.
+    #[test]
+    fn dragging_one_of_two_leaves_the_other_alone() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let a = placed(&mut app, (1.0, 1.0));
+        // The SAME fitting again, so both symbols are instances of one definition.
+        let fid = app.light.library.fittings.first().map(|f| f.id).expect("the fitting");
+        app.light.place_fitting = Some(fid);
+        assert!(app.place_illuminaire_at(2.0, 1.0));
+        assert_eq!(inserts(&app).len(), 2);
+
+        app.light.select(a, false);
+        app.begin_fixture_drag(a, (1.0, 1.0));
+        app.light.drag_to((1.0, 5.0));
+        app.drag_fixture_symbols();
+        app.light.end_drag();
+
+        let mut got = inserts(&app);
+        got.sort_by(|p, q| p.1.partial_cmp(&q.1).expect("finite"));
+        assert!(
+            (got[0].0 - 2.0).abs() < 1e-6 && (got[0].1 - 1.0).abs() < 1e-6,
+            "the fixture that was not dragged had its symbol moved to {:?}",
+            got[0],
+        );
+        assert!(
+            (got[1].1 - 5.0).abs() < 1e-6,
+            "the dragged fixture's symbol is at {:?}",
+            got[1],
+        );
+    }
+
+    /// TWO FIXTURES ON THE SAME SPOT TAKE TWO DIFFERENT SYMBOLS.
+    ///
+    /// The case that makes the claim have to be ONE-TO-ONE, and the one a single-fixture drag
+    /// cannot show: with several fixtures moving together and two of them at the same point, a
+    /// claim that simply finds "a block of this definition here" hands both fixtures the SAME
+    /// instance. One symbol is then moved twice and the other stranded on the plan — and since the
+    /// link is by position, the stranded one can no longer be found or deleted at all.
+    ///
+    /// Duplicating a fitting in place is how two end up on one spot, and it is not rare.
+    #[test]
+    fn two_fixtures_on_one_spot_do_not_fight_over_a_symbol() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let a = placed(&mut app, (1.0, 1.0));
+        let fid = app.light.library.fittings.first().map(|f| f.id).expect("the fitting");
+        app.light.place_fitting = Some(fid);
+        assert!(app.place_illuminaire_at(1.0, 1.0), "the second placement was refused");
+        let b = app.light.luminaires.last().expect("a second fixture").id;
+        assert_ne!(a, b);
+        assert_eq!(inserts(&app).len(), 2, "expected two symbols stacked on one point");
+
+        // Both selected and dragged together — what a rubber band or a shift-click gives.
+        app.light.select(a, false);
+        app.light.select(b, true);
+        app.begin_fixture_drag(a, (1.0, 1.0));
+        app.light.drag_to((7.0, 4.0));
+        app.drag_fixture_symbols();
+        app.light.end_drag();
+
+        let got = inserts(&app);
+        assert_eq!(got.len(), 2, "a symbol was created or destroyed");
+        for (i, p) in got.iter().enumerate() {
+            assert!(
+                (p.0 - 7.0).abs() < 1e-6 && (p.1 - 4.0).abs() < 1e-6,
+                "symbol {i} was left at {p:?} while its fixture moved to (7, 4) — two fixtures \
+                 claimed the same block and one symbol was stranded",
+            );
+        }
+    }
+
+    /// A DRAG IS ONE UNDO, AND IT TAKES BACK BOTH HALVES.
+    ///
+    /// The marker and the symbol move together, so they have to come back together. An Undo that
+    /// restored one of them would leave a state the user never made — which is worse than the bug
+    /// it came from, because now the two disagree and nothing did it on purpose.
+    #[test]
+    fn undoing_a_drag_puts_the_symbol_back_as_well() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        let before = inserts(&app);
+
+        app.begin_fixture_drag(id, (1.0, 1.0));
+        // The app drives this either side of `drag_to`, which is where the one undo step is taken.
+        let was = app.light.drag.as_ref().is_some_and(|d| d.moved);
+        app.light.drag_to((4.0, 1.0));
+        let now = app.light.drag.as_ref().is_some_and(|d| d.moved);
+        if now && !was {
+            app.snapshot_doc_and_lights();
+        }
+        app.drag_fixture_symbols();
+        app.light.end_drag();
+        assert_ne!(inserts(&app), before, "the symbol never moved in the first place");
+
+        app.do_undo();
+        let l = &app.light.luminaires[0];
+        assert!(
+            (l.position.x - 1.0).abs() < 1e-5,
+            "the fixture is at {} after an undo",
+            l.position.x,
+        );
+        assert_eq!(inserts(&app), before, "the symbol did not come back with its fixture");
+
+        // ONE step, not two: a second Undo must reach past the drag, not undo half of it.
+        app.do_undo();
+        assert!(
+            app.light.luminaires.is_empty() || inserts(&app).len() == before.len(),
+            "the drag was recorded as two steps, so an Undo left the drawing and the lights apart",
+        );
+    }
     /// A DRAG IS ONE UNDO, and the fixture goes back where it was.
     #[test]
     fn undoing_a_drag_puts_the_fixture_back() {
