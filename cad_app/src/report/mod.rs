@@ -14,4 +14,4 @@ pub mod ui;
 pub mod options;
 pub mod pdf;
 
-pub use options::{Format, Options, PageSize, ReportImage, Section};
+pub use options::{Format, Options, PageSize, Prefs, ReportImage, Section};

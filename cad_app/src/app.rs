@@ -2147,6 +2147,8 @@ pub struct CadApp {
     /// the selection can change while it runs.
     calc_selected: Option<usize>,
     calc_started: Option<std::time::Instant>,
+    /// The saved report settings have been read, and their logo images with them.
+    report_prefs_loaded: bool,
     /// A preview texture per LOGO, parallel to `report_opts.logos`.
     report_logo_tex: Vec<Option<egui::TextureHandle>>,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
@@ -3998,6 +4000,7 @@ impl Default for CadApp {
             calc_progress: None,
             calc_selected: None,
             calc_started: None,
+            report_prefs_loaded: false,
             report_logo_tex: Vec::new(),
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
@@ -26633,6 +26636,11 @@ impl CadApp {
         }
         // THE PREVIEW IS THE DOCUMENT, so it is laid out from the same state and the same options
         // the writer will use — every frame, because every option changes it.
+        // The settings a practice keeps, read once — here rather than at startup because the
+        // logos need a `Context` to make their preview textures from.
+        if !self.report_prefs_loaded {
+            self.load_report_prefs(Some(ctx));
+        }
         let Some(inp) = self.report_input() else {
             self.report_open = false;
             return;
@@ -26667,6 +26675,12 @@ impl CadApp {
         tex.truncate(n);
         self.report_tex = tex;
         self.report_page = page;
+        // CLOSING IS WHEN THEY ARE KEPT. Saving on every frame would rewrite the file sixty times
+        // a second while someone types a header; saving only on Save would lose the settings of
+        // anyone who set them up and then thought better of the report.
+        if self.report_open && !open {
+            self.save_report_prefs();
+        }
         self.report_open = open;
 
         if act.browse_dir {
@@ -26706,6 +26720,46 @@ impl CadApp {
         }
         if act.save {
             self.write_report();
+        }
+    }
+
+
+    /// Read the report settings a practice keeps, and re-read the logo images they name.
+    ///
+    /// The logos travel as PATHS, so the bytes come back off disk here. A file that has since been
+    /// moved leaves the entry in place with no image — the setting is not lost because a drive was
+    /// not mounted this morning, and the dialog shows it as a logo without a picture.
+    fn load_report_prefs(&mut self, ctx: Option<&egui::Context>) {
+        crate::report::Prefs::load().apply(&mut self.report_opts);
+        let paths: Vec<String> = self.report_opts.logos.iter().map(|l| l.path.clone()).collect();
+        let captions: Vec<String> =
+            self.report_opts.logos.iter().map(|l| l.caption.clone()).collect();
+        self.report_opts.logos.clear();
+        self.report_logo_tex.clear();
+        for (path, caption) in paths.into_iter().zip(captions) {
+            let before = self.report_opts.logos.len();
+            self.report_add_image(&path, ctx, true);
+            if self.report_opts.logos.len() == before {
+                // Unreadable — keep the entry so the setting survives, without an image.
+                self.report_opts.logos.push(crate::report::ReportImage {
+                    path,
+                    caption,
+                    jpeg: None,
+                });
+                self.report_logo_tex.push(None);
+            } else if let Some(l) = self.report_opts.logos.last_mut() {
+                l.caption = caption;
+            }
+        }
+        // The indices were checked against the list `Prefs` restored; the list is the same length
+        // now, so they still hold.
+        self.report_prefs_loaded = true;
+    }
+
+    /// Keep what a practice will want next time.
+    fn save_report_prefs(&mut self) {
+        if let Err(e) = crate::report::Prefs::of(&self.report_opts).save() {
+            self.history.push(format!("  ! report settings not saved — {e}"));
         }
     }
 
@@ -26877,6 +26931,7 @@ impl CadApp {
         };
         match std::fs::write(&path, bytes) {
             Ok(()) => {
+                self.save_report_prefs();
                 let msg = format!("Report written to {}", path.display());
                 self.history.push(format!("  {msg}"));
                 self.light.last_msg = msg;
@@ -62337,6 +62392,10 @@ mod the_owners_three_room_plan {
             generated += r.fixtures.iter().filter(|l| l.id >= 1_000_000).count();
         }
         println!("placed {placed}, generated {generated}");
+        println!("cores: {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0));
+        for (k, v) in &app.light.last_timings {
+            println!("  phase {k:<12} {v:>10.1}");
+        }
 
         assert_eq!(app.light.rooms.len(), 3, "this plan has three rooms");
         for r in &app.light.rooms {

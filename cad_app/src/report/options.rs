@@ -335,6 +335,141 @@ impl Options {
     }
 }
 
+
+/// The report settings that outlive one project.
+///
+/// A SEPARATE STRUCT, NOT `#[serde(skip)]` SCATTERED THROUGH `Options`, because the split is a
+/// decision and deserves to be written down in one place. A practice's header, its logo, the bands
+/// it reads drawings at and the order its reports are laid out in are the same on every job. The
+/// project's NAME is not, and neither is where this particular file goes — carrying those forward
+/// would put last week's client on this week's cover, which is the kind of mistake that reaches a
+/// client.
+///
+/// Logos travel as PATHS. The bytes are re-read when the dialog opens; a preferences file carrying
+/// a megabyte of image per logo is one nobody can open or diff.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Prefs {
+    #[serde(default)]
+    pub format: Option<Format>,
+    #[serde(default)]
+    pub page: Option<PageSize>,
+    #[serde(default)]
+    pub cover: Option<bool>,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub footer: String,
+    #[serde(default)]
+    pub page_numbers: Option<bool>,
+    #[serde(default)]
+    pub scale: Option<Scale>,
+    #[serde(default)]
+    pub sections: Vec<Section>,
+    #[serde(default)]
+    pub hidden: Vec<(Section, usize)>,
+    /// `(path, caption)` per logo, in order.
+    #[serde(default)]
+    pub logos: Vec<(String, String)>,
+    #[serde(default)]
+    pub header_image: Option<usize>,
+    #[serde(default)]
+    pub footer_image: Option<usize>,
+}
+
+impl Prefs {
+    /// What of these options is worth keeping.
+    pub fn of(o: &Options) -> Self {
+        Self {
+            format: Some(o.format),
+            page: Some(o.page),
+            cover: Some(o.cover),
+            header: o.header.clone(),
+            footer: o.footer.clone(),
+            page_numbers: Some(o.page_numbers),
+            scale: Some(o.scale.clone()),
+            sections: o.sections.clone(),
+            hidden: o.hidden.clone(),
+            logos: o.logos.iter().map(|l| (l.path.clone(), l.caption.clone())).collect(),
+            header_image: o.header_image,
+            footer_image: o.footer_image,
+        }
+    }
+
+    /// Put them back, leaving everything that belongs to THIS report alone.
+    ///
+    /// Each field is applied only if the file actually carried one, so a preferences file written
+    /// by an older build — or half-written — restores what it has and defaults the rest, rather
+    /// than blanking a header because the field did not exist yet.
+    pub fn apply(self, o: &mut Options) {
+        if let Some(v) = self.format {
+            o.format = v;
+        }
+        if let Some(v) = self.page {
+            o.page = v;
+        }
+        if let Some(v) = self.cover {
+            o.cover = v;
+        }
+        if let Some(v) = self.page_numbers {
+            o.page_numbers = v;
+        }
+        if let Some(v) = self.scale {
+            o.scale = v;
+        }
+        o.header = self.header;
+        o.footer = self.footer;
+        // An EMPTY section list is not a preference, it is a file that never held one — restoring
+        // it would give a report with nothing in it and no way to tell why.
+        if !self.sections.is_empty() {
+            o.sections = self.sections;
+            o.hidden = self.hidden;
+        }
+        // The images themselves are re-read from these paths; see `Options::logo_paths`.
+        o.logos = self
+            .logos
+            .into_iter()
+            .map(|(path, caption)| ReportImage { path, caption, jpeg: None })
+            .collect();
+        // A logo index that no longer names anything is dropped rather than left pointing past the
+        // end of a list a person has since shortened.
+        let n = o.logos.len();
+        o.header_image = self.header_image.filter(|i| *i < n);
+        o.footer_image = self.footer_image.filter(|i| *i < n);
+    }
+
+    /// Where they live — beside the Illuminaire library and the other cross-project preferences.
+    pub fn path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(std::path::PathBuf::from(home).join(".config/rust_cad/report.json"))
+    }
+
+    pub fn load() -> Self {
+        match Self::path().and_then(|p| std::fs::read_to_string(p).ok()) {
+            // A MALFORMED PREFERENCES FILE IS NOT AN ERROR TO SHOW ANYBODY. Unlike the fitting
+            // library, nothing here is irreplaceable — the worst case is re-typing a header — so
+            // it defaults quietly rather than putting a dialog in front of a report.
+            Some(t) => serde_json::from_str(&t).unwrap_or_default(),
+            None => Self::default(),
+        }
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let p = Self::path().ok_or("no home directory")?;
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        // Through a temp file and renamed, so an interrupted write cannot leave half a file where
+        // the settings were.
+        let tmp = p.with_extension("tmp");
+        std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", p.display())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +543,144 @@ mod tests {
         o.out_dir = if cfg!(windows) { "C:\\out".into() } else { "/out".into() };
         o.file_stem = "   ".into();
         assert!(o.out_path().to_string_lossy().ends_with("report.pdf"));
+    }
+}
+
+/// THE SETTINGS A PRACTICE KEEPS SURVIVE A RESTART — and the ones belonging to one report do not.
+///
+/// Asked for as "get the report settings going". The split is the whole of it: a header, a logo
+/// and the bands a practice reads drawings at are the same on every job; the project's NAME is
+/// not, and carrying it forward would put last week's client on this week's cover.
+#[cfg(test)]
+mod the_report_settings_are_kept {
+    use super::*;
+
+    fn set_up() -> Options {
+        let mut o = Options::default();
+        o.format = Format::Html;
+        o.page = PageSize::Letter;
+        o.cover = false;
+        o.header = "HSI Lighting · Project 2214".into();
+        o.footer = "confidential".into();
+        o.page_numbers = false;
+        o.scale = Scale { top: Some(750.0), bands: vec![50.0, 200.0] };
+        o.move_section(Section::Renders, -1);
+        o.set(Section::Surfaces, false);
+        o.logos = vec![
+            ReportImage { path: "D:/brand/hsi.png".into(), caption: "HSI".into(), jpeg: None },
+            ReportImage { path: "D:/brand/iso.png".into(), caption: String::new(), jpeg: None },
+        ];
+        o.header_image = Some(0);
+        o.footer_image = Some(1);
+        // …and the things that belong to THIS report.
+        o.title = "Gym · Level 2".into();
+        o.subtitle = "Issued for tender".into();
+        o.out_dir = "D:/jobs/2214".into();
+        o.file_stem = "gym-lighting".into();
+        o
+    }
+
+    /// A ROUND TRIP KEEPS THE STANDING CHOICES.
+    #[test]
+    fn the_standing_choices_come_back() {
+        let src = set_up();
+        let mut back = Options::default();
+        Prefs::of(&src).apply(&mut back);
+
+        assert_eq!(back.format, Format::Html);
+        assert_eq!(back.page, PageSize::Letter);
+        assert!(!back.cover);
+        assert_eq!(back.header, "HSI Lighting · Project 2214");
+        assert_eq!(back.footer, "confidential");
+        assert!(!back.page_numbers);
+        assert_eq!(back.scale.top, Some(750.0));
+        assert_eq!(back.scale.bands, vec![50.0, 200.0]);
+        assert_eq!(back.sections, src.sections, "the section order was not kept");
+        assert!(!back.has(Section::Surfaces), "a switched-off section came back on");
+        assert_eq!(back.logos.len(), 2, "the logos were not kept");
+        assert_eq!(back.logos[0].path, "D:/brand/hsi.png");
+        assert_eq!(back.logos[0].caption, "HSI");
+        assert_eq!(back.header_image, Some(0));
+        assert_eq!(back.footer_image, Some(1));
+    }
+
+    /// AND DOES NOT CARRY THE PROJECT ACROSS.
+    ///
+    /// This is the half that matters more: a title, a subtitle and an output folder that followed
+    /// a practice from one job to the next would put the wrong client's name on a cover, and the
+    /// file somewhere nobody meant.
+    #[test]
+    fn nothing_belonging_to_one_report_comes_back() {
+        let src = set_up();
+        let mut back = Options::default();
+        Prefs::of(&src).apply(&mut back);
+
+        assert!(back.title.is_empty(), "the project name followed: {:?}", back.title);
+        assert!(back.subtitle.is_empty(), "the cover line followed: {:?}", back.subtitle);
+        assert!(back.out_dir.is_empty(), "the output folder followed: {:?}", back.out_dir);
+        assert!(back.file_stem.is_empty(), "the file name followed: {:?}", back.file_stem);
+        assert!(back.images.is_empty(), "the renders followed");
+    }
+
+    /// LOGO BYTES ARE NOT IN THE FILE. A preferences file carrying a megabyte of image per logo is
+    /// one nobody can open, diff or copy between machines.
+    #[test]
+    fn only_the_logo_paths_are_written() {
+        let mut o = set_up();
+        o.logos[0].jpeg = Some((vec![0xAB; 4096], 800, 200));
+        let json = serde_json::to_string(&Prefs::of(&o)).expect("serialises");
+        assert!(json.contains("hsi.png"), "the path is the record");
+        assert!(!json.contains("171,171,171"), "the image bytes went into the file");
+        assert!(json.len() < 2000, "the preferences file is {} bytes", json.len());
+    }
+
+    /// A FILE FROM AN OLDER BUILD RESTORES WHAT IT HAS and defaults the rest, rather than blanking
+    /// a setting because the field did not exist when it was written.
+    #[test]
+    fn a_partial_file_does_not_blank_what_it_does_not_mention() {
+        let p: Prefs = serde_json::from_str(r#"{"header":"HSI Lighting"}"#).expect("older file");
+        let mut o = Options::default();
+        let defaults = Options::default();
+        p.apply(&mut o);
+        assert_eq!(o.header, "HSI Lighting");
+        assert_eq!(o.format, defaults.format, "the format was blanked");
+        assert_eq!(o.page, defaults.page, "the paper size was blanked");
+        assert_eq!(o.cover, defaults.cover, "the cover was switched off");
+        assert_eq!(o.sections, defaults.sections, "the sections were emptied");
+        assert_eq!(o.scale.bands, defaults.scale.bands, "the bands were blanked");
+    }
+
+    /// AN EMPTY SECTION LIST IS NOT A PREFERENCE. A file that never held one must not produce a
+    /// report with nothing in it and no way to tell why.
+    #[test]
+    fn an_empty_section_list_is_ignored() {
+        let p: Prefs = serde_json::from_str(r#"{"sections":[]}"#).expect("parses");
+        let mut o = Options::default();
+        p.apply(&mut o);
+        assert_eq!(o.sections, Section::all(), "an empty list emptied the report");
+    }
+
+    /// A LOGO INDEX THAT NO LONGER NAMES ANYTHING IS DROPPED, not left pointing past the end of a
+    /// list somebody has since shortened.
+    #[test]
+    fn a_stale_logo_index_is_dropped() {
+        let mut p = Prefs::of(&set_up());
+        p.logos.truncate(1);
+        let mut o = Options::default();
+        p.apply(&mut o);
+        assert_eq!(o.header_image, Some(0), "the surviving logo kept its slot");
+        assert_eq!(o.footer_image, None, "the footer pointed past the end of the list");
+    }
+
+    /// A CORRUPT FILE IS NOT AN ERROR TO SHOW ANYBODY. Nothing here is irreplaceable — the worst
+    /// case is re-typing a header — so it defaults quietly rather than putting a dialog in front
+    /// of a report.
+    #[test]
+    fn a_malformed_file_defaults_quietly() {
+        let p: Prefs = serde_json::from_str("{ not json").unwrap_or_default();
+        let mut o = Options::default();
+        p.apply(&mut o);
+        assert_eq!(o.sections, Section::all());
+        assert!(o.header.is_empty());
     }
 }
