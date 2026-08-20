@@ -54,6 +54,10 @@ pub struct RoomInput<'a> {
     pub grid: &'a LuxGrid,
     pub plane: &'a CalcPlane,
     pub mask: &'a [bool],
+    /// The room's outline, in metres. Empty for the whole-model fallback.
+    pub poly: &'a [glam::Vec2],
+    /// The fixtures standing in it — where they are, for the layout drawing.
+    pub fixtures: &'a [cad_light::Luminaire],
     pub installation: Option<&'a Installation>,
     pub cylindrical_avg: Option<f64>,
     /// The fittings standing in THIS room, by type.
@@ -99,6 +103,21 @@ impl<'a> Input<'a> {
 const INK: [u8; 3] = [17, 17, 17];
 const FAINT: [u8; 3] = [125, 125, 125];
 const RULE: [u8; 3] = [200, 200, 200];
+
+/// The box a header or footer logo is fitted into, in points — 120 x 24 pt, about 42 x 8.5 mm.
+///
+/// It is a BOX, not a size: the image keeps its own proportions inside it, so a tall logo comes out
+/// 24 pt high and narrow rather than squashed. The height is what the band can hold without the
+/// running text moving; the width is what is left beside a project name on A4.
+pub const LOGO_W: f64 = 120.0;
+pub const LOGO_H: f64 = 24.0;
+
+/// Two thirds of the page, as asked for — a drawing is the subject of the page it is on.
+const TWO_THIRDS: f64 = 0.666;
+/// Height of the banded legend and its labels.
+const LEGEND_H: f64 = 46.0;
+/// Below this the grid's figures stop being numbers and become a texture.
+const MIN_GRID_PT: f64 = 3.2;
 
 const MARGIN: f64 = 48.0;
 const HEAD_H: f64 = 34.0;
@@ -260,7 +279,8 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
                 Section::Summary => summary(&mut c, room, inp.unassigned),
                 Section::Installation => installation(&mut c, room, inp.maintenance),
                 Section::WorkingPlane => working_plane(&mut c, room, inp.eye_height),
-                Section::FalseColour => false_colour(&mut c, inp, room, opt),
+                Section::Layout => layout_page(&mut c, room),
+                Section::Results => results(&mut c, inp, room, opt),
                 Section::NumericGrid => numeric_grid(&mut c, room),
                 Section::Schedule => schedule(&mut c, &room.schedule, "Luminaire schedule"),
                 _ => {}
@@ -469,7 +489,8 @@ fn is_per_room(s: Section) -> bool {
         Section::Summary
             | Section::Installation
             | Section::WorkingPlane
-            | Section::FalseColour
+            | Section::Layout
+            | Section::Results
             | Section::NumericGrid
             | Section::Schedule
     )
@@ -706,99 +727,114 @@ fn working_plane(c: &mut Cursor, room: &RoomInput, eye_height: f32) {
     }
 }
 
-/// THE FALSE-COLOUR FIELD, GIVEN THE PAGE.
+/// THE RESULT, SCALED TO THE PAGE AND DRAWN SMOOTH.
 ///
-/// Two complaints shaped this. The plot came out as a stamp in the middle of a page — "the layout
-/// is too small it should occupy 2/3 of the pages real estate while maintaining proportions" — and
-/// the scale was whatever the viewport happened to be set to.
+/// "see how the false color shows up as grid make it smooth like in the reference." The field was
+/// drawn one rectangle per grid point, so a 125-column room came out as visible cross-hatching —
+/// the sampling grid rather than the light. A lighting drawing shows bands with curved edges,
+/// because illuminance is continuous and the grid is only where it was measured.
 ///
-/// So the plot is sized to fill TWO THIRDS OF THE PAGE, keeping the plane's proportions, and it
-/// starts a fresh page when what is left of this one cannot hold that. The room is the subject of
-/// the page it is on, which is what the reference drawing does.
-fn false_colour(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
+/// So the field is resampled BILINEARLY onto a much finer raster and each sample is coloured
+/// through the scale. With a banded scale that gives smooth curved band boundaries — the reference
+/// look — and with a continuous one, a smooth gradient. Runs of equal colour along a row are
+/// merged into one rectangle, which is what keeps the file small: a banded field has a handful of
+/// runs per row rather than one rectangle per sample.
+fn results(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
     let g = room.grid;
     if g.cols == 0 || g.rows == 0 {
         return;
     }
-    // The target: two thirds of the page in each direction, which is two thirds of its area at the
-    // plane's own aspect and reads as a figure rather than a thumbnail.
     let target_w = c.page_w * TWO_THIRDS;
     let target_h = c.page_h * TWO_THIRDS;
     let cell = (target_w / g.cols as f64).min(target_h / g.rows as f64);
     let plot_w = cell * g.cols as f64;
     let plot_h = cell * g.rows as f64;
 
-    // Heading, plot, legend. If they will not fit below what is already on the page, the plot gets
-    // a page of its own rather than being shrunk to whatever is left.
-    let needed = 40.0 + plot_h + LEGEND_H;
-    c.need_or_break(needed);
-    c.heading("Illuminance — false colour");
-    false_colour_body(c, inp, room, opt, cell, plot_w, plot_h);
+    c.need_or_break(40.0 + plot_h + LEGEND_H);
+    c.heading("Results — illuminance");
+    results_body(c, inp, room, opt, plot_w, plot_h);
 }
 
-/// The box a header or footer logo is fitted into, in points — 120 x 24 pt, about 42 x 8.5 mm.
-///
-/// It is a BOX, not a size: the image keeps its own proportions inside it, so a tall logo comes out
-/// 24 pt high and narrow rather than squashed. The height is what the band can hold without the
-/// running text moving; the width is what is left beside a project name on A4.
-pub const LOGO_W: f64 = 120.0;
-pub const LOGO_H: f64 = 24.0;
+/// How many raster samples across the plot, at most. 900 is well past what 300 dpi resolves on an
+/// A4 content width, and past it the only thing that grows is the file.
+const MAX_SAMPLES: usize = 900;
 
-/// Two thirds, as asked for.
-const TWO_THIRDS: f64 = 0.666;
-/// Height of the banded legend and its labels.
-const LEGEND_H: f64 = 46.0;
-
-fn false_colour_body(
+fn results_body(
     c: &mut Cursor,
     inp: &Input,
     room: &RoomInput,
     opt: &Options,
-    cell: f64,
     plot_w: f64,
     plot_h: f64,
 ) {
     let g = room.grid;
+    let (gc, gr) = (g.cols as usize, g.rows as usize);
     let x0 = c.left + (c.width() - plot_w) * 0.5;
     let y0 = c.y;
     let room_max = g.max;
-    let label = cell >= 22.0;
 
-    for r in 0..g.rows as usize {
-        for col in 0..g.cols as usize {
-            let i = r * g.cols as usize + col;
-            let Some(v) = g.values.get(i) else { continue };
-            let x = x0 + col as f64 * cell;
-            let y = y0 + r as f64 * cell;
-            if room.mask.get(i).is_some_and(|inside| !inside) {
-                // Outside the room: blank, not coloured. Colouring it would report illuminance on
-                // ground the room does not occupy.
-                continue;
+    // Enough samples to hide the grid, never more than the page can show.
+    let nx = (gc * 8).clamp(gc, MAX_SAMPLES);
+    let ny = ((nx as f64) * (plot_h / plot_w)).round().max(1.0) as usize;
+    let sw = plot_w / nx as f64;
+    let sh = plot_h / ny as f64;
+
+    for j in 0..ny {
+        // Sample at the CENTRE of each raster cell, in grid coordinates.
+        let gy = ((j as f64 + 0.5) / ny as f64) * gr as f64 - 0.5;
+        let mut run: Option<([u8; 3], usize)> = None;
+        for i in 0..=nx {
+            let colour = if i == nx {
+                None
+            } else {
+                let gx = ((i as f64 + 0.5) / nx as f64) * gc as f64 - 0.5;
+                sample(inp, room, opt, gx, gy, room_max)
+            };
+            match (&mut run, colour) {
+                (Some((c0, start)), Some(cc)) if *c0 == cc => {}
+                (Some((c0, start)), _) => {
+                    // Half a sample of overlap, so neighbouring runs meet rather than leaving a
+                    // hairline of white paper between them at the reader's rendering resolution.
+                    let x = x0 + *start as f64 * sw;
+                    let w = (i - *start) as f64 * sw + 0.15;
+                    c.push(Item::Rect { x, y: y0 + j as f64 * sh, w, h: sh + 0.15, fill: *c0 });
+                    run = colour.map(|cc| (cc, i));
+                }
+                (None, Some(cc)) => run = Some((cc, i)),
+                (None, None) => {}
             }
-            let t = opt.scale.t_for(*v, room_max);
-            let fill = ramp_rgb(inp.ramp, t);
-            c.push(Item::Rect { x, y, w: cell, h: cell, fill });
-            if label {
+        }
+    }
+
+    // THE VALUES, where the grid is coarse enough to carry them. A smooth field shows the shape of
+    // the light; the numbers make it checkable, and on a small room there is room for both.
+    let cell_w = plot_w / gc as f64;
+    let cell_h = plot_h / gr as f64;
+    if cell_w.min(cell_h) >= 22.0 {
+        for j in 0..gr {
+            for i in 0..gc {
+                let Some(v) = g.values.get(j * gc + i) else { continue };
+                let Some(fill) = sample(inp, room, opt, i as f64, j as f64, room_max) else {
+                    continue;
+                };
                 // Black on light, white on dark — a fixed ink colour is unreadable over half the
-                // ramp, and this plot exists to be read.
+                // ramp, and these exist to be read.
                 let lum = 0.299 * fill[0] as f64 + 0.587 * fill[1] as f64 + 0.114 * fill[2] as f64;
-                let ink = if lum > 140.0 { [20, 20, 20] } else { [245, 245, 245] };
                 c.push(Item::Text {
-                    x: x + cell * 0.5,
-                    y: y + cell * 0.5 + 2.0,
-                    size: (cell * 0.26).clamp(4.0, 8.0),
+                    x: x0 + (i as f64 + 0.5) * cell_w,
+                    y: y0 + (j as f64 + 0.5) * cell_h + 2.0,
+                    size: (cell_w.min(cell_h) * 0.26).clamp(4.0, 8.0),
                     font: Font::Regular,
-                    rgb: ink,
+                    rgb: if lum > 140.0 { [20, 20, 20] } else { [245, 245, 245] },
                     align: Align::Centre,
                     text: format!("{v:.0}"),
                 });
             }
         }
     }
-    c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [140, 140, 140], width: 0.7 });
+    let values_shown = cell_w.min(cell_h) >= 22.0;
 
-    // The dimensions of the plane, along the bottom — the reference drawing carries an axis, and
-    // without one a picture of a room states no size.
+    c.push(Item::Frame { x: x0, y: y0, w: plot_w, h: plot_h, rgb: [140, 140, 140], width: 0.7 });
     c.push(Item::Text {
         x: x0 + plot_w * 0.5,
         y: y0 + plot_h + 11.0,
@@ -809,11 +845,145 @@ fn false_colour_body(
         text: format!("{:.2} × {:.2} m", room.plane.width, room.plane.depth),
     });
     c.y = y0 + plot_h + 24.0;
-
     legend(c, inp, opt, room_max);
-    if !label {
-        c.note("Cell values are omitted at this grid size — the exact figures are in the grid table.");
+    if !values_shown {
+        // AFTER the legend, not before: `note` moves the pen, and emitting it mid-plot would print
+        // the sentence across the field it is describing.
+        c.note("Point values are omitted at this grid size — the grid table carries every figure.");
     }
+}
+
+/// The colour at a point in GRID coordinates, or `None` outside the room.
+///
+/// Bilinear between the four surrounding grid points. The room edge is taken from the room's own
+/// OUTLINE where there is one rather than from the cell mask — a mask is a staircase at grid
+/// resolution, and drawing a smooth field inside a staircase would put the jaggedness back at the
+/// one place the eye looks for it.
+fn sample(
+    inp: &Input,
+    room: &RoomInput,
+    opt: &Options,
+    gx: f64,
+    gy: f64,
+    room_max: f64,
+) -> Option<[u8; 3]> {
+    let g = room.grid;
+    let (gc, gr) = (g.cols as usize, g.rows as usize);
+
+    if !room.poly.is_empty() {
+        let p = room.plane;
+        let x = p.origin.x as f64 + (gx + 0.5) * (p.width as f64 / gc as f64);
+        let y = p.origin.y as f64 + (gy + 0.5) * (p.depth as f64 / gr as f64);
+        if !crate::factory::point_in_poly(room.poly, x as f32, y as f32) {
+            return None;
+        }
+    } else if !room.mask.is_empty() {
+        let i = (gy.round().clamp(0.0, (gr - 1) as f64) as usize) * gc
+            + gx.round().clamp(0.0, (gc - 1) as f64) as usize;
+        if room.mask.get(i).is_some_and(|inside| !inside) {
+            return None;
+        }
+    }
+
+    let x0 = gx.floor().clamp(0.0, (gc - 1) as f64) as usize;
+    let y0 = gy.floor().clamp(0.0, (gr - 1) as f64) as usize;
+    let x1 = (x0 + 1).min(gc - 1);
+    let y1 = (y0 + 1).min(gr - 1);
+    let tx = (gx - x0 as f64).clamp(0.0, 1.0);
+    let ty = (gy - y0 as f64).clamp(0.0, 1.0);
+    let at = |cx: usize, cy: usize| g.values.get(cy * gc + cx).copied().unwrap_or(0.0);
+    let v = at(x0, y0) * (1.0 - tx) * (1.0 - ty)
+        + at(x1, y0) * tx * (1.0 - ty)
+        + at(x0, y1) * (1.0 - tx) * ty
+        + at(x1, y1) * tx * ty;
+
+    Some(ramp_rgb(inp.ramp, opt.scale.t_for(v, room_max)))
+}
+
+/// THE LIGHTING LAYOUT — the room and what is in it, before the result.
+///
+/// Asked for as "have a page showing the lighting layout before it shows the false colors". A
+/// false-colour field says how much light there is; it does not say where the fittings are, and a
+/// reader checking a design needs to see the layout that produced the numbers.
+fn layout_page(c: &mut Cursor, room: &RoomInput) {
+    let p = room.plane;
+    if p.width <= 0.0 || p.depth <= 0.0 {
+        return;
+    }
+    let target_w = c.page_w * TWO_THIRDS;
+    let target_h = c.page_h * TWO_THIRDS;
+    let k = (target_w / p.width as f64).min(target_h / p.depth as f64);
+    let (dw, dh) = (p.width as f64 * k, p.depth as f64 * k);
+
+    c.need_or_break(40.0 + dh + 40.0);
+    c.heading("Lighting layout");
+
+    let x0 = c.left + (c.width() - dw) * 0.5;
+    let y0 = c.y;
+    // Plan coordinates → page. Y IS FLIPPED: a plan reads with +y up, a page with +y down, and a
+    // layout printed upside down against its own result is worse than no layout at all.
+    let to_page = |wx: f64, wy: f64| -> (f64, f64) {
+        (
+            x0 + (wx - p.origin.x as f64) * k,
+            y0 + dh - (wy - p.origin.y as f64) * k,
+        )
+    };
+
+    // The room outline, or the plane's own rectangle when there is none.
+    if room.poly.len() >= 3 {
+        let pts: Vec<(f64, f64)> =
+            room.poly.iter().map(|v| to_page(v.x as f64, v.y as f64)).collect();
+        for w in pts.windows(2) {
+            c.push(Item::Line {
+                x1: w[0].0,
+                y1: w[0].1,
+                x2: w[1].0,
+                y2: w[1].1,
+                rgb: [190, 40, 40],
+                width: 1.4,
+            });
+        }
+        // Closed, in case the footprint does not repeat its first point.
+        if let (Some(a), Some(b)) = (pts.first(), pts.last()) {
+            c.push(Item::Line { x1: b.0, y1: b.1, x2: a.0, y2: a.1, rgb: [190, 40, 40], width: 1.4 });
+        }
+    } else {
+        c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [190, 40, 40], width: 1.4 });
+    }
+
+    // Every fitting, where it stands.
+    for l in room.fixtures {
+        let (x, y) = to_page(l.position.x as f64, l.position.y as f64);
+        let r = 2.6;
+        c.push(Item::Line { x1: x - r, y1: y, x2: x + r, y2: y, rgb: [30, 30, 30], width: 0.8 });
+        c.push(Item::Line { x1: x, y1: y - r, x2: x, y2: y + r, rgb: [30, 30, 30], width: 0.8 });
+        c.push(Item::Frame {
+            x: x - r * 0.66,
+            y: y - r * 0.66,
+            w: r * 1.32,
+            h: r * 1.32,
+            rgb: [200, 150, 40],
+            width: 0.9,
+        });
+    }
+
+    c.push(Item::Frame { x: x0, y: y0, w: dw, h: dh, rgb: [215, 215, 215], width: 0.5 });
+    c.y = y0 + dh + 12.0;
+    c.text(
+        c.left,
+        7.5,
+        Font::Regular,
+        Align::Left,
+        FAINT,
+        &format!(
+            "{:.2} × {:.2} m  ·  {} fitting(s)  ·  mounting {:.2} m",
+            p.width,
+            p.depth,
+            room.fixtures.len(),
+            room.fixtures.first().map(|l| l.position.z).unwrap_or(0.0),
+        ),
+    );
+    c.y += 6.0;
 }
 
 fn ramp_rgb(ramp: fn(f32) -> (f32, f32, f32), t: f32) -> [u8; 3] {
@@ -968,8 +1138,6 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     c.y = y0 + rows * rowh + 6.0;
 }
 
-/// Below this the figures stop being numbers and become a texture.
-const MIN_GRID_PT: f64 = 3.2;
 
 fn surfaces(c: &mut Cursor, inp: &Input) {
     if inp.surfaces.is_empty() {
@@ -1079,6 +1247,8 @@ mod tests {
             grid: g,
             plane: p,
             mask: &[],
+            poly: &[],
+            fixtures: &[],
             installation: None,
             cylindrical_avg: None,
             schedule: Vec::new(),
@@ -1157,21 +1327,40 @@ mod tests {
         }
     }
 
-    /// The plot's cells, told apart from the legend by their size.
-    fn plot_cells(d: &Doc, cols: u32, rows: u32) -> Vec<(f64, f64, f64, f64)> {
-        let mut r = rects(d);
-        // The plot is square cells; the legend is 12 pt tall blocks. Keeping only the squares is
-        // enough, and the count is asserted against the grid so a mistake here cannot pass.
-        r.retain(|(_, _, w, h)| (w - h).abs() < 1e-6);
-        let _ = (cols, rows);
-        r
+    /// The plot's own bounds, taken from the frame drawn around it — a stable anchor now that the
+    /// field is a raster of merged runs rather than one rectangle per grid point.
+    fn plot_frames(d: &Doc) -> Vec<(f64, f64, f64, f64)> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Frame { x, y, w, h, rgb, .. } if *rgb == [140, 140, 140] => {
+                    Some((*x, *y, *w, *h))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every filled rectangle of the field, ignoring the legend's 12 pt blocks.
+    fn field_rects(d: &Doc) -> Vec<(f64, f64, f64, f64, [u8; 3])> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Rect { x, y, w, h, fill } if (*h - 12.0).abs() > 0.01 => {
+                    Some((*x, *y, *w, *h, *fill))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// THE PLOT TAKES TWO THIRDS OF THE PAGE.
     ///
     /// "the layout is too small it should occupy 2/3 of the pages real estate while maintaining
     /// proportions". It used to be sized to whatever was left below the heading, which on a busy
-    /// page was a stamp in the middle of white space.
+    /// page was a stamp in a field of white.
     #[test]
     fn the_plot_fills_two_thirds_of_the_page() {
         let (pw, ph) = PageSize::A4.points();
@@ -1180,19 +1369,13 @@ mod tests {
             let p = plane();
             let mut o = opts();
             o.cover = false;
-            o.sections = vec![Section::FalseColour];
+            o.sections = vec![Section::Results];
             let d = layout(&input(&g, &p), &o);
-            let cells = plot_cells(&d, cols, rows);
-            assert_eq!(cells.len(), (cols * rows) as usize, "{cols}x{rows}: a cell per point");
+            let f = plot_frames(&d);
+            assert_eq!(f.len(), 1, "{cols}x{rows}: expected one plot");
+            let (x, y, w, h) = f[0];
+            let _ = y;
 
-            let minx = cells.iter().map(|c| c.0).fold(f64::MAX, f64::min);
-            let maxx = cells.iter().map(|c| c.0 + c.2).fold(f64::MIN, f64::max);
-            let miny = cells.iter().map(|c| c.1).fold(f64::MAX, f64::min);
-            let maxy = cells.iter().map(|c| c.1 + c.3).fold(f64::MIN, f64::max);
-            let (w, h) = (maxx - minx, maxy - miny);
-
-            // ONE of the two directions must reach two thirds — whichever the plane's aspect makes
-            // the binding one. Both would only happen for a square plot on square paper.
             let fills_w = w >= pw * 0.66 - 1.0;
             let fills_h = h >= ph * 0.66 - 1.0;
             assert!(
@@ -1200,33 +1383,128 @@ mod tests {
                 "{cols}x{rows}: plot is {w:.0}x{h:.0} on {pw:.0}x{ph:.0} — neither side reaches \
                  two thirds",
             );
-            assert!(w <= pw * TWO_THIRDS + 1.0 && h <= ph * TWO_THIRDS + 1.0, "{cols}x{rows}: too big");
-            // Square cells, or the field is stretched and the picture lies about the room.
-            for (_, _, cw, ch) in &cells {
-                assert!((cw - ch).abs() < 1e-6, "{cols}x{rows}: cell {cw:.2}x{ch:.2} is not square");
-            }
+            assert!(
+                w <= pw * TWO_THIRDS + 1.0 && h <= ph * TWO_THIRDS + 1.0,
+                "{cols}x{rows}: too big",
+            );
+            assert!(x >= 0.0 && x + w <= pw, "{cols}x{rows}: spans {x:.1}..{:.1}", x + w);
+            // The field keeps the plane's proportions: cell aspect follows the grid, not the page.
+            let cell_aspect = (w / cols as f64) / (h / rows as f64);
+            assert!(
+                (cell_aspect - 1.0).abs() < 1e-6,
+                "{cols}x{rows}: the field is stretched, cell aspect {cell_aspect:.4}",
+            );
         }
     }
 
-    /// …AND IT STILL LANDS ON THE PAPER. Two thirds of the page is only useful if it is the right
-    /// two thirds.
+    /// THE FIELD IS DRAWN SMOOTH, not as one rectangle per measured point.
+    ///
+    /// "see how the false color shows up as grid make it smooth like in the reference." Drawn at
+    /// grid resolution, a 33-column room came out as visible cross-hatching — the sampling grid
+    /// rather than the light. It is resampled onto a much finer raster, and runs of one colour are
+    /// merged, so a banded scale gives smooth curved band edges.
     #[test]
-    fn the_plot_stays_within_the_margins() {
-        let (pw, _) = PageSize::A4.points();
-        let g = grid(33, 40);
+    fn the_field_is_finer_than_the_grid_it_came_from() {
+        let g = grid(8, 8);
         let p = plane();
         let mut o = opts();
         o.cover = false;
-        o.sections = vec![Section::FalseColour];
+        o.sections = vec![Section::Results];
         let d = layout(&input(&g, &p), &o);
-        let cells = plot_cells(&d, 33, 40);
-        let minx = cells.iter().map(|c| c.0).fold(f64::MAX, f64::min);
-        let maxx = cells.iter().map(|c| c.0 + c.2).fold(f64::MIN, f64::max);
-        assert!(minx >= 0.0 && maxx <= pw, "plot spans {minx:.1}..{maxx:.1} on a {pw:.0} page");
+        let (_, _, pw, ph) = plot_frames(&d)[0];
+        let r = field_rects(&d);
+        assert!(!r.is_empty(), "nothing was drawn");
+
+        // Every run is at most one raster row tall, which is far thinner than a grid cell.
+        let cell_h = ph / 8.0;
+        let tallest = r.iter().map(|x| x.3).fold(0.0_f64, f64::max);
+        assert!(
+            tallest < cell_h * 0.5,
+            "the tallest run is {tallest:.2} pt against a {cell_h:.2} pt grid cell — this is still \
+             being drawn one rectangle per measured point",
+        );
+        // …and the rows cover the plot from top to bottom.
+        let top = r.iter().map(|x| x.1).fold(f64::MAX, f64::min);
+        let bot = r.iter().map(|x| x.1 + x.3).fold(f64::MIN, f64::max);
+        assert!(bot - top > ph * 0.9, "the field covers {:.0} of {ph:.0} pt", bot - top);
+        assert!(pw > 0.0);
     }
 
-    /// A MASKED CELL IS BLANK, not coloured — colouring it reports illuminance on ground the room
-    /// does not occupy.
+
+    /// THE FIELD IS INTERPOLATED, not merely drawn at a finer pitch.
+    ///
+    /// Resampling without interpolating gives the same blocky field, only made of more rectangles
+    /// — the band edges still land exactly on grid-cell boundaries, so the sampling grid is still
+    /// what the eye sees. Bilinear is what makes a band edge a curve.
+    ///
+    /// Told apart by WHERE the colour changes: with nearest-neighbour every row breaks at the same
+    /// handful of x positions, one per grid column. With bilinear over a field that varies in y,
+    /// each row breaks somewhere slightly different.
+    #[test]
+    fn the_field_is_interpolated_and_not_just_finely_diced() {
+        // A diagonal ramp, so the band edges are diagonal lines rather than horizontal ones.
+        let cols = 8u32;
+        let rows = 8u32;
+        let vals: Vec<f64> = (0..(cols * rows))
+            .map(|i| {
+                let (x, y) = ((i % cols) as f64, (i / cols) as f64);
+                (x + y) * 60.0
+            })
+            .collect();
+        let min = vals.iter().cloned().fold(f64::MAX, f64::min);
+        let max = vals.iter().cloned().fold(f64::MIN, f64::max);
+        let avg = vals.iter().sum::<f64>() / vals.len() as f64;
+        let g = LuxGrid {
+            cols,
+            rows,
+            values: vals,
+            min,
+            max,
+            avg,
+            maintenance: 1.0,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        };
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+        let d = layout(&input(&g, &p), &o);
+
+        // Where each run begins, to the tenth of a point.
+        let starts: std::collections::BTreeSet<i64> =
+            field_rects(&d).iter().map(|r| (r.0 * 10.0).round() as i64).collect();
+        assert!(
+            starts.len() > cols as usize * 3,
+            "runs begin at only {} distinct positions across the whole field — with one per grid \
+             column that is a nearest-neighbour resample, not an interpolated one",
+            starts.len(),
+        );
+    }
+
+    /// A BANDED SCALE GIVES FEW COLOURS, which is what makes the bands readable — and the runs
+    /// merge, so a smooth field does not cost one rectangle per sample.
+    #[test]
+    fn a_banded_field_merges_into_runs() {
+        let g = grid(8, 8);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+        let d = layout(&input(&g, &p), &o);
+        let r = field_rects(&d);
+        let colours: std::collections::BTreeSet<[u8; 3]> = r.iter().map(|x| x.4).collect();
+        assert!(
+            colours.len() <= 8,
+            "a four-band scale produced {} colours — the bands are not being snapped",
+            colours.len(),
+        );
+        // One rectangle per sample would be hundreds of thousands; merged runs are far fewer.
+        assert!(r.len() < 20_000, "{} rectangles is not a merged field", r.len());
+    }
+
+    /// GROUND OUTSIDE THE ROOM IS NOT COLOURED — colouring it reports illuminance where the room
+    /// is not.
     #[test]
     fn cells_outside_the_room_are_not_coloured() {
         let g = grid(2, 1);
@@ -1235,32 +1513,40 @@ mod tests {
         i.rooms[0].mask = &[true, false];
         let mut o = opts();
         o.cover = false;
-        o.sections = vec![Section::FalseColour];
+        o.sections = vec![Section::Results];
         let d = layout(&i, &o);
-        assert_eq!(plot_cells(&d, 2, 1).len(), 1, "only the inside cell is filled");
+        let (px, _, pw, _) = plot_frames(&d)[0];
+        let r = field_rects(&d);
+        assert!(!r.is_empty());
+        // Everything drawn sits in the LEFT half — the right cell is outside the room.
+        let rightmost = r.iter().map(|x| x.0 + x.2).fold(f64::MIN, f64::max);
+        assert!(
+            rightmost < px + pw * 0.6,
+            "the field reaches {:.1}, past the half-way mark at {:.1}",
+            rightmost,
+            px + pw * 0.5,
+        );
     }
 
     /// VALUES APPEAR WHEN THERE IS ROOM AND NOT WHEN THERE IS NOT — and when they are dropped the
     /// page says so, rather than leaving a reader to wonder whether the plot is the whole story.
     #[test]
-    fn cell_values_are_printed_only_when_legible() {
+    fn point_values_are_printed_only_when_legible() {
         let mut o = opts();
-        o.sections = vec![Section::FalseColour];
+        o.sections = vec![Section::Results];
         o.cover = false;
-        // A CONTINUOUS SCALE, so the only "100" on the page can be a cell value. With the default
+        // A CONTINUOUS SCALE, so the only "100" on the page can be a point value. With the default
         // bands the legend writes "100" under itself, and this test would pass on that instead —
         // which is a test that cannot fail for the reason it names.
         o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
 
         let small = grid(4, 4);
         let p = plane();
-        let d = layout(&input(&small, &p), &o);
-        let t = texts(&d);
+        let t = texts(&layout(&input(&small, &p), &o));
         assert!(t.iter().any(|s| s == "100"), "a 4x4 plot has room for its values: {t:?}");
 
         let big = grid(60, 60);
-        let d = layout(&input(&big, &p), &o);
-        let t = texts(&d);
+        let t = texts(&layout(&input(&big, &p), &o));
         assert!(
             !t.iter().any(|s| s == "100"),
             "a 60x60 plot printed values that cannot be read at that size",
@@ -1268,6 +1554,142 @@ mod tests {
         assert!(
             t.iter().any(|s| s.contains("omitted")),
             "the page must say the values were left off: {t:?}",
+        );
+    }
+
+    /// THE SCALE IS THE REPORT'S DECISION, not the viewport's.
+    #[test]
+    fn pinning_the_scale_changes_the_colours() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+
+        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
+        let auto: Vec<[u8; 3]> =
+            field_rects(&layout(&input(&g, &p), &o)).iter().map(|x| x.4).collect();
+
+        o.scale = crate::report::options::Scale { top: Some(5000.0), bands: Vec::new() };
+        let pinned: Vec<[u8; 3]> =
+            field_rects(&layout(&input(&g, &p), &o)).iter().map(|x| x.4).collect();
+
+        assert_ne!(auto, pinned, "pinning the top to 5000 lx left every colour unchanged");
+        let mean = |v: &[[u8; 3]]| -> u64 {
+            v.iter().map(|p| p[0] as u64 + p[1] as u64 + p[2] as u64).sum::<u64>()
+                / v.len().max(1) as u64
+        };
+        assert!(
+            mean(&pinned) < mean(&auto),
+            "a higher ceiling must push the same room DOWN the ramp, not up",
+        );
+    }
+
+    /// THE LAYOUT PAGE SHOWS THE ROOM AND WHAT IS IN IT.
+    ///
+    /// "have a page showing the lighting layout before it shows the false colors." A field says how
+    /// much light there is; it does not say where the fittings are, and a reader checking a design
+    /// needs the layout that produced the numbers.
+    #[test]
+    fn the_layout_page_draws_the_room_and_its_fittings() {
+        let g = grid(6, 6);
+        let p = plane();
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        let lums: Vec<cad_light::Luminaire> = [(2.0_f32, 2.0_f32), (6.0, 2.0), (4.0, 4.5)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y))| cad_light::Luminaire {
+                id: i as u32 + 1,
+                profile: "P".into(),
+                position: cad_light::Vertex::new(x, y, 2.7),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            })
+            .collect();
+
+        let mut i = input(&g, &p);
+        i.rooms[0].poly = &poly;
+        i.rooms[0].fixtures = &lums;
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&i, &o);
+        let t = texts(&d);
+
+        assert!(t.iter().any(|s| s == "Lighting layout"), "no heading: {t:?}");
+        assert!(t.iter().any(|s| s.contains("3 fitting(s)")), "the count is missing: {t:?}");
+        // A marker per fitting.
+        let boxes = d.pages[0]
+            .items
+            .iter()
+            .filter(|x| matches!(x, Item::Frame { rgb, .. } if *rgb == [200, 150, 40]))
+            .count();
+        assert_eq!(boxes, 3, "expected a marker per fitting, got {boxes}");
+        // …and the outline, in red.
+        let outline = d.pages[0]
+            .items
+            .iter()
+            .filter(|x| matches!(x, Item::Line { rgb, .. } if *rgb == [190, 40, 40]))
+            .count();
+        assert!(outline >= 4, "the room outline has {outline} segments");
+    }
+
+    /// THE LAYOUT IS NOT UPSIDE DOWN. A plan reads with +y up and a page with +y down, so the
+    /// drawing has to be flipped once — and a layout printed upside down against its own result is
+    /// worse than no layout at all.
+    #[test]
+    fn the_layout_is_the_same_way_up_as_the_plan() {
+        let g = grid(4, 4);
+        let p = plane();
+        // One fitting near the plan's TOP (high y), one near the bottom.
+        let lums: Vec<cad_light::Luminaire> = [(4.0_f32, 5.5_f32), (4.0, 0.5)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y))| cad_light::Luminaire {
+                id: i as u32 + 1,
+                profile: "P".into(),
+                position: cad_light::Vertex::new(x, y, 2.7),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            })
+            .collect();
+        let mut i = input(&g, &p);
+        i.rooms[0].fixtures = &lums;
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Layout];
+        let d = layout(&i, &o);
+
+        // IN ITEM ORDER, not sorted — the markers are emitted in fixture order, so the first is
+        // the one at y = 5.5 m. Sorting them first made the comparison vacuous: two numbers put
+        // in order are always in order, whichever way up the drawing is.
+        let ys: Vec<f64> = d.pages[0]
+            .items
+            .iter()
+            .filter_map(|x| match x {
+                Item::Frame { y, rgb, .. } if *rgb == [200, 150, 40] => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ys.len(), 2);
+        // The fitting at y = 5.5 m is nearer the TOP of the plan, so nearer the top of the page —
+        // which is the SMALLER page y.
+        assert!(
+            ys[0] < ys[1],
+            "the fitting at y = 5.5 m printed at {:.1} and the one at y = 0.5 m at {:.1} — the \n             layout is mirrored vertically",
+            ys[0],
+            ys[1],
         );
     }
 
@@ -1311,49 +1733,6 @@ mod tests {
         assert!(!t.iter().any(|s| s.parse::<f64>().is_ok()), "values were printed anyway");
     }
 
-    /// THE SCALE IS THE REPORT'S DECISION, not the viewport's.
-    ///
-    /// Pinning the top changes the colours, and a report that ignored the setting would file a
-    /// picture drawn at a scale nobody chose.
-    #[test]
-    fn pinning_the_scale_changes_the_colours() {
-        let g = grid(4, 4);
-        let p = plane();
-        let mut o = opts();
-        o.cover = false;
-        o.sections = vec![Section::FalseColour];
-        o.scale = crate::report::options::Scale { top: None, bands: Vec::new() };
-        let auto = plot_cells(&layout(&input(&g, &p), &o), 4, 4);
-
-        o.scale = crate::report::options::Scale { top: Some(5000.0), bands: Vec::new() };
-        let d = layout(&input(&g, &p), &o);
-        let pinned = plot_cells(&d, 4, 4);
-        assert_eq!(auto.len(), pinned.len());
-
-        let fills = |d: &Doc| -> Vec<[u8; 3]> {
-            d.pages
-                .iter()
-                .flat_map(|p| p.items.iter())
-                .filter_map(|i| match i {
-                    Item::Rect { w, h, fill, .. } if (w - h).abs() < 1e-6 => Some(*fill),
-                    _ => None,
-                })
-                .collect()
-        };
-        let a = fills(&layout(
-            &input(&g, &p),
-            &Options {
-                scale: crate::report::options::Scale { top: None, bands: Vec::new() },
-                ..o.clone()
-            },
-        ));
-        let b = fills(&d);
-        assert_ne!(a, b, "pinning the top to 5000 lx left every colour unchanged");
-        assert!(
-            t_sum(&b) < t_sum(&a),
-            "a higher ceiling must push the same room DOWN the ramp, not up",
-        );
-    }
 
     /// Rough "how far up the ramp" — brighter ramp positions are lighter overall.
     fn t_sum(c: &[[u8; 3]]) -> u32 {
@@ -1368,7 +1747,7 @@ mod tests {
         let p = plane();
         let mut o = opts();
         o.cover = false;
-        o.sections = vec![Section::FalseColour];
+        o.sections = vec![Section::Results];
         o.scale = crate::report::options::Scale { top: Some(500.0), bands: vec![25.0, 100.0, 300.0] };
         let d = layout(&input(&g, &p), &o);
         let t = texts(&d);
@@ -1470,7 +1849,7 @@ mod tests {
         let mut o = opts();
         o.cover = false;
         // The plot fills two thirds of the page, so the grid starts near the bottom.
-        o.sections = vec![Section::FalseColour, Section::NumericGrid];
+        o.sections = vec![Section::Results, Section::NumericGrid];
         let t = texts(&layout(&input(&g, &p), &o));
         assert!(
             t.iter().any(|s| s == "Illuminance grid (lx)"),
@@ -1561,7 +1940,7 @@ mod tests {
         let p = plane();
         let mut o = opts();
         o.cover = false;
-        o.sections = vec![Section::Summary, Section::FalseColour];
+        o.sections = vec![Section::Summary, Section::Results];
         let mut i = input(&g, &p);
         i.rooms = vec![one_room(&g, &p, "Office"), one_room(&g, &p, "Store")];
         let d = layout(&i, &o);
@@ -1570,9 +1949,8 @@ mod tests {
         for name in ["Office", "Store"] {
             assert!(t.iter().any(|s| s == name), "no chapter for {name}: {t:?}");
         }
-        // Two plots, not one — a cell per point, twice.
-        let cells = plot_cells(&d, 6, 6);
-        assert_eq!(cells.len(), 6 * 6 * 2, "expected a plot per room, got {} cells", cells.len());
+        // TWO plots, not one — each room gets its own field, with its own frame around it.
+        assert_eq!(plot_frames(&d).len(), 2, "expected a plot per room");
         // …and two Summary headings, one under each chapter.
         assert_eq!(t.iter().filter(|s| *s == "Summary").count(), 2);
     }

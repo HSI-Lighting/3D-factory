@@ -61,7 +61,10 @@ pub enum Section {
     Installation,
     Materials,
     WorkingPlane,
-    FalseColour,
+    /// The lighting layout — the room and the fittings in it.
+    Layout,
+    /// The illuminance result, as a field.
+    Results,
     NumericGrid,
     Surfaces,
     /// What the room is lit WITH — manufacturer, catalogue number, load, per fitting type.
@@ -77,7 +80,8 @@ impl Section {
             Section::Installation => "Installation",
             Section::Materials => "Room & materials",
             Section::WorkingPlane => "Working plane",
-            Section::FalseColour => "Illuminance — false colour",
+            Section::Layout => "Lighting layout",
+            Section::Results => "Results — illuminance",
             Section::NumericGrid => "Illuminance grid (lx)",
             Section::Surfaces => "Surfaces",
             Section::Schedule => "Luminaire schedule",
@@ -92,7 +96,8 @@ impl Section {
             Section::Installation,
             Section::Materials,
             Section::WorkingPlane,
-            Section::FalseColour,
+            Section::Layout,
+            Section::Results,
             Section::Schedule,
             Section::Renders,
             Section::NumericGrid,

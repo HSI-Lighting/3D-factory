@@ -197,7 +197,7 @@ fn body(inp: &ReportInput, named: bool) -> String {
     // The scale is stated WITH the picture. A false-colour plot whose top is unstated says nothing:
     // the same room reads "mostly red" or "mostly blue" depending on a number in a menu.
     let top = inp.scale_top.max(1.0);
-    mark(&mut h, Section::FalseColour);
+    mark(&mut h, Section::Results);
     h.push_str("<h2>Illuminance — false colour</h2>");
     // NOT `.scroll` any more — the plot fits the page rather than running off it. See the CSS.
     h.push_str("<div class=\"fcwrap\"><table class=\"fc\">");

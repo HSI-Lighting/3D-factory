@@ -26455,6 +26455,8 @@ impl CadApp {
                 grid: &r.grid,
                 plane: &r.plane,
                 mask: &r.mask,
+                poly: &r.poly,
+                fixtures: &r.fixtures,
                 installation: r.installation.as_ref(),
                 cylindrical_avg: r.cylindrical_avg,
                 schedule: self.schedule_for(&r.fixtures),
@@ -61963,7 +61965,7 @@ mod the_report_is_asked_about_before_it_is_written {
         drop(inp);
 
         app.report_opts.set(crate::report::Section::NumericGrid, false);
-        app.report_opts.set(crate::report::Section::FalseColour, false);
+        app.report_opts.set(crate::report::Section::Results, false);
         let inp = app.report_input().expect("a calculation");
         let without = crate::report::layout::layout(&inp, &app.report_opts);
         assert!(
