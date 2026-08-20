@@ -116,8 +116,9 @@ pub const LOGO_H: f64 = 24.0;
 const TWO_THIRDS: f64 = 0.666;
 /// Height of the banded legend and its labels.
 const LEGEND_H: f64 = 46.0;
-/// Below this the grid's figures stop being numbers and become a texture.
-const MIN_GRID_PT: f64 = 3.2;
+/// The size the grid's figures are printed at when they fit — and the target the coarsening
+/// works back from. Below about five points a table of four-digit numbers stops being readable.
+const GRID_PT: f64 = 5.0;
 
 const MARGIN: f64 = 48.0;
 const HEAD_H: f64 = 34.0;
@@ -1069,64 +1070,78 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
     c.y += 4.0;
 }
 
-/// The numbers, on ONE page.
+/// The numbers, COARSENED to fit one page.
 ///
-/// "the illuminance grid comes in multiple pages. it should all be shown in a single page." A
-/// 70-column field was coming out as 23 pages of column blocks, which is not a table anybody reads.
+/// "for the illumination grid coarsen it. no need to have a millions points scale it so it fits
+/// the a4 size but make sure the report doesnt miss the main points."
 ///
-/// So the type is sized to the grid: whatever makes all of it fit the page, down to a floor. Below
-/// that floor it would be a grey texture rather than numbers, so the page says so and gives the
-/// figures that can still be read — the false-colour plot and the HTML report both carry the field.
+/// A 125 × 38 room is 4,750 values, which on A4 is 0.9 pt type — a grey texture, not numbers. So
+/// only every Nth point is printed, at a spacing chosen to land the type at a readable size.
+///
+/// DECIMATED, NOT AVERAGED. Every figure on the page is a real measured value at a real place, so
+/// a reader can go back to the model and find it. A block average would be a number that was never
+/// measured anywhere, and it would hide exactly what a lighting report is read for — the dark
+/// corner. The spacing is stated, and the true extremes are printed underneath with their
+/// coordinates, so nothing that decides whether the room passes can fall between the printed
+/// points.
 fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
     let g = room.grid;
-    if g.cols == 0 || g.rows == 0 {
+    let (gc, gr) = (g.cols as usize, g.rows as usize);
+    if gc == 0 || gr == 0 {
         return;
     }
-    let cols = g.cols as f64;
-    let rows = g.rows as f64;
     let avail_w = c.width();
     // MEASURED AGAINST A WHOLE PAGE, not against what is left of this one. The grid gets a fresh
     // page if it needs one, so sizing it to the tail end of the previous page would reject a table
     // that fits perfectly well.
-    let full_h = c.bottom - c.top - 30.0;
+    let full_h = c.bottom - c.top - 60.0;
 
-    // The widest figure decides the column, and four digits is the practical worst case.
-    let size = (avail_w / (cols * 4.6)).min(full_h / (rows * 1.45));
+    // The smallest stride that lands the type at a readable size. Stride 1 is the whole grid.
+    let mut stride = 1usize;
+    let (mut cols, mut rows, mut size) = (gc, gr, 0.0_f64);
+    loop {
+        cols = gc.div_ceil(stride);
+        rows = gr.div_ceil(stride);
+        size = (avail_w / (cols as f64 * 4.6)).min(full_h / (rows as f64 * 1.45));
+        if size >= GRID_PT || (cols <= 2 && rows <= 2) {
+            break;
+        }
+        stride += 1;
+    }
+    // Never smaller than the type this report will set, even at the coarsest useful stride.
+    let size = size.min(9.0);
 
-    // DECIDED BEFORE ANYTHING IS PUT DOWN.
-    //
-    // This used to print the heading first and then discover the grid was unprintable, so an
-    // apology got a page of its own with 700 points of white under it. Reported as "the
-    // illumination grid is show empty page". A section that has nothing to say says it in one
-    // line, where the reader already is.
-    if size < MIN_GRID_PT {
+    c.need_or_break(46.0 + rows as f64 * size * 1.45);
+    c.heading("Illuminance grid (lx)");
+    if stride > 1 {
+        let (dx, dy) = (
+            room.plane.width as f64 / gc as f64 * stride as f64,
+            room.plane.depth as f64 / gr as f64 * stride as f64,
+        );
         c.note(&format!(
-            "Illuminance grid: {} × {} = {} values. At one page that is {:.1} pt type, below the \
-             {MIN_GRID_PT:.0} pt this report will set — the false-colour plot above carries the \
-             same field, and the HTML report prints every value at a size a screen can zoom.",
-            g.cols,
-            g.rows,
-            g.values.len(),
-            size,
+            "Every {}{} point of the {} × {} grid — {:.2} × {:.2} m spacing. Measured values, not \
+             averages; the extremes below are over the WHOLE grid.",
+            stride,
+            ordinal(stride),
+            gc,
+            gr,
+            dx,
+            dy,
         ));
-        return;
+        c.y += 4.0;
     }
 
-    // It fits — but it needs the room. Take a fresh page rather than start it in a corner.
-    c.need_or_break(30.0 + rows * size * 1.45);
-    c.heading("Illuminance grid (lx)");
-
-    let colw = avail_w / cols;
+    let colw = avail_w / cols as f64;
     let rowh = size * 1.45;
     let y0 = c.y;
-    for r in 0..g.rows as usize {
-        for col in 0..g.cols as usize {
-            let i = r * g.cols as usize + col;
+    for (rr, r) in (0..gr).step_by(stride).enumerate() {
+        for (cc, col) in (0..gc).step_by(stride).enumerate() {
+            let i = r * gc + col;
             let Some(v) = g.values.get(i) else { continue };
             let inside = room.mask.get(i).copied().unwrap_or(true);
             c.push(Item::Text {
-                x: c.left + (col as f64 + 1.0) * colw - colw * 0.12,
-                y: y0 + (r as f64 + 1.0) * rowh,
+                x: c.left + (cc as f64 + 1.0) * colw - colw * 0.12,
+                y: y0 + (rr as f64 + 1.0) * rowh,
                 size,
                 font: Font::Regular,
                 rgb: if inside { INK } else { [190, 190, 190] },
@@ -1135,9 +1150,56 @@ fn numeric_grid(c: &mut Cursor, room: &RoomInput) {
             });
         }
     }
-    c.y = y0 + rows * rowh + 6.0;
+    c.y = y0 + rows as f64 * rowh + 6.0;
+
+    // THE MAIN POINTS, whether or not they were printed above. A decimated grid can step straight
+    // over the darkest point in the room, and that point is the one the whole report is read for.
+    extremes(c, room);
 }
 
+/// `1st`, `2nd`, `3rd`, `4th` — the suffix, given the number.
+fn ordinal(n: usize) -> &'static str {
+    match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    }
+}
+
+/// Where the darkest and brightest points actually are.
+fn extremes(c: &mut Cursor, room: &RoomInput) {
+    let g = room.grid;
+    let (gc, gr) = (g.cols as usize, g.rows as usize);
+    let p = room.plane;
+    let inside = |i: usize| room.mask.get(i).copied().unwrap_or(true);
+    let at = |i: usize| -> (f64, f64) {
+        let (cx, cy) = (i % gc, i / gc);
+        (
+            p.origin.x as f64 + (cx as f64 + 0.5) * (p.width as f64 / gc as f64),
+            p.origin.y as f64 + (cy as f64 + 0.5) * (p.depth as f64 / gr as f64),
+        )
+    };
+    let mut lo: Option<(usize, f64)> = None;
+    let mut hi: Option<(usize, f64)> = None;
+    for (i, v) in g.values.iter().enumerate() {
+        if !inside(i) {
+            continue;
+        }
+        if lo.is_none_or(|(_, b)| *v < b) {
+            lo = Some((i, *v));
+        }
+        if hi.is_none_or(|(_, b)| *v > b) {
+            hi = Some((i, *v));
+        }
+    }
+    let (Some((li, lv)), Some((hi_i, hv))) = (lo, hi) else { return };
+    let (lx, ly) = at(li);
+    let (hx, hy) = at(hi_i);
+    c.row("Minimum over the whole grid", &format!("{lv:.0} lx at ({lx:.2}, {ly:.2}) m"));
+    c.row("Maximum over the whole grid", &format!("{hv:.0} lx at ({hx:.2}, {hy:.2}) m"));
+}
 
 fn surfaces(c: &mut Cursor, inp: &Input) {
     if inp.surfaces.is_empty() {
@@ -1713,25 +1775,6 @@ mod tests {
         }
     }
 
-    /// A GRID TOO BIG TO READ SAYS SO rather than printing a grey texture or spilling over.
-    #[test]
-    fn an_unprintable_grid_explains_itself() {
-        let g = grid(200, 200);
-        let p = plane();
-        let mut o = opts();
-        o.cover = false;
-        o.page_numbers = false;
-        o.sections = vec![Section::NumericGrid];
-        let d = layout(&input(&g, &p), &o);
-        assert_eq!(d.pages.len(), 1, "it must not paginate its way out of this");
-        let t = texts(&d);
-        assert!(
-            t.iter().any(|s| s.contains("pt") && s.contains("200")),
-            "the page must state the size and why it was left out: {t:?}",
-        );
-        // …and nothing was printed as a texture.
-        assert!(!t.iter().any(|s| s.parse::<f64>().is_ok()), "values were printed anyway");
-    }
 
 
     /// Rough "how far up the ramp" — brighter ramp positions are lighter overall.
@@ -1794,46 +1837,133 @@ mod tests {
 
 
 
-    /// AN UNPRINTABLE GRID DOES NOT COST A PAGE.
+    /// A HUGE GRID IS COARSENED, not dropped and not spread over pages.
     ///
-    /// Reported as "the illumination grid is show empty page": the heading went down first, the
-    /// grid then turned out to be unprintable, and the apology got a page of its own with 700
-    /// points of white under it. The decision has to come before anything is put on the page.
+    /// "for the illumination grid coarsen it. no need to have a millions points scale it so it
+    /// fits the a4 size but make sure the report doesnt miss the main points." A 125 × 38 room is
+    /// 4,750 values — 0.9 pt type on A4, which is a grey texture rather than numbers.
     #[test]
-    fn an_unprintable_grid_costs_no_page_and_no_heading() {
-        let g = grid(125, 38); // the owner's Room 1 — 4,750 values
+    fn a_huge_grid_is_coarsened_onto_one_page() {
+        let g = grid(125, 38);
         let p = plane();
         let mut o = opts();
         o.cover = false;
         o.page_numbers = false;
-        o.sections = vec![Section::Summary, Section::NumericGrid];
+        o.sections = vec![Section::NumericGrid];
         let d = layout(&input(&g, &p), &o);
 
-        assert_eq!(d.pages.len(), 1, "the note took {} pages", d.pages.len());
+        assert_eq!(d.pages.len(), 1, "the grid took {} pages", d.pages.len());
         let t = texts(&d);
+        assert!(t.iter().any(|s| s == "Illuminance grid (lx)"), "the section went missing: {t:?}");
         assert!(
-            !t.iter().any(|s| s == "Illuminance grid (lx)"),
-            "a heading was printed over a section with nothing under it: {t:?}",
+            t.iter().any(|s| s.contains("point of the 125 × 38 grid") && s.contains("spacing")),
+            "the page must say what spacing it printed at: {t:?}",
         );
-        assert!(
-            t.iter().any(|s| s.contains("125") && s.contains("pt")),
-            "the note must still say what was left out and why: {t:?}",
-        );
+        // Coarsened, so far fewer figures than the grid holds — but not none.
+        let numbers = t.iter().filter(|s| s.parse::<f64>().is_ok()).count();
+        assert!(numbers > 20, "only {numbers} figures were printed");
+        assert!(numbers < 4750 / 4, "{numbers} figures is not a coarsened grid");
     }
 
-    /// A GRID THAT FITS IS STILL PRINTED, and still gets its heading. The fix must not have turned
-    /// the section off.
+    /// A GRID THAT FITS IS NOT COARSENED, and says nothing about spacing — every point is there.
     #[test]
-    fn a_grid_that_fits_is_printed_with_its_heading() {
+    fn a_small_grid_is_printed_whole() {
         let g = grid(10, 10);
         let p = plane();
         let mut o = opts();
         o.cover = false;
         o.sections = vec![Section::NumericGrid];
         let t = texts(&layout(&input(&g, &p), &o));
-        assert!(t.iter().any(|s| s == "Illuminance grid (lx)"), "the heading went missing");
+        assert!(t.iter().any(|s| s == "Illuminance grid (lx)"));
+        assert!(
+            !t.iter().any(|s| s.contains("spacing")),
+            "a grid that fits must not claim to have been coarsened: {t:?}",
+        );
         let numbers = t.iter().filter(|s| s.parse::<f64>().is_ok()).count();
         assert!(numbers >= 100, "only {numbers} of 100 values were printed");
+    }
+
+    /// THE EXTREMES ARE OVER THE WHOLE GRID, not over what was printed.
+    ///
+    /// This is the "does not miss the main points" guarantee. Decimation steps over points, and
+    /// the one it steps over may be the darkest in the room — which is the figure the whole report
+    /// is read for. So the true minimum and maximum are stated with their coordinates, whether or
+    /// not they were among the printed ones.
+    #[test]
+    fn the_true_extremes_are_reported_even_when_decimation_skips_them() {
+        // A flat field with ONE dark point, placed so a stride of 2 or more steps over it.
+        let (cols, rows) = (60u32, 40u32);
+        let mut vals = vec![300.0_f64; (cols * rows) as usize];
+        let dark_at = (13 * cols + 27) as usize; // odd row, odd column
+        vals[dark_at] = 7.0;
+        let bright_at = (21 * cols + 35) as usize;
+        vals[bright_at] = 990.0;
+        let g = LuxGrid {
+            cols,
+            rows,
+            values: vals,
+            min: 7.0,
+            max: 990.0,
+            avg: 300.0,
+            maintenance: 1.0,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        };
+        let p = CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 60.0,
+            depth: 40.0,
+            cols,
+            rows,
+        };
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::NumericGrid];
+        let d = layout(&input(&g, &p), &o);
+        let t = texts(&d);
+
+        assert!(
+            t.iter().any(|s| s.contains("spacing")),
+            "precondition: this grid must have been coarsened",
+        );
+        assert!(
+            !t.iter().any(|s| s == "7"),
+            "precondition: the dark point must have been stepped over by the decimation",
+        );
+        assert!(t.iter().any(|s| s.contains("Minimum over the whole grid")), "no minimum: {t:?}");
+        assert!(
+            t.iter().any(|s| s.starts_with("7 lx at (")),
+            "the true minimum is missing — the report stepped over the darkest point: {t:?}",
+        );
+        assert!(
+            t.iter().any(|s| s.starts_with("990 lx at (")),
+            "the true maximum is missing: {t:?}",
+        );
+        // …and the coordinates are the real ones: column 27 of 60 across 60 m is 27.5 m.
+        assert!(
+            t.iter().any(|s| s.contains("(27.50, 13.50) m")),
+            "the minimum is reported at the wrong place: {t:?}",
+        );
+    }
+
+    /// A MASKED POINT IS NOT AN EXTREME. The darkest cell of the rectangle may be outside the room
+    /// entirely, and reporting it would state a minimum on ground the room does not occupy.
+    #[test]
+    fn the_extremes_ignore_ground_outside_the_room() {
+        let g = grid(2, 1);
+        let p = plane();
+        let mut i = input(&g, &p);
+        i.rooms[0].mask = &[true, false];
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::NumericGrid];
+        let t = texts(&layout(&i, &o));
+        // Values are 100 and 150; the second is outside, so both extremes are 100.
+        assert!(t.iter().any(|s| s.starts_with("100 lx at (")), "the minimum is wrong: {t:?}");
+        assert!(
+            !t.iter().any(|s| s.starts_with("150 lx at (")),
+            "a point outside the room was reported as the maximum: {t:?}",
+        );
     }
 
     /// THE GRID IS SIZED AGAINST A WHOLE PAGE, not the tail of the previous one.

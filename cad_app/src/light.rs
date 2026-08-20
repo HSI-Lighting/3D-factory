@@ -386,6 +386,227 @@ pub struct RoomLayer {
 }
 
 
+
+/// How far a calculation has got, shared with whoever is watching it.
+///
+/// A LIGHTING CALCULATION TAKES MINUTES on a real building, and it ran on the UI thread — so the
+/// window stopped repainting, Windows greyed it out and wrote "Not Responding" in the title bar,
+/// and the only honest reading from outside was that the app had crashed. It is the same fault the
+/// phase timings were added for, one level up: the work is fine, there was simply no way to see it
+/// happening.
+#[derive(Default)]
+pub struct CalcProgress {
+    pub done: std::sync::atomic::AtomicU32,
+    pub total: std::sync::atomic::AtomicU32,
+    pub phase: std::sync::Mutex<String>,
+    /// Set by the UI to ask the worker to stop. Checked between rooms — a job you cannot stop is
+    /// not much better than one that freezes the window.
+    pub cancel: std::sync::atomic::AtomicBool,
+}
+
+impl CalcProgress {
+    fn step(&self, phase: &str) {
+        use std::sync::atomic::Ordering;
+        self.done.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut p) = self.phase.lock() {
+            p.clear();
+            p.push_str(phase);
+        }
+    }
+    pub fn fraction(&self) -> f32 {
+        use std::sync::atomic::Ordering;
+        let t = self.total.load(Ordering::Relaxed).max(1);
+        (self.done.load(Ordering::Relaxed) as f32 / t as f32).clamp(0.0, 1.0)
+    }
+    pub fn label(&self) -> String {
+        self.phase.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Everything a calculation needs, OWNED — so it can cross a thread.
+///
+/// Split out so the expensive part touches no `&self`: the app hands this to a worker and keeps
+/// painting. Building it is cheap (it clones a handful of tables and the scene triangles it was
+/// going to build anyway); running it is the minutes.
+pub struct CalcJob {
+    meshes: Vec<Mesh>,
+    lums: Vec<Luminaire>,
+    profiles: HashMap<String, IesProfile>,
+    materials: Vec<Material>,
+    settings: RaySettings,
+    maintenance: Maintenance,
+    /// One per room: `(name, footprint)`. A project with no rooms has one unnamed target.
+    targets: Vec<(String, Vec<glam::Vec2>)>,
+    /// The whole-model bounds, for a target with no footprint.
+    fallback: (f32, f32, f32, f32),
+    cell_size: f32,
+    plane_height: f32,
+    eye_height: f32,
+    wall_zone: f32,
+    scene_tris: usize,
+}
+
+/// What a calculation produced.
+pub struct CalcOutcome {
+    pub rooms: Vec<RoomResult>,
+    pub surfaces: Vec<cad_light::SurfaceResult>,
+    pub meshes: Vec<Mesh>,
+    pub timings: Vec<(&'static str, f64)>,
+    /// True when the worker was asked to stop and did.
+    pub cancelled: bool,
+}
+
+impl CalcJob {
+    /// How many steps [`run`](Self::run) will report.
+    pub fn steps(&self) -> u32 {
+        // The evaluator, then three phases per room, then the surfaces.
+        1 + self.targets.len() as u32 * 3 + 1
+    }
+
+    fn inset_bounds(&self, b: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let z = self.wall_zone.max(0.0);
+        let (x0, y0, x1, y1) = b;
+        if x1 - x0 <= 2.0 * z || y1 - y0 <= 2.0 * z {
+            return b;
+        }
+        (x0 + z, y0 + z, x1 - z, y1 - z)
+    }
+
+    /// THE WORK. No `&self` on the app, no UI, no borrows — this is what runs on the worker.
+    pub fn run(self, p: &CalcProgress) -> CalcOutcome {
+        use std::sync::atomic::Ordering;
+        p.total.store(self.steps(), Ordering::Relaxed);
+        let mut timings: Vec<(&'static str, f64)> = Vec::new();
+        let mut t = std::time::Instant::now();
+
+        // ONE EVALUATOR, EVERY ROOM. Building it builds a BVH over the whole scene, and light
+        // crosses between rooms through openings — so the rooms are separate questions about one
+        // scene rather than separate scenes.
+        p.step("Building the scene");
+        let ev = cad_light::Evaluator::new(
+            &self.meshes,
+            &self.lums,
+            &self.profiles,
+            &self.materials,
+            self.settings,
+            self.maintenance,
+        );
+        timings.push(("evaluator", t.elapsed().as_secs_f64() * 1000.0));
+        t = std::time::Instant::now();
+
+        let mut rooms = Vec::with_capacity(self.targets.len());
+        for (i, (name, poly)) in self.targets.iter().enumerate() {
+            if p.cancelled() {
+                return CalcOutcome {
+                    rooms,
+                    surfaces: Vec::new(),
+                    meshes: self.meshes,
+                    timings,
+                    cancelled: true,
+                };
+            }
+            let label = if name.is_empty() {
+                format!("Calculating ({} of {})", i + 1, self.targets.len())
+            } else {
+                format!("{name} ({} of {})", i + 1, self.targets.len())
+            };
+            rooms.push(self.room_result(&ev, name, poly, p, &label));
+        }
+        timings.push(("grids", t.elapsed().as_secs_f64() * 1000.0));
+        t = std::time::Instant::now();
+
+        p.step("Room surfaces");
+        let surfaces =
+            cad_light::surface_report_on(&ev, &self.meshes, &self.lums, &self.materials, 1.0);
+        timings.push(("surfaces", t.elapsed().as_secs_f64() * 1000.0));
+        timings.push(("scene_tris", self.scene_tris as f64));
+
+        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false }
+    }
+
+    /// Everything about ONE room, from an evaluator already built over the whole scene.
+    fn room_result(
+        &self,
+        ev: &cad_light::Evaluator,
+        name: &str,
+        poly: &[glam::Vec2],
+        p: &CalcProgress,
+        label: &str,
+    ) -> RoomResult {
+        let (min_x, min_y, max_x, max_y) =
+            if poly.len() >= 3 { self.inset_bounds(poly_bounds(poly)) } else { self.fallback };
+        let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
+        let (cols, rows) = LightState::grid_for(w, d, self.cell_size);
+        let grid_note = LightState::grid_note_for(w, d, self.cell_size, cols, rows);
+        let plane = CalcPlane {
+            origin: Vertex::new(min_x, min_y, self.plane_height),
+            width: w,
+            depth: d,
+            cols,
+            rows,
+        };
+
+        p.step(&format!("{label} — working plane"));
+        let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
+        // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
+        // this changes nothing — which is every case the engine is validated on.
+        let mask = if poly.len() >= 3 { LightState::inside_mask(&plane, poly) } else { Vec::new() };
+        if !mask.is_empty() {
+            LightState::apply_room_mask(&mut grid, &mask);
+        }
+
+        p.step(&format!("{label} — EN 12464-1 grid"));
+        let plane_en = plane.on_standard_grid();
+        let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
+        if poly.len() >= 3 {
+            let mask_en = LightState::inside_mask(&plane_en, poly);
+            if !mask_en.is_empty() {
+                LightState::apply_room_mask(&mut grid_en, &mask_en);
+            }
+        }
+
+        // Mean cylindrical illuminance at eye height, on a coarse sub-grid — every point costs 24
+        // azimuth evaluations, so measuring it at the work plane's resolution would multiply the
+        // calculation by twenty-four to refine one room-average figure.
+        p.step(&format!("{label} — cylindrical"));
+        let cylindrical_avg = {
+            const N: u32 = 12;
+            let mut sum = 0.0;
+            for r in 0..N {
+                for c in 0..N {
+                    let x = min_x + w * (c as f32 + 0.5) / N as f32;
+                    let y = min_y + d * (r as f32 + 0.5) / N as f32;
+                    sum += ev.cylindrical(glam::Vec3::new(x, y, self.eye_height));
+                }
+            }
+            Some(sum / (N * N) as f64)
+        };
+
+        // THE ROOM'S OWN FITTINGS, and its own load. A power density taken over every fitting in
+        // the building and divided by one room's floor is not a figure about anything.
+        let fixtures = LightState::fixtures_in(poly, &self.lums);
+        let installation =
+            Some(installation_summary(&fixtures, &self.profiles, (w * d) as f64));
+
+        RoomResult {
+            name: name.to_string(),
+            poly: poly.to_vec(),
+            plane,
+            grid,
+            mask,
+            plane_en,
+            grid_en,
+            cylindrical_avg,
+            installation,
+            fixtures,
+            grid_note,
+        }
+    }
+}
+
 /// One room's answer, whole.
 ///
 /// A CALCULATION USED TO PRODUCE ONE OF THESE and the app held it in loose fields. With two rooms
@@ -1808,16 +2029,23 @@ impl LightState {
     /// and names both numbers in the case that matters: what was requested, and what was used.
     pub fn grid_note(&self, w: f32, d: f32) -> Option<String> {
         let (cols, rows) = Self::grid_for(w, d, self.cell_size);
+        Self::grid_note_for(w, d, self.cell_size, cols, rows)
+    }
+
+    /// The same, from plain numbers — so the worker can ask without a `LightState` to hand.
+    pub fn grid_note_for(w: f32, d: f32, cell_size: f32, cols: u32, rows: u32) -> Option<String> {
+        let self_cell_size = cell_size;
         let (sx, sy) = (w / cols as f32, d / rows as f32);
         let used = sx.max(sy);
         // A fifth of a cell — comfortably past rounding a room's extent onto a whole number of
         // cells, and well short of the doubling this exists to report.
-        if (used - self.cell_size).abs() <= self.cell_size * 0.2 {
+        if (used - self_cell_size).abs() <= self_cell_size * 0.2 {
             return None;
         }
         Some(format!(
             "grid coarsened to {used:.2} m from the {:.2} m asked for — {} points is the limit",
-            self.cell_size, Self::MAX_GRID_POINTS,
+            self_cell_size,
+            Self::MAX_GRID_POINTS,
         ))
     }
 
@@ -1835,62 +2063,59 @@ impl LightState {
         }
     }
 
-    pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
+    /// Gather everything a calculation needs, on the UI thread, cheaply.
+    ///
+    /// `None` when there is nothing to calculate — and `last_msg` says so.
+    ///
+    /// THE EXPENSIVE PART IS NOT HERE. This builds the scene triangles and copies a handful of
+    /// tables; [`CalcJob::run`] does the minutes of ray tracing, and it takes no borrow on the app
+    /// so it can do them on another thread while the window keeps painting.
+    pub fn prepare(
+        &mut self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> Option<CalcJob> {
         self.last_timings.clear();
-        let t_phase = std::time::Instant::now();
         let meshes = self.scene_meshes(doc, factory);
         let scene_tris: usize = meshes.iter().map(|m| m.triangles.len()).sum();
         if std::env::var_os("SIMLUX_PHASE_LOG").is_some() {
             eprintln!("  [phase] scene is {scene_tris} triangles");
         }
-        self.note_phase("scene", t_phase);
-        // The calculation plane must cover whatever is actually being lit. With a 3D model that is
-        // the MODEL's footprint, which need not match the 2D drawing's at all — a plan carries
-        // dimensions, notes and title blocks that are not part of the building, and a building can
-        // sit anywhere relative to them.
+
         // THE ROOM INTERIOR, NOT THE BUILDING'S BOUNDING BOX.
         //
         // Reported as: "is [it] also calculating for the solid wall (the thickness i.e) becasue i
         // see the pseuso colors there too." It was. The plane spanned `mesh_bbox` — outer wall face
         // to outer wall face — so points buried in the wall thickness, and outside the building
         // altogether on a non-rectangular plan, were computed, painted and counted in Ē and U₀.
-        // They read near zero, being inside solid material, which drags the average down and makes
-        // uniformity meaningless: U₀'s minimum was a point inside a wall.
-        //
-        // Be exact about what this did and did not undermine. The ENGINE is validated — the
-        // identical-room tests build their own plane, inset by DIALux's stated 0.010 m wall zone.
-        // What was never validated is the APP's placement of it. That is the gap this closes.
         //
         // `mesh_bbox` stays as the fallback for a 2D-only project, which has no rooms to ask about.
-        let room_poly = factory.and_then(Self::calc_room_polygon);
-        let bounds = room_poly
-            .as_ref()
-            .map(|p| self.inset_bounds(poly_bounds(p)))
-            .or_else(|| if meshes.is_empty() { None } else { mesh_bbox(&meshes) });
-        let Some((min_x, min_y, max_x, max_y)) = bounds.or_else(|| bbox(doc)) else {
+        let targets = Self::calc_targets(factory);
+        let any_room = targets.iter().any(|(_, p)| p.len() >= 3);
+        let bounds = if any_room {
+            // Every room has its own footprint; the fallback is only for a target without one.
+            mesh_bbox(&meshes).or_else(|| bbox(doc))
+        } else {
+            (if meshes.is_empty() { None } else { mesh_bbox(&meshes) }).or_else(|| bbox(doc))
+        };
+        let Some(fallback) = bounds else {
             self.grid = None;
             self.plane = None;
-            self.last_msg = "No geometry — draw a closed room, or build one in the 3D Factory."
-                .to_string();
-            return;
+            self.rooms.clear();
+            self.last_msg =
+                "No geometry — draw a closed room, or build one in the 3D Factory.".to_string();
+            return None;
         };
-        let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
-        let (cols, rows) = Self::grid_for(w, d, self.cell_size);
-        let grid_note = self.grid_note(w, d);
-        let plane = CalcPlane {
-            origin: Vertex::new(min_x, min_y, self.plane_height),
-            width: w,
-            depth: d,
-            cols,
-            rows,
-        };
+
         // Lights the MODEL carries — a curved light is a real fitting, not a glowing texture.
         // Derived here rather than stored, so moving or deleting the fixture takes its light along.
+        // This also INSERTS their profiles, which is why it happens on the UI thread.
         let generated = match factory {
             Some(f) => self.generated_luminaires(f),
             None => Vec::new(),
         };
         let lums = if self.luminaires.is_empty() && generated.is_empty() && self.auto_center_light {
+            let (min_x, min_y, max_x, max_y) = fallback;
             vec![Luminaire {
                 id: 1,
                 // A stand-in light needs a real profile behind it or the "first look" it exists to
@@ -1900,7 +2125,11 @@ impl LightState {
                 } else {
                     BUILTIN.to_string()
                 },
-                position: Vertex::new(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), self.room_height),
+                position: Vertex::new(
+                    0.5 * (min_x + max_x),
+                    0.5 * (min_y + max_y),
+                    self.room_height,
+                ),
                 rotation_deg: 0.0,
                 dimming: 1.0,
                 watts_override: None,
@@ -1912,71 +2141,43 @@ impl LightState {
             v.extend(generated);
             v
         };
-        // ONE EVALUATOR, FOUR QUESTIONS. Building it builds a BVH, and on the owner's real project
-        // that is 1.9 s over seven million triangles — against 1.9 s for the grid it exists to
-        // sample. The work plane, the EN 12464-1 plane, cylindrical illuminance and the room
-        // surfaces are four questions about ONE scene, and each used to build its own tree, so
-        // most of an 8.5 s calculation went on constructing the same thing four times.
-        //
-        // `Evaluator`'s own note has said so since it was written: "none of them should rebuild
-        // the BVH — hence a reusable evaluator rather than a function per metric."
-        //
-        // The two tables are CLONED rather than borrowed off `self`, so the evaluator does not
-        // hold a borrow on the whole state for the rest of the calculation — which would stop it
-        // recording its own timings. A handful of photometric profiles and four materials, once
-        // per calculation, against a tree over seven million triangles.
-        let t_phase = std::time::Instant::now();
-        let profiles = self.profiles.clone();
-        let materials = self.materials.clone();
-        let ev = cad_light::Evaluator::new(
-            &meshes, &lums, &profiles, &materials, self.settings, self.maintenance,
-        );
-        self.note_phase("evaluator", t_phase);
 
-        // EVERY ROOM, from the one evaluator.
-        let t_phase = std::time::Instant::now();
-        let targets = Self::calc_targets(factory);
-        let mut results: Vec<RoomResult> = targets
-            .iter()
-            .map(|(name, poly)| {
-                self.room_result(&ev, &lums, name, poly, (min_x, min_y, max_x, max_y))
-            })
-            .collect();
-        self.note_phase("grid", t_phase);
+        Some(CalcJob {
+            meshes,
+            lums,
+            profiles: self.profiles.clone(),
+            materials: self.materials.clone(),
+            settings: self.settings,
+            maintenance: self.maintenance,
+            targets,
+            fallback,
+            cell_size: self.cell_size,
+            plane_height: self.plane_height,
+            eye_height: self.eye_height,
+            wall_zone: self.wall_zone,
+            scene_tris,
+        })
+    }
 
-        // ROOM SURFACES — walls and ceiling, which EN 12464-1 sets levels for and which the work
-        // plane says nothing about.
-        //
-        // OVER THE WHOLE MODEL, once. `surface_report_on` groups by MATERIAL, not by room, so
-        // there is no per-room answer to be had from it — the ceiling of a two-room building is one
-        // ceiling as far as the material table is concerned. Reported as its own section rather
-        // than repeated under each room, which would state the same building-wide figure twice as
-        // though it were two measurements.
-        let t_phase = std::time::Instant::now();
-        self.surfaces = cad_light::surface_report_on(&ev, &meshes, &lums, &self.materials, 1.0);
-        self.note_phase("surfaces", t_phase);
-        self.last_timings.push(("scene_tris", scene_tris as f64));
+    /// Take the results of a finished job.
+    ///
+    /// `selected` is the room whose geometry the user had selected, if any — the panel shows that
+    /// one, which is the gesture people already have. It does not decide what was calculated.
+    pub fn apply_outcome(&mut self, out: CalcOutcome, selected: Option<usize>) {
+        if out.cancelled {
+            self.last_msg = "Calculation stopped.".into();
+            self.meshes = out.meshes;
+            return;
+        }
+        let mut results = out.rooms;
+        if results.is_empty() {
+            self.last_msg = "Nothing to calculate.".into();
+            return;
+        }
+        self.surfaces = out.surfaces;
+        self.last_timings = out.timings;
 
-        // THE PRIMARY RESULT is what the single-room panel, the 3D view and the overlay legend all
-        // read. The room whose geometry is selected, else the first — so clicking a room and
-        // pressing Calculate still puts that room in the panel, which is the gesture people have.
-        let primary = factory
-            .and_then(|f| {
-                results.iter().position(|r| {
-                    f.rooms.iter().any(|room| {
-                        room.name.trim() == r.name.trim()
-                            && room
-                                .floor
-                                .iter()
-                                .chain(room.ceiling.iter())
-                                .chain(room.walls.iter())
-                                .chain(room.carve.iter())
-                                .any(|id| f.selection.contains(id))
-                    })
-                })
-            })
-            .unwrap_or(0);
-
+        let primary = selected.filter(|i| *i < results.len()).unwrap_or(0);
         let waiting = self.unassigned_count();
         let p = &results[primary];
         self.last_msg = if results.len() > 1 {
@@ -2027,7 +2228,7 @@ impl LightState {
         results.insert(primary, p);
         self.rooms = results;
 
-        self.meshes = meshes;
+        self.meshes = out.meshes;
         self.show_overlay = true;
 
         // Fit the orbit camera to everything calculated, not to one room of it.
@@ -2045,6 +2246,38 @@ impl LightState {
             .fold(0.0_f32, f32::max);
         let diag = (span * span + self.room_height * self.room_height).sqrt();
         self.cam_dist = (diag * 1.3).max(3.0);
+    }
+
+    /// Which room the user had selected, as an index into the targets — the one the panel shows.
+    pub fn selected_room(f: Option<&crate::factory::FactoryState>) -> Option<usize> {
+        let f = f?;
+        // BY INDEX, built the same way `calc_targets` builds them — same filter, same order.
+        // Matching on the NAME instead is a trap: two rooms may share one, and an unnamed room is
+        // called "Room 3" by its position, which is the very thing being looked up.
+        f.rooms
+            .iter()
+            .filter(|r| r.footprint.len() >= 3)
+            .position(|room| {
+                room.floor
+                    .iter()
+                    .chain(room.ceiling.iter())
+                    .chain(room.walls.iter())
+                    .chain(room.carve.iter())
+                    .any(|id| f.selection.contains(id))
+            })
+    }
+
+    /// Calculate here and now, blocking until it is done.
+    ///
+    /// The app runs this on a worker instead — see `prepare` / `CalcJob::run` / `apply_outcome`.
+    /// It stays because a test wants an answer, not a thread, and because keeping one path that
+    /// does the whole thing is what makes the threaded one checkable against it.
+    pub fn calculate(&mut self, doc: &Document, factory: Option<&crate::factory::FactoryState>) {
+        let Some(job) = self.prepare(doc, factory) else { return };
+        let progress = CalcProgress::default();
+        let out = job.run(&progress);
+        let selected = Self::selected_room(factory);
+        self.apply_outcome(out, selected);
     }
 
     /// SIMLUX workspace live sync: extrude the current room (imported per-layer
@@ -5326,5 +5559,180 @@ mod every_room_is_calculated {
         s.calculate(&doc, None);
         assert_eq!(s.rooms.len(), 1);
         assert!(s.grid.is_some(), "the primary result is still filled in");
+    }
+}
+
+/// THE CALCULATION RUNS OFF THE UI THREAD.
+///
+/// "while calculating the app stops responding for sometime and everything freezes." It ran on the
+/// UI thread, so the window stopped repainting, Windows greyed it out and wrote "Not Responding" —
+/// and from outside, a calculation working perfectly and a crash look identical.
+#[cfg(test)]
+mod the_calculation_can_leave_the_ui_thread {
+    use super::*;
+
+    fn room() -> (crate::factory::FactoryState, LightState) {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(6.0, 0.0),
+            glam::Vec2::new(6.0, 5.0),
+            glam::Vec2::new(0.0, 5.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.5;
+        s.luminaires.push(Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(3.0, 2.5, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        (f, s)
+    }
+
+    /// THE JOB IS `Send` — which is the whole point, and the one thing a compile can prove. If it
+    /// ever picks up a borrow on the app or an `Rc`, this stops building.
+    #[test]
+    fn a_job_can_cross_a_thread_and_come_back() {
+        let (f, mut s) = room();
+        let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
+        let p = std::sync::Arc::new(CalcProgress::default());
+        let p2 = p.clone();
+        let out = std::thread::spawn(move || job.run(&p2)).join().expect("the worker must finish");
+
+        assert!(!out.cancelled);
+        assert_eq!(out.rooms.len(), 1);
+        assert!(out.rooms[0].grid.avg > 1.0, "the room came back unlit");
+
+        // …and the answer is the same one the blocking path gives.
+        let (f2, mut s2) = room();
+        s2.calculate(&Document::default(), Some(&f2));
+        s.apply_outcome(out, None);
+        let a = s.grid.as_ref().expect("threaded grid");
+        let b = s2.grid.as_ref().expect("blocking grid");
+        assert!(
+            (a.avg - b.avg).abs() < 1e-9 && (a.min - b.min).abs() < 1e-9,
+            "threaded {:.6} / {:.6} against blocking {:.6} / {:.6}",
+            a.avg,
+            a.min,
+            b.avg,
+            b.min,
+        );
+    }
+
+    /// PROGRESS REACHES THE FULL WAY. A bar that stops at four fifths is a bar nobody trusts.
+    #[test]
+    fn progress_runs_from_nothing_to_everything() {
+        let (f, mut s) = room();
+        let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
+        let steps = job.steps();
+        let p = CalcProgress::default();
+        assert_eq!(p.fraction(), 0.0, "it starts at nothing");
+
+        let out = job.run(&p);
+        assert!(!out.cancelled);
+        assert_eq!(
+            p.done.load(std::sync::atomic::Ordering::Relaxed),
+            steps,
+            "the job reported {} of the {steps} steps it promised",
+            p.done.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!((p.fraction() - 1.0).abs() < 1e-6, "the bar finished at {}", p.fraction());
+        assert!(!p.label().is_empty(), "the last phase left no label");
+    }
+
+    /// THE PHASE SAYS WHICH ROOM. On a three-room building "Calculating…" for four minutes says
+    /// nothing; "Room 2 of 3 — working plane" says how much is left.
+    #[test]
+    fn the_phase_names_the_room_it_is_on() {
+        let (f, mut s) = room();
+        let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
+        let p = std::sync::Arc::new(CalcProgress::default());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let p2 = p.clone();
+        let seen2 = seen.clone();
+        let watcher = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let l = p2.label();
+                if !l.is_empty() {
+                    let mut v = seen2.lock().expect("lock");
+                    if v.last().map(|x: &String| x != &l).unwrap_or(true) {
+                        v.push(l);
+                    }
+                }
+                if p2.fraction() >= 1.0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let _ = job.run(&p);
+        let _ = watcher.join();
+
+        let labels = seen.lock().expect("lock").clone();
+        assert!(
+            labels.iter().any(|l| l.contains("working plane")),
+            "no phase named the working plane: {labels:?}",
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("1 of 1")),
+            "the phase does not say which room of how many: {labels:?}",
+        );
+    }
+
+    /// STOP MEANS STOP. A job you cannot cancel is not much better than one that freezes the
+    /// window — you still sit and wait for it.
+    #[test]
+    fn a_cancelled_job_comes_back_cancelled() {
+        let (f, mut s) = room();
+        let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
+        let p = CalcProgress::default();
+        p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = job.run(&p);
+        assert!(out.cancelled, "the job ran to completion after being cancelled");
+        assert!(out.rooms.is_empty(), "a cancelled job returned results");
+    }
+
+    /// A CANCELLED RESULT DOES NOT OVERWRITE THE LAST GOOD ONE. Half a calculation is not a
+    /// calculation, and replacing a finished answer with one is worse than showing nothing.
+    #[test]
+    fn cancelling_leaves_the_previous_answer_alone() {
+        let (f, mut s) = room();
+        s.calculate(&Document::default(), Some(&f));
+        let before = s.grid.as_ref().expect("a first answer").avg;
+        assert!(before > 1.0);
+
+        let job = s.prepare(&Document::default(), Some(&f)).expect("a job");
+        let p = CalcProgress::default();
+        p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        s.apply_outcome(job.run(&p), None);
+
+        assert!(
+            (s.grid.as_ref().expect("still there").avg - before).abs() < 1e-9,
+            "a cancelled run replaced the answer that was already on screen",
+        );
+        assert_eq!(s.rooms.len(), 1, "and it kept the rooms");
+        assert!(s.last_msg.contains("stopped"), "it must say what happened: {:?}", s.last_msg);
+    }
+
+    /// NOTHING TO CALCULATE IS NOT A JOB. An empty project must not spawn a worker that returns
+    /// an empty answer and wipes the panel.
+    #[test]
+    fn an_empty_project_produces_no_job() {
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        assert!(s.prepare(&Document::default(), None).is_none());
+        assert!(s.last_msg.contains("No geometry"), "it must say why: {:?}", s.last_msg);
     }
 }

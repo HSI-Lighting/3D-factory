@@ -2140,6 +2140,13 @@ pub struct CadApp {
     report_wants_dir: bool,
     /// The next image pick is a report image: `Some(false)` a render, `Some(true)` a logo.
     report_wants_images: Option<bool>,
+    // ---- the calculation, off the UI thread ----
+    calc_rx: Option<std::sync::mpsc::Receiver<crate::light::CalcOutcome>>,
+    calc_progress: Option<std::sync::Arc<crate::light::CalcProgress>>,
+    /// Which room the panel will show when the answer arrives — read when the job STARTED, since
+    /// the selection can change while it runs.
+    calc_selected: Option<usize>,
+    calc_started: Option<std::time::Instant>,
     /// A preview texture per LOGO, parallel to `report_opts.logos`.
     report_logo_tex: Vec<Option<egui::TextureHandle>>,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
@@ -3987,6 +3994,10 @@ impl Default for CadApp {
             report_tex_dirty: false,
             report_wants_dir: false,
             report_wants_images: None,
+            calc_rx: None,
+            calc_progress: None,
+            calc_selected: None,
+            calc_started: None,
             report_logo_tex: Vec::new(),
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
@@ -4777,8 +4788,7 @@ impl CadApp {
             self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
         }
         if action.calculate {
-            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-            self.light.calculate(plan, Some(&self.factory));
+            self.start_calculation();
         }
     }
 
@@ -14547,8 +14557,7 @@ impl CadApp {
                     // THE PLAN. The live preview 100 lines above already reads `plan_doc()`; this
                     // reached for `self.doc` again, so the picture and the number printed under it
                     // were fed by two different documents.
-                    let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-                    self.light.calculate(plan, Some(&self.factory));
+                    self.start_calculation();
                 }
                 if act.export_report {
                     self.export_light_report();
@@ -26512,6 +26521,109 @@ impl CadApp {
             .and_then(|p| p.file_stem())
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Untitled".to_string())
+    }
+
+
+    /// Start a calculation on a worker thread.
+    ///
+    /// THE WINDOW USED TO STOP REPAINTING. A lighting calculation is minutes on a real building
+    /// and it ran here, on the UI thread — so Windows greyed the app out and wrote "Not
+    /// Responding" in the title bar, and the only honest reading from outside was that it had
+    /// crashed. The work was fine; there was no way to see it happening.
+    ///
+    /// `prepare` is the cheap half and stays here, because it inserts the profiles the model's own
+    /// lights need. Everything after it takes no borrow on the app at all.
+    fn start_calculation(&mut self) {
+        if self.calc_rx.is_some() {
+            return; // one at a time — a second would fight the first for every core
+        }
+        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
+        let Some(job) = self.light.prepare(&plan, Some(&self.factory)) else { return };
+        let selected = crate::light::LightState::selected_room(Some(&self.factory));
+
+        let progress = std::sync::Arc::new(crate::light::CalcProgress::default());
+        progress
+            .total
+            .store(job.steps(), std::sync::atomic::Ordering::Relaxed);
+        let p = progress.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("simlux-calc".into())
+            .spawn(move || {
+                let out = job.run(&p);
+                // The receiver is gone only if the app closed; nothing to report to.
+                let _ = tx.send(out);
+            })
+            .expect("the calculation thread must start");
+
+        self.calc_rx = Some(rx);
+        self.calc_progress = Some(progress);
+        self.calc_selected = selected;
+        self.calc_started = Some(std::time::Instant::now());
+        self.light.last_msg = "Calculating…".into();
+    }
+
+    /// Collect a finished calculation, and show how the running one is getting on.
+    fn poll_calculation(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.calc_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(out) => {
+                let cancelled = out.cancelled;
+                let took = self.calc_started.map(|t| t.elapsed()).unwrap_or_default();
+                self.light.apply_outcome(out, self.calc_selected);
+                self.calc_rx = None;
+                self.calc_progress = None;
+                self.calc_started = None;
+                if !cancelled {
+                    self.history.push(format!("  calculated in {:.1} s", took.as_secs_f64()));
+                }
+                self.touch_view();
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The worker died without sending — a panic in the engine. Say so rather than
+                // leaving a progress bar up for ever.
+                self.calc_rx = None;
+                self.calc_progress = None;
+                self.calc_started = None;
+                self.light.last_msg = "The calculation stopped unexpectedly.".into();
+                self.history.push("  ! calculation thread ended without a result".into());
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+
+        let Some(p) = self.calc_progress.clone() else { return };
+        // A worker makes no input events, so nothing would repaint the window and the bar would
+        // sit still — which looks exactly like the freeze this replaces.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
+        let elapsed = self.calc_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("simlux_calculating")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Calculating");
+            ui.add_space(6.0);
+            let f = p.fraction();
+            ui.add(egui::ProgressBar::new(f).show_percentage().animate(true));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(p.label()).small().weak());
+            ui.label(
+                egui::RichText::new(format!("{elapsed:.0} s elapsed"))
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+            if p.cancelled() {
+                ui.label(egui::RichText::new("Stopping…").small().weak());
+            } else if ui.button("Stop").clicked() {
+                cancel = true;
+            }
+        });
+        if cancel {
+            p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.light.last_msg = "Stopping the calculation…".into();
+        }
     }
 
     /// The report dialog. Bails if closed.
@@ -41584,8 +41696,7 @@ impl eframe::App for CadApp {
                         .color(egui::Color32::from_rgb(150, 165, 185)));
                     if ui.button("  ⚡  Calculate lux").clicked() {
                         self.light.window_open = true;
-                        let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-                        self.light.calculate(plan, Some(&self.factory));
+                        self.start_calculation();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -42282,6 +42393,8 @@ impl eframe::App for CadApp {
         // Illuminaire (SIMLUX menu ▸ Illuminaire) — the fitting library. Bails if closed.
         self.render_illuminaire(ctx);
         self.render_report_dialog(ctx);
+        // The calculation runs on a worker; this collects it and shows how it is getting on.
+        self.poll_calculation(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_shortcuts_window(ctx);
         self.render_light_3d_panel(ctx);
