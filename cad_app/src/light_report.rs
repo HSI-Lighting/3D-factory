@@ -43,6 +43,10 @@ pub struct ReportInput<'a> {
     pub images: Vec<(Vec<u8>, String)>,
     /// What this room is lit WITH, by fitting type.
     pub schedule: Vec<crate::report::layout::ScheduleRow>,
+    /// The room outline, in metres — for the layout drawing. Empty when there is none.
+    pub poly: Vec<glam::Vec2>,
+    /// The fittings standing in it, for the same drawing.
+    pub fixtures: Vec<cad_light::Luminaire>,
 }
 
 /// Minimal HTML escaping — a room called `Smith & Sons <Ltd>` must not break the document.
@@ -96,6 +100,7 @@ fn body(inp: &ReportInput, named: bool) -> String {
     ));
 
     // ---- headline ---------------------------------------------------------------------------
+    mark(&mut h, Section::Summary);
     h.push_str("<div class=\"kpi\">");
     h.push_str(&kpi(&format!("{:.0} lx", g.avg), "average maintained"));
     h.push_str(&kpi(&format!("{:.2}", g.u0()), "uniformity U₀"));
@@ -112,6 +117,24 @@ fn body(inp: &ReportInput, named: bool) -> String {
              These results are for the {} that do.</p>",
             inp.unassigned,
             inp.installation.map(|i| i.count).unwrap_or(0),
+        ));
+    }
+
+    // ---- the layout, as a drawing ---------------------------------------------------------
+    //
+    // HTML HAS NO PAGES, so this is not "a page showing the lighting layout" — but the DRAWING is
+    // just as useful here, and inline SVG keeps the file the one self-contained thing it has
+    // always been. A field says how much light there is; it does not say where the fittings are.
+    mark(&mut h, Section::Layout);
+    if !inp.fixtures.is_empty() || inp.poly.len() >= 3 {
+        h.push_str("<h2>Lighting layout</h2>");
+        h.push_str(&layout_svg(inp));
+        h.push_str(&format!(
+            "<p class=\"note\">{:.2} × {:.2} m · {} fitting(s) · mounting {:.2} m</p>",
+            p.width,
+            p.depth,
+            inp.fixtures.len(),
+            inp.fixtures.first().map(|l| l.position.z).unwrap_or(0.0),
         ));
     }
 
@@ -315,6 +338,9 @@ fn body(inp: &ReportInput, named: bool) -> String {
 
     // The renders, if any were added and the section is on. Embedded as data URIs so the file
     // stays what it has always been: one self-contained document that survives being emailed.
+    mark(&mut h, Section::Schedule);
+    h.push_str(&schedule_table(&inp.schedule));
+
     mark(&mut h, Section::Renders);
     if !inp.images.is_empty() {
         h.push_str("<h2>Renders</h2><div class=\"renders\">");
@@ -349,6 +375,137 @@ use crate::report::Section;
 /// whose every number is already under test, each section is announced by a comment, and the
 /// filter keeps the runs the user asked for. The markers are inert in a browser and visible to
 /// anyone reading the file, which is more than a CSS class would be.
+
+/// The lighting layout as inline SVG — the room outline and a marker per fitting.
+///
+/// SVG rather than a raster, so it stays crisp at any zoom and costs a few hundred bytes; inline
+/// rather than a file, so the report is still the one thing you can email. Y IS FLIPPED once: a
+/// plan reads with +y up, SVG measures down, and a layout printed upside down against its own
+/// result is worse than no layout at all.
+fn layout_svg(inp: &ReportInput) -> String {
+    let p = inp.plane;
+    if p.width <= 0.0 || p.depth <= 0.0 {
+        return String::new();
+    }
+    // A viewBox in METRES, so everything below is written in the room's own coordinates and the
+    // browser does the scaling.
+    let (ox, oy) = (p.origin.x as f64, p.origin.y as f64);
+    let (w, d) = (p.width as f64, p.depth as f64);
+    let fy = |y: f64| d - (y - oy); // flip
+    let mut s = format!(
+        "<svg class=\"layout\" viewBox=\"0 0 {w:.3} {d:.3}\" preserveAspectRatio=\"xMidYMid meet\" \
+         xmlns=\"http://www.w3.org/2000/svg\">"
+    );
+    // Stroke widths are in metres too, so they have to be small — 1/400 of the room reads as a
+    // hairline at any size the browser picks.
+    let hair = (w.max(d) / 400.0).max(0.005);
+
+    if inp.poly.len() >= 3 {
+        let pts: Vec<String> = inp
+            .poly
+            .iter()
+            .map(|v| format!("{:.3},{:.3}", v.x as f64 - ox, fy(v.y as f64)))
+            .collect();
+        s.push_str(&format!(
+            "<polygon points=\"{}\" fill=\"none\" stroke=\"#be2828\" stroke-width=\"{:.4}\"/>",
+            pts.join(" "),
+            hair * 2.0,
+        ));
+    } else {
+        s.push_str(&format!(
+            "<rect x=\"0\" y=\"0\" width=\"{w:.3}\" height=\"{d:.3}\" fill=\"none\" \
+             stroke=\"#be2828\" stroke-width=\"{:.4}\"/>",
+            hair * 2.0,
+        ));
+    }
+
+    let r = (w.max(d) / 90.0).max(0.05);
+    for l in &inp.fixtures {
+        let (x, y) = (l.position.x as f64 - ox, fy(l.position.y as f64));
+        s.push_str(&format!(
+            "<g stroke=\"#1e1e1e\" stroke-width=\"{hw:.4}\">\
+             <line x1=\"{:.3}\" y1=\"{y:.3}\" x2=\"{:.3}\" y2=\"{y:.3}\"/>\
+             <line x1=\"{x:.3}\" y1=\"{:.3}\" x2=\"{x:.3}\" y2=\"{:.3}\"/></g>\
+             <rect x=\"{:.3}\" y=\"{:.3}\" width=\"{:.3}\" height=\"{:.3}\" fill=\"none\" \
+             stroke=\"#c8963c\" stroke-width=\"{hw:.4}\"/>",
+            x - r,
+            x + r,
+            y - r,
+            y + r,
+            x - r * 0.66,
+            y - r * 0.66,
+            r * 1.32,
+            r * 1.32,
+            hw = hair,
+        ));
+    }
+    s.push_str("</svg>");
+    s
+}
+
+/// THE LUMINAIRE SCHEDULE — what the room is lit with, by type.
+///
+/// It was in the PDF and not in the HTML at all, so a report asked for as HTML said what the
+/// illuminance was and never what produced it. A lighting report without a schedule cannot be
+/// checked, ordered from, or handed to an installer.
+fn schedule_table(rows: &[crate::report::layout::ScheduleRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut h = String::from(
+        "<h2>Luminaire schedule</h2><table class=\"sched\"><tr><th class=\"n\">Qty</th>\
+         <th>Fitting</th><th>Manufacturer</th><th class=\"n\">W</th><th class=\"n\">lm</th>\
+         <th class=\"n\">lm/W</th><th class=\"n\">Size</th></tr>",
+    );
+    let dash = |v: f64, dp: usize| -> String {
+        if v > 0.0 {
+            format!("{v:.dp$}")
+        } else {
+            "—".to_string()
+        }
+    };
+    for r in rows {
+        // The catalogue number and the lamp belong to the fitting, under its name — a schedule of
+        // nine columns on a phone is a schedule nobody reads.
+        let mut sub = Vec::new();
+        if !r.catalogue.trim().is_empty() && r.catalogue.trim() != r.profile.trim() {
+            sub.push(format!("cat. {}", esc(r.catalogue.trim())));
+        }
+        if !r.lamp.trim().is_empty() {
+            sub.push(esc(r.lamp.trim()));
+        }
+        let (l, wd, ht) = r.size_m;
+        h.push_str(&format!(
+            "<tr><td class=\"n\">{}</td><td><b>{}</b>{}</td><td>{}</td><td class=\"n\">{}</td>\
+             <td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td></tr>",
+            r.count,
+            esc(&r.profile),
+            if sub.is_empty() {
+                String::new()
+            } else {
+                format!("<span class=\"sub\">{}</span>", sub.join(" · "))
+            },
+            if r.manufacturer.trim().is_empty() { "—".into() } else { esc(r.manufacturer.trim()) },
+            dash(r.watts, 1),
+            dash(r.lumens, 0),
+            r.efficacy().map(|e| format!("{e:.0}")).unwrap_or_else(|| "—".into()),
+            if l > 0.0 || wd > 0.0 {
+                format!("{:.0} × {:.0} × {:.0} mm", l * 1000.0, wd * 1000.0, ht * 1000.0)
+            } else {
+                "—".into()
+            },
+        ));
+    }
+    let n: usize = rows.iter().map(|r| r.count).sum();
+    let watts: f64 = rows.iter().map(|r| r.total_watts()).sum();
+    h.push_str(&format!(
+        "<tr class=\"tot\"><td class=\"n\">{n}</td><td colspan=\"2\">fitting(s)</td>\
+         <td class=\"n\">{watts:.1}</td><td colspan=\"3\">connected</td></tr>",
+    ));
+    h.push_str("</table>");
+    h
+}
+
 const END_MARK: &str = "<!--SEC:END-->";
 
 fn mark(h: &mut String, s: Section) {
@@ -424,6 +581,14 @@ table.fc td.out{background:transparent;border:1px dashed rgba(128,128,128,.35)}
 .renders figure{flex:1 1 320px;margin:0}
 .renders img{width:100%;height:auto;border:1px solid var(--line);border-radius:6px;display:block}
 .renders figcaption{font-size:12px;color:#667;margin-top:5px;text-align:center}
+/* The layout drawing. A viewBox in metres, so the browser scales it and it stays crisp. */
+.layout{width:100%;max-width:560px;height:auto;display:block;margin:12px auto;
+  background:#fff;border:1px solid var(--line);border-radius:6px;padding:8px;box-sizing:border-box}
+/* The schedule: what the room is lit WITH. */
+table.sched{width:100%;border-collapse:collapse;margin:10px 0}
+table.sched th,table.sched td{padding:6px 8px;border-bottom:1px solid var(--line);font-size:13px}
+table.sched .sub{display:block;font-size:11px;color:#667;margin-top:2px}
+table.sched tr.tot td{font-weight:600;border-top:2px solid var(--line);border-bottom:none}
 /* The legend is the scale the plot was drawn at; without it the picture states nothing. */
 .legend{display:flex;align-items:center;gap:8px;margin:6px 0 2px}
 .legend .lgbar{display:flex;flex:0 0 320px;height:14px;border:1px solid rgba(128,128,128,.5)}
@@ -484,6 +649,8 @@ mod tests {
             sections: crate::report::Section::all(),
             images: Vec::new(),
             schedule: Vec::new(),
+            poly: Vec::new(),
+            fixtures: Vec::new(),
         }
     }
 
@@ -619,6 +786,8 @@ mod the_report_carries_the_false_colour_field {
             sections: crate::report::Section::all(),
             images: Vec::new(),
             schedule: Vec::new(),
+            poly: Vec::new(),
+            fixtures: Vec::new(),
         }
     }
 
@@ -764,16 +933,32 @@ mod the_html_honours_the_chosen_sections {
         assert!(!html.contains("class=\"grid\""), "the grid table survived its heading");
     }
 
-    /// THE TITLE AND THE HEADLINE ARE NEVER DROPPED. A report with no sections is a shorter
-    /// report; a report with no title is an anonymous one, and nobody can file it.
+    /// THE TITLE IS NEVER DROPPED. A report with no sections is a shorter report; a report with no
+    /// title is an anonymous one, and nobody can file it.
+    ///
+    /// The HEADLINE figures are part of Summary and go with it — they used to sit above the first
+    /// marker, which meant unticking Summary did nothing whatever to the HTML while emptying the
+    /// PDF. A tick that works in one format and not the other is worse than no tick.
     #[test]
-    fn the_masthead_survives_an_empty_selection() {
+    fn the_title_survives_an_empty_selection() {
         let (g, p) = (grid(), plane());
         let html = render(&with(&g, &p, Vec::new()));
         assert!(html.contains("Test room"), "the title went with the sections");
-        assert!(html.contains("average maintained"), "the headline figures went too");
         assert!(html.ends_with("</html>"), "the document did not close");
         assert!(!html.contains("<h2>"), "no section should have been printed");
+        assert!(
+            !html.contains("average maintained"),
+            "the headline survived an empty selection — Summary is a section like any other",
+        );
+    }
+
+    /// …and it comes back with Summary.
+    #[test]
+    fn the_headline_belongs_to_summary() {
+        let (g, p) = (grid(), plane());
+        let html = render(&with(&g, &p, vec![Section::Summary]));
+        assert!(html.contains("average maintained"), "Summary did not bring the headline back");
+        assert!(html.contains("Test room"));
     }
 
     /// THE MARKERS ARE INERT. They are HTML comments, so a file that somehow kept one would still
@@ -786,5 +971,151 @@ mod the_html_honours_the_chosen_sections {
             let html = render(&with(&g, &p, keep));
             assert!(!html.contains("SEC:"), "a marker was left in the output");
         }
+    }
+}
+
+/// THE HTML CARRIES THE SCHEDULE AND THE LAYOUT TOO.
+///
+/// They were in the PDF and not in the HTML at all, so a report asked for as HTML said what the
+/// illuminance was and never what produced it — and the tick boxes for them did nothing.
+#[cfg(test)]
+mod the_html_carries_the_same_sections_as_the_pdf {
+    use super::*;
+    use crate::report::Section;
+
+    fn grid2() -> LuxGrid {
+        LuxGrid {
+            cols: 2,
+            rows: 2,
+            values: vec![100.0, 200.0, 300.0, 400.0],
+            min: 100.0,
+            max: 400.0,
+            avg: 250.0,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        }
+    }
+
+    fn plane2() -> CalcPlane {
+        CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 8.0,
+            depth: 6.0,
+            cols: 2,
+            rows: 2,
+        }
+    }
+
+    fn lum(x: f32, y: f32, id: u32) -> cad_light::Luminaire {
+        cad_light::Luminaire {
+            id,
+            profile: "OCULUS".into(),
+            position: cad_light::Vertex::new(x, y, 2.7),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }
+    }
+
+    fn furnished<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> ReportInput<'a> {
+        let mut i = tests::input(g, p);
+        i.schedule = vec![crate::report::layout::ScheduleRow {
+            profile: "OCULUS GRANDE 2.0".into(),
+            count: 12,
+            manufacturer: "HSI Lighting".into(),
+            catalogue: "OG20-36".into(),
+            lamp: "LED 3000K".into(),
+            watts: 22.0,
+            lumens: 2400.0,
+            size_m: (0.095, 0.095, 0.06),
+        }];
+        i.poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        i.fixtures = vec![lum(2.0, 2.0, 1), lum(6.0, 4.0, 2)];
+        i
+    }
+
+    /// THE SCHEDULE IS THERE, with everything the fitting's own file declared.
+    #[test]
+    fn the_schedule_is_in_the_html() {
+        let (g, p) = (grid2(), plane2());
+        let html = render(&furnished(&g, &p));
+        for want in ["Luminaire schedule", "OCULUS GRANDE 2.0", "HSI Lighting", "OG20-36", "LED 3000K"] {
+            assert!(html.contains(want), "{want:?} is not in the HTML report");
+        }
+        assert!(html.contains("264.0"), "the connected load (12 × 22 W) is missing");
+        assert!(html.contains("109"), "the efficacy (2400/22) is missing");
+    }
+
+    /// THE LAYOUT IS DRAWN, as inline SVG so the file stays self-contained.
+    #[test]
+    fn the_layout_is_drawn_as_svg() {
+        let (g, p) = (grid2(), plane2());
+        let html = render(&furnished(&g, &p));
+        assert!(html.contains("<h2>Lighting layout</h2>"), "no layout section");
+        assert!(html.contains("<svg class=\"layout\""), "the drawing is not inline SVG");
+        assert!(html.contains("viewBox=\"0 0 8.000 6.000\""), "the viewBox is not the room");
+        assert!(html.contains("<polygon"), "the room outline was not drawn");
+        assert!(html.contains("2 fitting(s)"), "the fitting count is missing");
+        // Two markers, each a pair of crossing lines plus a box.
+        assert_eq!(html.matches("stroke=\"#c8963c\"").count(), 2, "a marker per fitting");
+    }
+
+    /// THE DRAWING IS NOT UPSIDE DOWN. A plan reads with +y up and SVG measures down, so it is
+    /// flipped once — and a layout mirrored against its own result is worse than none.
+    #[test]
+    fn the_svg_is_the_same_way_up_as_the_plan() {
+        let (g, p) = (grid2(), plane2());
+        let mut i = furnished(&g, &p);
+        // Near the plan's top (y = 5.5) and near its bottom (y = 0.5).
+        i.fixtures = vec![lum(4.0, 5.5, 1), lum(4.0, 0.5, 2)];
+        let html = render(&i);
+        // The marker boxes, in emission order: the first is the y = 5.5 fitting.
+        let ys: Vec<f64> = html
+            .split("stroke=\"#c8963c\"")
+            .skip(1)
+            .filter_map(|_| None::<f64>)
+            .collect();
+        let _ = ys;
+        let boxes: Vec<f64> = html
+            .match_indices("<rect x=\"")
+            .filter_map(|(at, _)| {
+                let rest = &html[at..];
+                let y = rest.split("y=\"").nth(1)?.split('"').next()?;
+                y.parse::<f64>().ok()
+            })
+            .collect();
+        assert_eq!(boxes.len(), 2, "expected two marker boxes, got {boxes:?}");
+        assert!(
+            boxes[0] < boxes[1],
+            "the fitting at y = 5.5 m drew at {:.2} and the one at y = 0.5 m at {:.2} — the \
+             drawing is mirrored",
+            boxes[0],
+            boxes[1],
+        );
+    }
+
+    /// AND BOTH CAN BE SWITCHED OFF, like every other section.
+    #[test]
+    fn both_honour_their_tick_boxes() {
+        let (g, p) = (grid2(), plane2());
+        let mut i = furnished(&g, &p);
+        i.sections = Section::all().into_iter().filter(|s| *s != Section::Schedule).collect();
+        let html = render(&i);
+        assert!(!html.contains("Luminaire schedule"), "the schedule ignored its tick box");
+        assert!(html.contains("Lighting layout"), "the layout went with it");
+
+        let mut i = furnished(&g, &p);
+        i.sections = Section::all().into_iter().filter(|s| *s != Section::Layout).collect();
+        let html = render(&i);
+        assert!(!html.contains("Lighting layout"), "the layout ignored its tick box");
+        assert!(html.contains("Luminaire schedule"), "the schedule went with it");
     }
 }

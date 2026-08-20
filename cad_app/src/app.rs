@@ -26868,6 +26868,8 @@ impl CadApp {
                         // than once per room.
                         images: if i == last { images.clone() } else { Vec::new() },
                         schedule: r.schedule.clone(),
+                        poly: r.poly.to_vec(),
+                        fixtures: r.fixtures.to_vec(),
                     })
                     .collect();
                 crate::light_report::render_all(&self.report_opts.title, &per).into_bytes()
