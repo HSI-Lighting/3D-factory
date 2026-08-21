@@ -5882,7 +5882,57 @@ impl CadApp {
                 ),
             }
         }
+        self.push_aim_arrows(&mut verts);
         verts
+    }
+
+    /// WHERE EVERY FITTING IS POINTING — a shaft to the floor, with a cross where it lands.
+    ///
+    /// Asked for as: *"in aiming lights add aiming arrows that the user can turn on and off in the
+    /// illuminaire tab that shows where the light is aimed at."*
+    ///
+    /// The arrow ends where the aim ray MEETS THE FLOOR, because that is the question: the aim tool
+    /// takes a point on the plan, so the arrow should land on the point that was clicked. Casting
+    /// against the whole model instead would be more literal and worse — 89 fittings against a
+    /// hundred thousand triangles, every frame, to move the tip onto a desk.
+    fn push_aim_arrows(&self, out: &mut Vec<crate::light3d::V3>) {
+        if !self.light.show_aim || self.light.luminaires.is_empty() {
+            return;
+        }
+        // The floor under the room being looked at. One height for all of them: the arrows are a
+        // readout of direction, and a per-fitting floor search would cost more than it tells.
+        let floor_z = match self.light.rooms.first() {
+            Some(r) => self.floor_under(&r.plane),
+            None => match self.light.plane.as_ref() {
+                Some(p) => self.floor_under(p),
+                None => 0.0,
+            },
+        };
+        for l in &self.light.luminaires {
+            let from = glam::Vec3::new(l.position.x, l.position.y, l.position.z);
+            let (aim, _, _) = l.frame();
+            // How far along the aim the floor is. `aim.z` is negative for anything pointing down,
+            // which is every fitting `aim_at` will produce — it refuses a target that is not below.
+            let drop = from.z - floor_z;
+            let t = if aim.z < -1e-3 {
+                drop / -aim.z
+            } else {
+                // Aimed level or upward — a wallwasher tipped to the horizontal. There is no floor
+                // to land on, so the arrow is drawn a fixed length and simply says which way.
+                drop.max(1.0)
+            };
+            // A ray aimed a hair off horizontal would otherwise draw a kilometre across the site.
+            let t = t.clamp(0.05, drop.max(1.0) * 6.0);
+            let hit = from + aim * t;
+            // AMBER, the colour the fitting markers already use, so the arrow reads as belonging to
+            // its light rather than as another kind of object in the room.
+            crate::light3d::push_aim_arrow(out, from, hit, [1.0, 0.72, 0.25]);
+            // Only mark the landing point when it IS a landing point.
+            if aim.z < -1e-3 {
+                let size = (self.light.cam_dist * 0.012).clamp(0.05, 0.25);
+                crate::light3d::push_aim_target(out, hit, size, [1.0, 0.72, 0.25]);
+            }
+        }
     }
 
     /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
@@ -64871,3 +64921,161 @@ mod ear_clip_probe {
     }
 }
 
+
+/// AN AIMING ARROW LANDS WHERE THE FITTING POINTS.
+///
+/// Asked for as: *"in aiming lights add aiming arrows that the user can turn on and off in the
+/// illuminaire tab that shows where the light is aimed at."*
+#[cfg(test)]
+mod aiming_arrows_show_where_a_light_points {
+    use super::*;
+
+    /// A lit room with one fitting, high enough that a tilt moves the landing point visibly.
+    fn one_light() -> CadApp {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = 1.0;
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 1,
+            profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        let doc = cad_kernel::Document::default();
+        app.light.calculate(&doc, Some(&app.factory));
+        app
+    }
+
+    /// Where the drawn geometry says the fitting is pointing.
+    ///
+    /// THE MOST-REPEATED VERTEX — which is the arrow's apex, and nothing else.
+    ///
+    /// Two earlier attempts measured the wrong thing, and both were wrong for the same reason: the
+    /// landing point carries a target CROSS as well as the arrow's head, and the cross reaches
+    /// further out than the apex does. Taking the furthest vertex gives an arm tip, about 200 mm
+    /// off. Taking the deepest ALONG THE AIM works only while the fitting is untilted — the cross
+    /// lies flat, so once the aim leans, its downhill arm is deeper than the apex. That version
+    /// passed the straight-down test and failed the tilted one, which is the half that matters.
+    ///
+    /// The head is a four-sided pyramid, so its apex is emitted once per face: the only vertex in
+    /// the buffer that appears four times, exactly, and it is placed exactly on the target.
+    fn tip(app: &CadApp) -> glam::Vec3 {
+        let mut v = Vec::new();
+        app.push_aim_arrows(&mut v);
+        assert!(!v.is_empty(), "no arrow geometry at all");
+        let pts: Vec<glam::Vec3> = v.iter().map(|p| glam::Vec3::new(p.x, p.y, p.z)).collect();
+        let same = |a: &glam::Vec3, b: &glam::Vec3| (*a - *b).length() < 1e-5;
+        let (best, n) = pts
+            .iter()
+            .map(|p| (*p, pts.iter().filter(|q| same(p, q)).count()))
+            .max_by_key(|(_, n)| *n)
+            .expect("a vertex");
+        assert!(
+            n >= 4,
+            "the most repeated vertex appears {n} times — the head is a four-sided pyramid and its \
+             apex should appear four. This helper is no longer finding the tip.",
+        );
+        best
+    }
+
+    /// STRAIGHT DOWN LANDS STRAIGHT BELOW. The un-aimed case, and the one every downlight is in.
+    #[test]
+    fn an_untilted_fitting_points_at_the_floor_beneath_it() {
+        let mut app = one_light();
+        app.light.show_aim = true;
+        let t = tip(&app);
+        assert!(
+            (t.x - 5.0).abs() < 0.05 && (t.y - 4.0).abs() < 0.05,
+            "the arrow lands at ({:.2}, {:.2}) — the fitting is at (5.00, 4.00) and is not tilted",
+            t.x,
+            t.y,
+        );
+        let floor = app.floor_under(&app.light.rooms[0].plane);
+        assert!(
+            (t.z - floor).abs() < 0.05,
+            "the arrow ends at z = {:.3} and the floor is at {floor:.3}",
+            t.z,
+        );
+    }
+
+    /// AND AIMING MOVES IT. The whole point: aim the fitting somewhere and the arrow follows.
+    ///
+    /// Checked against the target the fitting was aimed AT, not merely against "it moved" — an
+    /// arrow that swings to the wrong place is worse than one that does not move, because it looks
+    /// like it is working.
+    #[test]
+    fn aiming_a_fitting_moves_the_arrow_to_the_point_it_was_aimed_at() {
+        let mut app = one_light();
+        app.light.show_aim = true;
+        let floor = app.floor_under(&app.light.rooms[0].plane);
+        let target = glam::Vec3::new(8.0, 6.5, floor);
+        assert!(app.light.luminaires[0].aim_at(target), "aim_at refused a target below the fitting");
+
+        let t = tip(&app);
+        assert!(
+            (t - target).length() < 0.08,
+            "aimed at ({:.2}, {:.2}, {:.2}) but the arrow lands at ({:.2}, {:.2}, {:.2})",
+            target.x,
+            target.y,
+            target.z,
+            t.x,
+            t.y,
+            t.z,
+        );
+    }
+
+    /// THE TOGGLE TURNS IT OFF. It was asked for as a switch, and a switch that only goes one way
+    /// is a decoration.
+    #[test]
+    fn the_toggle_removes_the_arrows_entirely() {
+        let mut app = one_light();
+        app.light.show_aim = true;
+        let mut on = Vec::new();
+        app.push_aim_arrows(&mut on);
+        assert!(!on.is_empty(), "nothing was drawn with the toggle on");
+
+        app.light.show_aim = false;
+        let mut off = Vec::new();
+        app.push_aim_arrows(&mut off);
+        assert!(off.is_empty(), "{} vertices survived the toggle", off.len());
+    }
+
+    /// A FITTING AIMED LEVEL STILL DRAWS SOMETHING FINITE. There is no floor ahead of a wallwasher
+    /// tipped to the horizontal, and dividing by its vertical component would send the arrow to
+    /// infinity — or to a NaN, which the renderer turns into a triangle across the whole scene.
+    #[test]
+    fn a_fitting_aimed_level_does_not_draw_to_infinity() {
+        let mut app = one_light();
+        app.light.show_aim = true;
+        app.light.luminaires[0].tilt_deg = 90.0; // straight out, no downward component
+        let mut v = Vec::new();
+        app.push_aim_arrows(&mut v);
+        assert!(!v.is_empty(), "a level fitting drew no arrow at all");
+        for p in &v {
+            assert!(
+                p.x.is_finite() && p.y.is_finite() && p.z.is_finite(),
+                "a vertex came out non-finite: ({}, {}, {})",
+                p.x,
+                p.y,
+                p.z,
+            );
+            let d = (glam::Vec3::new(p.x, p.y, p.z) - glam::Vec3::new(5.0, 4.0, 2.9)).length();
+            assert!(d < 30.0, "a vertex is {d:.1} m from the fitting — the arrow ran away");
+        }
+    }
+}

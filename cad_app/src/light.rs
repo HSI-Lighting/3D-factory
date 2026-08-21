@@ -1333,6 +1333,17 @@ pub struct LightState {
     /// turning the colour off and leaving the lines on is a perfectly ordinary thing to want when
     /// checking a layout against them.
     pub show_isolux: bool,
+    /// Draw a line from each fitting along the way it POINTS, down to where it meets the floor.
+    ///
+    /// Asked for as: *"in aiming lights add aiming arrows that the user can turn on and off in the
+    /// illuminaire tab that shows where the light is aimed at."* It lives beside the aim tool
+    /// because it is that tool's readout — aiming a fitting and seeing nothing change is exactly
+    /// how a working feature gets reported as broken.
+    ///
+    /// ON by default, and deliberately: a toggle that hides the thing it was asked for is the same
+    /// failure one step removed. It is in the Luminaires menu for a plan crowded enough to want it
+    /// off.
+    pub show_aim: bool,
     /// Which false-colour palette the scale is read through.
     pub ramp: LuxRamp,
     /// Drop the ceiling out of the SIMLUX 3D view, so the room can be seen into from above.
@@ -1476,6 +1487,7 @@ impl LightState {
             // OFF by default: lines over a field the reader has not asked to be gridded is clutter,
             // and the field alone is what the view has always shown.
             show_isolux: false,
+            show_aim: true,
             ramp: LuxRamp::default(),
             hide_ceilings: true,
         }
@@ -3327,6 +3339,17 @@ impl LightState {
                     }
                     ui.close_menu();
                 }
+                // AND SHOW WHERE EACH ONE POINTS.
+                //
+                // Asked for as: *"in aiming lights add aiming arrows that the user can turn on and
+                // off in the illuminaire tab that shows where the light is aimed at."* It belongs
+                // beside the aim tool rather than in Display, because it is the aim tool's readout:
+                // aiming a fitting and seeing nothing change is the failure this prevents.
+                ui.checkbox(&mut self.show_aim, "⌖ show aiming arrows")
+                    .on_hover_text(
+                        "Draw a line from each fitting along the way it points, down to where it \
+                         meets the floor. Off for a crowded plan.",
+                    );
                 ui.separator();
                 self.selected_fixture_params_ui(ui);
                 ui.separator();

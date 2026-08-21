@@ -349,6 +349,92 @@ pub fn push_isolux_lines(
     }
 }
 
+/// WHERE A FITTING IS POINTING — a shaft from the luminaire to `hit`, with a head on the end.
+///
+/// Asked for as: *"add aiming arrows … that shows where the light is aimed at."*
+///
+/// The shaft is TWO CROSSED QUADS rather than a tube. A tube of any useful thickness is a dozen
+/// triangles per fitting and looks like a pipe; a single flat ribbon vanishes edge-on, which on an
+/// orbiting camera means the arrow disappears exactly when it is turned to look at. Two quads at
+/// right angles are four triangles, always present something to the eye, and read as a line rather
+/// than as an object.
+pub fn push_aim_arrow(out: &mut Vec<V3>, from: Vec3, hit: Vec3, rgb: [f32; 3]) {
+    let along = hit - from;
+    let len = along.length();
+    if len < 1e-4 {
+        return;
+    }
+    let dir = along / len;
+    // Two perpendiculars to the shaft. `Z` unless the shaft is itself vertical, which every
+    // un-aimed downlight is — so the degenerate case here is the COMMON one, not an edge case.
+    let up = if dir.z.abs() < 0.99 { Vec3::Z } else { Vec3::X };
+    let u = up.cross(dir).normalize_or_zero();
+    if u.length_squared() < 0.5 {
+        return;
+    }
+    let w = dir.cross(u);
+    // Scaled to the run, so a 6 m throw is not drawn with the same hairline as a 0.5 m one.
+    let half = (len * 0.006).clamp(0.008, 0.03);
+    let head = (len * 0.10).clamp(0.06, 0.30);
+    let neck = hit - dir * head;
+
+    let v = |p: Vec3| V3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
+    // The shaft, stopping at the neck so the head is not drawn over its own stem.
+    for perp in [u, w] {
+        let (a, b) = (from + perp * half, from - perp * half);
+        let (c, d) = (neck - perp * half, neck + perp * half);
+        out.extend([v(a), v(b), v(c)]);
+        out.extend([v(a), v(c), v(d)]);
+    }
+    // A four-sided pyramid for the head, apex ON the target — the point of the whole thing is
+    // where it lands, so that is the vertex that has to be exact.
+    let r = head * 0.34;
+    let ring = [neck + u * r, neck + w * r, neck - u * r, neck - w * r];
+    for k in 0..4 {
+        out.extend([v(hit), v(ring[k]), v(ring[(k + 1) % 4])]);
+    }
+}
+
+/// A small cross lying flat at the point a fitting is aimed at.
+///
+/// The arrow says which way; this says exactly where, and stays readable looking straight down —
+/// the view a lighting plan is actually checked in, and the one in which an arrow pointing at the
+/// camera is a dot.
+pub fn push_aim_target(out: &mut Vec<V3>, at: Vec3, size: f32, rgb: [f32; 3]) {
+    let v = |p: Vec3| V3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        nx: 0.0,
+        ny: 0.0,
+        nz: 0.0,
+        mode: 0.0,
+    };
+    let t = (size * 0.14).max(0.004);
+    for (ax, ay) in [(1.0_f32, 0.0_f32), (0.0, 1.0)] {
+        let d = Vec3::new(ax, ay, 0.0) * size;
+        let p = Vec3::new(-ay, ax, 0.0) * t;
+        let (a, b) = (at - d + p, at - d - p);
+        let (c, e) = (at + d - p, at + d + p);
+        out.extend([v(a), v(b), v(c)]);
+        out.extend([v(a), v(c), v(e)]);
+    }
+}
+
 /// Append a small bright octahedron marking a luminaire at (x, y, z).
 pub fn push_luminaire_marker(out: &mut Vec<V3>, x: f32, y: f32, z: f32, s: f32) {
     let c = [1.0, 0.86, 0.38];
