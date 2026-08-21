@@ -64232,3 +64232,69 @@ mod a_drawing_can_be_saved_as_dwg {
         }
     }
 }
+
+
+/// WHERE THE ZEROES ARE.
+///
+/// Reported as: "our min lux was 0 while for relux it was 133… its an obvious error. find the root
+/// cause." A minimum of exactly zero is not a low reading, it is a point that received nothing at
+/// all — which in a room with five bounces of interreflection is impossible unless the point is
+/// enclosed. This prints where they are, so the answer comes from the grid rather than a guess.
+///
+///     RESULT=<path to .simlux-result.json> cargo test -p cad_app --bin simlux where_the_zeroes_are -- --ignored --nocapture
+#[cfg(test)]
+mod result_forensics {
+    #[test]
+    #[ignore = "needs RESULT=<path>"]
+    fn where_the_zeroes_are() {
+        let Ok(path) = std::env::var("RESULT") else { return };
+        let text = std::fs::read_to_string(&path).expect("read the result");
+        let stored: crate::light_store::StoredResults =
+            serde_json::from_str(&text).expect("parse the result");
+        let rooms = stored.rooms().expect("rebuild the rooms");
+        for r in &rooms {
+            let g = &r.grid;
+            let (gc, gr) = (g.cols as usize, g.rows as usize);
+            let p = &r.plane;
+            println!(
+                "\n{}: {gc}x{gr} over {:.2} x {:.2} m at z {:.2}",
+                r.name, p.width, p.depth, p.origin.z
+            );
+            println!("  avg {:.1}  min {:.1}  max {:.1}", g.avg, g.min, g.max);
+
+            let inside = |i: usize| r.mask.get(i).copied().unwrap_or(true);
+            let mut lows: Vec<(f64, f32, f32)> = Vec::new();
+            let mut n_in = 0usize;
+            let mut n_zero = 0usize;
+            for j in 0..gr {
+                for i in 0..gc {
+                    let k = j * gc + i;
+                    if !inside(k) {
+                        continue;
+                    }
+                    n_in += 1;
+                    let v = g.values.get(k).copied().unwrap_or(0.0);
+                    let x = p.origin.x + (i as f32 + 0.5) * (p.width / gc as f32);
+                    let y = p.origin.y + (j as f32 + 0.5) * (p.depth / gr as f32);
+                    if v < 1.0 {
+                        n_zero += 1;
+                    }
+                    lows.push((v, x, y));
+                }
+            }
+            lows.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));
+            println!("  {n_in} cells in the room, {n_zero} of them under 1 lx");
+            println!("  the twelve darkest:");
+            for (v, x, y) in lows.iter().take(12) {
+                println!("    {v:8.2} lx at ({x:7.2}, {y:7.2})");
+            }
+            // What the room would report if those cells were not there.
+            let kept: Vec<f64> = lows.iter().map(|l| l.0).filter(|v| *v >= 1.0).collect();
+            if !kept.is_empty() {
+                let mn = kept.iter().cloned().fold(f64::MAX, f64::min);
+                let avg = kept.iter().sum::<f64>() / kept.len() as f64;
+                println!("  ignoring cells under 1 lx: min {mn:.1}, avg {avg:.1}");
+            }
+        }
+    }
+}

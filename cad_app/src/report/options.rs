@@ -138,10 +138,35 @@ pub struct Scale {
     pub bands: Vec<f64>,
 }
 
+/// THE DEFAULT FALSE-COLOUR SCHEME — the one DIALux and Relux both use.
+///
+/// Reported as: *"the false color looks comical in our report… look at the false colors in the
+/// screenshot i uploaded that should be the default false colors for simlux."*
+///
+/// The old bands were 25 / 100 / 300 / 500, which put nearly the whole of a normally-lit room into
+/// two colours: on the room this was reported against — 305 lx average — everything useful fell in
+/// the 100–300 and 300–500 bands, and the drawing said almost nothing about where the room was
+/// brighter or dimmer. These steps are the ones a lighting plan is actually read at: 50 for
+/// circulation, 100 and 200 through the range below a work plane, 300 where most tasks are
+/// specified. The same room now resolves across three bands instead of one.
+pub const DEFAULT_BANDS: [f64; 4] = [50.0, 100.0, 200.0, 300.0];
+
+/// The colours those bands are drawn in, dimmest first.
+///
+/// LOW IS WARM AND HIGH IS PALE, which is what both reference tools do and the opposite of a heat
+/// map. It reads correctly on a lighting drawing: the eye is pulled to the dark, saturated patches,
+/// and those are the parts of the room that FAIL — not the brightest ones.
+pub const DEFAULT_BAND_COLOURS: [[u8; 3]; 5] = [
+    [150, 78, 20],   // 0–50 lx        · brown
+    [232, 168, 30],  // 50–100 lx      · amber
+    [60, 175, 70],   // 100–200 lx     · green
+    [150, 235, 190], // 200–300 lx     · mint
+    [210, 245, 248], // 300 lx and up  · pale cyan
+];
+
 impl Default for Scale {
     fn default() -> Self {
-        // The EN 12464-1 steps a lighting drawing is normally banded at.
-        Self { top: None, bands: vec![25.0, 100.0, 300.0, 500.0] }
+        Self { top: None, bands: DEFAULT_BANDS.to_vec() }
     }
 }
 
@@ -217,11 +242,19 @@ impl Scale {
 
     /// What the legend says under the plot.
     pub fn caption(&self, room_max: f64) -> String {
-        let mode = if self.top.is_some() { "pinned" } else { "auto" };
         if self.bands.is_empty() {
-            format!("0 to {:.0} lx — {mode}", self.top_lx(room_max))
-        } else {
-            format!("banded to {:.0} lx — {mode}", self.top_lx(room_max))
+            let mode = if self.top.is_some() { "pinned" } else { "auto" };
+            return format!("0 to {:.0} lx — {mode}", self.top_lx(room_max));
+        }
+        // BANDED: SAY WHERE THE STEPS ARE, not where the room's brightest cell happened to land.
+        //
+        // This read "banded to 1802 lx" on the plan this came from — a number describing one cell
+        // under one downlight, which tells a reader nothing about the scale and makes it look as
+        // though the bands span that range. What the scale IS is the list of steps.
+        let steps: Vec<String> = self.bands.iter().map(|b| format!("{b:.0}")).collect();
+        match self.top {
+            Some(t) => format!("banded at {} lx, pinned to {t:.0}", steps.join(" · ")),
+            None => format!("banded at {} lx", steps.join(" · ")),
         }
     }
 }
@@ -324,7 +357,10 @@ impl Default for Options {
             footer: String::new(),
             page_numbers: true,
             scale: Scale::default(),
-            band_colours: Vec::new(),
+            // THE DEFAULT IS THE REFERENCE SCHEME, not "no choice made". An empty list means the
+            // palette decides, and the palette is a viewport thing whose job is showing a range at
+            // a glance — not the convention a lighting drawing is read by.
+            band_colours: DEFAULT_BAND_COLOURS.to_vec(),
             header_image: None,
             footer_image: None,
             sections: Section::all(),

@@ -1546,6 +1546,13 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
 /// different colours from the picture it explains is worse than no legend, and that is exactly what
 /// three call sites reading the palette their own way would eventually produce.
 fn band_fill(inp: &Input, opt: &Options, k: usize, t: f32) -> [u8; 3] {
+    // ONLY WHEN THE SCALE IS BANDED. A continuous scale is drawn as several dozen synthetic levels
+    // so one contour tracer can serve both, and those levels are not bands — index 0 of a gradient
+    // is not "the 0–50 lx band". Left ungated, a smooth ramp took the first few band colours and
+    // then jumped to the palette partway up, which is neither scheme.
+    if opt.scale.bands.is_empty() {
+        return ramp_rgb(inp.ramp, t);
+    }
     match opt.band_colours.get(k) {
         Some(c) => *c,
         None => ramp_rgb(inp.ramp, t),
@@ -1612,6 +1619,19 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
         c.push(Item::Frame { x, y, w, h, rgb: [150, 150, 150], width: 0.5 });
         c.y = y + h + 10.0;
         for (i, e) in edges.iter().enumerate() {
+            // THE TOP BAND IS OPEN-ENDED, and its label says so rather than naming the room's peak.
+            //
+            // The last edge is whatever the brightest point in the room happened to reach, so a
+            // room with one bright spot under a downlight ended its legend at "1802" — a number
+            // describing a single cell, which makes every band beneath it look like a narrow
+            // sliver of the range. What that band means is "300 lx and above", which is how both
+            // reference tools label it and how a reader actually uses it.
+            let last = i + 1 == edges.len();
+            let text = if last && opt.scale.top.is_none() && i > 0 {
+                format!("{:.0}+", edges[i - 1])
+            } else {
+                format!("{e:.0}")
+            };
             c.push(Item::Text {
                 x: x + bw * i as f64,
                 y: c.y,
@@ -1619,7 +1639,7 @@ fn legend(c: &mut Cursor, inp: &Input, opt: &Options, room_max: f64) {
                 font: Font::Regular,
                 rgb: FAINT,
                 align: if i == 0 { Align::Left } else { Align::Centre },
-                text: format!("{e:.0}"),
+                text,
             });
         }
     }
@@ -2180,6 +2200,74 @@ mod tests {
         }
     }
 
+    /// THE DEFAULT SCHEME IS THE ONE THE REFERENCE TOOLS USE.
+    ///
+    /// Reported as: *"the false color looks comical in our report… look at the false colors in the
+    /// screenshot i uploaded that should be the default false colors for simlux."*
+    ///
+    /// The old bands were 25 / 100 / 300 / 500. On the room this came from — 305 lx average, 1802
+    /// lx under one downlight — that put nearly everything into two colours, and the legend ran to
+    /// 1802 because the top of the ramp followed the room's brightest cell. A single bright spot
+    /// therefore decided how the whole drawing was coloured.
+    #[test]
+    fn the_default_bands_are_the_ones_a_lighting_plan_is_read_at() {
+        let o = Options::default();
+        assert_eq!(o.scale.bands, vec![50.0, 100.0, 200.0, 300.0]);
+        assert_eq!(
+            o.band_colours.len(),
+            o.scale.bands.len() + 1,
+            "a colour per band, including the one below the first step",
+        );
+        // Low is warm and high is pale, which is the reference convention and the opposite of a
+        // heat map: the eye is pulled to the dark saturated patches, and those are the FAILING
+        // parts of a room.
+        let dim = o.band_colours[0];
+        let bright = *o.band_colours.last().expect("a top band");
+        let lum = |c: [u8; 3]| 0.299 * c[0] as f64 + 0.587 * c[1] as f64 + 0.114 * c[2] as f64;
+        assert!(lum(bright) > lum(dim) + 60.0, "{bright:?} is not clearly paler than {dim:?}");
+
+        // A ROOM AT 305 LX RESOLVES ACROSS SEVERAL BANDS, which is the whole complaint.
+        let room_max = 1802.0;
+        let bands: std::collections::BTreeSet<usize> =
+            [120.0, 210.0, 260.0, 305.0, 340.0, 420.0].iter().map(|v| o.scale.band_index(*v, room_max)).collect();
+        assert!(
+            bands.len() >= 3,
+            "readings from 120 to 420 lx land in only {} band(s) — the drawing cannot show where \
+             the room is brighter",
+            bands.len(),
+        );
+    }
+
+    /// AND THE LEGEND SAYS "300+" RATHER THAN THE ROOM'S BRIGHTEST CELL.
+    ///
+    /// The top band is open-ended. Ending the legend at 1802 describes one cell under one
+    /// downlight and makes every band beneath it look like a sliver of the range.
+    #[test]
+    fn the_top_band_is_labelled_open_ended() {
+        let g = grid(4, 4);
+        let p = plane();
+        let mut o = opts();
+        o.cover = false;
+        o.sections = vec![Section::Results];
+        o.scale = crate::report::options::Scale { top: None, bands: vec![50.0, 100.0, 200.0, 300.0] };
+        let t = texts(&layout(&input(&g, &p), &o));
+        assert!(t.iter().any(|s| s == "300+"), "the legend does not say 300+: {t:?}");
+        // The CAPTION names the steps rather than the room's brightest cell. Checked here rather
+            // than by looking for the number anywhere on the page, which the first version did — and
+            // which caught a printed point value instead.
+        assert!(
+            t.iter().any(|s| s.contains("banded at 50 · 100 · 200 · 300 lx")),
+            "the caption does not say where the steps are: {t:?}",
+        );
+
+        // PINNED, the number is the number — somebody who set a ceiling means it.
+        o.scale.top = Some(600.0);
+        let t = texts(&layout(&input(&g, &p), &o));
+        assert!(t.iter().any(|s| s == "600"), "a pinned ceiling must be stated: {t:?}");
+        assert!(!t.iter().any(|s| s == "300+"), "a pinned scale is not open-ended: {t:?}");
+    }
+
+
     /// AN EMPTY LIST MEANS THE PALETTE — so a project made before the picker existed, and a
     /// settings file that never held one, both draw exactly as they did.
     #[test]
@@ -2190,10 +2278,20 @@ mod tests {
         o.cover = false;
         o.sections = vec![Section::Results];
 
+        // THE BASELINE IS THE PALETTE, so it has to be asked for. `Options::default` now carries
+        // the reference scheme's colours — that is the whole point of it being the default — so
+        // comparing against an unmodified `opts()` compares two lists of chosen colours and proves
+        // nothing about the fallback.
+        o.band_colours = Vec::new();
         let palette = field_fills(&layout(&input(&g, &p), &o));
         o.band_colours = Vec::new();
         let same = field_fills(&layout(&input(&g, &p), &o));
         assert_eq!(palette, same, "an empty list changed the drawing");
+        // And it really is the palette, not the reference scheme leaking through.
+        assert!(
+            !palette.contains(&crate::report::options::DEFAULT_BAND_COLOURS[0]),
+            "an empty list still drew the default band colours",
+        );
 
         // And a SHORT list falls back for the bands past its end rather than running off it.
         o.band_colours = vec![[1, 2, 3]];
@@ -2747,14 +2845,36 @@ mod tests {
         o.sections = vec![Section::Results];
         let d = layout(&input(&g, &p), &o);
 
-        // Where each run begins, to the tenth of a point.
-        let starts: std::collections::BTreeSet<i64> =
-            field_rects(&d).iter().map(|r| (r.0 * 10.0).round() as i64).collect();
+        // OFF THE GRID LATTICE, which is what interpolation means here.
+        //
+        // This used to count distinct run-start positions and require more than three per grid
+        // column — a number tuned to the fixture rather than to the question, and one that duly
+        // came out at 23 against a required 24 the moment the default bands changed. How MANY runs
+        // there are depends on how many bands the fixture happens to cross; where their edges FALL
+        // does not. Nearest-neighbour can only ever break at a grid column; bilinear breaks
+        // wherever the threshold actually is.
+        let (px, _, pw, _) = plot_frames(&d).first().copied().expect("a field");
+        let pitch = pw / cols as f64;
+        let mut off_lattice = 0usize;
+        let mut total = 0usize;
+        for r in field_rects(&d) {
+            // The plot's own left edge is a lattice position by construction; ignore it.
+            let along = r.0 - px;
+            if along < pitch * 0.25 {
+                continue;
+            }
+            total += 1;
+            let frac = (along / pitch).fract();
+            if frac > 0.08 && frac < 0.92 {
+                off_lattice += 1;
+            }
+        }
+        assert!(total > 0, "the field drew no runs at all");
         assert!(
-            starts.len() > cols as usize * 3,
-            "runs begin at only {} distinct positions across the whole field — with one per grid \
-             column that is a nearest-neighbour resample, not an interpolated one",
-            starts.len(),
+            off_lattice * 4 > total,
+            "only {off_lattice} of {total} run edges fall between grid columns — a run can only \
+             begin ON a column if the field was resampled nearest-neighbour rather than \
+             interpolated",
         );
     }
 
@@ -2914,28 +3034,25 @@ mod tests {
         let (fx, fy, fw, fh) = field;
         let top = colour_at(&d, fx + fw * 0.5, fy + fh * 0.12).expect("the top of the field");
         let bottom = colour_at(&d, fx + fw * 0.5, fy + fh * 0.88).expect("the bottom of the field");
-        let bright = |c: [u8; 3]| c[0] as u32 + c[1] as u32 + c[2] as u32;
         assert_ne!(top, bottom, "the fixture is not asymmetric enough to tell either way up");
 
-        // The brightest end of a CLASSIC ramp is the warm end; compare through the same ramp the
-        // page used rather than by eye.
-        let t_top = crate::light::lux_rgb(1.0);
-        let warm = [
-            (t_top.0 * 255.0) as i32,
-            (t_top.1 * 255.0) as i32,
-            (t_top.2 * 255.0) as i32,
-        ];
-        let near_warm = |c: [u8; 3]| {
-            ((c[0] as i32 - warm[0]).pow(2)
-                + (c[1] as i32 - warm[1]).pow(2)
-                + (c[2] as i32 - warm[2]).pow(2)) as f64
+        // BY BAND INDEX, not by how warm the colour looks.
+        //
+        // This used to measure nearness to the warm end of the classic ramp, on the reasoning that
+        // bright is warm. That is a property of one palette and not of the question being asked —
+        // and the default scheme is now the one DIALux and Relux use, where LOW is warm and HIGH is
+        // pale. The oracle was inverted overnight while the thing it tests was untouched. Which
+        // band a colour is answers the question in any palette.
+        let band_of = |c: [u8; 3]| {
+            o.band_colours.iter().position(|x| *x == c).unwrap_or_else(|| {
+                panic!("{c:?} is not one of the scale's band colours: {:?}", o.band_colours)
+            })
         };
         assert!(
-            near_warm(top) < near_warm(bottom),
+            band_of(top) > band_of(bottom),
             "the bright end of the room is at the BOTTOM of the page ({top:?} over {bottom:?}) — \
              the field is upside down against the layout",
         );
-        let _ = bright;
 
         // And the fitting, which is near the north edge, is likewise drawn in the top half.
         let marker_y = d
