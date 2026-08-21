@@ -77,16 +77,38 @@ pub fn paint_page(
             // room painted white. A comment here claimed painting order made the rule unnecessary.
             // It did not.
             Item::Poly { rings, fill } => {
+                // ONE MESH PER RING, NOT ONE SHAPE PER TRIANGLE.
+                //
+                // Reported as: *"why does the preview looks broken compared to the report output?"*
+                // — a preview criss-crossed with pale streaks over a PDF that is clean. The
+                // geometry was never wrong. egui ANTI-ALIASES EVERY SHAPE INDEPENDENTLY, feathering
+                // about a pixel in from its edge; two triangles sharing an edge therefore each fade
+                // out along it and the two half-transparent edges do not add back up to opaque. The
+                // seam shows as a hairline in the colour underneath.
+                //
+                // Which is why the artefacts had the shape they did: `paint_above` merges cells
+                // into ROW RUNS, so the seams between runs are horizontal — and ear clipping cuts
+                // long diagonals across a big ring like the room outline, so those show as
+                // diagonals crossing the whole plot. Both are visible in the report that prompted
+                // this.
+                //
+                // Triangles inside one `Mesh` share vertices and are rasterised as one surface, so
+                // there are no interior edges to feather. Only the ring's true outline is.
                 for r in rings {
-                    let pts: Vec<egui::Pos2> =
-                        r.iter().map(|(x, y)| at(*x, *y)).collect();
-                    for tri in ear_clip(&pts) {
-                        clip.add(egui::Shape::convex_polygon(
-                            tri.to_vec(),
-                            c32(*fill),
-                            egui::Stroke::NONE,
-                        ));
+                    let pts: Vec<egui::Pos2> = r.iter().map(|(x, y)| at(*x, *y)).collect();
+                    let tris = ear_clip(&pts);
+                    if tris.is_empty() {
+                        continue;
                     }
+                    let mut mesh = egui::epaint::Mesh::default();
+                    for tri in tris {
+                        let base = mesh.vertices.len() as u32;
+                        for p in tri {
+                            mesh.colored_vertex(p, c32(*fill));
+                        }
+                        mesh.add_triangle(base, base + 1, base + 2);
+                    }
+                    clip.add(egui::Shape::Mesh(mesh));
                 }
             }
             Item::Frame { x, y, w, h, rgb, width } => {
@@ -623,7 +645,7 @@ mod tests {
 /// A ring that cannot be reduced — self-intersecting, or degenerate to a sliver — stops early
 /// rather than looping: an unfillable polygon is a missing patch of colour, and a hung preview is
 /// a hung app.
-fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
+pub(crate) fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
     let mut out = Vec::new();
     if pts.len() < 3 {
         return out;
@@ -631,8 +653,31 @@ fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
     let area2 = |a: egui::Pos2, b: egui::Pos2, c: egui::Pos2| {
         (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
     };
+    // A CLOSED RING REPEATS ITS FIRST POINT, and ear clipping must not see it twice.
+    //
+    // This is what the streaked preview turned out to rest on. The room outline arrives as five
+    // points for four corners — the closing vertex duplicated — and a duplicate makes every
+    // triangle through it degenerate, so the algorithm stalls and gives up having emitted a
+    // fraction of the ring. Measured on the reference report: exactly one ring in 1,879, and it was
+    // the room outline itself, which is the band-zero fill under the entire plot.
+    let mut v: Vec<egui::Pos2> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if v.last().is_none_or(|q: &egui::Pos2| (q.x - p.x).abs() > 1e-6 || (q.y - p.y).abs() > 1e-6)
+        {
+            v.push(*p);
+        }
+    }
+    // …including the wrap-around: the last point may equal the first.
+    if v.len() > 1 {
+        let (f, l) = (v[0], v[v.len() - 1]);
+        if (f.x - l.x).abs() <= 1e-6 && (f.y - l.y).abs() <= 1e-6 {
+            v.pop();
+        }
+    }
+    if v.len() < 3 {
+        return out;
+    }
     // Work in a known winding, so "convex vertex" has one meaning below.
-    let mut v: Vec<egui::Pos2> = pts.to_vec();
     let signed: f32 = v
         .windows(2)
         .map(|w| w[0].x * w[1].y - w[1].x * w[0].y)
@@ -652,10 +697,16 @@ fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
             if area2(a, b, c) <= 0.0 {
                 continue; // reflex or collinear — not an ear
             }
-            // No other vertex may lie inside the candidate ear.
+            // No other vertex may lie STRICTLY inside the candidate ear.
+            //
+            // Strictly, and that word is the whole of it. With `>= 0.0` a vertex lying exactly ON
+            // one of the ear's edges counts as inside and blocks it — and the polygons this is
+            // handed are rectilinear run-merges, which are full of collinear points. When no ear
+            // can be found anywhere the loop gives up and emits a PARTIAL fill. Measured on the
+            // reference report: one ring in 1,879 hit it and lost two of its three triangles.
             let inside = (0..n).filter(|k| ![(i + n - 1) % n, i, (i + 1) % n].contains(k)).any(|k| {
                 let p = v[k];
-                area2(a, b, p) >= 0.0 && area2(b, c, p) >= 0.0 && area2(c, a, p) >= 0.0
+                area2(a, b, p) > 0.0 && area2(b, c, p) > 0.0 && area2(c, a, p) > 0.0
             });
             if inside {
                 continue;
@@ -846,4 +897,200 @@ opt.scale
     .bands
     .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+}
+
+
+/// THE PREVIEW IS THE DOCUMENT — including where its edges are.
+///
+/// Reported as: *"why does the preview looks broken compared to the report output?"* The PDF was
+/// clean and the preview was criss-crossed with pale streaks. Nothing was wrong with the geometry:
+/// egui anti-aliases every shape independently, so two triangles sharing an edge each faded out
+/// along it and the two half-transparent edges did not add back to opaque.
+#[cfg(test)]
+mod the_preview_does_not_show_its_own_seams {
+    use super::*;
+
+    /// A rectilinear ring with COLLINEAR vertices along its edges — the shape `paint_above` emits
+    /// when it merges cells into runs, and the shape that broke the triangulator.
+    fn run_merged_ring() -> Vec<egui::Pos2> {
+        vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),  // collinear with the next
+            egui::pos2(20.0, 0.0),
+            egui::pos2(20.0, 10.0),
+            egui::pos2(10.0, 10.0), // and here
+            egui::pos2(0.0, 10.0),
+        ]
+    }
+
+    /// EVERY RING IS FULLY TRIANGULATED. A ring of n vertices makes n − 2 triangles; anything less
+    /// is a fill with a piece missing, which is what a "broken" preview actually is.
+    #[test]
+    fn a_ring_with_collinear_vertices_is_completely_triangulated() {
+        let ring = run_merged_ring();
+        let tris = ear_clip(&ring);
+        assert_eq!(
+            tris.len(),
+            ring.len() - 2,
+            "a {}-vertex ring produced {} triangles — part of the fill is missing",
+            ring.len(),
+            tris.len(),
+        );
+        // …and the triangles cover the ring's area, so it is filled rather than merely covered in
+        // slivers. The ring is 20 x 10.
+        let area: f32 = tris
+            .iter()
+            .map(|t| {
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                    * 0.5
+            })
+            .sum();
+        assert!(
+            (area - 200.0).abs() < 1e-3,
+            "the triangles cover {area:.2} of the ring's 200.00 — the fill has holes in it",
+        );
+    }
+
+    /// A CONCAVE RING STILL WORKS. Contour bands are reliably concave, and a triangulator that only
+    /// handles convex rings would be no use here.
+    #[test]
+    fn a_concave_ring_is_completely_triangulated() {
+        // An L.
+        let ring = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(20.0, 0.0),
+            egui::pos2(20.0, 5.0),
+            egui::pos2(5.0, 5.0),
+            egui::pos2(5.0, 15.0),
+            egui::pos2(0.0, 15.0),
+        ];
+        let tris = ear_clip(&ring);
+        assert_eq!(tris.len(), ring.len() - 2, "the L came out incompletely triangulated");
+        let area: f32 = tris
+            .iter()
+            .map(|t| {
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                    * 0.5
+            })
+            .sum();
+        // 20 x 5 plus 5 x 10.
+        assert!((area - 150.0).abs() < 1e-3, "the L's triangles cover {area:.2} of 150.00");
+    }
+
+    /// ONE RING BECOMES ONE SHAPE. This is what removes the seams: triangles inside a single
+    /// `Mesh` share vertices and rasterise as one surface, so there are no interior edges to
+    /// feather. Emitting a shape per triangle — which is what this used to do — gives every
+    /// internal edge its own soft border, and the sum of two soft borders is a visible line.
+    #[test]
+    fn a_polygon_is_painted_as_one_mesh_not_a_shape_per_triangle() {
+        let ctx = egui::Context::default();
+        let ring = run_merged_ring();
+        let doc = Doc {
+            width: 200.0,
+            height: 200.0,
+            title: String::new(),
+            images: Vec::new(),
+            pages: vec![super::super::pdf::Page {
+                items: vec![Item::Poly {
+                    rings: vec![ring.iter().map(|p| (p.x as f64 + 20.0, p.y as f64 + 20.0)).collect()],
+                    fill: [10, 20, 30],
+                }],
+            }],
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(400.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let r = ui.available_rect_before_wrap();
+                paint_page(ui.painter(), r, &doc, 0, &[]);
+            });
+        });
+        let meshes = out
+            .shapes
+            .iter()
+            .filter(|cp| matches!(cp.shape, egui::epaint::Shape::Mesh(_)))
+            .count();
+        let polys = out
+            .shapes
+            .iter()
+            .filter(|cp| matches!(cp.shape, egui::epaint::Shape::Path(_)))
+            .count();
+        assert_eq!(meshes, 1, "the ring was painted as {meshes} meshes, expected exactly one");
+        assert_eq!(
+            polys, 0,
+            "{polys} path shapes were emitted — a shape per triangle is what feathers every \
+             internal edge into a visible seam",
+        );
+    }
+}
+
+/// THE REAL RING THAT BROKE IT — the room outline, closed.
+#[cfg(test)]
+mod a_closed_ring_is_triangulated_completely {
+    use super::*;
+
+    /// Taken verbatim off the reference report: five points for four corners, the last repeating
+    /// the first. This is the band-zero fill under the whole plot, so getting it wrong leaves a
+    /// hole under everything.
+    fn the_room_outline() -> Vec<egui::Pos2> {
+        vec![
+            egui::pos2(98.997925, 80.58617),
+            egui::pos2(496.28207, 80.58617),
+            egui::pos2(496.28207, 395.10278),
+            egui::pos2(98.997925, 395.10278),
+            egui::pos2(98.997925, 80.58617),
+        ]
+    }
+
+    fn area_of(tris: &[[egui::Pos2; 3]]) -> f32 {
+        tris.iter()
+            .map(|t| {
+                ((t[1].x - t[0].x) * (t[2].y - t[0].y) - (t[2].x - t[0].x) * (t[1].y - t[0].y)).abs()
+                    * 0.5
+            })
+            .sum()
+    }
+
+    /// FOUR CORNERS MAKE TWO TRIANGLES, and they cover the rectangle exactly.
+    ///
+    /// The old code returned ONE of them. A closing vertex that repeats the first makes every
+    /// triangle through it degenerate, the search for an ear stalls, and the loop gives up having
+    /// emitted a fraction of the ring — which on this ring is the fill under the entire drawing.
+    #[test]
+    fn the_closed_room_outline_fills_completely() {
+        let ring = the_room_outline();
+        let tris = ear_clip(&ring);
+        assert_eq!(
+            tris.len(),
+            2,
+            "a rectangle needs two triangles; got {} from a {}-point closed ring",
+            tris.len(),
+            ring.len(),
+        );
+        let want = (496.28207f32 - 98.997925) * (395.10278f32 - 80.58617);
+        let got = area_of(&tris);
+        assert!(
+            (got - want).abs() / want < 1e-4,
+            "the triangles cover {got:.1} of the rectangle's {want:.1} — the fill has a hole",
+        );
+    }
+
+    /// AND AN OPEN RING IS UNAFFECTED. Dropping a repeated closing point must not drop a real one.
+    #[test]
+    fn an_open_ring_keeps_all_its_corners() {
+        let ring = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(20.0, 0.0),
+            egui::pos2(20.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        let tris = ear_clip(&ring);
+        assert_eq!(tris.len(), 2, "an open rectangle should still be two triangles");
+        assert!((area_of(&tris) - 200.0).abs() < 1e-3, "covers {:.2} of 200.00", area_of(&tris));
+    }
 }

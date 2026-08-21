@@ -1092,6 +1092,13 @@ fn results(c: &mut Cursor, inp: &Input, room: &RoomInput, opt: &Options) {
 /// file size.
 const CONTOUR_RES: usize = 480;
 
+/// WHAT AN OBJECT STANDING IN THE ROOM IS DRAWN IN.
+///
+/// A plain warm grey, deliberately outside the band palette: it has to be obviously not a lux
+/// reading, because the whole point is that no reading was taken there. Light enough to sit under
+/// the fitting symbols without swallowing them.
+const OBJECT_FILL: [u8; 3] = [214, 211, 206];
+
 fn results_body(
     c: &mut Cursor,
     inp: &Input,
@@ -1165,6 +1172,30 @@ fn results_body(
     // painted the whole room white. Two renderers, one item, different pictures. Nothing here
     // needs a fill rule any more, so they cannot disagree.
     let p = room.plane;
+    // WHICH RASTER CELLS THE PLANE ACTUALLY EXISTS ON — the calculation's own mask, resampled.
+    //
+    // Separate from the room outline, and needed on top of it. Reported as: *"in our report the
+    // light at the furniture is 0 while in dialux it shows theres light on the surface."* The four
+    // blocks on that plan are 1.00 m tall and the working plane is at 0.80 m, so the plane runs
+    // THROUGH them: those readings are taken inside a solid and are 0 lx because an enclosed point
+    // receives nothing. The summary already excludes them — that was the fix for a room minimum of
+    // 0 lx — but this drawing did not, because it tested the outline and stopped there. So the
+    // picture said "this part of the room is dark" where the numbers beside it said "there is no
+    // reading here", and dark is the more believable of the two.
+    let measurable: Vec<bool> = if room.mask.is_empty() {
+        vec![true; nx * ny]
+    } else {
+        let mut v = vec![true; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let gx = ((i as f64 + 0.5) / nx as f64 * gc as f64) as usize;
+                let gy = ((1.0 - (j as f64 + 0.5) / ny as f64) * gr as f64) as usize;
+                v[j * nx + i] =
+                    room.mask.get(gy.min(gr - 1) * gc + gx.min(gc - 1)).copied().unwrap_or(true);
+            }
+        }
+        v
+    };
     let inside: Vec<bool> = if room.poly.len() >= 3 {
         let mut v = vec![false; nx * ny];
         for j in 0..ny {
@@ -1174,7 +1205,9 @@ fn results_body(
                 // room's MAXIMUM y.
                 let wy =
                     p.origin.y as f64 + (1.0 - (j as f64 + 0.5) / ny as f64) * p.depth as f64;
-                v[j * nx + i] = crate::factory::point_in_poly(room.poly, wx as f32, wy as f32);
+                // BOTH tests: in the room, AND somewhere a reading could be taken.
+                v[j * nx + i] = crate::factory::point_in_poly(room.poly, wx as f32, wy as f32)
+                    && measurable[j * nx + i];
             }
         }
         v
@@ -1231,6 +1264,35 @@ fn results_body(
         paint_above(c, &f, &inside, nx, ny, t, fill, &at);
     }
 
+    // ---- what is standing in the room -------------------------------------------------------
+    //
+    // The floor band fills the room's OUTLINE, so a cell struck out of `inside` still shows band
+    // zero underneath it — the darkest colour on the drawing, and the one that means "this fails".
+    // Painting the excluded cells over as a plain neutral is what makes them read as an OBJECT
+    // rather than as a hole in the lighting. A cupboard is not a dark patch; it is a cupboard.
+    //
+    // At grid resolution, so the blocks are the footprints the calculation actually excluded and
+    // not a smoothed guess at them.
+    if room.poly.len() >= 3 && room.mask.iter().any(|k| !k) {
+        let blocked: Vec<bool> = (0..nx * ny)
+            .map(|i| {
+                !measurable[i] && {
+                    // Inside the ROOM but not measurable — the outline test again, since `inside`
+                    // has already had the mask folded into it.
+                    let (i2, j2) = (i % nx, i / nx);
+                    let wx = p.origin.x as f64 + (i2 as f64 + 0.5) / nx as f64 * p.width as f64;
+                    let wy =
+                        p.origin.y as f64 + (1.0 - (j2 as f64 + 0.5) / ny as f64) * p.depth as f64;
+                    crate::factory::point_in_poly(room.poly, wx as f32, wy as f32)
+                }
+            })
+            .collect();
+        if blocked.iter().any(|b| *b) {
+            // Every blocked cell is "above" minus infinity, so this fills exactly them.
+            let flat = vec![0.0_f64; (nx + 1) * (ny + 1)];
+            paint_above(c, &flat, &blocked, nx, ny, f64::NEG_INFINITY, OBJECT_FILL, &at);
+        }
+    }
 
     // ---- the room's own edge -----------------------------------------------------------------
     //
@@ -1313,6 +1375,16 @@ fn results_body(
         // AFTER the legend, not before: `note` moves the pen, and emitting it mid-plot would print
         // the sentence across the field it is describing.
         c.note("Point values are omitted at this grid size — the grid table carries every figure.");
+    }
+    // WHAT THE GREY BLOCKS ARE. Unexplained, a colour outside the legend is just a mystery, and the
+    // obvious reading of a pale patch on a lighting drawing is "unlit".
+    let blocked = room.mask.iter().filter(|k| !**k).count();
+    if blocked > 0 && room.poly.len() >= 3 {
+        c.note(&format!(
+            "Grey: {blocked} grid point(s) fall inside objects standing in the room — the working \
+             plane runs through them, so no reading exists there and none is counted in the \
+             figures above.",
+        ));
     }
 }
 
@@ -4379,6 +4451,133 @@ mod the_mask_reaches_the_sections_that_walk_cells {
         assert!(
             t.iter().any(|s| s.contains(" lx at (")),
             "a room with no mask reported no extremes at all",
+        );
+    }
+}
+
+/// AN OBJECT IS DRAWN AS AN OBJECT, NOT AS DARKNESS.
+///
+/// Reported as: *"in our report the light at the furniture is 0 while in dialux it shows theres
+/// light on the surface."* Measured on that plan: the four blocks are 1.00 m tall and the working
+/// plane is at 0.80 m, so the plane runs through them and those readings are taken inside a solid.
+/// The summary already excluded them — that was the fix for a room minimum of 0 lx — but the
+/// drawing tested only the room outline, so it painted them with their raw 0 lx in the lowest band.
+/// The picture said "dark" where the numbers said "no reading", and dark is the more believable of
+/// the two.
+#[cfg(test)]
+mod objects_are_not_painted_as_darkness {
+    use super::tests::*;
+    use super::*;
+
+    /// A room with a block in the middle of it: the centre quarter of the grid is unmeasurable.
+    fn room_with_a_block<'a>(
+        g: &'a LuxGrid,
+        p: &'a CalcPlane,
+        poly: &'a [glam::Vec2],
+        mask: &'a [bool],
+    ) -> Input<'a> {
+        let mut i = input(g, p);
+        i.rooms[0].poly = poly;
+        i.rooms[0].mask = mask;
+        i
+    }
+
+    fn fixture() -> (LuxGrid, CalcPlane, Vec<glam::Vec2>, Vec<bool>) {
+        let (cols, rows) = (8u32, 6u32);
+        let g = grid(cols, rows);
+        let p = plane();
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        // Strike out a 2 x 2 patch of cells near the middle.
+        let mut mask = vec![true; (cols * rows) as usize];
+        for r in 2..4u32 {
+            for c in 3..5u32 {
+                mask[(r * cols + c) as usize] = false;
+            }
+        }
+        (g, p, poly, mask)
+    }
+
+    fn fills(d: &Doc) -> Vec<[u8; 3]> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Poly { fill, .. } => Some(*fill),
+                Item::Rect { fill, .. } => Some(*fill),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn texts(d: &Doc) -> Vec<String> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE EXCLUDED CELLS ARE PAINTED IN THE OBJECT COLOUR — a neutral that is not in the legend,
+    /// so it cannot be read as a lux band.
+    #[test]
+    fn a_cell_the_calculation_excluded_is_drawn_as_an_object() {
+        let (g, p, poly, mask) = fixture();
+        let d = layout(&room_with_a_block(&g, &p, &poly, &mask), &Options::default());
+        let f = fills(&d);
+        assert!(
+            f.contains(&OBJECT_FILL),
+            "nothing on the page is drawn in the object colour — the block is still showing as a \
+             lux band",
+        );
+        // …and it is NOT one of the band colours, or it would read as a reading.
+        let o = Options::default();
+        assert!(
+            !o.band_colours.contains(&OBJECT_FILL),
+            "the object colour is one of the band colours — it will be read as a lux value",
+        );
+    }
+
+    /// AND THE PAGE SAYS WHAT THE GREY IS. An unexplained colour outside the legend is a mystery,
+    /// and the obvious reading of a pale patch on a lighting drawing is "unlit".
+    #[test]
+    fn the_page_explains_the_object_colour() {
+        let (g, p, poly, mask) = fixture();
+        let d = layout(&room_with_a_block(&g, &p, &poly, &mask), &Options::default());
+        let t = texts(&d);
+        assert!(
+            t.iter().any(|s| s.contains("inside objects standing in the room")),
+            "the drawing carries a colour the legend does not explain",
+        );
+        assert!(
+            t.iter().any(|s| s.contains("4 grid point(s)")),
+            "the note does not say how many points were excluded: {:?}",
+            t.iter().filter(|s| s.contains("Grey")).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A ROOM WITH NOTHING IN IT GETS NO GREY AND NO NOTE. The note would be noise, and a stray
+    /// neutral block on a clear plan would be a defect.
+    #[test]
+    fn a_room_with_nothing_in_it_is_drawn_as_before() {
+        let (g, p, poly, _) = fixture();
+        let all = vec![true; (g.cols * g.rows) as usize];
+        let d = layout(&room_with_a_block(&g, &p, &poly, &all), &Options::default());
+        assert!(
+            !fills(&d).contains(&OBJECT_FILL),
+            "an empty room was given an object block",
+        );
+        assert!(
+            !texts(&d).iter().any(|s| s.contains("inside objects standing")),
+            "an empty room was given the object note",
         );
     }
 }

@@ -1481,6 +1481,22 @@ impl LightState {
         }
     }
 
+    /// WHETHER THE FALLBACK PALETTE CAN CHANGE THE PICTURE AT ALL.
+    ///
+    /// Asked as: *"does this even do anything? it seems to be redundant."* With the default scale
+    /// it does not — four thresholds make five bands and there are five band colours, so every band
+    /// is coloured explicitly and the palette is never reached. It becomes live in exactly two
+    /// cases, and the control is shown in exactly those.
+    pub fn palette_is_in_play(&self, opt: &crate::report::Options, room_max: f64) -> bool {
+        // A CONTINUOUS SCALE has no bands, so the palette draws the whole field.
+        if opt.scale.bands.is_empty() {
+            return true;
+        }
+        // …or a band has been left without a colour — by adding a threshold, or by `reset`.
+        let bands = opt.scale.edges(room_max).len().saturating_sub(1);
+        opt.band_colours.len() < bands
+    }
+
     /// The fitting a NEW point should get: the chosen one, or nothing.
     fn default_profile(&self) -> String {
         if self.profiles.contains_key(&self.active_profile) {
@@ -3494,24 +3510,34 @@ impl LightState {
                 // indistinguishable from broken and was reported as exactly that. There is one
                 // editor now, and it edits the settings the report and both views all read.
                 crate::report::ui::scale_editor_ui(ui, report, room_max, self.ramp.rgb_fn());
-                ui.separator();
-                // THE PALETTE, which is what a band with no colour of its own — and a CONTINUOUS
-                // scale, which has no bands at all — is drawn in. It is not the band colours; those
-                // are picked one at a time above.
-                ui.label(egui::RichText::new("Fallback palette").small().weak())
-                    .on_hover_text(
-                        "Used where the scale is NOT banded, and for any band left without a \
-                         colour of its own.",
-                    );
-                let cur = self.ramp;
-                egui::ComboBox::from_id_salt("lux_ramp")
-                    .width(190.0)
-                    .selected_text(cur.label())
-                    .show_ui(ui, |ui| {
-                        for r in LuxRamp::ALL {
-                            ui.selectable_value(&mut self.ramp, r, r.label());
-                        }
-                    });
+                // THE PALETTE, ONLY WHEN IT CAN CHANGE ANYTHING.
+                //
+                // "does this even do anything? it seems to be redundant." Fair, and nearly right:
+                // the default scale has four thresholds — five bands — and five band colours, so
+                // every band has an explicit colour and the palette is never consulted. It is only
+                // reached when the scale is CONTINUOUS, which has no bands at all, or when a band
+                // has been left without a colour of its own.
+                //
+                // Both of those are real, so the control is not dead. But showing it permanently
+                // says it is live when it usually is not, and a control that does nothing when you
+                // turn it is the same complaint as a control that is broken. Shown when it bites.
+                if self.palette_is_in_play(report, room_max) {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Fallback palette").small().weak())
+                        .on_hover_text(
+                            "In use right now: the scale is not banded, or a band has no colour of \
+                             its own. Give every band a colour and this stops mattering.",
+                        );
+                    let cur = self.ramp;
+                    egui::ComboBox::from_id_salt("lux_ramp")
+                        .width(190.0)
+                        .selected_text(cur.label())
+                        .show_ui(ui, |ui| {
+                            for r in LuxRamp::ALL {
+                                ui.selectable_value(&mut self.ramp, r, r.label());
+                            }
+                        });
+                }
             });
 
             ui.separator();

@@ -64811,3 +64811,63 @@ mod the_lux_sheet_sits_on_the_floor {
         );
     }
 }
+
+/// FORENSIC PROBE — does the preview's triangulator finish the polygons the report gives it?
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release does_ear_clip_finish -- --ignored --nocapture`
+#[cfg(test)]
+mod ear_clip_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn does_ear_clip_finish() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+        app.light.apply_config(cfg, &app.doc);
+        let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc).clone();
+        app.light.calculate(&plan, Some(&app.factory));
+
+        let inp = app.report_input().expect("report input");
+        let doc = crate::report::layout::layout(&inp, &app.report_opts);
+
+        let (mut polys, mut short, mut lost) = (0usize, 0usize, 0usize);
+        let (mut worst_want, mut worst_got, mut worst_len) = (0usize, 0usize, 0usize);
+        for pg in &doc.pages {
+            for it in &pg.items {
+                if let crate::report::pdf::Item::Poly { rings, .. } = it {
+                    for r in rings {
+                        let pts: Vec<egui::Pos2> =
+                            r.iter().map(|(x, y)| egui::pos2(*x as f32, *y as f32)).collect();
+                        if pts.len() < 3 {
+                            continue;
+                        }
+                        polys += 1;
+                        let want = pts.len() - 2;
+                        let got = crate::report::ui::ear_clip(&pts).len();
+                        if got < want {
+                            short += 1;
+                            lost += want - got;
+                            if want - got > worst_want.saturating_sub(worst_got) {
+                                worst_want = want;
+                                worst_got = got;
+                                worst_len = pts.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("polygons on the page      : {polys}");
+        println!("INCOMPLETELY triangulated : {short}");
+        println!("triangles never emitted   : {lost}");
+        if short > 0 {
+            println!("worst: a {worst_len}-vertex ring wanted {worst_want} triangles, got {worst_got}");
+        }
+    }
+}
+
