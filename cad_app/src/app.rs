@@ -833,17 +833,37 @@ fn save_file_worker(
         rec.alpha_b64 = if g.alpha.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.alpha) };
     }
     let lower = path.to_ascii_lowercase();
-    let bytes: Vec<u8> = if lower.ends_with(".dxf") {
+    let bytes: Vec<u8> = if lower.ends_with(".dxf") || lower.ends_with(".dwg") {
+        // A DWG GOES OUT AS DXF FIRST. Nothing here writes DWG — it is closed, versioned and
+        // undocumented — so the drawing is written in the format this app owns and handed to the
+        // same converter that opens a DWG, running the other way. See `save_as_dwg`.
         cad_io::dxf::write_dxf(&doc).into_bytes()
     } else if lower.ends_with(".rsm") {
         cad_io::rsm::write_rsm(&doc)
     } else {
-        return Err("unknown extension (expected .dxf or .rsm)".to_string());
+        return Err("unknown extension (expected .dxf, .dwg or .rsm)".to_string());
     };
     // Write ATOMICALLY (temp file + rename) so an interrupted write — e.g. a crash or a close
     // during an autosave — can never truncate the real file; the rename either happens whole or
     // not at all, leaving the previous good file intact.
-    atomic_write(path, &bytes).map_err(|e| format!("write '{path}': {e}"))?;
+    //
+    // A DWG is written to a TEMP DXF and converted ONTO the real path, so a conversion that fails
+    // leaves the previous `.dwg` untouched rather than replacing it with a DXF wearing its name —
+    // which would open in nothing and read as a corrupt file.
+    if lower.ends_with(".dwg") {
+        let stem = std::path::Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "drawing".into());
+        let tmp = std::env::temp_dir().join(format!("simlux_save_{stem}.dxf"));
+        atomic_write(&tmp.to_string_lossy(), &bytes)
+            .map_err(|e| format!("write '{}': {e}", tmp.display()))?;
+        let r = save_as_dwg(&tmp, std::path::Path::new(path));
+        let _ = std::fs::remove_file(&tmp);
+        r?;
+    } else {
+        atomic_write(path, &bytes).map_err(|e| format!("write '{path}': {e}"))?;
+    }
     // The sidecar is always written (matching the old synchronous path); it carries SIMLUX +
     // the 3D model. Any sidecar failure is reported but does not fail the drawing save.
     let solids = cfg.factory.model.features.len();
@@ -869,6 +889,98 @@ fn save_file_worker(
         Err(e) => format!("  saved '{}'  ({} bytes) · ! SIMLUX save: {}", path, bytes.len(), e),
     };
     Ok(SavePayload { bytes: bytes.len(), note })
+}
+
+/// Turn a written DXF into the DWG the user actually asked for.
+///
+/// Reported as: *"why cant i save as dwg?"* — and *"and fix the file saving"*. The save path took
+/// `.dxf` and `.rsm` and said so, which answers the question without solving it: a practice's
+/// filing, its consultants and its clients ask for `.dwg`.
+///
+/// THE ERROR IS THE POINT OF THIS FUNCTION. Every failure here is one somebody has to act on — no
+/// AutoCAD on this machine, a converter that could not be run, a conversion that produced nothing —
+/// and each has a different thing to do about it. "Save failed" would send them looking at the
+/// drawing, which is fine.
+fn save_as_dwg(dxf: &std::path::Path, dwg: &std::path::Path) -> Result<(), String> {
+    let conv = dxf_to_dwg_converter().ok_or_else(|| {
+        "no DXF→DWG converter found. DWG is a closed format, so SIMLUX writes a DXF and asks \
+         AutoCAD's headless core (accoreconsole) to save it on — the same tool that opens a DWG. \
+         Install AutoCAD, or set RUSTCAD_DXF2DWG to \"yourconverter {in} {out}\". Saving as .dxf \
+         needs none of this and loses nothing."
+            .to_string()
+    })?;
+    convert_dxf_to_dwg(&conv, dxf, dwg)
+}
+
+/// Run one named converter.
+///
+/// SPLIT FROM [`save_as_dwg`] so the conversion can be exercised with a stub. A test that had to
+/// find AutoCAD would run on one machine and quietly skip on every other, which is much the same
+/// as not having a test.
+fn convert_dxf_to_dwg(
+    conv: &str,
+    dxf: &std::path::Path,
+    dwg: &std::path::Path,
+) -> Result<(), String> {
+    // CONVERTED TO A TEMP FILE AND RENAMED ON, never written over the target.
+    //
+    // The first version deleted the destination before running the converter, so a conversion that
+    // then failed had already destroyed the drawing it was saving over. Caught by the test named
+    // for exactly that, which is the reason to write the test before believing the code.
+    let staged = dwg.with_extension("dwg.savetmp");
+    let _ = std::fs::remove_file(&staged);
+    let (in_s, out_s) = (dxf.to_string_lossy().to_string(), staged.to_string_lossy().to_string());
+
+    // The converter takes the same shapes as the DWG→DXF one: a `{in}/{out}` template through the
+    // shell, a `.cmd` wrapper through `cmd /c`, or a bare executable.
+    let status = if conv.contains("{in}") {
+        let cmd = conv.replace("{in}", &in_s).replace("{out}", &out_s);
+        if cfg!(windows) {
+            // RAW, NOT `arg`. Rust escapes an argument for a normal Windows program — quotes get
+            // backslashed — and `cmd` does not use those rules, so a command with a quoted path in
+            // it arrives mangled and exits 1. This is why the template form never worked here.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                std::process::Command::new("cmd").arg("/c").raw_arg(&cmd).status()
+            }
+            #[cfg(not(windows))]
+            {
+                unreachable!()
+            }
+        } else {
+            let q = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+            let shcmd = conv.replace("{in}", &q(&in_s)).replace("{out}", &q(&out_s));
+            std::process::Command::new("sh").arg("-c").arg(&shcmd).status()
+        }
+    } else if cfg!(windows)
+        && (conv.to_ascii_lowercase().ends_with(".cmd")
+            || conv.to_ascii_lowercase().ends_with(".bat"))
+    {
+        std::process::Command::new("cmd").arg("/c").arg(conv).arg(&in_s).arg(&out_s).status()
+    } else {
+        std::process::Command::new(conv).arg(&in_s).arg(&out_s).status()
+    };
+    let outcome = match status {
+        // EXISTENCE, NOT THE EXIT CODE. accoreconsole is cheerful about failure — a script that
+        // stopped at a prompt still exits zero — so the only thing worth believing is whether the
+        // file is there. The import direction learned this the same way.
+        Ok(_) if staged.is_file() => Ok(()),
+        Ok(s) => Err(format!(
+            "the DWG converter exited {s} and produced no file. A drawing that needs a font or an \
+             xref AutoCAD cannot find will stop at a prompt with nothing to answer it; run \
+             '{conv}' by hand on the DXF to see which."
+        )),
+        Err(e) => Err(format!("could not run the DWG converter '{conv}': {e}")),
+    };
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&staged);
+        return outcome;
+    }
+    std::fs::rename(&staged, dwg).map_err(|e| {
+        let _ = std::fs::remove_file(&staged);
+        format!("the DWG was converted but could not be put in place at '{}': {e}", dwg.display())
+    })
 }
 
 fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
@@ -29763,7 +29875,7 @@ impl CadApp {
             cad_io::rsm::write_rsm(plan)
         } else {
             self.history.push(format!(
-                "  ! save '{}': unknown extension (expected .dxf or .rsm)", path
+                "  ! save '{}': unknown extension (expected .dxf, .dwg or .rsm)", path
             ));
             return;
         };
@@ -29962,7 +30074,7 @@ impl CadApp {
             return;
         };
         let lower = path.to_ascii_lowercase();
-        if !(lower.ends_with(".dxf") || lower.ends_with(".rsm")) {
+        if !(lower.ends_with(".dxf") || lower.ends_with(".rsm") || lower.ends_with(".dwg")) {
             return; // never autosave an untitled or non-drawing file to a surprise location
         }
         if self.last_autosave.elapsed().as_secs() < AUTOSAVE_SECS {
@@ -30460,6 +30572,12 @@ impl CadApp {
                                 let before = dlg.ext.clone();
                                 ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF (*.dxf)");
                                 ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "Native (*.rsm)");
+                                // DWG ON THE SAVE SIDE TOO. It was offered for opening and not for
+                                // saving, which is the shape of "why cant i save as dwg?": the app
+                                // plainly handled the format, so its absence read as an oversight
+                                // rather than a decision. It needs AutoCAD present — the same
+                                // dependency opening one already has — and says so if it is not.
+                                ui.selectable_value(&mut dlg.ext, ".dwg".to_string(), "AutoCAD (*.dwg)");
                                 if dlg.mode == FileDialogMode::Open && dlg.ext != before
                                     && !dlg.filename.to_ascii_lowercase().ends_with(&dlg.ext)
                                 {
@@ -50115,6 +50233,45 @@ fn dwg_converter() -> Option<String> {
     None
 }
 
+/// Locate a DXF→DWG converter — the mirror of [`dwg_converter`], and the same search.
+///
+/// Reported as: *"why cant i save as dwg?"* Because the save path took `.dxf` and `.rsm` and said
+/// so, which answers the question without solving it: a practice's filing, its consultants and its
+/// clients ask for `.dwg`, and "we write an equivalent DXF" is not an answer anybody can hand over.
+///
+/// Nothing here writes DWG directly — it is closed, versioned and undocumented — so the app writes
+/// the DXF it already knows how to write and asks AutoCAD's own headless core to save it on. The
+/// dependency is the one this machine already has, because it is what opens a DWG too.
+fn dxf_to_dwg_converter() -> Option<String> {
+    if let Ok(c) = std::env::var("RUSTCAD_DXF2DWG") {
+        let c = c.trim().to_string();
+        if !c.is_empty() {
+            return Some(c);
+        }
+    }
+    let wrapper = if cfg!(windows) { "dxf2dwg.cmd" } else { "dxf2dwg.sh" };
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            let w = anc.join("tools/dwgconv").join(wrapper);
+            if w.is_file() {
+                return Some(w.to_string_lossy().to_string());
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let w = std::path::Path::new(&home).join(".local/bin/dxf2dwg");
+        if w.is_file() {
+            return Some(w.to_string_lossy().to_string());
+        }
+    }
+    for name in ["dxf2dwg", wrapper] {
+        if std::process::Command::new(name).output().is_ok() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 /// Run the converter `conv` to turn `dwg` into `out` (a .dxf). A `{in}/{out}`
 /// template runs via the shell; a bare path is spawned directly. `.cmd`/`.bat`
 /// wrappers on Windows are launched through `cmd /c` (they are not PE exes).
@@ -50124,7 +50281,18 @@ fn run_dwg_conversion(conv: &str, dwg: &str, out: &std::path::Path) -> Result<()
     let status = if conv.contains("{in}") {
         let cmd = conv.replace("{in}", dwg).replace("{out}", &out_s);
         if cfg!(windows) {
-            std::process::Command::new("cmd").arg("/c").arg(&cmd).status()
+            // RAW, NOT `arg` — see `convert_dxf_to_dwg`. Rust escapes an argument for a normal
+            // Windows program and `cmd` does not use those rules, so a command carrying a quoted
+            // path arrives mangled and exits 1. The same flaw, in the other direction.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                std::process::Command::new("cmd").arg("/c").raw_arg(&cmd).status()
+            }
+            #[cfg(not(windows))]
+            {
+                unreachable!()
+            }
         } else {
             let q = |s: &str| format!("'{}'", s.replace('\'', "'\''"));
             let shcmd = conv.replace("{in}", &q(dwg)).replace("{out}", &q(&out_s));
@@ -63724,6 +63892,150 @@ mod the_owners_three_room_plan {
                 r.name,
                 r.fixtures.len(),
             );
+        }
+    }
+}
+
+/// SAVING AS DWG.
+///
+/// Asked as "why cant i save as dwg?" and then "and fix the file saving". The save path took
+/// `.dxf` and `.rsm` and said so, which answers the question without solving it: a practice's
+/// filing, its consultants and its clients ask for `.dwg`.
+///
+/// DWG IS A CLOSED FORMAT and nothing here writes one. The drawing goes out as the DXF this app
+/// already writes, and AutoCAD's own headless core saves it on — the same tool, running the other
+/// way, that opens a DWG today. Every test below uses a STUB converter rather than looking for
+/// AutoCAD: a test that needed it would run on one machine and quietly skip on every other, which
+/// is much the same as not having one.
+#[cfg(test)]
+mod a_drawing_can_be_saved_as_dwg {
+    use super::*;
+
+    /// A converter that just copies its input to its output — enough to prove the plumbing.
+    // MUST CONTAIN `{in}`, or it is treated as a bare executable name rather than a shell
+    // command — which is how the first version of these tests failed, with "cannot find the path".
+    fn stub() -> &'static str {
+        if cfg!(windows) { "copy /y \"{in}\" \"{out}\"" } else { "cp {in} {out}" }
+    }
+
+    // Runs, exits zero, and writes nothing.
+    fn stub_that_writes_nothing() -> &'static str {
+        if cfg!(windows) { "echo {in} 1>nul" } else { "true {in}" }
+    }
+
+    /// THE ENVIRONMENT IS PROCESS-WIDE and tests run in parallel, so the two that set
+    /// `RUSTCAD_DXF2DWG` have to take turns. They did not at first, and one duly picked up the
+    /// other's deliberately-broken converter and failed for a reason that had nothing to do with
+    /// what it was testing.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join("simlux_dwg_save");
+        let _ = std::fs::create_dir_all(&d);
+        d.join(name)
+    }
+
+    #[test]
+    fn the_converter_is_run_and_its_output_is_the_file() {
+        let dxf = tmp("in.dxf");
+        let dwg = tmp("out.dwg");
+        std::fs::write(&dxf, b"  0\nSECTION\n").expect("the dxf");
+        let _ = std::fs::remove_file(&dwg);
+
+        convert_dxf_to_dwg(stub(), &dxf, &dwg).expect("the stub converter runs");
+        assert!(dwg.is_file(), "no file at {}", dwg.display());
+        assert_eq!(std::fs::read(&dwg).expect("read"), b"  0\nSECTION\n");
+        let _ = std::fs::remove_file(&dxf);
+        let _ = std::fs::remove_file(&dwg);
+    }
+
+    /// A CONVERTER THAT PRODUCES NOTHING IS A FAILURE, whatever it claims.
+    ///
+    /// accoreconsole is cheerful about failure: a script that stopped at a prompt still exits
+    /// zero. The DWG→DXF direction learned that the hard way — "the only symptom is a DXF that
+    /// never appears" — so existence, not the exit code, is what is believed.
+    #[test]
+    fn a_converter_that_writes_nothing_is_reported() {
+        let dxf = tmp("in2.dxf");
+        let dwg = tmp("out2.dwg");
+        std::fs::write(&dxf, b"x").expect("the dxf");
+        let _ = std::fs::remove_file(&dwg);
+
+        let e = convert_dxf_to_dwg(stub_that_writes_nothing(), &dxf, &dwg)
+            .expect_err("a silent failure must be caught");
+        assert!(e.contains("produced no file"), "unhelpful: {e}");
+        assert!(e.contains("run"), "the message must say what to do next: {e}");
+        let _ = std::fs::remove_file(&dxf);
+    }
+
+    /// AND A FAILED SAVE DOES NOT DESTROY THE FILE IT WAS SAVING OVER.
+    ///
+    /// The whole reason the DXF goes to a temp file first. Writing it straight onto the `.dwg` and
+    /// converting in place would, on any failure, leave a DXF wearing a `.dwg` name — a file that
+    /// opens in nothing and reads as corrupt, in place of the drawing that was there.
+    #[test]
+    fn a_failed_conversion_leaves_the_previous_dwg_alone() {
+        let path = tmp("keep.dwg");
+        std::fs::write(&path, b"the previous drawing").expect("seed");
+
+        let doc = Document::default();
+        let cfg = crate::simlux_io::SimluxConfig::default();
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // A converter that cannot be run at all.
+        std::env::set_var("RUSTCAD_DXF2DWG", "simlux-no-such-converter-xyz {in} {out}");
+        let r = save_file_worker(&path.to_string_lossy(), doc, cfg, Vec::new());
+        std::env::remove_var("RUSTCAD_DXF2DWG");
+
+        assert!(r.is_err(), "a save that could not convert reported success");
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            b"the previous drawing",
+            "the drawing that was already there was overwritten by a failed save",
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE EXTENSION IS ACCEPTED. Before, `.dwg` fell through to "unknown extension (expected .dxf
+    /// or .rsm)" — the message in the report.
+    #[test]
+    fn dwg_is_no_longer_an_unknown_extension() {
+        let path = tmp("ext.dwg");
+        let _ = std::fs::remove_file(&path);
+        let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("RUSTCAD_DXF2DWG", stub());
+        let r = save_file_worker(
+            &path.to_string_lossy(),
+            Document::default(),
+            crate::simlux_io::SimluxConfig::default(),
+            Vec::new(),
+        );
+        std::env::remove_var("RUSTCAD_DXF2DWG");
+
+        match r {
+            Ok(_) => assert!(path.is_file(), "the save reported success and wrote no file"),
+            Err(e) => panic!("a .dwg save failed: {e}"),
+        }
+        // What landed is what the converter was given — the DXF this app writes.
+        let head = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(head.contains("SECTION"), "the file does not look like the drawing that was sent");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AND AN UNKNOWN ONE STILL IS, naming every format that works.
+    #[test]
+    fn an_unknown_extension_still_says_which_ones_work() {
+        let e = save_file_worker(
+            "whatever.pdf",
+            Document::default(),
+            crate::simlux_io::SimluxConfig::default(),
+            Vec::new(),
+        );
+        let e = match e {
+            Err(e) => e,
+            Ok(_) => panic!("a .pdf was accepted as a drawing"),
+        };
+        for want in [".dxf", ".dwg", ".rsm"] {
+            assert!(e.contains(want), "{want} is missing from {e:?}");
         }
     }
 }
