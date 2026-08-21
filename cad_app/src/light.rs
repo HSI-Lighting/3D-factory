@@ -954,6 +954,23 @@ pub struct LightState {
     pub drag: Option<LumDrag>,
     /// Monotonic id source for placed luminaires.
     pub next_id: u32,
+    /// WHICH BLOCK INSTANCE EACH FIXTURE WAS PLACED AS — fixture id → dobject handle.
+    ///
+    /// Reported as: "i rotated a light and the result was still valid… does rotating the lights in
+    /// the 2d actually rotate a light in simlux as well?" It did not. `rotate`, `move`, `scale` and
+    /// `mirror` edit `doc.dobjects` and nothing else, so the symbol turned on the plan and the
+    /// luminaire behind it kept the aiming it was placed with. The calculation was then answering a
+    /// question about a layout the drawing no longer showed — and since nothing about the fixture
+    /// had changed, the result did not even go out of date.
+    ///
+    /// A HANDLE, not a position. The link used to be "the block of this fitting standing where the
+    /// fixture stands", which is exact right up until either of them moves — so it could never
+    /// survive the very edits it needed to follow. A dobject's handle is stable across moves,
+    /// rotations, undo, redo and a save/reopen.
+    ///
+    /// Keyed by NAME-like ids on both sides rather than positions in a list, because both lists are
+    /// reordered by ordinary editing.
+    pub symbol_of: std::collections::BTreeMap<u32, u64>,
     /// Rows/columns for the ▼ Luminaires grid array — the usual way a room is lit.
     pub array_rows: u32,
     pub array_cols: u32,
@@ -1151,6 +1168,7 @@ impl LightState {
             hover: None,
             drag: None,
             next_id: 1,
+            symbol_of: Default::default(),
             array_rows: 3,
             array_cols: 4,
             mount_to_ceiling: true,
@@ -2718,6 +2736,7 @@ impl LightState {
             factory: Default::default(),
             luminaires: self.luminaires.clone(),
             next_luminaire_id: self.next_id,
+            symbol_of: self.symbol_of.clone(),
             maintenance: Some(self.maintenance),
         }
     }
@@ -2748,6 +2767,11 @@ impl LightState {
             self.drag = None;
             let highest = self.luminaires.iter().map(|l| l.id).max().unwrap_or(0);
             self.next_id = cfg.next_luminaire_id.max(highest + 1);
+            // The link between each fixture and the block instance it was placed as. A project
+            // written before this existed simply has none, and its fixtures stop following their
+            // symbols until they are placed again — which is the honest outcome, since there is no
+            // record of which of fifty identical blocks belonged to which light.
+            self.symbol_of.clone_from(&cfg.symbol_of);
             repair_from_blocks(&mut self.luminaires, doc, &cfg.lux_block_ies);
         }
         if !cfg.materials.is_empty() {

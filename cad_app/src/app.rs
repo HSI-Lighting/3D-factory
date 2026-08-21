@@ -2153,6 +2153,8 @@ pub struct CadApp {
     /// for the gesture. See `begin_fixture_drag`: the link between a fixture and its symbol is by
     /// position, so it can only be established before the fixture moves.
     light_drag_symbols: Vec<(u32, usize)>,
+    /// The `edit_seq` the fixtures were last re-read from their symbols at.
+    symbol_sync_seq: u64,
     /// The saved report settings have been read, and their logo images with them.
     report_prefs_loaded: bool,
     /// THE LAID-OUT DOCUMENT THE PREVIEW IS PAINTING, kept between frames.
@@ -4018,6 +4020,7 @@ impl Default for CadApp {
             calc_selected: None,
             calc_started: None,
             light_drag_symbols: Vec::new(),
+            symbol_sync_seq: 0,
             report_prefs_loaded: false,
             report_doc: None,
             report_doc_key: None,
@@ -4731,11 +4734,21 @@ impl CadApp {
         self.index_dirty = true;
         self.touch_view();
 
+        // THE HANDLE OF THE INSTANCE JUST PUSHED — the durable link between this fixture and this
+        // symbol. `from_block` names the block DEFINITION, which every instance of a fitting
+        // shares, so it can say WHAT the symbol is and never WHICH ONE.
+        let handle = self.doc.dobjects.last().map(|d| d.handle);
         let id = self.light.place_point(x, y);
         if let Some(l) = self.light.luminaires.iter_mut().find(|l| l.id == id) {
             l.profile.clone_from(&f.profile);
             l.from_block = Some(block);
         }
+        if let Some(h) = handle {
+            self.light.symbol_of.insert(id, h);
+        }
+        // The fixture and its symbol are in step as of now, so the sync must not read the edit it
+        // has just made as somebody else's rotation.
+        self.symbol_sync_seq = self.edit_seq;
         // `place_point` stages its own copy, and the step above already covers the whole act —
         // block and light together. Left staged, it would be picked up by the NEXT snapshot as if
         // it were that edit's "before", so one Undo would reach back through two placements.
@@ -30846,6 +30859,91 @@ impl CadApp {
     }
 
 
+    /// RE-READ EVERY FIXTURE FROM THE SYMBOL IT WAS PLACED AS.
+    ///
+    /// Reported as: "i rotated a light and the result was still valid… does rotating the lights in
+    /// the 2d actually rotate a light in simlux as well?" It did not. `apply_rotate`, `apply_move`,
+    /// `apply_scale` and `apply_mirror` edit `doc.dobjects` and nothing else — verified by reading
+    /// them — so the symbol turned on the plan and the luminaire behind it kept the aiming it was
+    /// placed with. The calculation then answered a question about a layout the drawing no longer
+    /// showed, and because nothing about the FIXTURE had changed, the result did not even go out of
+    /// date. The staleness check was working; there was simply nothing for it to notice.
+    ///
+    /// ONE PLACE, DRIVEN BY "THE DRAWING CHANGED", rather than a call added to each editing
+    /// command. There are a dozen of those and more will be written; every one of them would have
+    /// to remember, and the day one does not, a light silently stops matching its symbol. Every
+    /// edit takes an undo snapshot and every snapshot bumps `edit_seq`, so that is the signal — and
+    /// it covers undo and redo too, which restore a whole document and would otherwise leave the
+    /// fixtures behind.
+    ///
+    /// Returns how many fixtures actually moved, so the caller only invalidates when something did.
+    fn sync_fixtures_from_symbols(&mut self) -> usize {
+        if self.light.symbol_of.is_empty() {
+            return 0;
+        }
+        let ku = self.doc.units.metres_per_unit;
+        let k = if ku.is_finite() && ku > 0.0 { ku } else { 1.0 };
+        // Handle → geometry, built once. A scan per fixture would be O(fixtures × dobjects), which
+        // on a real plan is five hundred times fifty thousand.
+        let by_handle: std::collections::HashMap<u64, (Vec2, f64)> = self
+            .doc
+            .dobjects
+            .iter()
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some((d.handle, (b.insert, b.rotation))),
+                _ => None,
+            })
+            .collect();
+
+        let mut moved = 0usize;
+        for l in self.light.luminaires.iter_mut() {
+            let Some(h) = self.light.symbol_of.get(&l.id) else { continue };
+            // A HANDLE THAT NO LONGER RESOLVES IS LEFT ALONE. The symbol may have been erased from
+            // the drawing, and moving the light to the origin — or deleting it — because a block
+            // went missing would be a far larger decision than this function is entitled to make.
+            let Some((insert, rot)) = by_handle.get(h) else { continue };
+            let (wx, wy) = ((insert.x * k) as f32, (insert.y * k) as f32);
+            let deg = rot.to_degrees() as f32;
+            // A TOLERANCE, because the position makes a round trip through drawing units every
+            // time a fixture is dragged. Writing back a value that differs in its last bit would
+            // mark the result out of date on a frame where nothing happened.
+            let dp = (l.position.x - wx).abs().max((l.position.y - wy).abs());
+            let dr = (l.rotation_deg - deg).abs();
+            if dp <= 1e-4 && dr <= 1e-3 {
+                continue;
+            }
+            l.position.x = wx;
+            l.position.y = wy;
+            l.rotation_deg = deg;
+            moved += 1;
+        }
+        moved
+    }
+
+    /// Keep the fixtures with their symbols, once per drawing edit.
+    ///
+    /// Cheap when nothing happened: an integer comparison. The work only runs on the frame after an
+    /// edit actually took a snapshot.
+    fn tick_symbol_sync(&mut self) {
+        if self.symbol_sync_seq == self.edit_seq {
+            return;
+        }
+        self.symbol_sync_seq = self.edit_seq;
+        // NOT DURING A SIMLUX DRAG. There the FIXTURE is what the pointer is moving and the symbol
+        // is following it; pulling the other way in the same frame would have the two arguing, and
+        // the drag would fight its own undo snapshot.
+        if self.light.drag.is_some() {
+            return;
+        }
+        let n = self.sync_fixtures_from_symbols();
+        if n > 0 {
+            self.history.push(format!(
+                "  ↻ {n} fitting(s) followed their symbol — recalculate for the new layout"
+            ));
+            self.touch_view();
+        }
+    }
+
     /// Start dragging a fixture, and take its SYMBOL along.
     ///
     /// Reported as: dragging a fixture moves the light but not its symbol. It did — `from_block`
@@ -42736,6 +42834,9 @@ impl eframe::App for CadApp {
         }
         // Is the answer on screen still an answer about THIS building? Asked before anything draws
         // it, and throttled inside — see `LightState::refresh_staleness`.
+        // The fixtures follow their symbols before anything asks whether the answer is still true —
+        // a light that has just been rotated on the plan must read as a change, not as unchanged.
+        self.tick_symbol_sync();
         self.refresh_light_staleness();
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
@@ -62335,6 +62436,148 @@ mod fixtures_are_undoable {
             "the dragged fixture's symbol is at {:?}",
             got[1],
         );
+    }
+
+    /// ROTATING A SYMBOL ON THE PLAN ROTATES THE LIGHT BEHIND IT.
+    ///
+    /// Asked as: *"does rotating the lights in the 2d actually rotate a light in simlux as well?
+    /// verify that too"*. It did not. `apply_rotate` edits `doc.dobjects` and nothing else — so did
+    /// `apply_move`, `apply_scale` and `apply_mirror` — and the luminaire kept the aiming it was
+    /// placed with while its symbol turned on the drawing.
+    ///
+    /// That is not only a wrong calculation, it is an INVISIBLY wrong one: the fixture had not
+    /// changed, so the fingerprint had not changed, so the result did not even go out of date.
+    /// "i rotated a light and the result was still valid" — the staleness check was working, there
+    /// was simply nothing for it to notice.
+    #[test]
+    fn rotating_a_symbol_rotates_its_light() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        assert!(app.light.symbol_of.contains_key(&id), "the fixture was not linked to its symbol");
+        assert_eq!(app.light.luminaires[0].rotation_deg, 0.0);
+
+        // Select the symbol on the drawing and turn it a quarter turn about its own insert.
+        let i = app
+            .doc
+            .dobjects
+            .iter()
+            .position(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .expect("a symbol");
+        app.selection = vec![i];
+        app.apply_rotate(Vec2::new(1.0, 1.0), std::f64::consts::FRAC_PI_2);
+        app.tick_symbol_sync();
+
+        let l = &app.light.luminaires[0];
+        assert!(
+            (l.rotation_deg - 90.0).abs() < 1e-3,
+            "the symbol was turned 90° and the light reads {}°",
+            l.rotation_deg,
+        );
+    }
+
+    /// MOVING ONE MOVES THE OTHER, and about a pivot the light orbits with its symbol.
+    #[test]
+    fn a_symbol_moved_on_the_plan_takes_its_light_with_it() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        let i = app
+            .doc
+            .dobjects
+            .iter()
+            .position(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .expect("a symbol");
+        app.selection = vec![i];
+
+        // A quarter turn about the ORIGIN: (1, 1) goes to (-1, 1).
+        app.apply_rotate(Vec2::new(0.0, 0.0), std::f64::consts::FRAC_PI_2);
+        app.tick_symbol_sync();
+        let _ = id;
+        let l = &app.light.luminaires[0];
+        assert!(
+            (l.position.x + 1.0).abs() < 1e-4 && (l.position.y - 1.0).abs() < 1e-4,
+            "the light is at ({}, {}) after its symbol orbited to (-1, 1)",
+            l.position.x,
+            l.position.y,
+        );
+    }
+
+    /// AND THE RESULT GOES OUT OF DATE FOR IT.
+    ///
+    /// The whole point of the report: "the result should be invalidated even if the position of the
+    /// light is changed. i rotated a light and the result was still valid."
+    #[test]
+    fn a_symbol_rotated_on_the_plan_puts_the_result_out_of_date() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        placed(&mut app, (1.0, 1.0));
+        // Pretend a calculation just ran over this scene.
+        let plan = app.plan_doc().clone();
+        let fp = app.light.current_fingerprint(&plan, Some(&app.factory)).expect("a fingerprint");
+        app.light.results_fingerprint = Some(fp);
+        app.light.results_stale = false;
+        app.light.stale_checked = None;
+
+        let i = app
+            .doc
+            .dobjects
+            .iter()
+            .position(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_)))
+            .expect("a symbol");
+        app.selection = vec![i];
+        app.apply_rotate(Vec2::new(1.0, 1.0), std::f64::consts::FRAC_PI_2);
+        app.tick_symbol_sync();
+
+        app.light.stale_checked = None;
+        let plan = app.plan_doc().clone();
+        app.light.refresh_staleness(&plan, Some(&app.factory));
+        assert!(
+            app.light.results_stale,
+            "a fitting was turned 90° on the plan and the answer still claimed to be current",
+        );
+    }
+
+    /// A SYMBOL THAT IS NOT THERE ANY MORE LEAVES ITS LIGHT ALONE.
+    ///
+    /// Somebody may erase a block from the drawing directly. Moving the light to the origin — or
+    /// deleting it — because a handle stopped resolving would be a far larger decision than a
+    /// bookkeeping pass is entitled to make, and it would be taken silently.
+    #[test]
+    fn a_light_whose_symbol_was_erased_stays_put() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        placed(&mut app, (3.0, 4.0));
+        app.doc.dobjects.retain(|d| !matches!(d.geom, cad_kernel::Geom::BlockRef(_)));
+        app.edit_seq += 1;
+        app.tick_symbol_sync();
+
+        let l = &app.light.luminaires[0];
+        assert!(
+            (l.position.x - 3.0).abs() < 1e-4 && (l.position.y - 4.0).abs() < 1e-4,
+            "the light moved to ({}, {}) because its symbol was erased",
+            l.position.x,
+            l.position.y,
+        );
+    }
+
+    /// THE LINK SURVIVES A SAVE AND A REOPEN.
+    ///
+    /// Without it a reopened project falls back to matching by position, and the first rotate
+    /// after that separates the two again — which is the bug, one session later.
+    #[test]
+    fn the_link_between_a_light_and_its_symbol_is_saved() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        let handle = *app.light.symbol_of.get(&id).expect("a link");
+
+        let cfg = app.light.to_config(&app.doc);
+        assert_eq!(cfg.symbol_of.get(&id), Some(&handle), "the link is not in the sidecar");
+
+        let mut fresh = crate::light::LightState::new();
+        fresh.apply_config(cfg, &app.doc);
+        assert_eq!(fresh.symbol_of.get(&id), Some(&handle), "the link did not come back");
     }
 
     /// TWO FIXTURES ON THE SAME SPOT TAKE TWO DIFFERENT SYMBOLS.

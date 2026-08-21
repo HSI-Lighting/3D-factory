@@ -479,6 +479,14 @@ pub struct SimluxConfig {
     /// fixtures the same id.
     #[serde(default)]
     pub next_luminaire_id: u32,
+    /// WHICH BLOCK INSTANCE EACH FIXTURE WAS PLACED AS — fixture id → dobject handle.
+    ///
+    /// What keeps a light with its symbol when that symbol is moved, rotated or mirrored by the
+    /// ordinary 2D commands. Persisted because the link has to survive a reopen: without it a
+    /// project loaded from disk would fall back to matching by position, and the first rotate after
+    /// that would separate the two again. Handles are stable across a save and a load.
+    #[serde(default)]
+    pub symbol_of: std::collections::BTreeMap<u32, u64>,
     /// The MAINTENANCE FACTOR the results are quoted at. `None` in a sidecar written before this
     /// existed — those projects were calculated at the initial condition, and are restored that
     /// way rather than silently acquiring a factor that would change every number in them.
