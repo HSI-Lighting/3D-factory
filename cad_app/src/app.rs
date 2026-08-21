@@ -64466,4 +64466,81 @@ mod max_forensics {
             }
         }
     }
+
+    /// HOW WIDE IS THE PEAK? — the question behind "our max is 1800 and theirs is 1400".
+    ///
+    /// A maximum is the brightest CELL CENTRE on a grid, so whether a tool reports the peak under a
+    /// downlight depends on whether it puts a point there. That is only worth saying if the peak is
+    /// genuinely narrow, which is a fact about the field and is measurable: how much of the room
+    /// stands above each level, and how far across the bright patch actually is.
+    ///
+    /// `RESULT=path/to/x.simlux-result.json cargo test -p cad_app --bin simlux --release
+    ///  how_wide_is_the_peak -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn how_wide_is_the_peak() {
+        let Ok(path) = std::env::var("RESULT") else { return };
+        let text = std::fs::read_to_string(&path).expect("read");
+        let stored: crate::light_store::StoredResults = serde_json::from_str(&text).expect("parse");
+        for r in stored.rooms().expect("rooms") {
+            let g = &r.grid;
+            let (gc, gr) = (g.cols as usize, g.rows as usize);
+            let p = &r.plane;
+            let (cw, ch) = (p.width / gc as f32, p.depth / gr as f32);
+            println!("\n{}: {gc}x{gr}, cells {cw:.3} x {ch:.3} m", r.name);
+            println!("  avg {:.1}  min {:.1}  max {:.1} lx", g.avg, g.min, g.max);
+
+            let live = |k: usize| r.mask.get(k).copied().unwrap_or(true);
+            let total = (0..gc * gr).filter(|k| live(*k)).count();
+
+            for cut in [1700.0_f64, 1600.0, 1400.0, 1200.0, 1000.0, 800.0] {
+                let mut n = 0usize;
+                let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) =
+                    (usize::MAX, 0usize, usize::MAX, 0usize);
+                for j in 0..gr {
+                    for i in 0..gc {
+                        let k = j * gc + i;
+                        if live(k) && g.values[k] >= cut {
+                            n += 1;
+                            lo_x = lo_x.min(i);
+                            hi_x = hi_x.max(i);
+                            lo_y = lo_y.min(j);
+                            hi_y = hi_y.max(j);
+                        }
+                    }
+                }
+                if n == 0 {
+                    println!("  above {cut:>6.0} lx: nothing");
+                    continue;
+                }
+                println!(
+                    "  above {cut:>6.0} lx: {n:>4} of {total} cells ({:>4.1}% of the room), \
+                     bounding box {:.2} x {:.2} m",
+                    100.0 * n as f64 / total as f64,
+                    (hi_x - lo_x + 1) as f32 * cw,
+                    (hi_y - lo_y + 1) as f32 * ch,
+                );
+            }
+
+            // THE PEAK CELL, and how fast it falls away from it — the shape of the spike.
+            let peak = (0..gc * gr).filter(|k| live(*k)).max_by(|a, b| {
+                g.values[*a].partial_cmp(&g.values[*b]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            if let Some(k) = peak {
+                let (pi, pj) = (k % gc, k / gc);
+                println!(
+                    "  peak cell ({pi}, {pj}) = {:.0} lx. Walking away in x, one cell ({cw:.3} m) \
+                     at a time:",
+                    g.values[k],
+                );
+                let mut line = String::new();
+                for d in 0..=7 {
+                    if pi + d < gc {
+                        line.push_str(&format!("{:>7.0}", g.values[pj * gc + pi + d]));
+                    }
+                }
+                println!("   {line}");
+            }
+        }
+    }
 }
