@@ -64298,3 +64298,45 @@ mod result_forensics {
         }
     }
 }
+
+#[cfg(test)]
+mod max_forensics {
+    #[test]
+    #[ignore = "needs RESULT=<path>"]
+    fn how_much_of_the_peak_is_the_grid() {
+        let Ok(path) = std::env::var("RESULT") else { return };
+        let text = std::fs::read_to_string(&path).expect("read");
+        let stored: crate::light_store::StoredResults = serde_json::from_str(&text).expect("parse");
+        for r in stored.rooms().expect("rooms") {
+            let g = &r.grid;
+            let (gc, gr) = (g.cols as usize, g.rows as usize);
+            let p = &r.plane;
+            let cell = p.width / gc as f32;
+            println!("\n{}: {gc}x{gr}, cells {:.3} m, max {:.1} lx", r.name, cell, g.max);
+            // What a COARSER grid would have reported, over every possible phase.
+            for step in [2usize, 3, 4] {
+                let mut best = f64::MIN;
+                let mut worst = f64::MAX;
+                for oy in 0..step {
+                    for ox in 0..step {
+                        let mut m = f64::MIN;
+                        for j in (oy..gr).step_by(step) {
+                            for i in (ox..gc).step_by(step) {
+                                let k = j * gc + i;
+                                if r.mask.get(k).copied().unwrap_or(true) {
+                                    m = m.max(g.values[k]);
+                                }
+                            }
+                        }
+                        best = best.max(m);
+                        worst = worst.min(m);
+                    }
+                }
+                println!(
+                    "  at {:.2} m spacing ({}x coarser): max lands between {worst:.0} and {best:.0} lx",
+                    cell * step as f32, step,
+                );
+            }
+        }
+    }
+}

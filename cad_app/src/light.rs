@@ -166,6 +166,182 @@ pub fn meshes_from_factory_ex(
     out
 }
 
+/// A SOLID STANDING IN THE ROOM — a cupboard, a display case, a desk pedestal.
+///
+/// Reported as: *"our min lux was 0 while for relux it was 133… its an obvious error. find the root
+/// cause."* The working plane is a flat rectangle at 0.8 m and a room has things standing in it, so
+/// some of its points land INSIDE one of them. The engine answers those correctly — an enclosed
+/// point receives nothing — but nobody measures illuminance inside a box. On the plan this was
+/// reported against, 65 of 1140 cells were buried in the furniture: they took the room's minimum
+/// from 102 lx to zero, and its uniformity with it.
+///
+/// ONE BODY AT A TIME, WHICH IS THE WHOLE POINT. Three earlier attempts tested containment against
+/// the scene as a whole and all three failed, measurably: a ray-parity test excluded every cell of
+/// an EMPTY room, because a room is itself a closed solid; counting nesting depth mis-fired because
+/// a floor is a slab rather than a plane; and even a signed winding count read a point 0.8 m above
+/// a 0.5 m table as buried, because the merged CSG output is not a clean manifold — a downward ray
+/// crossed 3 surfaces from open floor, 8 from inside a box and 10 from above one.
+///
+/// A single BODY is a closed solid, and `SolidMesh::face_ids` says which body each triangle came
+/// from. Parity against one body is exactly the textbook test and behaves like it.
+pub struct Obstacle {
+    tris: Vec<[glam::Vec3; 3]>,
+    min: glam::Vec3,
+    max: glam::Vec3,
+}
+
+impl Obstacle {
+    /// Build one from world-space triangles — used by the tests and by `obstacles_in`.
+    pub fn from_tris(tris: Vec<[glam::Vec3; 3]>) -> Self {
+        let (mut mn, mut mx) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for t in &tris {
+            for p in t {
+                mn = mn.min(*p);
+                mx = mx.max(*p);
+            }
+        }
+        Obstacle { tris, min: mn, max: mx }
+    }
+
+    /// Whether this solid encloses `p`, by vertical ray parity against its own triangles.
+    pub fn contains(&self, p: glam::Vec3) -> bool {
+        // The bounds first: on a real plan most cells are nowhere near most objects, and this is
+        // the difference between a few comparisons and a few thousand.
+        if p.x < self.min.x
+            || p.x > self.max.x
+            || p.y < self.min.y
+            || p.y > self.max.y
+            || p.z < self.min.z
+            || p.z > self.max.z
+        {
+            return false;
+        }
+        let mut above = 0usize;
+        for t in &self.tris {
+            let (a, b, c) = (t[0], t[1], t[2]);
+            // DOES THE TRIANGLE COVER THIS POINT IN PLAN — by the CROSSING rule, not by testing
+            // three barycentrics for being non-negative.
+            //
+            // The barycentric test accepts a point lying exactly ON an edge, and both triangles
+            // sharing that edge accept it. A box's top face is two triangles meeting on a diagonal,
+            // so a point at the centre of a square object was counted TWICE and read as outside.
+            // That is not a corner case here: cell centres and box corners are both on regular
+            // grids, so they land on each other constantly — it was the very first assertion this
+            // met.
+            //
+            // The crossing rule has a half-open convention built in — an edge counts only where
+            // `(y1 > y) != (y2 > y)` — so a shared edge is traversed in opposite directions by the
+            // two triangles and is counted exactly once between them.
+            let v = [a, b, c];
+            let mut inside = false;
+            for k in 0..3 {
+                let (p1, p2) = (v[k], v[(k + 1) % 3]);
+                if (p1.y > p.y) != (p2.y > p.y) {
+                    let t = (p.y - p1.y) / (p2.y - p1.y);
+                    if p1.x + t * (p2.x - p1.x) > p.x {
+                        inside = !inside;
+                    }
+                }
+            }
+            if !inside {
+                continue;
+            }
+            // Where this surface sits over the point. Barycentric is fine for the height, having
+            // already established that the point is within the triangle.
+            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+            if d.abs() < 1e-12 {
+                continue; // edge-on: no plan area, so nothing to be under
+            }
+            let bu = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / d;
+            let bv = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / d;
+            let z = bu * a.z + bv * b.z + (1.0 - bu - bv) * c.z;
+            if z > p.z {
+                above += 1;
+            }
+        }
+        // A closed solid presents an odd number of surfaces above any point inside it.
+        above % 2 == 1
+    }
+}
+
+/// The solids standing INSIDE `room` — everything except the shell the room is carved from.
+///
+/// The shell is told apart by its footprint: a building contains its own rooms, and a thing
+/// standing in a room does not. Anything whose plan bounds enclose the room's is therefore the
+/// structure around it, and is not something a working-plane point can be "inside" in the sense
+/// that matters.
+///
+/// Furniture goes in as well as CSG bodies, since a cupboard from the library buries a point just
+/// as thoroughly as one built in the Factory. An imported mesh that is not closed simply counts
+/// evenly and encloses nothing, which is the safe direction: it keeps a point that might be
+/// measurable rather than discarding one that is.
+pub fn obstacles_in(f: &crate::factory::FactoryState, room: &[glam::Vec2]) -> Vec<Obstacle> {
+    let mut out: Vec<Obstacle> = Vec::new();
+    let mut push = |tris: Vec<[glam::Vec3; 3]>| {
+        if !tris.is_empty() {
+            out.push(Obstacle::from_tris(tris));
+        }
+    };
+
+    // ---- CSG bodies, grouped by the feature each triangle belongs to -------------------------
+    let m = &f.cached;
+    let n = m.tri_count();
+    if !m.face_ids.is_empty() && m.face_ids.len() >= n {
+        let mut by_body: std::collections::BTreeMap<u32, Vec<[glam::Vec3; 3]>> = Default::default();
+        for t in 0..n {
+            let tri = [
+                glam::Vec3::from(m.positions[t * 3]),
+                glam::Vec3::from(m.positions[t * 3 + 1]),
+                glam::Vec3::from(m.positions[t * 3 + 2]),
+            ];
+            by_body.entry(m.face_ids[t]).or_default().push(tri);
+        }
+        for (_, tris) in by_body {
+            push(tris);
+        }
+    }
+
+    // ---- furniture, in world coordinates -------------------------------------------------------
+    for (i, inst) in f.furniture.iter().enumerate() {
+        let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
+        let Some(mm) = f.furniture_model_matrix(i) else { continue };
+        let mm = glam::Mat4::from_cols_array(&mm);
+        let tris: Vec<[glam::Vec3; 3]> = asset
+            .positions
+            .chunks_exact(3)
+            .map(|c| {
+                [
+                    mm.transform_point3(glam::Vec3::from(c[0])),
+                    mm.transform_point3(glam::Vec3::from(c[1])),
+                    mm.transform_point3(glam::Vec3::from(c[2])),
+                ]
+            })
+            .collect();
+        push(tris);
+    }
+
+    // ---- and drop the shell -------------------------------------------------------------------
+    if room.len() >= 3 {
+        let (mut rx0, mut ry0, mut rx1, mut ry1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for v in room {
+            rx0 = rx0.min(v.x);
+            ry0 = ry0.min(v.y);
+            rx1 = rx1.max(v.x);
+            ry1 = ry1.max(v.y);
+        }
+        // A hair of slack, so a body sitting exactly on the room's own boundary — the wall it was
+        // carved from — is still recognised as the structure and not as a wardrobe.
+        const SLACK: f32 = 1e-3;
+        out.retain(|o| {
+            !(o.min.x <= rx0 + SLACK
+                && o.min.y <= ry0 + SLACK
+                && o.max.x >= rx1 - SLACK
+                && o.max.y >= ry1 - SLACK)
+        });
+    }
+    out
+}
+
 /// Plan-view extent `(min_x, min_y, max_x, max_y)` of lighting geometry, or `None` if empty.
 ///
 /// The counterpart to `cad_light::bbox`, which measures the 2D DOCUMENT. Once the room comes from
@@ -524,6 +700,12 @@ pub struct CalcJob {
     maintenance: Maintenance,
     /// One per room: `(name, footprint)`. A project with no rooms has one unnamed target.
     targets: Vec<(String, Vec<glam::Vec2>)>,
+    /// The solids standing in each room — one list per target, in the same order.
+    ///
+    /// Gathered on the UI thread because it needs the Factory, which the worker cannot see. See
+    /// [`Obstacle`]: a working-plane cell inside one of these is not a place anybody measures, and
+    /// reporting it as 0 lx took a room's minimum to zero and its uniformity with it.
+    obstacles: Vec<Vec<Obstacle>>,
     /// The whole-model bounds, for a target with no footprint.
     fallback: (f32, f32, f32, f32),
     cell_size: f32,
@@ -576,6 +758,11 @@ impl CalcJob {
             settings,
             maintenance,
             targets,
+            // DERIVED, SO NOT HASHED AGAIN. The obstacles are a pure function of the scene
+            // triangles and the room outlines, and both of those are hashed below — a change to
+            // either moves the fingerprint, and nothing else can move the obstacles. Hashing their
+            // triangles a second time would be a second pass over the model for no new fact.
+            obstacles: _,
             fallback,
             cell_size,
             plane_height,
@@ -709,7 +896,8 @@ impl CalcJob {
             } else {
                 format!("{name} ({} of {})", i + 1, self.targets.len())
             };
-            rooms.push(self.room_result(&ev, name, poly, p, &label));
+            let obs = self.obstacles.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            rooms.push(self.room_result(&ev, name, poly, obs, p, &label));
         }
         timings.push(("grids", t.elapsed().as_secs_f64() * 1000.0));
         t = std::time::Instant::now();
@@ -729,6 +917,7 @@ impl CalcJob {
         ev: &cad_light::Evaluator,
         name: &str,
         poly: &[glam::Vec2],
+        obstacles: &[Obstacle],
         p: &CalcProgress,
         label: &str,
     ) -> RoomResult {
@@ -749,8 +938,8 @@ impl CalcJob {
         let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
         // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
         // this changes nothing — which is every case the engine is validated on.
-        let mask = if poly.len() >= 3 { LightState::inside_mask(&plane, poly) } else { Vec::new() };
-        if !mask.is_empty() {
+        let mask = LightState::measurable_mask(&plane, poly, obstacles);
+        if mask.iter().any(|k| !k) {
             LightState::apply_room_mask(&mut grid, &mask);
         }
 
@@ -758,8 +947,8 @@ impl CalcJob {
         let plane_en = plane.on_standard_grid();
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
         if poly.len() >= 3 {
-            let mask_en = LightState::inside_mask(&plane_en, poly);
-            if !mask_en.is_empty() {
+            let mask_en = LightState::measurable_mask(&plane_en, poly, obstacles);
+            if mask_en.iter().any(|k| !k) {
                 LightState::apply_room_mask(&mut grid_en, &mask_en);
             }
         }
@@ -1973,7 +2162,7 @@ impl LightState {
         let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
         // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
         // this changes nothing — which is every case the engine is validated on.
-        let mask = if poly.len() >= 3 { Self::inside_mask(&plane, poly) } else { Vec::new() };
+        let mask = Self::measurable_mask(&plane, poly, &[]);
         if !mask.is_empty() {
             Self::apply_room_mask(&mut grid, &mask);
         }
@@ -1981,7 +2170,7 @@ impl LightState {
         let plane_en = plane.on_standard_grid();
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
         if poly.len() >= 3 {
-            let mask_en = Self::inside_mask(&plane_en, poly);
+            let mask_en = Self::measurable_mask(&plane_en, poly, &[]);
             if !mask_en.is_empty() {
                 Self::apply_room_mask(&mut grid_en, &mask_en);
             }
@@ -2106,7 +2295,24 @@ impl LightState {
     /// The engine's plane is a rectangle, which is right: it is a sampling grid, not a boundary. A
     /// non-rectangular room's grid necessarily covers ground the room does not, and those cells are
     /// not part of the room's average however bright they read.
-    fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
+
+    /// Which cells of `plane` are places somebody could actually take a reading.
+    ///
+    /// TWO TESTS, AND THE SECOND IS THE ONE THAT WAS MISSING. A cell has to be inside the room's
+    /// outline — it always did — and it has to be in FREE AIR rather than buried in something
+    /// standing in the room.
+    ///
+    /// Reported as: *"our min lux was 0 while for relux it was 133… its an obvious error. find the
+    /// root cause."* The working plane is a flat rectangle at 0.8 m and a room has things standing
+    /// in it, so some of its points land inside a cupboard. The engine answered those correctly —
+    /// an enclosed point receives nothing — but nobody measures illuminance inside a box, so it was
+    /// a right answer to a question that should not have been asked. On the plan this came from, 65
+    /// of 1140 cells were buried in the furniture: they took the room's minimum from 102 lx to
+    /// zero, and its uniformity with it.
+    ///
+    /// With no obstacles this is exactly the outline test it has always been — which is every case
+    /// the engine is validated on.
+    fn measurable_mask(plane: &CalcPlane, poly: &[glam::Vec2], obstacles: &[Obstacle]) -> Vec<bool> {
         let (dx, dy) = (
             plane.width / plane.cols.max(1) as f32,
             plane.depth / plane.rows.max(1) as f32,
@@ -2116,11 +2322,22 @@ impl LightState {
             for c in 0..plane.cols {
                 let x = plane.origin.x + (c as f32 + 0.5) * dx;
                 let y = plane.origin.y + (r as f32 + 0.5) * dy;
-                m.push(crate::factory::point_in_poly(poly, x, y));
+                let in_room = poly.len() < 3 || crate::factory::point_in_poly(poly, x, y);
+                // Only worth asking where the cell is in the room at all.
+                let free = !in_room
+                    || !obstacles
+                        .iter()
+                        .any(|o| o.contains(glam::Vec3::new(x, y, plane.origin.z)));
+                m.push(in_room && free);
             }
         }
         m
     }
+    /// The outline test alone — the mask with nothing standing in the room.
+    fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
+        Self::measurable_mask(plane, poly, &[])
+    }
+
 
     /// Re-derive `avg` / `min` / `max` over the cells the mask keeps.
     ///
@@ -2522,6 +2739,11 @@ impl LightState {
             materials: self.materials.clone(),
             settings: self.settings,
             maintenance: self.maintenance,
+            obstacles: match factory {
+                // One list per target, in the same order — see `CalcJob::obstacles`.
+                Some(f) => targets.iter().map(|(_, p)| obstacles_in(f, p)).collect(),
+                None => targets.iter().map(|_| Vec::new()).collect(),
+            },
             targets,
             fallback,
             cell_size: self.cell_size,
@@ -6679,3 +6901,234 @@ mod a_calculation_is_kept_while_it_is_still_true {
         );
     }
 }
+
+/// A READING NOBODY COULD TAKE IS NOT A READING.
+///
+/// Reported as: *"our min lux was 0 while for relux it was 133… its an obvious error. find the root
+/// cause."*
+///
+/// The root cause, read out of the stored result rather than guessed at: 65 of the 1140 in-room
+/// cells on that plan sat at EXACTLY 0.00 lx, in rectangular clusters standing precisely where the
+/// room's furniture is. The working plane is a flat rectangle at 0.8 m and a room has things in it,
+/// so some of its points land inside a cupboard. The engine answered those correctly — an enclosed
+/// point receives nothing — but it was a right answer to a question that should not have been
+/// asked, and it took the room's minimum from 102 lx to zero. Ignoring those cells put the figures
+/// at min 102 lx and average 324 lx, against Relux's 133 lx on the same room.
+#[cfg(test)]
+mod a_point_inside_the_furniture_is_not_measured {
+    use super::*;
+
+    /// A closed box, as twelve triangles, spanning `lo..hi`.
+    fn box_tris(lo: glam::Vec3, hi: glam::Vec3) -> Vec<[glam::Vec3; 3]> {
+        let v = |x: f32, y: f32, z: f32| glam::Vec3::new(x, y, z);
+        let (a, b) = (lo, hi);
+        let c = [
+            v(a.x, a.y, a.z),
+            v(b.x, a.y, a.z),
+            v(b.x, b.y, a.z),
+            v(a.x, b.y, a.z),
+            v(a.x, a.y, b.z),
+            v(b.x, a.y, b.z),
+            v(b.x, b.y, b.z),
+            v(a.x, b.y, b.z),
+        ];
+        let q = |i: usize, j: usize, k: usize, l: usize| vec![[c[i], c[j], c[k]], [c[i], c[k], c[l]]];
+        let mut t = Vec::new();
+        t.extend(q(0, 1, 2, 3)); // bottom
+        t.extend(q(4, 5, 6, 7)); // top
+        t.extend(q(0, 1, 5, 4));
+        t.extend(q(1, 2, 6, 5));
+        t.extend(q(2, 3, 7, 6));
+        t.extend(q(3, 0, 4, 7));
+        t
+    }
+
+    /// A POINT INSIDE A BOX IS INSIDE IT, and one beside it is not.
+    #[test]
+    fn a_solid_knows_what_it_encloses() {
+        let o = Obstacle::from_tris(box_tris(
+            glam::Vec3::new(2.0, 2.0, 0.0),
+            glam::Vec3::new(4.0, 4.0, 1.0),
+        ));
+        assert!(o.contains(glam::Vec3::new(3.0, 3.0, 0.5)), "the middle of the box");
+        assert!(o.contains(glam::Vec3::new(2.1, 3.9, 0.9)), "just inside a corner");
+        assert!(!o.contains(glam::Vec3::new(1.0, 3.0, 0.5)), "beside it");
+        assert!(!o.contains(glam::Vec3::new(3.0, 3.0, 1.5)), "above it");
+        assert!(!o.contains(glam::Vec3::new(3.0, 3.0, -0.5)), "below it");
+    }
+
+    /// ABOVE A LOW TABLE IS NOT BURIED — the case three earlier attempts got wrong.
+    ///
+    /// A working plane at 0.8 m over a 0.5 m table is open air with light falling on it. Every
+    /// containment test tried against the MERGED scene read it as enclosed, because a room is
+    /// itself a closed solid and CSG output is not a clean manifold. One body at a time, it is
+    /// simply a point above a box.
+    #[test]
+    fn the_plane_above_a_low_table_is_still_measured() {
+        let table = Obstacle::from_tris(box_tris(
+            glam::Vec3::new(2.0, 2.0, 0.0),
+            glam::Vec3::new(4.0, 4.0, 0.5),
+        ));
+        assert!(
+            !table.contains(glam::Vec3::new(3.0, 3.0, 0.8)),
+            "the working plane over a 0.5 m table was treated as buried",
+        );
+    }
+
+    /// THE MASK DROPS THE BURIED CELLS AND KEEPS THE REST.
+    #[test]
+    fn the_mask_excludes_only_what_is_inside() {
+        let plane = CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 6.0,
+            depth: 6.0,
+            cols: 24,
+            rows: 24,
+        };
+        let poly = [
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(6.0, 0.0),
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        let cupboard = Obstacle::from_tris(box_tris(
+            glam::Vec3::new(2.0, 2.0, 0.0),
+            glam::Vec3::new(4.0, 4.0, 2.0),
+        ));
+        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard));
+        let without = LightState::measurable_mask(&plane, &poly, &[]);
+
+        assert!(without.iter().all(|k| *k), "an empty room lost cells to nothing at all");
+        let dropped = with.iter().filter(|k| !**k).count();
+        assert!(dropped > 0, "the cupboard excluded nothing");
+        // A 2 x 2 m box in a 6 x 6 m room is a ninth of it; the cells are 0.25 m, so about 64 of
+        // the 576. Bounded on BOTH sides — excluding far more than the object covers would be a
+        // different bug wearing the same face.
+        assert!(
+            (40..=90).contains(&dropped),
+            "{dropped} of 576 cells excluded by a box covering a ninth of the room",
+        );
+        for (i, keep) in with.iter().enumerate() {
+            let (c, r) = (i % 24, i / 24);
+            let x = 0.125 + c as f32 * 0.25;
+            let y = 0.125 + r as f32 * 0.25;
+            let deep_in = (2.3..3.7).contains(&x) && (2.3..3.7).contains(&y);
+            let well_out = x < 1.7 || x > 4.3 || y < 1.7 || y > 4.3;
+            if deep_in {
+                assert!(!keep, "a cell at ({x:.2}, {y:.2}) inside the cupboard is still counted");
+            } else if well_out {
+                assert!(keep, "a cell at ({x:.2}, {y:.2}) on open floor was thrown away");
+            }
+        }
+    }
+
+    /// AND THE SHELL IS NOT AN OBSTACLE. A room is a solid too, and treating the building as
+    /// something to be inside of excludes every cell in it — which is exactly what the first
+    /// attempts at this did.
+    #[test]
+    fn the_building_the_room_is_carved_from_is_not_furniture() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(6.0, 0.0),
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        // THE REQUIREMENT IS ABOUT THE FLOOR, NOT ABOUT THE COUNT.
+        //
+        // This first asserted that a plain room yields NO obstacles, which is the wrong
+        // expectation: the building decomposes into seven bodies — the outline volume, the floor
+        // slab, four walls and the ceiling — and a wall genuinely IS a solid a point can be inside
+        // of. Three of those enclose the whole plan and are dropped as the shell; the walls stay,
+        // correctly, since a working-plane point buried in a wall is not a reading either.
+        //
+        // What must never happen is a point on OPEN FLOOR reading as enclosed. That is what the
+        // earlier attempts got wrong, and it is what this checks.
+        let bare = obstacles_in(&f, &rect);
+        for (x, y) in [(1.0, 1.0), (3.0, 3.0), (5.0, 5.0), (0.5, 4.5), (4.5, 0.5)] {
+            assert!(
+                !bare.iter().any(|o| o.contains(glam::Vec3::new(x, y, 0.8))),
+                "open floor at ({x}, {y}) in an empty room reads as inside something",
+            );
+        }
+
+        // Put a cupboard in it, and that one IS an obstacle.
+        let cup = vec![
+            glam::Vec2::new(2.0, 2.0),
+            glam::Vec2::new(3.0, 2.0),
+            glam::Vec2::new(3.0, 3.0),
+            glam::Vec2::new(2.0, 3.0),
+            glam::Vec2::new(2.0, 2.0),
+        ];
+        f.add_building_outline(&cup, 2.0).expect("cupboard");
+        f.recompute();
+        let obs = obstacles_in(&f, &rect);
+        assert!(!obs.is_empty(), "a cupboard standing in the room was not seen");
+        assert!(
+            obs.iter().any(|o| o.contains(glam::Vec3::new(2.5, 2.5, 0.8))),
+            "the cupboard does not enclose its own middle",
+        );
+        assert!(
+            !obs.iter().any(|o| o.contains(glam::Vec3::new(0.5, 0.5, 0.8))),
+            "open floor across the room reads as inside something",
+        );
+    }
+
+    /// END TO END: a room with a cupboard in it reports a minimum somebody could measure.
+    #[test]
+    fn a_buried_cell_does_not_become_the_rooms_minimum() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(6.0, 0.0),
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let cup = vec![
+            glam::Vec2::new(2.0, 2.0),
+            glam::Vec2::new(4.0, 2.0),
+            glam::Vec2::new(4.0, 4.0),
+            glam::Vec2::new(2.0, 4.0),
+            glam::Vec2::new(2.0, 2.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.add_building_outline(&cup, 2.0).expect("cupboard");
+        f.recompute();
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.4;
+        s.plane_height = 0.8;
+        for (x, y) in [(1.0, 1.0), (5.0, 1.0), (1.0, 5.0), (5.0, 5.0)] {
+            s.luminaires.push(Luminaire {
+                id: s.luminaires.len() as u32 + 1,
+                profile: BUILTIN.to_string(),
+                position: Vertex::new(x, y, 2.9),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        s.calculate(&Document::default(), Some(&f));
+        let r = &s.rooms[0];
+        assert!(
+            r.mask.iter().any(|k| !k),
+            "the cupboard excluded nothing; the fixture does not reproduce the case",
+        );
+        assert!(
+            r.grid.min > 1.0,
+            "the minimum is {:.2} lx — a point inside the cupboard is reported as a reading",
+            r.grid.min,
+        );
+    }
+}
+
