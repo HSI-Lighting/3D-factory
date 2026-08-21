@@ -26773,6 +26773,10 @@ impl CadApp {
                 name: r.name.clone(),
                 grid: &r.grid,
                 plane: &r.plane,
+                // Computed alongside the working grid on every calculation, and — until now —
+                // shown nowhere. See `RoomInput::grid_en`.
+                grid_en: (!r.grid_en.values.is_empty()).then_some(&r.grid_en),
+                plane_en: (!r.grid_en.values.is_empty()).then_some(&r.plane_en),
                 mask: &r.mask,
                 poly: &r.poly,
                 fixtures: &r.fixtures,

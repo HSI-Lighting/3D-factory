@@ -1076,6 +1076,21 @@ impl RoomResult {
     pub fn area_m2(&self) -> f64 {
         (self.plane.width * self.plane.depth) as f64
     }
+
+    /// The grid spacing this room was calculated at — the COARSER axis, which is the one that
+    /// decides what a maximum can miss.
+    pub fn spacing(&self) -> f32 {
+        let sx = self.plane.width / self.grid.cols.max(1) as f32;
+        let sy = self.plane.depth / self.grid.rows.max(1) as f32;
+        sx.max(sy)
+    }
+
+    /// The same, for the EN 12464-1 grid computed beside it.
+    pub fn spacing_en(&self) -> f32 {
+        let sx = self.plane_en.width / self.grid_en.cols.max(1) as f32;
+        let sy = self.plane_en.depth / self.grid_en.rows.max(1) as f32;
+        sx.max(sy)
+    }
 }
 
 /// All lighting UI + engine state, owned by `CadApp`.
@@ -1470,6 +1485,47 @@ impl LightState {
         } else {
             UNASSIGNED.to_string()
         }
+    }
+
+    /// What the same rooms report on EN 12464-1's own grid, as one line — or `None` when there is
+    /// nothing to compare against.
+    ///
+    /// The standard's grid is computed on every calculation and, until this, was shown nowhere. It
+    /// is the figure another package's default is closest to, so it is what somebody comparing two
+    /// reports actually needs. Reported as: *"the max lux differs by a lot from the dialux and relux
+    /// values. why is that?"*
+    pub fn en_grid_note(&self) -> Option<String> {
+        let rooms: Vec<&RoomResult> = self
+            .rooms
+            .iter()
+            .filter(|r| {
+                !r.grid_en.values.is_empty()
+                    // Same grid, nothing to say — and printing one figure twice invites a hunt for
+                    // a difference that is not there.
+                    && (r.grid_en.cols != r.grid.cols || r.grid_en.rows != r.grid.rows)
+            })
+            .collect();
+        let first = rooms.first()?;
+        if rooms.len() == 1 {
+            return Some(format!(
+                "This grid: {:.2} m — max {:.0} lx, U₀ {:.2}.\n\
+                 EN 12464-1 grid: {:.2} m — max {:.0} lx, U₀ {:.2}, avg {:.0} lx.",
+                first.spacing(),
+                first.grid.max,
+                first.grid.u0(),
+                first.spacing_en(),
+                first.grid_en.max,
+                first.grid_en.u0(),
+                first.grid_en.avg,
+            ));
+        }
+        // Several rooms, each with its own grid: the brightest of them is the number a reader is
+        // looking at, and naming the rooms individually here would be a table, not a tooltip.
+        let mx = rooms.iter().map(|r| r.grid_en.max).fold(f64::MIN, f64::max);
+        Some(format!(
+            "On EN 12464-1's grid, the brightest of the {} rooms reads {mx:.0} lx.",
+            rooms.len(),
+        ))
     }
 
     /// Fixtures that still have no fitting on them.
@@ -3544,7 +3600,28 @@ impl LightState {
             if let Some(g) = self.grid.as_ref() {
                 ui.label(small(format!("· avg {:.0} lx", g.avg)));
                 ui.label(small(format!("· min {:.0}", g.min)));
-                ui.label(small(format!("· max {:.0}", g.max)));
+                // THE MAXIMUM CARRIES ITS GRID, on hover.
+                //
+                // Reported as: *"the max lux differs by a lot from the dialux and relux values.
+                // why is that?"* A maximum is the brightest grid POINT, not the brightest place in
+                // the room — a peak under a downlight is a few cells across, so a coarser grid can
+                // miss it while the average barely moves. The standard's grid is computed on every
+                // calculation and is the one another package's default is closest to, so it is the
+                // answer to hand somebody who is comparing two reports.
+                ui.label(small(format!("· max {:.0}", g.max))).on_hover_text(
+                    match self.en_grid_note() {
+                        Some(n) => format!(
+                            "The brightest GRID POINT, not the brightest place in the room.\n\n{n}\n\n\
+                             A peak under a downlight is only a few cells across, so a coarser grid \
+                             may never sample it — while the average hardly moves. Neither figure is \
+                             wrong; each is the maximum ON ITS OWN GRID.",
+                        ),
+                        None => "The brightest GRID POINT, not the brightest place in the room. A \
+                                 peak under a downlight is only a few cells across, so a coarser \
+                                 grid may never sample it."
+                            .to_string(),
+                    },
+                );
                 // Which condition the figures are for. A lux number without this is ambiguous, and
                 // the ambiguity always flatters the design.
                 ui.label(

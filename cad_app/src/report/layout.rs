@@ -53,6 +53,21 @@ pub struct RoomInput<'a> {
     pub name: String,
     pub grid: &'a LuxGrid,
     pub plane: &'a CalcPlane,
+    /// THE SAME ROOM ON EN 12464-1's OWN GRID, computed alongside the working one.
+    ///
+    /// Reported as: *"the max lux differs by a lot from the dialux and relux values. why is
+    /// that?"* — and the answer is that a maximum is not a property of a room. It is the brightest
+    /// CELL CENTRE on whatever grid was sampled, and ours is about twice as fine as the default in
+    /// DIALux or Relux. Measured on the project that prompted the question: the same field reports
+    /// 1802 lx on the working grid and 1662 lx on the standard's, while the average moves from
+    /// 323.6 to 326.9 — the maximum shifted 140 lx and the average 3.
+    ///
+    /// So both are printed. The working figures are the conservative ones and stay the headline;
+    /// the standard's are what a compliance claim rests on and what another package's default is
+    /// closest to. Neither replaces the other, and a reader comparing two reports needs to know
+    /// which they are holding.
+    pub grid_en: Option<&'a LuxGrid>,
+    pub plane_en: Option<&'a CalcPlane>,
     pub mask: &'a [bool],
     /// The room's outline, in metres. Empty for the whole-model fallback.
     pub poly: &'a [glam::Vec2],
@@ -132,6 +147,8 @@ impl<'a> Input<'a> {
                 name,
                 grid,
                 plane,
+                grid_en,
+                plane_en,
                 mask,
                 poly,
                 fixtures,
@@ -147,6 +164,15 @@ impl<'a> Input<'a> {
             h.f64(grid.min);
             h.f64(grid.max);
             crate::light::hash_json(&mut h, "plane", plane);
+            // THE EN GRID IS PRINTED, so it belongs in the key that decides whether the page has to
+            // be laid out again. It moves with the working grid in practice — both come out of one
+            // calculation — but "in practice" is how a stale preview gets shipped.
+            h.u64(grid_en.map(|g| g.cols as u64).unwrap_or(0));
+            h.u64(grid_en.map(|g| g.rows as u64).unwrap_or(0));
+            h.f64(grid_en.map(|g| g.avg).unwrap_or(0.0));
+            h.f64(grid_en.map(|g| g.min).unwrap_or(0.0));
+            h.f64(grid_en.map(|g| g.max).unwrap_or(0.0));
+            crate::light::hash_json(&mut h, "plane_en", plane_en);
             h.u64(mask.len() as u64);
             h.u64(poly.len() as u64);
             crate::light::hash_json(&mut h, "fixtures", fixtures);
@@ -690,7 +716,10 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
         "Uniformity U0 = Emin/E",
         &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
     );
-    c.row("Grid", &format!("{} x {} points", g.cols, g.rows));
+    c.row(
+        "Grid",
+        &format!("{} x {} points at {:.2} m", g.cols, g.rows, spacing_of(room.plane, g)),
+    );
     c.row(
         "Plane",
         &format!(
@@ -698,12 +727,60 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
             room.plane.width, room.plane.depth, room.plane.origin.z
         ),
     );
+    en_summary(c, room);
     if unassigned > 0 {
         c.note(&format!(
             "{unassigned} fixture(s) in this project have no photometric file assigned and \
              contribute nothing.",
         ));
     }
+}
+
+/// The grid spacing a plane and its grid imply, in metres.
+///
+/// The LONGER of the two axes, so a rectangular cell is described by its coarser side rather than
+/// flattered by its finer one — the coarse axis is the one that decides what a maximum misses.
+fn spacing_of(p: &CalcPlane, g: &LuxGrid) -> f32 {
+    let sx = p.width / g.cols.max(1) as f32;
+    let sy = p.depth / g.rows.max(1) as f32;
+    sx.max(sy)
+}
+
+/// THE SAME ROOM ON THE STANDARD'S OWN GRID, printed beside the working one.
+///
+/// Asked for after: *"the max lux differs by a lot from the dialux and relux values. why is
+/// that?"* Two figures for one room look like an error unless the report says why they differ, so
+/// this ends with the reason rather than leaving a reader to find it.
+fn en_summary(c: &mut Cursor, room: &RoomInput) {
+    let (Some(g), Some(p)) = (room.grid_en, room.plane_en) else { return };
+    if g.values.is_empty() || g.cols == 0 || g.rows == 0 {
+        return;
+    }
+    // NOT WHEN IT IS THE SAME GRID. On a small room the working grid and the standard's can come
+    // out identical, and printing one table twice invites a reader to hunt for the difference.
+    if g.cols == room.grid.cols && g.rows == room.grid.rows {
+        return;
+    }
+    c.heading(&format!("On the EN 12464-1 grid ({:.2} m)", spacing_of(p, g)));
+    c.row("Average E", &format!("{:.0} lx", g.avg));
+    c.row("Minimum E", &format!("{:.0} lx", g.min));
+    c.row("Maximum E", &format!("{:.0} lx", g.max));
+    c.row(
+        "Uniformity U0 = Emin/E",
+        &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
+    );
+    c.row("Grid", &format!("{} x {} points", g.cols, g.rows));
+    // WHY THE TWO DISAGREE, said once and in the place a reader meets it. A maximum is the
+    // brightest cell CENTRE on a grid — a spike under a downlight is a few cells across, so a
+    // coarser grid may never sample it, while an average barely moves. Without this the page reads
+    // as two answers to one question.
+    c.note(
+        "A maximum is the brightest grid point, not the brightest place in the room: a peak \
+         under a downlight is a few cells across, so a coarser grid may miss it. An average is \
+         barely affected. The working grid above is the finer of the two and so the conservative \
+         one; the standard's grid is the basis of a compliance claim, and is closest to the \
+         default in DIALux and Relux.",
+    );
 }
 
 fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
@@ -1865,7 +1942,7 @@ mod tests {
     use super::*;
     use crate::report::options::{Format, PageSize};
 
-    fn grid(cols: u32, rows: u32) -> LuxGrid {
+    pub(super) fn grid(cols: u32, rows: u32) -> LuxGrid {
         let n = (cols * rows) as usize;
         let vals: Vec<f64> = (0..n).map(|i| 100.0 + (i % 7) as f64 * 50.0).collect();
         let min = vals.iter().cloned().fold(f64::MAX, f64::min);
@@ -1884,7 +1961,7 @@ mod tests {
         }
     }
 
-    fn plane() -> CalcPlane {
+    pub(super) fn plane() -> CalcPlane {
         CalcPlane {
             origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
             width: 8.0,
@@ -1899,6 +1976,8 @@ mod tests {
             name: name.to_string(),
             grid: g,
             plane: p,
+            grid_en: None,
+            plane_en: None,
             mask: &[],
             poly: &[],
             fixtures: &[],
@@ -1908,7 +1987,7 @@ mod tests {
         }
     }
 
-    fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> Input<'a> {
+    pub(super) fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> Input<'a> {
         Input {
             rooms: vec![one_room(g, p, "")],
             maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
@@ -4002,5 +4081,134 @@ mod tests {
         o.sections = vec![Section::Renders];
         let d = layout(&input(&g, &p), &o);
         assert!(!texts(&d).iter().any(|s| s == "Renders"), "an empty renders page was produced");
+    }
+}
+
+/// BOTH GRIDS ARE PRINTED, and the report says why they disagree.
+///
+/// Asked for after: *"the max lux differs by a lot from the dialux and relux values. why is
+/// that?"* The answer is that a maximum is the brightest CELL CENTRE on a grid — so the standard's
+/// grid, which SIMLUX has always computed and never shown, goes on the page beside the working one.
+#[cfg(test)]
+mod the_report_states_which_grid_a_figure_is_on {
+    use super::tests::*;
+    use super::*;
+
+    /// A coarse grid over the same plane, with a DELIBERATELY LOWER maximum — which is the whole
+    /// phenomenon: a peak the fine grid catches and the coarse one misses.
+    fn en_grid() -> LuxGrid {
+        let (cols, rows) = (4u32, 3u32);
+        let vals: Vec<f64> = vec![
+            180.0, 220.0, 240.0, 190.0, //
+            210.0, 260.0, 255.0, 205.0, //
+            175.0, 215.0, 235.0, 185.0,
+        ];
+        let min = vals.iter().cloned().fold(f64::MAX, f64::min);
+        let max = vals.iter().cloned().fold(f64::MIN, f64::max);
+        let avg = vals.iter().sum::<f64>() / vals.len() as f64;
+        LuxGrid { cols, rows, values: vals, min, max, avg, maintenance: 0.8, direct: Vec::new(), indirect: Vec::new() }
+    }
+
+    fn texts(d: &Doc) -> Vec<String> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE STANDARD'S FIGURES REACH THE PAGE, and are its own rather than a copy of the working
+    /// grid's.
+    #[test]
+    fn the_en_grid_figures_are_printed() {
+        let (g, p, eg) = (grid(16, 12), plane(), en_grid());
+        let mut i = input(&g, &p);
+        i.rooms[0].grid_en = Some(&eg);
+        i.rooms[0].plane_en = Some(&p);
+        let d = layout(&i, &Options::default());
+        let t = texts(&d);
+        let has = |s: &str| t.iter().any(|x| x.contains(s));
+
+        assert!(has("EN 12464-1 grid"), "the standard's block is missing entirely");
+        assert!(has("4 x 3 points"), "the standard's grid shape is not on the page");
+        assert!(
+            has(&format!("{:.0} lx", eg.max)),
+            "the standard's maximum ({:.0} lx) is not on the page",
+            eg.max,
+        );
+        // …and the WORKING figures are still there. Adding the second set must not have replaced
+        // the first, which is the headline.
+        assert!(has("16 x 12 points"), "the working grid shape is gone");
+        assert!(
+            has(&format!("{:.0} lx", g.max)),
+            "the working maximum ({:.0} lx) is gone",
+            g.max,
+        );
+        assert!(
+            (g.max - eg.max).abs() > 1.0,
+            "the fixture does not reproduce the case — both grids report the same maximum",
+        );
+    }
+
+    /// AND THE PAGE SAYS WHY THEY DIFFER. Two maxima for one room read as an error unless the
+    /// reason is beside them; this is the whole point of printing the second one.
+    #[test]
+    fn the_page_explains_why_the_two_maxima_differ() {
+        let (g, p, eg) = (grid(16, 12), plane(), en_grid());
+        let mut i = input(&g, &p);
+        i.rooms[0].grid_en = Some(&eg);
+        i.rooms[0].plane_en = Some(&p);
+        let t = texts(&layout(&i, &Options::default()));
+        assert!(
+            t.iter().any(|x| x.contains("brightest grid point")),
+            "the report prints two different maxima and never says why",
+        );
+    }
+
+    /// NOTHING IS PRINTED WHEN THERE IS NOTHING TO COMPARE. On a small room the two grids come out
+    /// the same, and one table repeated invites a reader to hunt for a difference that is not there.
+    #[test]
+    fn an_identical_grid_is_not_printed_twice() {
+        let (g, p) = (grid(8, 6), plane());
+        let same = grid(8, 6);
+        let mut i = input(&g, &p);
+        i.rooms[0].grid_en = Some(&same);
+        i.rooms[0].plane_en = Some(&p);
+        let t = texts(&layout(&i, &Options::default()));
+        assert!(
+            !t.iter().any(|x| x.contains("EN 12464-1 grid")),
+            "the same grid was printed a second time under another name",
+        );
+    }
+
+    /// A RESULT WITHOUT ONE IS NOT BROKEN BY IT. Older stored results, and the whole-model
+    /// fallback, carry no EN grid.
+    #[test]
+    fn a_room_with_no_en_grid_still_lays_out() {
+        let (g, p) = (grid(16, 12), plane());
+        let i = input(&g, &p);
+        let d = layout(&i, &Options::default());
+        assert!(!d.pages.is_empty(), "a report with no EN grid produced no pages");
+        assert!(
+            !texts(&d).iter().any(|x| x.contains("EN 12464-1 grid")),
+            "a block was printed for a grid that does not exist",
+        );
+    }
+
+    /// THE GRID SPACING IS THE COARSER AXIS. A rectangular cell described by its finer side
+    /// flatters the grid, and the coarse axis is the one that decides what a maximum misses.
+    #[test]
+    fn spacing_is_quoted_from_the_coarser_axis() {
+        // 8 m over 4 columns is 2.00 m; 6 m over 12 rows is 0.50 m.
+        let p = CalcPlane { origin: cad_light::Vertex::new(0.0, 0.0, 0.8), width: 8.0, depth: 6.0, cols: 4, rows: 12 };
+        let g = grid(4, 12);
+        assert!(
+            (spacing_of(&p, &g) - 2.0).abs() < 1e-6,
+            "spacing came out {:.3} m, expected the coarser 2.000",
+            spacing_of(&p, &g),
+        );
     }
 }
