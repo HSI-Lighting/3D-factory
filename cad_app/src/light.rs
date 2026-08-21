@@ -1303,8 +1303,6 @@ pub struct LightState {
     pub meshes: Vec<Mesh>,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
-    /// Fixed scale ceiling for the colour map (None ⇒ auto = grid max).
-    pub scale_max: Option<f64>,
     /// IES file path typed into the panel.
     pub ies_path: String,
     /// Status / result line.
@@ -1464,7 +1462,6 @@ impl LightState {
             results_restored: false,
             meshes: Vec::new(),
             show_overlay: true,
-            scale_max: None,
             ies_path: String::new(),
             last_msg: "① Import your light files · ② click the plan to mark where they go · ③ pick a fitting for them."
                 .to_string(),
@@ -1482,14 +1479,6 @@ impl LightState {
             ramp: LuxRamp::default(),
             hide_ceilings: true,
         }
-    }
-
-    /// Colour-map ceiling: user override, else the current grid's max.
-    pub fn scale_ceiling(&self) -> f64 {
-        self.scale_max
-            .or_else(|| self.grid.as_ref().map(|g| g.max))
-            .unwrap_or(1.0)
-            .max(1e-3)
     }
 
     /// The fitting a NEW point should get: the chosen one, or nothing.
@@ -3178,7 +3167,15 @@ impl LightState {
     ///   Calculation — how the answer is worked out
     ///   Surfaces — what the room is made of
     ///   Display — how the result is drawn
-    pub fn toolbar_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
+    /// `report` is the SHARED false-colour scale — the SIMLUX window edits the very settings the
+    /// report does, because it used to edit its own and nothing drew from them. See
+    /// `crate::report::ui::scale_editor_ui`.
+    pub fn toolbar_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        report: &mut crate::report::Options,
+        room_max: f64,
+    ) -> LightAction {
         let mut action = LightAction::default();
         ui.horizontal_wrapped(|ui| {
             // ---- ① the LIBRARY of imported fittings -------------------------------------
@@ -3490,34 +3487,22 @@ impl LightState {
                          to show.",
                     );
                 ui.separator();
-                // ---- THE SCALE ITSELF ----------------------------------------------------
-                // A false-colour picture is unreadable without knowing what it is scaled to, and
-                // two rooms cannot be compared at all unless they are on the SAME scale — which is
-                // what the manual setting is for. Auto is per-room and re-scales every calculation.
-                ui.label(egui::RichText::new("Scale").small().weak());
-                let mut auto = self.scale_max.is_none();
-                if ui
-                    .checkbox(&mut auto, "auto (to this room's maximum)")
-                    .on_hover_text("Off: pin the top of the scale, so two rooms can be compared.")
-                    .changed()
-                {
-                    self.scale_max = if auto {
-                        None
-                    } else {
-                        Some(self.grid.as_ref().map(|g| g.max).unwrap_or(500.0).max(1.0))
-                    };
-                }
-                if let Some(m) = &mut self.scale_max {
-                    ui.add(
-                        egui::DragValue::new(m).update_while_editing(false)
-                            .speed(10.0)
-                            .prefix("top of scale  ")
-                            .suffix(" lx")
-                            .range(1.0..=100_000.0),
-                    );
-                }
+                // ---- THE SCALE, WHICH IS THE REPORT'S ------------------------------------
+                //
+                // This menu used to carry its own "auto / pin top" and its own palette, over state
+                // that nothing drew from any more — turning them changed nothing, which is
+                // indistinguishable from broken and was reported as exactly that. There is one
+                // editor now, and it edits the settings the report and both views all read.
+                crate::report::ui::scale_editor_ui(ui, report, room_max, self.ramp.rgb_fn());
                 ui.separator();
-                ui.label(egui::RichText::new("Colours").small().weak());
+                // THE PALETTE, which is what a band with no colour of its own — and a CONTINUOUS
+                // scale, which has no bands at all — is drawn in. It is not the band colours; those
+                // are picked one at a time above.
+                ui.label(egui::RichText::new("Fallback palette").small().weak())
+                    .on_hover_text(
+                        "Used where the scale is NOT banded, and for any band left without a \
+                         colour of its own.",
+                    );
                 let cur = self.ramp;
                 egui::ComboBox::from_id_salt("lux_ramp")
                     .width(190.0)
@@ -3527,9 +3512,6 @@ impl LightState {
                             ui.selectable_value(&mut self.ramp, r, r.label());
                         }
                     });
-                // A live sample of the chosen ramp, so the choice can be made by looking rather
-                // than by reading four names.
-                legend_bar_with(ui, self.scale_ceiling(), self.ramp);
             });
 
             ui.separator();
@@ -3893,25 +3875,6 @@ impl LightState {
             ui.checkbox(&mut self.show_isolux, "Isolux lines");
         });
 
-        // ---- Colour scale -----------------------------------------------
-        ui.horizontal(|ui| {
-            let mut auto = self.scale_max.is_none();
-            if ui.checkbox(&mut auto, "Auto scale").changed() {
-                self.scale_max = if auto {
-                    None
-                } else {
-                    Some(self.grid.as_ref().map(|g| g.max).unwrap_or(500.0).max(1.0))
-                };
-            }
-            if let Some(m) = &mut self.scale_max {
-                ui.add(
-                    egui::DragValue::new(m).update_while_editing(false)
-                        .speed(10.0)
-                        .suffix(" lx")
-                        .range(1.0..=100_000.0),
-                );
-            }
-        });
 
         // ---- Results ----------------------------------------------------
         if let Some(g) = &self.grid {
@@ -4090,9 +4053,10 @@ impl LightState {
                     );
                 }
             }
-            // The chosen palette here too — a legend in a different colour scheme from the
-            // picture it explains is worse than no legend.
-            legend_bar_with(ui, self.scale_ceiling(), self.ramp);
+            // The legend is drawn by the caller, which holds the report's scale — see
+            // `band_legend`. A legend in a different scheme from the picture it explains is worse
+            // than no legend, and this one used to be exactly that.
+            // (intentionally nothing here)
         }
 
         ui.add_space(4.0);
@@ -4208,6 +4172,63 @@ pub fn lux_color(t: f32) -> egui::Color32 {
 pub fn lux_rgb(t: f32) -> (f32, f32, f32) {
     let c = lux_color(t);
     (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
+}
+
+/// THE LEGEND FOR THE SCALE THE VIEWS ARE ACTUALLY DRAWN IN — the report's.
+///
+/// Reported as: *"change the 3d and 2d false colors to reports bands."* The legend has to move with
+/// them: a legend in a different scheme from the picture it explains is worse than no legend, and
+/// this one was still a blue→red gradient to 1802 lx over a drawing banded at 50 · 100 · 200 · 300.
+///
+/// Banded, this draws one block per band with its floor written underneath and the top one left
+/// open-ended, because that is what the drawing does. Unbanded, it falls back to the gradient bar,
+/// which is the honest picture of a continuous scale.
+pub fn band_legend(
+    ui: &mut egui::Ui,
+    opt: &crate::report::Options,
+    room_max: f64,
+    ramp: LuxRamp,
+) {
+    if opt.scale.bands.is_empty() {
+        legend_bar_with(ui, opt.scale.top_lx(room_max), ramp);
+        return;
+    }
+    let edges = opt.scale.edges(room_max);
+    let n = edges.len().saturating_sub(1);
+    if n == 0 {
+        return;
+    }
+    let (resp, painter) = ui.allocate_painter(egui::vec2(240.0, 16.0), egui::Sense::hover());
+    let rect = resp.rect;
+    let w = rect.width() / n as f32;
+    for k in 0..n {
+        let mid = (edges[k] + edges[k + 1]) * 0.5;
+        let c = opt.lux_rgb(mid, room_max, ramp.rgb_fn());
+        let x0 = rect.left() + w * k as f32;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x0 + w, rect.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgb(c[0], c[1], c[2]),
+        );
+    }
+    // The FLOOR of each band, under its block — the number that decides which side of the edge a
+    // reading falls on. The top band is open, and says so rather than naming the room's peak.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for k in 0..n {
+            let label = if k + 1 == n {
+                format!("{:.0}+", edges[k])
+            } else {
+                format!("{:.0}", edges[k])
+            };
+            ui.allocate_ui(egui::vec2(w, 12.0), |ui| {
+                ui.label(egui::RichText::new(label).small().weak());
+            });
+        }
+    });
 }
 
 /// A horizontal gradient legend from 0 to `max` lux, in the standard palette.
@@ -7406,4 +7427,126 @@ mod the_engine_is_part_of_the_fingerprint {
             "a result computed by a superseded engine was restored as though it were current",
         );
     }
+}
+
+/// ONE SCALE FOR THE WINDOW AND THE PAGE.
+///
+/// Reported as: *"linking the false color of the report with the simlux window. looks like it not
+/// wired in."* It was not: the SIMLUX Display menu carried its own "auto / pin top" and its own
+/// palette over state that nothing drew from any more, so turning them changed nothing — which is
+/// indistinguishable from broken.
+#[cfg(test)]
+mod the_window_and_the_page_share_one_scale {
+    use super::*;
+
+    fn banded() -> crate::report::Options {
+        let mut o = crate::report::Options::default();
+        o.scale.bands = vec![50.0, 100.0, 200.0, 300.0];
+        o.band_colours = vec![[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42], [50, 51, 52]];
+        o
+    }
+
+    /// The palette, as something no band colour could be mistaken for.
+    fn black(_t: f32) -> (f32, f32, f32) {
+        (0.0, 0.0, 0.0)
+    }
+
+    /// Run `band_legend` for real, headlessly, and hand back the colours it filled.
+    ///
+    /// THE FIRST VERSION OF THIS TEST NEVER CALLED THE LEGEND. It asserted things about
+    /// `Options::lux_rgb` — the rule the blocks would be filled with — and so was a statement about
+    /// the colour rule, not about the legend. Replacing the whole banded branch with the gradient
+    /// bar left it passing. Driving a frame costs a few lines and tests the function that was
+    /// changed.
+    fn legend_fills(o: &crate::report::Options, room_max: f64) -> Vec<egui::Color32> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(600.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                band_legend(ui, o, room_max, LuxRamp::Classic);
+            });
+        });
+        let mut fills = Vec::new();
+        for cp in out.shapes {
+            if let egui::epaint::Shape::Rect(r) = cp.shape {
+                // The panel's own background is painted too; only the legend's blocks are this
+                // short, and they are the only opaque fills of that height.
+                if r.rect.height() > 8.0 && r.rect.height() < 24.0 && r.fill.a() == 255 {
+                    fills.push(r.fill);
+                }
+            }
+        }
+        fills
+    }
+
+    /// THE LEGEND DRAWS THE BANDS, not a gradient — one block per band, in the band's own colour.
+    #[test]
+    fn the_legend_has_one_block_per_band_in_the_bands_own_colour() {
+        let o = banded();
+        let room_max = 1662.0;
+        let fills = legend_fills(&o, room_max);
+        assert_eq!(
+            fills.len(),
+            5,
+            "four thresholds make five bands; the legend painted {} blocks — a gradient bar paints \
+             64",
+            fills.len(),
+        );
+        for (k, c) in fills.iter().enumerate() {
+            let want = o.band_colours[k];
+            assert_eq!(
+                [c.r(), c.g(), c.b()],
+                want,
+                "legend block {k} is not band {k}'s own colour",
+            );
+        }
+    }
+
+    /// AND A CONTINUOUS SCALE STILL GETS A GRADIENT, which is the honest picture of one. The two
+    /// branches have to be told apart or the test above passes on either.
+    #[test]
+    fn a_scale_with_no_bands_still_draws_a_gradient() {
+        let mut o = banded();
+        o.scale.bands.clear();
+        let fills = legend_fills(&o, 1662.0);
+        assert!(
+            fills.len() > 30,
+            "a continuous scale drew {} blocks — that is a banded legend, not a gradient",
+            fills.len(),
+        );
+        // …and NOT in the band colours, which belong to bands.
+        assert!(
+            !fills.iter().any(|c| [c.r(), c.g(), c.b()] == o.band_colours[0]),
+            "a gradient took a band colour",
+        );
+    }
+
+    /// AND THE SETTINGS THE WINDOW EDITS ARE THE REPORT'S OWN OBJECT. The toolbar takes
+    /// `&mut Options` — so there is no copy to fall out of step, and a band changed in the SIMLUX
+    /// window IS the band the report prints.
+    #[test]
+    fn the_toolbar_edits_the_reports_own_options() {
+        let src = include_str!("light.rs");
+        let a = src.find("pub fn toolbar_ui").expect("the toolbar");
+        let sig = &src[a..a + 240];
+        assert!(
+            sig.contains("report: &mut crate::report::Options"),
+            "the toolbar no longer takes the report's options by reference — it has a copy, and a \
+             copy is how the window and the page drift apart:\n{sig}",
+        );
+    }
+
+    // THE OLD PER-WINDOW CEILING — `scale_max` and `scale_ceiling` — is GONE, and there is
+    // deliberately NO TEST for that. The first attempt grepped this file for the name and failed
+    // instantly, because the assertion's own message contains it: a source-grep test that can match
+    // its own text is worthless twice over. And the thing it was reaching for is already
+    // guaranteed by the compiler — a field that no longer exists cannot be read, so any leftover
+    // use is a build error rather than a silent regression. A test that restates what the compiler
+    // enforces adds nothing and costs a name in the suite.
 }

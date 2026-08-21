@@ -5217,7 +5217,14 @@ impl CadApp {
         if self.light.rooms.is_empty() {
             return;
         }
-        let maxv = self.light.scale_ceiling();
+        // THE REPORT'S SCALE AND BAND COLOURS — the same rule the 3D sheet and the page use.
+        //
+        // Asked for as: *"change the 3d and 2d false colors to reports bands."* This read the
+        // panel's own palette and its own ceiling, so the plan, the 3D view and the report were
+        // three pictures of one field in three different schemes.
+        let room_max = self.light_room_max();
+        let ramp = self.light.ramp.rgb_fn();
+        let opts = &self.report_opts;
         let clip = painter.with_clip_rect(rect);
         // EVERY ROOM, not just the one in the panel. A plan with two rooms used to show one lit
         // and one dark, which reads as a room that failed rather than a room nobody calculated.
@@ -5238,11 +5245,8 @@ impl CadApp {
                     continue;
                 }
                 let v = grid.values[i];
-                // THE CHOSEN PALETTE, not a fixed one. This called `lux_color`, which is hard-wired
-                // to Classic — so picking Viridis or Greyscale changed the 3D floor and the legend
-                // and left the plan exactly as it was: "i cant change the colors. it just shows
-                // some preset colors which also appears to show no change."
-                let color = self.light.ramp.color((v / maxv) as f32);
+                let c = opts.lux_rgb(v, room_max, ramp);
+                let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
                 let x0 = plane.origin.x + col as f32 * dx;
                 let y0 = plane.origin.y + row as f32 * dy;
                 // The calc plane is METRES (cad_light's contract; its bounds come from
@@ -5698,9 +5702,16 @@ impl CadApp {
             let (nx, ny) = Self::overlay_res(grid.cols as usize, grid.rows as usize);
             let f = crate::isolux::sample(grid, mask, nx, ny);
             // The floor, not the working plane: the result has always been read off the floor here
-            // and moving it would be a surprise, not a fix. `plane_height` is measured from the
-            // floor, so this puts it back — and on an upper storey `origin.z` carries the base.
-            let floor_z = plane.origin.z - self.light.plane_height;
+            // and moving it would be a surprise, not a fix.
+            //
+            // FROM THE MODEL, NOT FROM ARITHMETIC. This was `plane.origin.z - plane_height`, which
+            // assumes the working plane is measured up from z = 0. It is not: the reference project
+            // stands on a slab whose top is at 0.100 m, so the sheet was laid at 0.005 m — ninety
+            // -five millimetres UNDERNEATH the floor, hidden by it completely, and both toggles
+            // looked dead. Measured, not guessed: the vertex buffer had all 58,050 of its overlay
+            // vertices in it, correctly coloured, at z = 0.005 against a floor mesh starting at
+            // 0.100.
+            let floor_z = self.floor_under(plane);
             if self.light.floor_heatmap {
                 crate::light3d::push_lux_sheet(out, &f, plane, floor_z + 0.005, &paint);
             }
@@ -5733,6 +5744,41 @@ impl CadApp {
                 }
             }
         }
+    }
+
+    /// WHERE THE FLOOR ACTUALLY IS beneath a working plane, read off the model.
+    ///
+    /// The lux sheet is laid on the floor, so it has to know where the floor is — and the obvious
+    /// arithmetic is wrong. `plane.origin.z - plane_height` assumes the plane is measured up from
+    /// z = 0; a room standing on a slab has its floor at the slab's top, and on the reference
+    /// project that is 0.100 m. The sheet went to 0.005 m, under the floor, invisible.
+    ///
+    /// TWO THINGS MAKE THIS FIDDLIER THAN IT LOOKS. Material 0 is "floor", but materials here are
+    /// assigned by ORIENTATION — so a ceiling's upward-facing top face is filed as floor too, which
+    /// is why only surfaces below the plane count. And a building has more than one storey, so only
+    /// surfaces under THIS room's footprint count: the highest floor below the plane is the one this
+    /// room stands on.
+    fn floor_under(&self, plane: &cad_light::CalcPlane) -> f32 {
+        let (x0, x1) = (plane.origin.x, plane.origin.x + plane.width);
+        let (y0, y1) = (plane.origin.y, plane.origin.y + plane.depth);
+        // A margin, so a floor sitting a hair under the plane through rounding is not mistaken for
+        // the plane itself.
+        let ceiling = plane.origin.z - 0.05;
+        let mut best: Option<f32> = None;
+        for m in &self.light.meshes {
+            if m.material != 0 {
+                continue;
+            }
+            for v in &m.vertices {
+                if v.z <= ceiling && v.x >= x0 - 0.5 && v.x <= x1 + 0.5 && v.y >= y0 - 0.5 && v.y <= y1 + 0.5
+                {
+                    best = Some(best.map_or(v.z, |b: f32| b.max(v.z)));
+                }
+            }
+        }
+        // No floor in the model at all — a 2D-only project lit from the plan extrusion. The old
+        // arithmetic is then the best available, and it is right for exactly that case.
+        best.unwrap_or(plane.origin.z - self.light.plane_height)
     }
 
     /// How finely the overlay is resampled, from the grid it is drawn from.
@@ -14866,7 +14912,12 @@ impl CadApp {
                 // The SIMLUX toolbar, in the same grouped-menu shape as the 3D Factory's. It used
                 // to be a bare colour legend here and a tall column of numbered steps in a side
                 // panel, so "how do I add a light" had no answer anywhere on screen.
-                let act = self.light.toolbar_ui(ui);
+                // The toolbar edits the REPORT's scale — one set of settings for the window and
+                // the page alike. Taken out and put back so both borrows are short.
+                let room_max = self.light_room_max();
+                let mut ropts = std::mem::take(&mut self.report_opts);
+                let act = self.light.toolbar_ui(ui, &mut ropts, room_max);
+                self.report_opts = ropts;
                 if act.import_photometry {
                     open_ies_picker = true;
                 }
@@ -14880,9 +14931,11 @@ impl CadApp {
                     self.export_light_report();
                 }
                 if self.light.grid.is_some() {
-                    crate::light::legend_bar_with(
+                    // THE REPORT'S BANDS — the same scale the floor sheet is painted in.
+                    crate::light::band_legend(
                         ui,
-                        self.light.scale_ceiling(),
+                        &self.report_opts,
+                        self.light_room_max(),
                         self.light.ramp,
                     );
                 }
@@ -64614,5 +64667,147 @@ mod max_forensics {
                 println!("   {line}");
             }
         }
+    }
+}
+
+
+/// THE LUX SHEET HAS TO BE ON TOP OF THE FLOOR, NOT UNDER IT.
+///
+/// Reported as: *"the false color and isoline in display those seems to make no difference what so
+/// ever. and the false color appearing on the simlux window also is gone."*
+///
+/// Nothing was broken about the overlay itself — measured on the reference project, all 58,050 of
+/// its vertices were in the buffer and correctly coloured from the report's bands. They were at
+/// z = 0.005 m, and that room's floor mesh starts at z = 0.100 m. Ninety-five millimetres under the
+/// floor, hidden by it, and both toggles looked dead.
+///
+/// The cause was arithmetic that reads as obviously right: `plane.origin.z - plane_height`. It
+/// assumes the working plane is measured up from z = 0, and a room standing on a slab breaks it.
+#[cfg(test)]
+mod the_lux_sheet_sits_on_the_floor {
+    use super::*;
+
+    /// A room on a RAISED floor — the case the arithmetic gets wrong. Built through the factory so
+    /// the floor comes out wherever the real model puts it, rather than wherever a test says.
+    fn a_room_on_a_slab() -> CadApp {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = 0.5;
+        for (x, y) in [(2.0, 2.0), (6.0, 2.0), (2.0, 4.0), (6.0, 4.0)] {
+            app.light.luminaires.push(cad_light::Luminaire {
+                id: app.light.luminaires.len() as u32 + 1,
+                profile: crate::light::BUILTIN.to_string(),
+                position: cad_light::Vertex::new(x, y, 2.9),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        let doc = cad_kernel::Document::default();
+        app.light.calculate(&doc, Some(&app.factory));
+        app
+    }
+
+    /// The highest floor surface under the room — what the sheet has to clear.
+    fn floor_top(app: &CadApp) -> f32 {
+        let plane = &app.light.rooms[0].plane;
+        let mut top = f32::MIN;
+        for m in &app.light.meshes {
+            if m.material != 0 {
+                continue;
+            }
+            for v in &m.vertices {
+                if v.z <= plane.origin.z - 0.05 {
+                    top = top.max(v.z);
+                }
+            }
+        }
+        top
+    }
+
+    /// EVERY OVERLAY VERTEX IS ABOVE THE FLOOR IT IS DRAWN ON.
+    #[test]
+    fn the_sheet_is_not_buried_under_the_floor() {
+        let mut app = a_room_on_a_slab();
+        app.light.floor_heatmap = true;
+        app.light.show_isolux = true;
+        assert_eq!(app.light.rooms.len(), 1, "the fixture did not calculate");
+
+        let top = floor_top(&app);
+        // THE FIXTURE HAS TO REPRODUCE THE CASE. A room whose floor is already at z = 0 would pass
+        // this test with the old arithmetic and prove nothing at all.
+        assert!(
+            top > 0.01,
+            "the fixture's floor is at {top:.4} m — it does not reproduce a room standing on a slab",
+        );
+
+        let mut verts = Vec::new();
+        app.push_lux_overlay(&mut verts);
+        assert!(!verts.is_empty(), "the overlay produced no geometry");
+        let lowest = verts.iter().map(|v| v.z).fold(f32::MAX, f32::min);
+        assert!(
+            lowest > top,
+            "the overlay's lowest vertex is at {lowest:.4} m and the floor's top is at {top:.4} m — \
+             it is drawn underneath and cannot be seen",
+        );
+        // …and not floating either. A sheet a hand's breadth off the floor reads as a separate
+        // object rather than as the floor's colour.
+        assert!(
+            lowest - top < 0.05,
+            "the overlay is {:.3} m above the floor — it will read as a floating panel",
+            lowest - top,
+        );
+    }
+
+    /// AND `floor_under` FINDS IT, which is the thing the sheet depends on.
+    #[test]
+    fn the_floor_is_read_off_the_model_not_computed_from_the_plane_height() {
+        let app = a_room_on_a_slab();
+        let plane = &app.light.rooms[0].plane;
+        let found = app.floor_under(plane);
+        let top = floor_top(&app);
+        assert!(
+            (found - top).abs() < 1e-4,
+            "floor_under says {found:.4} m, the model's floor is at {top:.4} m",
+        );
+        // The arithmetic this replaced, spelled out — so the test says what it is defending against.
+        let by_arithmetic = plane.origin.z - app.light.plane_height;
+        assert!(
+            (by_arithmetic - top).abs() > 1e-3,
+            "the fixture does not discriminate: the old arithmetic gives {by_arithmetic:.4} m and \
+             the model's floor is at {top:.4} m",
+        );
+    }
+
+    /// A PROJECT WITH NO 3D MODEL still gets a sensible height rather than a panic or a NaN.
+    #[test]
+    fn a_project_with_no_floor_falls_back_to_the_plane_height() {
+        let app = CadApp::default();
+        let plane = cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 6.0,
+            depth: 4.0,
+            cols: 12,
+            rows: 8,
+        };
+        let z = app.floor_under(&plane);
+        assert!(z.is_finite(), "floor_under returned {z}");
+        assert!(
+            (z - (0.8 - app.light.plane_height)).abs() < 1e-6,
+            "with no model the fallback should be the plane height; got {z:.4}",
+        );
     }
 }

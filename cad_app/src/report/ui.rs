@@ -277,157 +277,8 @@ pub fn window_ui(
                             }
                         });
 
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("False-colour scale").strong());
-                        ui.horizontal(|ui| {
-                            let mut pinned = opt.scale.top.is_some();
-                            if ui.checkbox(&mut pinned, "Pin top").changed() {
-                                // Pinning starts from whatever the room reached, so the first
-                                // click changes nothing and the number can be edited from there.
-                                opt.scale.top = if pinned { Some(room_max.max(1.0)) } else { None };
-                            }
-                            if let Some(t) = opt.scale.top.as_mut() {
-                                ui.add(
-                                    egui::DragValue::new(t)
-                                        .speed(10.0)
-                                        .range(1.0..=100_000.0)
-                                        .suffix(" lx"),
-                                );
-                            } else {
-                                ui.label(
-                                    egui::RichText::new(format!("auto — {room_max:.0} lx"))
-                                        .small()
-                                        .weak(),
-                                );
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            let mut banded = !opt.scale.bands.is_empty();
-                            if ui
-                                .checkbox(&mut banded, "Bands")
-                                .on_hover_text(
-                                    "Discrete steps rather than a gradient — which parts of the \
-                                     room meet which requirement",
-                                )
-                                .changed()
-                            {
-                                opt.scale.bands =
-                                    if banded { vec![25.0, 100.0, 300.0, 500.0] } else { Vec::new() };
-                            }
-                            if !opt.scale.bands.is_empty() && ui.small_button("＋").clicked() {
-                                let last = opt.scale.bands.last().copied().unwrap_or(0.0);
-                                opt.scale.bands.push(last * 2.0 + 1.0);
-                            }
-                        });
-                        // A COLOUR PER BAND, from a wheel, kept with the settings.
-                        //
-                        // Asked for as "in the band add a band color picker … so this color band
-                        // will come for all future report generation."
-                        //
-                        // The list is filled from the PALETTE the first time it is touched, not
-                        // left blank: a swatch that does not show the colour the report will
-                        // actually use is a picker that lies, and the first thing anybody does is
-                        // compare it against the plot beside it.
-                        //
-                        // NOTHING IS WRITTEN UNTIL SOMEBODY PICKS A COLOUR. The obvious
-                        // implementation fills the list from the palette as soon as the dialog
-                        // opens, so the swatches have something to point at — and then merely
-                        // LOOKING at the dialog has silently made every band an explicit choice,
-                        // saved it to the settings, and cut the report off from the palette for
-                        // ever. Changing the app's colour scheme afterwards would do nothing and
-                        // nothing would say why.
-                        //
-                        // So each swatch shows the colour the report will actually use, edits a
-                        // COPY, and only writes back when it changed.
-                        let top = opt.scale.top_lx(room_max);
-                        let edges = opt.scale.edges(room_max);
-                        let n_bands = edges.len().saturating_sub(1);
-                        let shown = |opt: &Options, k: usize| -> [u8; 3] {
-                            if let Some(c) = opt.band_colours.get(k) {
-                                return *c;
-                            }
-                            let mid = match edges.get(k..k + 2) {
-                                Some(p) => (p[0] + p[1]) * 0.5,
-                                None => top,
-                            };
-                            let (r, g, b) = ramp((mid / top).clamp(0.0, 1.0) as f32);
-                            [
-                                (r * 255.0).round() as u8,
-                                (g * 255.0).round() as u8,
-                                (b * 255.0).round() as u8,
-                            ]
-                        };
-                        // Writing one band's colour has to make the others explicit too, or the
-                        // list would be short and every band past the end would silently fall back
-                        // to the palette — which is not what "I chose this one" means.
-                        let mut set_band: Option<(usize, [u8; 3])> = None;
-                        if !opt.scale.bands.is_empty() {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("Band colours").small().weak());
-                                if ui
-                                    .small_button("reset")
-                                    .on_hover_text("Back to the palette")
-                                    .clicked()
-                                {
-                                    opt.band_colours.clear();
-                                }
-                            });
-                            // Band 0 has no threshold row of its own — it is everything BELOW the
-                            // first step — so it gets a row here, or it could never be recoloured.
-                            ui.horizontal(|ui| {
-                                let mut c = shown(opt, 0);
-                                if ui.color_edit_button_srgb(&mut c).changed() {
-                                    set_band = Some((0, c));
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "0 – {:.0} lx",
-                                        opt.scale.bands.first().copied().unwrap_or(top),
-                                    ))
-                                    .small()
-                                    .weak(),
-                                );
-                            });
-                        }
-                        let mut drop_band: Option<usize> = None;
-                        for i in 0..opt.scale.bands.len() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("✕").clicked() {
-                                    drop_band = Some(i);
-                                }
-                                // The band STARTING at this threshold, so the swatch sits beside
-                                // the number that is its floor.
-                                let mut c = shown(opt, i + 1);
-                                if ui.color_edit_button_srgb(&mut c).changed() {
-                                    set_band = Some((i + 1, c));
-                                }
-                                ui.add(
-                                    egui::DragValue::new(&mut opt.scale.bands[i])
-                                        .speed(5.0)
-                                        .range(1.0..=100_000.0)
-                                        .suffix(" lx"),
-                                );
-                            });
-                        }
-                        if let Some((k, c)) = set_band {
-                            let mut all: Vec<[u8; 3]> =
-                                (0..n_bands.max(k + 1)).map(|j| shown(opt, j)).collect();
-                            all[k] = c;
-                            opt.band_colours = all;
-                        }
-                        if let Some(i) = drop_band {
-                            opt.scale.bands.remove(i);
-                            // The colour of the band that has just lost its floor goes with it, or
-                            // every colour above the gap would shift down by one.
-                            if i + 1 < opt.band_colours.len() {
-                                opt.band_colours.remove(i + 1);
-                            }
-                        }
-                        // Out of order the bands would draw as overlapping blocks with their
-                        // labels crossing, so they are kept sorted rather than validated later.
-                        opt.scale
-                            .bands
-                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        // THE SAME EDITOR THE SIMLUX WINDOW SHOWS — see `scale_editor_ui`.
+                        scale_editor_ui(ui, opt, room_max, ramp);
 
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("Header & footer").strong());
@@ -822,4 +673,177 @@ fn ear_clip(pts: &[egui::Pos2]) -> Vec<[egui::Pos2; 3]> {
         out.push([v[0], v[1], v[2]]);
     }
     out
+}
+
+/// THE FALSE-COLOUR SCALE EDITOR — one editor, wherever it is shown.
+///
+/// Reported as: *"linking the false color of the report with the simlux window. looks like it not
+/// wired in."* It was not. The overlay read `report_opts` correctly, but the SIMLUX Display menu
+/// still carried its OWN controls — a separate "auto / pin top" and a palette picker — over state
+/// nothing drew from any more. Turning them changed nothing, which is indistinguishable from
+/// broken.
+///
+/// So there is one editor and one set of settings, called from the report dialog and from the
+/// Display menu alike. Anything changed in either place is changed in both, because there is only
+/// one place for it to be changed.
+///
+/// `ramp` is the fallback palette — what a band with no colour of its own, and a CONTINUOUS scale
+/// with no bands at all, are drawn in.
+pub fn scale_editor_ui(
+    ui: &mut egui::Ui,
+    opt: &mut Options,
+    room_max: f64,
+    ramp: fn(f32) -> (f32, f32, f32),
+) {
+ui.label(egui::RichText::new("False-colour scale").strong());
+ui.horizontal(|ui| {
+    let mut pinned = opt.scale.top.is_some();
+    if ui.checkbox(&mut pinned, "Pin top").changed() {
+        // Pinning starts from whatever the room reached, so the first
+        // click changes nothing and the number can be edited from there.
+        opt.scale.top = if pinned { Some(room_max.max(1.0)) } else { None };
+    }
+    if let Some(t) = opt.scale.top.as_mut() {
+        ui.add(
+            egui::DragValue::new(t)
+                .speed(10.0)
+                .range(1.0..=100_000.0)
+                .suffix(" lx"),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new(format!("auto — {room_max:.0} lx"))
+                .small()
+                .weak(),
+        );
+    }
+});
+ui.horizontal(|ui| {
+    let mut banded = !opt.scale.bands.is_empty();
+    if ui
+        .checkbox(&mut banded, "Bands")
+        .on_hover_text(
+            "Discrete steps rather than a gradient — which parts of the \
+             room meet which requirement",
+        )
+        .changed()
+    {
+        opt.scale.bands =
+            if banded { vec![25.0, 100.0, 300.0, 500.0] } else { Vec::new() };
+    }
+    if !opt.scale.bands.is_empty() && ui.small_button("＋").clicked() {
+        let last = opt.scale.bands.last().copied().unwrap_or(0.0);
+        opt.scale.bands.push(last * 2.0 + 1.0);
+    }
+});
+// A COLOUR PER BAND, from a wheel, kept with the settings.
+//
+// Asked for as "in the band add a band color picker … so this color band
+// will come for all future report generation."
+//
+// The list is filled from the PALETTE the first time it is touched, not
+// left blank: a swatch that does not show the colour the report will
+// actually use is a picker that lies, and the first thing anybody does is
+// compare it against the plot beside it.
+//
+// NOTHING IS WRITTEN UNTIL SOMEBODY PICKS A COLOUR. The obvious
+// implementation fills the list from the palette as soon as the dialog
+// opens, so the swatches have something to point at — and then merely
+// LOOKING at the dialog has silently made every band an explicit choice,
+// saved it to the settings, and cut the report off from the palette for
+// ever. Changing the app's colour scheme afterwards would do nothing and
+// nothing would say why.
+//
+// So each swatch shows the colour the report will actually use, edits a
+// COPY, and only writes back when it changed.
+let top = opt.scale.top_lx(room_max);
+let edges = opt.scale.edges(room_max);
+let n_bands = edges.len().saturating_sub(1);
+let shown = |opt: &Options, k: usize| -> [u8; 3] {
+    if let Some(c) = opt.band_colours.get(k) {
+        return *c;
+    }
+    let mid = match edges.get(k..k + 2) {
+        Some(p) => (p[0] + p[1]) * 0.5,
+        None => top,
+    };
+    let (r, g, b) = ramp((mid / top).clamp(0.0, 1.0) as f32);
+    [
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    ]
+};
+// Writing one band's colour has to make the others explicit too, or the
+// list would be short and every band past the end would silently fall back
+// to the palette — which is not what "I chose this one" means.
+let mut set_band: Option<(usize, [u8; 3])> = None;
+if !opt.scale.bands.is_empty() {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Band colours").small().weak());
+        if ui
+            .small_button("reset")
+            .on_hover_text("Back to the palette")
+            .clicked()
+        {
+            opt.band_colours.clear();
+        }
+    });
+    // Band 0 has no threshold row of its own — it is everything BELOW the
+    // first step — so it gets a row here, or it could never be recoloured.
+    ui.horizontal(|ui| {
+        let mut c = shown(opt, 0);
+        if ui.color_edit_button_srgb(&mut c).changed() {
+            set_band = Some((0, c));
+        }
+        ui.label(
+            egui::RichText::new(format!(
+                "0 – {:.0} lx",
+                opt.scale.bands.first().copied().unwrap_or(top),
+            ))
+            .small()
+            .weak(),
+        );
+    });
+}
+let mut drop_band: Option<usize> = None;
+for i in 0..opt.scale.bands.len() {
+    ui.horizontal(|ui| {
+        if ui.small_button("✕").clicked() {
+            drop_band = Some(i);
+        }
+        // The band STARTING at this threshold, so the swatch sits beside
+        // the number that is its floor.
+        let mut c = shown(opt, i + 1);
+        if ui.color_edit_button_srgb(&mut c).changed() {
+            set_band = Some((i + 1, c));
+        }
+        ui.add(
+            egui::DragValue::new(&mut opt.scale.bands[i])
+                .speed(5.0)
+                .range(1.0..=100_000.0)
+                .suffix(" lx"),
+        );
+    });
+}
+if let Some((k, c)) = set_band {
+    let mut all: Vec<[u8; 3]> =
+        (0..n_bands.max(k + 1)).map(|j| shown(opt, j)).collect();
+    all[k] = c;
+    opt.band_colours = all;
+}
+if let Some(i) = drop_band {
+    opt.scale.bands.remove(i);
+    // The colour of the band that has just lost its floor goes with it, or
+    // every colour above the gap would shift down by one.
+    if i + 1 < opt.band_colours.len() {
+        opt.band_colours.remove(i + 1);
+    }
+}
+// Out of order the bands would draw as overlapping blocks with their
+// labels crossing, so they are kept sorted rather than validated later.
+opt.scale
+    .bands
+    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
 }
