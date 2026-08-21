@@ -53,21 +53,20 @@ pub struct RoomInput<'a> {
     pub name: String,
     pub grid: &'a LuxGrid,
     pub plane: &'a CalcPlane,
-    /// THE SAME ROOM ON EN 12464-1's OWN GRID, computed alongside the working one.
+    /// THE SAME ROOM ON EN 12464-1's OWN GRID — and, when it exists, the grid EVERY REPORTED FIGURE
+    /// comes from. See [`RoomInput::reported`].
     ///
     /// Reported as: *"the max lux differs by a lot from the dialux and relux values. why is
     /// that?"* — and the answer is that a maximum is not a property of a room. It is the brightest
-    /// CELL CENTRE on whatever grid was sampled, and ours is about twice as fine as the default in
-    /// DIALux or Relux. Measured on the project that prompted the question: the same field reports
-    /// 1802 lx on the working grid and 1662 lx on the standard's, while the average moves from
-    /// 323.6 to 326.9 — the maximum shifted 140 lx and the average 3.
-    ///
-    /// So both are printed. The working figures are the conservative ones and stay the headline;
-    /// the standard's are what a compliance claim rests on and what another package's default is
-    /// closest to. Neither replaces the other, and a reader comparing two reports needs to know
-    /// which they are holding.
+    /// CELL CENTRE on whatever grid was sampled, and the working grid is about twice as fine as the
+    /// default in DIALux or Relux. Measured on the project that prompted the question: the same
+    /// field reports 1802 lx on the working grid and 1662 lx on the standard's, while the average
+    /// moves from 323.6 to 326.9 — the maximum shifted 140 lx and the average 3.
     pub grid_en: Option<&'a LuxGrid>,
     pub plane_en: Option<&'a CalcPlane>,
+    /// Which cells of `grid_en` are measurable. Empty when every cell is, OR when the result was
+    /// stored before this was kept — see `RoomInput::reported_mask`.
+    pub mask_en: &'a [bool],
     pub mask: &'a [bool],
     /// The room's outline, in metres. Empty for the whole-model fallback.
     pub poly: &'a [glam::Vec2],
@@ -77,6 +76,56 @@ pub struct RoomInput<'a> {
     pub cylindrical_avg: Option<f64>,
     /// The fittings standing in THIS room, by type.
     pub schedule: Vec<ScheduleRow>,
+}
+
+impl<'a> RoomInput<'a> {
+    /// THE GRID EVERY REPORTED FIGURE COMES FROM — EN 12464-1's, whenever there is one.
+    ///
+    /// Asked for as: *"lets only show the en grid since its the standard showing 2 results will
+    /// confuse the user."* The report printed both for a while and that was worse: two averages and
+    /// two maxima under one room heading read as a contradiction, however carefully the difference
+    /// is explained underneath.
+    ///
+    /// ONE ACCESSOR, so a figure cannot be quoted off the wrong grid by accident. Every average,
+    /// minimum, maximum, uniformity, percentile and W/m²-per-100-lx in this file goes through here;
+    /// the only thing that still reads `grid` directly is the PICTURE, which is a different
+    /// question — see [`RoomInput::drawn`].
+    ///
+    /// NOTE WHAT THIS COSTS. The standard's grid is the coarser of the two, so it reports a HIGHER
+    /// minimum and a HIGHER uniformity than the working grid did. That is not a rounding
+    /// difference: on the project this came from, U₀ goes 0.32 → 0.33 and Emin 102 → 108 lx. The
+    /// standard's grid is the basis a compliance claim rests on, which is the reason to prefer it,
+    /// but it is the more generous of the two and the choice should be made knowing that.
+    pub fn reported(&self) -> &'a LuxGrid {
+        self.grid_en.unwrap_or(self.grid)
+    }
+
+    /// The plane that grid sits on.
+    pub fn reported_plane(&self) -> &'a CalcPlane {
+        self.plane_en.unwrap_or(self.plane)
+    }
+
+    /// THE GRID THE FALSE-COLOUR FIELD IS DRAWN FROM — always the fine one.
+    ///
+    /// A picture is not a measurement. The standard says how finely a room must be SAMPLED for its
+    /// figures to mean anything; it does not say how coarsely the result may be drawn, and a plan
+    /// rendered at 20 × 16 would throw away detail for nothing. The bands are thresholds in lux, so
+    /// a cell reads the same colour on either grid and there is no second number on show.
+    pub fn drawn(&self) -> &'a LuxGrid {
+        self.grid
+    }
+
+    /// The mask belonging to [`reported`](Self::reported) — which cells of it are measurable.
+    ///
+    /// EVERYTHING THAT WALKS CELLS NEEDS THIS. A masked grid's `avg`, `min` and `max` are computed
+    /// over the kept cells, but its `values` still holds every reading — including the ones taken
+    /// inside a cupboard. The extremes and the percentiles scan `values` themselves, so without
+    /// the mask they would quote a 0 lx reading from inside the furniture as the room's minimum
+    /// while the summary two rows above says 108 lx. That is the same defect the buried-cell fix
+    /// removed from the headline figures, reappearing one section lower down.
+    pub fn reported_mask(&self) -> &'a [bool] {
+        if self.grid_en.is_some() { self.mask_en } else { self.mask }
+    }
 }
 
 /// Everything the layout needs, gathered so it touches no UI types.
@@ -149,6 +198,7 @@ impl<'a> Input<'a> {
                 plane,
                 grid_en,
                 plane_en,
+                mask_en,
                 mask,
                 poly,
                 fixtures,
@@ -174,6 +224,10 @@ impl<'a> Input<'a> {
             h.f64(grid_en.map(|g| g.max).unwrap_or(0.0));
             crate::light::hash_json(&mut h, "plane_en", plane_en);
             h.u64(mask.len() as u64);
+            // The EN mask decides which cells the extremes and percentiles read, so it is an input
+            // to the page like any other.
+            h.u64(mask_en.len() as u64);
+            h.u64(mask_en.iter().filter(|k| !**k).count() as u64);
             h.u64(poly.len() as u64);
             crate::light::hash_json(&mut h, "fixtures", fixtures);
             crate::light::hash_json(&mut h, "installation", installation);
@@ -707,7 +761,9 @@ fn chapter(c: &mut Cursor, name: &str) {
 }
 
 fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
-    let g = room.grid;
+    // ONE GRID, and it is the standard's — see `RoomInput::reported`.
+    let g = room.reported();
+    let p = room.reported_plane();
     c.heading("Summary");
     c.row("Average E", &format!("{:.0} lx", g.avg));
     c.row("Minimum E", &format!("{:.0} lx", g.min));
@@ -716,18 +772,17 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
         "Uniformity U0 = Emin/E",
         &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
     );
+    // WHICH GRID, ON THE ROW ITSELF. A lux figure without its grid is ambiguous — the maximum
+    // especially, which is the brightest cell CENTRE and moves with spacing — and naming it here
+    // costs a reader nothing while answering the question this whole change came from.
     c.row(
-        "Grid",
-        &format!("{} x {} points at {:.2} m", g.cols, g.rows, spacing_of(room.plane, g)),
+        if room.grid_en.is_some() { "Grid (EN 12464-1)" } else { "Grid" },
+        &format!("{} x {} points at {:.2} m", g.cols, g.rows, spacing_of(p, g)),
     );
     c.row(
         "Plane",
-        &format!(
-            "{:.2} x {:.2} m at {:.2} m",
-            room.plane.width, room.plane.depth, room.plane.origin.z
-        ),
+        &format!("{:.2} x {:.2} m at {:.2} m", p.width, p.depth, p.origin.z),
     );
-    en_summary(c, room);
     if unassigned > 0 {
         c.note(&format!(
             "{unassigned} fixture(s) in this project have no photometric file assigned and \
@@ -744,43 +799,6 @@ fn spacing_of(p: &CalcPlane, g: &LuxGrid) -> f32 {
     let sx = p.width / g.cols.max(1) as f32;
     let sy = p.depth / g.rows.max(1) as f32;
     sx.max(sy)
-}
-
-/// THE SAME ROOM ON THE STANDARD'S OWN GRID, printed beside the working one.
-///
-/// Asked for after: *"the max lux differs by a lot from the dialux and relux values. why is
-/// that?"* Two figures for one room look like an error unless the report says why they differ, so
-/// this ends with the reason rather than leaving a reader to find it.
-fn en_summary(c: &mut Cursor, room: &RoomInput) {
-    let (Some(g), Some(p)) = (room.grid_en, room.plane_en) else { return };
-    if g.values.is_empty() || g.cols == 0 || g.rows == 0 {
-        return;
-    }
-    // NOT WHEN IT IS THE SAME GRID. On a small room the working grid and the standard's can come
-    // out identical, and printing one table twice invites a reader to hunt for the difference.
-    if g.cols == room.grid.cols && g.rows == room.grid.rows {
-        return;
-    }
-    c.heading(&format!("On the EN 12464-1 grid ({:.2} m)", spacing_of(p, g)));
-    c.row("Average E", &format!("{:.0} lx", g.avg));
-    c.row("Minimum E", &format!("{:.0} lx", g.min));
-    c.row("Maximum E", &format!("{:.0} lx", g.max));
-    c.row(
-        "Uniformity U0 = Emin/E",
-        &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
-    );
-    c.row("Grid", &format!("{} x {} points", g.cols, g.rows));
-    // WHY THE TWO DISAGREE, said once and in the place a reader meets it. A maximum is the
-    // brightest cell CENTRE on a grid — a spike under a downlight is a few cells across, so a
-    // coarser grid may never sample it, while an average barely moves. Without this the page reads
-    // as two answers to one question.
-    c.note(
-        "A maximum is the brightest grid point, not the brightest place in the room: a peak \
-         under a downlight is a few cells across, so a coarser grid may miss it. An average is \
-         barely affected. The working grid above is the finer of the two and so the conservative \
-         one; the standard's grid is the basis of a compliance claim, and is closest to the \
-         default in DIALux and Relux.",
-    );
 }
 
 fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
@@ -813,8 +831,8 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
     // W/m² AND W/m² PER 100 LX. The second is what a scheme is actually judged on: 10 W/m² holding
     // a room at 200 lx and 10 W/m² holding one at 600 lx are not comparable installations, and
     // regulations are written against the normalised figure for exactly that reason.
-    let per_100 = if room.grid.avg > 0.0 {
-        format!("   ({:.2} W/m2 per 100 lx)", i.power_density * 100.0 / room.grid.avg)
+    let per_100 = if room.reported().avg > 0.0 {
+        format!("   ({:.2} W/m2 per 100 lx)", i.power_density * 100.0 / room.reported().avg)
     } else {
         String::new()
     };
@@ -1004,9 +1022,18 @@ fn materials(c: &mut Cursor, inp: &Input) {
 }
 
 fn working_plane(c: &mut Cursor, room: &RoomInput, eye_height: f32) {
-    let g = room.grid;
+    // The REPORTED grid — percentiles and diversity are figures like any other. See
+    // `RoomInput::reported`.
+    let g = room.reported();
     c.heading("Working plane");
-    let mut v: Vec<f64> = g.values.clone();
+    // THE MEASURABLE CELLS ONLY. These percentiles used to be taken over every cell in the grid,
+    // masked or not — so on a room with furniture in it the 10th percentile was pulled down by
+    // readings taken inside a cupboard, while the minimum three rows above already excluded them.
+    // A pre-existing defect, and the same one that made a room's minimum 0 lx.
+    let mask = room.reported_mask();
+    let keep = |i: usize| mask.get(i).copied().unwrap_or(true);
+    let mut v: Vec<f64> =
+        g.values.iter().enumerate().filter(|(i, _)| keep(*i)).map(|(_, v)| *v).collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let pct = |p: f64| -> f64 {
         if v.is_empty() {
@@ -1073,11 +1100,18 @@ fn results_body(
     plot_w: f64,
     plot_h: f64,
 ) {
-    let g = room.grid;
+    // THE FINE GRID DRAWS, THE REPORTED GRID SCALES.
+    //
+    // The picture uses every cell that was calculated — a plan redrawn at the standard's spacing
+    // would throw away detail for nothing, and how coarsely a result may be DRAWN is not something
+    // the standard has an opinion about. But the top of an auto scale is a number the reader can
+    // see, in the legend's caption, so it comes from the same grid every other figure does. One
+    // number on the page, which is the whole point of quoting one grid.
+    let g = room.drawn();
     let (gc, gr) = (g.cols as usize, g.rows as usize);
     let x0 = c.left + (c.width() - plot_w) * 0.5;
     let y0 = c.y;
-    let room_max = g.max;
+    let room_max = room.reported().max;
 
     // ---- the field, resampled ------------------------------------------------------------
     //
@@ -1838,10 +1872,15 @@ fn ordinal(n: usize) -> &'static str {
 
 /// Where the darkest and brightest points actually are.
 fn extremes(c: &mut Cursor, room: &RoomInput) {
-    let g = room.grid;
+    // THE REPORTED GRID, WITH ITS OWN MASK. These two rows quote a maximum and a minimum, so taking
+    // them off the drawn grid would put a second pair of extremes on the page — which is exactly
+    // what quoting one grid is for. The mask has to come with it: `values` still holds the readings
+    // the statistics exclude.
+    let g = room.reported();
     let (gc, gr) = (g.cols as usize, g.rows as usize);
-    let p = room.plane;
-    let inside = |i: usize| room.mask.get(i).copied().unwrap_or(true);
+    let p = room.reported_plane();
+    let mask = room.reported_mask();
+    let inside = |i: usize| mask.get(i).copied().unwrap_or(true);
     let at = |i: usize| -> (f64, f64) {
         let (cx, cy) = (i % gc, i / gc);
         (
@@ -1978,6 +2017,7 @@ mod tests {
             plane: p,
             grid_en: None,
             plane_en: None,
+            mask_en: &[],
             mask: &[],
             poly: &[],
             fixtures: &[],
@@ -4084,18 +4124,20 @@ mod tests {
     }
 }
 
-/// BOTH GRIDS ARE PRINTED, and the report says why they disagree.
+
+/// ONE GRID IS QUOTED, AND IT IS THE STANDARD'S.
 ///
-/// Asked for after: *"the max lux differs by a lot from the dialux and relux values. why is
-/// that?"* The answer is that a maximum is the brightest CELL CENTRE on a grid — so the standard's
-/// grid, which SIMLUX has always computed and never shown, goes on the page beside the working one.
+/// Asked for as: *"lets only show the en grid since its the standard showing 2 results will confuse
+/// the user."* An earlier version printed both, with a note explaining the difference; two averages
+/// and two maxima under one room heading read as a contradiction however carefully the note is
+/// worded.
 #[cfg(test)]
-mod the_report_states_which_grid_a_figure_is_on {
+mod every_figure_comes_from_the_standards_grid {
     use super::tests::*;
     use super::*;
 
-    /// A coarse grid over the same plane, with a DELIBERATELY LOWER maximum — which is the whole
-    /// phenomenon: a peak the fine grid catches and the coarse one misses.
+    /// A coarse grid over the same plane, DELIBERATELY different in every statistic — so a figure
+    /// taken off the wrong grid is a different number rather than a rounding difference.
     fn en_grid() -> LuxGrid {
         let (cols, rows) = (4u32, 3u32);
         let vals: Vec<f64> = vec![
@@ -4120,81 +4162,91 @@ mod the_report_states_which_grid_a_figure_is_on {
             .collect()
     }
 
-    /// THE STANDARD'S FIGURES REACH THE PAGE, and are its own rather than a copy of the working
-    /// grid's.
+    fn with_en<'a>(g: &'a LuxGrid, p: &'a CalcPlane, eg: &'a LuxGrid) -> Input<'a> {
+        let mut i = input(g, p);
+        i.rooms[0].grid_en = Some(eg);
+        i.rooms[0].plane_en = Some(p);
+        i
+    }
+
+    /// THE STANDARD'S FIGURES ARE THE ONES ON THE PAGE — and the working grid's are NOT.
+    ///
+    /// The second half is the point of the change. It is not enough that the EN numbers appear;
+    /// the others have to be gone, or the reader is back to two answers.
     #[test]
-    fn the_en_grid_figures_are_printed() {
+    fn the_working_grids_figures_are_not_on_the_page() {
         let (g, p, eg) = (grid(16, 12), plane(), en_grid());
-        let mut i = input(&g, &p);
-        i.rooms[0].grid_en = Some(&eg);
-        i.rooms[0].plane_en = Some(&p);
-        let d = layout(&i, &Options::default());
-        let t = texts(&d);
+        let t = texts(&layout(&with_en(&g, &p, &eg), &Options::default()));
         let has = |s: &str| t.iter().any(|x| x.contains(s));
 
-        assert!(has("EN 12464-1 grid"), "the standard's block is missing entirely");
-        assert!(has("4 x 3 points"), "the standard's grid shape is not on the page");
         assert!(
-            has(&format!("{:.0} lx", eg.max)),
-            "the standard's maximum ({:.0} lx) is not on the page",
-            eg.max,
+            (g.max - eg.max).abs() > 1.0 && (g.avg - eg.avg).abs() > 1.0 && (g.min - eg.min).abs() > 1.0,
+            "the fixture does not discriminate — the two grids report the same statistics",
         );
-        // …and the WORKING figures are still there. Adding the second set must not have replaced
-        // the first, which is the headline.
-        assert!(has("16 x 12 points"), "the working grid shape is gone");
+        assert!(has(&format!("{:.0} lx", eg.max)), "the standard's maximum is missing");
+        assert!(has(&format!("{:.0} lx", eg.avg)), "the standard's average is missing");
+        assert!(has("4 x 3 points"), "the standard's grid shape is missing");
+        assert!(has("Grid (EN 12464-1)"), "the page does not say which grid it is quoting");
+
         assert!(
-            has(&format!("{:.0} lx", g.max)),
-            "the working maximum ({:.0} lx) is gone",
+            !has(&format!("{:.0} lx", g.max)),
+            "the working grid's maximum ({:.0} lx) is still on the page beside the standard's",
             g.max,
         );
         assert!(
-            (g.max - eg.max).abs() > 1.0,
-            "the fixture does not reproduce the case — both grids report the same maximum",
+            !has("16 x 12 points"),
+            "the working grid's shape is still on the page",
         );
     }
 
-    /// AND THE PAGE SAYS WHY THEY DIFFER. Two maxima for one room read as an error unless the
-    /// reason is beside them; this is the whole point of printing the second one.
+    /// THE PICTURE KEEPS THE FINE GRID. The standard sets how finely a room must be SAMPLED for its
+    /// figures to mean anything; it says nothing about how coarsely the result may be drawn, and a
+    /// plan redrawn at 4 x 3 would throw away every bit of detail for no gain.
     #[test]
-    fn the_page_explains_why_the_two_maxima_differ() {
+    fn the_field_is_still_drawn_from_the_calculated_grid() {
         let (g, p, eg) = (grid(16, 12), plane(), en_grid());
-        let mut i = input(&g, &p);
-        i.rooms[0].grid_en = Some(&eg);
-        i.rooms[0].plane_en = Some(&p);
-        let t = texts(&layout(&i, &Options::default()));
-        assert!(
-            t.iter().any(|x| x.contains("brightest grid point")),
-            "the report prints two different maxima and never says why",
-        );
+        let i = with_en(&g, &p, &eg);
+        assert_eq!(i.rooms[0].drawn().cols, 16, "the drawing dropped to the standard's grid");
+        assert_eq!(i.rooms[0].reported().cols, 4, "the figures came off the fine grid");
     }
 
-    /// NOTHING IS PRINTED WHEN THERE IS NOTHING TO COMPARE. On a small room the two grids come out
-    /// the same, and one table repeated invites a reader to hunt for a difference that is not there.
+    /// A ROOM WITH NO EN GRID FALLS BACK TO THE ONE IT HAS. Older stored results and the
+    /// whole-model fallback carry none, and must still report something.
     #[test]
-    fn an_identical_grid_is_not_printed_twice() {
-        let (g, p) = (grid(8, 6), plane());
-        let same = grid(8, 6);
-        let mut i = input(&g, &p);
-        i.rooms[0].grid_en = Some(&same);
-        i.rooms[0].plane_en = Some(&p);
-        let t = texts(&layout(&i, &Options::default()));
-        assert!(
-            !t.iter().any(|x| x.contains("EN 12464-1 grid")),
-            "the same grid was printed a second time under another name",
-        );
-    }
-
-    /// A RESULT WITHOUT ONE IS NOT BROKEN BY IT. Older stored results, and the whole-model
-    /// fallback, carry no EN grid.
-    #[test]
-    fn a_room_with_no_en_grid_still_lays_out() {
+    fn a_room_with_no_en_grid_reports_its_working_one() {
         let (g, p) = (grid(16, 12), plane());
         let i = input(&g, &p);
-        let d = layout(&i, &Options::default());
-        assert!(!d.pages.is_empty(), "a report with no EN grid produced no pages");
+        assert_eq!(i.rooms[0].reported().cols, 16, "a room with no EN grid reported nothing");
+        let t = texts(&layout(&i, &Options::default()));
         assert!(
-            !texts(&d).iter().any(|x| x.contains("EN 12464-1 grid")),
-            "a block was printed for a grid that does not exist",
+            t.iter().any(|x| x.contains("16 x 12 points")),
+            "the working grid is not on the page either",
+        );
+        // …and it does NOT claim to be the standard's.
+        assert!(
+            !t.iter().any(|x| x.contains("Grid (EN 12464-1)")),
+            "a working grid was labelled as EN 12464-1's",
+        );
+    }
+
+    /// THE SCALE IS TOPPED BY THE REPORTED MAXIMUM. An auto scale prints its ceiling in the
+    /// legend's caption, so taking it off the drawn grid would put a second maximum on the page
+    /// through the back door — which is exactly what this change is removing.
+    #[test]
+    fn an_auto_scale_is_capped_by_the_figure_the_page_quotes() {
+        let (g, p, eg) = (grid(16, 12), plane(), en_grid());
+        let mut o = Options::default();
+        o.scale.bands.clear(); // continuous, so the caption names a number
+        o.scale.top = None; // auto
+        let t = texts(&layout(&with_en(&g, &p, &eg), &o));
+        let caption = t.iter().find(|x| x.contains(" to ") && x.contains("auto"));
+        let caption = caption.expect("the continuous scale's caption");
+        assert!(
+            caption.contains(&format!("{:.0}", eg.max)),
+            "the caption reads {caption:?} — it should be capped at the reported {:.0} lx, not the \
+             drawn grid's {:.0}",
+            eg.max,
+            g.max,
         );
     }
 
@@ -4209,6 +4261,124 @@ mod the_report_states_which_grid_a_figure_is_on {
             (spacing_of(&p, &g) - 2.0).abs() < 1e-6,
             "spacing came out {:.3} m, expected the coarser 2.000",
             spacing_of(&p, &g),
+        );
+    }
+}
+
+
+/// AND THE CELLS THE STATISTICS EXCLUDE STAY EXCLUDED FURTHER DOWN THE PAGE.
+///
+/// `apply_room_mask` fixes a grid's `avg`, `min` and `max` and leaves its `values` alone — so the
+/// two sections that walk the cells themselves have to be handed the mask, or they quote readings
+/// the summary has already thrown out. This is the buried-cell defect — *"our min lux was 0 while
+/// for relux it was 133"* — reappearing one section lower down.
+#[cfg(test)]
+mod the_mask_reaches_the_sections_that_walk_cells {
+    use super::tests::*;
+    use super::*;
+
+    /// A grid with a 0 lx cell in it that the SUMMARY already excludes: `min` says 100, `values`
+    /// still holds the zero. Exactly the shape `apply_room_mask` leaves behind.
+    fn grid_with_a_buried_cell() -> (LuxGrid, Vec<bool>) {
+        let (cols, rows) = (4u32, 3u32);
+        let mut vals = vec![200.0_f64; 12];
+        vals[5] = 0.0; // inside the cupboard
+        vals[0] = 100.0; // the real minimum
+        vals[11] = 400.0;
+        let mut mask = vec![true; 12];
+        mask[5] = false;
+        // The statistics as the engine would leave them: over the KEPT cells only.
+        let kept: Vec<f64> =
+            vals.iter().zip(&mask).filter_map(|(v, k)| k.then_some(*v)).collect();
+        let g = LuxGrid {
+            cols,
+            rows,
+            values: vals,
+            min: kept.iter().cloned().fold(f64::MAX, f64::min),
+            max: kept.iter().cloned().fold(f64::MIN, f64::max),
+            avg: kept.iter().sum::<f64>() / kept.len() as f64,
+            maintenance: 0.8,
+            direct: Vec::new(),
+            indirect: Vec::new(),
+        };
+        (g, mask)
+    }
+
+    fn texts(d: &Doc) -> Vec<String> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE EXTREMES DO NOT NAME A CELL NOBODY COULD MEASURE.
+    #[test]
+    fn the_minimum_over_the_grid_skips_the_buried_cell() {
+        let (eg, emask) = grid_with_a_buried_cell();
+        let (g, p) = (grid(16, 12), plane());
+        let mut i = input(&g, &p);
+        i.rooms[0].grid_en = Some(&eg);
+        i.rooms[0].plane_en = Some(&p);
+        i.rooms[0].mask_en = &emask;
+        let t = texts(&layout(&i, &Options::default()));
+
+        assert!(
+            t.iter().any(|s| s.starts_with("100 lx at (")),
+            "the minimum should be the 100 lx cell; got {:?}",
+            t.iter().filter(|s| s.contains(" lx at (")).collect::<Vec<_>>(),
+        );
+        assert!(
+            !t.iter().any(|s| s.starts_with("0 lx at (")),
+            "a 0 lx reading from inside the furniture is quoted as the room's minimum",
+        );
+    }
+
+    /// AND NEITHER DO THE PERCENTILES. With one of twelve cells at 0 lx, an unmasked 10th
+    /// percentile lands on it; masked, the lowest reading in the room is 100 lx.
+    #[test]
+    fn the_percentiles_are_taken_over_measurable_cells_only() {
+        let (eg, emask) = grid_with_a_buried_cell();
+        let (g, p) = (grid(16, 12), plane());
+        let mut i = input(&g, &p);
+        i.rooms[0].grid_en = Some(&eg);
+        i.rooms[0].plane_en = Some(&p);
+        i.rooms[0].mask_en = &emask;
+        let t = texts(&layout(&i, &Options::default()));
+        let pcts = t
+            .iter()
+            .zip(t.iter().skip(1))
+            .find(|(a, _)| a.starts_with("10th / 90th"))
+            .map(|(_, b)| b.clone())
+            .expect("the percentile row");
+        // THE EXACT VALUE, because "not zero" does not discriminate here and a mutation proved it.
+        //
+        // Twelve cells, one of them buried. Unmasked the sorted list is [0, 100, 200×9, 400] and
+        // the 10th percentile lands on index 1 — which is 100, not the zero. So an assertion that
+        // the row is merely "not 0" passes with the mask ignored entirely. Masked, the list is the
+        // eleven measurable cells and the same percentile lands on 200. That difference is the
+        // whole test.
+        assert!(
+            pcts.starts_with("200 /"),
+            "the 10th / 90th percentile row reads {pcts:?}; over the measurable cells it is 200. \
+             Reading 100 means the buried cell is still in the sample.",
+        );
+    }
+
+    /// A ROOM WITH NO MASK LOSES NOTHING. An empty mask means every cell counts, and reading it as
+    /// "nothing counts" would empty the room.
+    #[test]
+    fn an_empty_mask_keeps_every_cell() {
+        let (g, p) = (grid(16, 12), plane());
+        let i = input(&g, &p);
+        assert!(i.rooms[0].reported_mask().is_empty());
+        let t = texts(&layout(&i, &Options::default()));
+        assert!(
+            t.iter().any(|s| s.contains(" lx at (")),
+            "a room with no mask reported no extremes at all",
         );
     }
 }

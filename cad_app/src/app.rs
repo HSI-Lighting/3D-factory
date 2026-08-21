@@ -5635,9 +5635,16 @@ impl CadApp {
     /// in the same places on screen as it does on the page. Taken over ALL rooms rather than
     /// per-room: two rooms drawn to different ceilings cannot be compared, which is the whole
     /// reason the report has a shared scale.
+    /// FROM THE REPORTED GRID, matching `RoomInput::reported` — the report quotes EN 12464-1's
+    /// grid, so an auto scale on screen has to be topped by the same number or the viewport and the
+    /// page put their band edges in different places.
     fn light_room_max(&self) -> f64 {
-        let over_rooms =
-            self.light.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
+        let over_rooms = self
+            .light
+            .rooms
+            .iter()
+            .map(|r| if r.grid_en.values.is_empty() { r.grid.max } else { r.grid_en.max })
+            .fold(0.0_f64, f64::max);
         if over_rooms > 0.0 {
             return over_rooms;
         }
@@ -26777,6 +26784,7 @@ impl CadApp {
                 // shown nowhere. See `RoomInput::grid_en`.
                 grid_en: (!r.grid_en.values.is_empty()).then_some(&r.grid_en),
                 plane_en: (!r.grid_en.values.is_empty()).then_some(&r.plane_en),
+                mask_en: &r.mask_en,
                 mask: &r.mask,
                 poly: &r.poly,
                 fixtures: &r.fixtures,
@@ -27068,7 +27076,7 @@ impl CadApp {
         };
         // Copied out before the borrow ends — the document is built, the numbers it needed are
         // done with, and what follows edits the state the input borrowed.
-        let room_max = inp.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
+        let room_max = inp.rooms.iter().map(|r| r.reported().max).fold(0.0_f64, f64::max);
         drop(inp);
         self.report_doc_key = Some(key);
 
@@ -27389,7 +27397,7 @@ impl CadApp {
             crate::report::Format::Html => {
                 // ONE ROOM PER SECTION, in the same order the PDF puts them — a format that
                 // silently reported the first room would be a trap, not a shorter report.
-                let room_max = inp.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
+                let room_max = inp.rooms.iter().map(|r| r.reported().max).fold(0.0_f64, f64::max);
                 let images: Vec<(Vec<u8>, String)> = self
                     .report_opts
                     .images
@@ -63322,6 +63330,7 @@ mod the_report_is_asked_about_before_it_is_written {
             mask: Vec::new(),
             plane_en: app.light.plane.clone().expect("plane"),
             grid_en: app.light.grid.clone().expect("grid"),
+            mask_en: Vec::new(),
             cylindrical_avg: None,
             installation: None,
             fixtures: Vec::new(),
@@ -64216,6 +64225,65 @@ mod the_owners_three_room_plan {
                 r.name,
                 r.fixtures.len(),
             );
+        }
+    }
+
+    /// EXACTLY WHAT THE REPORT WILL SAY — recalculated from the project, both grids side by side.
+    ///
+    /// The check to run against a DIALux or Relux report by hand after touching which grid is
+    /// quoted. It prints the working grid, the standard's grid, and the figures the report derives
+    /// from cells rather than from the summary — the extremes and the percentiles — because those
+    /// are the ones that need the mask and so are the ones a change here breaks quietly.
+    ///
+    /// `SIMLUX_PROJECT=<path without extension> cargo test -p cad_app --bin simlux --release
+    ///  what_the_report_will_quote -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_the_report_will_quote() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf))
+            .expect("the sidecar must read")
+            .expect("the project must have a sidecar");
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+        app.light.apply_config(cfg, &app.doc);
+        let plan = CadApp::plan_doc_of(app.factory.session.as_ref(), &app.doc).clone();
+        app.light.calculate(&plan, Some(&app.factory));
+
+        for r in &app.light.rooms {
+            let pct = |g: &cad_light::LuxGrid, m: &[bool], p: f64| -> f64 {
+                let mut v: Vec<f64> = g
+                    .values
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| m.get(*i).copied().unwrap_or(true))
+                    .map(|(_, x)| *x)
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                if v.is_empty() { 0.0 } else { v[(((v.len() - 1) as f64) * p).round() as usize] }
+            };
+            println!("\n=== {} ===", r.name);
+            for (label, g, m, sp) in [
+                ("working ", &r.grid, r.mask.as_slice(), r.spacing()),
+                ("EN 12464", &r.grid_en, r.mask_en.as_slice(), r.spacing_en()),
+            ] {
+                println!(
+                    "  {label}  {:>3} x {:<3} at {sp:.3} m   avg {:7.1}   min {:6.1}   max {:7.1}   \
+                     U0 {:.2}   p10 {:6.1}   p90 {:7.1}   {} cell(s) excluded",
+                    g.cols,
+                    g.rows,
+                    g.avg,
+                    g.min,
+                    g.max,
+                    g.u0(),
+                    pct(g, m, 0.1),
+                    pct(g, m, 0.9),
+                    m.iter().filter(|k| !**k).count(),
+                );
+            }
+            println!("  THE REPORT QUOTES the EN 12464 line above.");
         }
     }
 }

@@ -57,6 +57,13 @@ pub struct StoredRoom {
     pub mask_len: usize,
     pub plane_en: Option<CalcPlane>,
     pub grid_en: StoredGrid,
+    /// The same, for the EN 12464-1 grid — see `crate::light::RoomResult::mask_en`. Defaulted, so a
+    /// file written before this existed still loads; the report falls back to the summary figures
+    /// rather than scanning cells it cannot filter.
+    #[serde(default)]
+    pub mask_en_bits: String,
+    #[serde(default)]
+    pub mask_en_len: usize,
     pub cylindrical_avg: Option<f64>,
     pub installation: Option<Installation>,
     /// The fixtures standing in this room, as RECORDS. They must be the records and not ids: a
@@ -218,6 +225,8 @@ impl StoredResults {
                     mask_len: r.mask.len(),
                     plane_en: Some(r.plane_en),
                     grid_en: StoredGrid::of(&r.grid_en),
+                    mask_en_bits: pack_mask(&r.mask_en),
+                    mask_en_len: r.mask_en.len(),
                     cylindrical_avg: r.cylindrical_avg,
                     installation: r.installation,
                     fixtures: r.fixtures.clone(),
@@ -253,6 +262,10 @@ impl StoredResults {
             if r.mask_len > 0 && mask.len() != r.mask_len {
                 return None;
             }
+            let mask_en = unpack_mask(&r.mask_en_bits, r.mask_en_len);
+            if r.mask_en_len > 0 && mask_en.len() != r.mask_en_len {
+                return None;
+            }
             out.push(RoomResult {
                 name: r.name.clone(),
                 poly: r.poly.iter().map(|p| glam::Vec2::new(p[0], p[1])).collect(),
@@ -261,6 +274,7 @@ impl StoredResults {
                 mask,
                 plane_en,
                 grid_en: r.grid_en.to_grid(),
+                mask_en,
                 cylindrical_avg: r.cylindrical_avg,
                 installation: r.installation,
                 fixtures: r.fixtures.clone(),

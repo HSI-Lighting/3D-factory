@@ -988,10 +988,14 @@ impl CalcJob {
         p.step(&format!("{label} — EN 12464-1 grid"));
         let plane_en = plane.on_standard_grid();
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
+        // KEPT, not just applied. The report quotes this grid, and two of its sections walk the
+        // cells themselves rather than reading the summary — see `RoomResult::mask_en`.
+        let mut mask_en = Vec::new();
         if poly.len() >= 3 {
-            let mask_en = LightState::measurable_mask(&plane_en, poly, obstacles);
-            if mask_en.iter().any(|k| !k) {
-                LightState::apply_room_mask(&mut grid_en, &mask_en);
+            let m = LightState::measurable_mask(&plane_en, poly, obstacles);
+            if m.iter().any(|k| !k) {
+                LightState::apply_room_mask(&mut grid_en, &m);
+                mask_en = m;
             }
         }
 
@@ -1026,6 +1030,7 @@ impl CalcJob {
             mask,
             plane_en,
             grid_en,
+            mask_en,
             cylindrical_avg,
             installation,
             fixtures,
@@ -1057,6 +1062,15 @@ pub struct RoomResult {
     pub mask: Vec<bool>,
     pub plane_en: CalcPlane,
     pub grid_en: LuxGrid,
+    /// Which cells of `plane_en` are measurable — the twin of `mask`, for the standard's grid.
+    ///
+    /// NEEDED BECAUSE `apply_room_mask` FIXES THE STATISTICS AND LEAVES THE CELLS. A masked grid's
+    /// `avg`, `min` and `max` are computed over the kept cells only, but `values` still holds every
+    /// reading including the ones taken inside a cupboard. Anything that scans `values` itself —
+    /// the report's extremes and its percentiles — therefore has to be handed the mask, or it will
+    /// quote a 0 lx reading from inside the furniture as the room's minimum while the summary two
+    /// rows above says 108 lx.
+    pub mask_en: Vec<bool>,
     pub cylindrical_avg: Option<f64>,
     pub installation: Option<Installation>,
     /// The fixtures standing in this room — the RECORDS, not their ids.
@@ -1487,45 +1501,28 @@ impl LightState {
         }
     }
 
-    /// What the same rooms report on EN 12464-1's own grid, as one line — or `None` when there is
-    /// nothing to compare against.
+    /// THE GRID THE PANEL QUOTES — EN 12464-1's, matching the report.
     ///
-    /// The standard's grid is computed on every calculation and, until this, was shown nowhere. It
-    /// is the figure another package's default is closest to, so it is what somebody comparing two
-    /// reports actually needs. Reported as: *"the max lux differs by a lot from the dialux and relux
-    /// values. why is that?"*
-    pub fn en_grid_note(&self) -> Option<String> {
-        let rooms: Vec<&RoomResult> = self
-            .rooms
-            .iter()
-            .filter(|r| {
-                !r.grid_en.values.is_empty()
-                    // Same grid, nothing to say — and printing one figure twice invites a hunt for
-                    // a difference that is not there.
-                    && (r.grid_en.cols != r.grid.cols || r.grid_en.rows != r.grid.rows)
-            })
-            .collect();
-        let first = rooms.first()?;
-        if rooms.len() == 1 {
-            return Some(format!(
-                "This grid: {:.2} m — max {:.0} lx, U₀ {:.2}.\n\
-                 EN 12464-1 grid: {:.2} m — max {:.0} lx, U₀ {:.2}, avg {:.0} lx.",
-                first.spacing(),
-                first.grid.max,
-                first.grid.u0(),
-                first.spacing_en(),
-                first.grid_en.max,
-                first.grid_en.u0(),
-                first.grid_en.avg,
-            ));
+    /// Asked for as: *"lets only show the en grid since its the standard showing 2 results will
+    /// confuse the user."* The screen and the page have to name the same number, so this is the
+    /// panel's twin of `report::layout::RoomInput::reported`.
+    ///
+    /// ONE ROOM ONLY. `self.grid` is a project-wide grid combined across rooms, and there is no
+    /// combining an average of averages without weighting by area — which the combined grid already
+    /// did. So the standard's figures are quoted where they are unambiguous, and a multi-room
+    /// project keeps the combined summary it always had and sends the reader to the report, which
+    /// is per-room and is the authority.
+    pub fn reported_grid(&self) -> Option<&LuxGrid> {
+        if self.rooms.len() == 1 && !self.rooms[0].grid_en.values.is_empty() {
+            return Some(&self.rooms[0].grid_en);
         }
-        // Several rooms, each with its own grid: the brightest of them is the number a reader is
-        // looking at, and naming the rooms individually here would be a table, not a tooltip.
-        let mx = rooms.iter().map(|r| r.grid_en.max).fold(f64::MIN, f64::max);
-        Some(format!(
-            "On EN 12464-1's grid, the brightest of the {} rooms reads {mx:.0} lx.",
-            rooms.len(),
-        ))
+        self.grid.as_ref()
+    }
+
+    /// Whether [`reported_grid`](Self::reported_grid) is the standard's rather than the working one
+    /// — so a label can say which it is showing instead of leaving it to be guessed.
+    pub fn reporting_en_grid(&self) -> bool {
+        self.rooms.len() == 1 && !self.rooms[0].grid_en.values.is_empty()
     }
 
     /// Fixtures that still have no fitting on them.
@@ -2278,10 +2275,13 @@ impl LightState {
 
         let plane_en = plane.on_standard_grid();
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
+        // Kept, for the same reason as the other path — see `RoomResult::mask_en`.
+        let mut mask_en = Vec::new();
         if poly.len() >= 3 {
-            let mask_en = Self::measurable_mask(&plane_en, poly, &[]);
-            if !mask_en.is_empty() {
-                Self::apply_room_mask(&mut grid_en, &mask_en);
+            let m = Self::measurable_mask(&plane_en, poly, &[]);
+            if !m.is_empty() {
+                Self::apply_room_mask(&mut grid_en, &m);
+                mask_en = m;
             }
         }
 
@@ -2315,6 +2315,7 @@ impl LightState {
             mask,
             plane_en,
             grid_en,
+            mask_en,
             cylindrical_avg,
             installation,
             fixtures,
@@ -3597,7 +3598,9 @@ impl LightState {
                         .color(egui::Color32::from_rgb(255, 214, 90)),
                 );
             }
-            if let Some(g) = self.grid.as_ref() {
+            // THE SAME GRID THE REPORT QUOTES — the standard's. See `reported_grid`.
+            if let Some(g) = self.reported_grid() {
+                let en = self.reporting_en_grid();
                 ui.label(small(format!("· avg {:.0} lx", g.avg)));
                 ui.label(small(format!("· min {:.0}", g.min)));
                 // THE MAXIMUM CARRIES ITS GRID, on hover.
@@ -3605,23 +3608,28 @@ impl LightState {
                 // Reported as: *"the max lux differs by a lot from the dialux and relux values.
                 // why is that?"* A maximum is the brightest grid POINT, not the brightest place in
                 // the room — a peak under a downlight is a few cells across, so a coarser grid can
-                // miss it while the average barely moves. The standard's grid is computed on every
-                // calculation and is the one another package's default is closest to, so it is the
-                // answer to hand somebody who is comparing two reports.
+                // miss it while the average barely moves. Saying so where the number is is what
+                // stops the question being asked again.
                 ui.label(small(format!("· max {:.0}", g.max))).on_hover_text(
-                    match self.en_grid_note() {
-                        Some(n) => format!(
-                            "The brightest GRID POINT, not the brightest place in the room.\n\n{n}\n\n\
-                             A peak under a downlight is only a few cells across, so a coarser grid \
-                             may never sample it — while the average hardly moves. Neither figure is \
-                             wrong; each is the maximum ON ITS OWN GRID.",
-                        ),
-                        None => "The brightest GRID POINT, not the brightest place in the room. A \
-                                 peak under a downlight is only a few cells across, so a coarser \
-                                 grid may never sample it."
-                            .to_string(),
-                    },
+                    "The brightest GRID POINT, not the brightest place in the room. A peak under a \
+                     downlight is only a few cells across, so a coarser grid may never sample it — \
+                     while the average hardly moves. This is why two packages can report different \
+                     maxima for the same scheme.",
                 );
+                // WHICH GRID, said rather than assumed.
+                if en {
+                    ui.label(
+                        egui::RichText::new(format!("· EN grid {}×{}", g.cols, g.rows))
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 200, 150)),
+                    )
+                    .on_hover_text(
+                        "Figures are quoted on EN 12464-1's own grid — the spacing a compliance \
+                         claim rests on, and the one DIALux and Relux default closest to. The \
+                         false-colour field is still drawn from the finer calculated grid: how \
+                         coarsely a result may be DRAWN is not something the standard sets.",
+                    );
+                }
                 // Which condition the figures are for. A lux number without this is ambiguous, and
                 // the ambiguity always flatters the design.
                 ui.label(
