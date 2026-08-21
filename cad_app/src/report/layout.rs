@@ -1366,10 +1366,9 @@ fn sample(
 
     // Through the SAME band the field is painted with, so a printed point value picks its ink
     // against the colour it is actually sitting on rather than against the palette's idea of it —
-    // a dark number on a dark band chosen by hand would be unreadable. `usize::MAX` on a
-    // continuous scale, which no band index can be, so it falls through to the ramp.
-    let k = if opt.scale.bands.is_empty() { usize::MAX } else { opt.scale.band_index(v, room_max) };
-    Some(band_fill(inp, opt, k, opt.scale.t_for(v, room_max)))
+    // a dark number on a dark band chosen by hand would be unreadable. Entering the rule by VALUE
+    // is exactly what the viewport's overlay needs, so both go through one door.
+    Some(opt.lux_rgb(v, room_max, inp.ramp))
 }
 
 /// THE LIGHTING LAYOUT — the room and what is in it, before the result.
@@ -1545,28 +1544,15 @@ fn layout_page(c: &mut Cursor, room: &RoomInput) {
 /// One function, called by the FIELD, the LEGEND and the printed point values alike. A legend in
 /// different colours from the picture it explains is worse than no legend, and that is exactly what
 /// three call sites reading the palette their own way would eventually produce.
+///
+/// A THIN WRAPPER, and deliberately so: the rule itself lives on [`Options::band_rgb`], because the
+/// SIMLUX viewport paints the same field and used to have its own idea of what a lux value looks
+/// like. Two implementations agree right up until one of them is edited.
 fn band_fill(inp: &Input, opt: &Options, k: usize, t: f32) -> [u8; 3] {
-    // ONLY WHEN THE SCALE IS BANDED. A continuous scale is drawn as several dozen synthetic levels
-    // so one contour tracer can serve both, and those levels are not bands — index 0 of a gradient
-    // is not "the 0–50 lx band". Left ungated, a smooth ramp took the first few band colours and
-    // then jumped to the palette partway up, which is neither scheme.
-    if opt.scale.bands.is_empty() {
-        return ramp_rgb(inp.ramp, t);
-    }
-    match opt.band_colours.get(k) {
-        Some(c) => *c,
-        None => ramp_rgb(inp.ramp, t),
-    }
+    opt.band_rgb(k, t, inp.ramp)
 }
 
-fn ramp_rgb(ramp: fn(f32) -> (f32, f32, f32), t: f32) -> [u8; 3] {
-    let (r, g, b) = ramp(t.clamp(0.0, 1.0));
-    [
-        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
-    ]
-}
+use crate::report::options::ramp_rgb;
 
 /// The legend: banded blocks with their edges written under them, or a smooth bar when the scale
 /// has no bands.

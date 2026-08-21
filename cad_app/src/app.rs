@@ -5629,23 +5629,148 @@ impl CadApp {
         }
     }
 
+    /// The top of the scale, when it is on AUTO — the brightest cell in the project.
+    ///
+    /// The SAME number the report window computes for itself, so an auto scale puts its band edges
+    /// in the same places on screen as it does on the page. Taken over ALL rooms rather than
+    /// per-room: two rooms drawn to different ceilings cannot be compared, which is the whole
+    /// reason the report has a shared scale.
+    fn light_room_max(&self) -> f64 {
+        let over_rooms =
+            self.light.rooms.iter().map(|r| r.grid.max).fold(0.0_f64, f64::max);
+        if over_rooms > 0.0 {
+            return over_rooms;
+        }
+        self.light.grid.as_ref().map(|g| g.max).unwrap_or(0.0)
+    }
+
+    /// THE RESULT, DRAWN OVER THE FLOOR — the report's picture, in the viewport.
+    ///
+    /// Asked for as: *"in the simlux window the false colors are not appearing how it appears in
+    /// the report. it should be exactly as in the report"*, and *isolux contour lines in the SIMLUX
+    /// window*.
+    ///
+    /// Both read `report_opts` — the same scale, the same band thresholds, the same hand-picked
+    /// band colours — so there is no second set of settings to keep in step and no way for the two
+    /// pictures to disagree. Changing a band in the report dialog changes the viewport, which is
+    /// what *"any changes made in the false color in calculate or report will appear in both
+    /// places"* asks for.
+    fn push_lux_overlay(&self, out: &mut Vec<crate::light3d::V3>) {
+        if !self.light.floor_heatmap && !self.light.show_isolux {
+            return;
+        }
+        let room_max = self.light_room_max();
+        let ramp = self.light.ramp.rgb_fn();
+        let opts = &self.report_opts;
+        let paint = |lux: f64| -> [f32; 3] {
+            let c = opts.lux_rgb(lux, room_max, ramp);
+            // Straight through, as display values — `V3::mode = 0` marks a swatch the viewport does
+            // not light, so what is written here is what is seen. That is what makes these the
+            // report's bytes and not merely its palette.
+            [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]
+        };
+
+        // Every room, each on its own plane — a project is not always one rectangle, and the report
+        // draws them one at a time too. With no rooms at all, the whole-model fallback plane.
+        let mut sheets: Vec<(&cad_light::LuxGrid, &cad_light::CalcPlane, &[bool])> = self
+            .light
+            .rooms
+            .iter()
+            .map(|r| (&r.grid, &r.plane, r.mask.as_slice()))
+            .collect();
+        if sheets.is_empty() {
+            if let (Some(g), Some(p)) = (self.light.grid.as_ref(), self.light.plane.as_ref()) {
+                sheets.push((g, p, &[]));
+            }
+        }
+
+        for (grid, plane, mask) in sheets {
+            if grid.values.is_empty() {
+                continue;
+            }
+            let (nx, ny) = Self::overlay_res(grid.cols as usize, grid.rows as usize);
+            let f = crate::isolux::sample(grid, mask, nx, ny);
+            // The floor, not the working plane: the result has always been read off the floor here
+            // and moving it would be a surprise, not a fix. `plane_height` is measured from the
+            // floor, so this puts it back — and on an upper storey `origin.z` carries the base.
+            let floor_z = plane.origin.z - self.light.plane_height;
+            if self.light.floor_heatmap {
+                crate::light3d::push_lux_sheet(out, &f, plane, floor_z + 0.005, &paint);
+            }
+            if self.light.show_isolux {
+                // The BAND EDGES, so a line is always the boundary of a colour rather than a
+                // second scale drawn over the first. On a continuous scale there are no bands to
+                // take, so a round set of steps up to the ceiling stands in — an isolux line has
+                // to be AT some number to mean anything.
+                let edges = if self.report_opts.scale.bands.is_empty() {
+                    let top = self.report_opts.scale.top_lx(room_max);
+                    (1..=5).map(|k| top * k as f64 / 6.0).collect::<Vec<_>>()
+                } else {
+                    self.report_opts.scale.bands.clone()
+                };
+                // Scaled to the room so the lines stay legible in a big space and do not swamp a
+                // small one.
+                let w = (plane.width.max(plane.depth) * 0.0015).clamp(0.008, 0.05);
+                for t in edges {
+                    let segs = crate::isolux::trace(&f, t);
+                    crate::light3d::push_isolux_lines(
+                        out,
+                        &segs,
+                        nx,
+                        ny,
+                        plane,
+                        floor_z + 0.010,
+                        w,
+                        [0.08, 0.09, 0.10],
+                    );
+                }
+            }
+        }
+    }
+
+    /// How finely the overlay is resampled, from the grid it is drawn from.
+    ///
+    /// The report interpolates its bands, so an overlay drawn one quad per CALCULATED cell would
+    /// staircase where the report curves — the two pictures would differ in exactly the way this
+    /// work exists to remove. So the field is supersampled, and the factor is whatever the budget
+    /// allows: the SIMLUX view rebuilds its whole vertex buffer every frame, and a sheet is the one
+    /// thing here that scales with the grid rather than with the model.
+    pub(crate) fn overlay_res(cols: usize, rows: usize) -> (usize, usize) {
+        const BUDGET: usize = 12_000;
+        let (c, r) = (cols.max(1), rows.max(1));
+        for ss in [3_usize, 2, 1] {
+            if c * ss * r * ss <= BUDGET {
+                return (c * ss, r * ss);
+            }
+        }
+        // PAST THE BUDGET EVEN AT ONE QUAD PER CELL. `MAX_GRID_POINTS` is 16,384, so this is
+        // reachable on a real project rather than theoretical — and returning `(c, r)` here, which
+        // is what this did until a test asked, quietly spends 98,000 vertices A FRAME on a grid
+        // finer than the screen resolves. Coarsened to fit, keeping the aspect.
+        let k = (BUDGET as f64 / (c as f64 * r as f64)).sqrt();
+        let mut x = ((c as f64 * k).floor() as usize).max(2);
+        let mut y = ((r as f64 * k).floor() as usize).max(2);
+        // A LONG THIN GRID rounds its short axis UP to the floor of two and then spends the budget
+        // twice over on the long one — 16,384 × 1 came back as 14,021 × 2. Whichever axis was
+        // forced up, the other gives way.
+        if x * y > BUDGET {
+            x = (BUDGET / y).max(2);
+        }
+        if x * y > BUDGET {
+            y = (BUDGET / x).max(2);
+        }
+        (x, y)
+    }
+
     /// Build the flat-shaded (+ optional lux floor) triangle soup for the 3D view.
     fn build_scene3d_verts(&self) -> Vec<crate::light3d::V3> {
         if self.light.meshes.is_empty() {
             return Vec::new();
         }
-        let floor = if self.light.floor_heatmap {
-            match (self.light.grid.as_ref(), self.light.plane.as_ref()) {
-                // The chosen palette, not the fixed one — the false-colour scale is a reading
-                // instrument and the person reading it picks how to read it.
-                (Some(g), Some(p)) => {
-                    Some((g, p, self.light.scale_ceiling(), self.light.ramp.rgb_fn()))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // THE FLOOR IS A FLOOR. The result is drawn over it as its own sheet — see
+        // `light3d::push_lux_sheet` for the measurement that says why vertex colours could never
+        // have done it.
+        let floor = None;
         // HIDE CEILINGS. The result is painted on the FLOOR, and a closed box hides the one
         // surface this view exists to show. Filtered here rather than in the mesh build so the
         // CALCULATION still sees the ceiling — it is 70 % of the interreflection, and a view
@@ -5673,6 +5798,7 @@ impl CadApp {
             self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
         };
         let mut verts = crate::light3d::build_scene_verts(&shown, &self.light.materials, floor);
+        self.push_lux_overlay(&mut verts);
         // EACH FITTING AT ITS REAL SIZE, when its file declares one.
         //
         // "i need to see the illuminare as the dimensions in the ies/ldt files not the diamond
@@ -42376,6 +42502,7 @@ impl eframe::App for CadApp {
                     ui.separator();
                     ui.checkbox(&mut self.light.show_overlay, "  Lux overlay on 2D plan");
                     ui.checkbox(&mut self.light.floor_heatmap, "  Heatmap floor in 3D");
+                    ui.checkbox(&mut self.light.show_isolux, "  Isolux lines in 3D");
                     ui.add_space(4.0);
                     pp_cap_ui(ui, "menu: SIMLUX");
                 });

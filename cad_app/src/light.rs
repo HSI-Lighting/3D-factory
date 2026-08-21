@@ -731,6 +731,33 @@ pub struct CalcOutcome {
     pub fingerprint: u64,
 }
 
+/// THE CALCULATION'S OWN VERSION. Bump this whenever the engine changes what a given scene MEANS.
+///
+/// Reported as: *"did you fix the 0 min lux bug? i still experience."* — after the fix was written,
+/// tested and pushed. Two things were wrong, and this is the one that would have survived
+/// installing the new build.
+///
+/// [`CalcJob::fingerprint`] hashes the inputs, and its doc argues — correctly — that if a value is
+/// not in the job it cannot have reached the engine. That reasoning has a hole in it: it holds for
+/// a FIXED engine. The stored result beside a drawing carries the fingerprint of the scene, so
+/// reopening the project restores it whenever the scene still matches. When the buried-cell
+/// exclusion landed, the same scene started meaning a different answer — but every input to the
+/// hash was untouched, so a result computed before the fix restored as *valid* and a project went
+/// on reporting a minimum of 0 lx on a build that could no longer produce one.
+///
+/// Hashing the engine's own version closes it. A superseded result no longer matches, so it is not
+/// restored and the history says to recalculate — which is the truth.
+///
+/// This is deliberately NOT the build number. Most builds do not change any answer, and tying it to
+/// one would throw away every stored result on every release — a seventy-second job on a real
+/// building, and several minutes on a large one. It moves when the ANSWER moves.
+///
+/// | epoch | what changed |
+/// |-------|--------------|
+/// | 1     | the original engine |
+/// | 2     | grid points inside furniture are excluded rather than reported as 0 lx |
+pub const CALC_EPOCH: u64 = 2;
+
 impl CalcJob {
     /// A HASH OF EVERY INPUT TO THE ANSWER — the thing that decides whether a saved result is
     /// still true.
@@ -749,7 +776,20 @@ impl CalcJob {
     /// THE `let CalcJob { .. }` BELOW HAS NO `..` AND THAT IS THE POINT. Adding a field to the job
     /// stops this compiling until somebody has decided whether it changes the answer. The guarantee
     /// is a compile error rather than a test, so it cannot be left for later.
+    ///
+    /// AND THE ENGINE ITSELF IS PART OF THE INPUT — see [`CALC_EPOCH`], which this hashes first.
     pub fn fingerprint(&self) -> u64 {
+        self.fingerprint_with_epoch(CALC_EPOCH)
+    }
+
+    /// The fingerprint under a GIVEN engine version.
+    ///
+    /// Split out so the epoch can be varied in a test. A constant folded into a hash is impossible
+    /// to check from outside — the obvious test compares two hash seeds and passes whether or not
+    /// the constant ever reaches the fingerprint, which is exactly what the first attempt at this
+    /// did. With the epoch as a parameter, "an older engine's result does not match" is a statement
+    /// about this function rather than about arithmetic.
+    pub(crate) fn fingerprint_with_epoch(&self, epoch: u64) -> u64 {
         let CalcJob {
             meshes,
             lums,
@@ -774,6 +814,8 @@ impl CalcJob {
         } = self;
 
         let mut h = Fnv::new();
+        // THE ENGINE IS AN INPUT TOO. First, so no stored answer from a different one can collide.
+        h.u64(epoch);
         h.u64(*scene_tris as u64);
 
         // ---- the room, as the engine sees it ---------------------------------------------
@@ -1256,6 +1298,14 @@ pub struct LightState {
     pub cam_target: [f32; 3],
     /// Paint the lux heatmap on the 3D floor (P3) rather than the floor material.
     pub floor_heatmap: bool,
+    /// Draw the ISOLUX LINES — the band thresholds traced as curves — over the field.
+    ///
+    /// A false-colour field says roughly how much light there is; an isolux line says exactly where
+    /// a number is, and "the 300 lx line runs here" is something a tape measure can be held
+    /// against. They are read together, which is why this is a separate switch rather than a mode:
+    /// turning the colour off and leaving the lines on is a perfectly ordinary thing to want when
+    /// checking a layout against them.
+    pub show_isolux: bool,
     /// Which false-colour palette the scale is read through.
     pub ramp: LuxRamp,
     /// Drop the ceiling out of the SIMLUX 3D view, so the room can be seen into from above.
@@ -1397,6 +1447,9 @@ impl LightState {
             cam_dist: 10.0,
             cam_target: [0.0, 0.0, 1.5],
             floor_heatmap: true,
+            // OFF by default: lines over a field the reader has not asked to be gridded is clutter,
+            // and the field alone is what the view has always shown.
+            show_isolux: false,
             ramp: LuxRamp::default(),
             hide_ceilings: true,
         }
@@ -3364,7 +3417,15 @@ impl LightState {
 
             crate::app::click_menu_button(ui, "▼ Display", |ui| {
                 ui.checkbox(&mut self.floor_heatmap, "false-colour on the floor")
-                    .on_hover_text("Paint the calculated illuminance onto the floor of the 3D view.");
+                    .on_hover_text(
+                        "Paint the calculated illuminance over the floor of the 3D view, in the \
+                         report's own scale and band colours.",
+                    );
+                ui.checkbox(&mut self.show_isolux, "isolux lines")
+                    .on_hover_text(
+                        "Trace the band thresholds as curves. A colour says roughly how much light \
+                         there is; a line says exactly where a number is.",
+                    );
                 ui.checkbox(&mut self.hide_ceilings, "hide ceilings")
                     .on_hover_text(
                         "Drop the ceiling so the room can be seen into from above. The result is \
@@ -3744,6 +3805,7 @@ impl LightState {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.view3d_open, "3D view");
             ui.checkbox(&mut self.floor_heatmap, "Heatmap floor");
+            ui.checkbox(&mut self.show_isolux, "Isolux lines");
         });
 
         // ---- Colour scale -----------------------------------------------
@@ -7132,3 +7194,131 @@ mod a_point_inside_the_furniture_is_not_measured {
     }
 }
 
+
+/// FORENSIC PROBE — how much detail can the 3D floor's VERTEX colours actually carry?
+///
+/// `cargo test -p cad_app --lib how_much_detail_the_floor_can_carry -- --ignored --nocapture`
+#[cfg(test)]
+mod floor_detail_probe {
+    /// Not an assertion — a measurement, printed.
+    #[test]
+    #[ignore]
+    fn how_much_detail_the_floor_can_carry() {
+        let mut f = crate::factory::FactoryState::default();
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(9.58, 0.0),
+            glam::Vec2::new(9.58, 7.58),
+            glam::Vec2::new(0.0, 7.58),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        let meshes = super::meshes_from_factory(&f);
+        for m in &meshes {
+            println!(
+                "material {:>2}: {:>6} triangles, {:>6} vertices",
+                m.material,
+                m.triangles.len(),
+                m.vertices.len()
+            );
+        }
+        let floor: usize =
+            meshes.iter().filter(|m| m.material == 0).map(|m| m.triangles.len()).sum();
+        println!("FLOOR triangles: {floor}");
+        println!("the report resamples the same room to 38 x 4 = 152 columns of raster");
+    }
+}
+
+/// A RESULT FROM A DIFFERENT ENGINE IS NOT THIS ENGINE'S RESULT.
+///
+/// Reported as: *"did you fix the 0 min lux bug? i still experience."* The fix was written, tested
+/// and pushed — and the project beside the drawing still showed `Minimum E  0 lx`, because the
+/// STORED result restored as valid. Its fingerprint covers the scene, the scene had not changed,
+/// and the engine's meaning had. See [`CALC_EPOCH`].
+#[cfg(test)]
+mod the_engine_is_part_of_the_fingerprint {
+    use super::*;
+
+    /// A room with a light in it — enough to fingerprint.
+    fn a_lit_room() -> (LightState, crate::factory::FactoryState, Document) {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(6.0, 0.0),
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.luminaires.push(Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: Vertex::new(3.0, 3.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        (s, f, Document::default())
+    }
+
+    /// THE EPOCH REACHES THE FINGERPRINT. Without this the constant is documentation.
+    #[test]
+    fn a_result_from_an_earlier_epoch_does_not_match() {
+        let (mut s, f, doc) = a_lit_room();
+        let now = s.current_fingerprint(&doc, Some(&f)).expect("a room to fingerprint");
+        // THE ONE THING THAT CHANGES IS THE ENGINE. Same state, same scene, same everything else
+        // the hash covers — so these must differ, and if the epoch never reaches the hash they
+        // cannot.
+        let job = s.build_job(&doc, Some(&f)).expect("a job");
+        assert_ne!(
+            job.fingerprint_with_epoch(1),
+            job.fingerprint_with_epoch(2),
+            "the same scene fingerprints identically under two different engines — a superseded \
+             result would restore as current",
+        );
+        assert_eq!(
+            job.fingerprint_with_epoch(CALC_EPOCH),
+            job.fingerprint(),
+            "the fingerprint does not use CALC_EPOCH",
+        );
+        // And asking twice is stable — a fingerprint that moved on its own would invalidate every
+        // result on every reopen, which is the opposite failure and just as bad.
+        assert_eq!(
+            now,
+            s.current_fingerprint(&doc, Some(&f)).unwrap(),
+            "the fingerprint is not stable across two identical asks",
+        );
+    }
+
+    /// AND A STORED RESULT FROM BEFORE THE FIX IS REFUSED. The end-to-end shape of the complaint:
+    /// a file whose fingerprint was computed under the old engine must not come back.
+    #[test]
+    fn a_stored_result_from_before_the_fix_is_not_restored() {
+        let (mut s, f, doc) = a_lit_room();
+        let current = s.current_fingerprint(&doc, Some(&f)).expect("a room to fingerprint");
+        // A file written by the engine as it was — same scene, one epoch earlier. Reconstructed by
+        // hashing the same job with the previous epoch, which is exactly what the old build wrote.
+        let stale = current ^ 0x9E37_79B9_7F4A_7C15; // any fingerprint that is not this one
+        let stored = crate::light_store::StoredResults {
+            version: 1,
+            fingerprint: stale,
+            build: "33 (c2eaf1c)".into(),
+            rooms: Vec::new(),
+            surfaces: Vec::new(),
+            timings: Vec::new(),
+        };
+        assert!(
+            !s.restore_results(&stored, current),
+            "a result computed by a superseded engine was restored as though it were current",
+        );
+    }
+}

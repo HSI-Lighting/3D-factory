@@ -13,6 +13,7 @@ mod assets; // where bundled data lives at runtime — see the module docs
 mod handles; // swappable door-handle library (assets/handles/handles.json)
 mod hatch_trace;
 mod light;
+mod isolux; // isolux lines — marching squares over a calculated field
 mod illuminaire; // Illuminaire — a library of fittings: a 2D block + a photometric file
 mod light_report; // the SIMLUX calculation written out as a standalone HTML report
 mod light_store; // the last calculation, kept beside the drawing so closing the app does not lose it

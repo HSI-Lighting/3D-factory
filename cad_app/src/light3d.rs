@@ -237,6 +237,118 @@ pub fn build_scene_verts(
     out
 }
 
+/// THE RESULT AS ITS OWN SHEET, laid flat over the floor — not as a tint on the floor's vertices.
+///
+/// Reported as: *"in the simlux window the false colors are not appearing how it appears in the
+/// report. it should be exactly as in the report."*
+///
+/// The old heatmap coloured the FLOOR MESH'S VERTICES and let the rasteriser interpolate between
+/// them. Measured on the project this came from — a 9.58 × 7.58 m room — that floor is **14
+/// triangles**, so the "false colour" was a Gouraud wash across fourteen facets standing in for a
+/// 1,140-cell field. It could not show a band edge, because it had nowhere to put one: no vertex
+/// falls on the boundary, and every colour between two vertices is a blend of their two. No choice
+/// of palette or scale would have fixed it — the resolution was never there.
+///
+/// So the field gets its own geometry at the resolution of the field, and the floor goes back to
+/// being a floor.
+pub fn push_lux_sheet(
+    out: &mut Vec<V3>,
+    f: &crate::isolux::Field,
+    plane: &cad_light::CalcPlane,
+    z: f32,
+    paint: &dyn Fn(f64) -> [f32; 3],
+) {
+    if f.nx == 0 || f.ny == 0 {
+        return;
+    }
+    let (ox, oy) = (plane.origin.x, plane.origin.y);
+    let (sx, sy) = (plane.width / f.nx as f32, plane.depth / f.ny as f32);
+    for j in 0..f.ny {
+        for i in 0..f.nx {
+            if !f.inside.get(j * f.nx + i).copied().unwrap_or(true) {
+                continue;
+            }
+            let c = paint(crate::isolux::cell_value(f, i, j));
+            let (x0, y0) = (ox + i as f32 * sx, oy + j as f32 * sy);
+            let (x1, y1) = (x0 + sx, y0 + sy);
+            let v = |x: f32, y: f32| V3 {
+                x,
+                y,
+                z,
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                nx: 0.0,
+                ny: 0.0,
+                nz: 0.0,
+                mode: 0.0,
+            };
+            // Two triangles, wound counter-clockwise seen from above so the sheet faces the way
+            // anybody looking at a plan is looking.
+            out.extend([v(x0, y0), v(x1, y0), v(x1, y1)]);
+            out.extend([v(x0, y0), v(x1, y1), v(x0, y1)]);
+        }
+    }
+}
+
+/// Isolux lines as flat ribbons, `width` metres wide, at height `z`.
+///
+/// Ribbons rather than GL lines: this renderer draws triangles and nothing else, and a line width
+/// set through the driver is capped at 1 px on most of them anyway — which reads as a hairline that
+/// disappears when the view is zoomed out, exactly when the lines are most wanted.
+pub fn push_isolux_lines(
+    out: &mut Vec<V3>,
+    segs: &[crate::isolux::Seg],
+    nx: usize,
+    ny: usize,
+    plane: &cad_light::CalcPlane,
+    z: f32,
+    width: f32,
+    rgb: [f32; 3],
+) {
+    if nx == 0 || ny == 0 {
+        return;
+    }
+    let (ox, oy) = (plane.origin.x, plane.origin.y);
+    let (sx, sy) = (plane.width / nx as f32, plane.depth / ny as f32);
+    let half = width.max(1e-4) * 0.5;
+    for s in segs {
+        let (ax, ay) = (ox + s[0].0 as f32 * sx, oy + s[0].1 as f32 * sy);
+        let (bx, by) = (ox + s[1].0 as f32 * sx, oy + s[1].1 as f32 * sy);
+        let (dx, dy) = (bx - ax, by - ay);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            continue;
+        }
+        // The perpendicular, scaled to half the ribbon's width.
+        let (px, py) = (-dy / len * half, dx / len * half);
+        let v = |x: f32, y: f32| V3 {
+            x,
+            y,
+            z,
+            r: rgb[0],
+            g: rgb[1],
+            b: rgb[2],
+            nx: 0.0,
+            ny: 0.0,
+            nz: 0.0,
+            mode: 0.0,
+        };
+        let (p0, p1) = ((ax + px, ay + py), (ax - px, ay - py));
+        let (p2, p3) = ((bx - px, by - py), (bx + px, by + py));
+        out.extend([v(p0.0, p0.1), v(p1.0, p1.1), v(p2.0, p2.1)]);
+        out.extend([v(p0.0, p0.1), v(p2.0, p2.1), v(p3.0, p3.1)]);
+        // A ROUND JOIN, as a square cap at each end. Segments meet at any angle and butt ends
+        // leave a visible notch on a curve; a cap the width of the ribbon fills it. Cheap enough
+        // that it is not worth deciding whether a given joint needs one.
+        for (cx, cy) in [(ax, ay), (bx, by)] {
+            let q = |ddx: f32, ddy: f32| v(cx + ddx, cy + ddy);
+            out.extend([q(-half, -half), q(half, -half), q(half, half)]);
+            out.extend([q(-half, -half), q(half, half), q(-half, half)]);
+        }
+    }
+}
+
 /// Append a small bright octahedron marking a luminaire at (x, y, z).
 pub fn push_luminaire_marker(out: &mut Vec<V3>, x: f32, y: f32, z: f32, s: f32) {
     let c = [1.0, 0.86, 0.38];
@@ -6969,5 +7081,225 @@ mod the_restart_reason_names_the_right_input {
             Scene3dRenderer::taa_first_changed(&same, &same), "",
             "an unchanged frame named a culprit",
         );
+    }
+}
+
+/// THE RESULT DRAWN AS ITS OWN SHEET — the fix for a false-colour view that could not show a band.
+#[cfg(test)]
+mod the_lux_overlay {
+    use super::*;
+    use crate::isolux::Field;
+
+    fn plane(w: f32, d: f32) -> cad_light::CalcPlane {
+        cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: w,
+            depth: d,
+            cols: 4,
+            rows: 4,
+        }
+    }
+
+    /// A field that steps from 0 to 400 lx exactly halfway across in x.
+    fn step_field(nx: usize, ny: usize) -> Field {
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = if i as f64 >= nx as f64 * 0.5 { 400.0 } else { 0.0 };
+            }
+        }
+        Field { nx, ny, v, inside: vec![true; nx * ny] }
+    }
+
+    /// THE SHEET SHOWS A BAND EDGE — which the floor's own vertices could not.
+    ///
+    /// The measurement behind this whole change: the floor of a 9.58 × 7.58 m room is FOURTEEN
+    /// triangles, so a heatmap baked into its vertices had nowhere to put a boundary. A sheet at
+    /// the field's own resolution has one quad per sample, so the edge lands where the value is.
+    ///
+    /// A RAMP, not a step. The first version of this used a step field and asserted that every
+    /// vertex left of it was dark — and failed, correctly: a quad is coloured by its CELL value,
+    /// so the one quad STRADDLING a discontinuity takes the average and picks a side, putting one
+    /// of its corners on the far side of the boundary. That is not a defect, it is what a
+    /// discontinuity means on a finite grid. A ramp has a band edge at a well-defined place, which
+    /// is the thing actually worth pinning.
+    #[test]
+    fn the_band_edge_lands_where_the_value_reaches_it() {
+        // 0 → 400 lx across 10 m, so 200 lx is at x = 5.0 m.
+        let (nx, ny) = (20, 4);
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = 400.0 * i as f64 / nx as f64;
+            }
+        }
+        let f = Field { nx, ny, v, inside: vec![true; nx * ny] };
+        let p = plane(10.0, 4.0);
+        let mut out = Vec::new();
+        let paint = |lux: f64| if lux >= 200.0 { [1.0, 1.0, 1.0] } else { [0.0, 0.0, 0.0] };
+        push_lux_sheet(&mut out, &f, &p, 0.0, &paint);
+
+        assert_eq!(out.len(), nx * ny * 6, "one quad — six vertices — per cell");
+        assert!(out.iter().any(|v| v.r > 0.5), "the bright side never got painted");
+        assert!(out.iter().any(|v| v.r < 0.5), "the dark side never got painted");
+        // One cell is 0.5 m. Outside a cell of the edge, the colour is decided.
+        let cell = 10.0 / nx as f32;
+        for v in &out {
+            if v.x < 5.0 - cell {
+                assert!(v.r < 0.5, "a vertex at x = {:.3} m is bright, well below 200 lx", v.x);
+            } else if v.x > 5.0 + cell {
+                assert!(v.r > 0.5, "a vertex at x = {:.3} m is dark, well above 200 lx", v.x);
+            }
+        }
+    }
+
+    /// IT IS LAID OVER THE PLANE IT WAS CALCULATED ON, in metres — not over some normalised square.
+    #[test]
+    fn the_sheet_covers_the_plane_it_was_calculated_on() {
+        let f = step_field(8, 6);
+        let p = cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(2.5, -4.0, 0.8),
+            width: 9.58,
+            depth: 7.58,
+            cols: 8,
+            rows: 6,
+        };
+        let mut out = Vec::new();
+        push_lux_sheet(&mut out, &f, &p, 1.25, &|_| [0.5, 0.5, 0.5]);
+        let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+        for v in &out {
+            assert!((v.z - 1.25).abs() < 1e-6, "the sheet left its height: z = {}", v.z);
+            lo = (lo.0.min(v.x), lo.1.min(v.y));
+            hi = (hi.0.max(v.x), hi.1.max(v.y));
+        }
+        assert!((lo.0 - 2.5).abs() < 1e-4 && (lo.1 + 4.0).abs() < 1e-4, "starts at {lo:?}");
+        assert!(
+            (hi.0 - (2.5 + 9.58)).abs() < 1e-4 && (hi.1 - (-4.0 + 7.58)).abs() < 1e-4,
+            "ends at {hi:?}",
+        );
+    }
+
+    /// A CELL THE CALCULATION EXCLUDED IS NOT PAINTED. The buried cells under the furniture are
+    /// left out of the statistics; colouring them anyway would put a reading back on the drawing
+    /// that the numbers beside it deny.
+    #[test]
+    fn an_excluded_cell_gets_no_colour() {
+        let mut f = step_field(10, 10);
+        for i in 0..f.nx {
+            f.inside[i] = false; // the whole bottom row
+        }
+        let mut out = Vec::new();
+        push_lux_sheet(&mut out, &f, &plane(10.0, 10.0), 0.0, &|_| [1.0, 0.0, 0.0]);
+        assert_eq!(out.len(), 10 * 9 * 6, "the masked row was painted anyway");
+        for v in &out {
+            assert!(v.y >= 1.0 - 1e-4, "a vertex at y = {:.3} m is in the excluded row", v.y);
+        }
+    }
+
+    /// AN ISOLUX LINE IS WHERE THE VALUE IS, IN METRES. The tracer works in lattice units; this is
+    /// the step that puts it on the plan, and getting it wrong would draw a plausible curve in the
+    /// wrong place — the hardest kind of error to notice.
+    #[test]
+    fn the_line_lands_at_the_right_place_on_the_plan() {
+        // A field rising 0 → 500 lx across a 10 m plane: the 300 lx line is at x = 6 m.
+        let (nx, ny) = (10, 4);
+        let mut v = vec![0.0; (nx + 1) * (ny + 1)];
+        for j in 0..=ny {
+            for i in 0..=nx {
+                v[j * (nx + 1) + i] = 500.0 * i as f64 / nx as f64;
+            }
+        }
+        let f = Field { nx, ny, v, inside: vec![true; nx * ny] };
+        let segs = crate::isolux::trace(&f, 300.0);
+        assert!(!segs.is_empty());
+        let p = plane(10.0, 4.0);
+        let mut out = Vec::new();
+        let w = 0.02;
+        push_isolux_lines(&mut out, &segs, nx, ny, &p, 0.5, w, [0.0, 0.0, 0.0]);
+        assert!(!out.is_empty(), "the segments produced no geometry");
+        for vv in &out {
+            assert!((vv.z - 0.5).abs() < 1e-6, "a ribbon left its height");
+            // Half the ribbon width either side, plus the square end caps.
+            assert!(
+                (vv.x - 6.0).abs() <= w,
+                "a ribbon vertex at x = {:.4} m, but the 300 lx line is at 6.0 m",
+                vv.x,
+            );
+        }
+    }
+
+    /// THE OVERLAY IS FINER THAN THE GRID. The report interpolates its band edges; a sheet at one
+    /// quad per calculated cell would staircase where the report curves, which is the exact
+    /// difference this work exists to remove.
+    #[test]
+    fn the_overlay_supersamples_the_calculated_grid() {
+        // The project this came from: 38 × 30.
+        let (nx, ny) = crate::app::CadApp::overlay_res(38, 30);
+        assert!(nx > 38 && ny > 30, "a 38 × 30 grid was drawn at {nx} × {ny} — no finer than itself");
+        assert_eq!((nx % 38, ny % 30), (0, 0), "the supersample must be a whole multiple");
+        // …AND IT STAYS AFFORDABLE, which is not a nicety: this is rebuilt EVERY FRAME. The
+        // 128 × 128 case is the one that caught the real gap — `MAX_GRID_POINTS` is 16,384, so a
+        // grid past the budget is reachable on a real project, and the fallback used to hand back
+        // the full grid and spend 98,000 vertices a frame on it.
+        for (c, r) in [(38, 30), (128, 128), (16, 8), (200, 80), (128, 128), (16_384, 1)] {
+            let (x, y) = crate::app::CadApp::overlay_res(c, r);
+            assert!(x * y <= 12_000, "a {c} × {r} grid asked for {x} × {y} = {} cells", x * y);
+            assert!(x >= 2 && y >= 2, "a {c} × {r} grid collapsed to {x} × {y}");
+            // Coarsening is only ever a LAST resort — while the budget allows it, the overlay must
+            // be at least as fine as the data it is drawing.
+            if c * r <= 12_000 {
+                assert!(x >= c && y >= r, "a {c} × {r} grid was drawn COARSER, at {x} × {y}");
+            }
+        }
+    }
+}
+
+/// FORENSIC PROBE — what the overlay costs, per frame.
+///
+/// `cargo test -p cad_app --bin simlux --release what_the_overlay_costs_a_frame -- --ignored --nocapture`
+#[cfg(test)]
+mod overlay_cost_probe {
+    /// Not an assertion — a measurement, printed. The SIMLUX view rebuilds its whole vertex buffer
+    /// every frame, so a sheet that scales with the grid is the one thing here worth timing.
+    #[test]
+    #[ignore]
+    fn what_the_overlay_costs_a_frame() {
+        // The real project: 38 × 30 at 0.252 m.
+        let (gc, gr) = (38u32, 30u32);
+        let mut values = Vec::with_capacity((gc * gr) as usize);
+        for r in 0..gr {
+            for c in 0..gc {
+                let (x, y) = (c as f64 / gc as f64, r as f64 / gr as f64);
+                values.push(300.0 + 900.0 * ((x * 9.0).sin() * (y * 7.0).cos()).abs());
+            }
+        }
+        let grid = cad_light::LuxGrid::from_values(gc, gr, values);
+        let plane = cad_light::CalcPlane {
+            origin: cad_light::Vertex::new(0.0, 0.0, 0.8),
+            width: 9.58,
+            depth: 7.58,
+            cols: gc,
+            rows: gr,
+        };
+        let (nx, ny) = crate::app::CadApp::overlay_res(gc as usize, gr as usize);
+        let bands = [50.0_f64, 100.0, 200.0, 300.0];
+
+        let t0 = std::time::Instant::now();
+        let n = 100;
+        let mut verts = 0usize;
+        for _ in 0..n {
+            let f = crate::isolux::sample(&grid, &[], nx, ny);
+            let mut out = Vec::new();
+            super::push_lux_sheet(&mut out, &f, &plane, 0.0, &|_| [0.5, 0.5, 0.5]);
+            for t in bands {
+                let segs = crate::isolux::trace(&f, t);
+                super::push_isolux_lines(&mut out, &segs, nx, ny, &plane, 0.01, 0.02, [0.0; 3]);
+            }
+            verts = out.len();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+        println!("grid {gc} x {gr}  ->  overlay {nx} x {ny}");
+        println!("  {verts} vertices, {:.3} ms to build", per);
+        println!("  a 60 fps frame is 16.7 ms");
     }
 }

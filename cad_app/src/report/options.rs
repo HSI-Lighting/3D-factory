@@ -837,3 +837,133 @@ impl ImageSlot {
         }
     }
 }
+
+/// A ramp position as bytes. The one place `fn(f32) -> (f32, f32, f32)` becomes `[u8; 3]`.
+pub fn ramp_rgb(ramp: fn(f32) -> (f32, f32, f32), t: f32) -> [u8; 3] {
+    let (r, g, b) = ramp(t.clamp(0.0, 1.0));
+    [
+        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (b.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ]
+}
+
+impl Options {
+    /// THE COLOUR RULE. One function, and everything that paints a lux value goes through it.
+    ///
+    /// The report's field, its legend, its printed point values AND the SIMLUX viewport all have
+    /// to agree about what 180 lx looks like. Asked for as: *"any changes made in the false color
+    /// in calculate or report will appear in both places."* Two implementations of the same rule
+    /// agree right up until one of them is edited, and the failure is a drawing whose legend
+    /// contradicts it — which is worse than either being wrong alone, because a reader checks one
+    /// against the other and both look plausible.
+    ///
+    /// Entered by BAND, for callers that are already walking bands.
+    pub fn band_rgb(&self, k: usize, t: f32, ramp: fn(f32) -> (f32, f32, f32)) -> [u8; 3] {
+        // ONLY WHEN THE SCALE IS BANDED. A continuous scale is drawn as several dozen synthetic
+        // levels so one contour tracer can serve both, and those levels are not bands — index 0 of
+        // a gradient is not "the 0–50 lx band". Left ungated, a smooth ramp took the first few
+        // band colours and then jumped to the palette partway up, which is neither scheme.
+        if self.scale.bands.is_empty() {
+            return ramp_rgb(ramp, t);
+        }
+        match self.band_colours.get(k) {
+            Some(c) => *c,
+            None => ramp_rgb(ramp, t),
+        }
+    }
+
+    /// The same rule, entered by READING instead of by band — for callers holding a lux value and
+    /// no idea which band it falls in. The viewport's overlay is the one that needed this.
+    pub fn lux_rgb(&self, lux: f64, room_max: f64, ramp: fn(f32) -> (f32, f32, f32)) -> [u8; 3] {
+        // `usize::MAX` on a continuous scale, which no band index can be, so it falls through to
+        // the ramp exactly as `band_rgb` intends.
+        let k = if self.scale.bands.is_empty() {
+            usize::MAX
+        } else {
+            self.scale.band_index(lux, room_max)
+        };
+        self.band_rgb(k, self.scale.t_for(lux, room_max), ramp)
+    }
+}
+
+/// THE ONE COLOUR RULE, ENTERED BY VALUE — what the SIMLUX viewport paints with.
+#[cfg(test)]
+mod the_viewport_and_the_report_agree_about_colour {
+    use super::*;
+
+    fn banded() -> Options {
+        let mut o = Options::default();
+        o.scale.bands = vec![50.0, 100.0, 200.0, 300.0];
+        // Deliberately NOT the palette and deliberately all different, so an off-by-one in the band
+        // index is a different byte rather than a slightly different shade of the right one.
+        o.band_colours = vec![[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42], [50, 51, 52]];
+        o
+    }
+
+    /// Black, so any pixel that came from the PALETTE instead of a picked colour is obvious.
+    fn black(_t: f32) -> (f32, f32, f32) {
+        (0.0, 0.0, 0.0)
+    }
+
+    /// A READING GETS THE COLOUR ITS BAND WAS GIVEN. Checked against the literal bytes, not against
+    /// another call into the same code — the report and the viewport agreeing with each other is
+    /// worth nothing if they agree on the wrong band.
+    #[test]
+    fn every_reading_takes_the_colour_its_band_was_given() {
+        let o = banded();
+        for (lux, want) in [
+            (0.0, [10, 11, 12]),
+            (49.9, [10, 11, 12]),
+            (50.0, [20, 21, 22]),  // ON a threshold belongs to the band ABOVE it
+            (99.9, [20, 21, 22]),
+            (100.0, [30, 31, 32]),
+            (199.9, [30, 31, 32]),
+            (200.0, [40, 41, 42]),
+            (299.9, [40, 41, 42]),
+            (300.0, [50, 51, 52]),
+            (1802.0, [50, 51, 52]), // the open-ended top band
+        ] {
+            assert_eq!(o.lux_rgb(lux, 1802.0, black), want, "{lux} lx");
+        }
+    }
+
+    /// AND IT IS THE SAME RULE THE FIELD IS PAINTED WITH. The report's contour renderer walks
+    /// BANDS and colours each one by index; the viewport holds a value and no index at all. Two
+    /// entrances, and they have to arrive at the same place or a drawing disagrees with the legend
+    /// that explains it.
+    #[test]
+    fn entering_by_band_and_entering_by_value_arrive_together() {
+        let o = banded();
+        let room_max = 1802.0;
+        let edges = o.scale.edges(room_max);
+        for (k, pair) in edges.windows(2).enumerate() {
+            let mid = (pair[0] + pair[1]) * 0.5;
+            assert_eq!(
+                o.band_rgb(k, o.scale.t_for(mid, room_max), black),
+                o.lux_rgb(mid, room_max, black),
+                "band {k} ({:.0}–{:.0} lx) is painted one colour and read as another",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    /// A CONTINUOUS SCALE STILL COMES FROM THE PALETTE. Band colours are for bands; a gradient has
+    /// none, and taking the first few from the list was a real defect once.
+    #[test]
+    fn a_scale_with_no_bands_ignores_the_band_colours() {
+        let mut o = banded();
+        o.scale.bands.clear();
+        fn white(_t: f32) -> (f32, f32, f32) {
+            (1.0, 1.0, 1.0)
+        }
+        for lux in [0.0, 40.0, 150.0, 400.0, 1802.0] {
+            assert_eq!(
+                o.lux_rgb(lux, 1802.0, white),
+                [255, 255, 255],
+                "{lux} lx on a continuous scale took a BAND colour",
+            );
+        }
+    }
+}
