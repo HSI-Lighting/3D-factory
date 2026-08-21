@@ -381,16 +381,19 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     LAYOUTS.with(|n| n.set(n.get() + 1));
     let (w, h) = opt.page.points();
     let mut doc = Doc::new((w, h), opt.title.clone());
-    // ONE IMAGE TABLE, TWO LISTS. The PDF holds a single table of images, so the renders go in
-    // first and the logos after them — a logo's index into the table is `logo_base + i`. Kept
-    // apart in the options because they are different things chosen from different buttons; kept
-    // together here because the file format has one place to put them.
-    for im in opt.images.iter().chain(opt.logos.iter()) {
+    // ONE IMAGE TABLE, THREE LISTS. The PDF holds a single table of images, so the renders go in
+    // first, then the logos, then the covers — a logo's index into the table is `logo_base + i`
+    // and a cover's is `cover_base + i`. Kept apart in the options because they are different
+    // things chosen from different buttons, and mixing them is what the reports were about: "i
+    // have to add image at the render image addition then add them in the logo", and later the
+    // same of the cover. Kept together HERE because the file format has one place to put them.
+    for im in opt.images.iter().chain(opt.logos.iter()).chain(opt.covers.iter()) {
         if let Some((bytes, iw, ih)) = &im.jpeg {
             doc.images.push(Jpeg { bytes: bytes.clone(), w: *iw, h: *ih });
         }
     }
     let logo_base = opt.images.iter().filter(|i| i.jpeg.is_some()).count();
+    let cover_base = logo_base + opt.logos.iter().filter(|i| i.jpeg.is_some()).count();
 
     let has_head = !opt.header.trim().is_empty() || opt.header_image.is_some();
     let has_foot =
@@ -398,7 +401,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
 
     let mut cover_pages = Vec::new();
     if opt.cover {
-        cover_pages.push(cover(inp, opt, w, h, &doc));
+        cover_pages.push(cover(inp, opt, w, h, &doc, cover_base));
     }
 
     let mut c = Cursor::new(w, h, has_head, has_foot);
@@ -416,12 +419,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     // where the first per-room section sits in the list, not always at the top.
     let first_room_at = opt.sections.iter().position(|s| is_per_room(*s)).unwrap_or(usize::MAX);
     for s in opt.sections.iter().enumerate().filter(|(i, s)| *i < first_room_at && !is_per_room(**s)).map(|(_, s)| s) {
-        match s {
-            Section::Materials => materials(&mut c, inp),
-            Section::Surfaces => surfaces(&mut c, inp),
-            Section::Renders => renders(&mut c, opt, &doc),
-            _ => {}
-        }
+        building_wide(&mut c, inp, opt, &doc, *s, many);
     }
     for room in &inp.rooms {
         if many || !room.name.trim().is_empty() {
@@ -440,11 +438,6 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
             }
         }
     }
-    // The whole scheme's totals, once, when there is more than one room to total.
-    if many && opt.has(Section::Schedule) {
-        chapter(&mut c, "Whole scheme");
-        schedule(&mut c, &inp.total_schedule(), "Luminaire schedule — all rooms");
-    }
     for s in opt
         .sections
         .iter()
@@ -452,12 +445,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
         .filter(|(i, s)| *i > first_room_at && !is_per_room(**s))
         .map(|(_, s)| s)
     {
-        match s {
-            Section::Materials => materials(&mut c, inp),
-            Section::Surfaces => surfaces(&mut c, inp),
-            Section::Renders => renders(&mut c, opt, &doc),
-            _ => {}
-        }
+        building_wide(&mut c, inp, opt, &doc, *s, many);
     }
     let mut body = c.finish();
 
@@ -556,13 +544,15 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
 }
 
 /// The title page.
-fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc) -> Page {
+fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usize) -> Page {
     let mut p = Page::default();
     let mut y = h * 0.34;
 
     // The image sits ABOVE the title when there is one, so the eye lands on the picture and then
     // reads what it is — which is the order a cover is looked at.
-    if let Some(i) = opt.cover_image {
+    // The cover picture comes from the COVERS list, which has its own Add button — see the note on
+    // the image table above.
+    if let Some(i) = opt.cover_image.map(|i| cover_base + i) {
         if let Some(im) = doc.images.get(i) {
             let box_w = w - MARGIN * 2.0;
             let box_h = h * 0.34;
@@ -636,6 +626,32 @@ fn fit(iw: f64, ih: f64, bw: f64, bh: f64) -> (f64, f64) {
 
 
 /// Sections that describe ONE room, and so repeat inside each room's chapter.
+/// Emit one BUILDING-WIDE section, wherever the list has put it.
+///
+/// One function called from both sides of the room chapters, so a section cannot be movable in one
+/// direction and not the other — which is the shape the Whole scheme bug had.
+fn building_wide(
+    c: &mut Cursor,
+    inp: &Input,
+    opt: &Options,
+    doc: &Doc,
+    s: Section,
+    many_rooms: bool,
+) {
+    match s {
+        Section::Materials => materials(c, inp),
+        Section::Surfaces => surfaces(c, inp),
+        Section::Renders => renders(c, opt, doc),
+        // Only when there is more than one room to total. On a single-room report it would be the
+        // same schedule printed a second time under a grander heading.
+        Section::WholeScheme if many_rooms => {
+            chapter(c, "Whole scheme");
+            schedule(c, &inp.total_schedule(), "Luminaire schedule — all rooms");
+        }
+        _ => {}
+    }
+}
+
 fn is_per_room(s: Section) -> bool {
     matches!(
         s,
@@ -1029,48 +1045,87 @@ fn results_body(
     let sw = plot_w / nx as f64;
     let sh = plot_h / ny as f64;
     let at = |i: f64, j: f64| (x0 + i * sw, y0 + j * sh);
+    // WHICH RASTER CELLS ARE IN THE ROOM — computed once, shared by every band.
+    //
+    // A cell outside the room is simply never painted, so nothing has to be covered up afterwards.
+    // The first version DID cover it up, with one white shape carrying the plot rectangle and the
+    // room outline as two rings under the even-odd rule, and that was a mistake: the PDF filled it
+    // correctly and the on-screen preview — which has no even-odd and filled each ring in turn —
+    // painted the whole room white. Two renderers, one item, different pictures. Nothing here
+    // needs a fill rule any more, so they cannot disagree.
+    let p = room.plane;
+    let inside: Vec<bool> = if room.poly.len() >= 3 {
+        let mut v = vec![false; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let wx = p.origin.x as f64 + (i as f64 + 0.5) / nx as f64 * p.width as f64;
+                // Flipped like the field itself: raster row 0 is the top of the page, which is the
+                // room's MAXIMUM y.
+                let wy =
+                    p.origin.y as f64 + (1.0 - (j as f64 + 0.5) / ny as f64) * p.depth as f64;
+                v[j * nx + i] = crate::factory::point_in_poly(room.poly, wx as f32, wy as f32);
+            }
+        }
+        v
+    } else if !room.mask.is_empty() {
+        // NO OUTLINE, BUT A MASK. In a real calculation a mask only exists where an outline does,
+        // so this is the belt to that braces — but the cost of getting it wrong is colour claiming
+        // there is light on ground the room does not cover, and that is not something to leave to
+        // an invariant holding somewhere else. Cell by cell, which is a staircase at GRID
+        // resolution; a staircase in the right place beats a smooth edge in the wrong one.
+        let mut v = vec![true; nx * ny];
+        for j in 0..ny {
+            for i in 0..nx {
+                let gx = ((i as f64 + 0.5) / nx as f64 * gc as f64) as usize;
+                // Flipped like everything else here: raster row 0 is the top of the page, which is
+                // the room's maximum y and so the LAST grid row.
+                let gy = ((1.0 - (j as f64 + 0.5) / ny as f64) * gr as f64) as usize;
+                v[j * nx + i] =
+                    room.mask.get(gy.min(gr - 1) * gc + gx.min(gc - 1)).copied().unwrap_or(true);
+            }
+        }
+        v
+    } else {
+        vec![true; nx * ny]
+    };
+    let to_page = |v: &glam::Vec2| -> (f64, f64) {
+        (
+            x0 + (v.x as f64 - p.origin.x as f64) / p.width as f64 * plot_w,
+            y0 + plot_h - (v.y as f64 - p.origin.y as f64) / p.depth as f64 * plot_h,
+        )
+    };
+
     for (k, pair) in edges.windows(2).enumerate() {
         let mid = (pair[0] + pair[1]) * 0.5;
         let fill = band_fill(inp, opt, k, opt.scale.t_for(mid, room_max));
         if k == 0 {
-            // The floor band is the whole plot. Everything above it is painted on top, and the
-            // part outside the room is covered at the end.
-            c.push(Item::Rect { x: x0, y: y0, w: plot_w, h: plot_h, fill });
+            // THE FLOOR BAND IS THE ROOM ITSELF — its own outline, filled, so the edge of the
+            // colour is the edge of the room exactly. Every brighter band is painted over it.
+            if room.poly.len() >= 3 {
+                c.push(Item::Poly {
+                    rings: vec![room.poly.iter().map(to_page).collect()],
+                    fill,
+                });
+            } else if !room.mask.is_empty() {
+                // Mask only, so the floor band gets the same treatment as every other one: every
+                // cell is above a threshold of minus infinity, so this fills exactly where the
+                // mask says the room is and nowhere else.
+                paint_above(c, &f, &inside, nx, ny, f64::NEG_INFINITY, fill, &at);
+            } else {
+                c.push(Item::Rect { x: x0, y: y0, w: plot_w, h: plot_h, fill });
+            }
             continue;
         }
         let t = pair[0];
-        paint_above(c, &f, nx, ny, t, fill, &at);
+        paint_above(c, &f, &inside, nx, ny, t, fill, &at);
     }
 
-    // ---- and everything outside the room is not part of the answer --------------------------
+
+    // ---- the room's own edge -----------------------------------------------------------------
     //
-    // Covered rather than clipped: the bands are traced over the whole rectangle, and a single
-    // white shape with the plot's rectangle and the room's OUTLINE as its two rings hides the rest
-    // under the even-odd rule. That gives the room's real edge — the polygon itself, exactly —
-    // instead of the staircase a per-cell mask leaves, which is the jaggedness that shows up worst
-    // because it runs down the one line the eye follows.
+    // Drawn so the room reads as a room and not merely as where the colour stops.
     if room.poly.len() >= 3 {
-        let p = room.plane;
-        let to_page = |v: &glam::Vec2| -> (f64, f64) {
-            (
-                x0 + (v.x as f64 - p.origin.x as f64) / p.width as f64 * plot_w,
-                y0 + plot_h - (v.y as f64 - p.origin.y as f64) / p.depth as f64 * plot_h,
-            )
-        };
         let ring: Vec<(f64, f64)> = room.poly.iter().map(to_page).collect();
-        c.push(Item::Poly {
-            rings: vec![
-                vec![
-                    (x0, y0),
-                    (x0 + plot_w, y0),
-                    (x0 + plot_w, y0 + plot_h),
-                    (x0, y0 + plot_h),
-                ],
-                ring.clone(),
-            ],
-            fill: [255, 255, 255],
-        });
-        // The outline itself, so the room reads as a room and not as the edge of the colour.
         for w in ring.windows(2) {
             c.push(Item::Line {
                 x1: w[0].0,
@@ -1090,29 +1145,6 @@ fn results_body(
                 rgb: [150, 150, 150],
                 width: 0.6,
             });
-        }
-    } else if !room.mask.is_empty() {
-        // NO OUTLINE, BUT A MASK. In a real calculation a mask only exists where an outline does,
-        // so this is the belt to that braces — but the cost of getting it wrong is colour claiming
-        // there is light on ground the room does not cover, and that is not a thing to leave to an
-        // invariant holding somewhere else. Cell by cell, which is a staircase; a staircase in the
-        // right place beats a smooth edge in the wrong one.
-        let cw = plot_w / gc as f64;
-        let ch = plot_h / gr as f64;
-        for j in 0..gr {
-            for i in 0..gc {
-                if room.mask.get(j * gc + i).copied().unwrap_or(true) {
-                    continue;
-                }
-                c.push(Item::Rect {
-                    x: x0 + i as f64 * cw,
-                    // Flipped with the field: mask row 0 is the room's minimum y.
-                    y: y0 + plot_h - (j + 1) as f64 * ch,
-                    w: cw + 0.12,
-                    h: ch + 0.12,
-                    fill: [255, 255, 255],
-                });
-            }
         }
     }
 
@@ -1187,6 +1219,7 @@ fn results_body(
 fn paint_above(
     c: &mut Cursor,
     f: &[f64],
+    inside: &[bool],
     nx: usize,
     ny: usize,
     t: f64,
@@ -1221,6 +1254,12 @@ fn paint_above(
                 ((i + 1) as f64, (j + 1) as f64, v(i + 1, j + 1)),
                 (i as f64, (j + 1) as f64, v(i, j + 1)),
             ];
+            // Outside the room there is no answer to draw. Skipping is what removes the need for
+            // anything to be painted over afterwards — see the mask above.
+            if !inside.get(j * nx + i).copied().unwrap_or(true) {
+                close(&mut run, i, c);
+                continue;
+            }
             let n_in = corners.iter().filter(|(_, _, a)| *a >= t).count();
             if n_in == 4 {
                 run.get_or_insert(i);
@@ -2918,6 +2957,60 @@ mod tests {
         );
     }
 
+    /// THE PREVIEW CAN DRAW EVERYTHING THE PDF CAN.
+    ///
+    /// Reported as: the saved report looks right and the preview does not. It did not — the field
+    /// came out as an empty white box on screen and correct on paper.
+    ///
+    /// The cause was ONE ITEM NEEDING A FILL RULE THE PREVIEW DOES NOT HAVE. The ground outside
+    /// the room was hidden with a single white shape carrying two rings — the plot rectangle and
+    /// the room outline — relying on the even-odd rule to turn the second into a hole. A PDF
+    /// reader does that. egui has no even-odd, filled each ring in turn, and painted the entire
+    /// room white. Two renderers, one item, different pictures, and only one of them is the thing
+    /// that gets issued.
+    ///
+    /// So the invariant is structural rather than visual: no item may carry more than one ring.
+    /// With a single ring every fill rule agrees, which is what makes "the preview IS the document"
+    /// true rather than merely intended. A visual test would have to rasterise egui and would
+    /// still only cover the page it happened to look at.
+    #[test]
+    fn no_drawing_needs_a_fill_rule_the_preview_lacks() {
+        let l = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 3.0),
+            glam::Vec2::new(3.0, 3.0),
+            glam::Vec2::new(3.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        let g = grid(24, 18);
+        let p = plane();
+        let mut inp = input(&g, &p);
+        inp.rooms[0].poly = &l; // an L-shaped room, which is where holes would come from
+        let mut o = opts();
+        o.cover = false;
+        o.sections = crate::report::Section::all();
+        let d = layout(&inp, &o);
+
+        let worst = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Poly { rings, .. } => Some(rings.len()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(worst > 0, "nothing was drawn as a polygon at all — the fixture proves nothing");
+        assert_eq!(
+            worst, 1,
+            "an item carries {worst} rings, so the PDF and the on-screen preview will fill it \
+             differently",
+        );
+    }
+
+
     /// GROUND OUTSIDE THE ROOM IS NOT COLOURED — colouring it reports illuminance where the room
     /// is not.
     ///
@@ -2959,9 +3052,12 @@ mod tests {
                 inside.is_some_and(|c| c != [255, 255, 255]),
                 "{how}: inside the room came out {inside:?} — the field is not painted",
             );
-            assert_eq!(
-                outside,
-                Some([255, 255, 255]),
+            // EITHER NOTHING OR WHITE. Nothing is the better of the two — bare paper, because the
+            // field is never painted out there at all — and white is what a cover leaves behind.
+            // What must not appear is a BAND COLOUR, which would report illuminance on ground the
+            // room does not cover.
+            assert!(
+                matches!(outside, None | Some([255, 255, 255])),
                 "{how}: ground outside the room shows {outside:?}, which reports illuminance where \
                  the room is not",
             );
@@ -3560,12 +3656,49 @@ mod tests {
         assert_eq!(merged.len(), 1, "one type across both rooms");
         assert_eq!(merged[0].count, 10, "4 + 6");
 
+        // ITS OWN SECTION. It used to arrive free with the per-room Schedule, which is why it
+        // could be neither switched off nor moved.
+        o.sections = vec![Section::Schedule, Section::WholeScheme];
         let t = texts(&layout(&i, &o));
         assert!(t.iter().any(|s| s == "10"), "the combined quantity is not on the page: {t:?}");
         assert!(
             t.iter().any(|s| s.contains("all rooms")),
             "the combined schedule is not labelled as such",
         );
+
+        // AND IT CAN BE TURNED OFF, which was impossible before.
+        o.sections = vec![Section::Schedule];
+        let without = texts(&layout(&i, &o));
+        assert!(
+            !without.iter().any(|s| s.contains("all rooms")),
+            "the whole-scheme total printed with its section switched off: {without:?}",
+        );
+
+        // AND MOVED. Reported as "the whole scheme isnt movable its always stuck to the last
+        // page" — it was emitted after the last room regardless of where it sat in the list, so a
+        // practice that opens its reports with the totals had no way to.
+        //
+        // Compared by PAGE, since that is what "stuck to the last page" means: put first, the
+        // total must appear before the room chapters begin.
+        o.sections = vec![Section::WholeScheme, Section::Schedule];
+        let d = layout(&i, &o);
+        let page_of = |needle: &str| -> Option<usize> {
+            d.pages.iter().position(|pg| {
+                pg.items.iter().any(|it| match it {
+                    Item::Text { text, .. } => text.contains(needle),
+                    _ => false,
+                })
+            })
+        };
+        let total = page_of("all rooms").expect("the whole-scheme page");
+        let first_room = page_of("15 fitting(s)").or_else(|| page_of("4 fitting(s)"));
+        assert_eq!(total, 0, "listed first, the whole-scheme total is on page {total}");
+        if let Some(r) = first_room {
+            assert!(
+                total <= r,
+                "the total is on page {total} and the first room's schedule on page {r}",
+            );
+        }
     }
 
     /// A BUILDING-WIDE SECTION KEEPS ITS PLACE. The order IS the document, so listing Surfaces

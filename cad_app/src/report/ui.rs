@@ -21,6 +21,10 @@ pub struct Action {
     pub remove_image: Option<usize>,
     /// Add logo images — a list of their own, not the renders.
     pub add_logos: bool,
+    /// Add a cover picture — a list of its own, not the renders and not the logos.
+    pub add_cover: bool,
+    /// Drop this cover picture. A list that can only grow is a list with a mistake in it for ever.
+    pub remove_cover: Option<usize>,
     /// Drop this logo.
     pub remove_logo: Option<usize>,
     /// Take the current path-tracer render as an image.
@@ -61,11 +65,17 @@ pub fn paint_page(
                     c32(*fill),
                 );
             }
-            // THE PREVIEW PAINTS THE SAME POLYGONS THE PDF DOES. egui has no even-odd fill, and a
-            // convex-only tessellator would mangle the concave rings a contour produces — so each
-            // ring is triangulated by ear clipping, which handles any simple polygon. The holes a
-            // band can carry are drawn as their own rings by the caller in painting order,
-            // brightest last, so the preview shows the same picture without needing the rule.
+            // THE PREVIEW PAINTS THE SAME POLYGONS THE PDF DOES. egui can fill a CONVEX polygon and
+            // nothing else, and a contour band is reliably concave, so each ring is triangulated
+            // by ear clipping — which handles any simple polygon.
+            //
+            // EACH RING ON ITS OWN, which means this cannot render a hole. That is not a gap to
+            // be filled in later, it is the contract: nothing the layout emits carries more than
+            // one ring, and `no_drawing_needs_a_fill_rule_the_preview_lacks` holds it to that.
+            // The first version DID emit a two-ring shape — the plot rectangle with the room as an
+            // even-odd hole — and the result was a correct PDF beside a preview with the entire
+            // room painted white. A comment here claimed painting order made the rule unnecessary.
+            // It did not.
             Item::Poly { rings, fill } => {
                 for r in rings {
                     let pts: Vec<egui::Pos2> =
@@ -224,23 +234,47 @@ pub fn window_ui(
                                         .hint_text("optional second line"),
                                 );
                             });
+                            // ITS OWN LIST, AND ITS OWN BUTTON. Reported as "the cover page image
+                            // doesnt have a dedicated add image option. it taken from render, it
+                            // also needs a dedicated add option" — the same complaint the logos
+                            // got. Choosing a cover meant adding the picture as a RENDER first,
+                            // where it then appeared full width on the renders page whether it
+                            // belonged there or not.
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("Image").small().weak());
                                 let cur = opt
                                     .cover_image
-                                    .and_then(|i| opt.images.get(i))
+                                    .and_then(|i| opt.covers.get(i))
                                     .map(|i| i.caption_or_file())
                                     .unwrap_or_else(|| "none".to_string());
                                 egui::ComboBox::from_id_salt("cover_img")
                                     .selected_text(cur)
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut opt.cover_image, None, "none");
-                                        for i in 0..opt.images.len() {
-                                            let label = opt.images[i].caption_or_file();
+                                        for i in 0..opt.covers.len() {
+                                            let label = opt.covers[i].caption_or_file();
                                             ui.selectable_value(&mut opt.cover_image, Some(i), label);
                                         }
                                     });
+                                if ui.small_button("＋ Add…").clicked() {
+                                    act.add_cover = true;
+                                }
+                                if let Some(i) = opt.cover_image {
+                                    if ui.small_button("✕").on_hover_text("Drop it").clicked() {
+                                        act.remove_cover = Some(i);
+                                    }
+                                }
                             });
+                            if opt.covers.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No cover image yet — Add… puts one here, not on the \
+                                         renders page.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                         });
 
                         ui.add_space(8.0);

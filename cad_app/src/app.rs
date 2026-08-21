@@ -2139,7 +2139,7 @@ pub struct CadApp {
     /// The next folder pick is the report's output directory.
     report_wants_dir: bool,
     /// The next image pick is a report image: `Some(false)` a render, `Some(true)` a logo.
-    report_wants_images: Option<bool>,
+    report_wants_images: Option<crate::report::ImageSlot>,
     // ---- the calculation, off the UI thread ----
     calc_rx: Option<std::sync::mpsc::Receiver<crate::light::CalcOutcome>>,
     calc_progress: Option<std::sync::Arc<crate::light::CalcProgress>>,
@@ -2166,6 +2166,8 @@ pub struct CadApp {
     report_doc_key: Option<u64>,
     /// A preview texture per LOGO, parallel to `report_opts.logos`.
     report_logo_tex: Vec<Option<egui::TextureHandle>>,
+    /// A preview texture per COVER picture, parallel to `report_opts.covers`.
+    report_cover_tex: Vec<Option<egui::TextureHandle>>,
     /// Memory the undo history may hold, in bytes. Defaults to [`UNDO_BUDGET_BYTES`].
     ///
     /// A FIELD rather than the bare constant, for two reasons. It is the kind of limit a user with
@@ -4020,6 +4022,7 @@ impl Default for CadApp {
             report_doc: None,
             report_doc_key: None,
             report_logo_tex: Vec::new(),
+            report_cover_tex: Vec::new(),
             undo_budget_bytes: UNDO_BUDGET_BYTES,
             scene_import_pending: false,
             villa_autoloaded: false,
@@ -26801,7 +26804,9 @@ impl CadApp {
         // The preview reads ONE table, in the same order the PDF builds it: renders then logos.
         let mut tex = std::mem::take(&mut self.report_tex);
         let logo_tex = std::mem::take(&mut self.report_logo_tex);
+        let cover_tex = std::mem::take(&mut self.report_cover_tex);
         tex.extend(logo_tex.iter().cloned());
+        tex.extend(cover_tex.iter().cloned());
         let can_capture = self.pt_job.is_some();
         let act = crate::report::ui::window_ui(
             ctx,
@@ -26818,6 +26823,7 @@ impl CadApp {
         self.report_opts = opts;
         let n = self.report_opts.images.len().min(tex.len());
         self.report_logo_tex = logo_tex;
+        self.report_cover_tex = cover_tex;
         tex.truncate(n);
         self.report_tex = tex;
         self.report_page = page;
@@ -26833,16 +26839,30 @@ impl CadApp {
         }
         self.report_open = open;
 
+        self.apply_report_action(act);
+    }
+
+    /// Carry out what the dialog asked for, once the frame is over.
+    ///
+    /// SEPARATE FROM DRAWING IT, so each of these can be exercised on its own. The image lists and
+    /// the slots that name pictures by index are the fiddly part — three lists, three sets of
+    /// indices to keep straight — and driving a colour picker through a synthetic frame to reach
+    /// them would test egui rather than the bookkeeping.
+    fn apply_report_action(&mut self, act: crate::report::ui::Action) {
         if act.browse_dir {
             self.report_wants_dir = true;
             self.open_file_dialog(FileDialogMode::PickFolder, "");
         }
         if act.add_images {
-            self.report_wants_images = Some(false);
+            self.report_wants_images = Some(crate::report::ImageSlot::Render);
             self.open_file_dialog(FileDialogMode::ImportImage, "");
         }
         if act.add_logos {
-            self.report_wants_images = Some(true);
+            self.report_wants_images = Some(crate::report::ImageSlot::Logo);
+            self.open_file_dialog(FileDialogMode::ImportImage, "");
+        }
+        if act.add_cover {
+            self.report_wants_images = Some(crate::report::ImageSlot::Cover);
             self.open_file_dialog(FileDialogMode::ImportImage, "");
         }
         if let Some(i) = act.remove_image {
@@ -26863,6 +26883,21 @@ impl CadApp {
                 };
                 self.report_opts.header_image = repoint(self.report_opts.header_image);
                 self.report_opts.footer_image = repoint(self.report_opts.footer_image);
+            }
+        }
+        if let Some(i) = act.remove_cover {
+            if i < self.report_opts.covers.len() {
+                self.report_opts.covers.remove(i);
+                if i < self.report_cover_tex.len() {
+                    self.report_cover_tex.remove(i);
+                }
+                // The cover names a picture by INDEX, and everything after the removed one has
+                // moved down. Only THIS list, because only the cover indexes it.
+                self.report_opts.cover_image = match self.report_opts.cover_image {
+                    Some(c) if c == i => None,
+                    Some(c) if c > i => Some(c - 1),
+                    other => other,
+                };
             }
         }
         if act.capture_render {
@@ -26888,7 +26923,7 @@ impl CadApp {
         self.report_logo_tex.clear();
         for (path, caption) in paths.into_iter().zip(captions) {
             let before = self.report_opts.logos.len();
-            self.report_add_image(&path, ctx, true);
+            self.report_add_image(&path, ctx, crate::report::ImageSlot::Logo);
             if self.report_opts.logos.len() == before {
                 // Unreadable — keep the entry so the setting survives, without an image.
                 self.report_opts.logos.push(crate::report::ReportImage {
@@ -26926,21 +26961,26 @@ impl CadApp {
         if i < self.report_tex.len() {
             self.report_tex.remove(i);
         }
-        // EVERY slot that names an image by index, not just the cover — a header logo left
-        // pointing at the old number would put a different picture on every page.
-        let repoint = |cur: Option<usize>| match cur {
-            Some(c) if c == i => None,
-            Some(c) if c > i => Some(c - 1),
-            other => other,
-        };
-        self.report_opts.cover_image = repoint(self.report_opts.cover_image);
-        self.report_opts.header_image = repoint(self.report_opts.header_image);
-        self.report_opts.footer_image = repoint(self.report_opts.footer_image);
+        // NOTHING TO REPOINT HERE — and this used to repoint three things.
+        //
+        // `cover_image`, `header_image` and `footer_image` each name an image by INDEX, so back
+        // when every kind shared one list they all had to shift when a render was removed. They no
+        // longer share it: the header and footer index `logos`, the cover indexes `covers`, and
+        // this removes from `images`. Shifting them here therefore did the very damage the
+        // shifting existed to prevent — deleting a render silently moved the header logo onto a
+        // different picture, or unset it.
+        //
+        // Each list repoints its own slots when it loses an entry; see the `remove_logo` arm.
     }
 
 
     /// Load an image file for the report, as JPEG bytes plus a preview texture.
-    fn report_add_image(&mut self, path: &str, ctx: Option<&egui::Context>, is_logo: bool) {
+    fn report_add_image(
+        &mut self,
+        path: &str,
+        ctx: Option<&egui::Context>,
+        slot: crate::report::ImageSlot,
+    ) {
         let img = match image::open(path) {
             // RGBA, AND FLATTENED ONTO WHITE BELOW — not `to_rgb8()`.
             //
@@ -26971,7 +27011,7 @@ impl CadApp {
             rgb.push(over(g));
             rgb.push(over(b));
         }
-        self.report_push_image(path.to_string(), rgb, w, h, ctx, is_logo);
+        self.report_push_image(path.to_string(), rgb, w, h, ctx, slot);
     }
 
     /// Shared by the file loader and the render capture: RGB8 in, report image out.
@@ -26982,7 +27022,7 @@ impl CadApp {
         w: u32,
         h: u32,
         ctx: Option<&egui::Context>,
-        is_logo: bool,
+        slot: crate::report::ImageSlot,
     ) {
         // A REPORT IMAGE IS RESIZED ON THE WAY IN. A 6000-pixel render embedded whole makes a
         // 40 MB PDF nobody can email, and it is being printed into a box a few inches across —
@@ -27006,27 +27046,38 @@ impl CadApp {
             return;
         }
 
-        let kind = if is_logo { "logo" } else { "img" };
-        let n = if is_logo { self.report_opts.logos.len() } else { self.report_opts.images.len() };
+        use crate::report::ImageSlot;
+        let n = match slot {
+            ImageSlot::Render => self.report_opts.images.len(),
+            ImageSlot::Logo => self.report_opts.logos.len(),
+            ImageSlot::Cover => self.report_opts.covers.len(),
+        };
         let tex = ctx.map(|c| {
             let img = egui::ColorImage::from_rgb([w as usize, h as usize], &rgb);
-            c.load_texture(format!("report_{kind}_{n}"), img, Default::default())
+            c.load_texture(format!("report_{}_{n}", slot.tex_key()), img, Default::default())
         });
         let entry = crate::report::ReportImage {
             caption: String::new(),
             path: path.clone(),
             jpeg: Some((jpeg, w, h)),
         };
-        if is_logo {
-            self.report_opts.logos.push(entry);
-            self.report_logo_tex.push(tex);
-        } else {
-            self.report_opts.images.push(entry);
-            self.report_tex.push(tex);
+        match slot {
+            ImageSlot::Render => {
+                self.report_opts.images.push(entry);
+                self.report_tex.push(tex);
+            }
+            ImageSlot::Logo => {
+                self.report_opts.logos.push(entry);
+                self.report_logo_tex.push(tex);
+            }
+            ImageSlot::Cover => {
+                self.report_opts.covers.push(entry);
+                self.report_cover_tex.push(tex);
+            }
         }
         self.history.push(format!(
             "  report: added {} {} ({w}×{h})",
-            if is_logo { "logo" } else { "render" },
+            slot.noun(),
             file_stem_of(&path),
         ));
     }
@@ -27042,7 +27093,14 @@ impl CadApp {
             return;
         };
         let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-        self.report_push_image("render".into(), rgb, w as u32, h as u32, None, false);
+        self.report_push_image(
+            "render".into(),
+            rgb,
+            w as u32,
+            h as u32,
+            None,
+            crate::report::ImageSlot::Render,
+        );
         self.report_tex_dirty = true;
     }
 
@@ -30619,8 +30677,8 @@ impl CadApp {
                     // The same browser, asked for by two callers — a raster to trace, or a render
                     // for the report.
                     match std::mem::take(&mut self.report_wants_images) {
-                        Some(is_logo) => {
-                            self.report_add_image(&path.to_string_lossy(), Some(ctx), is_logo)
+                        Some(slot) => {
+                            self.report_add_image(&path.to_string_lossy(), Some(ctx), slot)
                         }
                         None => self.do_import_image(&path.to_string_lossy()),
                     }
@@ -62755,38 +62813,101 @@ mod the_report_is_asked_about_before_it_is_written {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// REMOVING AN IMAGE DOES NOT LEAVE THE COVER POINTING AT ANOTHER ONE.
+    /// EACH LIST REPOINTS ITS OWN SLOTS, AND ONLY ITS OWN.
     ///
-    /// The cover names an image by INDEX, and every index after the removed one moves down — so a
-    /// cover left alone would quietly show a different picture, which is the kind of mistake that
-    /// reaches a client.
+    /// The cover, the header and the footer each name a picture by INDEX. When all three kinds
+    /// shared one list they all had to shift together whenever anything was removed — and this
+    /// test asserted exactly that.
+    ///
+    /// They no longer share it: renders, logos and cover pictures are three lists, chosen from
+    /// three buttons, because twice now a picture had to be added in the wrong place to get it
+    /// where it was wanted. Which means the old shifting had become the very damage it existed to
+    /// prevent — deleting a RENDER moved the header logo onto a different picture.
     #[test]
     fn removing_an_image_repoints_the_cover() {
         let mut app = calculated();
+        let img = |n: &str| crate::report::ReportImage {
+            path: format!("{n}.jpg"),
+            caption: n.into(),
+            jpeg: Some((vec![0xFF, 0xD8], 10, 10)),
+        };
         for n in ["a", "b", "c"] {
-            app.report_opts.images.push(crate::report::ReportImage {
+            app.report_opts.images.push(img(n));
+            app.report_tex.push(None);
+            app.report_opts.logos.push(img(n));
+            app.report_logo_tex.push(None);
+            app.report_opts.covers.push(img(n));
+            app.report_cover_tex.push(None);
+        }
+        app.report_open = true;
+
+        // A RENDER GOES. The header and the cover point into other lists and must not move.
+        app.report_opts.cover_image = Some(2);
+        app.report_opts.header_image = Some(2);
+        app.report_remove_image(0);
+        assert_eq!(app.report_opts.images.len(), 2);
+        assert_eq!(app.report_opts.images[0].caption, "b");
+        assert_eq!(
+            app.report_opts.header_image,
+            Some(2),
+            "removing a render moved the header logo onto a different picture",
+        );
+        assert_eq!(
+            app.report_opts.cover_image,
+            Some(2),
+            "removing a render moved the cover onto a different picture",
+        );
+        assert_eq!(app.report_tex.len(), 2, "the preview textures went out of step");
+    }
+
+    /// A LOGO GOING TAKES THE HEADER AND FOOTER WITH IT — the list that actually owns them.
+    #[test]
+    fn removing_a_logo_repoints_the_header_and_footer() {
+        let mut app = calculated();
+        for n in ["a", "b", "c"] {
+            app.report_opts.logos.push(crate::report::ReportImage {
+                path: format!("{n}.png"),
+                caption: n.into(),
+                jpeg: Some((vec![0xFF, 0xD8], 10, 10)),
+            });
+            app.report_logo_tex.push(None);
+        }
+        app.report_opts.header_image = Some(2);
+        app.report_opts.footer_image = Some(0);
+        app.report_open = true;
+
+        let mut act = crate::report::ui::Action::default();
+        act.remove_logo = Some(0);
+        app.apply_report_action(act);
+
+        assert_eq!(app.report_opts.logos.len(), 2);
+        assert_eq!(app.report_opts.header_image, Some(1), "the header did not follow its logo");
+        assert_eq!(app.report_opts.footer_image, None, "the footer kept a dead index");
+        assert_eq!(app.report_logo_tex.len(), 2, "the preview textures went out of step");
+    }
+
+    /// AND A COVER PICTURE CAN BE DROPPED. A list that can only grow is a list with a mistake in
+    /// it for ever — the Add button is not much use without one.
+    #[test]
+    fn a_cover_picture_can_be_dropped() {
+        let mut app = calculated();
+        for n in ["a", "b"] {
+            app.report_opts.covers.push(crate::report::ReportImage {
                 path: format!("{n}.jpg"),
                 caption: n.into(),
                 jpeg: Some((vec![0xFF, 0xD8], 10, 10)),
             });
-            app.report_tex.push(None);
+            app.report_cover_tex.push(None);
         }
-
-        // Removing an EARLIER image slides the chosen one down.
-        app.report_opts.cover_image = Some(2);
-        app.report_opts.header_image = Some(2);
-        app.report_open = true;
-        app.report_remove_image(0);
-        assert_eq!(app.report_opts.cover_image, Some(1), "the cover follows its image");
-        assert_eq!(app.report_opts.header_image, Some(1), "the header logo follows its image too");
-        assert_eq!(app.report_opts.images[1].caption, "c");
-
-        // Removing the chosen one clears it rather than pointing somewhere arbitrary.
         app.report_opts.cover_image = Some(1);
-        app.report_remove_image(1);
+        app.report_open = true;
+
+        let mut act = crate::report::ui::Action::default();
+        act.remove_cover = Some(1);
+        app.apply_report_action(act);
+        assert_eq!(app.report_opts.covers.len(), 1);
         assert_eq!(app.report_opts.cover_image, None, "the cover kept a dead index");
-        assert_eq!(app.report_opts.images.len(), 1);
-        assert_eq!(app.report_tex.len(), 1, "the preview textures went out of step");
+        assert_eq!(app.report_cover_tex.len(), 1, "the preview textures went out of step");
     }
 
 
@@ -62928,7 +63049,7 @@ mod the_report_is_asked_about_before_it_is_written {
         img.save(&path).expect("write the fixture");
 
         let mut app = CadApp::default();
-        app.report_add_image(&path.to_string_lossy(), None, true);
+        app.report_add_image(&path.to_string_lossy(), None, crate::report::ImageSlot::Logo);
         assert_eq!(app.report_opts.logos.len(), 1, "the logo was not taken: {:?}", app.history);
 
         // Read the ENCODED bytes back, because that is what the PDF embeds.

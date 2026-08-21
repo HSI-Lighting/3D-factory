@@ -71,6 +71,18 @@ pub enum Section {
     Schedule,
     /// The render images, on a page of their own.
     Renders,
+    /// THE WHOLE SCHEME — every room totalled, once.
+    ///
+    /// A SECTION OF ITS OWN rather than a tail on the per-room schedule. It used to be neither
+    /// ticked nor moved: it was emitted after the last room whenever the Schedule section was on
+    /// and there was more than one room, so it could not be switched off and could not be put
+    /// anywhere else — "the whole scheme isnt movable its always stuck to the last page". A
+    /// practice that opens its reports with the totals had no way to.
+    ///
+    /// Building-wide, so it goes where it sits in the list relative to the room chapters, exactly
+    /// like Surfaces and Renders. Shown only when there IS more than one room to total, because
+    /// on a single-room report it would be the same schedule printed twice.
+    WholeScheme,
 }
 
 impl Section {
@@ -86,6 +98,7 @@ impl Section {
             Section::Surfaces => "Surfaces",
             Section::Schedule => "Luminaire schedule",
             Section::Renders => "Renders",
+            Section::WholeScheme => "Whole scheme — all rooms",
         }
     }
 
@@ -101,6 +114,7 @@ impl Section {
             Section::Schedule,
             Section::Renders,
             Section::NumericGrid,
+            Section::WholeScheme,
             Section::Surfaces,
         ]
     }
@@ -283,6 +297,15 @@ pub struct Options {
     /// different places and are chosen from different buttons.
     #[serde(skip)]
     pub logos: Vec<ReportImage>,
+    /// COVER PICTURES, kept apart from both.
+    ///
+    /// Reported as: "the cover page image doesnt have a dedicated add image option. it taken from
+    /// render, it also needs a dedicated add option" — the same complaint the logos got, for the
+    /// same reason. Choosing a cover meant first adding the picture as a RENDER, where it then
+    /// appeared full width on the renders page whether or not it belonged there. A cover picture
+    /// is one image used in one place, and it is chosen from its own button.
+    #[serde(skip)]
+    pub covers: Vec<ReportImage>,
     /// Where the file goes. Empty until chosen.
     pub out_dir: String,
     pub file_stem: String,
@@ -308,6 +331,7 @@ impl Default for Options {
             hidden: Vec::new(),
             images: Vec::new(),
             logos: Vec::new(),
+            covers: Vec::new(),
             out_dir: String::new(),
             file_stem: String::new(),
         }
@@ -467,6 +491,19 @@ impl Prefs {
         if !self.sections.is_empty() {
             o.sections = self.sections;
             o.hidden = self.hidden;
+            // A SECTION ADDED SINCE THIS FILE WAS WRITTEN GOES IN, rather than silently not
+            // existing. The list is a saved ORDER, not a saved census, and restoring it verbatim
+            // would mean anybody who had ever opened the dialog before a section was invented
+            // never sees it — their settings would hold the report back a version, permanently,
+            // with nothing to say so.
+            //
+            // Appended at the end, and only when it is not deliberately HIDDEN: a section somebody
+            // switched off must stay off, and its remembered position is what brings it back.
+            for s in Section::all() {
+                if !o.sections.contains(&s) && !o.hidden.iter().any(|(x, _)| *x == s) {
+                    o.sections.push(s);
+                }
+            }
         }
         // The images themselves are re-read from these paths; see `Options::logo_paths`.
         o.logos = self
@@ -726,5 +763,41 @@ mod the_report_settings_are_kept {
         p.apply(&mut o);
         assert_eq!(o.sections, Section::all());
         assert!(o.header.is_empty());
+    }
+}
+
+/// Which of the report's three image lists a file is being added to.
+///
+/// AN ENUM RATHER THAN A BOOL, which is what this was. Two lists fitted in a `bool` and the third
+/// did not — and the reason there is a third is that both times two kinds shared a list somebody
+/// had to add a picture in the wrong place to get it where they wanted it: "i have to add image at
+/// the render image addition then add them in the logo", and then the same of the cover. They are
+/// different things, used in different places, chosen from different buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSlot {
+    /// The renders page.
+    Render,
+    /// A header or footer mark.
+    Logo,
+    /// The picture on the cover.
+    Cover,
+}
+
+impl ImageSlot {
+    /// What to call it in the log — the user's word for the thing, not the field's name.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ImageSlot::Render => "render",
+            ImageSlot::Logo => "logo",
+            ImageSlot::Cover => "cover image",
+        }
+    }
+    /// A stable prefix for the preview texture's name.
+    pub fn tex_key(self) -> &'static str {
+        match self {
+            ImageSlot::Render => "img",
+            ImageSlot::Logo => "logo",
+            ImageSlot::Cover => "cover",
+        }
     }
 }
