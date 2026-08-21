@@ -80,7 +80,25 @@ pub struct Luminaire {
     pub profile: String,
     pub position: Vertex,
     /// Rotation about the vertical axis (degrees).
+    ///
+    /// Also the direction a TILTED fitting leans toward — see [`tilt_deg`](Self::tilt_deg). The two
+    /// are one pose: aiming a fitting at a point turns it in plan and tips it over, and they cannot
+    /// disagree about which way it is facing.
     pub rotation_deg: f32,
+    /// TILT FROM STRAIGHT DOWN, degrees. `0` is a fitting pointing at the floor.
+    ///
+    /// Asked for as an aim tool: *"the use of the tool will be to aim the light to a point… while
+    /// aiming the light stays at the same height and at the same location, its place where its
+    /// pointed downward is what we are changing."*
+    ///
+    /// A luminaire had only an azimuth, and the engine took the photometric axis straight from
+    /// world-down — so a fitting could be turned about its own axis and could not be aimed at all.
+    /// Aiming without this would spin a spot on the spot and change no number on the page.
+    ///
+    /// `#[serde(default)]` so every project written before it existed loads with its fittings
+    /// pointing down, which is exactly what they were.
+    #[serde(default)]
+    pub tilt_deg: f32,
     /// Dimming / output scale, 0.0–1.0.
     pub dimming: f32,
     /// CONNECTED LOAD for THIS fitting (W), overriding the profile's.
@@ -146,6 +164,52 @@ impl Luminaire {
             Some(lm) if prof.lumens > 0.0 && lm >= 0.0 => d * (lm / prof.lumens),
             _ => d,
         }
+    }
+
+    /// THE FITTING'S OWN FRAME — where it points, and where its C0 plane lies.
+    ///
+    /// Returns `(aim, c0, c90)`, all unit: `aim` is the photometric nadir, the direction the
+    /// fitting points; `c0` is the C0-plane reference, which is the fitting's own length for a
+    /// linear luminaire; `c90` completes the right-handed set.
+    ///
+    /// Untilted this is exactly what the engine always assumed — `aim` straight down, `c0` along
+    /// +X turned by `rotation_deg`. Tilted, the whole frame tips TOGETHER, because a fitting aimed
+    /// at a wall has turned its body and not merely its beam: a batten aimed across a room is still
+    /// a batten lying along its own length.
+    ///
+    /// The tilt goes TOWARD `rotation_deg`, so a fitting at 90° tilted 30° leans toward +Y.
+    pub fn frame(&self) -> (Vec3, Vec3, Vec3) {
+        let (a, t) = ((self.rotation_deg as f64).to_radians(), (self.tilt_deg as f64).to_radians());
+        let (sa, ca) = (a.sin() as f32, a.cos() as f32);
+        let (st, ct) = (t.sin() as f32, t.cos() as f32);
+        // Straight down, tipped by `t` toward the azimuth.
+        let aim = Vec3::new(st * ca, st * sa, -ct);
+        // The C0 axis starts along the azimuth and tips with it, staying perpendicular to `aim`.
+        let c0 = Vec3::new(ct * ca, ct * sa, st);
+        // `c0 × aim` and NOT the other way round: the other order mirrors every C-plane, which is
+        // invisible on an axially symmetric fitting and wrong on every other.
+        let c90 = c0.cross(aim);
+        (aim, c0, c90)
+    }
+
+    /// AIM THIS FITTING AT A POINT, without moving it.
+    ///
+    /// "while aiming the light stays at the same height and at the same location, its place where
+    /// its pointed downward is what we are changing." So this writes the pose and never the
+    /// position: the azimuth it turns to and the tilt it leans by, which together put its nadir
+    /// through `target`.
+    ///
+    /// A target at or above the fitting is REFUSED rather than clamped. Aiming a luminaire upward
+    /// through its own housing is not a pose it has; silently flattening it to horizontal would
+    /// leave a fitting that looks aimed and is not.
+    pub fn aim_at(&mut self, target: Vec3) -> bool {
+        let v = target - self.position.to_vec3();
+        if v.length() < 1e-6 || v.z >= 0.0 {
+            return false;
+        }
+        self.rotation_deg = v.y.atan2(v.x).to_degrees();
+        self.tilt_deg = (-v.z / v.length()).clamp(-1.0, 1.0).acos().to_degrees();
+        true
     }
 }
 
@@ -600,6 +664,7 @@ mod metric_tests {
             profile: profile.into(),
             position: Vertex::new(0.0, 0.0, 3.0),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -820,6 +885,7 @@ mod a_fitting_may_be_re_rated {
             profile: "p".into(),
             position: Vertex::new(0.0, 0.0, 3.0),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,

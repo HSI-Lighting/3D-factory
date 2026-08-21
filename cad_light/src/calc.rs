@@ -176,8 +176,15 @@ fn intensity_toward(prof: &IesProfile, lum: &Luminaire, point: Vec3) -> f64 {
         return 0.0;
     }
     let dir = d / dist;
-    let gamma = (-dir.z).clamp(-1.0, 1.0).acos().to_degrees() as f64;
-    let phi = (dir.y.atan2(dir.x).to_degrees() as f64) - lum.rotation_deg as f64;
+    // READ THROUGH THE FITTING'S OWN FRAME rather than off the world axes.
+    //
+    // The photometric angles are measured from the luminaire's nadir and its C0 plane. This used
+    // to take them from world-down and world-+X, which is right only for a fitting pointing at the
+    // floor — and every fitting was, because a luminaire had no tilt to give it. See
+    // `Luminaire::frame`; untilted, this reduces to exactly the expression it replaces.
+    let (aim, c0, c90) = lum.frame();
+    let gamma = dir.dot(aim).clamp(-1.0, 1.0).acos().to_degrees() as f64;
+    let phi = dir.dot(c90).atan2(dir.dot(c0)).to_degrees() as f64;
     prof.intensity(gamma, phi) * lum.output_scale(prof)
 }
 
@@ -265,8 +272,10 @@ fn direct(ev: &Evaluator, point: Vec3, normal: Vec3) -> f64 {
         // treated as a point — which it now is, being `len/n` long and at least its own length
         // away. The axis is the fitting's local x, turned by its rotation, matching the convention
         // `intensity_toward` already uses for the C-planes.
-        let a = (lum.rotation_deg as f64).to_radians();
-        let axis = Vec3::new(a.cos() as f32, a.sin() as f32, 0.0);
+        // The fitting's own long axis — its C0 direction, which tips with it. A batten aimed at a
+        // wall is still a batten lying along its own length, so the pieces have to follow the
+        // body and not stay flat on the ceiling.
+        let (_, axis, _) = lum.frame();
         for k in 0..n {
             // Piece centres, spread symmetrically about the fitting's own centre.
             let t = (k as f64 + 0.5) / n as f64 - 0.5;
@@ -501,7 +510,7 @@ mod tests {
         let meshes = extrude::box_room(w, d, h);
         let mut profiles = HashMap::new();
         profiles.insert("flat".into(), flat_1000cd());
-        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None, from_block: None }];
+        let lums = vec![Luminaire { id: 1, profile: "flat".into(), position: Vertex::new(w / 2.0, d / 2.0, h), rotation_deg: 0.0, tilt_deg: 0.0, dimming: 1.0, watts_override: None, flux_override: None, from_block: None }];
         let plane = CalcPlane { origin: Vertex::new(0.0, 0.0, 0.0), width: w, depth: d, cols: 24, rows: 24 };
         (meshes, profiles, lums, plane, RaySettings { rays_per_point: 64, max_bounces: bounces, shadows: true })
     }
@@ -646,6 +655,7 @@ mod tests {
             profile: "iso".into(),
             position: Vertex::new(w / 2.0, d / 2.0, h / 2.0), // centred, so nothing self-shadows
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -741,6 +751,7 @@ mod tests {
             profile: "iso".into(),
             position: Vertex::new(0.0, 0.0, 0.0),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -1244,6 +1255,7 @@ mod surface_tests {
             profile: "iso".into(),
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -1610,6 +1622,7 @@ mod a_luminaire_is_not_a_point {
             profile: "linear".into(),
             position: at,
             rotation_deg,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -1773,3 +1786,168 @@ mod a_luminaire_is_not_a_point {
     }
 }
 
+
+/// AIMING A LUMINAIRE.
+///
+/// Asked for as: *"in the luminaries tab i want a aim tool, the use of the tool will be to aim the
+/// light to a point… while aiming the light stays at the same height and at the same location, its
+/// place where its pointed downward is what we are changing."*
+///
+/// A luminaire had only an azimuth, and the engine read the photometric angles straight off the
+/// world axes — so a fitting could be turned about its own axis and could not be aimed at all.
+/// Aiming without a tilt would spin a spot on the spot and change no figure on the page.
+#[cfg(test)]
+mod a_luminaire_can_be_aimed {
+    use super::*;
+    use crate::ies::PhotometryType;
+    use crate::types::default_materials;
+
+    /// A NARROW BEAM, 20° to the half-angle — the case aiming exists for. A wide distribution
+    /// would move so little under a tilt that a test could not tell a working aim from a broken
+    /// one.
+    fn spot() -> IesProfile {
+        let va: Vec<f64> = (0..=90).map(|d| d as f64).collect();
+        let cd: Vec<f64> = va.iter().map(|g| if *g <= 20.0 { 10_000.0 } else { 0.0 }).collect();
+        IesProfile {
+            manufacturer: String::new(),
+            catalogue: String::new(),
+            lamp: String::new(),
+            name: "spot".into(),
+            photometry: PhotometryType::C,
+            lumens: -1.0,
+            multiplier: 1.0,
+            vertical_angles: va,
+            horizontal_angles: vec![0.0],
+            candela: vec![cd],
+            watts: 0.0,
+            width: 0.0,
+            length: 0.0,
+            height: 0.0,
+            luminous_length: 0.0,
+            luminous_width: 0.0,
+        }
+    }
+
+    fn fixture(rotation_deg: f32, tilt_deg: f32) -> Luminaire {
+        Luminaire {
+            id: 1,
+            profile: "spot".into(),
+            position: Vertex::new(0.0, 0.0, 3.0),
+            rotation_deg,
+            tilt_deg,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }
+    }
+
+    /// Direct illuminance on the floor at `p`, from one fitting, in free space.
+    fn lit(l: &Luminaire, p: Vec3) -> f64 {
+        let mut profiles = HashMap::new();
+        profiles.insert("spot".to_string(), spot());
+        let lums = vec![l.clone()];
+        let s = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+        let mats = default_materials();
+        Evaluator::new(&[], &lums, &profiles, &mats, s, Maintenance::INITIAL).illuminance(p, Vec3::Z)
+    }
+
+    /// UNTILTED, NOTHING CHANGED. The property that keeps every existing project's numbers: the
+    /// frame reduces to what the engine assumed before it had one.
+    #[test]
+    fn a_fitting_pointing_down_is_unaffected() {
+        let l = fixture(0.0, 0.0);
+        let (aim, c0, _) = l.frame();
+        assert!((aim - Vec3::new(0.0, 0.0, -1.0)).length() < 1e-6, "aim is {aim:?}");
+        assert!((c0 - Vec3::X).length() < 1e-6, "c0 is {c0:?}");
+        // Straight beneath it is lit; well outside the 20° cone is not.
+        assert!(lit(&l, Vec3::ZERO) > 100.0);
+        assert!(lit(&l, Vec3::new(4.0, 0.0, 0.0)) < 1.0);
+    }
+
+    /// AIMED, THE LIGHT MOVES AND THE FITTING DOES NOT.
+    #[test]
+    fn aiming_moves_the_beam_and_not_the_fitting() {
+        let mut l = fixture(0.0, 0.0);
+        let before = l.position;
+        let target = Vec3::new(2.0, 0.0, 0.0); // 2 m along +x, on the floor
+
+        assert!(lit(&l, target) < 1.0, "the target starts outside the beam");
+        assert!(l.aim_at(target), "the aim was refused");
+        assert!(lit(&l, target) > 100.0, "the target is not lit after aiming at it");
+        assert!(lit(&l, Vec3::ZERO) < 1.0, "the beam did not leave where it was");
+
+        assert_eq!(
+            (before.x, before.y, before.z),
+            (l.position.x, l.position.y, l.position.z),
+            "the fitting moved; aiming must change only the direction",
+        );
+        // 2 m across, 3 m down: 33.7° from vertical, toward +x.
+        assert!((l.tilt_deg - 33.69).abs() < 0.05, "tilt {}", l.tilt_deg);
+        assert!(l.rotation_deg.abs() < 1e-3, "azimuth {}", l.rotation_deg);
+    }
+
+    /// AND IT AIMS THE RIGHT WAY ROUND. A sign slip in the frame points the beam at the mirror
+    /// image of the target — which on a symmetric room looks entirely convincing.
+    #[test]
+    fn it_aims_at_the_point_and_not_its_mirror() {
+        for target in [
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(-2.0, 0.0, 0.0),
+            Vec3::new(0.0, 2.0, 0.0),
+            Vec3::new(0.0, -2.0, 0.0),
+            Vec3::new(1.5, 1.5, 0.0),
+        ] {
+            let mut l = fixture(0.0, 0.0);
+            assert!(l.aim_at(target));
+            let there = lit(&l, target);
+            let mirrored = lit(&l, Vec3::new(-target.x, -target.y, 0.0));
+            assert!(
+                there > 100.0 && mirrored < 1.0,
+                "aimed at {target:?}: {there:.0} lx there, {mirrored:.0} lx at the mirror point",
+            );
+        }
+    }
+
+    /// A TARGET AT OR ABOVE THE FITTING IS REFUSED rather than flattened. A luminaire silently
+    /// left horizontal would look aimed and not be.
+    #[test]
+    fn a_target_that_is_not_below_is_refused() {
+        let mut l = fixture(0.0, 0.0);
+        assert!(!l.aim_at(Vec3::new(2.0, 0.0, 3.0)), "level with the fitting");
+        assert!(!l.aim_at(Vec3::new(2.0, 0.0, 5.0)), "above the fitting");
+        assert!(!l.aim_at(Vec3::new(0.0, 0.0, 3.0)), "the fitting itself");
+        assert_eq!(l.tilt_deg, 0.0, "a refused aim still moved the fitting");
+    }
+
+    /// THE C-PLANES TURN WITH IT. An asymmetric distribution aimed sideways has to carry its own
+    /// shape round with it, or aiming a batten would light the wrong axis.
+    #[test]
+    fn the_distribution_turns_with_the_fitting() {
+        // A blade: bright along C0, dark across it.
+        let mut p = spot();
+        p.horizontal_angles = vec![0.0, 90.0];
+        let va = p.vertical_angles.clone();
+        p.candela = vec![
+            va.iter().map(|g| if *g <= 40.0 { 10_000.0 } else { 0.0 }).collect(),
+            vec![0.0; va.len()],
+        ];
+
+        let mut profiles = HashMap::new();
+        profiles.insert("spot".to_string(), p);
+        let shine = |l: &Luminaire, at: Vec3| -> f64 {
+            let lums = vec![l.clone()];
+            let s = RaySettings { rays_per_point: 1, max_bounces: 0, shadows: false };
+            let mats = default_materials();
+            Evaluator::new(&[], &lums, &profiles, &mats, s, Maintenance::INITIAL)
+                .illuminance(at, Vec3::Z)
+        };
+
+        // Untilted at azimuth 0, the blade lies along x.
+        let flat = fixture(0.0, 0.0);
+        assert!(shine(&flat, Vec3::new(1.5, 0.0, 0.0)) > shine(&flat, Vec3::new(0.0, 1.5, 0.0)));
+        // Turned a quarter turn, it lies along y.
+        let turned = fixture(90.0, 0.0);
+        assert!(shine(&turned, Vec3::new(0.0, 1.5, 0.0)) > shine(&turned, Vec3::new(1.5, 0.0, 0.0)));
+    }
+}

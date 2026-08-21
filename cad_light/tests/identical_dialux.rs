@@ -168,6 +168,7 @@ fn simlux_against_dialux_on_three_fully_specified_rooms() {
                 profile: "FONDO".to_string(),
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
             .collect();
 
@@ -271,6 +272,7 @@ fn refining_the_grid_lowers_the_minimum_but_not_the_average() {
                 profile: "FONDO".to_string(),
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
             .collect();
         println!("\n=== {} — U0 vs calculation grid (DIALux says {:.3}) ===", case.name, case.u0);
@@ -375,6 +377,7 @@ fn ugr_from_the_seated_observer() {
                 profile: "FONDO".to_string(),
                 position: Vertex::new(*x, *y, MOUNT_Z),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0, watts_override: None, flux_override: None, from_block: None })
             .collect();
 

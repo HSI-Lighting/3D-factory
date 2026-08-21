@@ -944,6 +944,15 @@ pub struct LightState {
     pub auto_center_light: bool,
     /// When set, canvas clicks drop a luminaire (P4 placement mode).
     pub place_mode: bool,
+    /// THE AIM TOOL IS ARMED: the next clicks pick a fitting, then the point it should light.
+    pub aim_mode: bool,
+    /// The fitting the aim tool has picked, waiting for its target. `None` = still choosing one.
+    ///
+    /// TWO CLICKS AND A HELD ID, rather than aiming whatever happens to be selected. The selection
+    /// is what Delete and drag act on, and quietly re-aiming a dozen fittings because they were
+    /// still highlighted from an earlier gesture is not what "select a light and then click on a
+    /// point" asks for.
+    pub aim_pick: Option<u32>,
     /// Ids of the selected fixtures. Selection is what "assign a fitting", "delete" and "drag"
     /// all act on, so it is the one piece of state the whole editing flow shares.
     pub selected: Vec<u32>,
@@ -1164,6 +1173,8 @@ impl LightState {
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
+            aim_mode: false,
+            aim_pick: None,
             selected: Vec::new(),
             hover: None,
             drag: None,
@@ -1281,6 +1292,7 @@ impl LightState {
             profile: profile.clone(),
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -1649,6 +1661,7 @@ impl LightState {
                     profile: profile.clone(),
                     position: Vertex::new(x, y, z),
                     rotation_deg: 0.0,
+                    tilt_deg: 0.0,
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
@@ -2171,6 +2184,7 @@ impl LightState {
                     profile: profile.clone(),
                     position: Vertex::new(p.x, p.y, p.z),
                     rotation_deg: 0.0,
+                    tilt_deg: 0.0,
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
@@ -2489,6 +2503,7 @@ impl LightState {
                     self.room_height,
                 ),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0,
                 watts_override: None,
                 flux_override: None,
@@ -2921,7 +2936,49 @@ impl LightState {
                 {
                     self.place_mode = !placing;
                     if self.place_mode {
+                        self.aim_mode = false;
+                        self.aim_pick = None;
+                    }
+                    if self.place_mode {
                         self.last_msg = "Click the plan to mark each light position · drag a marker to move it · Esc to stop.".into();
+                    }
+                    ui.close_menu();
+                }
+                // ---- AIM ------------------------------------------------------------------
+                //
+                // "in the luminaries tab i want a aim tool, the use of the tool will be to aim the
+                // light to a point. when aim i selected the user can select a light and then click
+                // on a point where they would like to point it."
+                //
+                // Two clicks, in that order, and the fitting does not move: "while aiming the light
+                // stays at the same height and at the same location, its place where its pointed
+                // downward is what we are changing."
+                let aiming = self.aim_mode;
+                if ui
+                    .selectable_label(
+                        aiming,
+                        if aiming {
+                            match self.aim_pick {
+                                Some(_) => "◉ Aiming — click the point to aim at (Esc to stop)",
+                                None => "◉ Aiming — click a light (Esc to stop)",
+                            }
+                        } else {
+                            "⌖ Aim a light at a point"
+                        },
+                    )
+                    .on_hover_text(
+                        "Click a fitting, then click where it should point. It stays exactly where \
+                         it is — only the direction changes.",
+                    )
+                    .clicked()
+                {
+                    self.aim_mode = !aiming;
+                    self.aim_pick = None;
+                    // Both modes want the next click on the plan, and only one can have it.
+                    if self.aim_mode {
+                        self.place_mode = false;
+                        self.last_msg =
+                            "Aim: click a fitting, then click the point it should light.".into();
                     }
                     ui.close_menu();
                 }
@@ -3874,6 +3931,7 @@ mod uniformity_is_quoted_with_its_grid {
                         2.7,
                     ),
                     rotation_deg: 0.0,
+                    tilt_deg: 0.0,
                     dimming: 1.0,
                     watts_override: None,
                     flux_override: None,
@@ -3983,6 +4041,7 @@ mod uniformity_is_quoted_with_its_grid {
                 profile: BUILTIN.to_string(),
                 position: Vertex::new(x, y, 2.7),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0,
                 watts_override: None,
                 flux_override: None,
@@ -4803,6 +4862,7 @@ mod furniture_in_the_light_scene {
             profile: "p".into(),
             position: Vertex::new(3.0, 3.0, 2.9),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -5650,6 +5710,7 @@ mod reopening_relinks_fittings_to_their_blocks {
             profile: profile.to_string(),
             position: Vertex::new(0.0, 0.0, 3.0),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -5792,6 +5853,7 @@ mod every_room_is_calculated {
                 profile: BUILTIN.to_string(),
                 position: Vertex::new(cx, cy, 2.7),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0,
                 watts_override: None,
                 flux_override: None,
@@ -5872,6 +5934,7 @@ mod every_room_is_calculated {
             profile: BUILTIN.to_string(),
             position: Vertex::new(2.0, 2.0, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -5904,6 +5967,7 @@ mod every_room_is_calculated {
             profile: BUILTIN.to_string(),
             position: Vertex::new(999.0, 999.0, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -5943,6 +6007,7 @@ mod every_room_is_calculated {
             profile: BUILTIN.to_string(),
             position: Vertex::new(2.0, 2.0, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -5989,6 +6054,7 @@ mod the_calculation_can_leave_the_ui_thread {
             profile: BUILTIN.to_string(),
             position: Vertex::new(3.0, 2.5, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,
@@ -6159,6 +6225,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
             profile: BUILTIN.to_string(),
             position: Vertex::new(3.0, 2.5, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,

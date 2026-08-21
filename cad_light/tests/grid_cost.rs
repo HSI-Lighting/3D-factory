@@ -30,6 +30,7 @@ fn gym(cols: u32, rows: u32) -> (Vec<Mesh>, Vec<Luminaire>, HashMap<String, IesP
                     h - 0.2,
                 ),
                 rotation_deg: 0.0,
+                tilt_deg: 0.0,
                 dimming: 1.0,
                 from_block: None,
                 flux_override: None,

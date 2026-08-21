@@ -4696,9 +4696,11 @@ impl CadApp {
         }
         if let Some(id) = act.place {
             self.light.place_fitting = Some(id);
-            // The two placement modes are mutually exclusive: a click cannot both drop a bare
-            // point and insert a block, and leaving the old one armed would do both.
+            // The placement and aiming modes are mutually exclusive: a click cannot drop a bare
+            // point, insert a block AND aim something, and leaving another armed would try.
             self.light.place_mode = false;
+            self.light.aim_mode = false;
+            self.light.aim_pick = None;
             let what = self.light.library.get(id).map(|f| f.name.clone()).unwrap_or_default();
             self.light.last_msg = format!("Placing \"{what}\" — click the plan. Esc stops.");
         }
@@ -5425,6 +5427,16 @@ impl CadApp {
         // ---- press: grab a marker, or drop a new point ----
         if ctx.input(|i| i.pointer.primary_pressed()) && over_canvas {
             if let Some((x, y)) = at {
+                // THE AIM TOOL OWNS THE CLICK WHILE IT IS ARMED, both halves of it.
+                //
+                // Before selection, before placement, before the drafting canvas: a tool somebody
+                // deliberately switched on has to be what answers the next click, or the first
+                // click picks a fitting and the second drags it somewhere.
+                if self.light.aim_mode {
+                    self.aim_click(x, y, tol);
+                    self.light_gesture = true;
+                    return true;
+                }
                 let additive = ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl);
                 if let Some(id) = self.light.pick_at(x, y, tol) {
                     if additive {
@@ -5491,7 +5503,14 @@ impl CadApp {
         // focused.
         let typing = self.typing_in_a_field();
         if !typing && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.light.place_fitting.is_some() {
+            if self.light.aim_mode {
+                // FIRST, because it is the mode most likely to be on by mistake — it stays armed
+                // between fittings so a run can be aimed without re-arming, which also means it
+                // outlives the moment somebody stops thinking about it.
+                self.light.aim_mode = false;
+                self.light.aim_pick = None;
+                self.light.last_msg = "Stopped aiming.".into();
+            } else if self.light.place_fitting.is_some() {
                 self.light.place_fitting = None;
                 self.light.last_msg = "Stopped placing.".into();
             } else if self.light.place_mode {
@@ -31062,6 +31081,80 @@ impl CadApp {
         }
     }
 
+
+    /// One click of the aim tool: pick a fitting, then pick where it should point.
+    ///
+    /// Asked for as: *"in the luminaries tab i want a aim tool… when aim i selected the user can
+    /// select a light and then click on a point where they would like to point it."*
+    ///
+    /// THE FITTING DOES NOT MOVE. "while aiming the light stays at the same height and at the same
+    /// location, its place where its pointed downward is what we are changing" — so this writes the
+    /// pose and never the position.
+    ///
+    /// THE TARGET IS ON THE WORKING PLANE. A click on a plan gives an x and a y and no height at
+    /// all, and the working plane is the one surface such a click unambiguously names: it is the
+    /// plane the whole calculation is about and the one the false colours on screen belong to.
+    /// Aiming at a wall wants a height as well, which is a box to add when somebody needs it — not
+    /// a number to guess at now.
+    fn aim_click(&mut self, x: f32, y: f32, tol: f32) {
+        match self.light.aim_pick {
+            // ---- second click: the target -------------------------------------------------
+            Some(id) => {
+                let z = self.light.plane_height;
+                let Some(l) = self.light.luminaires.iter().find(|l| l.id == id) else {
+                    self.light.aim_pick = None;
+                    return;
+                };
+                // A fitting is aimed DOWNWARD, and a target at or above it has no such pose. Said
+                // rather than clamped: a light silently left flat would look aimed and not be.
+                if l.position.z <= z + 1e-3 {
+                    self.light.last_msg = format!(
+                        "Fitting #{id} is at {:.2} m, at or below the working plane at {z:.2} m — \
+                         nothing below it to aim at.",
+                        l.position.z,
+                    );
+                    self.light.aim_pick = None;
+                    return;
+                }
+                self.snapshot_doc_and_lights();
+                let target = glam::Vec3::new(x, y, z);
+                let mut done = false;
+                if let Some(l) = self.light.luminaires.iter_mut().find(|l| l.id == id) {
+                    done = l.aim_at(target);
+                }
+                if done {
+                    let l = self
+                        .light
+                        .luminaires
+                        .iter()
+                        .find(|l| l.id == id)
+                        .expect("just aimed it");
+                    self.light.last_msg = format!(
+                        "Fitting #{id} aimed at ({x:.2}, {y:.2}) — {:.0}° from vertical, toward \
+                         {:.0}°. Click another fitting, or Esc to stop.",
+                        l.tilt_deg, l.rotation_deg,
+                    );
+                    self.touch_view();
+                }
+                // Ready for the next one, so a run of fittings can be aimed without re-arming.
+                self.light.aim_pick = None;
+            }
+            // ---- first click: which fitting -------------------------------------------------
+            None => match self.light.pick_at(x, y, tol) {
+                Some(id) => {
+                    self.light.aim_pick = Some(id);
+                    // Selected as well, so the panel's parameters are about the one being aimed.
+                    self.light.selected = vec![id];
+                    self.light.last_msg =
+                        format!("Fitting #{id} — now click the point it should light.");
+                }
+                None => {
+                    self.light.last_msg =
+                        "No fitting there. Click a marker to pick the light to aim.".into();
+                }
+            },
+        }
+    }
     /// Start dragging a fixture, and take its SYMBOL along.
     ///
     /// Reported as: dragging a fixture moves the light but not its symbol. It did — `from_block`
@@ -62746,6 +62839,106 @@ mod fixtures_are_undoable {
         let mut fresh = crate::light::LightState::new();
         fresh.apply_config(cfg, &app.doc);
         assert_eq!(fresh.symbol_of.get(&id), Some(&handle), "the link did not come back");
+    }
+
+    /// THE AIM TOOL IS TWO CLICKS: a fitting, then the point it should light.
+    ///
+    /// Asked for as "when aim i selected the user can select a light and then click on a point
+    /// where they would like to point it".
+    #[test]
+    fn aiming_takes_a_fitting_then_a_target() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        app.light.plane_height = 0.8;
+        let id = placed(&mut app, (1.0, 1.0));
+        app.light.luminaires[0].position.z = 3.0;
+        app.light.aim_mode = true;
+
+        // First click: on the marker.
+        app.aim_click(1.0, 1.0, 0.5);
+        assert_eq!(app.light.aim_pick, Some(id), "the first click did not pick the fitting");
+        assert_eq!(app.light.selected, vec![id], "and it should be selected while being aimed");
+
+        // Second click: three metres away.
+        app.aim_click(4.0, 1.0, 0.5);
+        assert_eq!(app.light.aim_pick, None, "the tool did not come back for the next fitting");
+        let l = &app.light.luminaires[0];
+        assert!(
+            (l.position.x - 1.0).abs() < 1e-5 && (l.position.z - 3.0).abs() < 1e-5,
+            "the fitting moved to ({}, {}, {})",
+            l.position.x,
+            l.position.y,
+            l.position.z,
+        );
+        // 3 m across, 2.2 m down to the working plane: 53.7° from vertical, toward +x.
+        assert!((l.tilt_deg - 53.75).abs() < 0.2, "tilt is {}", l.tilt_deg);
+        assert!(l.rotation_deg.abs() < 1e-3, "azimuth is {}", l.rotation_deg);
+        assert!(app.light.aim_mode, "the tool disarmed itself after one fitting");
+    }
+
+    /// A FIRST CLICK ON EMPTY PLAN PICKS NOTHING, and says so rather than aiming whatever was
+    /// selected earlier.
+    #[test]
+    fn aiming_needs_a_fitting_under_the_first_click() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        let id = placed(&mut app, (1.0, 1.0));
+        app.light.select(id, false);
+        app.light.aim_mode = true;
+
+        app.aim_click(20.0, 20.0, 0.5);
+        assert_eq!(app.light.aim_pick, None, "it picked a fitting that was not there");
+        assert!(app.light.last_msg.contains("No fitting"), "{:?}", app.light.last_msg);
+        assert_eq!(app.light.luminaires[0].tilt_deg, 0.0, "a fitting was aimed by an empty click");
+    }
+
+    /// AND AIMING PUTS THE RESULT OUT OF DATE.
+    ///
+    /// Aiming changes where the light goes, so it changes the answer — which is the whole reason
+    /// for adding tilt rather than only turning the fitting on its axis.
+    #[test]
+    fn aiming_a_fitting_puts_the_result_out_of_date() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        app.light.plane_height = 0.8;
+        placed(&mut app, (1.0, 1.0));
+        app.light.luminaires[0].position.z = 3.0;
+
+        let plan = app.plan_doc().clone();
+        let fp = app.light.current_fingerprint(&plan, Some(&app.factory)).expect("a fingerprint");
+        app.light.results_fingerprint = Some(fp);
+        app.light.results_stale = false;
+
+        app.light.aim_mode = true;
+        app.aim_click(1.0, 1.0, 0.5);
+        app.aim_click(5.0, 2.0, 0.5);
+
+        app.light.stale_checked = None;
+        let plan = app.plan_doc().clone();
+        app.light.refresh_staleness(&plan, Some(&app.factory));
+        assert!(
+            app.light.results_stale,
+            "a fitting was aimed somewhere else and the answer still claimed to be current",
+        );
+    }
+
+    /// THE TILT SURVIVES A SAVE AND A REOPEN. An aim that came back pointing at the floor would be
+    /// a silent loss of the whole scheme's aiming.
+    #[test]
+    fn an_aimed_fitting_is_saved_aimed() {
+        let mut app = CadApp::default();
+        app.doc.units.metres_per_unit = 1.0;
+        placed(&mut app, (1.0, 1.0));
+        app.light.luminaires[0].position.z = 3.0;
+        app.light.luminaires[0].tilt_deg = 27.5;
+        app.light.luminaires[0].rotation_deg = 61.0;
+
+        let cfg = app.light.to_config(&app.doc);
+        let mut fresh = crate::light::LightState::new();
+        fresh.apply_config(cfg, &app.doc);
+        let l = &fresh.luminaires[0];
+        assert!((l.tilt_deg - 27.5).abs() < 1e-4, "the tilt came back as {}", l.tilt_deg);
+        assert!((l.rotation_deg - 61.0).abs() < 1e-4, "the azimuth came back as {}", l.rotation_deg);
     }
 
     /// TWO FIXTURES ON THE SAME SPOT TAKE TWO DIFFERENT SYMBOLS.

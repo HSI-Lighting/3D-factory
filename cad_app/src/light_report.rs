@@ -1013,6 +1013,7 @@ mod the_html_carries_the_same_sections_as_the_pdf {
             profile: "OCULUS".into(),
             position: cad_light::Vertex::new(x, y, 2.7),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0,
             watts_override: None,
             flux_override: None,

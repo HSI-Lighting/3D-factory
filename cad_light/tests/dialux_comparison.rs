@@ -161,6 +161,7 @@ fn layout(profiles: &HashMap<String, IesProfile>) -> Vec<Luminaire> {
             profile: profile.to_string(),
             position: Vertex::new(x, y, z),
             rotation_deg: 0.0,
+            tilt_deg: 0.0,
             dimming: 1.0, watts_override: None, flux_override: None, from_block: None });
     };
 
