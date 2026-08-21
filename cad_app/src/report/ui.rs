@@ -302,6 +302,58 @@ pub fn window_ui(
                         // THE SAME EDITOR THE SIMLUX WINDOW SHOWS — see `scale_editor_ui`.
                         scale_editor_ui(ui, opt, room_max, ramp);
 
+                        // ---- TEXT SIZE ----------------------------------------------------
+                        //
+                        // Asked for as: *"for the report i want font size controls."* ONE number
+                        // for the whole document: the report has six type sizes and they are a
+                        // hierarchy — cover over chapter over heading over row over note — which is
+                        // what a reader navigates by. Six independent boxes is six chances to end
+                        // up with a heading smaller than its body text.
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Text size").strong());
+                        ui.horizontal(|ui| {
+                            let mut pct = opt.text_scale * 100.0;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut pct)
+                                        .update_while_editing(false)
+                                        .speed(1.0)
+                                        .suffix(" %")
+                                        .range(
+                                            super::options::TEXT_SCALE_MIN * 100.0
+                                                ..=super::options::TEXT_SCALE_MAX * 100.0,
+                                        ),
+                                )
+                                .on_hover_text(
+                                    "Scales every size in the report together — headings, tables, \
+                                     notes and the labels on the drawings. The drawings themselves \
+                                     stay at their stated scale.",
+                                )
+                                .changed()
+                            {
+                                opt.text_scale = pct / 100.0;
+                            }
+                            if ui
+                                .small_button("reset")
+                                .on_hover_text("Back to the report as designed")
+                                .clicked()
+                            {
+                                opt.text_scale = 1.0;
+                            }
+                        });
+                        // WHAT THE NUMBER MEANS IN POINTS, because a percentage is not something a
+                        // print shop or a client specification talks in.
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "body {:.1} pt · headings {:.1} pt · notes {:.1} pt",
+                                9.0 * opt.text_scale,
+                                12.0 * opt.text_scale,
+                                8.0 * opt.text_scale,
+                            ))
+                            .small()
+                            .weak(),
+                        );
+
                         ui.add_space(8.0);
                         ui.label(egui::RichText::new("Header & footer").strong());
                         ui.add(

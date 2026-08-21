@@ -307,6 +307,17 @@ struct Cursor {
     /// a room's three pages line up with each other as well as with the other rooms. A room half
     /// the size draws half the size. It is stated on each drawing, so nobody has to infer it.
     scale: f64,
+    /// EVERY TEXT SIZE IN THE REPORT, MULTIPLIED BY THIS.
+    ///
+    /// Asked for as: *"for the report i want font size controls."* One number for the whole
+    /// document, so the hierarchy a reader navigates by — cover over chapter over heading over row
+    /// over note — survives being made bigger or smaller. Applied in `push`, which is the single
+    /// point every piece of text goes through, and in `lh` for the spacing that has to move with
+    /// it.
+    ///
+    /// NOT the drawings THEMSELVES. Their annotations scale, because those are text; the plans do
+    /// not, because they are at a stated 1:100 and a scale bar that lies is worse than small type.
+    text_scale: f64,
 }
 
 /// The scale every drawing in the report is set at, points per metre.
@@ -363,6 +374,8 @@ impl Cursor {
             // Replaced by `layout` once it has seen the rooms; a cursor built for anything else
             // draws nothing scaled.
             scale: 1.0,
+            // …and likewise: `layout` sets this from the options.
+            text_scale: 1.0,
         }
     }
 
@@ -394,8 +407,49 @@ impl Cursor {
         }
     }
 
+    /// THE ONE PLACE A TEXT SIZE IS DECIDED.
+    ///
+    /// Asked for as: *"for the report i want font size controls."* Every size in this file stays
+    /// written as the point size it is at 100%, and the multiply happens HERE — because a scale
+    /// applied at each of the twenty-odd places text is emitted is a scale somebody will forget at
+    /// the twenty-first, and the symptom is one line of a report that does not grow with the rest.
+    ///
+    /// It follows that `text()` must NOT scale as well, or every size comes out squared.
+    ///
+    /// ONE KIND OF TEXT IS EXEMPT, through [`push_unscaled`](Self::push_unscaled).
     fn push(&mut self, it: Item) {
+        let it = match it {
+            Item::Text { x, y, size, font, rgb, align, text } => {
+                Item::Text { x, y, size: size * self.text_scale, font, rgb, align, text }
+            }
+            other => other,
+        };
         self.page.items.push(it);
+    }
+
+    /// TEXT WHOSE SIZE IS DICTATED BY THE GEOMETRY IT SITS IN, and so must not be scaled.
+    ///
+    /// There is exactly one: the point values printed inside the cells of the results field. Their
+    /// size is computed from the cell — `(cell · 0.26).clamp(4, 8)` — because it has to FIT the
+    /// cell, and a value that overflows its cell collides with its neighbours and stops being
+    /// readable at all. Enlarging it by the report's text control would defeat the only rule it
+    /// has.
+    ///
+    /// That is the same argument the drawings themselves are exempt under, and it is the reason
+    /// this is a named door rather than an `if` inside `push`: an exemption you have to ask for by
+    /// name cannot be granted by accident.
+    fn push_unscaled(&mut self, it: Item) {
+        self.page.items.push(it);
+    }
+
+    /// A vertical step that exists to make room for TEXT, scaled with it.
+    ///
+    /// The sizes and the spacings in this file were written as one set of numbers and only look
+    /// independent: `row` advances 10 pt because its text is 9 pt. Grow the type without growing
+    /// the rhythm and the lines collide. Geometry — a plot's width, a logo box — goes nowhere near
+    /// this: the drawings are at a stated 1:100 and must not move.
+    fn lh(&self, v: f64) -> f64 {
+        v * self.text_scale
     }
 
     fn text(&mut self, x: f64, size: f64, font: Font, align: Align, rgb: [u8; 3], s: &str) {
@@ -404,31 +458,31 @@ impl Cursor {
 
     /// A section heading, with the rule under it.
     fn heading(&mut self, s: &str) {
-        self.need(40.0);
-        self.y += 14.0;
+        self.need(self.lh(40.0));
+        self.y += self.lh(14.0);
         self.text(self.left, 12.0, Font::Bold, Align::Left, INK, s);
-        self.y += 5.0;
+        self.y += self.lh(5.0);
         let (l, r, y) = (self.left, self.right, self.y);
         self.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: RULE, width: 0.6 });
-        self.y += 14.0;
+        self.y += self.lh(14.0);
     }
 
     /// A label on the left and a value on the right — the shape every figure in this report takes.
     fn row(&mut self, k: &str, v: &str) {
-        self.need(16.0);
-        self.y += 10.0;
+        self.need(self.lh(16.0));
+        self.y += self.lh(10.0);
         self.text(self.left, 9.0, Font::Regular, Align::Left, INK, k);
         self.text(self.right, 9.0, Font::Regular, Align::Right, INK, v);
-        self.y += 4.0;
+        self.y += self.lh(4.0);
         let (l, r, y) = (self.left, self.right, self.y);
         self.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [235, 235, 235], width: 0.4 });
     }
 
     fn note(&mut self, s: &str) {
-        self.need(14.0);
-        self.y += 11.0;
+        self.need(self.lh(14.0));
+        self.y += self.lh(11.0);
         self.text(self.left, 8.0, Font::Regular, Align::Left, FAINT, s);
-        self.y += 2.0;
+        self.y += self.lh(2.0);
     }
 
     fn finish(mut self) -> Vec<Page> {
@@ -487,6 +541,14 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
     let mut c = Cursor::new(w, h, has_head, has_foot);
     // Chosen before anything is drawn, from every room at once — see `Cursor::scale`.
     c.scale = common_scale(inp, w, h);
+    c.text_scale = opt.text_scale.clamp(
+        crate::report::options::TEXT_SCALE_MIN,
+        crate::report::options::TEXT_SCALE_MAX,
+    );
+    // The running header and footer are stamped onto finished pages further down, outside the
+    // cursor, so they scale by hand like the cover does. Their band is 34 pt deep for 8 pt type, so
+    // there is room for this without moving the content box.
+    let ts = c.text_scale;
     // A CHAPTER PER ROOM, then the building-wide sections once.
     //
     // Three rooms used to come out as one plot with a bounding box round them, because a
@@ -559,7 +621,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
             p.items.push(Item::Text {
                 x: MARGIN,
                 y: MARGIN + 8.0,
-                size: 8.0,
+                size: 8.0 * ts,
                 font: Font::Regular,
                 rgb: FAINT,
                 align: Align::Left,
@@ -588,7 +650,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
                 p.items.push(Item::Text {
                     x: MARGIN,
                     y: fy,
-                    size: 8.0,
+                    size: 8.0 * ts,
                     font: Font::Regular,
                     rgb: FAINT,
                     align: Align::Left,
@@ -611,7 +673,7 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
                 p.items.push(Item::Text {
                     x: w - MARGIN,
                     y: fy,
-                    size: 8.0,
+                    size: 8.0 * ts,
                     font: Font::Regular,
                     rgb: FAINT,
                     align: Align::Right,
@@ -624,7 +686,15 @@ pub fn layout(inp: &Input, opt: &Options) -> Doc {
 }
 
 /// The title page.
+/// THE COVER BUILDS ITS OWN PAGE, so it does not pass through `Cursor::push` and does not get the
+/// text scale for free. It applies it by hand, and that is not a wart to tidy away later — it is
+/// the exact failure the comment on `push` predicted, caught on the first run: a 26 pt cover title
+/// sitting unchanged over a report set at 140%.
 fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usize) -> Page {
+    let ts = opt.text_scale.clamp(
+        crate::report::options::TEXT_SCALE_MIN,
+        crate::report::options::TEXT_SCALE_MAX,
+    );
     let mut p = Page::default();
     let mut y = h * 0.34;
 
@@ -652,7 +722,7 @@ fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usiz
     p.items.push(Item::Text {
         x: w * 0.5,
         y,
-        size: 26.0,
+        size: 26.0 * ts,
         font: Font::Bold,
         rgb: INK,
         align: Align::Centre,
@@ -663,7 +733,7 @@ fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usiz
         p.items.push(Item::Text {
             x: w * 0.5,
             y,
-            size: 12.0,
+            size: 12.0 * ts,
             font: Font::Regular,
             rgb: [80, 80, 80],
             align: Align::Centre,
@@ -682,7 +752,7 @@ fn cover(inp: &Input, opt: &Options, w: f64, h: f64, doc: &Doc, cover_base: usiz
     p.items.push(Item::Text {
         x: w * 0.5,
         y: h - MARGIN - 18.0,
-        size: 8.0,
+        size: 8.0 * ts,
         font: Font::Regular,
         rgb: FAINT,
         align: Align::Centre,
@@ -748,16 +818,16 @@ fn is_per_room(s: Section) -> bool {
 /// A room's chapter heading — only when there is more than one, or it is noise on a single-room
 /// report that already says which room it is about on the cover.
 fn chapter(c: &mut Cursor, name: &str) {
-    c.need_or_break(60.0);
+    c.need_or_break(c.lh(60.0));
     if !c.page.items.is_empty() {
         c.brk();
     }
-    c.y += 8.0;
+    c.y += c.lh(8.0);
     c.text(c.left, 17.0, Font::Bold, Align::Left, INK, name);
-    c.y += 7.0;
+    c.y += c.lh(7.0);
     let (l, r, y) = (c.left, c.right, c.y);
     c.push(Item::Line { x1: l, y1: y, x2: r, y2: y, rgb: [120, 120, 120], width: 1.2 });
-    c.y += 10.0;
+    c.y += c.lh(10.0);
 }
 
 fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
@@ -1336,7 +1406,8 @@ fn results_body(
                 // Black on light, white on dark — a fixed ink colour is unreadable over half the
                 // ramp, and these exist to be read.
                 let lum = 0.299 * fill[0] as f64 + 0.587 * fill[1] as f64 + 0.114 * fill[2] as f64;
-                c.push(Item::Text {
+                // UNSCALED — see `Cursor::push_unscaled`. This size exists to fit the cell.
+                c.push_unscaled(Item::Text {
                     x: x0 + (i as f64 + 0.5) * cell_w,
                     // Flipped with the field above it, or the numbers would describe the mirror
                     // image of the picture they are printed on.
@@ -4579,5 +4650,239 @@ mod objects_are_not_painted_as_darkness {
             !texts(&d).iter().any(|s| s.contains("inside objects standing")),
             "an empty room was given the object note",
         );
+    }
+}
+
+/// ONE NUMBER SETS EVERY TYPE SIZE IN THE REPORT.
+///
+/// Asked for as: *"for the report i want font size controls."* One control rather than six,
+/// because the report's sizes are a HIERARCHY — cover over chapter over heading over row over note
+/// — and that hierarchy is what a reader navigates by.
+#[cfg(test)]
+mod the_text_size_control {
+    use super::tests::*;
+    use super::*;
+
+    /// A grid too fine for point values, so every piece of text on the page is the document's own.
+    fn doc_at(scale: f64) -> Doc {
+        let (g, p) = (grid(48, 36), plane());
+        let mut o = Options::default();
+        o.text_scale = scale;
+        layout(&input(&g, &p), &o)
+    }
+
+    /// …and a coarse one, where the values ARE printed in their cells.
+    pub(super) fn doc_with_point_values(scale: f64) -> Doc {
+        let (g, p) = (grid(8, 6), plane());
+        let mut o = Options::default();
+        o.text_scale = scale;
+        layout(&input(&g, &p), &o)
+    }
+
+    fn text_items(d: &Doc) -> Vec<(f64, f64, String)> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { size, y, text, .. } => Some((*size, *y, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// EVERY SIZE MOVES, AND BY THE SAME FACTOR. A control that scaled most of the report and left
+    /// one heading behind would be worse than none — the odd size out reads as a mistake.
+    ///
+    /// ON A GRID TOO FINE FOR POINT VALUES, deliberately. Those are the one exempt text in the
+    /// report — their size is computed to FIT a grid cell, so scaling them would defeat the only
+    /// rule they have — and this test is about the document's own type. `the_point_values_stay_the
+    /// _size_that_fits_their_cell` is where the exemption itself is pinned. The first version of
+    /// this test used a coarse grid, caught the exempt size, and failed for a reason that was not a
+    /// defect: 6.44 pt is a cell measurement, not a typographic choice.
+    #[test]
+    fn every_size_in_the_document_scales_together() {
+        let k = 1.4;
+        let base = text_items(&doc_at(1.0));
+        let big = text_items(&doc_at(k));
+        assert!(base.len() > 20, "the fixture is too small to say anything: {} items", base.len());
+
+        let distinct = |v: &[(f64, f64, String)]| {
+            let mut s: Vec<i64> = v.iter().map(|(sz, _, _)| (sz * 1000.0).round() as i64).collect();
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
+        let a = distinct(&base);
+        let b = distinct(&big);
+        assert!(a.len() >= 4, "the report should use at least four sizes; found {a:?}");
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "scaling changed how many DISTINCT sizes the report uses — {a:?} became {b:?}, so some \
+             sizes moved and others did not",
+        );
+        for (x, y) in a.iter().zip(&b) {
+            let want = (*x as f64 * k).round() as i64;
+            assert!(
+                (want - *y).abs() <= 2,
+                "a size of {:.2} pt should become {:.2} at {k}x, but came out {:.2}",
+                *x as f64 / 1000.0,
+                want as f64 / 1000.0,
+                *y as f64 / 1000.0,
+            );
+        }
+    }
+
+    /// AND THE SPACING MOVES WITH IT. The sizes and the vertical rhythm in this file were written
+    /// as one set of numbers; grow the type and leave the rhythm and the lines collide.
+    #[test]
+    fn the_rows_get_further_apart_as_the_type_grows() {
+        let gap = |scale: f64| -> f64 {
+            let d = doc_at(scale);
+            // EVERY page, not page zero — which is the cover and carries no table rows at all.
+            // Consecutive rows are the tightest spacing in the report and so the first thing to
+            // collide.
+            let ys: Vec<f64> = d
+                .pages
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .filter_map(|i| match i {
+                    Item::Text { size, y, .. } if (*size - 9.0 * scale).abs() < 0.2 => Some(*y),
+                    _ => None,
+                })
+                .collect();
+            let mut steps: Vec<f64> = ys.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 1.0).collect();
+            steps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert!(!steps.is_empty(), "no row spacing to measure at {scale}x");
+            steps[steps.len() / 2]
+        };
+        let (small, large) = (gap(1.0), gap(1.4));
+        assert!(
+            large > small * 1.25,
+            "rows are {small:.2} pt apart at 100% and {large:.2} pt at 140% — the spacing did not \
+             follow the type, so the lines will run into each other",
+        );
+    }
+
+    /// THE DRAWINGS DO NOT SCALE. Their labels do — those are text — but the plans are at a stated
+    /// ratio, and a scale note that no longer matches the drawing under it is worse than small type.
+    #[test]
+    fn the_drawings_keep_their_stated_scale() {
+        let width_of_biggest_poly = |scale: f64| -> f64 {
+            let d = doc_at(scale);
+            d.pages
+                .iter()
+                .flat_map(|p| p.items.iter())
+                .filter_map(|i| match i {
+                    Item::Poly { rings, .. } => rings.first().map(|r| {
+                        let xs: Vec<f64> = r.iter().map(|(x, _)| *x).collect();
+                        xs.iter().cloned().fold(f64::MIN, f64::max)
+                            - xs.iter().cloned().fold(f64::MAX, f64::min)
+                    }),
+                    _ => None,
+                })
+                .fold(0.0_f64, f64::max)
+        };
+        let (a, b) = (width_of_biggest_poly(1.0), width_of_biggest_poly(1.4));
+        assert!(a > 1.0, "no drawing in the fixture to measure");
+        assert!(
+            (a - b).abs() < 0.01,
+            "the plan is {a:.2} pt wide at 100% text and {b:.2} pt at 140% — the drawing moved with \
+             the type, so its stated scale is now a lie",
+        );
+        // …and the note that states it says the same thing.
+        let note_at = |scale: f64| -> Vec<String> {
+            text_items(&doc_at(scale))
+                .into_iter()
+                .map(|(_, _, t)| t)
+                .filter(|t| t.contains("1:"))
+                .collect()
+        };
+        assert_eq!(note_at(1.0), note_at(1.4), "the stated drawing scale changed with the type size");
+    }
+
+    /// AN ABSURD SETTING IS CLAMPED rather than producing a document nobody can use. The dialog
+    /// bounds it, but a settings file is a text file somebody can edit.
+    #[test]
+    fn a_setting_from_outside_the_dialog_is_still_bounded() {
+        for absurd in [0.0, -3.0, 40.0, f64::INFINITY] {
+            let sizes: Vec<f64> = text_items(&doc_at(absurd)).into_iter().map(|(s, _, _)| s).collect();
+            assert!(!sizes.is_empty(), "a text_scale of {absurd} produced no text at all");
+            for s in sizes {
+                assert!(
+                    s.is_finite() && s > 3.0 && s < 80.0,
+                    "a text_scale of {absurd} produced a {s} pt size",
+                );
+            }
+        }
+    }
+
+    /// AND THE DEFAULT CHANGES NOTHING. Every report written before this existed must come out
+    /// exactly as it did.
+    #[test]
+    fn the_default_is_the_report_as_it_was() {
+        assert_eq!(Options::default().text_scale, 1.0);
+        let d = doc_at(1.0);
+        let sizes: Vec<i64> =
+            text_items(&d).into_iter().map(|(s, _, _)| (s * 100.0).round() as i64).collect();
+        // The sizes the report is designed at, unrounded and unscaled.
+        assert!(sizes.contains(&900), "the 9 pt table row is missing at 100%: {sizes:?}");
+        assert!(sizes.contains(&1200), "the 12 pt heading is missing at 100%");
+        assert!(sizes.contains(&800), "the 8 pt note is missing at 100%");
+    }
+}
+
+/// THE ONE TEXT THE SIZE CONTROL MUST NOT TOUCH.
+#[cfg(test)]
+mod the_point_values_keep_fitting_their_cells {
+    use super::the_text_size_control::*;
+    use super::*;
+
+    /// The sizes of the numbers printed inside the grid cells.
+    ///
+    /// SELECTED BY INK, NOT BY SIZE. The first version of this filter took integer text under
+    /// 10 pt — and the legend's band labels are integers too, so at 150% they crossed the 10 pt
+    /// line and dropped out of the sample. A filter whose criterion moves with the thing under
+    /// test measures nothing. A point value is the only text drawn in near-black or near-white,
+    /// chosen per cell for contrast against the band it sits on.
+    fn in_cell_sizes(d: &Doc) -> Vec<f64> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { size, rgb, .. }
+                    if *rgb == [20, 20, 20] || *rgb == [245, 245, 245] =>
+                {
+                    Some(*size)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A VALUE PRINTED IN A CELL STAYS THE SIZE THAT FITS THE CELL.
+    ///
+    /// Its size is `(cell · 0.26).clamp(4, 8)` — computed from the geometry it has to sit inside,
+    /// not chosen typographically. Scaling it with the report's text control would make it overflow
+    /// the cell and collide with its neighbours, which is the one thing it must not do.
+    #[test]
+    fn the_point_values_stay_the_size_that_fits_their_cell() {
+        let small = in_cell_sizes(&doc_with_point_values(1.0));
+        assert!(!small.is_empty(), "the coarse fixture printed no point values to check");
+        let big = in_cell_sizes(&doc_with_point_values(1.5));
+        assert_eq!(
+            small.len(),
+            big.len(),
+            "the number of point values changed with the text size — {} against {}",
+            small.len(),
+            big.len(),
+        );
+        for (a, b) in small.iter().zip(&big) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "a point value is {a:.2} pt at 100% and {b:.2} pt at 150% — it no longer fits its \
+                 cell",
+            );
+        }
     }
 }

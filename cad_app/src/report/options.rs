@@ -149,6 +149,18 @@ pub struct Scale {
 /// brighter or dimmer. These steps are the ones a lighting plan is actually read at: 50 for
 /// circulation, 100 and 200 through the range below a work plane, 300 where most tasks are
 /// specified. The same room now resolves across three bands instead of one.
+/// The narrowest and widest the report's type may be set to.
+///
+/// Bounded on BOTH sides, and not as a nicety. Below about 70% the 7.5 pt legend labels stop
+/// being readable in print, and above 150% a table row stops fitting between its own rules — at
+/// which point the control is producing a broken document rather than a large one.
+pub const TEXT_SCALE_MIN: f64 = 0.70;
+pub const TEXT_SCALE_MAX: f64 = 1.50;
+
+fn one() -> f64 {
+    1.0
+}
+
 pub const DEFAULT_BANDS: [f64; 4] = [50.0, 100.0, 200.0, 300.0];
 
 /// The colours those bands are drawn in, dimmest first.
@@ -307,6 +319,17 @@ pub struct Options {
     /// visible in the dialog the moment it happens rather than a surprise in the output.
     #[serde(default)]
     pub band_colours: Vec<[u8; 3]>,
+    /// EVERY TEXT SIZE IN THE REPORT, MULTIPLIED BY THIS. 1.0 is the report as designed.
+    ///
+    /// Asked for as: *"for the report i want font size controls."* One number rather than a box
+    /// per role: the report has six type sizes and they are a HIERARCHY — cover over chapter over
+    /// heading over row over note — which is what a reader navigates by. Six independent boxes is
+    /// six chances to end up with a heading smaller than its body text, and no way back except
+    /// remembering what they all were.
+    ///
+    /// Defaulted, so every report written before this existed still loads and draws identically.
+    #[serde(default = "one")]
+    pub text_scale: f64,
     /// A logo for the header, by index into `logos`.
     #[serde(default)]
     pub header_image: Option<usize>,
@@ -361,6 +384,7 @@ impl Default for Options {
             // palette decides, and the palette is a viewport thing whose job is showing a range at
             // a glance — not the convention a lighting drawing is read by.
             band_colours: DEFAULT_BAND_COLOURS.to_vec(),
+            text_scale: 1.0,
             header_image: None,
             footer_image: None,
             sections: Section::all(),
