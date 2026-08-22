@@ -1866,7 +1866,7 @@ pub struct FurnitureAsset {
     /// meshes. Drawing a 2M-triangle piece — let alone several copies — at full detail every
     /// frame is ~140 ms/frame; this coarse proxy keeps the shape but a fraction of the tris.
     /// Only built for heavy, UNTEXTURED assets (welding vertices would scramble real UVs).
-    pub lod: std::cell::RefCell<Option<std::sync::Arc<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>>,
+    pub lod: std::cell::RefCell<Option<std::sync::Arc<LodMesh>>>,
     /// Lazily-built per-triangle grouping (coplanar faces + connected bodies) for per-surface
     /// texturing. Computed once from `positions`; see [`Self::group_geom`].
     pub groups: std::cell::RefCell<Option<std::sync::Arc<FurnGroups>>>,
@@ -2082,27 +2082,97 @@ impl FurnitureAsset {
         self.alpha.iter().any(|&a| a < ALPHA_OPAQUE)
     }
 
-    /// True when this asset is heavy enough to warrant the decimated display proxy. Skipped for
-    /// UV-mapped (glTF) assets — clustering welds vertices and would break their texture coords.
+    /// True when this asset is heavy enough to warrant the decimated display proxy.
+    ///
+    /// USED TO READ `uvs.is_empty() && alpha.is_empty() && …`, and that was the whole LOD system
+    /// switched off. Every real import carries UVs, and anything with glass carries per-vertex
+    /// alpha, so no asset above the threshold was ever decimated — on the reference gym plan all
+    /// five heavy machines (467k–497k triangles each) declined it, and the view drew 7,030,514
+    /// triangles a frame with a decimator sitting right there. The guard was not wrong about the
+    /// hazard: clustering welds vertices, and welding across a UV seam does not blur a texture, it
+    /// smears a different part of the atlas across the face.
+    ///
+    /// The answer is to weld with the attributes rather than in spite of them — see
+    /// [`cluster_decimate_attr`], which refuses to merge across a seam, a face group or a material
+    /// part, and carries UV, alpha and face id through to the proxy.
     pub fn needs_lod(&self) -> bool {
-        // Translucent assets skip decimation: welding/dropping vertices would break the
-        // per-vertex `alpha` correspondence used to split opaque vs. see-through triangles.
-        self.uvs.is_empty() && self.alpha.is_empty() && self.positions.len() / 3 > LOD_TRI_THRESHOLD
+        self.positions.len() / 3 > LOD_TRI_THRESHOLD
     }
 
-    /// The decimated (positions, normals), built once and cached.
-    pub fn lod_geom(&self) -> std::sync::Arc<(Vec<[f32; 3]>, Vec<[f32; 3]>)> {
+    /// The decimated proxy — positions, normals AND the attributes — built once and cached.
+    ///
+    /// `face` is the source face-group id per proxy triangle, which is what lets everything keyed
+    /// on face groups keep working against the proxy: the per-surface texture split, face picking
+    /// and the selected-face outline all read it instead of `group_geom()`.
+    pub fn lod_geom(&self) -> std::sync::Arc<LodMesh> {
         {
             let c = self.lod.borrow();
             if let Some(a) = c.as_ref() {
                 return a.clone();
             }
         }
-        let built = std::sync::Arc::new(cluster_decimate(&self.positions, 64));
+        // The face grouping first — it is what stops the decimator welding one material into its
+        // neighbour. `group_geom` is itself cached and, above `COPLANAR_TRI_LIMIT`, is the cheap
+        // material-part grouping rather than the flood fill.
+        let groups = self.group_geom();
+        let built = std::sync::Arc::new(cluster_decimate_attr(
+            &self.positions,
+            &self.normals,
+            &self.uvs,
+            &self.alpha,
+            &groups.face,
+            64,
+        ));
         *self.lod.borrow_mut() = Some(built.clone());
         built
     }
 }
+
+/// A decimated display proxy that still knows what it is made of.
+///
+/// The old proxy was positions and normals only, which is why it could only ever be used on assets
+/// that had nothing else — and those are exactly the assets that never needed it.
+#[derive(Debug, Clone, Default)]
+pub struct LodMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    /// Per vertex, and EMPTY when the source had none — callers test
+    /// `uvs.len() == positions.len()` exactly as they do on the full mesh.
+    pub uvs: Vec<[f32; 2]>,
+    /// Per vertex, empty when the source was fully opaque.
+    pub alpha: Vec<f32>,
+    /// Per TRIANGLE: the face-group id of the source triangle this one came from.
+    pub face: Vec<u32>,
+}
+
+impl LodMesh {
+    pub fn tri_count(&self) -> usize {
+        self.positions.len() / 3
+    }
+    /// Mirrors `FurnitureAsset::vertex_alpha` so the two can be swapped without a special case.
+    pub fn vertex_alpha(&self, i: usize) -> f32 {
+        self.alpha.get(i).copied().unwrap_or(1.0)
+    }
+}
+
+/// How far apart in the atlas two vertices may be and still be welded together.
+///
+/// This is the seam-preserving half of [`cluster_decimate_attr`]. Two vertices in the same position
+/// cell merge only when their texture coordinates are within this of each other, so the two sides
+/// of a seam — touching in space, far apart in the atlas — stay separate.
+///
+/// A DISTANCE, NOT A LATTICE CELL, and the difference is worth both bugs it avoids. Quantising UV
+/// space puts arbitrary boundaries through it: two coordinates a thousandth apart land either side
+/// of one and are needlessly split, while two a whole cell apart can share it and be wrongly
+/// merged. Measured on the reference gym plan, quantising at 1/256 gave 2,627,375 proxy triangles
+/// and at 1/64 gave 1,306,456 — a 2× swing driven entirely by where the boundaries happened to
+/// fall, not by any property of the meshes.
+///
+/// 0.01 is about ten texels on a 1024 map: comfortably tighter than the gap an unwrapper leaves
+/// between islands, comfortably looser than the UV drift across one 3 cm position cell. The other
+/// half of the protection is that the cluster key already separates face groups, and a UV island
+/// boundary usually IS a material boundary.
+pub const UV_WELD_TOL: f32 = 0.01;
 
 /// Vertex-cluster decimation: snap every vertex to a `grid`³ lattice over the mesh bounds, weld
 /// coincident cells to their centroid, and keep only triangles whose three vertices land in
@@ -2152,6 +2222,180 @@ pub fn cluster_decimate(pos: &[[f32; 3]], grid: u32) -> (Vec<[f32; 3]>, Vec<[f32
         out_n.push(n); out_n.push(n); out_n.push(n);
     }
     (out_p, out_n)
+}
+
+/// SEAM-PRESERVING vertex-cluster decimation — the same idea as [`cluster_decimate`], but it
+/// carries the attributes instead of refusing to run when they exist.
+///
+/// The plain decimator snaps every vertex to a lattice cell and welds the cell to its centroid.
+/// That is fine for bare geometry and destroys anything keyed to a vertex, which is why
+/// `needs_lod` used to decline every asset with UVs or per-vertex alpha — i.e. every real import.
+///
+/// THE CLUSTER KEY IS NOT THE POSITION CELL ALONE. It is `(position cell, UV cell, face group)`,
+/// and each of the three is load-bearing:
+///
+/// * **UV cell** — the two sides of a texture seam touch in space and are far apart in the atlas.
+///   Welding them does not blur the texture, it stretches one triangle across whatever else the
+///   atlas holds between the two islands. Quantising by [`UV_WELD_GRID`] keeps them apart.
+/// * **Face group** — a face group is what a texture is assigned to. Welding across the boundary
+///   would drag one material's vertices into another's draw call, so the two would fight over
+///   which texture the triangle belongs to. Splitting on it also means the proxy can carry the
+///   source face id per triangle, which is what keeps per-surface texturing, face picking and the
+///   face outline working against the proxy at all.
+/// * **Position cell** — the actual decimation. Everything else only refuses to merge.
+///
+/// A triangle survives when its three vertices land in three distinct clusters, as before. Normals
+/// are recomputed flat per surviving face; UV and alpha are the cluster's mean, which is exact for
+/// a cluster that came from one island and never runs across a seam because a seam cannot be in
+/// one cluster.
+///
+/// COST. `cluster_decimate` uses a flat `grid³` array because a per-vertex HashMap over 6 M
+/// vertices measured ≈ 0.5 s and showed up as a spike the first time a heavy piece drew. That trick
+/// cannot survive extra key dimensions — the array would be `grid³ × uv_grid² × groups`. Instead
+/// the flat array holds a SMALL LIST per cell, scanned linearly: a position cell holds one entry in
+/// the ordinary case and a handful at a seam, so the lookup keeps the flat array's speed without
+/// its dimensionality.
+#[allow(clippy::too_many_arguments)]
+pub fn cluster_decimate_attr(
+    pos: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+    alpha: &[f32],
+    face: &[u32],
+    grid: u32,
+) -> LodMesh {
+    let _ = normals; // flat normals are recomputed per surviving face, as in `cluster_decimate`
+    let keep_uv = uvs.len() == pos.len();
+    let keep_alpha = alpha.len() == pos.len();
+    if pos.len() < 3 {
+        return LodMesh {
+            positions: pos.to_vec(),
+            normals: vec![[0.0, 0.0, 1.0]; pos.len()],
+            uvs: if keep_uv { uvs.to_vec() } else { Vec::new() },
+            alpha: if keep_alpha { alpha.to_vec() } else { Vec::new() },
+            face: Vec::new(),
+        };
+    }
+    let (mut mn, mut mx) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in pos {
+        for k in 0..3 {
+            mn[k] = mn[k].min(p[k]);
+            mx[k] = mx[k].max(p[k]);
+        }
+    }
+    let ext = [
+        (mx[0] - mn[0]).max(1e-6),
+        (mx[1] - mn[1]).max(1e-6),
+        (mx[2] - mn[2]).max(1e-6),
+    ];
+    let gi = grid.clamp(2, 128) as usize;
+    let gf = gi as f32;
+    let cell_of = |p: &[f32; 3]| -> usize {
+        let c = |v: f32, mnk: f32, ek: f32| {
+            (((v - mnk) / ek * gf).floor() as i64).clamp(0, gi as i64 - 1) as usize
+        };
+        (c(p[0], mn[0], ext[0]) * gi + c(p[1], mn[1], ext[1])) * gi + c(p[2], mn[2], ext[2])
+    };
+
+    // Per position cell, the clusters occupying it: `(face group, cluster index)`. One entry in the
+    // ordinary case; more only where a seam or a material boundary crosses the cell.
+    let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); gi * gi * gi];
+    // Running sums: x, y, z, u, v, alpha, count.
+    let mut acc: Vec<[f64; 7]> = Vec::new();
+    let mut of_vertex: Vec<u32> = Vec::with_capacity(pos.len());
+
+    for (i, p) in pos.iter().enumerate() {
+        // A NaN UV can never be within tolerance of anything, itself included, so it would split
+        // every vertex from every other and defeat the decimation entirely. Folded to the origin.
+        let (u, vv) = match uvs.get(i) {
+            Some(t) if keep_uv && t[0].is_finite() && t[1].is_finite() => (t[0], t[1]),
+            _ => (0.0, 0.0),
+        };
+        let fg = face.get(i / 3).copied().unwrap_or(0);
+        let cell = cell_of(p);
+        // Same face group, and near enough in the atlas to be the same piece of surface. The UV is
+        // compared against the cluster's RUNNING MEAN, which is the centre of the coordinates
+        // already merged into it — so a cluster cannot creep across a seam one vertex at a time.
+        let slot = buckets[cell]
+            .iter()
+            .find(|(g, c)| {
+                if *g != fg {
+                    return false;
+                }
+                if !keep_uv {
+                    return true;
+                }
+                let a = acc[*c as usize];
+                let n = a[6].max(1.0);
+                ((a[3] / n) as f32 - u).abs() <= UV_WELD_TOL
+                    && ((a[4] / n) as f32 - vv).abs() <= UV_WELD_TOL
+            })
+            .map(|(_, c)| *c);
+        let ci = match slot {
+            Some(c) => c,
+            None => {
+                let c = acc.len() as u32;
+                acc.push([0.0; 7]);
+                buckets[cell].push((fg, c));
+                c
+            }
+        };
+        let a = &mut acc[ci as usize];
+        a[0] += p[0] as f64;
+        a[1] += p[1] as f64;
+        a[2] += p[2] as f64;
+        a[3] += u as f64;
+        a[4] += vv as f64;
+        a[5] += if keep_alpha { alpha[i] as f64 } else { 1.0 };
+        a[6] += 1.0;
+        of_vertex.push(ci);
+    }
+
+    let centre = |c: u32| -> ([f32; 3], [f32; 2], f32) {
+        let a = acc[c as usize];
+        let n = a[6].max(1.0);
+        (
+            [(a[0] / n) as f32, (a[1] / n) as f32, (a[2] / n) as f32],
+            [(a[3] / n) as f32, (a[4] / n) as f32],
+            (a[5] / n) as f32,
+        )
+    };
+
+    let mut out = LodMesh {
+        positions: Vec::new(),
+        normals: Vec::new(),
+        uvs: Vec::new(),
+        alpha: Vec::new(),
+        face: Vec::new(),
+    };
+    for t in 0..pos.len() / 3 {
+        let (i0, i1, i2) = (of_vertex[t * 3], of_vertex[t * 3 + 1], of_vertex[t * 3 + 2]);
+        // Two corners in one cluster means the triangle collapsed to a sliver — drop it, exactly
+        // as the plain decimator does.
+        if i0 == i1 || i1 == i2 || i0 == i2 {
+            continue;
+        }
+        let (pa, ua, aa) = centre(i0);
+        let (pb, ub, ab) = centre(i1);
+        let (pc, uc, ac) = centre(i2);
+        let n = (Vec3::from(pb) - Vec3::from(pa))
+            .cross(Vec3::from(pc) - Vec3::from(pa))
+            .normalize_or_zero();
+        let n = if n.length_squared() < 0.5 { [0.0, 0.0, 1.0] } else { n.to_array() };
+        out.positions.extend_from_slice(&[pa, pb, pc]);
+        out.normals.extend_from_slice(&[n, n, n]);
+        // ABSENT IN, ABSENT OUT. Callers decide between real texture coordinates and box projection
+        // by testing `uvs.len() == positions.len()`, so a proxy that emitted zeroes for a mesh that
+        // had none would not fail that test — it would pass it, with garbage.
+        if keep_uv {
+            out.uvs.extend_from_slice(&[ua, ub, uc]);
+        }
+        if keep_alpha {
+            out.alpha.extend_from_slice(&[aa, ab, ac]);
+        }
+        out.face.push(face.get(t).copied().unwrap_or(0));
+    }
+    out
 }
 
 /// Which step of the PATH-SWEEP flow is active.
@@ -3943,7 +4187,7 @@ impl FactoryState {
             // Pick against the DISPLAY geometry — the decimated proxy for heavy pieces — so a
             // click on a 2M-triangle import doesn't ray-test millions of triangles per click.
             let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
             let mut ft: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
@@ -3982,7 +4226,7 @@ impl FactoryState {
                 _ => continue,
             }
             let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
             let mut ft: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
@@ -4071,7 +4315,7 @@ impl FactoryState {
         let fur_t = self.furniture.get(fi).and_then(|inst| {
             let asset = self.furniture_lib.get(inst.asset)?;
             let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.0, None => &asset.positions };
+            let positions: &[[f32; 3]] = match &lod { Some(a) => &a.positions, None => &asset.positions };
             let mut best: Option<f32> = None;
             for tri in positions.chunks_exact(3) {
                 let a = self.furniture_point(inst, tri[0]);
@@ -4619,17 +4863,26 @@ impl FactoryState {
         let asset = self.furniture_lib.get(asset_idx)?;
         // NB: translucent assets are pickable — a mesh with glass (e.g. the villa, whose panes
         // carry per-vertex alpha since the FBX opacity import) must still take face/piece clicks;
-        // the per-surface render path handles translucency. Only LOD-heavy meshes bail.
-        if asset.needs_lod() {
-            return None;
-        }
+        // the per-surface render path handles translucency.
+        //
+        // A HEAVY PIECE IS PICKED AGAINST THE PROXY, not turned away. This returned `None` for
+        // anything LOD'd — which cost nothing while `needs_lod` refused every textured asset, and
+        // would have made every real import un-paintable the moment it stopped. The proxy carries
+        // the source face id per triangle, so a hit on it names the same face group a hit on the
+        // full mesh would, at a fraction of the ray tests. It also picks what is actually ON
+        // SCREEN, which is the more defensible answer for a click.
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
         // World ray → the instance's LOCAL space (positions are stored local).
         let (ow, dw) = Self::ray(cursor, rect, mvp);
         let inv = glam::Mat4::from_cols_array(&model).inverse();
         let ol = inv.transform_point3(ow);
         let dl = inv.transform_vector3(dw).normalize_or_zero();
+        let hit_pos: &[[f32; 3]] = match &lod {
+            Some(a) => &a.positions,
+            None => &asset.positions,
+        };
         let mut best: Option<(f32, usize)> = None;
-        for (ti, tri) in asset.positions.chunks_exact(3).enumerate() {
+        for (ti, tri) in hit_pos.chunks_exact(3).enumerate() {
             let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
             if let Some(t) = cad_solid::ray_triangle(ol, dl, a, b, c) {
                 if best.map_or(true, |(bt, _)| t < bt) {
@@ -4638,7 +4891,17 @@ impl FactoryState {
             }
         }
         let (_, ht) = best?;
+        // Which face group was hit. Through the proxy, its own per-triangle face id IS the source
+        // group; the body grouping below is still read off the full mesh, which is right — it is a
+        // property of the asset, not of whichever proxy triangle happened to be in the way.
         let groups = asset.group_geom();
+        let ht = match &lod {
+            Some(a) => {
+                let fg = a.face.get(ht).copied().unwrap_or(0);
+                groups.face.iter().position(|&g| g == fg).unwrap_or(0)
+            }
+            None => ht,
+        };
         Some(if whole_piece {
             let bid = groups.body.get(ht).copied().unwrap_or(0);
             let mut set = std::collections::BTreeSet::new();
@@ -5046,19 +5309,25 @@ impl FactoryState {
         let Some((fi, groups)) = self.furn_face_sel.as_ref() else { return out };
         let Some(inst) = self.furniture.get(*fi) else { return out };
         let Some(asset) = self.furniture_lib.get(inst.asset) else { return out };
-        if asset.needs_lod() {
-            return out;
-        }
+        // TRACED ON WHATEVER IS ON SCREEN. This returned nothing at all for a LOD'd asset, which
+        // cost nothing while `needs_lod` refused every textured import and would have silently
+        // removed the selection outline from all of them once it stopped.
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let fg = asset.group_geom();
+        let (src_pos, src_face): (&[[f32; 3]], &[u32]) = match &lod {
+            Some(a) => (&a.positions, &a.face),
+            None => (&asset.positions, &fg.face),
+        };
 
         // Rebuild only when the SELECTION changed — not when the camera moved.
         {
-            let tris = asset.positions.len() / 3;
+            let tris = src_pos.len() / 3;
             let stale = self.face_outline.borrow().as_ref().is_none_or(|c| {
                 c.inst != *fi || c.asset != inst.asset || c.tris != tris || c.groups != *groups
             });
             if stale {
                 *self.face_outline.borrow_mut() =
-                    Some(Self::build_face_outline(asset, *fi, inst.asset, groups));
+                    Some(Self::build_face_outline(src_pos, src_face, *fi, inst.asset, groups));
             }
         }
         let cache = self.face_outline.borrow();
@@ -5091,11 +5360,13 @@ impl FactoryState {
     /// so the two triangles sharing an edge carry two separate copies of its endpoints, and an
     /// index-based match would find no shared edges at all and hand back the wireframe it was
     /// meant to replace.
+    /// Takes the POSITIONS AND FACE IDS rather than the asset, so it can be traced on the decimated
+    /// proxy when that is what is on screen. An outline built from the full mesh would float a
+    /// little off the proxy the user is actually looking at.
     fn build_face_outline(
-        asset: &FurnitureAsset, inst: usize, asset_idx: usize, groups: &[u32],
+        positions: &[[f32; 3]], face: &[u32], inst: usize, asset_idx: usize, groups: &[u32],
     ) -> FaceOutline {
         use std::collections::hash_map::Entry;
-        let fg = asset.group_geom();
         let want: std::collections::HashSet<u32> = groups.iter().copied().collect();
         // 0.1 mm — far below anything a user can see, far above f32 noise on a metre-scale model.
         let key = |p: [f32; 3]| {
@@ -5107,13 +5378,13 @@ impl FactoryState {
         };
         let mut edges: std::collections::HashMap<([i64; 3], [i64; 3]), ([Vec3; 2], u32)> =
             std::collections::HashMap::new();
-        for t in 0..fg.face.len() {
-            if !want.contains(&fg.face[t]) {
+        for t in 0..face.len() {
+            if !want.contains(&face[t]) {
                 continue;
             }
             let base = t * 3;
             for e in 0..3 {
-                let (p, q) = (asset.positions[base + e], asset.positions[base + (e + 1) % 3]);
+                let (p, q) = (positions[base + e], positions[base + (e + 1) % 3]);
                 let (kp, kq) = (key(p), key(q));
                 // Order-independent, so the same edge from the neighbouring triangle (which winds
                 // it the other way) lands on the same key.
@@ -5141,7 +5412,7 @@ impl FactoryState {
         FaceOutline {
             inst,
             asset: asset_idx,
-            tris: asset.positions.len() / 3,
+            tris: positions.len() / 3,
             groups: groups.to_vec(),
             edges: out,
             truncated,
@@ -8166,11 +8437,29 @@ impl FactoryState {
         let Some(inst) = self.furniture.get(i) else { return Vec::new() };
         let Some(asset) = self.furniture_lib.get(inst.asset) else { return Vec::new() };
         // Heavy pieces render from a decimated proxy (built once) so 8 imports don't crawl.
+        //
+        // THE PROXY PEELS ITS GLASS TOO, now that it carries alpha. This branch used to emit every
+        // proxy triangle into the solid pass, which was correct only because `needs_lod` refused
+        // any asset that had alpha at all — a heavy piece with glass in it would otherwise have had
+        // its panes drawn opaque here AND blended again in the transparent pass.
         if asset.needs_lod() {
             let lod = asset.lod_geom();
-            return lod.0.iter().zip(lod.1.iter())
-                .map(|(p, n)| v(Vec3::from(*p), shade_furniture(inst.color, Vec3::from(*n))))
-                .collect();
+            let glassy = lod.alpha.iter().any(|&a| a < ALPHA_OPAQUE);
+            let mut out = Vec::with_capacity(lod.positions.len());
+            for t in 0..lod.tri_count() {
+                let base = t * 3;
+                if glassy && (base..base + 3).all(|k| lod.vertex_alpha(k) < ALPHA_OPAQUE) {
+                    continue;
+                }
+                for k in base..base + 3 {
+                    let n = lod.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                    out.push(v(
+                        Vec3::from(lod.positions[k]),
+                        shade_furniture(inst.color, Vec3::from(n)),
+                    ));
+                }
+            }
+            return out;
         }
         // Opaque common case: emit every triangle (fast path, unchanged).
         if !asset.is_translucent() {
@@ -8264,20 +8553,32 @@ impl FactoryState {
             (mx[1] - mn[1]).max(1e-4),
             (mx[2] - mn[2]).max(1e-4),
         ];
+        // Heavy pieces render from the decimated proxy.
+        //
+        // EVERY ATTRIBUTE COMES FROM THE SAME SOURCE AS THE POSITIONS. This used to read positions
+        // from the proxy and UVs from `asset.uvs` by the same index `k`, which is not a
+        // correspondence at all — the proxy has its own, shorter vertex list. It was safe only
+        // because `needs_lod` guaranteed a proxied asset had no UVs (the comment here said so
+        // outright). With the proxy carrying UVs, mixing the two would texture a mesh with another
+        // mesh's coordinates, so `src_uv` follows `src_pos`.
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let (src_pos, src_nrm, src_uv, src_alpha): (
+            &[[f32; 3]],
+            &[[f32; 3]],
+            &[[f32; 2]],
+            &[f32],
+        ) = match &lod {
+            Some(a) => (&a.positions, &a.normals, &a.uvs, &a.alpha),
+            None => (&asset.positions, &asset.normals, &asset.uvs, &asset.alpha),
+        };
         // Real UVs (from a glTF import) map the texture as the artist intended; otherwise box
         // projection normalised to the local bbox.
-        let has_uv = asset.uvs.len() == asset.positions.len();
-        // Heavy untextured pieces render from the decimated proxy (needs_lod ⇒ no real UVs).
-        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
-        let (src_pos, src_nrm): (&[[f32; 3]], &[[f32; 3]]) = match &lod {
-            Some(a) => (&a.0, &a.1),
-            None => (&asset.positions, &asset.normals),
-        };
+        let has_uv = src_uv.len() == src_pos.len();
         let mut out = Vec::with_capacity(src_pos.len());
         for (k, p) in src_pos.iter().enumerate() {
             let n = Vec3::from(src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
             let (uc, vc) = if has_uv {
-                let t = asset.uvs[k];
+                let t = src_uv[k];
                 (t[0], t[1])
             } else {
                 let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
@@ -8292,7 +8593,10 @@ impl FactoryState {
             let s = shade_scalar(n, true); // sun-aware; matches `shade_furniture`
             let uv = tex.map_uv(uc, vc); // tiling + move + rotate
             out.push(crate::light3d::TexVtx {
-                x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s, a: asset.vertex_alpha(k) * tex.opacity,
+                // From `src_alpha`, for the same reason as `src_uv`: the proxy's vertex k is not
+                // the full mesh's vertex k.
+                x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s,
+                a: src_alpha.get(k).copied().unwrap_or(1.0) * tex.opacity,
             });
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -8363,9 +8667,11 @@ impl FactoryState {
         // NB: a translucent asset is NOT bailed here — the per-surface split below peels glass
         // face-groups into `translucent` buckets (the blended pass) while its solid materials stay
         // opaque, so a multi-material piece with glass (e.g. the villa) still renders every region.
-        if asset.needs_lod() {
-            return None;
-        }
+        // NO BAIL FOR HEAVY PIECES ANY MORE. This returned `None`, which sent a multi-material
+        // import down the whole-object texture path and dropped its per-surface assignment — and
+        // that was invisible only because `needs_lod` refused any asset with UVs, i.e. every
+        // multi-material import there is. The split reads the proxy's own per-triangle face ids
+        // below, so it produces the same buckets from fewer triangles.
 
         // Cheap per-instance signature: everything the split depends on EXCEPT pose (the buckets are
         // in local space). If it matches the memo we skip the O(tri) rebuild entirely — the reason a
@@ -8410,8 +8716,22 @@ impl FactoryState {
         let groups = asset.group_geom();
         let (mn, mx) = (asset.local_min, asset.local_max);
         let ext = [(mx[0] - mn[0]).max(1e-4), (mx[1] - mn[1]).max(1e-4), (mx[2] - mn[2]).max(1e-4)];
-        let has_uv = asset.uvs.len() == asset.positions.len();
-        let ntri = asset.positions.len() / 3;
+        // Positions, normals, UVs, alpha AND the per-triangle face id all from ONE source. The
+        // proxy's face ids are the source's, which is what makes the same texture assignment land
+        // on the same surfaces at a fraction of the triangles.
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let (src_pos, src_nrm, src_uv, src_alpha, src_face): (
+            &[[f32; 3]],
+            &[[f32; 3]],
+            &[[f32; 2]],
+            &[f32],
+            &[u32],
+        ) = match &lod {
+            Some(a) => (&a.positions, &a.normals, &a.uvs, &a.alpha, &a.face),
+            None => (&asset.positions, &asset.normals, &asset.uvs, &asset.alpha, &groups.face),
+        };
+        let has_uv = src_uv.len() == src_pos.len();
+        let ntri = src_pos.len() / 3;
 
         // Assignment fingerprint: whole-object texture + the sorted per-face map. Folded into every
         // buffer key so a paint (which changes this) rebuilds only that instance's GPU meshes.
@@ -8461,7 +8781,7 @@ impl FactoryState {
                         let s = shade_scalar(n, true);
                         let uv = tex.map_uv(uc, vc);
                         // Surface transparency multiplies the mesh's own per-vertex opacity.
-                        let a = asset.vertex_alpha(k) * tex.opacity;
+                        let a = src_alpha.get(k).copied().unwrap_or(1.0) * tex.opacity;
                         buf.push(crate::light3d::TexVtx { x: p[0], y: p[1], z: p[2], u: uv[0], v: uv[1], s, a });
                     }
                 }
@@ -15926,5 +16246,191 @@ mod a_save_keeps_the_furniture {
             d.furniture_lib.len(), raw.len(),
         );
         assert!(!raw.is_empty() && !raw[0].pos.is_empty(), "the geometry handed over is empty");
+    }
+}
+
+/// THE LOD WAS SWITCHED OFF FOR EVERY ASSET IT WAS BUILT FOR.
+///
+/// `needs_lod` read `uvs.is_empty() && alpha.is_empty() && tris > 200_000`. Every real import
+/// carries UVs and anything with glass carries per-vertex alpha, so nothing above the threshold was
+/// ever decimated: on the reference gym plan all five heavy machines (467k–497k triangles) declined
+/// it and the view drew 7,030,514 triangles a frame.
+///
+/// The guard was right about the hazard and wrong about the remedy. Welding across a texture seam
+/// does not blur a texture — it stretches a triangle across whatever else the atlas holds between
+/// the two islands. So the decimator now refuses to weld across a seam, a face group or a material
+/// part, and carries the attributes through instead of declining the work.
+#[cfg(test)]
+mod seam_preserving_lod {
+    use super::*;
+
+    /// A flat strip of quads along +X, subdivided `n` times, with a TEXTURE SEAM at x = 0.44.
+    ///
+    /// Left of the seam the atlas coordinate is ~0.05, right of it ~0.95: the two sides touch in
+    /// space and sit at opposite ends of the image, which is exactly what a seam is. Nothing in the
+    /// source has a `u` anywhere near the middle — that is what makes the assertion below sharp.
+    fn seamed_strip(n: usize) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+        let (mut pos, mut uv, mut face) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for j in 0..n {
+                let (x0, x1) = (i as f32 / n as f32, (i + 1) as f32 / n as f32);
+                let (y0, y1) = (j as f32 / n as f32, (j + 1) as f32 / n as f32);
+                let u = |x: f32| if x < 0.44 { 0.05 } else { 0.95 };
+                for (a, b, c) in [((x0, y0), (x1, y0), (x1, y1)), ((x0, y0), (x1, y1), (x0, y1))] {
+                    for (x, y) in [a, b, c] {
+                        pos.push([x, y, 0.0]);
+                        uv.push([u(x), y]);
+                    }
+                    face.push(0);
+                }
+            }
+        }
+        (pos, uv, face)
+    }
+
+    /// THE SEAM SURVIVES. Every output UV must be a value the source could have produced.
+    ///
+    /// If a cluster had swallowed both sides of the seam its mean `u` would be 0.5, and no source
+    /// vertex is anywhere near 0.5 — so a UV in the middle of the range is proof of a weld across
+    /// the atlas, which is the exact failure the old `uvs.is_empty()` guard existed to avoid.
+    #[test]
+    fn a_texture_seam_is_never_welded_across() {
+        let (pos, uv, face) = seamed_strip(40);
+        let out = cluster_decimate_attr(&pos, &[], &uv, &[], &face, 8);
+        assert!(!out.positions.is_empty(), "it must produce a proxy at all");
+        assert_eq!(out.uvs.len(), out.positions.len(), "UVs stay per-vertex");
+        for t in &out.uvs {
+            assert!(
+                t[0] <= 0.2 || t[0] >= 0.8,
+                "u = {:.3} is between the two islands, so a cluster spanned the seam",
+                t[0],
+            );
+        }
+    }
+
+    /// …AND IT STILL DECIMATES. A seam-aware decimator that simply refused to weld anything would
+    /// pass the test above and be useless.
+    #[test]
+    fn it_still_removes_most_of_the_triangles() {
+        let (pos, uv, face) = seamed_strip(40);
+        let before = pos.len() / 3;
+        let out = cluster_decimate_attr(&pos, &[], &uv, &[], &face, 8);
+        assert!(
+            out.tri_count() * 4 < before,
+            "3,200 triangles should collapse hard on an 8³ grid; got {} from {before}",
+            out.tri_count(),
+        );
+    }
+
+    /// TWO MATERIALS ALMOST IN THE SAME PLACE MUST NOT MERGE.
+    ///
+    /// A face group is what a texture is ASSIGNED to, so welding across the boundary drags one
+    /// material's vertices into another's draw call and the two fight over which texture the
+    /// triangle carries.
+    ///
+    /// The two sheets are 1 mm apart — comfortably inside one lattice cell — with identical UVs, so
+    /// the face id is the only thing keeping them apart. Merged, both would be pulled to the
+    /// half-way plane at z = 0.0005; separate, each keeps its own z exactly.
+    ///
+    /// ASSERTED ON THE GEOMETRY, NOT ON THE ID LIST. Checking merely that both ids appear in the
+    /// output proves nothing at all — the id is copied from the source triangle, so it survives a
+    /// merge untouched. It has to be the positions that show the two never met.
+    #[test]
+    fn two_face_groups_in_the_same_place_stay_apart() {
+        let (mut pos, mut uv, mut face) = (Vec::new(), Vec::new(), Vec::new());
+        for (g, z) in [(0u32, 0.0f32), (1, 0.001)] {
+            for i in 0..20 {
+                for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.5, 1.0)] {
+                    pos.push([x + i as f32, y, z]);
+                    uv.push([0.5, 0.5]);
+                }
+                face.push(g);
+            }
+        }
+        // A SPACER FAR AWAY IN Z, and it is load-bearing. The lattice is sized to the mesh's own
+        // bounds, so with only the two sheets in it the whole z extent IS the 1 mm gap and the
+        // lattice separates them on its own — the test then passed with the face id deleted from
+        // the key, proving nothing. With the model a metre deep, one z cell is 125 mm and the two
+        // sheets sit squarely inside the same one, which is the situation the face id has to
+        // resolve by itself.
+        for (x, y) in [(0.0f32, 0.0f32), (1.0, 0.0), (0.5, 1.0)] {
+            pos.push([x, y, 1.0]);
+            uv.push([0.5, 0.5]);
+        }
+        face.push(2);
+
+        let out = cluster_decimate_attr(&pos, &[], &uv, &[], &face, 8);
+        assert!(!out.face.is_empty(), "the proxy must not be empty");
+        assert_eq!(out.face.len(), out.tri_count(), "one face id per proxy triangle");
+        assert!(out.face.contains(&0) && out.face.contains(&1), "both groups must survive");
+        for t in 0..out.tri_count() {
+            if out.face[t] == 2 {
+                continue; // the spacer
+            }
+            let want = if out.face[t] == 0 { 0.0 } else { 0.001 };
+            for k in t * 3..t * 3 + 3 {
+                assert!(
+                    (out.positions[k][2] - want).abs() < 1e-6,
+                    "face {} vertex at z = {} should be exactly {want}; halfway means the two \
+                     materials were welded into one cluster",
+                    out.face[t],
+                    out.positions[k][2],
+                );
+            }
+        }
+    }
+
+    /// PER-VERTEX ALPHA COMES THROUGH. Glass is split from frame by it, so a proxy that dropped it
+    /// would draw every pane opaque.
+    #[test]
+    fn per_vertex_alpha_is_carried_and_stays_per_vertex() {
+        let (pos, uv, face) = seamed_strip(20);
+        let alpha: Vec<f32> = pos.iter().map(|p| if p[1] < 0.5 { 0.3 } else { 1.0 }).collect();
+        let out = cluster_decimate_attr(&pos, &[], &uv, &alpha, &face, 8);
+        assert_eq!(out.alpha.len(), out.positions.len(), "alpha stays per-vertex");
+        assert!(out.alpha.iter().any(|&a| a < ALPHA_OPAQUE), "the see-through half must survive");
+        assert!(out.alpha.iter().any(|&a| a >= ALPHA_OPAQUE), "and so must the solid half");
+    }
+
+    /// A SOURCE WITH NO ATTRIBUTES PRODUCES A PROXY WITH NONE — callers test
+    /// `uvs.len() == positions.len()`, and a proxy that invented UVs would fail that test in the
+    /// worst way, by passing it.
+    #[test]
+    fn absent_attributes_stay_absent() {
+        let (pos, _, face) = seamed_strip(10);
+        let out = cluster_decimate_attr(&pos, &[], &[], &[], &face, 8);
+        assert!(out.uvs.is_empty(), "no UVs in, no UVs out");
+        assert!(out.alpha.is_empty(), "no alpha in, no alpha out");
+        assert!(!out.positions.is_empty());
+    }
+
+    /// THE FIX ITSELF: a heavy asset WITH UVs must now want a proxy. This is the assertion that
+    /// fails against the old `needs_lod`, and the reason the gym plan drew 7 M triangles a frame.
+    #[test]
+    fn a_heavy_textured_asset_now_wants_a_proxy() {
+        let n = (LOD_TRI_THRESHOLD + 1) * 3;
+        let mut a = FurnitureAsset::new(
+            "heavy".into(),
+            vec![[0.0, 0.0, 0.0]; n],
+            vec![[0.0, 0.0, 1.0]; n],
+            [1.0, 1.0, 1.0],
+        );
+        assert!(a.needs_lod(), "a bare heavy asset always did");
+        a.uvs = vec![[0.0, 0.0]; n];
+        assert!(a.needs_lod(), "and now it does WITH texture coordinates — this was the bug");
+        a.alpha = vec![1.0; n];
+        assert!(a.needs_lod(), "…and with per-vertex alpha");
+    }
+
+    /// The threshold still governs: a small asset is drawn whole, proxy or not.
+    #[test]
+    fn a_light_asset_is_left_alone() {
+        let a = FurnitureAsset::new(
+            "light".into(),
+            vec![[0.0, 0.0, 0.0]; 300],
+            vec![[0.0, 0.0, 1.0]; 300],
+            [1.0, 1.0, 1.0],
+        );
+        assert!(!a.needs_lod());
     }
 }

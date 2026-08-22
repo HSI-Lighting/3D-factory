@@ -65215,13 +65215,14 @@ mod what_the_gpu_draws_probe {
         }
         let mut drawn = 0usize;
         let mut drawn_if_lod = 0usize;
+        let mut full = 0usize;
         for (idx, n) in &used {
             let Some(a) = f.furniture_lib.get(*idx) else { continue };
             let tris = a.positions.len() / 3;
             let need = a.needs_lod();
             // What the decimator WOULD give, whether or not `needs_lod` allows it.
             let would = crate::factory::cluster_decimate(&a.positions, 64).0.len() / 3;
-            let lod_tris = if need { a.lod_geom().0.len() / 3 } else { would };
+            let lod_tris = if need { a.lod_geom().positions.len() / 3 } else { would };
             println!(
                 "{:<26} {:>9} {:>9} {:>7} {:>9} {:>9}   x{n}",
                 a.name,
@@ -65231,15 +65232,21 @@ mod what_the_gpu_draws_probe {
                 need,
                 lod_tris,
             );
-            drawn += tris * n;
+            // AS DRAWN means as drawn. This counted the full mesh unconditionally and printed it
+            // under "as drawn", which was true only while `needs_lod` refused every heavy asset —
+            // exactly the same class of lie as the `tris=` line in the perf dump, which counts the
+            // CSG buffer and calls it the scene.
+            drawn += if need { lod_tris } else { tris } * n;
+            full += tris * n;
             drawn_if_lod += lod_tris * n;
         }
         println!("\n=== PER FRAME ===");
         println!("  building (CSG opaque buffer) : {} tris", f.cached.positions.len() / 3);
-        println!("  furniture, as drawn          : {drawn} tris across {} instances", f.furniture.len());
-        println!("  furniture, if the decimator were allowed to run : {drawn_if_lod} tris");
+        println!("  furniture, at full detail    : {full} tris across {} instances", f.furniture.len());
+        println!("  furniture, AS DRAWN          : {drawn} tris  ({:.1}x less)", full as f64 / drawn.max(1) as f64);
+        println!("  furniture, if every asset were proxied : {drawn_if_lod} tris");
         println!(
-            "  furniture is {:.3}% of the geometry",
+            "  furniture is {:.3}% of the geometry as drawn",
             100.0 * drawn as f64 / (drawn + f.cached.positions.len() / 3).max(1) as f64
         );
     }
