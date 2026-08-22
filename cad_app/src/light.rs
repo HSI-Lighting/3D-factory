@@ -1525,6 +1525,8 @@ pub struct LightState {
     ///
     /// Assign through [`Self::set_meshes`] rather than writing the field, or the view goes stale.
     pub meshes_gen: u64,
+    /// What the LIVE mesh rebuild was last run for -- see `live_mesh_sig_of`.
+    pub live_mesh_sig: Option<u64>,
     /// Express or Thorough — see [`CalcMode`]. This is what the NEXT calculation will run as; the
     /// mode a result was actually computed in travels with the result, in [`RoomResult::mode`],
     /// because the two disagree the moment the user flips the switch and has not pressed Calculate.
@@ -1701,6 +1703,7 @@ impl LightState {
             results_restored: false,
             meshes: Vec::new(),
             meshes_gen: 0,
+            live_mesh_sig: None,
             mode: CalcMode::default(),
             results_mode: None,
             show_overlay: true,
@@ -3264,6 +3267,47 @@ impl LightState {
     /// openings, slabs and storeys, and the 2D extrusion is a footprint pulled to a single height.
     /// The extrusion stays as the fallback so a plan-only project is unaffected — that is still a
     /// perfectly good way to get a first lux figure before any 3D work exists.
+    /// WHAT THE LIVE REBUILD WOULD PRODUCE, as one number — or `None` when it cannot be summarised
+    /// cheaply and the caller must just do the work.
+    ///
+    /// THE SIMLUX WORKSPACE REBUILT THE ENTIRE CALCULATION GEOMETRY EVERY FRAME. In split mode
+    /// `render_light_3d_panel` called [`Self::rebuild_live_meshes_with`] unconditionally, and that
+    /// runs `scene_meshes` → `meshes_from_factory_mode(.., Thorough)`, which transforms every
+    /// furniture triangle into a fresh buffer: on the reference gym plan 7,036,129 triangles,
+    /// 21.1 M vertices, about 253 MB, every frame. Measured at ~205 ms of a ~210 ms frame — the
+    /// whole of the lag, and SIMLUX-only because nothing else enters split mode.
+    ///
+    /// It is the same mistake as the display buffer, one level upstream: that was cached, and this
+    /// went on regenerating the very geometry the cache exists to avoid touching.
+    ///
+    /// `None` when there is no 3D model, because `scene_meshes` then falls through to the DOC
+    /// extrusion and this cannot summarise a document without hashing it. That path is the cheap
+    /// one — a footprint pulled to one height — so it keeps rebuilding every frame, as before.
+    pub fn live_mesh_sig_of(&self, factory: Option<&crate::factory::FactoryState>) -> Option<u64> {
+        let f = factory?;
+        if f.cached.positions.len() < 3 && f.furniture.is_empty() {
+            return None; // doc-driven; see above
+        }
+        let mut h = Fnv::new();
+        // Express and Thorough build different furniture, so the mode is an input.
+        h.u64(self.mode as u64);
+        h.u64(f.geom_version);
+        h.u64(f.cached.positions.len() as u64);
+        // EVERY INSTANCE, THROUGH THE VERY MATRIX THE BUILD USES. `geom_version` moves on a CSG
+        // rebuild and never when furniture is placed or moved, so leaving these out would freeze
+        // the light scene the moment a piece was dragged.
+        h.u64(f.furniture.len() as u64);
+        for (i, inst) in f.furniture.iter().enumerate() {
+            h.u64(inst.asset as u64);
+            if let Some(m) = f.furniture_model_matrix(i) {
+                for v in m {
+                    h.f32(v);
+                }
+            }
+        }
+        Some(h.finish())
+    }
+
     pub fn rebuild_live_meshes_with(
         &mut self,
         doc: &Document,
@@ -8272,5 +8316,118 @@ mod express_where_furniture_matters {
             "the box stands where the frame is air, so it must bury more cells: \
              Express {edrop}, Thorough {tdrop}",
         );
+    }
+}
+
+/// THE SIMLUX WORKSPACE REBUILT THE WHOLE CALCULATION GEOMETRY EVERY FRAME.
+///
+/// In split mode `render_light_3d_panel` called `rebuild_live_meshes_with` unconditionally, and
+/// that is `scene_meshes` → `meshes_from_factory_mode(.., Thorough)`: every furniture triangle
+/// transformed into a fresh buffer, 7,036,129 of them on the reference gym plan — 21.1 M vertices,
+/// about 253 MB — sixty times a second. Measured at ~205 ms of a ~210 ms frame.
+///
+/// SIMLUX-only, because nothing else enters split mode. That is what the user said in the first
+/// report and what four rounds of work in the 3D renderer failed to hear.
+#[cfg(test)]
+mod the_live_mesh_rebuild {
+    use super::*;
+
+    fn a_furnished_model() -> crate::factory::FactoryState {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        let idx = f.add_furniture_asset(
+            "stool".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
+                    [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 6],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, glam::Vec3::new(5.0, 4.0, 0.0));
+        f
+    }
+
+    /// AN UNTOUCHED SCENE ASKS FOR THE SAME SIGNATURE. A signature that moves on its own rebuilds
+    /// every frame and looks exactly like the bug it was written to fix.
+    #[test]
+    fn an_untouched_model_keeps_its_signature() {
+        let f = a_furnished_model();
+        let s = LightState::new();
+        assert_eq!(s.live_mesh_sig_of(Some(&f)), s.live_mesh_sig_of(Some(&f)));
+        assert!(s.live_mesh_sig_of(Some(&f)).is_some(), "a 3D model can be summarised");
+    }
+
+    /// EVERYTHING `scene_meshes` READS MOVES IT. A miss here is the dangerous direction: the light
+    /// scene would freeze at whatever it was when the workspace opened, and the 3D view and the
+    /// next calculation would both describe a building that is no longer there.
+    #[test]
+    fn everything_the_live_scene_is_built_from_moves_the_signature() {
+        let cases: Vec<(&str, fn(&mut crate::factory::FactoryState, &mut LightState))> = vec![
+            ("rebuilding the CSG model", |f, _| f.recompute()),
+            ("moving a piece of furniture", |f, _| f.furniture[0].pos[0] += 0.4),
+            ("rotating a piece of furniture", |f, _| f.furniture[0].rot[2] += 12.0),
+            ("scaling a piece of furniture", |f, _| f.furniture[0].scale *= 1.3),
+            ("deleting a piece of furniture", |f, _| f.furniture.clear()),
+            ("switching Express/Thorough", |_, s| s.mode = CalcMode::Express),
+        ];
+        for (what, change) in cases {
+            let mut f = a_furnished_model();
+            let mut s = LightState::new();
+            let before = s.live_mesh_sig_of(Some(&f));
+            change(&mut f, &mut s);
+            assert_ne!(
+                s.live_mesh_sig_of(Some(&f)),
+                before,
+                "{what} must rebuild the live scene, or the 3D view and the next calculation both \
+                 describe a building that is no longer there",
+            );
+        }
+    }
+
+    /// A 2D-ONLY PROJECT CANNOT BE SUMMARISED, and says so rather than guessing. `scene_meshes`
+    /// then extrudes the DOCUMENT, which this has no cheap handle on — and that path is the cheap
+    /// one anyway, so the caller keeps rebuilding it.
+    #[test]
+    fn a_project_with_no_model_declines_to_summarise() {
+        let f = crate::factory::FactoryState::default();
+        let s = LightState::new();
+        assert!(s.live_mesh_sig_of(Some(&f)).is_none(), "no model, no cheap signature");
+        assert!(s.live_mesh_sig_of(None).is_none(), "and no factory at all is the same answer");
+    }
+
+    /// THE GUARD IS AT THE CALL SITE, and it is the whole fix. A grep, because the alternative is
+    /// standing up an egui context and a GL surface; needles are assembled at run time because
+    /// `include_str!` includes THIS module and a literal would match the assertion instead of the
+    /// code — a mistake already made once in this file.
+    #[test]
+    fn the_workspace_only_rebuilds_when_the_signature_moves() {
+        let src = include_str!("app.rs");
+        let needle = |parts: &[&str]| -> String { parts.concat() };
+        let anchor = needle(&["let sig = self.light.live_mesh_", "sig_of(Some(&self.factory));"]);
+        let a = src.find(&anchor).expect("the live-rebuild guard is gone");
+        let b = src[a..].find("\n        }").map(|e| a + e).expect("re-anchor if the block moves");
+        let body = &src[a..b];
+        assert!(body.len() < 2_500, "the slice must be the guard, not half the file");
+        for parts in [
+            &["if sig.is_none() || self.light.live_mesh_", "sig != sig {"][..],
+            &["rebuild_live_meshes_", "with(&plan, Some(&self.factory));"][..],
+            &["self.light.live_mesh_", "sig = sig;"][..],
+        ] {
+            let n = needle(parts);
+            assert!(body.contains(&n), "the guard no longer contains `{n}`");
+        }
     }
 }

@@ -15153,11 +15153,31 @@ impl CadApp {
             // Live: re-extrude the current room so the 3D tracks the 2D plan. The PLAN — with a
             // face-sketch open `self.doc` is the sketch, and the room would collapse to its
             // handful of construction lines every frame the sketch was live.
-            let plan = self.plan_doc().clone();
-            // …and hand it the 3D MODEL, which is the real building. The extrusion behind this is
-            // only a footprint pulled to one height: no openings, no slabs, no storeys. It stays
-            // as the fallback for a plan-only project.
-            self.light.rebuild_live_meshes_with(&plan, Some(&self.factory));
+            // ONLY WHEN SOMETHING IT READS HAS MOVED — and this was the lag, all of it.
+            //
+            // This ran unconditionally, every frame the workspace was open. `rebuild_live_meshes_with`
+            // is `scene_meshes` → `meshes_from_factory_mode(.., Thorough)`, which transforms EVERY
+            // furniture triangle into a fresh buffer: 7,036,129 triangles and 21.1 M vertices on the
+            // reference gym plan, about 253 MB, sixty times a second. Measured at ~205 ms of a
+            // ~210 ms frame. The `plan_doc().clone()` above it copied all 1,442 drawing objects
+            // again for good measure.
+            //
+            // It is SIMLUX-only because nothing else enters split mode, which is exactly what the
+            // user said from the first report and what four rounds of work in the 3D renderer
+            // failed to hear. The display buffer was cached three builds ago; this is the same
+            // mistake one level upstream, still regenerating the geometry that cache exists to
+            // avoid touching.
+            let sig = self.light.live_mesh_sig_of(Some(&self.factory));
+            // `None` means the scene comes from the 2D document, which cannot be summarised
+            // cheaply — that path is the cheap one and keeps rebuilding, as before.
+            if sig.is_none() || self.light.live_mesh_sig != sig {
+                let plan = self.plan_doc().clone();
+                // …and hand it the 3D MODEL, which is the real building. The extrusion behind this
+                // is only a footprint pulled to one height: no openings, no slabs, no storeys. It
+                // stays as the fallback for a plan-only project.
+                self.light.rebuild_live_meshes_with(&plan, Some(&self.factory));
+                self.light.live_mesh_sig = sig;
+            }
         }
         let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
