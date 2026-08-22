@@ -8143,3 +8143,134 @@ mod express_and_thorough {
         assert!(!CalcMode::Express.is_compliant());
     }
 }
+
+/// EXPRESS AGAINST THOROUGH WHERE THE FURNITURE IS ACTUALLY IN THE ROOM.
+///
+/// The first attempt at this gate ran on the reference gym plan and the two modes agreed to three
+/// decimal places — which proved only that the substitution does not LEAK, because 0 of 119 cells
+/// were masked in Express and an Express box is watertight, so no machine overlapped the room that
+/// grid covered. It said nothing about accuracy where a box stands in for a real piece.
+///
+/// This is that scene, built deliberately: a room with an OPEN FRAME in the middle of it — mostly
+/// air, straddling the working plane — and lights overhead. A box is the substitution's worst case,
+/// because the box is solid where the frame is not.
+#[cfg(test)]
+mod express_where_furniture_matters {
+    use super::*;
+
+    /// A 8 x 6 m room with a 2 x 2 x 2 m open cage at its centre and four downlights over it.
+    fn a_room_with_an_open_frame() -> crate::factory::FactoryState {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+
+        // Vertical bars on a 2 x 2 m ring, 2 m tall: the volume is nearly all air, and its BOX is
+        // nearly all solid. Local coordinates, centred, so the instance transform places it.
+        let mut pos = Vec::new();
+        let bars = 16;
+        for i in 0..bars {
+            let a = i as f32 / bars as f32 * std::f32::consts::TAU;
+            let (cx, cy) = (a.cos() * 1.0, a.sin() * 1.0);
+            let w = 0.02;
+            // Two triangles making a thin upright quad.
+            for (dx, dy, z) in [
+                (-w, -w, 0.0), (w, w, 0.0), (w, w, 2.0),
+                (-w, -w, 0.0), (w, w, 2.0), (-w, -w, 2.0),
+            ] {
+                pos.push([cx + dx, cy + dy, z]);
+            }
+        }
+        let normals = vec![[0.0, 0.0, 1.0]; pos.len()];
+        let idx = f.add_furniture_asset(
+            "cage".into(),
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals,
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, glam::Vec3::new(4.0, 3.0, 0.0));
+        f
+    }
+
+    fn run(mode: crate::light::CalcMode) -> (f64, f64, f64, f64, usize, f64) {
+        let f = a_room_with_an_open_frame();
+        let mut s = crate::light::LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 0.4;
+        s.mode = mode;
+        for (i, (x, y)) in [(2.0, 2.0), (6.0, 2.0), (2.0, 4.0), (6.0, 4.0)].iter().enumerate() {
+            s.luminaires.push(cad_light::Luminaire {
+                id: i as u32 + 1,
+                profile: crate::light::BUILTIN.to_string(),
+                position: cad_light::Vertex::new(*x, *y, 2.9),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        let doc = cad_kernel::Document::default();
+        let t = std::time::Instant::now();
+        s.calculate(&doc, Some(&f));
+        let secs = t.elapsed().as_secs_f64();
+        let r = s.rooms.first().expect("a room");
+        let g = if r.grid_en.values.is_empty() { &r.grid } else { &r.grid_en };
+        let mask = if r.grid_en.values.is_empty() { &r.mask } else { &r.mask_en };
+        let dropped = mask.iter().filter(|k| !**k).count();
+        (g.avg, g.min, g.max, g.u0(), dropped, secs)
+    }
+
+    /// THE SUBSTITUTION REACHES THE ANSWER when the piece is in the measured room.
+    ///
+    /// This is the assertion the gym run could not make. A box is more occluding than an open frame
+    /// — solid where the frame is air — so the two modes must NOT agree here. If they did, either
+    /// the substitution is not reaching the engine or the room does not contain the piece, and both
+    /// would make every other Express number meaningless.
+    #[test]
+    fn boxing_an_open_frame_changes_the_answer() {
+        let (ea, emin, emax, eu0, edrop, esec) = run(crate::light::CalcMode::Express);
+        let (ta, tmin, tmax, tu0, tdrop, tsec) = run(crate::light::CalcMode::Thorough);
+        let pc = |a: f64, b: f64| if b.abs() > 1e-9 { 100.0 * (a - b) / b } else { 0.0 };
+        println!("\n=== EXPRESS AGAINST THOROUGH, furniture INSIDE the measured room ===");
+        println!("{:<10} {:>9} {:>9} {:>9} {:>8} {:>8} {:>8}", "mode", "avg lx", "min lx", "max lx", "U0", "masked", "seconds");
+        println!("{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}", "Express", ea, emin, emax, eu0, edrop, esec);
+        println!("{:<10} {:>9.2} {:>9.2} {:>9.2} {:>8.3} {:>8} {:>8.2}", "Thorough", ta, tmin, tmax, tu0, tdrop, tsec);
+        println!(
+            "  Express against Thorough:  avg {:+.1}%   min {:+.1}%   max {:+.1}%   U0 {:+.3}",
+            pc(ea, ta), pc(emin, tmin), pc(emax, tmax), eu0 - tu0,
+        );
+
+        assert!(ta > 1.0, "the reference run must actually be lit: {ta:.2} lx");
+        assert!(
+            (ea - ta).abs() > 0.01 || edrop != tdrop,
+            "boxing an open frame must change SOMETHING — avg {ea:.3} against {ta:.3}, \
+             masked {edrop} against {tdrop}. If these agree the substitution is not reaching the \
+             engine, and no Express figure means anything.",
+        );
+    }
+
+    /// A BOX BURIES CELLS AN OPEN FRAME DOES NOT, and that is the honest, useful difference: the
+    /// buried-cell test is exact on a box and meaningless on a mesh that is not watertight.
+    #[test]
+    fn the_box_excludes_cells_the_frame_leaves_measurable() {
+        let (_, _, _, _, edrop, _) = run(crate::light::CalcMode::Express);
+        let (_, _, _, _, tdrop, _) = run(crate::light::CalcMode::Thorough);
+        assert!(
+            edrop > tdrop,
+            "the box stands where the frame is air, so it must bury more cells: \
+             Express {edrop}, Thorough {tdrop}",
+        );
+    }
+}

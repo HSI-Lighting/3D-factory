@@ -5916,20 +5916,52 @@ impl CadApp {
     /// rebuilding costs: `meshes_gen` moves whenever the scene triangles are replaced, and the
     /// factory's own `geom_version` moves whenever the CSG model is rebuilt. Everything else here
     /// is a handful of scalars and is hashed by value.
+    ///
+    /// IT MIRRORS THE BUILD'S BRANCH, and both halves of that matter.
+    ///
+    /// The build stopped reading `light.meshes` when the view moved to display detail; it reads the
+    /// FACTORY now, except on a 2D-only project. Hashing `meshes_gen` regardless then cost a full
+    /// 105 MB re-upload every time a calculation landed, for a buffer whose inputs had not moved —
+    /// two of those fire back to back on load, and the session dump shows them as 354 ms frames.
+    ///
+    /// The other direction was worse and was the real bug: `geom_version` is bumped by `recompute`,
+    /// which is the CSG solve — **placing, moving, rotating or deleting FURNITURE does not touch
+    /// it**. So once the build began reading furniture live, nothing in this key moved when a piece
+    /// did, and the SIMLUX view would have gone on showing the old pose indefinitely. The instances
+    /// are hashed through the very matrix the build uses, so the two cannot disagree about what a
+    /// pose is.
     fn scene3d_static_key(&self) -> u64 {
         let mut f = crate::light::Fnv::new();
-        f.u64(self.light.meshes_gen);
-        f.u64(self.factory.geom_version);
-        // Picks WHICH of the three ceiling branches runs, and the height one of them filters at.
+        // Shared by both branches.
         f.u64(self.light.hide_ceilings as u64);
         f.f32(self.light.plane_height);
-        // The CSG mesh is only consulted to choose that branch, but "is there a model at all"
-        // changes the answer, so it is asked rather than assumed.
-        f.u64(self.factory.cached.positions.len() as u64);
         // THROUGH JSON, for the reason `hash_json` gives: a material gains fields, and a hand
         // written list of them is a list that falls behind without saying so. The failure here
         // would be a reflectance edit that changes the report and not the picture.
         crate::light::hash_json(&mut f, "materials", &self.light.materials);
+
+        let from_factory =
+            self.factory.cached.positions.len() >= 3 || !self.factory.furniture.is_empty();
+        f.u64(from_factory as u64);
+        if from_factory {
+            f.u64(self.factory.geom_version);
+            f.u64(self.factory.cached.positions.len() as u64);
+            // EVERY INSTANCE, THROUGH ITS OWN MODEL MATRIX — 26 of them on the reference plan, so
+            // 416 floats, which is nothing beside the buffer it guards.
+            f.u64(self.factory.furniture.len() as u64);
+            for (i, inst) in self.factory.furniture.iter().enumerate() {
+                f.u64(inst.asset as u64);
+                if let Some(m) = self.factory.furniture_model_matrix(i) {
+                    for v in m {
+                        f.f32(v);
+                    }
+                }
+            }
+        } else {
+            // The 2D-only fallback is the one path that still draws `light.meshes`, so this is the
+            // one place its generation counter is an input.
+            f.u64(self.light.meshes_gen);
+        }
         f.finish()
     }
 
@@ -65446,6 +65478,21 @@ mod the_scene_cache {
         app.factory.add_building_outline(&rect, 3.0).expect("building");
         app.factory.add_room(&rect).expect("room");
         app.factory.recompute();
+        // A PIECE OF FURNITURE, because the view reads the factory's furniture live and `recompute`
+        // — the only thing that moves `geom_version` — is never called when one is placed or moved.
+        let idx = app.factory.add_furniture_asset(
+            "stool".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
+                    [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 6],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::new(5.0, 4.0, 0.0));
         app.light.auto_center_light = false;
         app.light.cell_size = 1.0;
         app.light.luminaires.push(cad_light::Luminaire {
@@ -65521,11 +65568,26 @@ mod the_scene_cache {
     fn everything_the_room_is_built_from_moves_the_key() {
         let cases: Vec<(&str, fn(&mut CadApp))> = vec![
             ("the scene triangles", |a: &mut CadApp| {
+                // ON A 2D-ONLY PROJECT, where the fallback branch really does draw `light.meshes`.
+                // On a factory project it must NOT invalidate — see the sibling test.
+                a.factory = crate::factory::FactoryState::default();
                 let m = a.light.meshes.clone();
                 a.light.set_meshes(m); // same content: the GENERATION is what must move
             }),
             ("the CSG model", |a: &mut CadApp| {
                 a.factory.recompute();
+            }),
+            ("moving a piece of furniture", |a: &mut CadApp| {
+                a.factory.furniture[0].pos[0] += 0.4;
+            }),
+            ("rotating a piece of furniture", |a: &mut CadApp| {
+                a.factory.furniture[0].rot[2] += 12.0;
+            }),
+            ("scaling a piece of furniture", |a: &mut CadApp| {
+                a.factory.furniture[0].scale *= 1.3;
+            }),
+            ("deleting a piece of furniture", |a: &mut CadApp| {
+                a.factory.furniture.clear();
             }),
             ("the hide-ceilings toggle", |a: &mut CadApp| {
                 a.light.hide_ceilings = !a.light.hide_ceilings;
@@ -65546,6 +65608,27 @@ mod the_scene_cache {
             change(&mut app);
             assert_ne!(app.scene3d_static_key(), before, "{what} must invalidate the cached room");
         }
+    }
+
+    /// A CALCULATION LANDING MUST NOT REBUILD THE ROOM.
+    ///
+    /// The other half of `everything_the_room_is_built_from_moves_the_key`, and the reason the key
+    /// mirrors the build's branch instead of hashing everything. On a project WITH a model the view
+    /// draws the factory, not `light.meshes` — so a finished calculation changes nothing it reads,
+    /// and invalidating on it costs a 105 MB re-upload for a buffer whose inputs have not moved.
+    /// Two of those fire back to back on load; the session dump shows them as 354 ms frames.
+    #[test]
+    fn a_finished_calculation_does_not_rebuild_the_room() {
+        let mut app = a_lit_room();
+        assert!(!app.factory.furniture.is_empty(), "the fixture must be a factory project");
+        let before = app.scene3d_static_key();
+        let m = app.light.meshes.clone();
+        app.light.set_meshes(m);
+        assert_eq!(
+            app.scene3d_static_key(),
+            before,
+            "the view draws the factory here, so new engine meshes are not one of its inputs",
+        );
     }
 
     /// `set_meshes` IS THE ONLY WAY IN. Writing the field direct compiles and leaves the view
@@ -66240,5 +66323,152 @@ mod the_simlux_perf_tap {
             let n = needle(parts);
             assert!(body.contains(&n), "the tap no longer mentions `{n}`");
         }
+    }
+}
+
+#[cfg(test)]
+mod what_furniture_costs_the_calculation {
+    use super::*;
+
+    /// Does one small piece of furniture really make a calculation six times slower?
+    #[test]
+    #[ignore = "timing probe"]
+    fn time_calculate_with_and_without_furniture() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        for with in [false, true] {
+            let mut app = CadApp::default();
+            app.factory.add_building_outline(&rect, 3.0).expect("building");
+            app.factory.add_room(&rect).expect("room");
+            app.factory.recompute();
+            if with {
+                let idx = app.factory.add_furniture_asset(
+                    "stool".into(),
+                    crate::mesh_io::ObjMesh {
+                        positions: vec![
+                            [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
+                            [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                        ],
+                        normals: vec![[0.0, 0.0, 1.0]; 6],
+                        color: Some([0.6, 0.6, 0.6]),
+                        alpha: Vec::new(),
+                    },
+                );
+                app.factory.place_furniture(idx, glam::Vec3::new(5.0, 4.0, 0.0));
+            }
+            app.light.auto_center_light = false;
+            app.light.cell_size = 1.0;
+            app.light.luminaires.push(cad_light::Luminaire {
+                id: 1,
+                profile: crate::light::BUILTIN.to_string(),
+                position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+                rotation_deg: 0.0, tilt_deg: 0.0, dimming: 1.0,
+                watts_override: None, flux_override: None, from_block: None,
+            });
+            let t = std::time::Instant::now();
+            app.light.calculate(&cad_kernel::Document::default(), Some(&app.factory));
+            let r = app.light.rooms.first().expect("a room");
+            println!(
+                "furniture={with:<5} calculate {:>7.2} s   grid {}x{}  avg {:.1} lx",
+                t.elapsed().as_secs_f64(), r.plane.cols, r.plane.rows, r.grid.avg,
+            );
+        }
+    }
+}
+
+/// FORENSIC PROBE — what the 2D lux overlay costs, one mesh against one shape per cell.
+#[cfg(test)]
+mod what_the_two_d_overlay_costs {
+    use super::*;
+
+    #[test]
+    #[ignore = "timing probe"]
+    fn one_mesh_against_one_shape_per_cell() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(20.0, 0.0),
+            glam::Vec2::new(20.0, 14.0),
+            glam::Vec2::new(0.0, 14.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = 0.2; // a fine grid, as a real project has
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 1, profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(10.0, 7.0, 2.9),
+            rotation_deg: 0.0, tilt_deg: 0.0, dimming: 1.0,
+            watts_override: None, flux_override: None, from_block: None,
+        });
+        app.light.calculate(&cad_kernel::Document::default(), Some(&app.factory));
+        app.light.show_overlay = true;
+        let r = app.light.rooms.first().expect("a room");
+        let cells = (r.plane.cols * r.plane.rows) as usize;
+
+        let ctx = egui::Context::default();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0));
+
+        // THE PATH AS SHIPPED — one mesh per room. Timed over several paints; the first allocates.
+        let mut new_ms = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let out = ctx.run(egui::RawInput::default(), |c| {
+                app.paint_lux_overlay(&c.layer_painter(egui::LayerId::background()), area);
+            });
+            // TESSELLATION IS INSIDE THE MEASUREMENT. `ctx.run` only builds the paint LIST; the
+            // per-shape anti-aliasing that makes 16,384 rectangles expensive happens here, and a
+            // timing that stopped before it would miss the entire effect under test.
+            let prims = ctx.tessellate(out.shapes, 1.0);
+            std::hint::black_box(prims.len());
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            new_ms = new_ms.min(ms);
+        }
+
+        // THE OLD PATH — one `rect_filled` per cell, rebuilt here so the comparison is measured and
+        // not remembered.
+        let mut old_ms = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            let out = ctx.run(egui::RawInput::default(), |c| {
+                let p = c.layer_painter(egui::LayerId::background());
+                let clip = p.with_clip_rect(area);
+                for room in &app.light.rooms {
+                    let (grid, plane) = (&room.grid, &room.plane);
+                    let dx = plane.width / plane.cols.max(1) as f32;
+                    let dy = plane.depth / plane.rows.max(1) as f32;
+                    for row in 0..plane.rows {
+                        for col in 0..plane.cols {
+                            let i = (row * plane.cols + col) as usize;
+                            if room.mask.get(i).is_some_and(|k| !k) { continue; }
+                            let v = grid.values[i];
+                            let c3 = app.report_opts.lux_rgb(v, 500.0, app.light.ramp.rgb_fn());
+                            let x0 = plane.origin.x + col as f32 * dx;
+                            let y0 = plane.origin.y + row as f32 * dy;
+                            let p0 = app.w2s_m(Vec2::new(x0 as f64, y0 as f64), area);
+                            let p1 = app.w2s_m(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), area);
+                            clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0,
+                                egui::Color32::from_rgb(c3[0], c3[1], c3[2]));
+                        }
+                    }
+                }
+            });
+            let prims = ctx.tessellate(out.shapes, 1.0);
+            std::hint::black_box(prims.len());
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            old_ms = old_ms.min(ms);
+        }
+
+        println!("\n=== 2D LUX OVERLAY, {cells} cells ===");
+        println!("  one shape per cell (before) : {old_ms:>8.2} ms per frame");
+        println!("  one mesh per room  (after)  : {new_ms:>8.2} ms per frame");
+        println!("  {:.0}x less", old_ms / new_ms.max(1e-6));
     }
 }
