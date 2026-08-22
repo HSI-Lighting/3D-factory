@@ -1973,7 +1973,23 @@ pub struct FacetedFurniture {
 }
 
 /// Above this triangle count a furniture asset gets a decimated display proxy.
-pub const LOD_TRI_THRESHOLD: usize = 200_000;
+///
+/// WAS 200_000, WHICH LET THE WINDOWS STRAIGHT THROUGH. The old figure was pitched when the
+/// decimator could only run on bare geometry, so it was aimed at the multi-million-triangle imports
+/// that happened to have no UVs. Now that the proxy carries UVs, alpha and face groups there is no
+/// reason to hold it that high — and the gym plan shows what the gap cost: a Window is 39,667
+/// triangles, for a frame and a pane, and six of them are 238,002 triangles sitting just under the
+/// bar. Measured on that file:
+///
+/// ```text
+///   threshold 200_000   1,146,673 tris drawn
+///   threshold  20_000     916,471 tris drawn      Window 39,667 -> 1,300
+/// ```
+///
+/// The trade is real and small, and it is the right way round: an asset between 20k and 200k
+/// triangles is now drawn from a proxy, so a piece with genuinely fine detail seen close up reads
+/// slightly coarser than it did. 1,300 triangles is a generous budget for a window.
+pub const LOD_TRI_THRESHOLD: usize = 20_000;
 
 /// Above this triangle count, [`FurnitureAsset::group_geom`] stops running the coplanar flood fill
 /// and uses the import's material PARTS as the face grouping instead. The flood fill is O(n) with a
