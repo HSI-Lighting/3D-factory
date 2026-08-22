@@ -14319,7 +14319,9 @@ impl CadApp {
                     [1.0,0.0,0.0,0.0, 0.0,1.0,0.0,0.0, 0.0,0.0,1.0,0.0, 0.0,0.0,0.0,1.0];
                 // Each opaque draw also carries its WORLD model matrix (last [f32;16]) so the sun
                 // shadow pass + normal maps can transform local geometry to world.
-                let mut furn_draws: Vec<(u64, StdArc<Vec<crate::light3d::V3>>, [f32; 16], [f32; 16])> =
+                // `(key, mesh, camera·model, world model, in_view)` — see `aabb_in_frustum` for why
+                // the off-screen ones are carried in the list rather than dropped from it.
+                let mut furn_draws: Vec<(u64, StdArc<Vec<crate::light3d::V3>>, [f32; 16], [f32; 16], bool)> =
                     Vec::with_capacity(self.factory.furniture.len());
                 // Textured furniture is peeled off into its own list (image-mapped pass); the
                 // rest stay flat-shaded. `tex_assets_owned` carries the pixels the pass needs.
@@ -14339,6 +14341,16 @@ impl CadApp {
                     // Depth (NDC z of the instance origin) for back-to-front sorting of any glass.
                     let origin = glam::Vec3::new(model[12], model[13], model[14]);
                     let depth = mvp_m.project_point3(origin).z;
+                    // IS ANY OF IT ON SCREEN? Against the asset's own cached local bounds, through
+                    // `fmvp` — no per-instance world AABB to build or keep in step with a move.
+                    // An asset that has somehow gone missing counts as visible: the draw below will
+                    // find nothing to draw, and guessing "invisible" would hide a real piece.
+                    let in_view = self
+                        .factory
+                        .furniture_lib
+                        .get(self.factory.furniture[i].asset)
+                        .map(|a| crate::light3d::aabb_in_frustum(&fmvp, a.local_min, a.local_max))
+                        .unwrap_or(true);
                     // PER-SURFACE textured piece: split into one textured group per texture used
                     // plus a flat remainder. Only returns Some when the instance has per-face
                     // textures (else the whole-object paths below handle it unchanged).
@@ -14370,7 +14382,7 @@ impl CadApp {
                                 .entry(*key)
                                 .or_insert_with(|| StdArc::new(verts.clone()))
                                 .clone();
-                            furn_draws.push((*key, mesh, fmvp, model));
+                            furn_draws.push((*key, mesh, fmvp, model, in_view));
                         }
                         continue;
                     }
@@ -14403,7 +14415,7 @@ impl CadApp {
                             self.furniture_gpu_meshes.insert(key, mesh);
                         }
                         let mesh = self.furniture_gpu_meshes[&key].clone();
-                        furn_draws.push((key, mesh, fmvp, model));
+                        furn_draws.push((key, mesh, fmvp, model, in_view));
                         // Peel this piece's see-through triangles into the blended pass.
                         if let Some((tkey, tverts)) = self.factory.furniture_translucent_mesh(i) {
                             let tmesh = self
@@ -14729,9 +14741,11 @@ impl CadApp {
                             let gl = gp.gl();
                             let vp = info.viewport_in_pixels();
                             let s = info.screen_size_px;
-                            // Furniture draws as (key, &local_mesh, camera·model, world model) slices.
-                            let furn: Vec<(u64, &[crate::light3d::V3], [f32; 16], [f32; 16])> =
-                                furn_draws.iter().map(|(k, m, mv, md)| (*k, m.as_slice(), *mv, *md)).collect();
+                            // Furniture draws as (key, &local_mesh, camera·model, world model,
+                            // in_view) slices. Off-screen instances stay in the list — only the
+                            // camera pass may skip them.
+                            let furn: Vec<(u64, &[crate::light3d::V3], [f32; 16], [f32; 16], bool)> =
+                                furn_draws.iter().map(|(k, m, mv, md, v)| (*k, m.as_slice(), *mv, *md, *v)).collect();
                             // Translucent furniture (already sorted back-to-front); drop the depth.
                             let transp: Vec<(u64, &[crate::light3d::V3A], [f32; 16], [f32; 16])> =
                                 transp_draws_owned.iter()
@@ -65481,5 +65495,68 @@ mod what_a_simlux_frame_costs_probe {
         println!("   capped at overlay_res's 12,000 cells per room, so it cannot grow without bound.)");
         println!("\n  GPU: the room used to be re-uploaded every frame too (scene_ver = None).");
         println!("       It is now versioned, so those {:.1} MB cross the bus only when it changes.", mb(stat.len()));
+    }
+}
+
+/// FORENSIC PROBE — how much of the model is off screen at a typical working camera?
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release what_frustum_culling_saves -- --ignored --nocapture`
+#[cfg(test)]
+mod what_frustum_culling_saves_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_frustum_culling_saves() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+
+        let f = &app.factory;
+        let total_tris: usize = (0..f.furniture.len())
+            .filter_map(|i| f.furniture_lib.get(f.furniture[i].asset))
+            .map(|a| a.positions.len() / 3)
+            .sum();
+
+        // Where the model sits, so the camera can be aimed at something real.
+        let mut c = glam::Vec3::ZERO;
+        let mut n = 0.0f32;
+        for i in 0..f.furniture.len() {
+            let m = f.furniture_model_matrix(i).unwrap_or(glam::Mat4::IDENTITY.to_cols_array());
+            c += glam::Vec3::new(m[12], m[13], m[14]);
+            n += 1.0;
+        }
+        if n > 0.0 {
+            c /= n;
+        }
+
+        println!("\n=== FRUSTUM CULLING, {} instances / {total_tris} triangles ===", f.furniture.len());
+        println!("{:<34} {:>6} {:>12} {:>8}", "camera", "drawn", "tris drawn", "culled");
+        for (label, dist) in [
+            ("whole model in shot (120 m)", 120.0f32),
+            ("a room (25 m)", 25.0),
+            ("working on one machine (6 m)", 6.0),
+            ("close on a detail (2 m)", 2.0),
+        ] {
+            let mvp_m = glam::Mat4::from_cols_array(&crate::light3d::mvp(
+                0.6, 0.35, dist, c.to_array(), 16.0 / 9.0, false,
+            ));
+            let (mut drawn, mut tris) = (0usize, 0usize);
+            for i in 0..f.furniture.len() {
+                let model = f.furniture_model_matrix(i).unwrap_or(glam::Mat4::IDENTITY.to_cols_array());
+                let fmvp = (mvp_m * glam::Mat4::from_cols_array(&model)).to_cols_array();
+                let Some(a) = f.furniture_lib.get(f.furniture[i].asset) else { continue };
+                if crate::light3d::aabb_in_frustum(&fmvp, a.local_min, a.local_max) {
+                    drawn += 1;
+                    tris += a.positions.len() / 3;
+                }
+            }
+            let pct = 100.0 * (1.0 - tris as f64 / total_tris.max(1) as f64);
+            println!("{:<34} {:>6} {:>12} {:>7.1}%", label, drawn, tris, pct);
+        }
+        println!("\n  Every one of these used to be submitted at every camera, every frame.");
     }
 }

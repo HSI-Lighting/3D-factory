@@ -516,6 +516,47 @@ pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho
     (proj * view).to_cols_array()
 }
 
+/// IS THIS BOX POSSIBLY IN SHOT? — the conservative frustum test, in clip space.
+///
+/// Every furniture instance was submitted every frame whether or not any of it was on screen. On
+/// the reference gym plan that is 26 instances and 7,036,129 triangles handed to the GPU in order
+/// to look at the inside of one machine.
+///
+/// `clip` is projection·view·model, so an asset's own cached LOCAL bounds go in untransformed and
+/// this does the transform — no per-instance world AABB to build or keep in step.
+///
+/// The eight corners are tested against the six planes as `-w ≤ x,y,z ≤ w`, the convention both
+/// `perspective_rh_gl` and `orthographic_rh_gl` produce. A box is rejected only when ALL EIGHT
+/// corners fall outside THE SAME plane, which is the standard conservative form and is the right
+/// way round: it will occasionally keep a box that is not really visible — a large one straddling
+/// two planes with no corner inside, which is exactly the room you are standing in — and it can
+/// never drop one that is.
+pub fn aabb_in_frustum(clip: &[f32; 16], mn: [f32; 3], mx: [f32; 3]) -> bool {
+    let m = Mat4::from_cols_array(clip);
+    // One counter per plane. Rejecting on "outside ANY plane" instead — the tempting simpler
+    // form — culls a box that spans the whole view, because no single corner need be inside it.
+    let mut out = [0u8; 6];
+    for i in 0..8 {
+        let p = glam::Vec4::new(
+            if i & 1 == 0 { mn[0] } else { mx[0] },
+            if i & 2 == 0 { mn[1] } else { mx[1] },
+            if i & 4 == 0 { mn[2] } else { mx[2] },
+            1.0,
+        );
+        let c = m * p;
+        // `w` is negative behind the eye, which makes these comparisons flip — and that is the
+        // behaviour wanted, not a bug to guard: a point behind the camera then fails both the
+        // near test and one of each opposing pair, so a box entirely behind is culled by `z < -w`.
+        if c.x < -c.w { out[0] += 1; }
+        if c.x > c.w { out[1] += 1; }
+        if c.y < -c.w { out[2] += 1; }
+        if c.y > c.w { out[3] += 1; }
+        if c.z < -c.w { out[4] += 1; }
+        if c.z > c.w { out[5] += 1; }
+    }
+    !out.iter().any(|&n| n == 8)
+}
+
 // Depth-only pass from the sun's point of view — the shadow map. Positions only; the fragment
 // stage writes nothing but depth.
 const DEPTH_VS: &str = r#"
@@ -4447,9 +4488,16 @@ impl Scene3dRenderer {
         // from a persistent per-key GPU buffer with a model matrix — so a heavy mesh is uploaded
         // once and never CPU-transformed on import/move/rotate. `key` = asset+colour; instances
         // that share it share the buffer. `local_mesh` is only read the first time a key appears.
-        // `(key, local_mesh, camera·model, world model)` — the world model added for the shadow
+        // `(key, local_mesh, camera·model, world model, in_view)` — the world model for the shadow
         // lookup + normal maps (identity's fine for already-world geometry).
-        furn: &[(u64, &[V3], [f32; 16], [f32; 16])],
+        //
+        // `in_view` is [`aabb_in_frustum`] against the CAMERA, and ONLY THE CAMERA PASS MAY HONOUR
+        // IT. The list still has to arrive whole, because two other things read it and both would
+        // be wrong with the off-screen instances missing: the shadow pass, where a machine behind
+        // the camera still casts into shot, and the buffer-eviction set, which would drop the GPU
+        // buffer of anything off screen and re-upload it the moment it came back — turning a pan
+        // into a stutter, which is the opposite of the point.
+        furn: &[(u64, &[V3], [f32; 16], [f32; 16], bool)],
         // TRANSLUCENT furniture triangles, each `(key, local_mesh, camera·model)` like `furn` but
         // holding only the see-through faces (glass). Uploaded once per key, drawn in a blended
         // pass after all opaque geometry; the caller passes them BACK-TO-FRONT for correct order.
@@ -4562,7 +4610,7 @@ impl Scene3dRenderer {
             f.bytes(bytes(dyn_verts));
             sec[2] = f.0; // overlay + lines + per-frame opaque
 
-            for (k, m, mv, md) in furn {
+            for (k, m, mv, md, _) in furn {
                 f.u64(*k);
                 f.u64(m.len() as u64);
                 f.f32s(mv);
@@ -4707,7 +4755,7 @@ impl Scene3dRenderer {
             // this they accumulate for the whole session. Keyed on what THIS frame draws.
             if evict_stale {
                 use std::collections::HashSet;
-                let live_furn: HashSet<u64> = furn.iter().map(|&(k, _, _, _)| k).collect();
+                let live_furn: HashSet<u64> = furn.iter().map(|&(k, _, _, _, _)| k).collect();
                 self.furn_bufs.retain(|k, &mut (vao, vbo, _)| {
                     if live_furn.contains(k) { return true; }
                     gl.delete_vertex_array(vao);
@@ -4803,7 +4851,7 @@ impl Scene3dRenderer {
                         }
                         // Furniture (local) → depth_mvp = light_mvp · model.
                         let lm = Mat4::from_cols_array(lmvp);
-                        for &(key, fverts, _fmvp, ref model) in furn {
+                        for &(key, fverts, _fmvp, ref model, _seen) in furn {
                             if let Some((vao, count)) = self.furn_buf(gl, key, fverts) {
                                 let dm = (lm * Mat4::from_cols_array(model)).to_cols_array();
                                 if let Some(loc) = &self.u_depth_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, &dm); }
@@ -4954,7 +5002,13 @@ impl Scene3dRenderer {
             // Same opaque state as the scene. Each furniture draws from a persistent GPU buffer
             // (uploaded once, keyed by asset+colour) with camera·model — so import/move/rotate
             // of even a multi-million-triangle piece needs no CPU transform and no re-upload.
-            for &(key, verts, ref fmvp, ref model) in furn {
+            // THE ONE PASS THAT SKIPS WHAT IS OFF SCREEN. The shadow pass above deliberately does
+            // not — a piece behind the camera still casts into shot — and neither does the
+            // eviction set, which would otherwise re-upload it the moment it panned back in.
+            for &(key, verts, ref fmvp, ref model, in_view) in furn {
+                if !in_view {
+                    continue;
+                }
                 self.draw_furn(gl, key, verts, fmvp, model);
             }
 
@@ -7411,5 +7465,136 @@ mod overlay_cost_probe {
         println!("grid {gc} x {gr}  ->  overlay {nx} x {ny}");
         println!("  {verts} vertices, {:.3} ms to build", per);
         println!("  a 60 fps frame is 16.7 ms");
+    }
+}
+
+/// EVERY FURNITURE INSTANCE WAS SUBMITTED EVERY FRAME, on screen or not — 26 of them and
+/// 7,036,129 triangles on the reference gym plan, to look at the inside of one machine.
+///
+/// The danger in a culler is not the one it drops, it is the one it drops WRONGLY: geometry that
+/// blinks out at the edge of a pan is a far worse bug than the frames it saves. So these tests are
+/// mostly about what must NOT be culled.
+#[cfg(test)]
+mod frustum_culling {
+    use super::*;
+
+    /// Camera 10 m out along +X, looking at the origin, Z up — the same call the viewport makes.
+    fn cam() -> [f32; 16] {
+        mvp(0.0, 0.0, 10.0, [0.0, 0.0, 0.0], 16.0 / 9.0, false)
+    }
+
+    fn cube(c: [f32; 3], r: f32) -> ([f32; 3], [f32; 3]) {
+        ([c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r])
+    }
+
+    #[test]
+    fn what_the_camera_is_looking_at_is_kept() {
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 0.5);
+        assert!(aabb_in_frustum(&cam(), mn, mx));
+    }
+
+    /// A BOX THAT SWALLOWS THE CAMERA — the case the obvious implementation gets wrong.
+    ///
+    /// Testing "outside ANY plane" rejects this, because a box spanning the whole view need not
+    /// have a single corner inside it: every corner is outside left OR right, and outside top OR
+    /// bottom. Counting per plane and demanding all eight on the same side is what keeps it. The
+    /// room you are standing in is exactly this box, so getting it wrong empties the screen.
+    #[test]
+    fn a_box_the_camera_is_inside_is_kept() {
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 100.0);
+        assert!(aabb_in_frustum(&cam(), mn, mx), "the surrounding room must not be culled");
+    }
+
+    #[test]
+    fn something_far_off_to_the_side_is_culled() {
+        let (mn, mx) = cube([0.0, 500.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx));
+        let (mn, mx) = cube([0.0, 0.0, 500.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx), "and above it");
+    }
+
+    /// The camera sits at x = +10 looking toward the origin, so x = +50 is squarely behind it.
+    #[test]
+    fn something_behind_the_camera_is_culled() {
+        let (mn, mx) = cube([50.0, 0.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&cam(), mn, mx));
+    }
+
+    /// AT THE EDGE, IN IS IN. A culler that is a little too eager is not visibly different from a
+    /// correct one until something pops at the frame edge, which is precisely when it is noticed.
+    /// Walk a box in from far outside and check it is kept from the moment it touches the frustum.
+    #[test]
+    fn a_box_crossing_the_edge_is_kept_before_it_is_fully_in() {
+        let m = cam();
+        // Far enough out to be culled; then step toward the axis until it is kept, and check that
+        // once kept it STAYS kept all the way in — no gap, no flicker.
+        let mut first_kept = None;
+        for i in 0..=200 {
+            let y = 20.0 - i as f32 * 0.1;
+            let (mn, mx) = cube([0.0, y, 0.0], 1.0);
+            let kept = aabb_in_frustum(&m, mn, mx);
+            match (first_kept, kept) {
+                (None, true) => first_kept = Some(y),
+                (Some(at), false) => panic!("culled again at y={y} after first keeping at y={at}"),
+                _ => {}
+            }
+        }
+        let at = first_kept.expect("it must be kept by the time it reaches the axis");
+        assert!(at > 1.0, "a box 1 m across must be kept while still off-axis, not only at y=0");
+    }
+
+    /// The parallel projection is the other half of the viewport and has its own clip volume.
+    #[test]
+    fn the_orthographic_view_culls_too() {
+        let m = mvp(0.0, 0.0, 10.0, [0.0, 0.0, 0.0], 16.0 / 9.0, true);
+        let (mn, mx) = cube([0.0, 0.0, 0.0], 0.5);
+        assert!(aabb_in_frustum(&m, mn, mx), "what it is looking at is kept");
+        let (mn, mx) = cube([0.0, 500.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "and what is far to the side is not");
+    }
+
+    /// A DEGENERATE BOX IS STILL A BOX. Assets with no geometry cache `[0,0,0]` bounds, and a
+    /// zero-extent AABB at the origin must not be treated as "nothing to see".
+    #[test]
+    fn a_zero_sized_box_at_the_target_is_kept() {
+        assert!(aabb_in_frustum(&cam(), [0.0; 3], [0.0; 3]));
+    }
+
+    /// EACH PLANE PAIR EARNS ITS PLACE.
+    ///
+    /// The cases above are all caught by more than one plane at once — a box 500 m to the side is
+    /// past the far plane as well as past the right one, and anything behind the eye has negative
+    /// `w`, which puts it outside BOTH of every opposing pair. Deleting a whole pair left every one
+    /// of them passing, which means three of the six planes were untested code.
+    ///
+    /// These sit where exactly one pair can catch them. The camera is 10 m out with a 45° field and
+    /// a far plane at 80 m, so at the target the view is about ±7.4 m wide and ±4.1 m tall.
+    #[test]
+    fn every_plane_pair_is_the_only_one_catching_something() {
+        let m = cam();
+        // 20 m to the side, level with the axis and 22 m from the eye: inside near and far,
+        // vertically centred, so only LEFT/RIGHT can reject it.
+        //
+        // BOTH SIDES, and that is not symmetry for its own sake — with only the +Y case here,
+        // deleting the LEFT plane broke nothing and it was untested code. Same for the −Z case
+        // below and the BOTTOM plane. A culler with a dead plane looks perfect until the day
+        // something sails through it.
+        let (mn, mx) = cube([0.0, 20.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the right plane must cull this");
+        let (mn, mx) = cube([0.0, -20.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the left plane must cull this");
+        // The same, turned into the vertical: only TOP/BOTTOM can reject these.
+        let (mn, mx) = cube([0.0, 0.0, 20.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the top plane must cull this");
+        let (mn, mx) = cube([0.0, 0.0, -20.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the bottom plane must cull this");
+        // Straight down the view axis, 110 m from the eye and past the 80 m far plane: dead centre
+        // of the frame, so only FAR can reject it.
+        let (mn, mx) = cube([-100.0, 0.0, 0.0], 1.0);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the far plane must cull this");
+        // 40 mm in front of the eye, inside the 100 mm near plane, on the axis and with positive
+        // `w` — so the side planes read it as inside and only NEAR can reject it.
+        let (mn, mx) = cube([9.96, 0.0, 0.0], 0.01);
+        assert!(!aabb_in_frustum(&m, mn, mx), "the near plane must cull this");
     }
 }
