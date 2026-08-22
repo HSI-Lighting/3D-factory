@@ -2009,6 +2009,13 @@ pub struct CadApp {
     /// `paint_lux_overlay` takes `&self`.
     lux_overlay_us: std::cell::Cell<u64>,
     lux_overlay_cells: std::cell::Cell<u32>,
+    /// The SIMLUX GL draw alone, microseconds, `glFinish` either side — written by the paint
+    /// callback and read by the tap on the NEXT frame. Atomic because the callback owns nothing.
+    ///
+    /// Only this separates "the GPU is slow" from "everything else in the frame is slow", and
+    /// inter-frame wall time cannot: it is the whole app frame, and I have twice reasoned wrongly
+    /// from it. `glFinish` is a stall, so it is only issued while the recorder is running.
+    simlux_gl_us: StdArc<std::sync::atomic::AtomicU64>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
     /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
@@ -4091,6 +4098,7 @@ impl Default for CadApp {
             simlux_perf_key:        None,
             lux_overlay_us:         std::cell::Cell::new(0),
             lux_overlay_cells:      std::cell::Cell::new(0),
+            simlux_gl_us:           StdArc::new(std::sync::atomic::AtomicU64::new(0)),
             factory:             crate::factory::FactoryState::default(),
             factory_perf_prev:       None,
             factory_perf_last_frame: None,
@@ -15296,10 +15304,21 @@ impl CadApp {
                         crate::dbg_event!(
                             self,
                             crate::dbg_recorder::DbgEvent::FactoryPerf {
+                                // `gl` IS THE ONE NUMBER THAT SPLITS THE FRAME.
+                                //
+                                // `frame_us` is the wall time BETWEEN SIMLUX paints — the whole
+                                // app's frame, not this view's cost — so a 210 ms reading says
+                                // nothing about where the 210 ms went, and I have twice guessed
+                                // wrong from it. This is the GL draw alone, `glFinish` either side,
+                                // so `frame - gl` is everything else: the 2D canvas, egui, the rest.
+                                // It is LAST FRAME's value: the paint callback runs after this.
                                 phase: format!(
-                                    "{what} room={}v dyn={}v 2d-overlay {:.1} ms / {} cells",
+                                    "{what} room={}v dyn={}v gl {:.1} ms 2d-overlay {:.1} ms / {} cells",
                                     verts.len(),
                                     dyn_verts.len(),
+                                    self.simlux_gl_us.load(std::sync::atomic::Ordering::Relaxed)
+                                        as f64
+                                        / 1000.0,
                                     self.lux_overlay_us.get() as f64 / 1000.0,
                                     self.lux_overlay_cells.get(),
                                 ),
@@ -15328,12 +15347,21 @@ impl CadApp {
                     );
                 } else {
                     let renderer = self.light3d_renderer.clone();
+                    // TIME THE DRAW ITSELF, while the recorder is on. `glFinish` is a stall and
+                    // would be indefensible every frame, but it is exactly what makes the number
+                    // mean GPU time rather than "how far ahead the driver let us run".
+                    let gl_us = self.simlux_gl_us.clone();
+                    let time_gl = self.dbg.recording;
                     let cb = egui::PaintCallback {
                         rect,
                         callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
                             let gl = gp.gl();
                             let vp = info.viewport_in_pixels();
                             let s = info.screen_size_px;
+                            let t_gl = time_gl.then(|| {
+                                crate::light3d::gl_finish(gl);
+                                std::time::Instant::now()
+                            });
                             if let Ok(mut r) = renderer.lock() {
                                 // The lux view NEVER accumulates: it shares the renderer with the
                                 // factory, and averaging jittered samples of a false-colour scale
@@ -15352,6 +15380,13 @@ impl CadApp {
                                     false,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
+                                );
+                            }
+                            if let Some(t) = t_gl {
+                                crate::light3d::gl_finish(gl);
+                                gl_us.store(
+                                    t.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
                                 );
                             }
                         })),
@@ -66312,7 +66347,9 @@ mod the_simlux_perf_tap {
             .map(|e| a + e)
             .expect("re-anchor this if the tap moves");
         let body = &src[a..b];
-        assert!(body.len() < 4_000, "the slice must be the tap, not half the file");
+        // Generous, because the point is to catch an anchor that silently matched the whole rest
+        // of the file — not to police how long the tap is allowed to be.
+        assert!(body.len() < 8_000, "the slice must be the tap, not half the file");
         for parts in [
             &["DbgEvent::", "FactoryPerf"][..],
             &["simlux-", "slow-frame"][..],

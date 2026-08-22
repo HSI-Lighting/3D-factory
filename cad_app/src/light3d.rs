@@ -7606,3 +7606,17 @@ mod frustum_culling {
         assert!(!aabb_in_frustum(&m, mn, mx), "the near plane must cull this");
     }
 }
+
+/// BLOCK UNTIL THE GPU HAS ACTUALLY FINISHED.
+///
+/// The one thing that turns "how far ahead the driver let us run" into GPU time. Bracketing a draw
+/// with this is the only way to tell a slow GPU from a slow frame around it, and inter-frame wall
+/// time cannot — it is the whole app's frame.
+///
+/// A STALL, deliberately: it costs exactly the parallelism it exists to measure, so it belongs
+/// behind the recorder and nowhere else. Lives here because this is the module that owns the `glow`
+/// trait import; `app.rs` sees a different re-export of the crate and cannot call it directly.
+pub fn gl_finish(gl: &glow::Context) {
+    use glow::HasContext as _;
+    unsafe { gl.finish() };
+}
