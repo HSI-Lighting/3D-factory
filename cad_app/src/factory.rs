@@ -8448,7 +8448,10 @@ impl FactoryState {
             let mut out = Vec::with_capacity(lod.positions.len());
             for t in 0..lod.tri_count() {
                 let base = t * 3;
-                if glassy && (base..base + 3).all(|k| lod.vertex_alpha(k) < ALPHA_OPAQUE) {
+                // ANY vertex, matching `tri_is_translucent` on the full mesh — the peel here and
+                // the one in `furniture_translucent_mesh` have to agree exactly or a pane is
+                // drawn twice or lost.
+                if glassy && (base..base + 3).any(|k| lod.vertex_alpha(k) < ALPHA_OPAQUE) {
                     continue;
                 }
                 for k in base..base + 3 {
@@ -8501,20 +8504,31 @@ impl FactoryState {
         if !asset.is_translucent() {
             return None;
         }
+        // FROM THE SAME MESH THE SOLID PASS DRAWS. `furniture_local_mesh` peels this piece's glass
+        // OUT of the proxy, so if the panes came back from the full mesh the frame would be the
+        // proxy's and the glass the original's — two different meshes in one object.
+        let lod = if asset.needs_lod() { Some(asset.lod_geom()) } else { None };
+        let (src_pos, src_nrm, src_alpha): (&[[f32; 3]], &[[f32; 3]], &[f32]) = match &lod {
+            Some(a) => (&a.positions, &a.normals, &a.alpha),
+            None => (&asset.positions, &asset.normals, &asset.alpha),
+        };
         let mut out = Vec::new();
-        for t in 0..asset.positions.len() / 3 {
+        for t in 0..src_pos.len() / 3 {
             let base = t * 3;
-            if !tri_is_translucent(asset, base) {
+            // The proxy's own alpha, and ANY vertex — the same rule `tri_is_translucent` applies to
+            // the full mesh. `all` instead would leave a triangle that is part glass in the solid
+            // pass here and out of it there, so a pane would be drawn twice or not at all.
+            if !(base..base + 3).any(|k| src_alpha.get(k).copied().unwrap_or(1.0) < ALPHA_OPAQUE) {
                 continue;
             }
             for k in base..base + 3 {
-                let p = asset.positions[k];
-                let n = asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
+                let p = src_pos[k];
+                let n = src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]);
                 let c = shade_furniture(inst.color, Vec3::from(n));
                 out.push(crate::light3d::V3A {
                     x: p[0], y: p[1], z: p[2],
                     r: c.col[0], g: c.col[1], b: c.col[2],
-                    a: asset.vertex_alpha(k),
+                    a: src_alpha.get(k).copied().unwrap_or(1.0),
                 });
             }
         }
@@ -8761,8 +8775,16 @@ impl FactoryState {
         use std::collections::BTreeMap;
         let mut buckets: BTreeMap<usize, Vec<crate::light3d::TexVtx>> = BTreeMap::new();
         let mut flat: Vec<V3> = Vec::new();
+        // EVERY INDEX BELOW IS INTO THE SAME MESH. `ntri`, the positions, the normals, the UVs, the
+        // alpha and the face ids all come from `src_*` — which is the proxy when there is one and
+        // the full mesh when there is not.
+        //
+        // This read `ntri` from the proxy and `asset.positions[k]` from the full mesh, which is not
+        // a correspondence: it drew the FIRST N triangles of the real mesh wearing the proxy's
+        // texture coordinates. It shipped in build 44 and was caught by the compiler's own
+        // `unused variable: src_nrm` / `src_face` — the two the loop had quietly stopped consulting.
         for t in 0..ntri {
-            let fg = groups.face.get(t).copied().unwrap_or(0);
+            let fg = src_face.get(t).copied().unwrap_or(0);
             let eff = inst
                 .surface_texture
                 .get(&fg)
@@ -8775,8 +8797,8 @@ impl FactoryState {
                     let tex = &self.textures[ti];
                     let buf = buckets.entry(ti).or_default();
                     for k in base..base + 3 {
-                        let p = asset.positions[k];
-                        let n = Vec3::from(asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                        let p = src_pos[k];
+                        let n = Vec3::from(src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
                         let (uc, vc) = uv_of(k, &p, n);
                         let s = shade_scalar(n, true);
                         let uv = tex.map_uv(uc, vc);
@@ -8787,8 +8809,8 @@ impl FactoryState {
                 }
                 None => {
                     for k in base..base + 3 {
-                        let p = asset.positions[k];
-                        let n = Vec3::from(asset.normals.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
+                        let p = src_pos[k];
+                        let n = Vec3::from(src_nrm.get(k).copied().unwrap_or([0.0, 0.0, 1.0]));
                         flat.push(v(Vec3::from(p), shade_furniture(inst.color, n)));
                     }
                 }
@@ -16432,5 +16454,140 @@ mod seam_preserving_lod {
             [1.0, 1.0, 1.0],
         );
         assert!(!a.needs_lod());
+    }
+}
+
+/// EVERY DRAW PATH MUST READ ONE MESH, PROXY OR FULL — never half of each.
+///
+/// The tests beside `cluster_decimate_attr` prove the PROXY is right. They say nothing about the
+/// five functions that consume it, and that is where the real bug was: `furniture_faceted` took its
+/// triangle COUNT from the proxy and its POSITIONS from the full mesh, so it drew the first N
+/// triangles of the real mesh wearing the proxy's texture coordinates. It compiled, it did not
+/// panic — the proxy is shorter, so every index was in range — and it shipped.
+///
+/// The signal was the compiler's own `unused variable: src_nrm` / `src_face`: the loop had quietly
+/// stopped consulting two of the five things it destructured. These tests are the version that does
+/// not depend on anyone reading a warning.
+#[cfg(test)]
+mod lod_consumers_read_one_mesh {
+    use super::*;
+
+    /// An asset over the LOD threshold, with UVs, two material parts and some glass — so every
+    /// consumer has something of each to get wrong.
+    fn a_heavy_textured_asset() -> FactoryState {
+        let mut f = FactoryState::default();
+        let n = LOD_TRI_THRESHOLD + 50;
+        let (mut pos, mut uv, mut alpha) = (Vec::new(), Vec::new(), Vec::new());
+        for t in 0..n {
+            let a = t as f32 * 0.0013;
+            let z = if t % 2 == 0 { 0.0 } else { 0.7 };
+            for (dx, dy) in [(0.0f32, 0.0f32), (0.01, 0.0), (0.0, 0.01)] {
+                pos.push([a.cos() + dx, a.sin() + dy, z]);
+                uv.push([(a * 0.1).fract().abs(), (a * 0.07).fract().abs()]);
+                alpha.push(if t % 5 == 0 { 0.3 } else { 1.0 });
+            }
+        }
+        let normals = vec![[0.0, 0.0, 1.0]; pos.len()];
+        let idx = f.add_furniture_asset(
+            "heavy".into(),
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals,
+                color: Some([0.7, 0.7, 0.7]),
+                alpha,
+            },
+        );
+        f.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        f
+    }
+
+    /// THE FACETED SPLIT — the one that was wrong. Every emitted vertex must be a vertex of the
+    /// proxy, because that is where its triangle count came from.
+    #[test]
+    fn the_faceted_split_emits_only_proxy_vertices() {
+        let mut f = a_heavy_textured_asset();
+        let asset = &f.furniture_lib[0];
+        assert!(asset.needs_lod(), "the fixture must actually be proxied");
+        let lod = asset.lod_geom();
+        let proxy: std::collections::HashSet<[u32; 3]> =
+            lod.positions.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+        let full_only = f.furniture_lib[0]
+            .positions
+            .iter()
+            .filter(|p| !proxy.contains(&[p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]))
+            .count();
+        assert!(full_only > 0, "the two meshes must differ, or this test cannot fail");
+
+        // Give it a per-surface assignment so `furniture_faceted` actually runs.
+        let tex = f.add_texture("t".into(), 2, 2, vec![255u8; 16]);
+        let groups = f.furniture_lib[0].group_geom();
+        let some_group = groups.face.first().copied().unwrap_or(0);
+        f.furniture[0].surface_texture.insert(some_group, tex);
+
+        let fac = f.furniture_faceted(0).expect("a faceted split");
+        let mut seen = 0usize;
+        for (_, _, verts) in &fac.opaque {
+            for v in verts {
+                seen += 1;
+                assert!(
+                    proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]),
+                    "a vertex at ({}, {}, {}) is not in the proxy — the split mixed two meshes",
+                    v.x, v.y, v.z,
+                );
+            }
+        }
+        for (_, _, verts) in &fac.translucent {
+            for v in verts {
+                seen += 1;
+                assert!(proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]));
+            }
+        }
+        if let Some((_, verts)) = &fac.flat {
+            for v in verts {
+                seen += 1;
+                assert!(proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]));
+            }
+        }
+        assert!(seen > 0, "the split produced nothing to check");
+    }
+
+    /// THE WHOLE-OBJECT TEXTURED PATH, same property.
+    #[test]
+    fn the_textured_mesh_emits_only_proxy_vertices() {
+        let mut f = a_heavy_textured_asset();
+        let tex = f.add_texture("t".into(), 2, 2, vec![255u8; 16]);
+        f.furniture[0].texture = Some(tex);
+        let lod = f.furniture_lib[0].lod_geom();
+        let proxy: std::collections::HashSet<[u32; 3]> =
+            lod.positions.iter().map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]).collect();
+
+        let (_, _, verts) = f.furniture_textured_mesh(0).expect("a textured mesh");
+        assert!(!verts.is_empty());
+        for v in &verts {
+            assert!(
+                proxy.contains(&[v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]),
+                "a vertex at ({}, {}, {}) is not in the proxy",
+                v.x, v.y, v.z,
+            );
+        }
+    }
+
+    /// THE SOLID AND GLASS PASSES MUST PARTITION THE PROXY, not overlap and not lose triangles.
+    /// Both peel on the same rule, so every proxy triangle belongs to exactly one of them.
+    #[test]
+    fn the_solid_and_glass_passes_partition_the_proxy() {
+        let f = a_heavy_textured_asset();
+        let lod = f.furniture_lib[0].lod_geom();
+        let total = lod.tri_count();
+
+        let solid = f.furniture_local_mesh(0).len() / 3;
+        let glass = f.furniture_translucent_mesh(0).map(|(_, v)| v.len() / 3).unwrap_or(0);
+        assert!(glass > 0, "the fixture has glass in it, so the peel must find some");
+        assert_eq!(
+            solid + glass,
+            total,
+            "every proxy triangle belongs to exactly one pass: {solid} solid + {glass} glass \
+             against {total}",
+        );
     }
 }
