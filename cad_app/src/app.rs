@@ -26982,6 +26982,8 @@ impl CadApp {
             .iter()
             .map(|r| crate::report::layout::RoomInput {
                 name: r.name.clone(),
+                // The mode the ANSWER was computed in, not the switch's current position.
+                express: self.light.results_mode == Some(crate::light::CalcMode::Express),
                 grid: &r.grid,
                 plane: &r.plane,
                 // Computed alongside the working grid on every calculation, and — until now —
@@ -65565,5 +65567,110 @@ mod what_frustum_culling_saves_probe {
             println!("{:<34} {:>6} {:>12} {:>7.1}%", label, drawn, tris, pct);
         }
         println!("\n  Every one of these used to be submitted at every camera, every frame.");
+    }
+}
+
+/// EXPRESS AGAINST THOROUGH ON A REAL FURNISHED PROJECT — the gate before Express is trusted.
+///
+/// The DIALux fixtures cannot answer this: they carry no furniture, so the two modes build
+/// identical geometry there and `validate-lighting.ps1` passing in Thorough says nothing at all
+/// about Express. It has to be measured on a scene that actually has furniture in it.
+///
+/// The file carries no luminaires of its own, so a regular grid of the built-in downlight is laid
+/// over it. That is fine for this question — both modes see exactly the same lights, and what is
+/// being compared is the effect of the furniture representation, not the scheme.
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release express_against_thorough -- --ignored --nocapture`
+#[cfg(test)]
+mod express_against_thorough_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn express_against_thorough() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+
+        // A regular scheme over the model's own footprint, at 3 m.
+        let (mn, mx) = match app.factory.cached.bounds() {
+            Some(b) => b,
+            None => return,
+        };
+        app.light.auto_center_light = false;
+        app.light.cell_size = 0.5;
+        let (w, d) = (mx[0] - mn[0], mx[1] - mn[1]);
+        let (nx, ny) = (8usize, 4usize);
+        for i in 0..nx {
+            for j in 0..ny {
+                app.light.luminaires.push(cad_light::Luminaire {
+                    id: (i * ny + j) as u32 + 1,
+                    profile: crate::light::BUILTIN.to_string(),
+                    position: cad_light::Vertex::new(
+                        mn[0] + w * (i as f32 + 0.5) / nx as f32,
+                        mn[1] + d * (j as f32 + 0.5) / ny as f32,
+                        3.0,
+                    ),
+                    rotation_deg: 0.0,
+                    tilt_deg: 0.0,
+                    dimming: 1.0,
+                    watts_override: None,
+                    flux_override: None,
+                    from_block: None,
+                });
+            }
+        }
+
+        let doc = cad_kernel::Document::default();
+        let mut row = |mode: crate::light::CalcMode| {
+            app.light.mode = mode;
+            let t = std::time::Instant::now();
+            let job = app.light.prepare(&doc, Some(&app.factory)).expect("a job");
+            let tris = job.scene_triangle_count();
+            let out = job.run(&crate::light::CalcProgress::default());
+            let secs = t.elapsed().as_secs_f64();
+            let r = out.rooms.first().expect("a room");
+            let en = !r.grid_en.values.is_empty();
+            let g = if en { &r.grid_en } else { &r.grid };
+            let mask = if en { &r.mask_en } else { &r.mask };
+            // HOW MANY CELLS WERE THROWN AWAY, because that is where the two modes differ most:
+            // `Obstacle::contains` is exact on a box and meaningless on a mesh that is not
+            // watertight, so Express can exclude cells that Thorough silently keeps.
+            let dropped = mask.iter().filter(|k| !**k).count();
+            println!(
+                "{:<10} {:>10} {:>9.1} {:>9.3} {:>9.3} {:>9.3} {:>8.4} {:>8} {:>6}/{}",
+                mode.label(),
+                tris,
+                secs,
+                g.avg,
+                g.min,
+                g.max,
+                g.u0(),
+                out.surfaces.len(),
+                dropped,
+                g.values.len(),
+            );
+            (g.avg, g.min, g.max, g.u0())
+        };
+
+        println!("\n=== EXPRESS AGAINST THOROUGH ===");
+        println!(
+            "{:<10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>6}",
+            "mode", "scene tris", "seconds", "avg lx", "min lx", "max lx", "U0", "surfaces", "masked"
+        );
+        let e = row(crate::light::CalcMode::Express);
+        let t = row(crate::light::CalcMode::Thorough);
+        let pc = |a: f64, b: f64| if b.abs() > 1e-9 { 100.0 * (a - b) / b } else { 0.0 };
+        println!(
+            "\n  Express against Thorough:  avg {:+.1}%   min {:+.1}%   max {:+.1}%   U0 {:+.2}",
+            pc(e.0, t.0),
+            pc(e.1, t.1),
+            pc(e.2, t.2),
+            e.3 - t.3,
+        );
+        println!("  (a box is more occluding than the piece it replaces, so Express is expected LOW)");
     }
 }

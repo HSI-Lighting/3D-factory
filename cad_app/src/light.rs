@@ -71,6 +71,80 @@ pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
     meshes_from_factory_ex(f, None)
 }
 
+/// HOW MUCH OF THE MODEL THE ENGINE IS ASKED TO SEE.
+///
+/// The two differ in ONE thing: how furniture is represented. Same rays, same bounces, same grid,
+/// same materials — so a run of each on one scene is a controlled comparison, and any difference in
+/// the numbers is attributable to the box substitution and nothing else. Mixing in sample counts
+/// would have made that comparison uninterpretable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum CalcMode {
+    /// Furniture as the box it occupies. For iterating a layout.
+    ///
+    /// A box is MORE OCCLUDING than the thing it replaces — a chair is mostly air and its box is
+    /// solid from floor to seat-back — so this reads low under and beside furniture, and its
+    /// uniformity a little worse. That is the expected direction and it is why an Express result is
+    /// labelled everywhere it appears and never carries a compliance claim.
+    Express,
+    /// Every triangle of every piece. The answer a report defends.
+    #[default]
+    Thorough,
+}
+
+impl CalcMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            CalcMode::Express => "Express",
+            CalcMode::Thorough => "Thorough",
+        }
+    }
+    /// Whether a result computed this way may be quoted as an EN 12464-1 compliance figure.
+    pub fn is_compliant(self) -> bool {
+        matches!(self, CalcMode::Thorough)
+    }
+}
+
+/// ONE FURNITURE INSTANCE AS THE BOX IT OCCUPIES — 12 triangles instead of half a million.
+///
+/// The asset's cached LOCAL bounds carried through the instance's own transform, so a piece standing
+/// at an angle to the grid gets a box that leans with it rather than an axis-aligned one inflated to
+/// contain it. Same 12 triangles either way; the oriented one is the piece's actual footprint.
+///
+/// Wound outward, because the engine reads a triangle's normal and a box turned inside out would
+/// bounce light the wrong way.
+pub fn furniture_box_tris(
+    f: &crate::factory::FactoryState,
+    i: usize,
+) -> Option<Vec<[glam::Vec3; 3]>> {
+    let inst = f.furniture.get(i)?;
+    let asset = f.furniture_lib.get(inst.asset)?;
+    let m = glam::Mat4::from_cols_array(&f.furniture_model_matrix(i)?);
+    let (lo, hi) = (asset.local_min, asset.local_max);
+    // Corner k, with bit 0 = x, bit 1 = y, bit 2 = z.
+    let c = |k: usize| -> glam::Vec3 {
+        m.transform_point3(glam::Vec3::new(
+            if k & 1 == 0 { lo[0] } else { hi[0] },
+            if k & 2 == 0 { lo[1] } else { hi[1] },
+            if k & 4 == 0 { lo[2] } else { hi[2] },
+        ))
+    };
+    // Six faces, each two triangles, every one wound counter-clockwise seen from OUTSIDE.
+    //
+    // INDICES ARE BIT PATTERNS, not a walk round the face. Corner 2 is +y and corner 3 is +x+y,
+    // which is not the order a hand-drawn box diagram numbers them in — writing these out as though
+    // it were put the two −Z triangles' normals along +Z, i.e. the box inside out. Caught by
+    // `the_proxy_is_wound_outward`, which is why that test exists.
+    const FACES: [[usize; 3]; 12] = [
+        [0, 2, 3], [0, 3, 1], // −Z
+        [4, 5, 7], [4, 7, 6], // +Z
+        [0, 1, 5], [0, 5, 4], // −Y
+        [2, 6, 7], [2, 7, 3], // +Y
+        [0, 4, 6], [0, 6, 2], // −X
+        [1, 3, 7], [1, 7, 5], // +X
+    ];
+    Some(FACES.iter().map(|t| [c(t[0]), c(t[1]), c(t[2])]).collect())
+}
+
 /// [`meshes_from_factory`], optionally with everything that LIDS THE ROOM left out — DRAWING only.
 ///
 /// Reported twice: "hide ceiling in simlux doesnt work". The view filtered by MATERIAL, and material
@@ -96,6 +170,15 @@ pub fn meshes_from_factory(f: &crate::factory::FactoryState) -> Vec<Mesh> {
 pub fn meshes_from_factory_ex(
     f: &crate::factory::FactoryState,
     hide_above: Option<f32>,
+) -> Vec<Mesh> {
+    meshes_from_factory_mode(f, hide_above, CalcMode::Thorough)
+}
+
+/// [`meshes_from_factory_ex`], with furniture drawn as boxes under [`CalcMode::Express`].
+pub fn meshes_from_factory_mode(
+    f: &crate::factory::FactoryState,
+    hide_above: Option<f32>,
+    mode: CalcMode,
 ) -> Vec<Mesh> {
     let pos = &f.cached.positions;
     if pos.len() < 3 && f.furniture.is_empty() {
@@ -141,7 +224,23 @@ pub fn meshes_from_factory_ex(
     // Furniture goes in under its OWN material rather than being bucketed by orientation like the
     // building: a desk top is not a floor and a cupboard side is not a wall, and giving a shop's
     // stock the ceiling's 0.70 would recreate the very error this fixes.
+    //
+    // EXPRESS SUBSTITUTES A BOX FOR EACH PIECE and changes nothing else — see [`CalcMode`]. On the
+    // reference gym plan that is 26 boxes, 312 triangles, against 7,030,514: the BVH build and
+    // `Obstacle::contains` both collapse, and the whole scene fits in cache instead of thrashing
+    // 337 MB of DRAM. It is also the only representation in which `contains` is trustworthy, since
+    // a box is watertight by construction and an imported FBX generally is not.
     for (i, inst) in f.furniture.iter().enumerate() {
+        if mode == CalcMode::Express {
+            if let Some(tris) = furniture_box_tris(f, i) {
+                for t in tris {
+                    for p in t {
+                        buckets[MATERIAL_FURNITURE as usize].push(Vertex::new(p.x, p.y, p.z));
+                    }
+                }
+            }
+            continue;
+        }
         let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
         let Some(m) = f.furniture_model_matrix(i) else { continue };
         let m = glam::Mat4::from_cols_array(&m);
@@ -191,6 +290,12 @@ pub struct Obstacle {
 }
 
 impl Obstacle {
+    /// How many triangles this body's parity test walks. `contains` is O(this) per cell inside the
+    /// bounds, so it is the cost of the buried-cell test and worth being able to assert on.
+    pub fn tri_count(&self) -> usize {
+        self.tris.len()
+    }
+
     /// Build one from world-space triangles — used by the tests and by `obstacles_in`.
     pub fn from_tris(tris: Vec<[glam::Vec3; 3]>) -> Self {
         let (mut mn, mut mx) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
@@ -276,6 +381,15 @@ impl Obstacle {
 /// evenly and encloses nothing, which is the safe direction: it keeps a point that might be
 /// measurable rather than discarding one that is.
 pub fn obstacles_in(f: &crate::factory::FactoryState, room: &[glam::Vec2]) -> Vec<Obstacle> {
+    obstacles_in_mode(f, room, CalcMode::Thorough)
+}
+
+/// [`obstacles_in`], with furniture as boxes under [`CalcMode::Express`].
+pub fn obstacles_in_mode(
+    f: &crate::factory::FactoryState,
+    room: &[glam::Vec2],
+    mode: CalcMode,
+) -> Vec<Obstacle> {
     let mut out: Vec<Obstacle> = Vec::new();
     let mut push = |tris: Vec<[glam::Vec3; 3]>| {
         if !tris.is_empty() {
@@ -302,7 +416,20 @@ pub fn obstacles_in(f: &crate::factory::FactoryState, room: &[glam::Vec2]) -> Ve
     }
 
     // ---- furniture, in world coordinates -------------------------------------------------------
+    //
+    // EXPRESS IS THE MORE TRUSTWORTHY ONE HERE, which is the opposite of how a fast mode usually
+    // reads. `Obstacle::contains` is ray parity against the body's own triangles and its own doc
+    // says an unclosed mesh "counts evenly and encloses nothing" — an imported gym machine is not
+    // watertight, so on the full mesh this test returns whatever the non-manifold surface happens
+    // to produce. A box is closed by construction, and it costs 12 triangles per cell instead of
+    // half a million.
     for (i, inst) in f.furniture.iter().enumerate() {
+        if mode == CalcMode::Express {
+            if let Some(tris) = furniture_box_tris(f, i) {
+                push(tris);
+            }
+            continue;
+        }
         let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
         let Some(mm) = f.furniture_model_matrix(i) else { continue };
         let mm = glam::Mat4::from_cols_array(&mm);
@@ -713,6 +840,9 @@ pub struct CalcJob {
     eye_height: f32,
     wall_zone: f32,
     scene_tris: usize,
+    /// Express or Thorough — see [`CalcMode`]. In the fingerprint, so an Express preview can never
+    /// be restored as the answer to a Thorough request.
+    mode: CalcMode,
 }
 
 /// What a calculation produced.
@@ -729,6 +859,13 @@ pub struct CalcOutcome {
     /// stamped with the scene as it looked on ARRIVAL would claim to describe a building it was
     /// never computed from.
     pub fingerprint: u64,
+    /// WHICH MODE ACTUALLY PRODUCED THIS, taken from the job and not from the app.
+    ///
+    /// The switch on screen says what the NEXT run will be. A user who flips it to Thorough and
+    /// reads the panel before pressing Calculate would otherwise be told that the Express numbers
+    /// in front of them are Thorough ones, which is the whole failure this labelling exists to
+    /// prevent.
+    pub mode: CalcMode,
 }
 
 /// THE CALCULATION'S OWN VERSION. Bump this whenever the engine changes what a given scene MEANS.
@@ -756,7 +893,7 @@ pub struct CalcOutcome {
 /// |-------|--------------|
 /// | 1     | the original engine |
 /// | 2     | grid points inside furniture are excluded rather than reported as 0 lx |
-pub const CALC_EPOCH: u64 = 2;
+pub const CALC_EPOCH: u64 = 3;
 
 impl CalcJob {
     /// A HASH OF EVERY INPUT TO THE ANSWER — the thing that decides whether a saved result is
@@ -811,12 +948,18 @@ impl CalcJob {
             // Derived from `meshes`, and reported rather than used — but hashing it costs one word
             // and removes the question.
             scene_tris,
+            mode,
         } = self;
 
         let mut h = Fnv::new();
         // THE ENGINE IS AN INPUT TOO. First, so no stored answer from a different one can collide.
         h.u64(epoch);
         h.u64(*scene_tris as u64);
+        // AND SO IS HOW MUCH OF THE MODEL IT WAS SHOWN. The two modes make the furniture different
+        // geometry, so `meshes` already differs — but only for a scene that HAS furniture. Hashed
+        // in its own right so an empty room's Express and Thorough answers stay distinguishable,
+        // and so the field cannot be added to the job and forgotten here.
+        h.u64(*mode as u64);
 
         // ---- the room, as the engine sees it ---------------------------------------------
         h.u64(meshes.len() as u64);
@@ -878,6 +1021,12 @@ impl CalcJob {
         h.finish()
     }
 
+    /// How many triangles the engine was handed. Reported by the mode probe, which has to show the
+    /// substitution as a number rather than assert that it happened.
+    pub fn scene_triangle_count(&self) -> usize {
+        self.scene_tris
+    }
+
     /// How many steps [`run`](Self::run) will report.
     pub fn steps(&self) -> u32 {
         // The evaluator, then three phases per room, then the surfaces.
@@ -931,6 +1080,7 @@ impl CalcJob {
                     timings,
                     cancelled: true,
                     fingerprint,
+                    mode: self.mode,
                 };
             }
             let label = if name.is_empty() {
@@ -944,13 +1094,21 @@ impl CalcJob {
         timings.push(("grids", t.elapsed().as_secs_f64() * 1000.0));
         t = std::time::Instant::now();
 
+        // THE ROOM SURFACES — a whole extra pass over every wall, floor and ceiling, on top of the
+        // grids. EN 12464-1 sets requirements on them and a report quotes them, so Thorough pays
+        // it; Express is for moving fittings around and does not, which is a straight saving with
+        // no effect on the working-plane numbers.
         p.step("Room surfaces");
-        let surfaces =
-            cad_light::surface_report_on(&ev, &self.meshes, &self.lums, &self.materials, 1.0);
+        let surfaces = match self.mode {
+            CalcMode::Thorough => {
+                cad_light::surface_report_on(&ev, &self.meshes, &self.lums, &self.materials, 1.0)
+            }
+            CalcMode::Express => Vec::new(),
+        };
         timings.push(("surfaces", t.elapsed().as_secs_f64() * 1000.0));
         timings.push(("scene_tris", self.scene_tris as f64));
 
-        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false, fingerprint }
+        CalcOutcome { rooms, surfaces, meshes: self.meshes, timings, cancelled: false, fingerprint, mode: self.mode }
     }
 
     /// Everything about ONE room, from an evaluator already built over the whole scene.
@@ -1287,6 +1445,10 @@ pub struct LightState {
     /// what makes writing the result to disk safe at all — without it, reopening a project would
     /// show a figure with no way to know which building it describes.
     pub results_fingerprint: Option<u64>,
+    /// The mode the answer ON SCREEN was computed in — NOT [`Self::mode`], which is what the next
+    /// run will use. They differ the moment the switch is flipped and Calculate has not been
+    /// pressed, and that gap is exactly when a mislabelled Express result would escape.
+    pub results_mode: Option<CalcMode>,
     /// The scene has moved on since the answer on screen was computed.
     ///
     /// The result is KEPT and clearly marked rather than thrown away. Somebody who nudges a fixture
@@ -1316,6 +1478,10 @@ pub struct LightState {
     ///
     /// Assign through [`Self::set_meshes`] rather than writing the field, or the view goes stale.
     pub meshes_gen: u64,
+    /// Express or Thorough — see [`CalcMode`]. This is what the NEXT calculation will run as; the
+    /// mode a result was actually computed in travels with the result, in [`RoomResult::mode`],
+    /// because the two disagree the moment the user flips the switch and has not pressed Calculate.
+    pub mode: CalcMode,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
     /// IES file path typed into the panel.
@@ -1488,6 +1654,8 @@ impl LightState {
             results_restored: false,
             meshes: Vec::new(),
             meshes_gen: 0,
+            mode: CalcMode::default(),
+            results_mode: None,
             show_overlay: true,
             ies_path: String::new(),
             last_msg: "① Import your light files · ② click the plan to mark where they go · ③ pick a fitting for them."
@@ -2077,7 +2245,8 @@ impl LightState {
         doc: &Document,
         factory: Option<&crate::factory::FactoryState>,
     ) -> Vec<Mesh> {
-        let from_3d = factory.map(meshes_from_factory).unwrap_or_default();
+        let mode = self.mode;
+        let from_3d = factory.map(|f| meshes_from_factory_mode(f, None, mode)).unwrap_or_default();
         if !from_3d.is_empty() {
             return from_3d;
         }
@@ -2884,7 +3053,7 @@ impl LightState {
             maintenance: self.maintenance,
             obstacles: match factory {
                 // One list per target, in the same order — see `CalcJob::obstacles`.
-                Some(f) => targets.iter().map(|(_, p)| obstacles_in(f, p)).collect(),
+                Some(f) => targets.iter().map(|(_, p)| obstacles_in_mode(f, p, self.mode)).collect(),
                 None => targets.iter().map(|_| Vec::new()).collect(),
             },
             targets,
@@ -2894,6 +3063,7 @@ impl LightState {
             eye_height: self.eye_height,
             wall_zone: self.wall_zone,
             scene_tris,
+            mode: self.mode,
         })
     }
 
@@ -2928,6 +3098,7 @@ impl LightState {
         // This answer now belongs to a known scene — which is what makes it worth writing down, and
         // what lets the next session tell whether it is still about this building.
         self.results_fingerprint = Some(out.fingerprint);
+        self.results_mode = Some(out.mode);
         self.results_stale = false;
         self.results_restored = false;
         self.stale_checked = None;
@@ -3939,11 +4110,39 @@ impl LightState {
         ui.separator();
 
         // ---- Calculate --------------------------------------------------
+        //
+        // THE MODE SITS NEXT TO THE BUTTON IT CHANGES, so nobody presses Calculate without seeing
+        // which one they are about to run.
+        ui.horizontal(|ui| {
+            ui.label("Detail:");
+            ui.selectable_value(&mut self.mode, CalcMode::Express, "Express").on_hover_text(
+                "Furniture as the box it occupies. Same rays, same bounces, same grid — only the \
+                 furniture is simplified. For trying a layout; not a compliance figure.",
+            );
+            ui.selectable_value(&mut self.mode, CalcMode::Thorough, "Thorough").on_hover_text(
+                "Every triangle of every piece, plus the room-surface report. The answer to put in \
+                 front of a client.",
+            );
+        });
         if ui
-            .add(egui::Button::new(egui::RichText::new("  Calculate  ").strong()))
+            .add(egui::Button::new(
+                egui::RichText::new(format!("  Calculate ({})  ", self.mode.label())).strong(),
+            ))
             .clicked()
         {
             action.calculate = true;
+        }
+        // WHAT IS ON SCREEN, not what the switch says. Flipping to Thorough does not make the
+        // Express numbers below it Thorough ones, and this is the line that says so.
+        if self.results_mode == Some(CalcMode::Express) {
+            ui.label(
+                egui::RichText::new(
+                    "⚠  Express result — furniture simplified to boxes. Not an EN 12464-1 \
+                     compliance figure.",
+                )
+                .small()
+                .color(egui::Color32::from_rgb(226, 160, 60)),
+            );
         }
         ui.checkbox(&mut self.show_overlay, "Show lux overlay on 2D plan");
         ui.horizontal(|ui| {
@@ -7634,4 +7833,266 @@ mod the_window_and_the_page_share_one_scale {
     // guaranteed by the compiler — a field that no longer exists cannot be read, so any leftover
     // use is a build error rather than a silent regression. A test that restates what the compiler
     // enforces adds nothing and costs a name in the suite.
+}
+
+/// EXPRESS AND THOROUGH — the same calculation, shown different amounts of the model.
+///
+/// The whole design rests on the two differing in ONE thing: how furniture is represented. Same
+/// rays, same bounces, same grid, same materials — so a run of each on one scene is a controlled
+/// comparison and any difference is attributable to the box substitution. These tests pin that,
+/// and pin the labelling, because the failure that would discredit the feature is not a wrong
+/// number: it is a right-enough number reaching a client with no sign of which mode made it.
+#[cfg(test)]
+mod express_and_thorough {
+    use super::*;
+
+    /// A room with one heavy-ish piece of furniture standing in it.
+    fn a_furnished_room() -> crate::factory::FactoryState {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        // A hollow cage: lots of triangles, mostly air — the shape a box proxy changes most.
+        let mut pos = Vec::new();
+        for i in 0..200 {
+            let a = i as f32 * 0.031;
+            for (dx, dy, dz) in [(0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (0.0, 0.0, 0.9)] {
+                pos.push([a.cos() * 0.5 + dx, a.sin() * 0.5 + dy, dz]);
+            }
+        }
+        let n = vec![[0.0, 0.0, 1.0]; pos.len()];
+        let idx = f.add_furniture_asset(
+            "cage".into(),
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals: n,
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, glam::Vec3::new(4.0, 3.0, 0.0));
+        f
+    }
+
+    /// THE BOX IS THE ASSET'S BOUNDS, CARRIED THROUGH THE INSTANCE'S OWN TRANSFORM — and it is a
+    /// box: 12 triangles, 6 planes, closed.
+    #[test]
+    fn a_proxy_is_twelve_triangles_that_enclose_the_piece() {
+        let f = a_furnished_room();
+        let tris = crate::light::furniture_box_tris(&f, 0).expect("a proxy");
+        assert_eq!(tris.len(), 12, "six faces, two triangles each");
+
+        // Every original vertex is inside the box the proxy describes.
+        let inst = &f.furniture[0];
+        let asset = &f.furniture_lib[inst.asset];
+        let m = glam::Mat4::from_cols_array(&f.furniture_model_matrix(0).unwrap());
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        for t in &tris {
+            for p in t {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+        }
+        for p in &asset.positions {
+            let w = m.transform_point3(glam::Vec3::from(*p));
+            assert!(
+                w.cmpge(lo - 1e-3).all() && w.cmple(hi + 1e-3).all(),
+                "vertex {w:?} escaped the proxy box {lo:?}..{hi:?}",
+            );
+        }
+    }
+
+    /// EVERY FACE POINTS OUT. The engine reads a triangle's normal, and a box turned inside out
+    /// would bounce light back into itself.
+    #[test]
+    fn the_proxy_is_wound_outward() {
+        let f = a_furnished_room();
+        let tris = crate::light::furniture_box_tris(&f, 0).expect("a proxy");
+        let c: glam::Vec3 =
+            tris.iter().flatten().copied().fold(glam::Vec3::ZERO, |a, b| a + b) / 36.0;
+        for t in &tris {
+            let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+            let out = (t[0] + t[1] + t[2]) / 3.0 - c;
+            assert!(n.dot(out) > 0.0, "a face is wound inward: normal {n:?} against {out:?}");
+        }
+    }
+
+    /// THE SUBSTITUTION IS THE ONLY DIFFERENCE, and it really is a substitution: Express hands the
+    /// engine 12 triangles of furniture where Thorough hands it 600.
+    #[test]
+    fn express_replaces_the_furniture_and_leaves_the_building_alone() {
+        let f = a_furnished_room();
+        let thorough = crate::light::meshes_from_factory_mode(&f, None, CalcMode::Thorough);
+        let express = crate::light::meshes_from_factory_mode(&f, None, CalcMode::Express);
+
+        let furn = |ms: &[Mesh]| -> usize {
+            ms.iter()
+                .filter(|m| m.material == cad_light::MATERIAL_FURNITURE)
+                .map(|m| m.triangles.len())
+                .sum()
+        };
+        let building = |ms: &[Mesh]| -> usize {
+            ms.iter()
+                .filter(|m| m.material != cad_light::MATERIAL_FURNITURE)
+                .map(|m| m.triangles.len())
+                .sum()
+        };
+        assert_eq!(furn(&express), 12, "one box for the one piece");
+        assert_eq!(furn(&thorough), 200, "...against every triangle of the cage");
+        assert_eq!(
+            building(&express),
+            building(&thorough),
+            "the BUILDING must be identical in both — only furniture is substituted",
+        );
+    }
+
+    /// AN EXPRESS ANSWER MUST NEVER BE RESTORED AS A THOROUGH ONE. The fingerprint is what stops a
+    /// stored result being reused for a different question, so the mode has to be in it.
+    #[test]
+    fn the_two_modes_do_not_share_a_fingerprint() {
+        let doc = Document::default();
+        let fp = |f: &crate::factory::FactoryState, m: CalcMode| {
+            let mut s = LightState::new();
+            s.auto_center_light = false;
+            s.mode = m;
+            s.prepare(&doc, Some(f)).expect("a job").fingerprint()
+        };
+
+        let furnished = a_furnished_room();
+        assert_ne!(
+            fp(&furnished, CalcMode::Express),
+            fp(&furnished, CalcMode::Thorough),
+            "an Express result would restore as the answer to a Thorough request",
+        );
+
+        // AN EMPTY ROOM IS THE CASE THAT NEEDS THE FIELD. With furniture in the scene the two modes
+        // build different `meshes`, so the fingerprint separates them whether or not the mode is
+        // hashed — the furnished check above passes with the field deleted and proves nothing.
+        // Strip the furniture and the geometry is identical; only the mode is left to tell the two
+        // apart, and they ARE still different answers, because Express also skips the surfaces.
+        let mut bare = a_furnished_room();
+        bare.furniture.clear();
+        assert_ne!(
+            fp(&bare, CalcMode::Express),
+            fp(&bare, CalcMode::Thorough),
+            "with no furniture the geometry is identical, so the MODE itself must be in the hash",
+        );
+    }
+
+    /// …AND NEITHER MODE MAY COLLIDE WITH AN ANSWER FROM AN OLDER ENGINE.
+    #[test]
+    fn the_epoch_still_separates_engine_versions() {
+        let f = a_furnished_room();
+        let doc = Document::default();
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        let job = s.prepare(&doc, Some(&f)).expect("a job");
+        assert_ne!(
+            job.fingerprint_with_epoch(crate::light::CALC_EPOCH),
+            job.fingerprint_with_epoch(crate::light::CALC_EPOCH - 1),
+            "results from the previous engine must not restore as current",
+        );
+    }
+
+    /// EXPRESS SKIPS THE ROOM-SURFACE PASS — a whole extra sweep over every wall, floor and
+    /// ceiling, which a designer moving fittings around is not reading.
+    #[test]
+    fn express_does_not_pay_for_the_surface_report() {
+        let f = a_furnished_room();
+        let doc = Document::default();
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 2.0; // keep the test quick; the grid is not what is under test
+
+        s.mode = CalcMode::Thorough;
+        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
+        assert!(!out.surfaces.is_empty(), "Thorough reports the room surfaces");
+        assert_eq!(out.mode, CalcMode::Thorough, "the outcome carries the mode it ran in");
+
+        s.mode = CalcMode::Express;
+        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
+        assert!(out.surfaces.is_empty(), "Express does not");
+        assert_eq!(out.mode, CalcMode::Express);
+        assert!(!out.rooms.is_empty(), "…but it still answers the working plane");
+    }
+
+    /// THE LABEL FOLLOWS THE ANSWER, NOT THE SWITCH.
+    ///
+    /// A calculation is minutes on a real building and it runs on a worker, so there is a whole
+    /// window in which the switch can move while the answer is still being computed. Flip it during
+    /// that window and a label read off `self.mode` at apply time would stamp Thorough on numbers
+    /// an Express run produced — which is precisely how a preview escapes as a compliance figure.
+    ///
+    /// SO THE FLIP HAPPENS BEFORE `apply_outcome`, not after. Flipping afterwards proves nothing:
+    /// the field is already written, and the test passes against a version that reads the switch.
+    #[test]
+    fn flipping_the_switch_mid_run_does_not_relabel_the_answer() {
+        let f = a_furnished_room();
+        let doc = Document::default();
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 2.0;
+        s.mode = CalcMode::Express;
+        let out = s.prepare(&doc, Some(&f)).expect("a job").run(&CalcProgress::default());
+        assert_eq!(out.mode, CalcMode::Express);
+
+        s.mode = CalcMode::Thorough; // …while the worker was busy
+        s.apply_outcome(out, None);
+        assert_eq!(
+            s.results_mode,
+            Some(CalcMode::Express),
+            "the answer was computed in Express and must still say so",
+        );
+
+        s.mode = CalcMode::Thorough; // and flipping it afterwards changes nothing either
+        assert_eq!(
+            s.results_mode,
+            Some(CalcMode::Express),
+            "the answer on screen is still the Express one and must still say so",
+        );
+    }
+
+    /// THE BURIED-CELL TEST IS BOXED TOO — and this is where Express is the more trustworthy of the
+    /// two, which is the opposite of how a fast mode usually reads.
+    ///
+    /// `Obstacle::contains` is a ray-parity test against the body's OWN triangles, and its doc says
+    /// an unclosed mesh "counts evenly and encloses nothing". An imported machine is not watertight,
+    /// so on the full mesh the answer is whatever the non-manifold surface happens to produce. A box
+    /// is closed by construction — and costs 12 triangles per cell instead of the whole mesh.
+    #[test]
+    fn express_boxes_the_obstacles_as_well_as_the_light_scene() {
+        let f = a_furnished_room();
+        let room = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        let biggest = |obs: Vec<Obstacle>| obs.iter().map(|o| o.tri_count()).max().unwrap_or(0);
+        let thorough = biggest(obstacles_in_mode(&f, &room, CalcMode::Thorough));
+        let express = biggest(obstacles_in_mode(&f, &room, CalcMode::Express));
+        assert_eq!(thorough, 200, "Thorough walks every triangle of the cage");
+        assert_eq!(express, 12, "Express walks a box");
+        // The one the working plane runs through: a cell in the middle of the cage is INSIDE the
+        // box and, on the open frame, is not inside anything at all.
+        let mid = glam::Vec3::new(4.0, 3.0, 0.45);
+        let inside = |m: CalcMode| obstacles_in_mode(&f, &room, m).iter().any(|o| o.contains(mid));
+        assert!(inside(CalcMode::Express), "a point inside the box reads as buried");
+        assert!(!inside(CalcMode::Thorough), "…and the open frame encloses nothing, as its doc says");
+    }
+
+    /// Only Thorough may be quoted as compliance. One place says so, so the report and the panel
+    /// cannot drift apart on it.
+    #[test]
+    fn only_thorough_carries_a_compliance_claim() {
+        assert!(CalcMode::Thorough.is_compliant());
+        assert!(!CalcMode::Express.is_compliant());
+    }
 }

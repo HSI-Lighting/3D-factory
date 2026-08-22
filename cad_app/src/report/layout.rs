@@ -51,6 +51,13 @@ impl ScheduleRow {
 /// One room's answer, as the report needs it.
 pub struct RoomInput<'a> {
     pub name: String,
+    /// COMPUTED IN EXPRESS MODE — furniture stood in for by the box it occupies.
+    ///
+    /// Said on the PAGE, not only in the app. A PDF outlives the window it was exported from, and
+    /// the one thing that must not happen to this feature is an Express preview reaching a client
+    /// as a compliance figure. A box is more occluding than the thing it replaces, so these numbers
+    /// read low around furniture: a defensible preview, not a defensible submission.
+    pub express: bool,
     pub grid: &'a LuxGrid,
     pub plane: &'a CalcPlane,
     /// THE SAME ROOM ON EN 12464-1's OWN GRID — and, when it exists, the grid EVERY REPORTED FIGURE
@@ -194,6 +201,7 @@ impl<'a> Input<'a> {
         for r in rooms {
             let RoomInput {
                 name,
+                express,
                 grid,
                 plane,
                 grid_en,
@@ -207,6 +215,8 @@ impl<'a> Input<'a> {
                 schedule,
             } = r;
             h.str(name);
+            // It changes what the page SAYS, so it changes the page.
+            h.u64(*express as u64);
             // The cells are `calc`'s business; the SHAPE of the grid is cheap and worth having.
             h.u64(grid.cols as u64);
             h.u64(grid.rows as u64);
@@ -849,6 +859,11 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
         if room.grid_en.is_some() { "Grid (EN 12464-1)" } else { "Grid" },
         &format!("{} x {} points at {:.2} m", g.cols, g.rows, spacing_of(p, g)),
     );
+    // ON THE SAME PAGE AS THE FIGURES IT QUALIFIES. A caveat on a different page is a caveat that
+    // travels separately from the number, and these pages are read one at a time.
+    if room.express {
+        c.row("Detail", "Express — furniture as boxes");
+    }
     c.row(
         "Plane",
         &format!("{:.2} x {:.2} m at {:.2} m", p.width, p.depth, p.origin.z),
@@ -2156,6 +2171,7 @@ mod tests {
     fn one_room<'a>(g: &'a LuxGrid, p: &'a CalcPlane, name: &str) -> RoomInput<'a> {
         RoomInput {
             name: name.to_string(),
+            express: false,
             grid: g,
             plane: p,
             grid_en: None,
