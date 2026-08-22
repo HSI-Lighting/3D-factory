@@ -2025,6 +2025,13 @@ pub struct CadApp {
     /// it was asleep. The interval is still worth printing -- it says whether the app is being
     /// driven at all -- but the number that decides SLOW has to be WORK.
     frame_start: Option<std::time::Instant>,
+    /// PHASE CHECKPOINTS WITHIN ONE FRAME, microseconds since `frame_start`.
+    ///
+    /// `cpu` says the frame costs 205 ms and `gl` says only 4-25 ms of that is the SIMLUX draw,
+    /// and both taps report the SAME cpu 0.2 ms apart -- so the time is spent before either of
+    /// them and neither can say where. Bisecting a 2,000-line `update` by reading it is how the
+    /// last four rounds went; this is the version that answers in one dump.
+    frame_marks: Vec<(&'static str, u32)>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
     /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
@@ -4109,6 +4116,7 @@ impl Default for CadApp {
             lux_overlay_cells:      std::cell::Cell::new(0),
             simlux_gl_us:           StdArc::new(std::sync::atomic::AtomicU64::new(0)),
             frame_start:            None,
+            frame_marks:            Vec::new(),
             factory:             crate::factory::FactoryState::default(),
             factory_perf_prev:       None,
             factory_perf_last_frame: None,
@@ -5921,6 +5929,35 @@ impl CadApp {
             y = (BUDGET / x).max(2);
         }
         (x, y)
+    }
+
+    /// Stamp a phase boundary in this frame — see [`Self::frame_marks`]. Cheap enough to leave in
+    /// unconditionally: one `Instant::now` and a push, a handful of times a frame.
+    fn mark(&mut self, what: &'static str) {
+        if let Some(t0) = self.frame_start {
+            let us = t0.elapsed().as_micros() as u32;
+            self.frame_marks.push((what, us));
+        }
+    }
+
+    /// The phase boundaries as `name delta-ms`, longest first — the line that says where a frame
+    /// actually went. Sub-millisecond spans are dropped; they are never the answer and they crowd
+    /// out the one that is.
+    fn frame_marks_summary(&self) -> String {
+        let mut spans: Vec<(&str, u32)> = Vec::with_capacity(self.frame_marks.len());
+        let mut prev = 0u32;
+        for (name, at) in &self.frame_marks {
+            spans.push((name, at.saturating_sub(prev)));
+            prev = *at;
+        }
+        spans.sort_by(|a, b| b.1.cmp(&a.1));
+        spans
+            .iter()
+            .take(5)
+            .filter(|(_, us)| *us > 500)
+            .map(|(n, us)| format!("{n} {:.1}", *us as f64 / 1000.0))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// EVERYTHING THE CACHED HALF OF THE SIMLUX SCENE IS BUILT FROM, as one number.
@@ -14733,9 +14770,10 @@ impl CadApp {
                             (_, false) => format!("SHADERS-FAILED[{bad}] {geom}"),
                             (true, _) => format!("buffer-rebuilt {geom}"),
                             _ => format!(
-                                "slow-frame {geom} ({:.0} ms since last paint{})",
+                                "slow-frame {geom} ({:.0} ms since last paint{}) [{}]",
                                 interval_us as f64 / 1000.0,
                                 if interval_us > 150_000 { ", idle heartbeat" } else { "" },
+                                self.frame_marks_summary(),
                             ),
                         };
                         crate::dbg_event!(
@@ -15351,13 +15389,14 @@ impl CadApp {
                                 // so `frame - gl` is everything else: the 2D canvas, egui, the rest.
                                 // It is LAST FRAME's value: the paint callback runs after this.
                                 phase: format!(
-                                    "{what} cpu {:.1} ms of {:.0} ms since last paint{} room={}v dyn={}v gl {:.1} ms 2d-overlay {:.1} ms / {} cells",
+                                    "{what} cpu {:.1} ms of {:.0} ms since last paint{} [{}] room={}v dyn={}v gl {:.1} ms 2d-overlay {:.1} ms / {} cells",
                                     cpu_us as f64 / 1000.0,
                                     interval_us as f64 / 1000.0,
                                     // The app idles at a 5 Hz heartbeat, so an interval near 200 ms
                                     // means NOBODY IS DRIVING IT — the frame is not slow, it is
                                     // asleep. Said on the line so the two are never confused again.
                                     if interval_us > 150_000 { " (idle heartbeat)" } else { "" },
+                                    self.frame_marks_summary(),
                                     verts.len(),
                                     dyn_verts.len(),
                                     self.simlux_gl_us.load(std::sync::atomic::Ordering::Relaxed)
@@ -41246,6 +41285,7 @@ impl eframe::App for CadApp {
         // WHEN THIS FRAME'S WORK BEGAN — see `CadApp::frame_start`. Taken first, so nothing else
         // can be charged to it.
         self.frame_start = Some(std::time::Instant::now());
+        self.frame_marks.clear();
 
         // The app's GL context (eframe runs the glow renderer) — the GPU path tracer draws on it.
         self.pt_gl = _frame.gl().cloned();
@@ -43017,7 +43057,7 @@ impl eframe::App for CadApp {
         });
         self.menubar_rect = topbar_ir.response.rect;
         // The customize drop window (anchored just under the QAT bar).
-        self.qat_customize_window(ctx);
+        self.mark("topbar"); self.qat_customize_window(ctx);
 
         // ---- top toolbar ------------------------------------------------
         // Top toolbar — all draw/modify icons moved to the left rails, so this
@@ -43103,7 +43143,7 @@ impl eframe::App for CadApp {
         // "dsnap" button — see render of the bottom status bar.)
 
         // ---- User-Environment Settings window (registry-driven) ------------
-        self.settings_window(ctx);
+        self.mark("toolbar"); self.settings_window(ctx);
 
         // ---- arc method picker ----------------------------------------------
         if self.arc_picker_open {
@@ -43256,7 +43296,7 @@ impl eframe::App for CadApp {
         // Always called — it checks `screen_stats_open` and bails if
         // closed. Open by default since the user wanted to confirm
         // the app knows what's on screen.
-        self.render_screen_stats_window(ctx);
+        self.mark("settings"); self.render_screen_stats_window(ctx);
 
         // ---- left panel: Layer dock (Slice B) ---------------------------
         if self.layer_panel_open {
@@ -43294,7 +43334,7 @@ impl eframe::App for CadApp {
         self.render_param_panel(ctx);   // parametric MODE constraint panel
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
-        self.render_dbg_recorder_window(ctx);
+        self.render_dbg_recorder_window(ctx); self.mark("dialogs");
         // FRAME-END STATE POLL — capture every transition that wasn't
         // explicitly wired. Tools, state machines, window open/close,
         // SYSVAR flips, undo depth — all get StateChange/ToolChange/
@@ -43659,19 +43699,19 @@ impl eframe::App for CadApp {
         // The fixtures follow their symbols before anything asks whether the answer is still true —
         // a light that has just been rotated on the plan must read as a change, not as unchanged.
         self.tick_symbol_sync();
-        self.refresh_light_staleness();
+        self.mark("statusbar"); self.refresh_light_staleness(); self.mark("staleness");
         // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
-        self.render_light_panel(ctx);
+        self.render_light_panel(ctx); self.mark("lightpanel");
         // Illuminaire (SIMLUX menu ▸ Illuminaire) — the fitting library. Bails if closed.
         self.render_illuminaire(ctx);
         self.render_report_dialog(ctx);
         // The calculation runs on a worker; this collects it and shows how it is getting on.
         self.poll_calculation(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
-        self.render_shortcuts_window(ctx);
-        self.render_light_3d_panel(ctx);
+        self.render_shortcuts_window(ctx); self.mark("illum+report");
+        self.render_light_3d_panel(ctx); self.mark("simlux3d");
         // 3D FACTORY viewport (docked right, like the SIMLUX 3D view).
-        self.render_factory_panel(ctx);
+        self.render_factory_panel(ctx); self.mark("factory3d");
         self.render_draw3d_dialog(ctx);
         if self.arch_modal_open {
             self.render_arch_dialog(ctx);
