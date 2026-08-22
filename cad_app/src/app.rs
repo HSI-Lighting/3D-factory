@@ -2016,6 +2016,15 @@ pub struct CadApp {
     /// inter-frame wall time cannot: it is the whole app frame, and I have twice reasoned wrongly
     /// from it. `glFinish` is a stall, so it is only issued while the recorder is running.
     simlux_gl_us: StdArc<std::sync::atomic::AtomicU64>,
+    /// WHEN THE CURRENT FRAME'S WORK BEGAN, set at the top of `update`.
+    ///
+    /// The perf taps measured the wall time BETWEEN paints and called it the frame time. That is
+    /// not what it is: the app deliberately idles at a 5 Hz heartbeat
+    /// (`request_repaint_after(200 ms)`), so an idle frame reads as 210-230 ms and every one of
+    /// them was flagged SLOW. A whole session of that was reported as "the app is at 4.8 fps" when
+    /// it was asleep. The interval is still worth printing -- it says whether the app is being
+    /// driven at all -- but the number that decides SLOW has to be WORK.
+    frame_start: Option<std::time::Instant>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
     /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
@@ -4099,6 +4108,7 @@ impl Default for CadApp {
             lux_overlay_us:         std::cell::Cell::new(0),
             lux_overlay_cells:      std::cell::Cell::new(0),
             simlux_gl_us:           StdArc::new(std::sync::atomic::AtomicU64::new(0)),
+            frame_start:            None,
             factory:             crate::factory::FactoryState::default(),
             factory_perf_prev:       None,
             factory_perf_last_frame: None,
@@ -14365,14 +14375,23 @@ impl CadApp {
                 // measure the whole-frame delta — then log it on the import/edit moment (a
                 // rebuild) or on a slow orbit frame (throttled so it can't flood the dump).
                 let now = std::time::Instant::now();
-                let mut frame_us = self
+                let mut interval_us = self
                     .factory_perf_last_frame
                     .map(|t| now.saturating_duration_since(t).as_micros() as u64)
                     .unwrap_or(0);
                 // A >1 s "frame" means the 3D view was closed/idle, not a stall — don't
                 // mistake reopening the view for a dropped frame.
-                if frame_us > 1_000_000 { frame_us = 0; }
+                if interval_us > 1_000_000 { interval_us = 0; }
                 self.factory_perf_last_frame = Some(now);
+                // WORK, NOT INTERVAL. The delta between paints is not the frame's cost: the app
+                // idles at a 5 Hz heartbeat (`request_repaint_after(200 ms)`), so an untouched
+                // frame reads 200 ms-plus and clears any sane SLOW bar while doing nothing at all.
+                // `frame_us` is now the time spent in THIS frame's `update`, which is what the
+                // threshold below was always meant to test.
+                let frame_us = self
+                    .frame_start
+                    .map(|t| now.saturating_duration_since(t).as_micros() as u64)
+                    .unwrap_or(interval_us);
 
                 // Push the resolved sun light to the (thread-local) shader BEFORE any shaded buffer
                 // is built this frame, so the scene + furniture bake under the current daylight.
@@ -14709,9 +14728,15 @@ impl CadApp {
                             })
                             .unwrap_or_default();
                         let phase = match (rebuilt, bad.is_empty()) {
+                            // The interval rides along, and says whether anything is DRIVING the
+                            // app: near 200 ms is the idle heartbeat, not a stall.
                             (_, false) => format!("SHADERS-FAILED[{bad}] {geom}"),
                             (true, _) => format!("buffer-rebuilt {geom}"),
-                            _ => format!("slow-frame {geom}"),
+                            _ => format!(
+                                "slow-frame {geom} ({:.0} ms since last paint{})",
+                                interval_us as f64 / 1000.0,
+                                if interval_us > 150_000 { ", idle heartbeat" } else { "" },
+                            ),
                         };
                         crate::dbg_event!(
                             self,
@@ -15279,10 +15304,23 @@ impl CadApp {
                 // is a SIMLUX cost that no 3D counter can see, and it is where the lag was.
                 if self.dbg.recording {
                     let now = std::time::Instant::now();
-                    let frame_us = self
+                    // WORK, NOT INTERVAL — and the difference is the whole reason a session of an
+                    // IDLE app got reported as running at 4.8 fps.
+                    //
+                    // This measured the wall time between paints. The app deliberately idles at a
+                    // 5 Hz heartbeat (`request_repaint_after(200 ms)`), so an untouched frame reads
+                    // 210–230 ms, every one of them cleared the 20 ms bar, and sixty consecutive
+                    // ⚠ SLOW lines described a window that was asleep. `cpu_us` is the time spent
+                    // in THIS frame's `update` so far, which is what SLOW is supposed to mean.
+                    let cpu_us = self
+                        .frame_start
+                        .map(|t| now.saturating_duration_since(t).as_micros() as u64)
+                        .unwrap_or(0);
+                    let interval_us = self
                         .simlux_perf_last_frame
                         .map(|t| now.saturating_duration_since(t).as_micros() as u64)
                         .unwrap_or(0);
+                    let frame_us = cpu_us;
                     self.simlux_perf_last_frame = Some(now);
                     let rebuilt = self.simlux_perf_key != Some(scene_ver);
                     self.simlux_perf_key = Some(scene_ver);
@@ -15290,7 +15328,7 @@ impl CadApp {
                     // bar there flags every frame on a vsync-locked display and stops meaning
                     // anything. A missed refresh lands near 33 ms; 20 ms catches the first stumble.
                     const SLOW_FRAME_US: u64 = 20_000;
-                    let slow = frame_us >= SLOW_FRAME_US && frame_us < 1_000_000;
+                    let slow = cpu_us >= SLOW_FRAME_US;
                     let throttle_ok = self
                         .simlux_perf_last_slow
                         .map(|t| now.saturating_duration_since(t).as_millis() >= 300)
@@ -15313,7 +15351,13 @@ impl CadApp {
                                 // so `frame - gl` is everything else: the 2D canvas, egui, the rest.
                                 // It is LAST FRAME's value: the paint callback runs after this.
                                 phase: format!(
-                                    "{what} room={}v dyn={}v gl {:.1} ms 2d-overlay {:.1} ms / {} cells",
+                                    "{what} cpu {:.1} ms of {:.0} ms since last paint{} room={}v dyn={}v gl {:.1} ms 2d-overlay {:.1} ms / {} cells",
+                                    cpu_us as f64 / 1000.0,
+                                    interval_us as f64 / 1000.0,
+                                    // The app idles at a 5 Hz heartbeat, so an interval near 200 ms
+                                    // means NOBODY IS DRIVING IT — the frame is not slow, it is
+                                    // asleep. Said on the line so the two are never confused again.
+                                    if interval_us > 150_000 { " (idle heartbeat)" } else { "" },
                                     verts.len(),
                                     dyn_verts.len(),
                                     self.simlux_gl_us.load(std::sync::atomic::Ordering::Relaxed)
@@ -41199,6 +41243,9 @@ fn paint_arc_method_icon(
 
 impl eframe::App for CadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // WHEN THIS FRAME'S WORK BEGAN — see `CadApp::frame_start`. Taken first, so nothing else
+        // can be charged to it.
+        self.frame_start = Some(std::time::Instant::now());
 
         // The app's GL context (eframe runs the glow renderer) — the GPU path tracer draws on it.
         self.pt_gl = _frame.gl().cloned();
