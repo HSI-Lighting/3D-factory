@@ -1990,6 +1990,25 @@ pub struct CadApp {
     /// What [`Self::scene3d_static`] was last built from — see `scene3d_static_key`. `None` means
     /// never built, which is not the same as built-from-an-empty-scene.
     scene3d_static_key: Option<u64>,
+    /// SIMLUX PERF MONITOR — the same taps the 3D Factory has, for the view that had none.
+    ///
+    /// `FACTORY PERF` events come only from `render_factory_panel`, so a SIMLUX session records
+    /// NOTHING and every frame number in such a dump describes a view that was not running. Three
+    /// rounds of work went into the 3D Factory's triangle count on the strength of measurements
+    /// from the wrong window before that was noticed; the absence of perf events in a SIMLUX dump
+    /// was the only clue, and absence is a poor signal to have to read.
+    simlux_perf_last_frame: Option<std::time::Instant>,
+    simlux_perf_last_slow: Option<std::time::Instant>,
+    /// The static key at the previous SIMLUX frame, so a rebuild is visible as a rebuild.
+    simlux_perf_key: Option<u64>,
+    /// What the 2D LUX OVERLAY cost at its last paint, and over how many cells.
+    ///
+    /// It lives in the 2D canvas, not the SIMLUX window, but it runs only when a lighting result
+    /// exists — so it is a SIMLUX cost that no 3D counter can see, and it is where the lag actually
+    /// was: one egui shape per cell, up to 16,384 of them, every frame. `Cell` because
+    /// `paint_lux_overlay` takes `&self`.
+    lux_overlay_us: std::cell::Cell<u64>,
+    lux_overlay_cells: std::cell::Cell<u32>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
     /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
@@ -4067,6 +4086,11 @@ impl Default for CadApp {
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             scene3d_static:      StdArc::new(Vec::new()),
             scene3d_static_key:  None,
+            simlux_perf_last_frame: None,
+            simlux_perf_last_slow:  None,
+            simlux_perf_key:        None,
+            lux_overlay_us:         std::cell::Cell::new(0),
+            lux_overlay_cells:      std::cell::Cell::new(0),
             factory:             crate::factory::FactoryState::default(),
             factory_perf_prev:       None,
             factory_perf_last_frame: None,
@@ -5227,6 +5251,16 @@ impl CadApp {
     /// mapping each work-plane cell through the same `w2s` view transform as the
     /// geometry so the heatmap tracks pan/zoom exactly. Clipped to the canvas.
     fn paint_lux_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
+        // WHAT THIS COSTS, RECORDED — see `CadApp::lux_overlay_us`. It runs only when a lighting
+        // result exists, and it lives in the 2D canvas, so no 3D counter could ever see it. It is
+        // where the SIMLUX lag actually was, and it went four rounds unmeasured.
+        let t0 = std::time::Instant::now();
+        self.lux_overlay_cells.set(0);
+        self.paint_lux_overlay_inner(painter, rect);
+        self.lux_overlay_us.set(t0.elapsed().as_micros() as u64);
+    }
+
+    fn paint_lux_overlay_inner(&self, painter: &egui::Painter, rect: egui::Rect) {
         if !self.light.show_overlay {
             return;
         }
@@ -5307,6 +5341,9 @@ impl CadApp {
                 }
             }
             if !mesh.is_empty() {
+                // Quads painted, for the perf tap — the number that scaled with the grid.
+                self.lux_overlay_cells
+                    .set(self.lux_overlay_cells.get() + (mesh.indices.len() / 6) as u32);
                 clip.add(egui::Shape::Mesh(mesh));
             }
         }
@@ -15189,7 +15226,65 @@ impl CadApp {
                 // …and the parts that really do change every frame: the lux sheet, the fittings and
                 // where they point. Bounded, and cheap enough to leave uncached — which also means
                 // there is no key to get wrong when the scale is edited from the toolbar.
+                let t_dyn = std::time::Instant::now();
                 let dyn_verts = self.build_scene3d_dyn();
+                let dyn_us = t_dyn.elapsed().as_micros() as u64;
+
+                // ---- SIMLUX PERF TAP -------------------------------------------------------
+                //
+                // The 3D Factory has had one of these for a year; this view had none, so a SIMLUX
+                // session recorded NOTHING and every frame number in such a dump described a view
+                // that was not even running. It carries the 2D overlay's cost too, because that
+                // lives in the CAD canvas but only ever runs when a lighting result exists — so it
+                // is a SIMLUX cost that no 3D counter can see, and it is where the lag was.
+                if self.dbg.recording {
+                    let now = std::time::Instant::now();
+                    let frame_us = self
+                        .simlux_perf_last_frame
+                        .map(|t| now.saturating_duration_since(t).as_micros() as u64)
+                        .unwrap_or(0);
+                    self.simlux_perf_last_frame = Some(now);
+                    let rebuilt = self.simlux_perf_key != Some(scene_ver);
+                    self.simlux_perf_key = Some(scene_ver);
+                    // The same threshold and throttle the factory tap uses: 16.7 ms IS 60 Hz, so a
+                    // bar there flags every frame on a vsync-locked display and stops meaning
+                    // anything. A missed refresh lands near 33 ms; 20 ms catches the first stumble.
+                    const SLOW_FRAME_US: u64 = 20_000;
+                    let slow = frame_us >= SLOW_FRAME_US && frame_us < 1_000_000;
+                    let throttle_ok = self
+                        .simlux_perf_last_slow
+                        .map(|t| now.saturating_duration_since(t).as_millis() >= 300)
+                        .unwrap_or(true);
+                    if rebuilt || (slow && throttle_ok) {
+                        if slow && !rebuilt {
+                            self.simlux_perf_last_slow = Some(now);
+                        }
+                        let sz = std::mem::size_of::<crate::light3d::V3>();
+                        let what = if rebuilt { "simlux-rebuilt" } else { "simlux-slow-frame" };
+                        crate::dbg_event!(
+                            self,
+                            crate::dbg_recorder::DbgEvent::FactoryPerf {
+                                phase: format!(
+                                    "{what} room={}v dyn={}v 2d-overlay {:.1} ms / {} cells",
+                                    verts.len(),
+                                    dyn_verts.len(),
+                                    self.lux_overlay_us.get() as f64 / 1000.0,
+                                    self.lux_overlay_cells.get(),
+                                ),
+                                frame_us,
+                                build_us: dyn_us,
+                                scene_tris: (verts.len() + dyn_verts.len()) / 3,
+                                furniture_insts: self.factory.furniture.len(),
+                                heaviest_tris: self.factory.heaviest_furniture_tris(),
+                                // The per-frame upload is the DYNAMIC half; the room is versioned
+                                // and crosses the bus only when it is rebuilt.
+                                upload_bytes: dyn_verts.len() * sz
+                                    + if rebuilt { verts.len() * sz } else { 0 },
+                                cache_rebuilt: rebuilt,
+                            }
+                        );
+                    }
+                }
 
                 if verts.is_empty() && dyn_verts.is_empty() {
                     painter.text(
@@ -66043,6 +66138,107 @@ mod the_two_d_lux_overlay {
                     m.indices.len(),
                 );
             }
+        }
+    }
+}
+
+/// THE SIMLUX VIEW REPORTS WHAT IT COSTS.
+///
+/// It did not, and that is why the lag took four rounds. `FACTORY PERF` events come only from
+/// `render_factory_panel`, so a SIMLUX session recorded nothing at all and every frame number in
+/// such a dump — 20.3 ms, 517 ms, `tris=`, `heaviest=` — described a view that was not running.
+/// The only clue was the ABSENCE of events, which is a poor thing to have to notice.
+#[cfg(test)]
+mod the_simlux_perf_tap {
+    use super::*;
+
+    /// THE 2D OVERLAY'S COST IS RECORDED, and its cell count with it.
+    ///
+    /// This is the one that mattered: the overlay lives in the CAD canvas, so no 3D counter could
+    /// see it, and it runs only when a lighting result exists — so it left no trace in any of the
+    /// modelling dumps that three rounds of work were aimed at. What was wrong was that its cell
+    /// count scaled with the grid, so the cell count is what has to be in the record.
+    #[test]
+    fn painting_the_overlay_records_its_cost_and_its_cell_count() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = 0.5;
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 1,
+            profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        app.light.calculate(&cad_kernel::Document::default(), Some(&app.factory));
+        app.light.show_overlay = true;
+
+        assert_eq!(app.lux_overlay_cells.get(), 0, "nothing painted yet");
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+            app.paint_lux_overlay(&painter, r);
+        });
+        let cells = app.lux_overlay_cells.get();
+        assert!(cells > 100, "a 10 x 8 m room at 0.5 m is hundreds of cells; recorded {cells}");
+
+        // AND IT RESETS. A counter that only ever accumulates reads as a leak the first time the
+        // overlay is switched off, and would report the last busy frame forever.
+        app.light.show_overlay = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+            app.paint_lux_overlay(&painter, r);
+        });
+        assert_eq!(app.lux_overlay_cells.get(), 0, "switched off, it must record zero cells");
+    }
+
+    /// THE TAP IS IN THE SIMLUX VIEW, not only in the factory's. A grep, because the alternative is
+    /// standing up a GL context; it fails the day somebody deletes the tap, which is the regression
+    /// that matters — a silent view is exactly what cost four rounds.
+    #[test]
+    fn the_simlux_view_emits_a_perf_event() {
+        // ANCHORED ON STRINGS THIS TEST DOES NOT ITSELF CONTAIN. `include_str!("app.rs")` includes
+        // THIS MODULE, so searching for a phrase that also appears in the assertions finds the
+        // assertion and passes whatever happened to the code. The first version searched for the
+        // tap's banner comment; renaming the banner renamed it in both places and the test sailed
+        // through. Each needle below is assembled at run time so the literal is not in the file.
+        let src = include_str!("app.rs");
+        let needle = |parts: &[&str]| -> String { parts.concat() };
+        // Starts ABOVE the `if recording` gate, or the slice cannot contain the gate it is asked to
+        // check for — which is how the first run of this failed.
+        let anchor = needle(&["let t_dyn = std::time::", "Instant::now();"]);
+        let a = src.find(&anchor).expect("the SIMLUX perf tap is gone");
+        let b = src[a..]
+            .find("\n                if verts.is_empty()")
+            .map(|e| a + e)
+            .expect("re-anchor this if the tap moves");
+        let body = &src[a..b];
+        assert!(body.len() < 4_000, "the slice must be the tap, not half the file");
+        for parts in [
+            &["DbgEvent::", "FactoryPerf"][..],
+            &["simlux-", "slow-frame"][..],
+            &["self.lux_overlay_", "us.get()"][..],
+            &["self.lux_overlay_", "cells.get()"][..],
+            &["if self.dbg.", "recording"][..],
+        ] {
+            let n = needle(parts);
+            assert!(body.contains(&n), "the tap no longer mentions `{n}`");
         }
     }
 }
