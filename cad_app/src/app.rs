@@ -14417,12 +14417,24 @@ impl CadApp {
                         let mesh = self.furniture_gpu_meshes[&key].clone();
                         furn_draws.push((key, mesh, fmvp, model, in_view));
                         // Peel this piece's see-through triangles into the blended pass.
-                        if let Some((tkey, tverts)) = self.factory.furniture_translucent_mesh(i) {
-                            let tmesh = self
-                                .furniture_transp_meshes
-                                .entry(tkey)
-                                .or_insert_with(|| StdArc::new(tverts))
-                                .clone();
+                        // THE KEY FIRST, THE GEOMETRY ONLY ON A MISS. This called
+                        // `furniture_translucent_mesh(i)` unconditionally and handed the result to
+                        // `or_insert_with`, which DROPS it on a cache hit: the peel walked all six
+                        // windows' 39,667 triangles apiece every frame to build vectors that were
+                        // then thrown away. Measured at 0.36 ms/frame here — small, but it is the
+                        // same shape as the bug that once cost 600 ms/frame in `furniture_faceted`,
+                        // and it grows with the model.
+                        if let Some(tkey) = self.factory.furniture_translucent_key(i) {
+                            if !self.furniture_transp_meshes.contains_key(&tkey) {
+                                if let Some((_, tverts)) = self.factory.furniture_translucent_mesh(i)
+                                {
+                                    self.furniture_transp_meshes.insert(tkey, StdArc::new(tverts));
+                                }
+                            }
+                            let tmesh = match self.furniture_transp_meshes.get(&tkey) {
+                                Some(m) => m.clone(),
+                                None => continue, // no see-through triangles after all
+                            };
                             // The WORLD model too, not only camera·model: the glass shader has to
                             // build a normal, and doing that from a depth-buffer reconstruction is
                             // what made every pane speckle on a plan sited at 6852 m. See TRANSP_VS.
@@ -65672,5 +65684,114 @@ mod express_against_thorough_probe {
             e.3 - t.3,
         );
         println!("  (a box is more occluding than the piece it replaces, so Express is expected LOW)");
+    }
+}
+
+/// FORENSIC PROBE — is the proxy reaching the draw path, and what does building it cost?
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release what_the_lod_costs -- --ignored --nocapture`
+#[cfg(test)]
+mod what_the_lod_costs_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_the_lod_costs() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+        let f = &app.factory;
+
+        // ---- what it costs to BUILD the proxies, the first time anything draws --------------
+        println!("\n=== BUILDING THE PROXY (first draw, lazily) ===");
+        println!("{:<26} {:>9} {:>11} {:>10} {:>10}", "asset", "tris", "group_geom", "lod_geom", "proxy tris");
+        let mut used: std::collections::BTreeMap<usize, usize> = Default::default();
+        for inst in &f.furniture {
+            *used.entry(inst.asset).or_default() += 1;
+        }
+        let mut total_build = 0.0f64;
+        for (idx, _) in &used {
+            let Some(a) = f.furniture_lib.get(*idx) else { continue };
+            if !a.needs_lod() {
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let g = a.group_geom();
+            let gms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            let l = a.lod_geom();
+            let lms = t.elapsed().as_secs_f64() * 1000.0;
+            total_build += gms + lms;
+            println!(
+                "{:<26} {:>9} {:>9.1} ms {:>8.1} ms {:>10}",
+                a.name,
+                a.positions.len() / 3,
+                gms,
+                lms,
+                l.tri_count(),
+            );
+            let _ = g;
+        }
+        println!("  total, once, on the UI thread at first draw: {total_build:.0} ms");
+
+        // ---- what the DRAW PATH actually emits, now the caches are warm ----------------------
+        println!("\n=== WHAT THE DRAW PATH EMITS (per instance) ===");
+        let (mut drawn, mut full) = (0usize, 0usize);
+        // WARM THE MEMO FIRST. Timing a single pass times 26 cache MISSES and then calls the
+        // result a per-frame cost — the same mistake as reading `heaviest=` off the perf line and
+        // taking it for what is drawn.
+        let warmup = std::time::Instant::now();
+        for i in 0..f.furniture.len() {
+            let _ = f.furniture_faceted(i);
+            let _ = f.furniture_textured_mesh(i);
+        }
+        let cold = warmup.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        for i in 0..f.furniture.len() {
+            let Some(a) = f.furniture_lib.get(f.furniture[i].asset) else { continue };
+            full += a.positions.len() / 3;
+            let mut n = 0usize;
+            if let Some(fac) = f.furniture_faceted(i) {
+                for (_, _, v) in &fac.opaque {
+                    n += v.len() / 3;
+                }
+                for (_, _, v) in &fac.translucent {
+                    n += v.len() / 3;
+                }
+                if let Some((_, v)) = &fac.flat {
+                    n += v.len() / 3;
+                }
+            } else if let Some((_, _, v)) = f.furniture_textured_mesh(i) {
+                n += v.len() / 3;
+            } else {
+                n += f.furniture_local_mesh(i).len() / 3;
+                n += f.furniture_translucent_mesh(i).map(|(_, v)| v.len() / 3).unwrap_or(0);
+            }
+            drawn += n;
+        }
+        let warm = t.elapsed().as_secs_f64() * 1000.0;
+        println!("  full detail        : {full} tris");
+        println!("  ACTUALLY SUBMITTED : {drawn} tris   ({:.1}x less)", full as f64 / drawn.max(1) as f64);
+        println!("  building the split, once      : {cold:.1} ms");
+        println!("  asking again, memo warm       : {warm:.1} ms");
+        println!("
+=== PER-FRAME COST BY FUNCTION (memos warm, as the render loop calls them) ===");
+        for (name, n) in [("furniture_faceted", 0), ("furniture_translucent_mesh", 1), ("furniture_textured_mesh", 2), ("furniture_model_matrix", 3)] {
+            let t = std::time::Instant::now();
+            for _ in 0..10 {
+                for i in 0..f.furniture.len() {
+                    match n {
+                        0 => { let _ = f.furniture_faceted(i); }
+                        1 => { let _ = f.furniture_translucent_mesh(i); }
+                        2 => { let _ = f.furniture_textured_mesh(i); }
+                        _ => { let _ = f.furniture_model_matrix(i); }
+                    }
+                }
+            }
+            println!("  {:<32} {:>8.2} ms per frame", name, t.elapsed().as_secs_f64() * 100.0);
+        }
     }
 }

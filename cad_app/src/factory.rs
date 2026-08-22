@@ -6666,6 +6666,22 @@ impl FactoryState {
                     .map(|e| FurnEmitter { pos: [e[0] as f32, e[1] as f32, e[2] as f32], lumens: e[3], watts: e[4] })
                     .collect();
                 fa.cct_k = a.cct_k;
+                // BUILD THE DISPLAY PROXY HERE, ON THE WORKER, not on the first frame that draws.
+                //
+                // `lod_geom` is lazy and cached, which was harmless while `needs_lod` refused every
+                // textured asset and so never ran at all. Now that it runs, the laziness moved
+                // 175 ms of decimation onto the UI thread at the moment the model first appears —
+                // measured on the gym plan, five assets at 30–36 ms each — landing in the same
+                // frame as the first GPU upload of the whole scene. It read as a 517 ms frame.
+                //
+                // This function exists to keep exactly this kind of work off the main thread (see
+                // `apply_persist_prebuilt`), so the proxy belongs in it. Warming `group_geom` first
+                // is not incidental: `lod_geom` needs it, and doing it here keeps that off the UI
+                // thread as well.
+                if fa.needs_lod() {
+                    let _ = fa.group_geom();
+                    let _ = fa.lod_geom();
+                }
                 fa
             })
             .collect()
@@ -8535,13 +8551,32 @@ impl FactoryState {
         if out.is_empty() {
             return None;
         }
-        // Key = asset + colour, tagged distinct from the opaque `furniture_key` so the two
-        // never share a GPU buffer.
+        Some((self.furniture_translucent_key(i)?, out))
+    }
+
+    /// THE GPU BUFFER KEY FOR INSTANCE `i`'s GLASS, WITHOUT BUILDING THE GLASS.
+    ///
+    /// The render loop asked for the whole peel every frame just to learn this key, then dropped
+    /// the geometry when the buffer was already cached — a full walk of six windows' 39,667
+    /// triangles apiece, sixty times a second, for a number that depends only on the asset and its
+    /// colour. Splitting it out lets the caller look the buffer up first and build only on a miss.
+    ///
+    /// `None` when the piece has no see-through triangles at all, so the caller can skip it
+    /// entirely — the same answer `furniture_translucent_mesh` gives, from cheap inputs.
+    pub fn furniture_translucent_key(&self, i: usize) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let inst = self.furniture.get(i)?;
+        let asset = self.furniture_lib.get(inst.asset)?;
+        if !asset.is_translucent() {
+            return None;
+        }
+        // Key = asset + colour, tagged distinct from the opaque `furniture_key` so the two never
+        // share a GPU buffer.
         let mut h = std::collections::hash_map::DefaultHasher::new();
         inst.asset.hash(&mut h);
         for x in inst.color { x.to_bits().hash(&mut h); }
         0xA1A1_A1A1u32.hash(&mut h);
-        Some((h.finish(), out))
+        Some(h.finish())
     }
 
     /// Build the full TEXTURED local mesh for instance `i` when it carries a pasted texture:
@@ -8948,11 +8983,19 @@ impl FactoryState {
 
     /// Triangle count of the single heaviest PLACED furniture mesh (0 if none). The usual
     /// culprit when the 3D view goes slow after an import — surfaced in the perf monitor.
+    /// AS DRAWN, which is the whole point of a perf metric.
+    ///
+    /// This reported the asset's FULL triangle count, so on the gym plan the dump said
+    /// `heaviest=497050` whether the piece was drawn at 497,050 triangles or at the proxy's 68,059
+    /// — the number could not distinguish the bug from the fix. Same class of mistake as `tris=`
+    /// counting only the CSG buffer and reading like the scene.
     pub fn heaviest_furniture_tris(&self) -> usize {
         self.furniture
             .iter()
             .filter_map(|inst| self.furniture_lib.get(inst.asset))
-            .map(|a| a.positions.len() / 3)
+            .map(|a| {
+                if a.needs_lod() { a.lod_geom().tri_count() } else { a.positions.len() / 3 }
+            })
             .max()
             .unwrap_or(0)
     }
@@ -16589,5 +16632,119 @@ mod lod_consumers_read_one_mesh {
             "every proxy triangle belongs to exactly one pass: {solid} solid + {glass} glass \
              against {total}",
         );
+    }
+}
+
+/// THE FIRST FRAME AFTER A LOAD MUST NOT BUILD THE PROXIES.
+///
+/// Turning the LOD on moved 175 ms of decimation (five assets at 30–36 ms) onto the UI thread at
+/// the moment the model first appears, because `lod_geom` is lazy. That lands in the same frame as
+/// the first GPU upload of the whole scene and read as a 517 ms frame in the session dump.
+///
+/// The decode already runs on a worker precisely so this kind of work stays off the main thread.
+#[cfg(test)]
+mod the_first_frame_after_a_load {
+    use super::*;
+
+    fn a_heavy_rec() -> crate::simlux_io::FurnitureAssetRec {
+        let n = (LOD_TRI_THRESHOLD + 20) * 3;
+        let mut pos = Vec::with_capacity(n * 3);
+        for i in 0..n {
+            let a = i as f32 * 0.0007;
+            pos.extend_from_slice(&[a.cos(), a.sin(), (i % 3) as f32 * 0.4]);
+        }
+        crate::simlux_io::FurnitureAssetRec {
+            name: "heavy".into(),
+            color: [0.7, 0.7, 0.7],
+            positions: pos.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// THE WORKER LEAVES THE PROXY READY. Observed on the cache itself, because the point is not
+    /// that a proxy can be built — it is that it is ALREADY built by the time the UI thread has it.
+    #[test]
+    fn decoding_the_library_leaves_the_proxy_already_built() {
+        let lib = FactoryState::decode_furniture_lib(vec![a_heavy_rec()]);
+        let a = &lib[0];
+        assert!(a.needs_lod(), "the fixture must be heavy enough to want a proxy");
+        assert!(
+            a.lod.borrow().is_some(),
+            "the proxy is still unbuilt, so the first frame that draws will pay for it",
+        );
+        assert!(
+            a.groups.borrow().is_some(),
+            "…and its face grouping too, which `lod_geom` needs and would otherwise also cost",
+        );
+    }
+
+    /// A LIGHT ASSET IS NOT DECIMATED, so nothing is built for it and the decode stays cheap.
+    #[test]
+    fn a_light_asset_costs_the_worker_nothing() {
+        let mut rec = a_heavy_rec();
+        rec.positions.truncate(30);
+        let lib = FactoryState::decode_furniture_lib(vec![rec]);
+        assert!(!lib[0].needs_lod());
+        assert!(lib[0].lod.borrow().is_none(), "no proxy is wanted, so none should be built");
+    }
+}
+
+/// THE GLASS PEEL IS BUILT ONCE, NOT EVERY FRAME.
+#[cfg(test)]
+mod the_translucent_key {
+    use super::*;
+
+    fn a_glassy_piece() -> FactoryState {
+        let mut f = FactoryState::default();
+        let pos: Vec<[f32; 3]> = (0..60)
+            .map(|i| [(i % 5) as f32, (i / 5) as f32, (i % 3) as f32])
+            .collect();
+        let normals = vec![[0.0, 0.0, 1.0]; pos.len()];
+        let alpha: Vec<f32> = (0..pos.len()).map(|i| if i < 30 { 0.3 } else { 1.0 }).collect();
+        let idx = f.add_furniture_asset(
+            "pane".into(),
+            crate::mesh_io::ObjMesh { positions: pos, normals, color: Some([1.0; 3]), alpha },
+        );
+        f.place_furniture(idx, Vec3::ZERO);
+        f
+    }
+
+    /// THE CHEAP KEY IS THE SAME KEY. If it were not, the render loop would look up one buffer and
+    /// fill another, and the glass would be rebuilt every frame anyway — silently, since both paths
+    /// still produce a picture.
+    ///
+    /// A WEAK TEST ON PURPOSE, and worth saying so: `furniture_translucent_mesh` now DELEGATES to
+    /// `furniture_translucent_key`, so the two cannot disagree and no mutation of the key makes
+    /// this fail. The delegation is the guarantee; this pins only that the delegation is still
+    /// there, and would start earning its place the day somebody inlines the hash back.
+    #[test]
+    fn the_cheap_key_matches_the_one_the_geometry_carries() {
+        let f = a_glassy_piece();
+        let (from_mesh, _) = f.furniture_translucent_mesh(0).expect("this piece has glass");
+        assert_eq!(
+            f.furniture_translucent_key(0),
+            Some(from_mesh),
+            "the key looked up must be the key stored",
+        );
+    }
+
+    /// AND IT AGREES ABOUT ABSENCE. A piece with no see-through triangles must answer `None` from
+    /// the cheap path too, or the caller would insert an empty buffer and draw it.
+    #[test]
+    fn a_solid_piece_has_no_translucent_key() {
+        let mut f = a_glassy_piece();
+        f.furniture_lib[0].alpha = vec![1.0; f.furniture_lib[0].positions.len()];
+        assert!(f.furniture_translucent_mesh(0).is_none());
+        assert!(f.furniture_translucent_key(0).is_none());
+    }
+
+    /// THE COLOUR IS IN THE KEY, so recolouring a piece gets its own buffer rather than reusing the
+    /// old one — the property that makes looking the key up first safe at all.
+    #[test]
+    fn recolouring_a_piece_changes_its_key() {
+        let mut f = a_glassy_piece();
+        let before = f.furniture_translucent_key(0).expect("a key");
+        f.furniture[0].color = [0.1, 0.9, 0.2];
+        assert_ne!(f.furniture_translucent_key(0), Some(before));
     }
 }
