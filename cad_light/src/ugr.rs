@@ -47,8 +47,12 @@ pub struct Observer {
 impl Observer {
     /// Seated eye height, the EN 12464-1 default for an office.
     pub const SEATED_EYE_M: f32 = 1.2;
-    /// Standing eye height.
-    pub const STANDING_EYE_M: f32 = 1.5;
+    /// Standing eye height — EN 12464-1's pair with the seated 1.2 m.
+    ///
+    /// Was 1.5 m, which is not a value the standard uses; the pair is 1.2 m seated, 1.6 m standing.
+    /// The 0.1 m is not a rounding: the position index is steep near the line of sight, so raising
+    /// the eye moves a ceiling fitting several degrees closer to it and the rating with it.
+    pub const STANDING_EYE_M: f32 = 1.6;
 
     pub fn looking(position: Vertex, direction: Vec3) -> Self {
         Self { position, direction }
@@ -113,11 +117,41 @@ pub fn position_index(sigma_deg: f64, alpha_deg: f64) -> f64 {
 ///
 /// Returns `None` when there is nothing to rate: no source in the field of view, or no background
 /// to see it against. Zero would be a lie — zero is an excellent UGR.
+///
+/// EVERY FITTING IS TAKEN AS VISIBLE and at its INITIAL output. A real room has walls in it and a
+/// real installation is quoted maintained — see [`ugr_at_ex`], which this is the plain-scene case
+/// of. Kept as its own entry point because the formula's own tests want no scene and no factor.
 pub fn ugr_at(
     observer: &Observer,
     luminaires: &[Luminaire],
     profiles: &HashMap<String, IesProfile>,
     background: f64,
+) -> Option<UgrResult> {
+    ugr_at_ex(observer, luminaires, profiles, background, 1.0, &|_, _| true)
+}
+
+/// UGR at one observer, WITH OCCLUSION AND MAINTENANCE — the form a real room wants.
+///
+/// * `visible(eye, luminaire)` — `false` when something stands between them. Without it every
+///   fitting in the model glares from wherever it is, including through a party wall and from the
+///   next room, and the error is in the unsafe direction. `RtScene::occluded` negated is the
+///   intended argument; `&|_, _| true` is the no-scene case.
+/// * `maintenance` — the factor the installation is quoted at, applied to luminaire output exactly
+///   as [`Evaluator`](crate::Evaluator) applies it to illuminance.
+///
+/// **UGR IS NOT INVARIANT TO A UNIFORM SCALE, so the two halves must agree.** Scaling every
+/// luminaire by `m` scales the glare sum by `m²`, and the background it is seen against by `m`, so
+/// the net is `ΔUGR = 8·log₁₀(m)` — about −0.8 at a 0.80 factor. This function scales only the
+/// LUMINAIRES; `background` must arrive already maintained, which it does when it comes from an
+/// `Evaluator` (that applies the factor to everything it returns). Applying it here as well would
+/// count it twice and land the rating 0.8 low.
+pub fn ugr_at_ex(
+    observer: &Observer,
+    luminaires: &[Luminaire],
+    profiles: &HashMap<String, IesProfile>,
+    background: f64,
+    maintenance: f64,
+    visible: &dyn Fn(Vec3, Vec3) -> bool,
 ) -> Option<UgrResult> {
     if !(background.is_finite() && background > 0.0) {
         return None;
@@ -155,13 +189,39 @@ pub fn ugr_at(
         }
         let sigma_deg = cos_sigma.clamp(-1.0, 1.0).acos().to_degrees();
 
-        // The luminaire's own emission angle toward the eye: gamma from ITS nadir (−Z).
+        // ANYTHING IN THE WAY REMOVES IT. Cheap rejects are already done; this is one shadow ray.
+        // Placed BEFORE the aperture test so an occluded fitting is not also counted as one whose
+        // file declares no area — those two say very different things to the reader.
+        if !visible(eye, l.position.to_vec3()) {
+            continue;
+        }
+
+        // READ THE PHOTOMETRY THROUGH THE FITTING'S OWN FRAME, exactly as `calc.rs` does.
         //
-        // `dir` runs eye → luminaire, so the ray reaching the eye runs −`dir`, and
-        // cos γ = (−dir)·(0,0,−1) = dir.z. Negating it here instead put a fitting directly
-        // OVERHEAD at γ = 180° — pointing at the ceiling — which read back zero intensity and zero
-        // projected area, so every realistic observer got no rating at all.
-        let gamma_deg = (dir.z as f64).clamp(-1.0, 1.0).acos().to_degrees();
+        // γ and φ are measured from the luminaire's nadir and its C0 plane. This used to take them
+        // from the WORLD axes — γ from world-down and φ from world +X — which is right only for a
+        // fitting pointing at the floor. `tilt_deg` is precisely what the aiming tool writes, so a
+        // spot tipped 30° into someone's eye was read at whatever its file holds at nadir, often
+        // near zero: the glare map would have been blank in the one place it matters.
+        //
+        // `dir` runs eye → luminaire, so the ray that REACHES the eye leaves the fitting along
+        // `-dir`. That is the direction to sample, and it is the same convention as
+        // `intensity_toward`, whose own `dir` runs luminaire → point.
+        let (aim, c0, c90) = l.frame();
+        let out = -dir;
+        let gamma_deg = (out.dot(aim) as f64).clamp(-1.0, 1.0).acos().to_degrees();
+        // 180° OUT, SEPARATELY FROM THE TILT BUG. The old azimuth was `atan2(dir.y, dir.x)` — the
+        // bearing of the luminaire FROM THE EYE, where the C-plane wants the bearing of the eye
+        // FROM THE LUMINAIRE. The two are opposite, so an eye standing off the +X side of a fitting
+        // was read in its C0 plane when it is squarely in its C180. Invisible on an axially
+        // symmetric downlight, and a straight swap of one flank for the other on anything with an
+        // asymmetric optic — a wall-washer, an aimed spot, a batten with a shielded side.
+        let azim = (out.dot(c90).atan2(out.dot(c0)).to_degrees() as f64).rem_euclid(360.0);
+
+        // γ FEEDS THE APERTURE TOO, so it has to be the corrected one: `projected_luminous_area`
+        // foreshortens the aperture about its OWN normal, which is the aim vector and not world
+        // down. Reading it off the world axes tilted the aperture the wrong way on every aimed
+        // fitting — the same root cause, biting a second time.
         let Some(area) = prof.projected_luminous_area(gamma_deg) else {
             skipped_no_area += 1;
             continue;
@@ -171,13 +231,16 @@ pub fn ugr_at(
             continue;
         }
 
-        // Azimuth about the luminaire's own axis, so a non-symmetric distribution is sampled the
-        // way it is aimed.
-        let azim = {
-            let a = (dir.y as f64).atan2(dir.x as f64).to_degrees() - l.rotation_deg as f64;
-            a.rem_euclid(360.0)
-        };
-        let intensity = prof.intensity(gamma_deg, azim) * prof.multiplier * l.dimming as f64;
+        // ONE ACCESSOR FOR OUTPUT, the same one `calc.rs` uses.
+        //
+        // This read `prof.intensity(..) * prof.multiplier * l.dimming`, which was wrong twice.
+        // `IesProfile::intensity` ALREADY applies the multiplier (`ies.rs`), so it was counted
+        // twice — invisible on EULUMDAT, which always parses 1.0, and real on LM-63, which reads it
+        // from the header. UGR goes as I², so a file carrying 0.8 landed 1.5 UGR low and one
+        // carrying 2 landed 4.8 high, either side of a pass/fail line. And `dimming` alone ignores
+        // `flux_override`, so a fitting the user re-rated to 2000 lm LIT the room at one output and
+        // GLARED at another. `output_scale` folds both, so the two can never disagree again.
+        let intensity = prof.intensity(gamma_deg, azim) * l.output_scale(prof) * maintenance;
         if intensity <= 0.0 {
             continue;
         }
@@ -416,5 +479,220 @@ mod tests {
     #[test]
     fn background_luminance_is_the_lambertian_conversion() {
         assert!((background_from_indirect(std::f64::consts::PI) - 1.0).abs() < 1e-12);
+    }
+
+    // ===== the five defects, each as the check that fails on the code that had it ===============
+
+    /// A NARROW BEAM: 3000 cd at nadir, 100 cd by 30°, nothing at 90°. Axially symmetric, so the
+    /// only thing that can move its output is γ — which is the whole point of the aim test.
+    fn spot(side: f64) -> IesProfile {
+        let mut p = flat_source(0.0, side);
+        p.vertical_angles = vec![0.0, 30.0, 90.0];
+        p.horizontal_angles = vec![0.0];
+        p.candela = vec![vec![3000.0, 100.0, 0.0]];
+        p
+    }
+
+    /// TWO DIFFERENT FLANKS: bright across C0, dim across C180. Nothing else in the file tells the
+    /// two sides apart, so any result that differs between them differs *only* by the azimuth.
+    fn asymmetric(c0: f64, c180: f64, side: f64) -> IesProfile {
+        let mut p = flat_source(0.0, side);
+        p.vertical_angles = vec![0.0, 90.0];
+        p.horizontal_angles = vec![0.0, 180.0, 360.0];
+        p.candela = vec![vec![c0, c0], vec![c180, c180], vec![c0, c0]];
+        p
+    }
+
+    fn lamp_at(x: f32, y: f32, z: f32) -> Luminaire {
+        Luminaire {
+            id: 1,
+            profile: "p".into(),
+            position: Vertex::new(x, y, z),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        }
+    }
+
+    /// §2.1 — **AIM MATTERS.** The defect: γ was read from the WORLD's downward axis, so `tilt_deg`
+    /// — the field the aiming tool writes — changed nothing at all. A spot tipped into someone's
+    /// eye was rated at whatever its file holds at nadir.
+    ///
+    /// Same fitting, same place, same eye; only the pose differs. On the old code both readings are
+    /// bit-identical, because the tilt was never consulted.
+    #[test]
+    fn a_fitting_aimed_at_the_observer_glares_far_more_than_one_aimed_at_the_floor() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let p = profiles(spot(0.5));
+
+        let level = ugr_at(&obs, &[lamp_at(0.0, 2.0, 3.2)], &p, 50.0).expect("floor-aimed");
+
+        let mut aimed = lamp_at(0.0, 2.0, 3.2);
+        assert!(aimed.aim_at(obs.position.to_vec3()), "the fitting must accept the aim");
+        let aimed = ugr_at(&obs, &[aimed], &p, 50.0).expect("eye-aimed");
+
+        // γ goes 45° → 0°, so the beam swings from 75 cd onto the eye at its full 3000 cd. The term
+        // goes as I², damped by the aperture opening out as it faces square on.
+        assert!(
+            aimed.ugr > level.ugr + 15.0,
+            "aiming the beam into the eye must show: aimed {:.2} against floor-aimed {:.2}",
+            aimed.ugr,
+            level.ugr,
+        );
+        assert!(
+            aimed.sources[0].luminance > level.sources[0].luminance * 20.0,
+            "and it is the LUMINANCE that moved: {:.0} against {:.0} cd/m²",
+            aimed.sources[0].luminance,
+            level.sources[0].luminance,
+        );
+    }
+
+    /// §2.1, SAFETY PROPERTY — the frame fix must be a no-op on the fittings that had no pose.
+    ///
+    /// Untilted, `aim` is straight down and `(−dir)·aim` is exactly the old `dir.z`. Everything the
+    /// eight formula tests above pin therefore has to survive unchanged, and this says so against a
+    /// number rather than by assertion: the hand-calculated case still lands on 14.81.
+    #[test]
+    fn an_untilted_fitting_reads_exactly_as_it_did_before_the_frame_fix() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let r = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.5)), 50.0)
+            .expect("a result");
+        assert!((r.sources[0].sigma_deg - 45.0).abs() < 1e-3);
+        assert!((r.ugr - 14.81).abs() < 0.05, "UGR {}", r.ugr);
+    }
+
+    /// §2.1b — **THE AZIMUTH WAS 180° OUT**, separately from the tilt, and this one the plan did not
+    /// list.
+    ///
+    /// The old expression was `atan2(dir.y, dir.x)`, the bearing of the LUMINAIRE FROM THE EYE. A
+    /// C-plane is indexed by the bearing of the EYE FROM THE LUMINAIRE, and those are opposite. So
+    /// an eye standing off a fitting's +X side was read in its C0 plane when it stands squarely in
+    /// its C180 — a straight swap of one flank for the other.
+    ///
+    /// Eye at the origin, fitting 2 m along +X: the light that reaches the eye leaves the fitting
+    /// travelling in −X, which is C180 and therefore the DIM side.
+    #[test]
+    fn an_asymmetric_fitting_is_read_in_the_c_plane_that_faces_the_eye() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::X);
+        let p = profiles(asymmetric(2000.0, 200.0, 0.5));
+        let r = ugr_at(&obs, &[lamp_at(2.0, 0.0, 3.2)], &p, 50.0).expect("a result");
+
+        // I = 200 cd (C180), A_p = 0.25·cos45 = 0.176777 m² → L = 1131 cd/m².
+        // Reading C0 instead would give ten times that.
+        assert!(
+            (r.sources[0].luminance - 1131.4).abs() < 5.0,
+            "the eye is in C180, so 200 cd → 1131 cd/m²; got {:.0}. Ten times that is the old \
+             azimuth reading the bright flank.",
+            r.sources[0].luminance,
+        );
+    }
+
+    /// §2.2 — **THE CANDELA MULTIPLIER, ONCE.** `IesProfile::intensity` already applies it, and the
+    /// old line applied it again. EULUMDAT always parses 1.0 so it never showed on `.ldt`; LM-63
+    /// reads a real value from its header, and UGR goes as I².
+    #[test]
+    fn the_candela_multiplier_is_applied_once_and_not_twice() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let plain = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(flat_source(1000.0, 0.5)), 50.0)
+            .unwrap()
+            .ugr;
+        let mut doubled = flat_source(1000.0, 0.5);
+        doubled.multiplier = 2.0;
+        let doubled =
+            ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &profiles(doubled), 50.0).unwrap().ugr;
+
+        // Twice the output is twice the luminance and four times the term: 8·log₁₀(4) = 4.82.
+        // Counted twice it would be four times the output and 8·log₁₀(16) = 9.64.
+        assert!(
+            (doubled - plain - 4.82).abs() < 0.05,
+            "a multiplier of 2 must add 4.82, not 9.64: {doubled:.2} - {plain:.2}",
+        );
+    }
+
+    /// §2.3 — **A RE-RATED FITTING GLARES AT ITS NEW OUTPUT.** The old line scaled by `dimming`
+    /// alone, so a fitting the user re-rated LIT the room at one output and GLARED at another.
+    #[test]
+    fn re_rating_a_fitting_moves_its_glare_as_well_as_its_light() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let p = profiles(flat_source(1000.0, 0.5)); // the profile declares 1000 lm
+        let full = ugr_at(&obs, &one_lamp(0.0, 2.0, 3.2), &p, 50.0).unwrap().ugr;
+
+        let mut halved = lamp_at(0.0, 2.0, 3.2);
+        halved.flux_override = Some(500.0);
+        let halved = ugr_at(&obs, &[halved], &p, 50.0).unwrap().ugr;
+
+        // Half the flux quarters the term: 8·log₁₀(0.25) = −4.82. Ignored, it would be 0.
+        assert!(
+            (full - halved - 4.82).abs() < 0.05,
+            "re-rating 1000 lm to 500 must drop the rating 4.82: {full:.2} - {halved:.2}",
+        );
+    }
+
+    /// §2.4 — **SOMETHING IN THE WAY REMOVES IT.** Without this every fitting in the model glares
+    /// from wherever it is, including from the next room straight through the party wall — and it
+    /// is wrong in the unsafe direction, which is the one that gets signed off.
+    #[test]
+    fn a_fitting_behind_an_obstruction_drops_out_of_the_sum() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let p = profiles(flat_source(1000.0, 0.5));
+        let lums = one_lamp(0.0, 2.0, 3.2);
+
+        let seen = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true);
+        let hidden = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| false);
+        assert!(seen.is_some(), "the plain scene must still rate");
+        assert!(hidden.is_none(), "a wall in the way leaves nothing to rate, not a rating of zero");
+
+        // And with two fittings, hiding ONE leaves the other — it removes a source rather than
+        // abandoning the calculation.
+        let mut two = one_lamp(0.0, 2.0, 3.2);
+        let mut second = lamp_at(0.6, 2.0, 3.2);
+        second.id = 2;
+        two.push(second);
+        let both = ugr_at_ex(&obs, &two, &p, 50.0, 1.0, &|_, _| true).unwrap();
+        let one_hidden =
+            ugr_at_ex(&obs, &two, &p, 50.0, 1.0, &|_, to| to.x < 0.3).unwrap();
+        assert_eq!(both.sources.len(), 2);
+        assert_eq!(one_hidden.sources.len(), 1, "exactly the unobstructed fitting survives");
+        assert!(one_hidden.ugr < both.ugr);
+    }
+
+    /// §2.5 — **MAINTAINED, LIKE EVERY OTHER FIGURE ON THE PAGE.** UGR is not invariant to a
+    /// uniform scale, so a maintained lux plan beside a day-one glare figure is two conventions in
+    /// one report.
+    ///
+    /// This function scales the LUMINAIRES only; the background arrives already maintained from the
+    /// evaluator. So against a FIXED background the sum moves by m² — `ΔUGR = 16·log₁₀(m)` — and it
+    /// is the caller supplying a maintained background that turns that into the net 8·log₁₀(m).
+    #[test]
+    fn maintenance_scales_the_glare_sum_and_not_the_background() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let p = profiles(flat_source(1000.0, 0.5));
+        let lums = one_lamp(0.0, 2.0, 3.2);
+        let initial = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true).unwrap().ugr;
+        let kept = ugr_at_ex(&obs, &lums, &p, 50.0, 0.8, &|_, _| true).unwrap().ugr;
+
+        let expect = 16.0 * 0.8f64.log10(); // −1.55
+        assert!(
+            (kept - initial - expect).abs() < 0.02,
+            "0.80 maintained must move the rating by {expect:.2}: {kept:.2} - {initial:.2}",
+        );
+        // The net once the caller's background is maintained too is half of that, and it is the
+        // number the report footnote has to stand behind.
+        assert!((8.0 * 0.8f64.log10() + 0.776).abs() < 0.01);
+    }
+
+    /// `ugr_at` is now `ugr_at_ex` with nothing in the way and no factor — and must stay exactly
+    /// that, or the eight formula tests above stop describing what the app actually calls.
+    #[test]
+    fn the_plain_entry_point_is_the_unobstructed_unmaintained_case() {
+        let obs = Observer::looking(Vertex::new(0.0, 0.0, 1.2), Vec3::Y);
+        let p = profiles(flat_source(1000.0, 0.5));
+        let lums = one_lamp(0.0, 2.0, 3.2);
+        let plain = ugr_at(&obs, &lums, &p, 50.0).unwrap();
+        let ex = ugr_at_ex(&obs, &lums, &p, 50.0, 1.0, &|_, _| true).unwrap();
+        assert_eq!(plain.ugr.to_bits(), ex.ugr.to_bits(), "{} vs {}", plain.ugr, ex.ugr);
     }
 }

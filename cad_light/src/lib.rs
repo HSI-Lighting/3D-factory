@@ -21,7 +21,9 @@ pub use extrude::{bbox, box_room, extrude, extrude_handles, triangulate};
 pub use ies::{parse as parse_ies, Aperture, IesProfile, PhotometryType};
 pub use ldt::{parse as parse_ldt, Symmetry};
 pub mod ugr;
-pub use ugr::{background_from_indirect, position_index, ugr_at, GlareSource, Observer, UgrResult};
+pub use ugr::{
+    background_from_indirect, position_index, ugr_at, ugr_at_ex, GlareSource, Observer, UgrResult,
+};
 
 pub use types::{
     default_materials, en12464_cells, en12464_spacing, installation_summary, CalcPlane, Installation,
