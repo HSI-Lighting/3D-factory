@@ -1968,6 +1968,28 @@ pub struct CadApp {
     /// SIMLUX 3D viewport renderer (offscreen-FBO glow), shared into the egui
     /// PaintCallback like `gpu_renderer`.
     light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
+    /// SIMLUX 3D: THE HEAVY HALF OF THE SCENE BUFFER, BUILT ONLY WHEN IT CHANGES.
+    ///
+    /// `build_scene3d_verts` ran every frame the view was open and rebuilt everything in it. The
+    /// room geometry is the expensive part by a distance: on the reference gym plan the furniture
+    /// alone is 7,030,514 triangles, so every frame cloned or re-transformed all of them and
+    /// expanded them into 40-byte vertices — roughly 844 MB allocated, filled and dropped, on the UI
+    /// thread, while the 2D plan beside it was being edited. That is what "it lags while I place
+    /// luminaires" was.
+    ///
+    /// SPLIT BY HOW OFTEN IT CHANGES, not by what it draws. This half is the room, and it moves only
+    /// when the model, the calculation, the materials or the ceiling toggle do — rarely, and never
+    /// during a drag. The lux sheet, the fitting markers and the aim arrows are still rebuilt every
+    /// frame: they are bounded (the sheet by `overlay_res`'s 12,000-cell budget, the rest by the
+    /// number of fittings) and they depend on things that really do change per frame, like the
+    /// camera distance the marker glyph is sized by.
+    ///
+    /// `Arc` because the buffer is handed to a paint callback that outlives the borrow, and cloning
+    /// it to do that would hand back everything the cache saves.
+    scene3d_static: StdArc<Vec<crate::light3d::V3>>,
+    /// What [`Self::scene3d_static`] was last built from — see `scene3d_static_key`. `None` means
+    /// never built, which is not the same as built-from-an-empty-scene.
+    scene3d_static_key: Option<u64>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
     /// 3D-Factory PERF MONITOR (recorder tap). Previous opaque render buffer, so a rebuild
@@ -4043,6 +4065,8 @@ impl Default for CadApp {
             gpu_renderer: StdArc::new(Mutex::new(GpuShapeRenderer::default())),
             light:               crate::light::LightState::new(),
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
+            scene3d_static:      StdArc::new(Vec::new()),
+            scene3d_static_key:  None,
             factory:             crate::factory::FactoryState::default(),
             factory_perf_prev:       None,
             factory_perf_last_frame: None,
@@ -5815,42 +5839,56 @@ impl CadApp {
         (x, y)
     }
 
-    /// Build the flat-shaded (+ optional lux floor) triangle soup for the 3D view.
-    fn build_scene3d_verts(&self) -> Vec<crate::light3d::V3> {
-        if self.light.meshes.is_empty() {
-            return Vec::new();
+    /// EVERYTHING THE CACHED HALF OF THE SIMLUX SCENE IS BUILT FROM, as one number.
+    ///
+    /// Only the inputs of [`Self::build_scene3d_static`] belong here. Getting this wrong in the
+    /// stale direction is worse than the lag it cures — a user who drops a wall's reflectance and
+    /// sees nothing change has been told a lie about their room — so the rule is that anything the
+    /// static build reads is either in this key or is a counter that moves when it changes.
+    ///
+    /// The two heavy inputs are counters rather than content, because hashing them would cost what
+    /// rebuilding costs: `meshes_gen` moves whenever the scene triangles are replaced, and the
+    /// factory's own `geom_version` moves whenever the CSG model is rebuilt. Everything else here
+    /// is a handful of scalars and is hashed by value.
+    fn scene3d_static_key(&self) -> u64 {
+        let mut f = crate::light::Fnv::new();
+        f.u64(self.light.meshes_gen);
+        f.u64(self.factory.geom_version);
+        // Picks WHICH of the three ceiling branches runs, and the height one of them filters at.
+        f.u64(self.light.hide_ceilings as u64);
+        f.f32(self.light.plane_height);
+        // The CSG mesh is only consulted to choose that branch, but "is there a model at all"
+        // changes the answer, so it is asked rather than assumed.
+        f.u64(self.factory.cached.positions.len() as u64);
+        // THROUGH JSON, for the reason `hash_json` gives: a material gains fields, and a hand
+        // written list of them is a list that falls behind without saying so. The failure here
+        // would be a reflectance edit that changes the report and not the picture.
+        crate::light::hash_json(&mut f, "materials", &self.light.materials);
+        f.finish()
+    }
+
+    /// The cached room geometry, rebuilt only when [`Self::scene3d_static_key`] moves.
+    fn scene3d_static(&mut self) -> StdArc<Vec<crate::light3d::V3>> {
+        let key = self.scene3d_static_key();
+        if self.scene3d_static_key != Some(key) {
+            self.scene3d_static = StdArc::new(self.build_scene3d_static());
+            self.scene3d_static_key = Some(key);
         }
-        // THE FLOOR IS A FLOOR. The result is drawn over it as its own sheet — see
-        // `light3d::push_lux_sheet` for the measurement that says why vertex colours could never
-        // have done it.
-        let floor = None;
-        // HIDE CEILINGS. The result is painted on the FLOOR, and a closed box hides the one
-        // surface this view exists to show. Filtered here rather than in the mesh build so the
-        // CALCULATION still sees the ceiling — it is 70 % of the interreflection, and a view
-        // option that changed the answer would be a trap.
-        // …and filtered by FEATURE, not by material. Material here is assigned by ORIENTATION, so
-        // dropping material 2 took only the ceiling's UNDERSIDE: its top face is `n.z > 0.7`, i.e.
-        // material 0 (floor), and stayed — as did the building's own roof. Looking down, the room
-        // was still lidded and the toggle looked broken, which is what was reported. Twice.
-        //
-        // Rebuilt from the factory with the ceiling features left out, the way the 3D Factory does
-        // it, so both faces go. `self.light.meshes` is untouched and Calculate still sees the
-        // ceiling. With no 3D model — a 2D-only project lit from the plan extrusion — there are no
-        // features to ask about, so the old material filter is still the best available.
-        let shown: Vec<cad_light::Mesh> = if !self.light.hide_ceilings {
-            self.light.meshes.clone()
-        } else if self.factory.cached.positions.len() >= 3 {
-            // Everything horizontal above the working plane. See `meshes_from_factory_ex` for why
-            // this is geometric and not per-material or per-feature — both of those were tried and
-            // measured, and both left the room lidded.
-            crate::light::meshes_from_factory_ex(
-                &self.factory,
-                Some(self.light.plane_height.max(0.1)),
-            )
-        } else {
-            self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
-        };
-        let mut verts = crate::light3d::build_scene_verts(&shown, &self.light.materials, floor);
+        self.scene3d_static.clone()
+    }
+
+    /// THE PER-FRAME HALF: the lux sheet, the fittings, and where they point.
+    ///
+    /// Small by construction — the sheet is capped at `overlay_res`'s 12,000 cells per room and the
+    /// rest scales with the number of fittings — and genuinely frame-dependent: the marker glyph is
+    /// sized by camera distance, and the scale the sheet is painted in is edited live from the
+    /// toolbar. Kept out of the cache so that editing either updates on the next frame, with no
+    /// cache key to get wrong.
+    fn build_scene3d_dyn(&self) -> Vec<crate::light3d::V3> {
+        let mut verts = Vec::new();
+        if self.light.meshes.is_empty() {
+            return verts;
+        }
         self.push_lux_overlay(&mut verts);
         // EACH FITTING AT ITS REAL SIZE, when its file declares one.
         //
@@ -5884,6 +5922,44 @@ impl CadApp {
         }
         self.push_aim_arrows(&mut verts);
         verts
+    }
+
+    /// Build the flat-shaded room geometry for the 3D view — the CACHED half.
+    fn build_scene3d_static(&self) -> Vec<crate::light3d::V3> {
+        if self.light.meshes.is_empty() {
+            return Vec::new();
+        }
+        // THE FLOOR IS A FLOOR. The result is drawn over it as its own sheet — see
+        // `light3d::push_lux_sheet` for the measurement that says why vertex colours could never
+        // have done it.
+        let floor = None;
+        // HIDE CEILINGS. The result is painted on the FLOOR, and a closed box hides the one
+        // surface this view exists to show. Filtered here rather than in the mesh build so the
+        // CALCULATION still sees the ceiling — it is 70 % of the interreflection, and a view
+        // option that changed the answer would be a trap.
+        // …and filtered by FEATURE, not by material. Material here is assigned by ORIENTATION, so
+        // dropping material 2 took only the ceiling's UNDERSIDE: its top face is `n.z > 0.7`, i.e.
+        // material 0 (floor), and stayed — as did the building's own roof. Looking down, the room
+        // was still lidded and the toggle looked broken, which is what was reported. Twice.
+        //
+        // Rebuilt from the factory with the ceiling features left out, the way the 3D Factory does
+        // it, so both faces go. `self.light.meshes` is untouched and Calculate still sees the
+        // ceiling. With no 3D model — a 2D-only project lit from the plan extrusion — there are no
+        // features to ask about, so the old material filter is still the best available.
+        let shown: Vec<cad_light::Mesh> = if !self.light.hide_ceilings {
+            self.light.meshes.clone()
+        } else if self.factory.cached.positions.len() >= 3 {
+            // Everything horizontal above the working plane. See `meshes_from_factory_ex` for why
+            // this is geometric and not per-material or per-feature — both of those were tried and
+            // measured, and both left the room lidded.
+            crate::light::meshes_from_factory_ex(
+                &self.factory,
+                Some(self.light.plane_height.max(0.1)),
+            )
+        } else {
+            self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
+        };
+        crate::light3d::build_scene_verts(&shown, &self.light.materials, floor)
     }
 
     /// WHERE EVERY FITTING IS POINTING — a shaft to the floor, with a cross where it lands.
@@ -14694,7 +14770,9 @@ impl CadApp {
                                 r.set_taa(gl, taa_samples);
                                 r.uv_origin = uv_org;
                                 r.render(
-                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver),
+                                    // The 3D Factory already keeps its whole scene in the versioned
+                                    // buffer, so it has no per-frame opaque geometry to add.
+                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver), &[],
                                     &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
                                     &tex_feat_transp, cam_pos, &tex_reflect_owned, &tex_proc_owned,
                                     &tex_pbr_owned, sun_uniform, &shadow_mvp, clay, mf_highlight, color_pipeline, env_render, true,
@@ -15031,9 +15109,18 @@ impl CadApp {
                     aspect,
                     false, // SIMLUX room view keeps perspective
                 );
-                let verts = self.build_scene3d_verts();
+                // THE ROOM, FROM THE CACHE — rebuilt only when the model, the calculation, the
+                // materials or the ceiling toggle move. `Arc` so it can cross into the paint
+                // callback without a copy; on a real project this is 844 MB that used to be
+                // rebuilt every frame while the plan beside it was being edited.
+                let scene_ver = self.scene3d_static_key();
+                let verts = self.scene3d_static();
+                // …and the parts that really do change every frame: the lux sheet, the fittings and
+                // where they point. Bounded, and cheap enough to leave uncached — which also means
+                // there is no key to get wrong when the scale is edited from the toolbar.
+                let dyn_verts = self.build_scene3d_dyn();
 
-                if verts.is_empty() {
+                if verts.is_empty() && dyn_verts.is_empty() {
                     painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -15055,7 +15142,7 @@ impl CadApp {
                                 // would blur the reading it exists to report.
                                 r.set_taa(gl, 0);
                                 r.render(
-                                    gl, &verts, &[], &[], &mvp, None,
+                                    gl, &verts, &[], &[], &mvp, Some(scene_ver), &dyn_verts,
                                     &[], &[], &[], &[], &[], &[], &[], [0.0, 0.0, 0.0], &[], &[],
                                     &[], None, &[], false, None,
                                     // The lux heatmap's vertex colours ARE the false-colour scale —
@@ -65077,5 +65164,322 @@ mod aiming_arrows_show_where_a_light_points {
             let d = (glam::Vec3::new(p.x, p.y, p.z) - glam::Vec3::new(5.0, 4.0, 2.9)).length();
             assert!(d < 30.0, "a vertex is {d:.1} m from the fitting — the arrow ran away");
         }
+    }
+}
+
+/// FORENSIC PROBE — why is the 3D view slow on this project?
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release what_the_gpu_is_actually_drawing -- --ignored --nocapture`
+#[cfg(test)]
+mod what_the_gpu_draws_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_the_gpu_is_actually_drawing() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let t0 = std::time::Instant::now();
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+        println!("sidecar parsed in {:.1} s", t0.elapsed().as_secs_f64());
+
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        let t1 = std::time::Instant::now();
+        app.factory.recompute();
+        println!("recompute {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
+
+        let f = &app.factory;
+        println!("\n=== ASSETS ({} in the library) ===", f.furniture_lib.len());
+        println!(
+            "{:<26} {:>9} {:>9} {:>7} {:>9} {:>9}",
+            "asset", "tris", "uvs", "alpha", "needs_lod", "lod tris"
+        );
+        let mut used: std::collections::BTreeMap<usize, usize> = Default::default();
+        for inst in &f.furniture {
+            *used.entry(inst.asset).or_default() += 1;
+        }
+        let mut drawn = 0usize;
+        let mut drawn_if_lod = 0usize;
+        for (idx, n) in &used {
+            let Some(a) = f.furniture_lib.get(*idx) else { continue };
+            let tris = a.positions.len() / 3;
+            let need = a.needs_lod();
+            // What the decimator WOULD give, whether or not `needs_lod` allows it.
+            let would = crate::factory::cluster_decimate(&a.positions, 64).0.len() / 3;
+            let lod_tris = if need { a.lod_geom().0.len() / 3 } else { would };
+            println!(
+                "{:<26} {:>9} {:>9} {:>7} {:>9} {:>9}   x{n}",
+                a.name,
+                tris,
+                a.uvs.len(),
+                a.alpha.len(),
+                need,
+                lod_tris,
+            );
+            drawn += tris * n;
+            drawn_if_lod += lod_tris * n;
+        }
+        println!("\n=== PER FRAME ===");
+        println!("  building (CSG opaque buffer) : {} tris", f.cached.positions.len() / 3);
+        println!("  furniture, as drawn          : {drawn} tris across {} instances", f.furniture.len());
+        println!("  furniture, if the decimator were allowed to run : {drawn_if_lod} tris");
+        println!(
+            "  furniture is {:.3}% of the geometry",
+            100.0 * drawn as f64 / (drawn + f.cached.positions.len() / 3).max(1) as f64
+        );
+    }
+}
+
+/// THE SIMLUX 3D VIEW MUST NOT REBUILD THE ROOM IN ORDER TO MOVE A LIGHT.
+///
+/// It did, on every frame. `build_scene3d_verts` rebuilt everything it drew each time, and on the
+/// reference gym plan the room is 7,030,514 triangles — about 844 MB of vertices allocated, filled
+/// and dropped per frame, on the UI thread, while the 2D plan beside it was being edited. Reported
+/// as the app lagging while placing luminaires.
+///
+/// The fix splits the buffer by HOW OFTEN IT CHANGES: the room is cached against
+/// `scene3d_static_key`, and the lux sheet, the fittings and the aim arrows are rebuilt each frame.
+/// Both halves have to hold, and the second is the one that bites — a cache that never invalidates
+/// is not fast, it is wrong.
+#[cfg(test)]
+mod the_scene_cache {
+    use super::*;
+
+    /// Every field of the buffer, so "unchanged" means unchanged and not merely the same length.
+    fn digest(v: &[crate::light3d::V3]) -> u64 {
+        let mut f = crate::light::Fnv::new();
+        f.u64(v.len() as u64);
+        for p in v {
+            for c in [p.x, p.y, p.z, p.r, p.g, p.b, p.nx, p.ny, p.nz, p.mode] {
+                f.f32(c);
+            }
+        }
+        f.finish()
+    }
+
+    /// A room with a calculated result in it, so both halves have something to build.
+    fn a_lit_room() -> CadApp {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = 1.0;
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 1,
+            profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        let doc = cad_kernel::Document::default();
+        app.light.calculate(&doc, Some(&app.factory));
+        app
+    }
+
+    /// THE CACHE HAS TO HIT AT ALL. A key that moves on its own — a clock, a frame counter, a hash
+    /// of something itself rebuilt each frame — would rebuild every frame and look exactly like the
+    /// bug it was written to fix, while every invalidation test below still passed.
+    #[test]
+    fn an_untouched_scene_asks_for_the_same_key_twice() {
+        let app = a_lit_room();
+        assert_eq!(app.scene3d_static_key(), app.scene3d_static_key());
+    }
+
+    /// THE WHOLE POINT: the gesture that lagged must not touch the room. Placing, dragging and
+    /// aiming a fitting move the same fields, and none is anything the room is built from.
+    #[test]
+    fn moving_a_fitting_does_not_rebuild_the_room() {
+        let mut app = a_lit_room();
+        let key = app.scene3d_static_key();
+        let room = digest(&app.build_scene3d_static());
+
+        app.light.luminaires[0].position = cad_light::Vertex::new(2.0, 6.0, 2.9);
+        app.light.luminaires[0].tilt_deg = 25.0;
+        app.light.luminaires[0].rotation_deg = 90.0;
+        app.light.cam_dist = 14.0; // the marker glyph is sized by this
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 2,
+            profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(8.0, 2.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+
+        assert_eq!(app.scene3d_static_key(), key, "placing a fitting must not invalidate the room");
+        assert_eq!(digest(&app.build_scene3d_static()), room, "...nor change a vertex of it");
+    }
+
+    /// ...AND THE CHANGE MUST STILL REACH THE SCREEN. The half above is only allowed to stay still
+    /// because the other half moves; if both were cached the fitting would not appear to move at
+    /// all, which is a worse bug than the lag.
+    #[test]
+    fn moving_a_fitting_does_change_the_per_frame_half() {
+        let mut app = a_lit_room();
+        let before = digest(&app.build_scene3d_dyn());
+        app.light.luminaires[0].position = cad_light::Vertex::new(2.0, 6.0, 2.9);
+        assert_ne!(digest(&app.build_scene3d_dyn()), before, "the fitting must visibly move");
+    }
+
+    /// EVERY INPUT THE ROOM IS BUILT FROM IS IN THE KEY.
+    ///
+    /// One at a time, from a fresh scene each time, so a later change cannot be carried by an
+    /// earlier one. A miss here fails in the dangerous direction: the user drops a wall's
+    /// reflectance, the report changes, the picture does not, and nothing on screen says why.
+    #[test]
+    fn everything_the_room_is_built_from_moves_the_key() {
+        let cases: Vec<(&str, fn(&mut CadApp))> = vec![
+            ("the scene triangles", |a: &mut CadApp| {
+                let m = a.light.meshes.clone();
+                a.light.set_meshes(m); // same content: the GENERATION is what must move
+            }),
+            ("the CSG model", |a: &mut CadApp| {
+                a.factory.recompute();
+            }),
+            ("the hide-ceilings toggle", |a: &mut CadApp| {
+                a.light.hide_ceilings = !a.light.hide_ceilings;
+            }),
+            ("the working plane height", |a: &mut CadApp| {
+                a.light.plane_height += 0.25;
+            }),
+            ("a surface reflectance", |a: &mut CadApp| {
+                a.light.materials[0].reflectance = 0.11;
+            }),
+            ("a surface colour", |a: &mut CadApp| {
+                a.light.materials[0].color = [0.9, 0.1, 0.1];
+            }),
+        ];
+        for (what, change) in cases {
+            let mut app = a_lit_room();
+            let before = app.scene3d_static_key();
+            change(&mut app);
+            assert_ne!(app.scene3d_static_key(), before, "{what} must invalidate the cached room");
+        }
+    }
+
+    /// `set_meshes` IS THE ONLY WAY IN. Writing the field direct compiles and leaves the view
+    /// painting the previous room, so the accessor has to be what moves the counter.
+    #[test]
+    fn replacing_the_scene_triangles_moves_the_generation() {
+        let mut app = a_lit_room();
+        let g = app.light.meshes_gen;
+        app.light.set_meshes(Vec::new());
+        assert_eq!(app.light.meshes_gen, g.wrapping_add(1));
+        assert!(app.light.meshes.is_empty());
+    }
+
+    /// THE SPLIT IS REAL, not two names for one build: the room half must carry no fitting geometry
+    /// and no lux sheet. Measured by emptying the per-frame half's inputs and watching the room
+    /// stay exactly as it was.
+    #[test]
+    fn each_half_carries_only_its_own_geometry() {
+        let mut app = a_lit_room();
+        let room = digest(&app.build_scene3d_static());
+        let framed = digest(&app.build_scene3d_dyn());
+        assert!(!app.build_scene3d_dyn().is_empty(), "the frame half must have had something in it");
+
+        app.light.luminaires.clear();
+        app.light.floor_heatmap = false;
+        app.light.show_isolux = false;
+        assert_eq!(
+            digest(&app.build_scene3d_static()),
+            room,
+            "the room half must not contain fittings or the lux sheet",
+        );
+        assert!(app.build_scene3d_dyn().is_empty(), "...and with those gone the frame half is empty");
+        assert_ne!(framed, digest(&app.build_scene3d_dyn()), "which is a change, so it was there");
+    }
+}
+
+/// FORENSIC PROBE — what one frame of the SIMLUX 3D view costs, before and after the split.
+///
+/// `SIMLUX_PROJECT=<stem> cargo test -p cad_app --bin simlux --release what_a_simlux_frame_costs -- --ignored --nocapture`
+#[cfg(test)]
+mod what_a_simlux_frame_costs_probe {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs SIMLUX_PROJECT=<path without extension>"]
+    fn what_a_simlux_frame_costs() {
+        let Ok(stem) = std::env::var("SIMLUX_PROJECT") else { return };
+        let dxf = format!("{stem}.dxf");
+        let cfg = crate::simlux_io::load(std::path::Path::new(&dxf)).unwrap().unwrap();
+
+        let mut app = CadApp::default();
+        app.factory.apply_persist(cfg.factory.clone());
+        app.factory.recompute();
+
+        // The scene the light engine sees — furniture included. Set directly rather than by running
+        // a calculation: this probe is about what the VIEW costs, and the view reads these.
+        let meshes = crate::light::meshes_from_factory(&app.factory);
+        let tris: usize = meshes.iter().map(|m| m.triangles.len()).sum();
+        app.light.set_meshes(meshes);
+
+        // Something for the per-frame half to draw. The file carries no fittings of its own.
+        for i in 0..89u32 {
+            app.light.luminaires.push(cad_light::Luminaire {
+                id: i + 1,
+                profile: crate::light::BUILTIN.to_string(),
+                position: cad_light::Vertex::new(i as f32 * 0.5, 2.0, 3.0),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+
+        let mb = |n: usize| n as f64 * std::mem::size_of::<crate::light3d::V3>() as f64 / 1.0e6;
+
+        let t = std::time::Instant::now();
+        let stat = app.build_scene3d_static();
+        let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = std::time::Instant::now();
+        let dynv = app.build_scene3d_dyn();
+        let dyn_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // The cached path, as the view actually calls it: key, then hand back the Arc.
+        let t = std::time::Instant::now();
+        for _ in 0..60 {
+            let k = app.scene3d_static_key();
+            std::hint::black_box(k);
+        }
+        let key_ms = t.elapsed().as_secs_f64() * 1000.0 / 60.0;
+
+        println!("\n=== SCENE ===");
+        println!("  light-engine triangles      : {tris}");
+        println!("\n=== ONE FRAME, BEFORE (everything rebuilt) ===");
+        println!("  room geometry               : {:>9.1} ms   {:>8} verts  {:>8.1} MB", build_ms, stat.len(), mb(stat.len()));
+        println!("  lux sheet + fittings + aim  : {:>9.1} ms   {:>8} verts  {:>8.1} MB", dyn_ms, dynv.len(), mb(dynv.len()));
+        println!("  TOTAL PER FRAME             : {:>9.1} ms   {:>8.1} MB", build_ms + dyn_ms, mb(stat.len() + dynv.len()));
+        println!("\n=== ONE FRAME, AFTER (room cached, rest rebuilt) ===");
+        println!("  cache key                   : {:>9.3} ms", key_ms);
+        println!("  lux sheet + fittings + aim  : {:>9.1} ms   {:>8.1} MB", dyn_ms, mb(dynv.len()));
+        println!("  TOTAL PER FRAME             : {:>9.1} ms   {:>8.1} MB", key_ms + dyn_ms, mb(dynv.len()));
+        if dyn_ms + key_ms > 0.0 {
+            println!("\n  {:.0}x less CPU work per frame", (build_ms + dyn_ms) / (key_ms + dyn_ms));
+        }
+        println!("\n  (the lux sheet is absent here — this file has no calculated result. It is");
+        println!("   capped at overlay_res's 12,000 cells per room, so it cannot grow without bound.)");
+        println!("\n  GPU: the room used to be re-uploaded every frame too (scene_ver = None).");
+        println!("       It is now versioned, so those {:.1} MB cross the bus only when it changes.", mb(stat.len()));
     }
 }

@@ -4426,8 +4426,23 @@ impl Scene3dRenderer {
         mvp: &[f32; 16],
         // `scene_ver`: when `Some(v)`, `verts` is drawn from a persistent buffer that is
         // re-uploaded ONLY when `v` changes (kills the per-frame upload of a static heavy
-        // scene). `None` = re-upload every frame (the small SIMLUX light view).
+        // scene). `None` = re-upload every frame.
         scene_ver: Option<u64>,
+        // OPAQUE TRIANGLES THAT CHANGE EVERY FRAME — drawn in the same pass as `verts`, right
+        // after it, from the scratch buffer.
+        //
+        // The SIMLUX view used to pass its whole buffer as `verts` with `scene_ver = None`,
+        // because the comment above once said "the small SIMLUX light view" and it was. It is not
+        // any more: with furniture in the light scene it is millions of triangles, re-uploaded
+        // sixty times a second. Versioning it is only half the fix, because a handful of those
+        // vertices — the fitting markers, sized by camera distance, and the aim arrows — really do
+        // change per frame, and mixing them in would invalidate the version every frame and buy
+        // nothing. They come through here instead, and the heavy half stays parked on the GPU.
+        //
+        // Not the `overlay` pass, which blends at a fixed 0.45 with depth-write off: these are
+        // solid objects and would come out as ghosts. Not in the shadow pass either — nothing here
+        // is big enough to cast a shadow worth the upload.
+        dyn_verts: &[V3],
         // Furniture instances, each `(key, local_mesh, camera·model)`. Every furniture is drawn
         // from a persistent per-key GPU buffer with a model matrix — so a heavy mesh is uploaded
         // once and never CPU-transformed on import/move/rotate. `key` = asset+colour; instances
@@ -4542,7 +4557,10 @@ impl Scene3dRenderer {
 
             f.bytes(bytes(overlay));
             f.bytes(bytes(lines));
-            sec[2] = f.0; // overlay + lines
+            // Re-uploaded every frame like the other two, so it is hashed whole like them — a
+            // diagnostic that ignored it would report "nothing changed" while the aim arrows moved.
+            f.bytes(bytes(dyn_verts));
+            sec[2] = f.0; // overlay + lines + per-frame opaque
 
             for (k, m, mv, md) in furn {
                 f.u64(*k);
@@ -4924,6 +4942,12 @@ impl Scene3dRenderer {
 
             if !verts.is_empty() {
                 self.draw_opaque_batch(gl, verts, mvp, scene_ver, 0);
+            }
+            // The frame-by-frame opaque geometry, in the same pass and the same state, from the
+            // scratch buffer. `None` is what makes it a fresh upload each time, which is right:
+            // it is small and it has genuinely changed.
+            if !dyn_verts.is_empty() {
+                self.draw_opaque_batch(gl, dyn_verts, mvp, None, 0);
             }
 
             // ---- furniture pass: every instance, its own model matrix ----

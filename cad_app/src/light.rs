@@ -1301,6 +1301,21 @@ pub struct LightState {
     /// is not always "you just pressed Calculate".
     pub results_restored: bool,
     pub meshes: Vec<Mesh>,
+    /// BUMPED EVERY TIME [`Self::meshes`] IS REPLACED — the SIMLUX 3D view's cache key.
+    ///
+    /// That view rebuilt its whole vertex buffer every frame: on a real project that is 7.03 M
+    /// triangles cloned, re-transformed and expanded into 40-byte vertices — about 844 MB allocated
+    /// and thrown away per frame, on the UI thread, while the plan beside it is being edited. It is
+    /// cached now, and a cache needs to know when it is wrong.
+    ///
+    /// A COUNTER AND NOT A CONTENT HASH, because the thing it guards is 21 M floats: hashing them
+    /// to find out whether to rebuild costs the same order as rebuilding. And not the calculation
+    /// fingerprint either, which looks like it would do and does not — a CANCELLED run assigns
+    /// `meshes` and leaves `results_fingerprint` untouched, so the cache would keep painting the
+    /// scene the cancelled run replaced.
+    ///
+    /// Assign through [`Self::set_meshes`] rather than writing the field, or the view goes stale.
+    pub meshes_gen: u64,
     /// Paint the false-colour overlay on the 2D plan.
     pub show_overlay: bool,
     /// IES file path typed into the panel.
@@ -1472,6 +1487,7 @@ impl LightState {
             stale_checked: None,
             results_restored: false,
             meshes: Vec::new(),
+            meshes_gen: 0,
             show_overlay: true,
             ies_path: String::new(),
             last_msg: "① Import your light files · ② click the plan to mark where they go · ③ pick a fitting for them."
@@ -2881,6 +2897,17 @@ impl LightState {
         })
     }
 
+    /// THE ONLY WAY TO REPLACE THE SCENE TRIANGLES — assigns and bumps [`Self::meshes_gen`].
+    ///
+    /// Writing `light.meshes` directly compiles and leaves the SIMLUX 3D view painting the previous
+    /// scene until something else happens to invalidate it. Every site that sets the field goes
+    /// through here so the counter cannot be forgotten at three of them and remembered at the
+    /// fourth.
+    pub fn set_meshes(&mut self, m: Vec<Mesh>) {
+        self.meshes = m;
+        self.meshes_gen = self.meshes_gen.wrapping_add(1);
+    }
+
     /// Take the results of a finished job.
     ///
     /// `selected` is the room whose geometry the user had selected, if any — the panel shows that
@@ -2888,7 +2915,7 @@ impl LightState {
     pub fn apply_outcome(&mut self, out: CalcOutcome, selected: Option<usize>) {
         if out.cancelled {
             self.last_msg = "Calculation stopped.".into();
-            self.meshes = out.meshes;
+            self.set_meshes(out.meshes);
             return;
         }
         let mut results = out.rooms;
@@ -2956,7 +2983,7 @@ impl LightState {
         results.insert(primary, p);
         self.rooms = results;
 
-        self.meshes = out.meshes;
+        self.set_meshes(out.meshes);
         self.show_overlay = true;
 
         // Fit the orbit camera to everything calculated, not to one room of it.
@@ -3024,7 +3051,8 @@ impl LightState {
         doc: &Document,
         factory: Option<&crate::factory::FactoryState>,
     ) {
-        self.meshes = self.scene_meshes(doc, factory);
+        let m = self.scene_meshes(doc, factory);
+        self.set_meshes(m);
         // Frame what is actually THERE. Framing from the 2D drawing pointed the camera at the
         // plan's extent — title block, dimensions and all — which with a 3D model loaded is not
         // where the building is, and on a survey plan sited kilometres from the origin is not
@@ -5829,9 +5857,17 @@ mod the_simlux_view_can_be_read {
     #[test]
     fn hiding_the_ceiling_is_a_view_option_only() {
         let src = include_str!("app.rs");
-        let a = src.find("fn build_scene3d_verts").expect("the SIMLUX vertex builder");
-        let b = src[a..].find("\n    /// SIMLUX 3D viewport").map(|e| a + e).unwrap_or(src.len());
+        // `build_scene3d_verts` split in two when the SIMLUX view stopped rebuilding its whole
+        // buffer every frame; the ceiling filter lives in the cached half. The end anchor was
+        // `\n    /// SIMLUX 3D viewport`, which is a FIELD doc a few thousand lines EARLIER in the
+        // file — searching forward from the function never found it, so `body` was silently the
+        // whole rest of `app.rs` and the two assertions below were close to vacuous. Anchored on
+        // the next item instead, so this really does read one function.
+        let a = src.find("fn build_scene3d_static").expect("the SIMLUX scene builder");
+        let b = src[a..].find("\n    /// WHERE EVERY FITTING IS POINTING").map(|e| a + e)
+            .expect("the item that follows it — re-anchor this if either is renamed");
         let body = &src[a..b];
+        assert!(body.len() < 4_000, "the slice must be ONE function, not the rest of the file");
         // THIS ASSERTION USED TO BE THE WHOLE TEST, and it passed for the entire life of a toggle
         // that did nothing: `build_scene_verts` dropped the ceiling unconditionally over in
         // light3d.rs, which this test cannot see — and could not have observed in any case, because
