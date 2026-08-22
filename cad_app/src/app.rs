@@ -5252,34 +5252,63 @@ impl CadApp {
         let clip = painter.with_clip_rect(rect);
         // EVERY ROOM, not just the one in the panel. A plan with two rooms used to show one lit
         // and one dark, which reads as a room that failed rather than a room nobody calculated.
+        //
+        // ONE MESH PER ROOM, NOT ONE SHAPE PER CELL.
+        //
+        // This called `rect_filled` for every calculated cell — up to `MAX_GRID_POINTS`, 16,384
+        // separate `Shape::Rect`s per room, EVERY FRAME. egui tessellates and anti-aliases each
+        // shape independently, so that is 16,384 trips through the tessellator and roughly 130,000
+        // vertices of paint list built and thrown away per frame, on the UI thread.
+        //
+        // It is also why the lag was "only when SIMLUX is open": this runs only when there is a
+        // lighting result to draw, so nothing about it shows up in a modelling session — which is
+        // exactly what the earlier session dumps were, and part of why three rounds of work went
+        // into the 3D view instead.
+        //
+        // The same fix as the report preview's rings, for the same reason: a `Mesh` shares its
+        // vertices and has no interior edges to feather, so the cells also stop showing the faint
+        // seams that per-shape AA left between them.
         for room in &self.light.rooms {
-        let (grid, plane) = (&room.grid, &room.plane);
-        if grid.values.is_empty() {
-            continue;
-        }
-        let dx = plane.width / plane.cols.max(1) as f32;
-        let dy = plane.depth / plane.rows.max(1) as f32;
-        for row in 0..plane.rows {
-            for col in 0..plane.cols {
-                let i = (row * plane.cols + col) as usize;
-                // Cells outside the room are not the room's result and are not painted. A grid is
-                // a rectangle and a room need not be; those cells were computed, but colouring them
-                // reports illuminance on ground the room does not occupy.
-                if room.mask.get(i).is_some_and(|inside| !inside) {
-                    continue;
-                }
-                let v = grid.values[i];
-                let c = opts.lux_rgb(v, room_max, ramp);
-                let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
-                let x0 = plane.origin.x + col as f32 * dx;
-                let y0 = plane.origin.y + row as f32 * dy;
-                // The calc plane is METRES (cad_light's contract; its bounds come from
-                // `extrude::bbox`, which scales by the document's unit).
-                let p0 = self.w2s_m(Vec2::new(x0 as f64, y0 as f64), rect);
-                let p1 = self.w2s_m(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
-                clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0, color);
+            let (grid, plane) = (&room.grid, &room.plane);
+            if grid.values.is_empty() {
+                continue;
             }
-        }
+            let dx = plane.width / plane.cols.max(1) as f32;
+            let dy = plane.depth / plane.rows.max(1) as f32;
+            let mut mesh = egui::epaint::Mesh::default();
+            mesh.reserve_triangles((plane.cols * plane.rows) as usize * 2);
+            mesh.reserve_vertices((plane.cols * plane.rows) as usize * 4);
+            for row in 0..plane.rows {
+                for col in 0..plane.cols {
+                    let i = (row * plane.cols + col) as usize;
+                    // Cells outside the room are not the room's result and are not painted. A grid
+                    // is a rectangle and a room need not be; those cells were computed, but
+                    // colouring them reports illuminance on ground the room does not occupy.
+                    if room.mask.get(i).is_some_and(|inside| !inside) {
+                        continue;
+                    }
+                    let v = grid.values[i];
+                    let c = opts.lux_rgb(v, room_max, ramp);
+                    let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
+                    let x0 = plane.origin.x + col as f32 * dx;
+                    let y0 = plane.origin.y + row as f32 * dy;
+                    // The calc plane is METRES (cad_light's contract; its bounds come from
+                    // `extrude::bbox`, which scales by the document's unit).
+                    let p0 = self.w2s_m(Vec2::new(x0 as f64, y0 as f64), rect);
+                    let p1 = self.w2s_m(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
+                    let r = egui::Rect::from_two_pos(p0, p1);
+                    let base = mesh.vertices.len() as u32;
+                    mesh.colored_vertex(r.left_top(), color);
+                    mesh.colored_vertex(r.right_top(), color);
+                    mesh.colored_vertex(r.right_bottom(), color);
+                    mesh.colored_vertex(r.left_bottom(), color);
+                    mesh.add_triangle(base, base + 1, base + 2);
+                    mesh.add_triangle(base, base + 2, base + 3);
+                }
+            }
+            if !mesh.is_empty() {
+                clip.add(egui::Shape::Mesh(mesh));
+            }
         }
     }
 
@@ -65586,6 +65615,23 @@ mod what_a_simlux_frame_costs_probe {
         let stat = app.build_scene3d_static();
         let build_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+        // A RESULT ON SCREEN, WHICH IS THE STATE THE USER IS ACTUALLY IN.
+        //
+        // Without one `push_lux_overlay` returns on its first line, so every "0.1 ms" this probe
+        // has ever printed for the per-frame half was measured with the lux sheet switched OFF —
+        // the single largest thing in it. Measuring the idle case and reporting it as the frame
+        // cost is how the same mistake gets made three times.
+        let doc = cad_kernel::Document::default();
+        app.light.floor_heatmap = true;
+        app.light.show_isolux = true;
+        let t_calc = std::time::Instant::now();
+        app.light.calculate(&doc, Some(&app.factory));
+        println!(
+            "\n  (calculated a result first: {:.1} s, {} room(s) — the sheet is the per-frame half's\n   largest term and is absent without one)",
+            t_calc.elapsed().as_secs_f64(),
+            app.light.rooms.len(),
+        );
+
         let t = std::time::Instant::now();
         let dynv = app.build_scene3d_dyn();
         let dyn_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -65891,6 +65937,112 @@ mod what_the_lod_costs_probe {
                 }
             }
             println!("  {:<32} {:>8.2} ms per frame", name, t.elapsed().as_secs_f64() * 100.0);
+        }
+    }
+}
+
+/// THE 2D LUX OVERLAY IS ONE MESH PER ROOM, NOT ONE SHAPE PER CELL.
+///
+/// It called `rect_filled` for every calculated cell — up to `MAX_GRID_POINTS`, 16,384 separate
+/// `Shape::Rect`s per room, EVERY FRAME. egui tessellates and anti-aliases each shape on its own,
+/// so that is 16,384 trips through the tessellator and ~130,000 vertices of paint list built and
+/// dropped per frame, on the UI thread.
+///
+/// It runs only when there is a lighting RESULT to draw, which is why the lag was "only when SIMLUX
+/// is open" and why it left no trace in the modelling session dumps that three rounds of 3D work
+/// were aimed at.
+#[cfg(test)]
+mod the_two_d_lux_overlay {
+    use super::*;
+
+    /// A calculated room, painted once through a headless egui pass, returning the shapes emitted.
+    fn shapes_for(cell_size: f32) -> Vec<egui::Shape> {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+        app.light.auto_center_light = false;
+        app.light.cell_size = cell_size;
+        app.light.luminaires.push(cad_light::Luminaire {
+            id: 1,
+            profile: crate::light::BUILTIN.to_string(),
+            position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        app.light.calculate(&cad_kernel::Document::default(), Some(&app.factory));
+        app.light.show_overlay = true;
+        assert!(!app.light.rooms.is_empty(), "the fixture must have a calculated room");
+
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+            app.paint_lux_overlay(&painter, r);
+        });
+        out.shapes.into_iter().map(|c| c.shape).collect()
+    }
+
+    /// ONE SHAPE FOR THE WHOLE ROOM, however many cells it has.
+    ///
+    /// Counting shapes and not time: a timing assertion on a build machine is a flake, and the
+    /// thing that was wrong is structural — the shape COUNT scaled with the grid.
+    #[test]
+    fn a_room_is_painted_as_one_mesh_however_fine_its_grid() {
+        for cell in [1.0f32, 0.5, 0.25] {
+            let shapes = shapes_for(cell);
+            let meshes = shapes.iter().filter(|s| matches!(s, egui::Shape::Mesh(_))).count();
+            let rects = shapes.iter().filter(|s| matches!(s, egui::Shape::Rect(_))).count();
+            assert_eq!(meshes, 1, "cell {cell} m: one mesh for the room");
+            assert_eq!(rects, 0, "cell {cell} m: no per-cell rectangles, {rects} found");
+        }
+    }
+
+    /// AND IT STILL PAINTS THE CELLS. A mesh with nothing in it would pass the count above and
+    /// draw an empty plan, which is a worse bug than the one being fixed — so the finer grid must
+    /// carry more triangles than the coarse one.
+    #[test]
+    fn the_mesh_carries_a_quad_per_cell() {
+        let tris = |cell: f32| -> usize {
+            shapes_for(cell)
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Mesh(m) => Some(m.indices.len() / 3),
+                    _ => None,
+                })
+                .sum()
+        };
+        let coarse = tris(1.0);
+        let fine = tris(0.25);
+        assert!(coarse >= 2, "even one cell is a quad: {coarse} triangles");
+        assert!(
+            fine > coarse * 4,
+            "a four-times-finer grid must carry far more triangles: {fine} against {coarse}",
+        );
+        // EVERY CELL IS A QUAD — four vertices, two triangles. `fine % 2 == 0` looked like it said
+        // that and does not: one triangle per cell is also an even count whenever the cell count
+        // is, so dropping half of every quad passed it. The vertex-to-index ratio pins it exactly.
+        for s in shapes_for(0.5) {
+            if let egui::Shape::Mesh(m) = s {
+                assert_eq!(
+                    m.vertices.len() * 3,
+                    m.indices.len() * 2,
+                    "{} vertices against {} indices is not four-and-six per cell",
+                    m.vertices.len(),
+                    m.indices.len(),
+                );
+            }
         }
     }
 }
