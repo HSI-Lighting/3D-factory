@@ -5946,16 +5946,32 @@ impl CadApp {
         // it, so both faces go. `self.light.meshes` is untouched and Calculate still sees the
         // ceiling. With no 3D model — a 2D-only project lit from the plan extrusion — there are no
         // features to ask about, so the old material filter is still the best available.
-        let shown: Vec<cad_light::Mesh> = if !self.light.hide_ceilings {
-            self.light.meshes.clone()
-        } else if self.factory.cached.positions.len() >= 3 {
+        // AT DISPLAY DETAIL, NOT THE CALCULATION'S.
+        //
+        // This took `self.light.meshes` — the geometry the ENGINE was handed — and drew it. On the
+        // gym plan that is 7,036,129 triangles baked into one world-space soup: 21,104,808 vertices,
+        // 844 MB. Caching it stopped the rebuild and did nothing about the size, and parking 844 MB
+        // in a persistent GPU buffer is past what a card has spare, so it spills over the bus and
+        // every draw starves. That is why the lag was SIMLUX-only: the 3D Factory instances its
+        // furniture — one buffer per asset, twenty-six matrices — where this bakes each instance out
+        // in full, so the same mesh is paid for twenty-six times.
+        //
+        // `FurnitureDetail::Proxy` is the geometry the 3D Factory already displays, so the two views
+        // agree, and `light.meshes` is untouched — Calculate still sees every triangle.
+        let plane_z = self.light.plane_height.max(0.1);
+        let shown: Vec<cad_light::Mesh> = if self.factory.cached.positions.len() >= 3
+            || !self.factory.furniture.is_empty()
+        {
             // Everything horizontal above the working plane. See `meshes_from_factory_ex` for why
             // this is geometric and not per-material or per-feature — both of those were tried and
             // measured, and both left the room lidded.
-            crate::light::meshes_from_factory_ex(
+            crate::light::meshes_from_factory_detail(
                 &self.factory,
-                Some(self.light.plane_height.max(0.1)),
+                self.light.hide_ceilings.then_some(plane_z),
+                crate::light::FurnitureDetail::Proxy,
             )
+        } else if !self.light.hide_ceilings {
+            self.light.meshes.clone()
         } else {
             self.light.meshes.iter().filter(|m| m.material != 2).cloned().collect()
         };
@@ -14798,7 +14814,7 @@ impl CadApp {
                                 r.render(
                                     // The 3D Factory already keeps its whole scene in the versioned
                                     // buffer, so it has no per-frame opaque geometry to add.
-                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver), &[],
+                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver), 0, &[],
                                     &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
                                     &tex_feat_transp, cam_pos, &tex_reflect_owned, &tex_proc_owned,
                                     &tex_pbr_owned, sun_uniform, &shadow_mvp, clay, mf_highlight, color_pipeline, env_render, true,
@@ -15168,7 +15184,7 @@ impl CadApp {
                                 // would blur the reading it exists to report.
                                 r.set_taa(gl, 0);
                                 r.render(
-                                    gl, &verts, &[], &[], &mvp, Some(scene_ver), &dyn_verts,
+                                    gl, &verts, &[], &[], &mvp, Some(scene_ver), 1, &dyn_verts,
                                     &[], &[], &[], &[], &[], &[], &[], [0.0, 0.0, 0.0], &[], &[],
                                     &[], None, &[], false, None,
                                     // The lux heatmap's vertex colours ARE the false-colour scale —
@@ -65439,6 +65455,89 @@ mod the_scene_cache {
         );
         assert!(app.build_scene3d_dyn().is_empty(), "...and with those gone the frame half is empty");
         assert_ne!(framed, digest(&app.build_scene3d_dyn()), "which is a change, so it was there");
+    }
+
+    /// THE VIEW DRAWS THE PROXY; THE CALCULATION KEEPS EVERY TRIANGLE.
+    ///
+    /// The SIMLUX viewport was built from `light.meshes` — the geometry handed to the ENGINE. On the
+    /// gym plan that baked 7,036,129 triangles into one world-space soup: 21,104,808 vertices,
+    /// 844 MB. Caching it stopped the rebuild and did nothing about the size, and 844 MB parked in a
+    /// persistent GPU buffer is past what a card has spare, so it spills over the bus. That is why
+    /// the lag was SIMLUX-only — the 3D Factory instances its furniture, this bakes every instance
+    /// out in full. With the display proxy: 2,762,679 vertices, 110.5 MB.
+    ///
+    /// BOTH HALVES ARE THE TEST. Drawing less is only correct while the engine still sees all of it;
+    /// a change that quietly decimated the calculation would make the view fast and the report wrong.
+    #[test]
+    fn the_view_draws_the_proxy_and_the_calculation_still_sees_every_triangle() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(12.0, 0.0),
+            glam::Vec2::new(12.0, 9.0),
+            glam::Vec2::new(0.0, 9.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.add_room(&rect).expect("room");
+        app.factory.recompute();
+
+        // One asset over the LOD threshold, and DENSE — a fine grid over one square metre, so many
+        // vertices share a lattice cell and there is something to weld. A first attempt walked a
+        // helix: every vertex landed in its own cell, nothing merged, and the proxy came back the
+        // same size as the mesh. The test caught that, which is the only reason it is not still
+        // "passing" against a proxy that does nothing.
+        let side = 101usize; // 2 * 101^2 = 20,402 triangles, over LOD_TRI_THRESHOLD
+        let mut pos = Vec::with_capacity(side * side * 6);
+        for i in 0..side {
+            for j in 0..side {
+                let (x0, x1) = (i as f32 / side as f32, (i + 1) as f32 / side as f32);
+                let (y0, y1) = (j as f32 / side as f32, (j + 1) as f32 / side as f32);
+                for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)] {
+                    pos.push([x, y, ((i + j) % 2) as f32 * 0.02]);
+                }
+            }
+        }
+        assert!(
+            pos.len() / 3 > crate::factory::LOD_TRI_THRESHOLD,
+            "the fixture must be over the threshold to have a proxy at all",
+        );
+        let normals = vec![[0.0, 0.0, 1.0]; pos.len()];
+        let idx = app.factory.add_furniture_asset(
+            "heavy".into(),
+            crate::mesh_io::ObjMesh {
+                positions: pos,
+                normals,
+                color: Some([0.7, 0.7, 0.7]),
+                alpha: Vec::new(),
+            },
+        );
+        app.factory.place_furniture(idx, glam::Vec3::new(6.0, 4.5, 0.0));
+
+        let full = app.factory.furniture_lib[idx].positions.len() / 3;
+        let proxy = app.factory.furniture_lib[idx].lod_geom().tri_count();
+        assert!(proxy * 2 < full, "the fixture's proxy must be much smaller: {proxy} of {full}");
+
+        // THE ENGINE'S GEOMETRY — every triangle, still.
+        let calc = crate::light::meshes_from_factory(&app.factory);
+        let calc_furn: usize = calc
+            .iter()
+            .filter(|m| m.material == cad_light::MATERIAL_FURNITURE)
+            .map(|m| m.triangles.len())
+            .sum();
+        assert_eq!(calc_furn, full, "the calculation must still be handed the whole mesh");
+
+        // THE VIEW'S GEOMETRY — the proxy.
+        app.light.set_meshes(calc);
+        let drawn = app.build_scene3d_static().len() / 3;
+        assert!(
+            drawn < full,
+            "the view must not draw the calculation's {full} furniture triangles; it drew {drawn}",
+        );
+        assert!(
+            drawn >= proxy,
+            "…but it must draw the proxy and the building, not nothing: {drawn} against {proxy}",
+        );
     }
 }
 

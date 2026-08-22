@@ -174,11 +174,48 @@ pub fn meshes_from_factory_ex(
     meshes_from_factory_mode(f, hide_above, CalcMode::Thorough)
 }
 
+/// HOW MUCH OF EACH FURNITURE PIECE GOES INTO THE BUCKET.
+///
+/// The calculation and the SIMLUX viewport share this builder, and they do not want the same thing.
+/// The calculation wants every triangle (or, in Express, a box). The VIEW wants something it can
+/// afford to hold on the GPU.
+///
+/// That distinction was missing and it cost the SIMLUX view dearly: the viewport was built from the
+/// CALCULATION's geometry, so on the gym plan it baked 7,036,129 triangles into one world-space
+/// soup — 21,104,808 vertices, **844 MB**. Caching that stopped it being rebuilt every frame and
+/// did nothing about its SIZE; parking 844 MB in a persistent GPU buffer is past what a card has
+/// spare, and it spills over the bus instead. It is also why the symptom was SIMLUX-only: the 3D
+/// Factory INSTANCES its furniture — one buffer per asset, twenty-six model matrices — where this
+/// bakes every instance out in full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FurnitureDetail {
+    /// Every triangle. What the calculation is entitled to.
+    Full,
+    /// The decimated display proxy for heavy assets — [`FurnitureAsset::lod_geom`]. For the VIEW
+    /// only: it is the same geometry the 3D Factory already draws, so the two views agree.
+    Proxy,
+    /// One box per piece. [`CalcMode::Express`].
+    Box,
+}
+
 /// [`meshes_from_factory_ex`], with furniture drawn as boxes under [`CalcMode::Express`].
 pub fn meshes_from_factory_mode(
     f: &crate::factory::FactoryState,
     hide_above: Option<f32>,
     mode: CalcMode,
+) -> Vec<Mesh> {
+    let detail = match mode {
+        CalcMode::Express => FurnitureDetail::Box,
+        CalcMode::Thorough => FurnitureDetail::Full,
+    };
+    meshes_from_factory_detail(f, hide_above, detail)
+}
+
+/// The one builder, told explicitly how much of each furniture piece it may emit.
+pub fn meshes_from_factory_detail(
+    f: &crate::factory::FactoryState,
+    hide_above: Option<f32>,
+    detail: FurnitureDetail,
 ) -> Vec<Mesh> {
     let pos = &f.cached.positions;
     if pos.len() < 3 && f.furniture.is_empty() {
@@ -231,7 +268,7 @@ pub fn meshes_from_factory_mode(
     // 337 MB of DRAM. It is also the only representation in which `contains` is trustworthy, since
     // a box is watertight by construction and an imported FBX generally is not.
     for (i, inst) in f.furniture.iter().enumerate() {
-        if mode == CalcMode::Express {
+        if detail == FurnitureDetail::Box {
             if let Some(tris) = furniture_box_tris(f, i) {
                 for t in tris {
                     for p in t {
@@ -244,7 +281,17 @@ pub fn meshes_from_factory_mode(
         let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
         let Some(m) = f.furniture_model_matrix(i) else { continue };
         let m = glam::Mat4::from_cols_array(&m);
-        for p in &asset.positions {
+        // `Proxy` is the DISPLAY detail and takes the same decimated geometry the 3D Factory draws,
+        // so the two views show the same thing. It is what stops this buffer being 844 MB: every
+        // instance is baked out in world space here, so the full mesh is paid for twenty-six times
+        // over, and there is nowhere for a shared per-asset buffer to help.
+        let lod = (detail == FurnitureDetail::Proxy && asset.needs_lod())
+            .then(|| asset.lod_geom());
+        let src: &[[f32; 3]] = match &lod {
+            Some(l) => &l.positions,
+            None => &asset.positions,
+        };
+        for p in src {
             let w = m.transform_point3(glam::Vec3::from(*p));
             buckets[MATERIAL_FURNITURE as usize].push(Vertex::new(w.x, w.y, w.z));
         }

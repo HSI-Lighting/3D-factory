@@ -4469,6 +4469,14 @@ impl Scene3dRenderer {
         // re-uploaded ONLY when `v` changes (kills the per-frame upload of a static heavy
         // scene). `None` = re-upload every frame.
         scene_ver: Option<u64>,
+        // WHICH PERSISTENT SLOT `verts` LIVES IN — and it must differ per VIEW.
+        //
+        // The 3D Factory and the SIMLUX viewport share one `Scene3dRenderer` and can both be open.
+        // They used to be safe by accident, because SIMLUX passed `scene_ver = None` and drew from
+        // the scratch buffer. Giving SIMLUX a version put both views on slot 0 with different
+        // versions, so each frame evicted the other's upload and BOTH re-uploaded their whole scene
+        // — the exact per-frame cost the versioning was added to remove, doubled.
+        scene_slot: usize,
         // OPAQUE TRIANGLES THAT CHANGE EVERY FRAME — drawn in the same pass as `verts`, right
         // after it, from the scratch buffer.
         //
@@ -4821,13 +4829,13 @@ impl Scene3dRenderer {
                     // The scene's static buffer is uploaded ONCE, outside the cascade loop — three
                     // cascades must not mean three re-uploads of a million-triangle villa.
                     let scene_ready = !verts.is_empty()
-                        && match (scene_ver, self.static_vao[0], self.static_vbo[0]) {
+                        && match (scene_ver, self.static_vao[scene_slot], self.static_vbo[scene_slot]) {
                             (Some(v), Some(_), Some(vbo)) => {
-                                if self.static_ver[0] != v {
+                                if self.static_ver[scene_slot] != v {
                                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                                     gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(verts), glow::STATIC_DRAW);
-                                    self.static_ver[0] = v;
-                                    self.static_len[0] = verts.len() as i32;
+                                    self.static_ver[scene_slot] = v;
+                                    self.static_len[scene_slot] = verts.len() as i32;
                                 }
                                 true
                             }
@@ -4843,10 +4851,10 @@ impl Scene3dRenderer {
                         gl.clear(glow::DEPTH_BUFFER_BIT);
                         // Scene (world-space) → depth_mvp = light_mvp.
                         if scene_ready {
-                            if let Some(vao) = self.static_vao[0] {
+                            if let Some(vao) = self.static_vao[scene_slot] {
                                 if let Some(loc) = &self.u_depth_mvp { gl.uniform_matrix_4_f32_slice(Some(loc), false, lmvp); }
                                 gl.bind_vertex_array(Some(vao));
-                                gl.draw_arrays(glow::TRIANGLES, 0, self.static_len[0]);
+                                gl.draw_arrays(glow::TRIANGLES, 0, self.static_len[scene_slot]);
                             }
                         }
                         // Furniture (local) → depth_mvp = light_mvp · model.
@@ -4989,7 +4997,7 @@ impl Scene3dRenderer {
             }
 
             if !verts.is_empty() {
-                self.draw_opaque_batch(gl, verts, mvp, scene_ver, 0);
+                self.draw_opaque_batch(gl, verts, mvp, scene_ver, scene_slot);
             }
             // The frame-by-frame opaque geometry, in the same pass and the same state, from the
             // scratch buffer. `None` is what makes it a fresh upload each time, which is right:
