@@ -1527,6 +1527,10 @@ pub struct LightState {
     pub meshes_gen: u64,
     /// What the LIVE mesh rebuild was last run for -- see `live_mesh_sig_of`.
     pub live_mesh_sig: Option<u64>,
+    /// The cheap scene signature the CURRENT result corresponds to -- the reference the staleness
+    /// question is answered against. `None` means no reference yet, so the next check must do the
+    /// expensive fingerprint once to establish one.
+    pub stale_ref_sig: Option<u64>,
     /// Express or Thorough — see [`CalcMode`]. This is what the NEXT calculation will run as; the
     /// mode a result was actually computed in travels with the result, in [`RoomResult::mode`],
     /// because the two disagree the moment the user flips the switch and has not pressed Calculate.
@@ -1704,6 +1708,7 @@ impl LightState {
             meshes: Vec::new(),
             meshes_gen: 0,
             live_mesh_sig: None,
+            stale_ref_sig: None,
             mode: CalcMode::default(),
             results_mode: None,
             show_overlay: true,
@@ -2935,6 +2940,87 @@ impl LightState {
     ///
     /// Costs what building a job costs — the scene triangles — which is why the caller throttles
     /// it rather than asking every frame.
+    /// EVERYTHING A CALCULATION WOULD BE FINGERPRINTED FROM, without building it.
+    ///
+    /// `current_fingerprint` answers "is the result still true?" by constructing a whole `CalcJob`
+    /// — which runs `scene_meshes` and transforms every furniture triangle. On the reference gym
+    /// plan that is 7,036,129 triangles and it measured **600 ms**, once per frame, from the moment
+    /// a result existed. The 250 ms throttle in front of it was worse than useless: the check costs
+    /// more than the interval, so every frame was already past it. A throttle shorter than the work
+    /// it guards never throttles anything.
+    ///
+    /// This is the same question asked of the INPUTS. The geometry half is
+    /// [`Self::live_mesh_sig_of`] — `geom_version` plus every furniture pose — and the rest is the
+    /// light-side state, through `hash_json` so a field added next year is covered without anyone
+    /// remembering to add it here.
+    ///
+    /// `None` when the scene comes from the 2D document, which cannot be summarised cheaply; the
+    /// caller then falls back to the full fingerprint, and that case has no furniture to make it
+    /// expensive.
+    ///
+    /// PROFILES ARE HASHED BY SHAPE, not contents: name, lumens, watts, multiplier and the size of
+    /// the candela table. Serialising the tables themselves would put a hundred kilobytes of JSON
+    /// through this every frame, which is the cost this exists to remove. The gap is a profile
+    /// replaced by a different one with identical name, output and table dimensions — and the
+    /// consequence is a missing "results are stale" warning, never a wrong number.
+    pub fn scene_sig(
+        &self,
+        doc: &Document,
+        factory: Option<&crate::factory::FactoryState>,
+    ) -> Option<u64> {
+        let geom = self.live_mesh_sig_of(factory)?;
+        let _ = doc;
+        let mut h = Fnv::new();
+        h.u64(geom);
+        // The rooms are the calculation's TARGETS, and their footprints decide every grid.
+        if let Some(f) = factory {
+            h.u64(f.rooms.len() as u64);
+            for r in &f.rooms {
+                h.u64(r.footprint.len() as u64);
+                for p in &r.footprint {
+                    h.f32(p.x);
+                    h.f32(p.y);
+                }
+            }
+        }
+        hash_json(&mut h, "lums", &self.luminaires);
+        hash_json(&mut h, "materials", &self.materials);
+        hash_json(&mut h, "settings", &self.settings);
+        hash_json(&mut h, "maintenance", &self.maintenance);
+        // `RoomLayer` is not `Serialize`, so this one is by hand -- four fields, and the compiler
+        // will not warn if a fifth is added. Kept small and named for exactly that reason.
+        h.u64(self.room.len() as u64);
+        for g in &self.room {
+            h.u64(g.layer_id as u64);
+            h.str(&g.name);
+            h.f32(g.height);
+            h.u64(g.handles.len() as u64);
+            for x in &g.handles {
+                h.u64(*x);
+            }
+        }
+        h.f32(self.cell_size);
+        h.f32(self.plane_height);
+        h.f32(self.eye_height);
+        h.f32(self.wall_zone);
+        h.f32(self.room_height);
+        h.u64(self.mode as u64);
+        let mut names: Vec<&String> = self.profiles.keys().collect();
+        names.sort();
+        h.u64(names.len() as u64);
+        for n in names {
+            h.str(n);
+            if let Some(p) = self.profiles.get(n) {
+                h.f64(p.lumens);
+                h.f64(p.watts);
+                h.f64(p.multiplier);
+                h.u64(p.vertical_angles.len() as u64);
+                h.u64(p.horizontal_angles.len() as u64);
+            }
+        }
+        Some(h.finish())
+    }
+
     pub fn current_fingerprint(
         &mut self,
         doc: &Document,
@@ -2969,6 +3055,25 @@ impl LightState {
         let Some(was) = self.results_fingerprint else {
             return false; // nothing calculated — nothing to be stale
         };
+        // THE CHEAP QUESTION FIRST, and after the first answer it is the ONLY question.
+        //
+        // This went straight to `current_fingerprint`, which builds a whole `CalcJob` and with it
+        // every furniture triangle: 600 ms on the reference gym plan, once per frame, from the
+        // moment a result existed. The throttle below could not help — the check costs more than
+        // the interval, so every frame was already past it. A throttle shorter than the work it
+        // guards never throttles anything.
+        //
+        // `scene_sig` asks the same question of the INPUTS. Once a reference is established the
+        // verdict is a `u64` comparison, so a stationary scene costs nothing — and so does a
+        // furniture drag, which the throttled version could never manage, because every frame of a
+        // drag moved the scene and bought another full rebuild.
+        let now_sig = self.scene_sig(doc, factory);
+        if let (Some(n), Some(r)) = (now_sig, self.stale_ref_sig) {
+            let stale = n != r;
+            let changed = stale != self.results_stale;
+            self.results_stale = stale;
+            return changed;
+        }
         let now = std::time::Instant::now();
         if let Some(t) = self.stale_checked {
             if now.duration_since(t) < Self::STALE_CHECK_INTERVAL {
@@ -2982,6 +3087,13 @@ impl LightState {
             return false;
         };
         let stale = is != was;
+        // ESTABLISH THE REFERENCE, so this path runs at most once per result — and only when the
+        // scene MATCHES, because that is the sig the answer belongs to and every later question is
+        // "has it moved away from this?". Recording a mismatching sig would make a stale result
+        // look current the moment nothing else changed.
+        if !stale {
+            self.stale_ref_sig = now_sig;
+        }
         let changed = stale != self.results_stale;
         self.results_stale = stale;
         changed
@@ -3018,6 +3130,9 @@ impl LightState {
         self.last_timings.clear();
         self.rooms = rooms;
         self.results_fingerprint = Some(stored.fingerprint);
+        // A NEW ANSWER NEEDS A NEW REFERENCE. The old one describes the scene the PREVIOUS result
+        // belonged to; keeping it would answer "has it moved?" against the wrong thing.
+        self.stale_ref_sig = None;
         self.results_stale = false;
         self.results_restored = true;
         self.stale_checked = None;
@@ -3148,6 +3263,9 @@ impl LightState {
         // This answer now belongs to a known scene — which is what makes it worth writing down, and
         // what lets the next session tell whether it is still about this building.
         self.results_fingerprint = Some(out.fingerprint);
+        // A NEW ANSWER NEEDS A NEW REFERENCE -- see `stale_ref_sig`. The next staleness check does
+        // one full fingerprint to establish it, and every check after that is a u64 comparison.
+        self.stale_ref_sig = None;
         self.results_mode = Some(out.mode);
         self.results_stale = false;
         self.results_restored = false;
@@ -7186,26 +7304,41 @@ mod a_calculation_is_kept_while_it_is_still_true {
         assert!(!s.results_stale, "the change was undone and the answer stayed marked out of date");
     }
 
-    /// THE CHECK IS THROTTLED. It costs what building the scene triangles costs; at sixty frames a
-    /// second on a real building that is a measurable slice of every frame, spent to re-answer a
-    /// question whose answer cannot have changed in sixteen milliseconds.
+    /// THE EXPENSIVE CHECK RUNS ONCE PER RESULT, AND THE CHANGE IS NOTICED AT ONCE.
+    ///
+    /// THIS TEST USED TO ASSERT THE OPPOSITE, and it was right to at the time: the check built the
+    /// whole scene, so it was throttled to 250 ms and the app was deliberately blind to a change
+    /// for a quarter of a second. It asserted that blindness — `!results_stale` immediately after
+    /// moving a fitting five metres.
+    ///
+    /// That throttle never worked on a real building. The check measured 600 ms on the reference
+    /// gym plan, so every frame was already past a 250 ms interval and it ran every frame anyway —
+    /// a throttle shorter than the work it guards throttles nothing. Now the question is asked of
+    /// the INPUTS (`scene_sig`), so it is a `u64` comparison and there is nothing left to throttle.
+    ///
+    /// The blindness goes with it, and that is a gain, not a regression: a fitting moved is stale
+    /// the same frame. What is pinned here is the cost — the reference is established ONCE and the
+    /// expensive path is never taken again for that result.
     #[test]
-    fn the_check_does_not_run_every_frame() {
+    fn the_expensive_check_runs_once_and_the_change_is_seen_at_once() {
         let (f, mut s) = room();
         s.calculate(&Document::default(), Some(&f));
         s.stale_checked = None;
+        assert!(s.stale_ref_sig.is_none(), "a fresh result starts with no reference");
 
         s.refresh_staleness(&Document::default(), Some(&f));
-        let first = s.stale_checked.expect("the first check ran");
+        let first = s.stale_checked.expect("the first check ran the expensive path");
+        assert!(s.stale_ref_sig.is_some(), "…and adopted the matching scene as the reference");
+        assert!(!s.results_stale);
 
-        s.luminaires[0].position.x += 5.0; // a change it would certainly notice, if it looked
+        s.luminaires[0].position.x += 5.0;
         s.refresh_staleness(&Document::default(), Some(&f));
-        assert_eq!(s.stale_checked, Some(first), "the check ran again immediately");
-        assert!(!s.results_stale, "the throttle did not hold");
-
-        s.stale_checked = None;
-        s.refresh_staleness(&Document::default(), Some(&f));
-        assert!(s.results_stale, "and once the interval passes it notices");
+        assert!(s.results_stale, "a fitting moved five metres is stale on the very next look");
+        assert_eq!(
+            s.stale_checked,
+            Some(first),
+            "and it cost nothing: the expensive path was not entered again",
+        );
     }
 
     /// A PROJECT EMPTIED TO NOTHING DOES NOT CONDEMN THE ANSWER.
@@ -8429,5 +8562,166 @@ mod the_live_mesh_rebuild {
             let n = needle(parts);
             assert!(body.contains(&n), "the guard no longer contains `{n}`");
         }
+    }
+}
+
+/// "NOW THE APP LAGS AFTER CALCULATING."
+///
+/// `refresh_staleness` answered "is this result still true?" by building a whole `CalcJob` —
+/// `scene_meshes` and every furniture triangle with it. Measured at 600 ms, once per frame, from
+/// the moment a result existed. The 250 ms throttle in front of it was worse than useless: the
+/// check costs more than the interval, so every frame was already past it. **A throttle shorter
+/// than the work it guards never throttles anything.**
+///
+/// The cure is to ask the same question of the INPUTS. But the danger is entirely one-sided: a
+/// staleness check that is cheap and WRONG lets a result that no longer describes the building keep
+/// its "current" badge, and somebody signs it. So most of what follows is about the change being
+/// noticed, not about it being fast.
+#[cfg(test)]
+mod the_staleness_check {
+    use super::*;
+
+    fn a_calculated_project() -> (crate::factory::FactoryState, LightState) {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        let idx = f.add_furniture_asset(
+            "stool".into(),
+            crate::mesh_io::ObjMesh {
+                positions: vec![
+                    [0.0, 0.0, 0.0], [0.4, 0.0, 0.0], [0.4, 0.4, 0.0],
+                    [0.0, 0.0, 0.0], [0.4, 0.4, 0.0], [0.0, 0.4, 0.0],
+                ],
+                normals: vec![[0.0, 0.0, 1.0]; 6],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, glam::Vec3::new(5.0, 4.0, 0.0));
+
+        let mut s = LightState::new();
+        s.auto_center_light = false;
+        s.cell_size = 2.0;
+        s.luminaires.push(cad_light::Luminaire {
+            id: 1,
+            profile: BUILTIN.to_string(),
+            position: cad_light::Vertex::new(5.0, 4.0, 2.9),
+            rotation_deg: 0.0,
+            tilt_deg: 0.0,
+            dimming: 1.0,
+            watts_override: None,
+            flux_override: None,
+            from_block: None,
+        });
+        s.calculate(&Document::default(), Some(&f));
+        assert!(s.results_fingerprint.is_some(), "the fixture must have a result");
+        (f, s)
+    }
+
+    /// A SETTLED PROJECT ASKS THE SAME QUESTION AND GETS THE SAME ANSWER, cheaply. A signature that
+    /// moves on its own would rebuild every frame and look exactly like the bug it replaced.
+    #[test]
+    fn an_untouched_project_keeps_its_scene_signature() {
+        let (f, s) = a_calculated_project();
+        let doc = Document::default();
+        assert_eq!(s.scene_sig(&doc, Some(&f)), s.scene_sig(&doc, Some(&f)));
+        assert!(s.scene_sig(&doc, Some(&f)).is_some());
+    }
+
+    /// AFTER THE FIRST CHECK, A SETTLED PROJECT NEVER TOUCHES THE EXPENSIVE PATH AGAIN — and the
+    /// verdict stays "current", which is the half that matters.
+    #[test]
+    fn a_settled_project_stops_paying_for_the_check() {
+        let (f, mut s) = a_calculated_project();
+        let doc = Document::default();
+        assert!(s.stale_ref_sig.is_none(), "a fresh result has no reference yet");
+        s.refresh_staleness(&doc, Some(&f)); // one full fingerprint, establishing the reference
+        assert!(
+            s.stale_ref_sig.is_some(),
+            "the matching scene must become the reference, or every frame pays 600 ms again",
+        );
+        assert!(!s.results_stale, "nothing moved, so the result is current");
+        for _ in 0..5 {
+            s.refresh_staleness(&doc, Some(&f));
+            assert!(!s.results_stale, "and it stays current");
+        }
+    }
+
+    /// THE DANGEROUS DIRECTION. Every one of these makes the stored answer describe a building that
+    /// is no longer there, and every one must still be caught — by the CHEAP path, after the
+    /// reference is established, because that is the only path a running app takes.
+    #[test]
+    fn a_real_change_still_marks_the_result_stale() {
+        let cases: Vec<(&str, fn(&mut crate::factory::FactoryState, &mut LightState))> = vec![
+            ("moving a fitting", |_, s| s.luminaires[0].position.x += 1.0),
+            ("aiming a fitting", |_, s| s.luminaires[0].tilt_deg += 20.0),
+            ("dimming a fitting", |_, s| s.luminaires[0].dimming = 0.4),
+            ("adding a fitting", |_, s| {
+                let mut l = s.luminaires[0].clone();
+                l.id = 99;
+                s.luminaires.push(l);
+            }),
+            ("deleting every fitting", |_, s| s.luminaires.clear()),
+            ("a surface reflectance", |_, s| s.materials[0].reflectance = 0.11),
+            ("the working plane height", |_, s| s.plane_height += 0.2),
+            ("the grid spacing", |_, s| s.cell_size *= 0.5),
+            ("the maintenance factor", |_, s| s.maintenance.llmf = 0.55),
+            ("the ray settings", |_, s| s.settings.max_bounces += 1),
+            ("switching Express/Thorough", |_, s| s.mode = CalcMode::Express),
+            ("moving a piece of furniture", |f, _| f.furniture[0].pos[0] += 0.5),
+            ("deleting the furniture", |f, _| f.furniture.clear()),
+            ("rebuilding the CSG model", |f, _| f.recompute()),
+        ];
+        for (what, change) in cases {
+            let (mut f, mut s) = a_calculated_project();
+            let doc = Document::default();
+            s.refresh_staleness(&doc, Some(&f)); // establish the reference
+            assert!(!s.results_stale, "{what}: the fixture must start current");
+            change(&mut f, &mut s);
+            s.refresh_staleness(&doc, Some(&f));
+            assert!(
+                s.results_stale,
+                "{what} changes the answer, so the result must be marked stale — a cheap check \
+                 that misses it lets a figure that no longer describes the building keep its \
+                 badge, and somebody signs it",
+            );
+        }
+    }
+
+    /// A NEW RESULT DROPS THE OLD REFERENCE. Keeping it would answer "has the scene moved?" against
+    /// the scene the PREVIOUS answer belonged to.
+    #[test]
+    fn a_new_result_drops_the_reference() {
+        let (f, mut s) = a_calculated_project();
+        let doc = Document::default();
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(s.stale_ref_sig.is_some());
+        s.calculate(&doc, Some(&f));
+        assert!(s.stale_ref_sig.is_none(), "a fresh answer needs a fresh reference");
+    }
+
+    /// A MISMATCHING SCENE IS NOT RECORDED AS THE REFERENCE. If it were, a stale result would look
+    /// current again the moment nothing else changed — the worst possible failure for this feature.
+    #[test]
+    fn a_stale_scene_never_becomes_the_reference() {
+        let (mut f, mut s) = a_calculated_project();
+        let doc = Document::default();
+        f.furniture[0].pos[0] += 0.5; // moved BEFORE any reference was taken
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(s.results_stale, "the scene moved, so the result is stale");
+        assert!(
+            s.stale_ref_sig.is_none(),
+            "and the moved scene must NOT be adopted as the reference",
+        );
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(s.results_stale, "…so it is still stale on the next look");
     }
 }
