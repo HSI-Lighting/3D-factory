@@ -1185,7 +1185,17 @@ impl CalcJob {
         let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
         // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
         // this changes nothing — which is every case the engine is validated on.
-        let mask = LightState::measurable_mask(&plane, poly, obstacles);
+        // STRAIGHT DOWN FROM THE CELL. `blocked` is the shadow query pointed at the floor: from
+        // just under the working plane to well below the model, so it clears anything the cell is
+        // standing on and still reaches ground under a basement. Only consulted when no room
+        // outline was drawn — see `measurable_mask`.
+        let floor_below = |x: f32, y: f32| {
+            ev.blocked(
+                glam::Vec3::new(x, y, plane.origin.z - 1e-3),
+                glam::Vec3::new(x, y, plane.origin.z - 1_000.0),
+            )
+        };
+        let mask = LightState::measurable_mask(&plane, poly, obstacles, Some(&floor_below));
         if mask.iter().any(|k| !k) {
             LightState::apply_room_mask(&mut grid, &mask);
         }
@@ -1195,9 +1205,13 @@ impl CalcJob {
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
         // KEPT, not just applied. The report quotes this grid, and two of its sections walk the
         // cells themselves rather than reading the summary — see `RoomResult::mask_en`.
+        // NO `poly.len() >= 3` GUARD ANY MORE. It was there because an absent outline masked
+        // nothing, so the work was pointless; the building's own floor is now a boundary in its own
+        // right, and the EN grid is the one the report quotes — leaving it unmasked would put the
+        // ground outside the walls into the figures a scheme is signed off on.
         let mut mask_en = Vec::new();
-        if poly.len() >= 3 {
-            let m = LightState::measurable_mask(&plane_en, poly, obstacles);
+        {
+            let m = LightState::measurable_mask(&plane_en, poly, obstacles, Some(&floor_below));
             if m.iter().any(|k| !k) {
                 LightState::apply_room_mask(&mut grid_en, &m);
                 mask_en = m;
@@ -2541,7 +2555,15 @@ impl LightState {
         let mut grid = cad_light::calculate_on(ev, &plane, self.maintenance);
         // The room's figures are over the ROOM. For a rectangular room every cell is inside it and
         // this changes nothing — which is every case the engine is validated on.
-        let mask = Self::measurable_mask(&plane, poly, &[]);
+        // The same building-outline boundary as the other path, and for the same reason — a room
+        // that was never drawn is bounded by the building, not by the scene's bounding rectangle.
+        let floor_below = |x: f32, y: f32| {
+            ev.blocked(
+                glam::Vec3::new(x, y, plane.origin.z - 1e-3),
+                glam::Vec3::new(x, y, plane.origin.z - 1_000.0),
+            )
+        };
+        let mask = Self::measurable_mask(&plane, poly, &[], Some(&floor_below));
         if !mask.is_empty() {
             Self::apply_room_mask(&mut grid, &mask);
         }
@@ -2550,8 +2572,8 @@ impl LightState {
         let mut grid_en = cad_light::calculate_on(ev, &plane_en, self.maintenance);
         // Kept, for the same reason as the other path — see `RoomResult::mask_en`.
         let mut mask_en = Vec::new();
-        if poly.len() >= 3 {
-            let m = Self::measurable_mask(&plane_en, poly, &[]);
+        {
+            let m = Self::measurable_mask(&plane_en, poly, &[], Some(&floor_below));
             if !m.is_empty() {
                 Self::apply_room_mask(&mut grid_en, &m);
                 mask_en = m;
@@ -2695,7 +2717,24 @@ impl LightState {
     ///
     /// With no obstacles this is exactly the outline test it has always been — which is every case
     /// the engine is validated on.
-    fn measurable_mask(plane: &CalcPlane, poly: &[glam::Vec2], obstacles: &[Obstacle]) -> Vec<bool> {
+    /// WITH NO ROOM OUTLINE, THE BUILDING ITSELF IS THE OUTLINE — `floor` answers "is there
+    /// anything under this cell", and a cell standing over nothing is not part of the result.
+    ///
+    /// Reported as: *"see how the areas outside the building is also calculated. that info need not
+    /// be shown. the perfect outline of the building is what the user wants to see."* A project
+    /// with no Rooms defined got ONE unnamed target with an empty polygon, and `poly.len() < 3`
+    /// then meant every cell counted — so the grid was the scene's bounding rectangle and the
+    /// ground outside the walls was coloured 0 lx and averaged in with the rest.
+    ///
+    /// A polygon could not have fixed this: there was none to use. Asking the geometry instead
+    /// gives a boundary that follows curved walls, re-entrant corners and courtyards exactly,
+    /// because it IS the building.
+    fn measurable_mask(
+        plane: &CalcPlane,
+        poly: &[glam::Vec2],
+        obstacles: &[Obstacle],
+        floor: Option<&dyn Fn(f32, f32) -> bool>,
+    ) -> Vec<bool> {
         let (dx, dy) = (
             plane.width / plane.cols.max(1) as f32,
             plane.depth / plane.rows.max(1) as f32,
@@ -2705,7 +2744,13 @@ impl LightState {
             for c in 0..plane.cols {
                 let x = plane.origin.x + (c as f32 + 0.5) * dx;
                 let y = plane.origin.y + (r as f32 + 0.5) * dy;
-                let in_room = poly.len() < 3 || crate::factory::point_in_poly(poly, x, y);
+                let in_room = if poly.len() >= 3 {
+                    crate::factory::point_in_poly(poly, x, y)
+                } else {
+                    // A DRAWN ROOM ALWAYS WINS. The floor test only stands in for an outline that
+                    // was never given, so it can never overrule one that was.
+                    floor.is_none_or(|f| f(x, y))
+                };
                 // Only worth asking where the cell is in the room at all.
                 let free = !in_room
                     || !obstacles
@@ -2714,11 +2759,17 @@ impl LightState {
                 m.push(in_room && free);
             }
         }
+        // NEVER MASK AWAY THE WHOLE RESULT. If nothing has floor under it the assumption behind the
+        // test is wrong for this scene — a plan-only project with no 3D model reaches here — and an
+        // empty grid is a worse answer than a rectangular one. Keep what the old behaviour kept.
+        if floor.is_some() && poly.len() < 3 && !m.iter().any(|&k| k) {
+            m.iter_mut().for_each(|k| *k = true);
+        }
         m
     }
     /// The outline test alone — the mask with nothing standing in the room.
     fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
-        Self::measurable_mask(plane, poly, &[])
+        Self::measurable_mask(plane, poly, &[], None)
     }
 
 
@@ -7718,8 +7769,8 @@ mod a_point_inside_the_furniture_is_not_measured {
             glam::Vec3::new(2.0, 2.0, 0.0),
             glam::Vec3::new(4.0, 4.0, 2.0),
         ));
-        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard));
-        let without = LightState::measurable_mask(&plane, &poly, &[]);
+        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard), None);
+        let without = LightState::measurable_mask(&plane, &poly, &[], None);
 
         assert!(without.iter().all(|k| *k), "an empty room lost cells to nothing at all");
         let dropped = with.iter().filter(|k| !**k).count();
@@ -8839,5 +8890,91 @@ mod a_stale_result_also_stops_paying {
             !s.results_stale,
             "the scene is back to the one the answer was calculated from, so it is current again",
         );
+    }
+}
+
+/// "SEE HOW THE AREAS OUTSIDE THE BUILDING IS ALSO CALCULATED."
+///
+/// A project with no Rooms defined got one unnamed target with an EMPTY polygon. `poly.len() < 3`
+/// then meant every cell counted, so the grid was the scene's bounding rectangle and the ground
+/// outside the walls was coloured 0 lx and averaged into the result — on a 33 × 13 m building whose
+/// walls are angled and curved, that is a lot of ground.
+///
+/// No polygon could have fixed it, because there was none. The building's own floor is the
+/// boundary, and it follows curved walls and re-entrant corners exactly, because it IS the building.
+#[cfg(test)]
+mod the_building_is_its_own_outline {
+    use super::*;
+
+    /// An L: floor over the left half at every y, and over the right half only at low y. The corner
+    /// that is missing is the one a bounding rectangle would wrongly include.
+    fn an_l_shaped_floor(x: f32, y: f32) -> bool {
+        x < 5.0 || y < 5.0
+    }
+
+    fn a_plane() -> CalcPlane {
+        CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 10.0,
+            depth: 10.0,
+            cols: 10,
+            rows: 10,
+        }
+    }
+
+    fn at(m: &[bool], col: u32, row: u32) -> bool {
+        m[(row * 10 + col) as usize]
+    }
+
+    /// WITH NO OUTLINE, THE FLOOR IS THE OUTLINE — and the empty corner is left out.
+    #[test]
+    fn with_no_room_outline_the_floor_decides() {
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&an_l_shaped_floor));
+        assert!(at(&m, 2, 2), "over floor, inside");
+        assert!(at(&m, 7, 2), "the low-y arm has floor, so it is inside");
+        assert!(
+            !at(&m, 7, 7),
+            "the corner with NO floor under it must be left out — this is the whole complaint",
+        );
+        assert!(m.iter().any(|&k| k), "and it must not mask the room away");
+    }
+
+    /// A DRAWN ROOM ALWAYS WINS. The floor test stands in for an outline that was never given; it
+    /// must never overrule one that was, or drawing a room would stop meaning anything.
+    #[test]
+    fn a_drawn_outline_beats_the_floor() {
+        // A square in the corner the floor test rejects.
+        let poly = vec![
+            glam::Vec2::new(6.0, 6.0),
+            glam::Vec2::new(9.0, 6.0),
+            glam::Vec2::new(9.0, 9.0),
+            glam::Vec2::new(6.0, 9.0),
+        ];
+        let m = LightState::measurable_mask(&a_plane(), &poly, &[], Some(&an_l_shaped_floor));
+        assert!(
+            at(&m, 7, 7),
+            "inside the DRAWN room, so it counts however the floor test would have voted",
+        );
+        assert!(!at(&m, 2, 2), "and outside the drawn room it does not, floor or no floor");
+    }
+
+    /// NEVER MASK THE WHOLE RESULT AWAY. A plan-only project has no 3D model, so nothing has floor
+    /// under it — and an empty grid is a worse answer than the rectangular one it replaced.
+    #[test]
+    fn a_scene_with_no_floor_at_all_keeps_every_cell() {
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&|_, _| false));
+        assert!(
+            m.iter().all(|&k| k),
+            "with no floor anywhere the assumption does not hold for this scene, so the old \
+             behaviour stands rather than deleting the answer",
+        );
+    }
+
+    /// AND WITH NO FLOOR TEST SUPPLIED, NOTHING CHANGES — the path every existing caller and every
+    /// validated fixture takes.
+    #[test]
+    fn without_a_floor_test_it_is_the_outline_test_it_always_was() {
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], None);
+        assert!(m.iter().all(|&k| k), "no outline and no floor test means every cell, as before");
     }
 }

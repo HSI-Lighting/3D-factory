@@ -40,6 +40,16 @@ pub struct Evaluator<'a> {
 }
 
 impl<'a> Evaluator<'a> {
+    /// Is there scene geometry anywhere on the straight line from `from` to `to`?
+    ///
+    /// The BVH is built once over the whole scene, and every caller so far has been a shadow test
+    /// inside this module. It is exposed because "is this grid cell over the building at all" is
+    /// the same query pointed downwards — and asking the GEOMETRY is the only way to get a boundary
+    /// that follows curved and irregular walls instead of a bounding rectangle.
+    pub fn blocked(&self, from: Vec3, to: Vec3) -> bool {
+        self.scene.occluded(from, to)
+    }
+
     pub fn new(
         meshes: &[Mesh],
         luminaires: &'a [Luminaire],
