@@ -716,6 +716,18 @@ struct LoadPayload {
 struct SavePayload {
     bytes: usize,
     note: String,
+    /// SET WHEN THE DRAWING WAS WRITTEN AND THE SIMLUX HALF WAS NOT.
+    ///
+    /// A half-save was already REPORTED -- the note opens "SIMLUX DID NOT SAVE" -- but it was only
+    /// ever a line in the command history, and `apply_saved` went on to clear `unsaved` as if the
+    /// whole project had reached disk. So the app believed it was saved, the close guard never
+    /// fired, and the only copy of the 3D model, the furniture, the fittings and the results sat in
+    /// a `.savetmp` nobody knew to look for. Found on the owner's project two weeks after the fact:
+    /// the live sidecar was from the 10th, the temp beside it from the 24th.
+    ///
+    /// Carried as DATA rather than parsed back out of `note`, so the state and the message cannot
+    /// disagree about whether the save worked.
+    simlux_failed: Option<String>,
 }
 
 /// The file's stem (name without directory or extension), for the overlay subtitle.
@@ -881,6 +893,7 @@ fn save_file_worker(
     let insts = cfg.factory.furniture.len();
     let texs = cfg.factory.textures.len();
     let imports = format!(", {furn} asset(s)/{insts} placed, {texs} texture(s)");
+    let mut simlux_failed = None;
     let note = match crate::simlux_io::save(std::path::Path::new(path), &cfg) {
         Ok(_) if solids > 0 => format!(
             "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s){imports}",
@@ -891,15 +904,21 @@ fn save_file_worker(
         // as success and closed on. Reported as: made a calculation, saved, reopened, "nothing was
         // saved" — because the only thing saying otherwise was a clause at the end of a line that
         // began by claiming the opposite.
-        Err(e) => format!(
-            "  ⚠ SIMLUX DID NOT SAVE — the drawing '{}' was written ({} bytes) but the 3D model, \
-             furniture, fittings and results were NOT.\n     {}",
-            path,
-            bytes.len(),
-            e,
-        ),
+        Err(e) => {
+            // AND AS DATA, not only as prose. `apply_saved` has to know the project did not reach
+            // disk, and parsing that fact back out of a sentence is how a message and a state come
+            // to disagree about it.
+            simlux_failed = Some(e.clone());
+            format!(
+                "  ⚠ SIMLUX DID NOT SAVE — the drawing '{}' was written ({} bytes) but the 3D \
+                 model, furniture, fittings and results were NOT.\n     {}",
+                path,
+                bytes.len(),
+                e,
+            )
+        }
     };
-    Ok(SavePayload { bytes: bytes.len(), note })
+    Ok(SavePayload { bytes: bytes.len(), note, simlux_failed })
 }
 
 /// Turn a written DXF into the DWG the user actually asked for.
@@ -2434,6 +2453,12 @@ pub struct CadApp {
     autosave_on: bool,
     /// The background autosave worker's result channel while one is running (`None` = idle).
     autosave_rx: Option<std::sync::mpsc::Receiver<BusyMsg>>,
+    /// A SAVE THAT WROTE THE DRAWING AND NOT THE PROJECT, held until the user acknowledges it.
+    ///
+    /// The message already existed and went to the command history, which scrolls -- so two weeks
+    /// of failed saves passed unseen while the app reported "saved". Anything that leaves work on
+    /// disk in one file and nowhere else has to be in front of the user, not behind them.
+    save_failure: Option<String>,
     /// When the last autosave fired — the interval timer.
     last_autosave: std::time::Instant,
     /// Monotonic edit counter, bumped on every snapshot (2D or 3D). An autosave records the value
@@ -4253,6 +4278,7 @@ impl Default for CadApp {
             pending_close: false,
             autosave_on: false, // OFF every start — see the field's docs
             autosave_rx: None,
+            save_failure: None,
             last_autosave: std::time::Instant::now(),
             edit_seq: 0,
             autosave_seq: 0,
@@ -17899,6 +17925,12 @@ impl CadApp {
                              rescaled; re-promote, or `units {} rescale`, to bring them along",
                             self.doc.units.label(), was.label(), self.doc.units.label()));
                         }
+                        // SET, AND THEN SANITY-CHECKED. Typing a unit is the other way a drawing
+                        // ends up claiming a scale it does not have -- the gym plan was `(User)`,
+                        // not declared by its file.
+                        if let Some(w) = self.unit_sanity_note() {
+                            self.history.push(w);
+                        }
                     }
                 }
             }
@@ -30955,14 +30987,168 @@ impl CadApp {
                  before building.",
                 u.label()));
         }
+        // AND WHETHER THAT UNIT — declared by the file or adopted just above — CAN POSSIBLY BE
+        // RIGHT. AFTER both branches, deliberately: the adopted case is at least as likely to be
+        // wrong as the declared one, and an earlier draft of this put the check between them,
+        // which silently attached the `else` to the wrong `if` and let a declared unit be
+        // overwritten. The suite caught it; the shape is worth keeping obvious.
+        if let Some(w) = self.unit_sanity_note() {
+            self.history.push(w);
+        }
     }
 
     /// Finalize a save completed by [`save_file_worker`] — record the file + log line.
+    /// DOES THE DECLARED UNIT MAKE THIS DRAWING A PLAUSIBLE BUILDING? `None` when it does.
+    ///
+    /// A drawing carries two claims about its scale — the numbers in it, and the unit it says those
+    /// numbers are in — and nothing ever checked one against the other. The owner's gym plan
+    /// declared MILLIMETRES and contained METRES: a 3.4-unit wall, which is an ordinary wall in
+    /// metres and 3.4 mm in millimetres. Under that declaration the fittings synced to 1/1000 scale
+    /// and landed 3.5 km from the building, the furniture outlines drew 3.5 million units off
+    /// screen, and every calculation returned 0 lx everywhere. It cost a session to find, and the
+    /// contradiction was sitting in the file the whole time.
+    ///
+    /// The test is deliberately loose. Buildings run from about a metre to a few kilometres across;
+    /// outside that is not a marginal call, it is a unit that cannot be right. A tighter bound
+    /// would fire on legitimate work — a single detail, a site plan — and a warning that cries wolf
+    /// is one nobody reads, which is how this was missed in the first place.
+    fn unit_sanity_note(&self) -> Option<String> {
+        const PLAUSIBLE_MIN_M: f64 = 1.0;
+        const PLAUSIBLE_MAX_M: f64 = 5_000.0;
+        const CANDIDATES: [(&str, f64); 5] =
+            [("mm", 0.001), ("cm", 0.01), ("m", 1.0), ("in", 0.0254), ("ft", 0.3048)];
+
+        let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+        let mut any = false;
+        for d in &self.doc.dobjects {
+            let (bmin, bmax) = d.geom.bbox();
+            if !bmin.x.is_finite() || !bmax.x.is_finite() {
+                continue;
+            }
+            lo = (lo.0.min(bmin.x), lo.1.min(bmin.y));
+            hi = (hi.0.max(bmax.x), hi.1.max(bmax.y));
+            any = true;
+        }
+        // The SPAN, not the coordinates. A survey plan sits kilometres from the origin and that
+        // says nothing about how big the building drawn on it is.
+        let span = if any { (hi.0 - lo.0).max(hi.1 - lo.1) } else { 0.0 };
+        if !any || span <= 0.0 {
+            return None; // an empty drawing makes no claim to contradict
+        }
+        let k = self.doc.units.metres_per_unit;
+        let as_declared = span * k;
+        if (PLAUSIBLE_MIN_M..=PLAUSIBLE_MAX_M).contains(&as_declared) {
+            return None;
+        }
+        // NAME THE UNIT THAT WOULD WORK. "Your unit is wrong" leaves the reader to guess which of
+        // six it should have been, and the arithmetic is the same one they would have to do.
+        let fits: Vec<(&str, f64)> = CANDIDATES
+            .iter()
+            .copied()
+            .filter(|(_, kk)| (PLAUSIBLE_MIN_M..=PLAUSIBLE_MAX_M).contains(&(span * kk)))
+            .collect();
+        let advice = match fits.as_slice() {
+            [] => "no standard unit makes this a building-sized drawing — check the geometry itself"
+                .to_string(),
+            [(n, kk)] => format!("`units {n}` would make it {:.2} m across", span * kk),
+            // AS COMMANDS, not as bare unit names. The reader has to type one of these, and
+            // "try m or ft" leaves them to work out that `units` is the word in front of it.
+            many => format!(
+                "try {}",
+                many.iter()
+                    .map(|(n, kk)| format!("`units {n}` ({:.2} m)", span * kk))
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+            ),
+        };
+        Some(format!(
+            "  ⚠ units: this drawing is {span:.2} units across, which at 1 unit = {} is {as_declared:.3} m \
+             — not a building. {advice}. (Setting the unit never moves geometry.)",
+            self.doc.units.label(),
+        ))
+    }
+
+    /// THE SAVE THAT DID NOT SAVE, in front of the user until they say they have seen it.
+    ///
+    /// Everything below already existed except this window: the rename is retried for ~1.5 s, the
+    /// temp is deliberately kept because it holds work that exists nowhere else, and the error names
+    /// it and says what to do. All of that went into the command history, which scrolls — so on the
+    /// owner's project the live sidecar ended up two weeks older than the temp beside it, while the
+    /// app went on reporting "saved".
+    ///
+    /// Modal, and it cannot be dismissed by clicking past it: the alternative is losing a day's
+    /// work to a line nobody read.
+    fn render_save_failure(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.save_failure.clone() else { return };
+        let mut open = true;
+        egui::Window::new("⚠  The project was NOT saved")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The drawing was written. The 3D model, furniture, fittings and results \
+                         were not.",
+                    )
+                    .strong(),
+                );
+                ui.add_space(6.0);
+                // THE PATH IS THE POINT. The work is on disk under another name, and this window
+                // exists so somebody knows that before the window closes.
+                ui.label(msg);
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The file is usually held open by a sync tool — Dropbox, OneDrive, \
+                         Google Drive. Pause it, or save somewhere local, and save again.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    // Only offered where there is somewhere to write to. A project with no path
+                    // has never been saved and this window cannot arise for it.
+                    if let Some(p) = self.current_file.clone() {
+                        if ui.button("Save again").clicked() {
+                            self.save_failure = None;
+                            self.do_save_now(&p.to_string_lossy());
+                        }
+                    }
+                    if ui.button("I understand — leave it unsaved").clicked() {
+                        self.save_failure = None;
+                    }
+                });
+                ui.add_space(4.0);
+                // The project stays marked unsaved either way, so the close guard still fires.
+                ui.label(
+                    egui::RichText::new("The project stays marked unsaved until it writes.").weak(),
+                );
+            });
+        if !open {
+            self.save_failure = None;
+        }
+        let _ = &mut open;
+    }
+
     fn apply_saved(&mut self, path: &str, payload: SavePayload) {
         self.current_file = Some(std::path::PathBuf::from(path));
-        self.unsaved = false; // now matches disk
+        // A HALF-SAVE IS NOT A SAVE. `unsaved = false` was unconditional, so a project whose SIMLUX
+        // half never reached disk was marked as matching it: the close guard stayed quiet, the
+        // window shut, and the only copy of the 3D model, the furniture, the fittings and the
+        // results was a `.savetmp` nobody knew to look for. On the owner's project the live
+        // sidecar was two weeks older than the temp sitting beside it.
+        //
+        // The warning existed the whole time. It was a line in the command history, which scrolls.
+        self.unsaved = payload.simlux_failed.is_some();
         self.last_autosave = std::time::Instant::now(); // an explicit save resets the autosave clock
         self.history.push(payload.note);
+        // AND IN FRONT OF THE USER, because losing a day's work to a line that scrolled past is
+        // what this costs. Dismissed by acknowledging it, not by the next repaint.
+        if let Some(e) = payload.simlux_failed {
+            self.save_failure = Some(e);
+        }
         // A result computed before the drawing had a name had nowhere to go; this is where the
         // project gets one. Also what carries the result along on a Save As, so the copy opens
         // showing what the original showed instead of an empty panel.
@@ -43599,6 +43785,7 @@ impl eframe::App for CadApp {
         // bare `hatch` is typed; closes on OK / Cancel / X.
         self.render_hatch_dialog(ctx);
         self.render_text_style_dialog(ctx);
+        self.render_save_failure(ctx);
         self.render_dim_style_manager(ctx);
         self.render_wall_style_manager(ctx);
         self.render_wall_style_dialog(ctx);
@@ -67144,5 +67331,204 @@ mod the_calculating_zone_is_shown_while_it_runs {
         );
         assert!(overlay < zone, "the wash goes OVER the previous result");
         assert!(zone < lums, "and UNDER the fixtures, which are what the user is aiming");
+    }
+}
+
+/// A HALF-SAVE IS NOT A SAVE.
+///
+/// Reported as: *"i made a calculation and saved the file. when i closed and opened the nothing was
+/// saved."* Everything needed to catch this already existed — the rename is retried for ~1.5 s, the
+/// temp is deliberately KEPT because it holds work that exists nowhere else, and the error names it
+/// and says what to do. All of it went to the command history, which scrolls.
+///
+/// And `apply_saved` cleared `unsaved` regardless, so the app believed the project matched disk: the
+/// close guard stayed quiet and the window shut on a `.savetmp` nobody knew to look for. On the
+/// owner's project the live sidecar was two weeks older than the temp beside it.
+#[cfg(test)]
+mod a_failed_save_is_not_reported_as_a_save {
+    use super::*;
+
+    fn payload(failed: Option<&str>) -> SavePayload {
+        SavePayload {
+            bytes: 1234,
+            note: "  saved".into(),
+            simlux_failed: failed.map(|s| s.to_string()),
+        }
+    }
+
+    /// THE PROJECT STAYS UNSAVED, which is what makes the close guard fire. Without it the window
+    /// shuts on work that reached disk under another name.
+    #[test]
+    fn a_half_save_leaves_the_project_unsaved() {
+        let mut app = CadApp::default();
+        app.unsaved = true;
+        app.apply_saved("C:/x/plan.dxf", payload(Some("could not replace …")));
+        assert!(
+            app.unsaved,
+            "the SIMLUX half never reached disk, so the project does NOT match it — clearing this \
+             is what let the window close on a stranded temp",
+        );
+    }
+
+    /// AND A REAL SAVE STILL CLEARS IT, or every save would nag forever and the flag would stop
+    /// meaning anything.
+    #[test]
+    fn a_whole_save_clears_it() {
+        let mut app = CadApp::default();
+        app.unsaved = true;
+        app.apply_saved("C:/x/plan.dxf", payload(None));
+        assert!(!app.unsaved, "a save that wrote both halves matches disk");
+        assert!(app.save_failure.is_none(), "and raises nothing");
+    }
+
+    /// THE FAILURE IS RAISED WHERE IT WILL BE SEEN, carrying the path of the file that holds the
+    /// work. A message in the scrollback is what this replaces.
+    #[test]
+    fn the_failure_is_raised_with_the_path_that_holds_the_work() {
+        let mut app = CadApp::default();
+        app.apply_saved("C:/x/plan.dxf", payload(Some("…IS saved, in 'C:/x/plan.simlux.json.savetmp'")));
+        let raised = app.save_failure.expect("a half-save must raise the dialog");
+        assert!(
+            raised.contains("savetmp"),
+            "the dialog must name the file the work is actually in: {raised}",
+        );
+    }
+
+    /// THE WORKER ITSELF SETS THE FLAG. Everything above tests what `apply_saved` does with it; if
+    /// nothing ever set it, all of that would pass over a feature that never fires. The failure is
+    /// forced portably by making the sidecar's destination a DIRECTORY -- the drawing writes
+    /// normally, and the rename onto it cannot succeed on any platform.
+    #[test]
+    fn the_worker_records_a_sidecar_failure() {
+        let dir = std::env::temp_dir().join(format!("simlux_halfsave_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let drawing = dir.join("plan.dxf");
+        // The sidecar path, occupied by a directory.
+        std::fs::create_dir_all(dir.join("plan.simlux.json")).expect("blocker");
+
+        let out = save_file_worker(
+            &drawing.to_string_lossy(),
+            Document::default(),
+            crate::simlux_io::SimluxConfig::default(),
+            Vec::new(),
+        )
+        .expect("the DRAWING half must still succeed -- that is what makes this a HALF save");
+
+        assert!(
+            out.simlux_failed.is_some(),
+            "the worker must record the sidecar failure as data, or nothing downstream can know",
+        );
+        assert!(
+            out.note.contains("DID NOT SAVE"),
+            "and say so in the line it writes: {}",
+            out.note,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AND IT IS ANNOUNCED AS A FAILURE, not as a save with a clause on the end. A line opening
+    /// with the word "saved" is read as success and closed on.
+    #[test]
+    fn the_history_line_does_not_open_by_claiming_success() {
+        let mut app = CadApp::default();
+        let mut p = payload(Some("boom"));
+        p.note = "  ⚠ SIMLUX DID NOT SAVE — the drawing was written but …".into();
+        app.apply_saved("C:/x/plan.dxf", p);
+        let line = app.history.last().expect("the save writes a line");
+        assert!(!line.trim_start().starts_with("saved"), "it must not open with success: {line}");
+        assert!(line.contains("DID NOT SAVE"), "and must say what happened: {line}");
+    }
+}
+
+/// A DRAWING MAKES TWO CLAIMS ABOUT ITS SCALE and nothing checked them against each other.
+///
+/// The owner's gym plan declared MILLIMETRES and contained METRES: a 3.4-unit wall, which is an
+/// ordinary wall in metres and 3.4 mm in millimetres. Under that declaration the fittings synced to
+/// 1/1000 scale and landed 3.5 km from the building, the furniture outlines drew 3.5 million units
+/// off screen, and every calculation returned 0 lx. It cost a session to find, and the
+/// contradiction was in the file the whole time.
+#[cfg(test)]
+mod the_declared_unit_is_checked_against_the_drawing {
+    use super::*;
+
+    /// A drawing `span` units across, declared at `k` metres per unit.
+    fn drawing(span: f64, k: f64) -> CadApp {
+        let mut app = CadApp::default();
+        app.doc = Document::default();
+        app.doc.units = cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::Declared);
+        app.doc.push(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(span, span * 0.4) }.into());
+        app
+    }
+
+    /// THE REAL CASE: 33 units across, declared millimetres — 33 mm, which is not a building.
+    #[test]
+    fn the_gym_plan_would_have_been_caught() {
+        let app = drawing(33.0, 0.001);
+        let w = app.unit_sanity_note().expect("33 mm is not a building and must be flagged");
+        assert!(w.contains("`units m`"), "it must name the unit that works: {w}");
+        assert!(w.contains("33"), "and show the span it measured: {w}");
+        // AND MUST NOT NAME UNITS THAT DO NOT HELP. Listing all six is not advice, it is the
+        // reader doing the arithmetic themselves -- which is the job this is here to do.
+        for useless in ["`units mm`", "`units cm`", "`units in`"] {
+            assert!(
+                !w.contains(useless),
+                "{useless} would make it {:.3} m, still not a building -- it must not be offered: {w}",
+                33.0 * match useless {
+                    "`units mm`" => 0.001,
+                    "`units cm`" => 0.01,
+                    _ => 0.0254,
+                },
+            );
+        }
+    }
+
+    /// THE OTHER DIRECTION, which is the more common mistake: a millimetre drawing read as metres.
+    /// 33 000 units at 1 m/unit is a 33 km building.
+    #[test]
+    fn a_millimetre_drawing_read_as_metres_is_caught() {
+        let app = drawing(33_000.0, 1.0);
+        let w = app.unit_sanity_note().expect("a 33 km building must be flagged");
+        assert!(w.contains("`units mm`"), "millimetres is the unit that makes it 33 m: {w}");
+    }
+
+    /// AND A DRAWING THAT AGREES WITH ITSELF SAYS NOTHING. A warning that fires on correct work is
+    /// one that gets ignored, which is how the original was missed.
+    #[test]
+    fn a_sane_drawing_is_silent() {
+        assert!(drawing(33.0, 1.0).unit_sanity_note().is_none(), "33 m in metres is a building");
+        assert!(
+            drawing(33_000.0, 0.001).unit_sanity_note().is_none(),
+            "33 000 mm is the same building, declared the other way",
+        );
+        assert!(drawing(4.0, 1.0).unit_sanity_note().is_none(), "a 4 m room is legitimate");
+        assert!(drawing(1_200.0, 1.0).unit_sanity_note().is_none(), "so is a 1.2 km site plan");
+    }
+
+    /// AN EMPTY DRAWING MAKES NO CLAIM, so there is nothing to contradict — and a new file must not
+    /// open with a warning on it.
+    #[test]
+    fn an_empty_drawing_is_silent() {
+        let mut app = CadApp::default();
+        app.doc = Document::default();
+        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        assert!(app.unit_sanity_note().is_none(), "nothing drawn, nothing to check");
+    }
+
+    /// IT MEASURES THE SPAN, NOT THE COORDINATES. The gym plan sits 6.8 km from the origin on
+    /// survey coordinates; that says nothing about how big the building is, and a check that read
+    /// position instead of size would pass every wrong file and fail every right one.
+    #[test]
+    fn a_drawing_far_from_the_origin_is_judged_on_its_size() {
+        let mut app = CadApp::default();
+        app.doc = Document::default();
+        app.doc.units = cad_kernel::DocUnits::new(1.0, cad_kernel::UnitSource::Declared);
+        app.doc.push(
+            Line { a: Vec2::new(3_499.6, -6_852.6), b: Vec2::new(3_532.7, -6_839.6) }.into(),
+        );
+        assert!(
+            app.unit_sanity_note().is_none(),
+            "33 m across at 6.8 km from the origin is the owner's actual plan, correctly declared",
+        );
     }
 }
