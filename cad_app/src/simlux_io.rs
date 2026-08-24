@@ -458,6 +458,20 @@ pub struct SimluxConfig {
     pub plane_height: f32,
     #[serde(default)]
     pub cell_size: f32,
+    /// The border excluded from the result, measured in from the walls, and the height cylindrical
+    /// illuminance is measured at (metres).
+    ///
+    /// NEITHER WAS SAVED. `wall_zone` had no UI, so it never varied from its default and nobody
+    /// noticed; `eye_height` did, and silently reset on every reopen, taking the Ez figure the
+    /// report quotes with it. Both are inputs to the calculation FINGERPRINT, so a value that does
+    /// not survive a reopen also makes a restored result disagree with the scene that produced it.
+    ///
+    /// `#[serde(default)]` plus the `> 0.0` guard on load, exactly like the three above: a sidecar
+    /// written before this existed keeps today's default rather than adopting a zero.
+    #[serde(default)]
+    pub wall_zone: f32,
+    #[serde(default)]
+    pub eye_height: f32,
     /// APP-LAYER wall-style extension: wall-style NAME → centerline linetype NAME.
     /// Keyed by name (like everything else here) so it survives save/reopen even though
     /// style/linetype ids are positional. Kept out of cad_kernel's `WallStyle` (D5).

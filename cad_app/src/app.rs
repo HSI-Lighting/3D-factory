@@ -5359,6 +5359,53 @@ impl CadApp {
         self.lux_overlay_us.set(t0.elapsed().as_micros() as u64);
     }
 
+    /// WHAT IS BEING CALCULATED, WHILE IT IS BEING CALCULATED — and gone the moment it lands.
+    ///
+    /// Asked for as: *"the zone thats calculating should be highlighted. nothing fancy just a low
+    /// transparency green highlight once calculated it should be gone as well."* A Thorough run on
+    /// this building takes twelve seconds, and until now the plan gave no sign which ground the
+    /// answer was going to cover — so a wrong region only became visible twelve seconds later, in
+    /// the result itself.
+    ///
+    /// Gated on `calc_rx`, which is `Some` for exactly the life of the worker: set when the job is
+    /// spawned, cleared in `poll_calculation` on every exit, success or panic. There is no separate
+    /// flag that could be left switched on.
+    fn paint_calculating_zone(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.calc_rx.is_none() || self.factory.session.is_some() {
+            return;
+        }
+        // Low-transparency green — a wash, not a highlight that hides the plan under it.
+        let fill = egui::Color32::from_rgba_unmultiplied(80, 200, 120, 40);
+        let clip = painter.with_clip_rect(rect);
+        let rooms: Vec<&Vec<glam::Vec2>> = self
+            .factory
+            .rooms
+            .iter()
+            .map(|r| &r.footprint)
+            .filter(|f| f.len() >= 3)
+            .collect();
+        if !rooms.is_empty() {
+            // THE ACTUAL TARGETS, drawn as the rooms they are — so a project where one room is
+            // being calculated does not look like the whole plan is.
+            for poly in rooms {
+                let pts: Vec<egui::Pos2> = poly
+                    .iter()
+                    .map(|p| self.w2s_m(Vec2::new(p.x as f64, p.y as f64), rect))
+                    .collect();
+                clip.add(egui::Shape::convex_polygon(pts, fill, egui::Stroke::NONE));
+            }
+            return;
+        }
+        // NO ROOMS DRAWN, so the target is the whole building, and its extent is the honest thing
+        // to show. The cell-by-cell boundary is decided on the worker by the floor test (see
+        // `measurable_mask`) and is not available here.
+        if let Some((mn, mx)) = self.factory.features_aabb() {
+            let a = self.w2s_m(Vec2::new(mn.x as f64, mn.y as f64), rect);
+            let b = self.w2s_m(Vec2::new(mx.x as f64, mx.y as f64), rect);
+            clip.rect_filled(egui::Rect::from_two_pos(a, b), 0.0, fill);
+        }
+    }
+
     fn paint_lux_overlay_inner(&self, painter: &egui::Painter, rect: egui::Rect) {
         if !self.light.show_overlay {
             return;
@@ -44190,6 +44237,10 @@ impl eframe::App for CadApp {
             self.paint_room_names_2d(&painter, rect);
             // SIMLUX: lux heatmap + luminaire markers on the 2D plan (overlay default off).
             self.paint_lux_overlay(&painter, rect);
+            // WHILE A CALCULATION IS RUNNING, over the old result and under the fixtures: the
+            // fixtures are what the user is looking at, and the wash says which ground the answer
+            // being computed will cover.
+            self.paint_calculating_zone(&painter, rect);
             self.paint_luminaires_2d(&painter, rect);
 
             // ---- Background grid (GrdEnb) ---------------------------------
@@ -67024,5 +67075,70 @@ mod the_recorder_sees_the_lighting {
         };
         assert!(ev(8_600_000).contains("8.6 s"));
         assert!(!ev(0).contains("⏱"), "an untimed op must not claim to have taken no time");
+    }
+}
+
+/// THE CALCULATING ZONE — "the zone thats calculating should be highlighted. nothing fancy just a
+/// low transparency green highlight once calculated it should be gone as well."
+///
+/// The half that matters is "gone as well". A progress affordance left switched on is worse than
+/// none: a green wash over a finished result reads as part of the answer.
+#[cfg(test)]
+mod the_calculating_zone_is_shown_while_it_runs {
+    use super::*;
+
+    /// A grep, because the alternative is standing up an egui context and a GL surface. Needles are
+    /// assembled at run time — `include_str!` includes THIS module, so a literal would match the
+    /// assertion instead of the code. That mistake has already been made once in this file.
+    fn body_of(f: &str) -> String {
+        let src = include_str!("app.rs");
+        let a = src.find(f).expect("the painter is gone");
+        let end = src[a..].find("\n    }\n").map(|e| a + e).expect("re-anchor if the fn moves");
+        src[a..end].to_string()
+    }
+
+    /// IT IS TIED TO THE WORKER'S OWN LIFETIME, not to a flag of its own. `calc_rx` is `Some` for
+    /// exactly as long as the job exists — set when it is spawned, cleared in `poll_calculation` on
+    /// EVERY exit including a panic — so there is nothing that can be left switched on.
+    #[test]
+    fn the_highlight_is_gated_on_the_running_job() {
+        let needle = |p: &[&str]| -> String { p.concat() };
+        let body = body_of(&needle(&["fn paint_calculating_", "zone(&self"]));
+        assert!(
+            body.contains(&needle(&["if self.calc_rx.is_", "none()"])),
+            "the wash must be gated on the job itself, or it outlives the calculation",
+        );
+    }
+
+    /// AND `poll_calculation` CLEARS THAT GATE ON EVERY PATH. If a panic left `calc_rx` set, the
+    /// wash would stay up for the rest of the session — and so would the refusal to start another
+    /// calculation, which is the same bug wearing a different face.
+    #[test]
+    fn every_exit_from_the_poll_clears_the_gate() {
+        let needle = |p: &[&str]| -> String { p.concat() };
+        let body = body_of(&needle(&["fn poll_calculation(&mut self"]));
+        let clears = body.matches(&needle(&["self.calc_rx = ", "None;"])).count();
+        assert!(
+            clears >= 2,
+            "both the finished path and the worker-died path must clear it, found {clears}",
+        );
+    }
+
+    /// IT IS DRAWN UNDER THE FIXTURES AND OVER THE OLD RESULT — the fixtures are what is being
+    /// looked at, and the wash says which ground the answer coming will cover.
+    #[test]
+    fn it_paints_between_the_old_result_and_the_fixtures() {
+        let src = include_str!("app.rs");
+        let needle = |p: &[&str]| -> String { p.concat() };
+        let overlay = src.find(&needle(&["self.paint_lux_over", "lay(&painter, rect);"]));
+        let zone = src.find(&needle(&["self.paint_calculating_", "zone(&painter, rect);"]));
+        let lums = src.find(&needle(&["self.paint_luminaires_", "2d(&painter, rect);"]));
+        let (overlay, zone, lums) = (
+            overlay.expect("the lux overlay call"),
+            zone.expect("the calculating wash is not painted at all"),
+            lums.expect("the fixture markers"),
+        );
+        assert!(overlay < zone, "the wash goes OVER the previous result");
+        assert!(zone < lums, "and UNDER the fixtures, which are what the user is aiming");
     }
 }

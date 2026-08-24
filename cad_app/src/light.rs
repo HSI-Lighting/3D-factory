@@ -3598,6 +3598,8 @@ impl LightState {
             room_height: self.room_height,
             plane_height: self.plane_height,
             cell_size: self.cell_size,
+            wall_zone: self.wall_zone,
+            eye_height: self.eye_height,
             // App-layer wall centerline linetypes are filled in by the caller
             // (write_simlux_sidecar) — `light` doesn't own that map.
             wall_centerline: BTreeMap::new(),
@@ -3671,6 +3673,15 @@ impl LightState {
         }
         if cfg.cell_size > 0.0 {
             self.cell_size = cfg.cell_size;
+        }
+        // The same `> 0.0` guard, and for the same reason: a sidecar written before these were
+        // saved carries 0.0 for them, which is a real value for `wall_zone` and a nonsense one for
+        // `eye_height` -- adopting either would silently change a reopened project.
+        if cfg.wall_zone > 0.0 {
+            self.wall_zone = cfg.wall_zone;
+        }
+        if cfg.eye_height > 0.0 {
+            self.eye_height = cfg.eye_height;
         }
         self.room.clear();
         for (name, height) in cfg.layers_3d {
@@ -3933,6 +3944,31 @@ impl LightState {
                     ui.end_row();
                     ui.label("grid cell").on_hover_text("Target spacing of the measurement grid; finer is slower");
                     ui.add(egui::DragValue::new(&mut self.cell_size).update_while_editing(false).speed(0.05).suffix(" m").range(0.05..=5.0));
+                    ui.end_row();
+                    // THE BORDER, exposed. It has always insetted the plane and there has never
+                    // been a way to set it, so every project ran at the 10 mm default — measuring
+                    // the dark strip at the skirting, which is where illuminance collapses and
+                    // where U₀ therefore reads near zero. DIALux and Relux both exclude a border
+                    // and default it to 0.5 m; EN 12464-1 treats the surrounding area separately
+                    // from the task area. Asked for as: "lets have a wall zone as a parameter. so
+                    // the user can choose it."
+                    ui.label("wall zone").on_hover_text(
+                        "Border excluded from the result, measured in from the walls. EN 12464-1 \
+                         treats the surrounding area separately from the task area, and DIALux and \
+                         Relux both default this to 0.5 m. At 0 the grid runs into the skirting, \
+                         where illuminance collapses — which drags min and U₀ down without \
+                         describing anywhere anyone actually works.\n\nInsets the plane's BOUNDING \
+                         RECTANGLE, so on a rectangular room it is a true border from every wall; \
+                         on an irregular or curved plan it is not yet an offset from the outline \
+                         itself.",
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.wall_zone)
+                            .update_while_editing(false)
+                            .speed(0.05)
+                            .suffix(" m")
+                            .range(0.0..=5.0),
+                    );
                     ui.end_row();
                     ui.label("eye height").on_hover_text("Height the cylindrical illuminance Ez is measured at — 1.2 m seated, 1.6 m standing");
                     ui.add(egui::DragValue::new(&mut self.eye_height).update_while_editing(false).speed(0.05).suffix(" m").range(0.3..=2.5));
@@ -8976,5 +9012,102 @@ mod the_building_is_its_own_outline {
     fn without_a_floor_test_it_is_the_outline_test_it_always_was() {
         let m = LightState::measurable_mask(&a_plane(), &[], &[], None);
         assert!(m.iter().all(|&k| k), "no outline and no floor test means every cell, as before");
+    }
+}
+
+/// THE WALL ZONE IS A PARAMETER NOW — "lets have a wall zone as a parameter. so the user can
+/// choose it."
+///
+/// It has always insetted the working plane and there has never been a way to set it, so every
+/// project ran at the 10 mm default: measuring the dark strip at the skirting, which is where
+/// illuminance collapses and where U₀ therefore reads near zero. DIALux and Relux both exclude a
+/// border and default it to 0.5 m.
+///
+/// A setting that does not survive a reopen is not a setting, so most of this is about persistence.
+#[cfg(test)]
+mod the_wall_zone_is_the_users_to_choose {
+    use super::*;
+
+    /// IT SURVIVES A SAVE AND REOPEN. `wall_zone` was never written to the sidecar — it had no UI,
+    /// so it never varied and nobody noticed. The moment it is settable, a value that resets is
+    /// worse than no control at all.
+    #[test]
+    fn the_wall_zone_survives_a_round_trip() {
+        let mut s = LightState::new();
+        s.wall_zone = 0.5;
+        let cfg = s.to_config(&Document::default());
+        assert_eq!(cfg.wall_zone, 0.5, "it must reach the sidecar");
+
+        let mut back = LightState::new();
+        back.apply_config(cfg, &Document::default());
+        assert_eq!(back.wall_zone, 0.5, "and come back from it");
+    }
+
+    /// SO DOES THE EYE HEIGHT, which had the identical defect and a UI — it silently reset on every
+    /// reopen, taking the cylindrical illuminance the report quotes with it.
+    #[test]
+    fn the_eye_height_survives_a_round_trip() {
+        let mut s = LightState::new();
+        s.eye_height = 1.6; // standing
+        let cfg = s.to_config(&Document::default());
+        let mut back = LightState::new();
+        back.apply_config(cfg, &Document::default());
+        assert_eq!(back.eye_height, 1.6);
+    }
+
+    /// AN OLD SIDECAR KEEPS TODAY'S DEFAULTS. Written before these were saved, it carries 0.0 for
+    /// both — a real value for `wall_zone` and a nonsense one for `eye_height`. Adopting either
+    /// would silently change a project somebody has already reported on.
+    #[test]
+    fn a_sidecar_written_before_this_keeps_the_defaults() {
+        let fresh = LightState::new();
+        let mut cfg = fresh.to_config(&Document::default());
+        cfg.wall_zone = 0.0; // as an older file deserialises
+        cfg.eye_height = 0.0;
+
+        let mut back = LightState::new();
+        back.apply_config(cfg, &Document::default());
+        assert_eq!(back.wall_zone, fresh.wall_zone, "no zone in the file means the default");
+        assert_eq!(back.eye_height, fresh.eye_height);
+    }
+
+    /// AND CHANGING IT MARKS THE RESULT STALE. The zone decides which ground is measured, so a
+    /// result computed at one border does not describe the same room at another.
+    #[test]
+    fn changing_the_zone_marks_the_answer_out_of_date() {
+        let mut s = LightState::new();
+        let before = s.scene_sig(&Document::default(), None);
+        s.wall_zone = 0.5;
+        let after = s.scene_sig(&Document::default(), None);
+        // A 2D-only project declines to summarise, so this is about the FINGERPRINT either way.
+        if before.is_some() {
+            assert_ne!(after, before, "the zone must move the scene signature");
+        }
+        // A REAL ROOM, because `prepare` on an empty project returns None for both and the
+        // comparison would be None == None -- a test that passes by having nothing to compare.
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 8.0),
+            glam::Vec2::new(0.0, 8.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+
+        let mut a = LightState::new();
+        let mut b = LightState::new();
+        b.wall_zone = 0.5;
+        let fa = a.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
+        let fb = b.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
+        assert!(fa.is_some(), "the fixture must actually produce a job");
+        assert_ne!(
+            fa,
+            fb,
+            "two zones must not produce the same fingerprint, or a restored result would be \
+             adopted for a scene it does not describe",
+        );
     }
 }
