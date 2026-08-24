@@ -1531,6 +1531,20 @@ pub struct LightState {
     /// question is answered against. `None` means no reference yet, so the next check must do the
     /// expensive fingerprint once to establish one.
     pub stale_ref_sig: Option<u64>,
+
+    /// WHAT THAT JUDGEMENT SAID. Held with `stale_ref_sig` so an unchanged scene keeps its verdict
+    /// without re-deriving it -- including a verdict of "stale", which is the case build 56 could
+    /// not keep and so paid the full 600 ms fingerprint every frame until the next calculation.
+    pub stale_ref_verdict: bool,
+
+    /// THE SCENE THE CURRENT RESULT WAS CALCULATED FROM, learned the first time a judgement comes
+    /// back "not stale" -- at that moment the scene in front of us is, by definition, that one.
+    /// Once known it answers staleness exactly and for nothing, in both directions: an edit reads
+    /// as stale on the very next frame, and an undo back to it reads as current again.
+    ///
+    /// Only a "not stale" verdict may set it. Adopting a scene just judged STALE would make the
+    /// result look current as soon as nothing else changed -- the one failure this must never have.
+    pub result_sig: Option<u64>,
     /// Express or Thorough — see [`CalcMode`]. This is what the NEXT calculation will run as; the
     /// mode a result was actually computed in travels with the result, in [`RoomResult::mode`],
     /// because the two disagree the moment the user flips the switch and has not pressed Calculate.
@@ -1709,6 +1723,8 @@ impl LightState {
             meshes_gen: 0,
             live_mesh_sig: None,
             stale_ref_sig: None,
+            stale_ref_verdict: false,
+            result_sig: None,
             mode: CalcMode::default(),
             results_mode: None,
             show_overlay: true,
@@ -3068,11 +3084,34 @@ impl LightState {
         // furniture drag, which the throttled version could never manage, because every frame of a
         // drag moved the scene and bought another full rebuild.
         let now_sig = self.scene_sig(doc, factory);
-        if let (Some(n), Some(r)) = (now_sig, self.stale_ref_sig) {
+        // THE SCENE THE ANSWER BELONGS TO, once known, settles every later question exactly and for
+        // nothing: anything other than it is stale, it itself is current, and an undo that returns
+        // to it reads as current again. A judgement of "not stale" is what identifies it — at that
+        // moment the scene in front of us IS the one the result was calculated from.
+        if let (Some(n), Some(r)) = (now_sig, self.result_sig) {
             let stale = n != r;
             let changed = stale != self.results_stale;
             self.results_stale = stale;
             return changed;
+        }
+        // NOT KNOWN YET, which means every judgement so far has come back "stale": we know which
+        // scene the answer does NOT belong to and not which one it does. A scene that has not moved
+        // since it was judged still does not need judging twice.
+        if let (Some(n), Some(r)) = (now_sig, self.stale_ref_sig) {
+            if n == r {
+                // The scene has not moved since it was last JUDGED, so the verdict it was given
+                // then still stands. One comparison, and it works for either verdict — which is
+                // the bug this replaced: build 56 recorded the reference only when the answer was
+                // "current", so a STALE result never got one and went on paying 600 ms a frame for
+                // as long as it stayed stale, which is from the moment you edit until you press
+                // Calculate. The narrow case was the one that mattered.
+                let changed = self.stale_ref_verdict != self.results_stale;
+                self.results_stale = self.stale_ref_verdict;
+                return changed;
+            }
+            // IT MOVED, so fall through and judge it properly. This cannot shortcut to "different,
+            // therefore stale": an undo can carry a scene back to matching the result it belongs
+            // to, and only a real judgement sees that.
         }
         let now = std::time::Instant::now();
         if let Some(t) = self.stale_checked {
@@ -3087,13 +3126,19 @@ impl LightState {
             return false;
         };
         let stale = is != was;
-        // ESTABLISH THE REFERENCE, so this path runs at most once per result — and only when the
-        // scene MATCHES, because that is the sig the answer belongs to and every later question is
-        // "has it moved away from this?". Recording a mismatching sig would make a stale result
-        // look current the moment nothing else changed.
+        // A VERDICT OF "CURRENT" IDENTIFIES THE ANSWER'S OWN SCENE — this one — and from here on
+        // every question is answered against it, cheaply and exactly. Only this verdict may set it:
+        // adopting a scene we have just judged stale would make the result look current the moment
+        // nothing else changed, which is the one failure this feature must never have.
         if !stale {
-            self.stale_ref_sig = now_sig;
+            self.result_sig = now_sig;
         }
+        // RECORD THE JUDGEMENT EITHER WAY, so a stale result stops re-deriving a verdict about a
+        // scene that has not moved. Build 56 recorded nothing on a stale verdict and so paid the
+        // full 600 ms fingerprint every frame for as long as the result stayed stale — from the
+        // moment you edit anything until you press Calculate.
+        self.stale_ref_sig = now_sig;
+        self.stale_ref_verdict = stale;
         let changed = stale != self.results_stale;
         self.results_stale = stale;
         changed
@@ -3133,6 +3178,7 @@ impl LightState {
         // A NEW ANSWER NEEDS A NEW REFERENCE. The old one describes the scene the PREVIOUS result
         // belonged to; keeping it would answer "has it moved?" against the wrong thing.
         self.stale_ref_sig = None;
+        self.result_sig = None;
         self.results_stale = false;
         self.results_restored = true;
         self.stale_checked = None;
@@ -3266,6 +3312,7 @@ impl LightState {
         // A NEW ANSWER NEEDS A NEW REFERENCE -- see `stale_ref_sig`. The next staleness check does
         // one full fingerprint to establish it, and every check after that is a u64 comparison.
         self.stale_ref_sig = None;
+        self.result_sig = None;
         self.results_mode = Some(out.mode);
         self.results_stale = false;
         self.results_restored = false;
@@ -8581,7 +8628,7 @@ mod the_live_mesh_rebuild {
 mod the_staleness_check {
     use super::*;
 
-    fn a_calculated_project() -> (crate::factory::FactoryState, LightState) {
+    pub fn a_calculated_project() -> (crate::factory::FactoryState, LightState) {
         let rect = vec![
             glam::Vec2::new(0.0, 0.0),
             glam::Vec2::new(10.0, 0.0),
@@ -8708,20 +8755,89 @@ mod the_staleness_check {
         assert!(s.stale_ref_sig.is_none(), "a fresh answer needs a fresh reference");
     }
 
-    /// A MISMATCHING SCENE IS NOT RECORDED AS THE REFERENCE. If it were, a stale result would look
-    /// current again the moment nothing else changed — the worst possible failure for this feature.
+    /// A MISMATCHING SCENE IS NEVER ADOPTED AS THE ANSWER'S OWN SCENE. If it were, a stale result
+    /// would look current again the moment nothing else changed — the worst failure this feature
+    /// can have, because the badge is the only thing between a superseded lux figure and somebody
+    /// signing it.
+    ///
+    /// This asserted `stale_ref_sig.is_none()` when one field did both jobs. There are now two,
+    /// deliberately: the stale scene IS remembered — that is what stops the verdict being
+    /// re-derived at 600 ms a frame — while `result_sig`, the scene the answer belongs to, stays
+    /// unknown. The safety property is about the latter, and it is unchanged.
     #[test]
-    fn a_stale_scene_never_becomes_the_reference() {
+    fn a_stale_scene_never_becomes_the_answers_own_scene() {
         let (mut f, mut s) = a_calculated_project();
         let doc = Document::default();
-        f.furniture[0].pos[0] += 0.5; // moved BEFORE any reference was taken
+        f.furniture[0].pos[0] += 0.5; // moved BEFORE anything was ever judged
         s.refresh_staleness(&doc, Some(&f));
         assert!(s.results_stale, "the scene moved, so the result is stale");
         assert!(
-            s.stale_ref_sig.is_none(),
-            "and the moved scene must NOT be adopted as the reference",
+            s.result_sig.is_none(),
+            "a scene just judged STALE must never become the one the answer belongs to",
+        );
+        assert!(
+            s.stale_ref_sig.is_some(),
+            "…but it IS remembered as judged, or the verdict is re-derived every frame",
         );
         s.refresh_staleness(&doc, Some(&f));
         assert!(s.results_stale, "…so it is still stale on the next look");
+    }
+}
+
+/// THE HOLE IN BUILD 56'S GUARD, which is the shape of bug a cache invites: the fast path was
+/// correct and simply never taken in the case that mattered.
+///
+/// The reference signature was recorded only when the verdict came back "current". So a result
+/// judged STALE never got one, fell through to the 600 ms `current_fingerprint` on every frame,
+/// and kept doing so for as long as it stayed stale — which is from the moment you edit anything
+/// until you press Calculate. Exactly the window in which somebody is placing fittings and
+/// wondering why the app is dead.
+#[cfg(test)]
+mod a_stale_result_also_stops_paying {
+    use super::*;
+
+    /// A STALE, STATIONARY SCENE IS JUDGED ONCE. `stale_checked` is the witness: it only moves on
+    /// the expensive path, so an unchanged timestamp proves that path was not entered.
+    #[test]
+    fn a_stale_scene_is_judged_once_and_then_left_alone() {
+        let (mut f, mut s) = super::the_staleness_check::a_calculated_project();
+        let doc = Document::default();
+        f.furniture[0].pos[0] += 0.5; // now the answer describes a building that moved
+
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(s.results_stale, "the scene moved, so the result is stale");
+        let judged = s.stale_checked.expect("the expensive path ran once");
+
+        for _ in 0..5 {
+            s.refresh_staleness(&doc, Some(&f));
+            assert!(s.results_stale, "and it stays stale, because nothing moved back");
+            assert_eq!(
+                s.stale_checked,
+                Some(judged),
+                "…without re-deriving it: build 56 paid 600 ms here on every single frame",
+            );
+        }
+    }
+
+    /// AND THE VERDICT IS STILL REVERSIBLE. The cheap path must not become a one-way latch — undo
+    /// carries the scene back to matching the result it belongs to, and that has to read as
+    /// current again or the badge is a lie in the safe direction rather than the dangerous one.
+    #[test]
+    fn undoing_the_change_clears_the_verdict() {
+        let (mut f, mut s) = super::the_staleness_check::a_calculated_project();
+        let doc = Document::default();
+        let home = f.furniture[0].pos[0];
+
+        f.furniture[0].pos[0] += 0.5;
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(s.results_stale);
+
+        f.furniture[0].pos[0] = home; // undo
+        s.stale_checked = None; // the throttle is not what is under test
+        s.refresh_staleness(&doc, Some(&f));
+        assert!(
+            !s.results_stale,
+            "the scene is back to the one the answer was calculated from, so it is current again",
+        );
     }
 }

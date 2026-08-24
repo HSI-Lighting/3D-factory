@@ -11439,6 +11439,62 @@ impl CadApp {
                 f.cam_dist, f.cam_yaw.to_degrees(), f.cam_pitch.to_degrees(), f.ortho),
         ]));
 
+        // ── THE LIGHT STATE, which this dump reported NOTHING about. ─────────────────────────
+        //
+        // "why is the calculation not being made. i noticed the lights were also not being placed"
+        // — and the answer was not in here. The dump described the building in detail and the
+        // lighting not at all: no fitting count, no result, no mode, no status line. There are
+        // three separate ways a calculation declines and each one writes a message, and the
+        // message was the single thing a session recording could not show.
+        //
+        // The same lesson as the frame checkpoints: a question gets answered by guessing for as
+        // long as the trace does not name the subsystem being asked about.
+        let l = &self.light;
+        let mut light = vec![
+            format!(
+                "fittings={} profiles={} mode={} rooms_calculated={} overlay_shown={}",
+                l.luminaires.len(),
+                l.profiles.len(),
+                l.mode.label(),
+                l.rooms.len(),
+                l.show_overlay,
+            ),
+            format!(
+                "result={}  stale={}  grid={} plane={}  calc_running={}",
+                if l.results_fingerprint.is_some() { "present" } else { "NONE — nothing calculated" },
+                l.results_stale,
+                l.grid.is_some(),
+                l.plane.is_some(),
+                self.calc_rx.is_some(),
+            ),
+            // THE STATUS LINE IS THE ANSWER when a calculation refuses to run. "No geometry —
+            // draw a closed room…" and "Nothing to calculate." are refusals that look, from
+            // outside the app, exactly like a button that does nothing at all.
+            format!("last_msg = {:?}", l.last_msg),
+            format!(
+                "cell={:.3} m plane_h={:.3} eye_h={:.3} wall_zone={:.3} room_h={:.3}",
+                l.cell_size, l.plane_height, l.eye_height, l.wall_zone, l.room_height,
+            ),
+            format!("scene_meshes={} surfaces={}", l.meshes.len(), l.materials.len()),
+        ];
+        // The fittings themselves, because "not being placed" is a claim about this list. Capped:
+        // a real job carries hundreds, and what is wanted is the count plus a readable sample.
+        for (i, x) in l.luminaires.iter().take(12).enumerate() {
+            light.push(format!(
+                "  [{:2}] {} @ ({:.2},{:.2},{:.2}) rot={:.0}° tilt={:.0}° dim={:.2}{}",
+                i, x.profile, x.position.x, x.position.y, x.position.z,
+                x.rotation_deg, x.tilt_deg, x.dimming,
+                if x.from_block.is_some() { "  (follows a plan symbol)" } else { "" },
+            ));
+        }
+        if l.luminaires.len() > 12 {
+            light.push(format!("  … {} more", l.luminaires.len() - 12));
+        }
+        if l.luminaires.is_empty() {
+            light.push("  (NO fittings at all — placement is not reaching LightState)".into());
+        }
+        sections.push(("light".into(), light));
+
         let bodies = f.model.features.iter().filter(|x| x.op == BoolOp::Union).count();
         crate::dbg_recorder::DbgEvent::FactoryScene {
             reason:  reason.to_string(),
