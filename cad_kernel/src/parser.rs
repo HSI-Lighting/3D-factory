@@ -176,6 +176,9 @@ pub enum Command {
     /// REPAIRCUTS — re-measure openings that were cut by the broken thickness probe and never
     /// reached the far face. Undoable.
     RepairCuts,
+    /// STRAYLIGHTS -- report fittings that stand nowhere near the building, and remove them on
+    /// `straylights purge`. Undoable.
+    StrayLights(bool),
     /// SCENE — capture the whole 3D scene (world coordinates, cut depths, materials, furniture,
     /// render passes, camera) into the session recorder and the history panel. Read-only.
     ///
@@ -283,6 +286,7 @@ impl Command {
             Command::Diag               => "Diag",
             Command::Dedupe             => "Dedupe",
             Command::RepairCuts         => "RepairCuts",
+            Command::StrayLights(_)     => "StrayLights",
             Command::Scene              => "Scene",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
@@ -495,6 +499,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "diag" | "diagnose" => Ok(Command::Diag),
         "dedupe" | "dedup" => Ok(Command::Dedupe),
         "repaircuts" | "repaircut" | "fixcuts" => Ok(Command::RepairCuts),
+        "straylights" | "strays" | "orphanlights" => {
+            let purge = toks.iter().skip(1).any(|t| t.eq_ignore_ascii_case("purge"));
+            Ok(Command::StrayLights(purge))
+        }
         "scene" | "scenedump" | "3dstate" => Ok(Command::Scene),
         "units" | "unit" | "insunits" => {
             // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as

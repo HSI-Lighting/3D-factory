@@ -3853,6 +3853,9 @@ impl LightState {
         ui: &mut egui::Ui,
         report: &mut crate::report::Options,
         room_max: f64,
+        // How many fittings stand outside the building -- see `CadApp::stray_light_ids`. Passed
+        // in because this panel cannot see the Factory, and the answer is a fact about the model.
+        strays: usize,
     ) -> LightAction {
         let mut action = LightAction::default();
         ui.horizontal_wrapped(|ui| {
@@ -4287,6 +4290,24 @@ impl LightState {
                     .small()
                     .strong(),
             );
+            // AND HOW MANY OF THEM ARE NOWHERE NEAR THE BUILDING. Invisible otherwise: a fitting
+            // kilometres off the plan is off screen, unselectable, contributes no light -- and is
+            // still counted in the schedule and the installed load. Reported as "the report is
+            // showing wrong number of lights theres only 31 lights in simlux file", against a
+            // project carrying 37 of them.
+            if strays > 0 {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {strays} outside the building"))
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(226, 160, 60)),
+                )
+                .on_hover_text(
+                    "These stand so far outside the model that they cannot be part of the scheme \n                     -- usually left behind by a unit change. They give no light, but they ARE \n                     counted in the fitting schedule and the installed power.
+
+Type \n                     `straylights` to list them, `straylights purge` to remove them.",
+                );
+            }
             // …AND THE LIGHTS THE MODEL CARRIES. A curved light is a real fitting now, but it is
             // DERIVED from the placed object at calculation time rather than living in
             // `luminaires` — so a room holding two of them and no hand-placed points read

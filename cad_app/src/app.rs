@@ -15503,7 +15503,8 @@ impl CadApp {
                 // the page alike. Taken out and put back so both borrows are short.
                 let room_max = self.light_room_max();
                 let mut ropts = std::mem::take(&mut self.report_opts);
-                let act = self.light.toolbar_ui(ui, &mut ropts, room_max);
+                let strays = self.stray_light_ids().len();
+                let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays);
                 self.report_opts = ropts;
                 if act.import_photometry {
                     open_ies_picker = true;
@@ -17991,6 +17992,65 @@ impl CadApp {
                     "3D scene written to the history panel — press Start in the Recorder to \
                      capture it into a dump too".into()
                 };
+            }
+            // FITTINGS THAT STAND NOWHERE NEAR THE BUILDING — report, and remove on `purge`.
+            //
+            // Reported as: *"the report is showing wrong number of lights theres only 31 lights in
+            // simlux file."* There were 68 in `light.luminaires`: the 31 real ones, and 37 stranded
+            // at x ≈ 3.5 — a thousandth of the building's coordinates, left behind by the units
+            // declaration that read a metre drawing as millimetres. They are 3.5 km from the plan,
+            // so no light of theirs ever reaches it and every lux figure was right; but they are
+            // counted, and they carried the schedule to 68 fittings and 1360 W against the true 31
+            // and 620 W. A power density on a report is a number somebody signs.
+            //
+            // THE TEST IS DISTANCE, NOT PROVENANCE. A fitting with no plan symbol is perfectly
+            // ordinary — that is what placing one by hand produces — so "has no symbol" would
+            // delete legitimate work. Standing kilometres outside the model is not ambiguous.
+            Ok(Command::StrayLights(purge)) => {
+                let strays = self.stray_light_ids();
+                if strays.is_empty() {
+                    self.history.push(format!(
+                        "  straylights: none — all {} fitting(s) stand within the building",
+                        self.light.luminaires.len(),
+                    ));
+                } else if purge {
+                    self.light.stage_undo();
+                    let before = self.light.luminaires.len();
+                    self.light.luminaires.retain(|l| !strays.contains(&l.id));
+                    self.light.selected.retain(|s| !strays.contains(s));
+                    for id in &strays {
+                        self.light.symbol_of.remove(id);
+                    }
+                    self.light.results_stale = true;
+                    self.history.push(format!(
+                        "  straylights: removed {} of {} fitting(s) — {} left. Re-run Calculate; \
+                         Ctrl+Z undoes it.",
+                        strays.len(),
+                        before,
+                        self.light.luminaires.len(),
+                    ));
+                    self.touch_view();
+                } else {
+                    // NAMED, NOT ACTED ON. Deleting fittings is not something a report command
+                    // should do because somebody typed it to look.
+                    self.history.push(format!(
+                        "  ⚠ straylights: {} of {} fitting(s) stand outside the building and are \
+                         counted in the schedule anyway. `straylights purge` removes them.",
+                        strays.len(),
+                        self.light.luminaires.len(),
+                    ));
+                    for id in strays.iter().take(4) {
+                        if let Some(l) = self.light.luminaires.iter().find(|l| l.id == *id) {
+                            self.history.push(format!(
+                                "      #{id} at ({:.2}, {:.2}, {:.2})",
+                                l.position.x, l.position.y, l.position.z,
+                            ));
+                        }
+                    }
+                    if strays.len() > 4 {
+                        self.history.push(format!("      … and {} more", strays.len() - 4));
+                    }
+                }
             }
             Ok(Command::RepairCuts) => {
                 self.snapshot_factory();
@@ -31028,6 +31088,32 @@ impl CadApp {
     }
 
     /// Finalize a save completed by [`save_file_worker`] — record the file + log line.
+    /// Fittings standing so far outside the model that they cannot be part of the scheme.
+    ///
+    /// THE MARGIN IS DELIBERATELY GENEROUS. An external fitting on a façade, a bollard by the door,
+    /// a floodlight aimed back at the building — all legitimate, all outside the walls. What is not
+    /// legitimate is a fitting a kilometre away, and the gap between those two cases is enormous,
+    /// so the threshold does not need to be clever: the model's own extent, plus the larger of ten
+    /// metres and a quarter of its span.
+    ///
+    /// Returns ids rather than indices — the caller removes them, and indices shift as it does.
+    fn stray_light_ids(&self) -> Vec<u32> {
+        let Some((mn, mx)) = self.factory.features_aabb() else {
+            return Vec::new(); // no model to be outside OF
+        };
+        let span = (mx.x - mn.x).max(mx.y - mn.y);
+        let pad = 10.0_f32.max(span * 0.25);
+        self.light
+            .luminaires
+            .iter()
+            .filter(|l| {
+                let p = l.position;
+                p.x < mn.x - pad || p.x > mx.x + pad || p.y < mn.y - pad || p.y > mx.y + pad
+            })
+            .map(|l| l.id)
+            .collect()
+    }
+
     /// DOES THE DECLARED UNIT MAKE THIS DRAWING A PLAUSIBLE BUILDING? `None` when it does.
     ///
     /// A drawing carries two claims about its scale — the numbers in it, and the unit it says those
@@ -67560,5 +67646,187 @@ mod the_declared_unit_is_checked_against_the_drawing {
             app.unit_sanity_note().is_none(),
             "33 m across at 6.8 km from the origin is the owner's actual plan, correctly declared",
         );
+    }
+}
+
+/// "THE REPORT IS SHOWING WRONG NUMBER OF LIGHTS THERES ONLY 31 LIGHTS IN SIMLUX FILE."
+///
+/// There were 68 in `light.luminaires`: the 31 real ones, and 37 stranded at x ≈ 3.5 — a thousandth
+/// of the building's coordinates — left behind by the unit declaration that read a metre drawing as
+/// millimetres. They sit 3.5 km from the plan, so no light of theirs reaches it and every lux figure
+/// was right. But they are COUNTED: the schedule read 68 fittings and 1360 W against the true 31 and
+/// 620 W, and a power density on a report is a number somebody signs.
+#[cfg(test)]
+pub mod fittings_outside_the_building_are_found {
+    use super::*;
+
+    // ON SURVEY COORDINATES, like the project this came from -- 33 x 13 m sitting at x 3500,
+    // y -6850. That is not decoration: a fitting divided by 1000 lands 3.5 km away only BECAUSE
+    // the building is far from the origin. A model drawn at the origin would put its own strays
+    // inside itself, where no distance test can see them -- see `the_origin_is_the_blind_spot`.
+    pub const OX: f32 = 3500.0;
+    pub const OY: f32 = -6850.0;
+
+    pub fn a_building_with(fittings: &[(f32, f32)]) -> CadApp {
+        let rect = vec![
+            glam::Vec2::new(OX, OY),
+            glam::Vec2::new(OX + 30.0, OY),
+            glam::Vec2::new(OX + 30.0, OY + 12.0),
+            glam::Vec2::new(OX, OY + 12.0),
+            glam::Vec2::new(OX, OY),
+        ];
+        let mut app = CadApp::default();
+        app.factory = crate::factory::FactoryState::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.recompute();
+        app.light.luminaires.clear();
+        for (i, (x, y)) in fittings.iter().enumerate() {
+            app.light.luminaires.push(cad_light::Luminaire {
+                id: i as u32 + 1,
+                profile: String::new(),
+                position: cad_light::Vertex::new(*x, *y, 3.0),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        app
+    }
+
+    /// THE REAL CASE, at the real ratio: fittings inside, and fittings at a thousandth of the
+    /// building's coordinates.
+    #[test]
+    fn a_fitting_at_a_thousandth_of_the_coordinates_is_found() {
+        // Two inside, and two at a THOUSANDTH of the coordinates -- the real signature.
+        let app = a_building_with(&[
+            (OX + 15.0, OY + 6.0),
+            ((OX + 15.0) / 1000.0, (OY + 6.0) / 1000.0),
+            (OX + 25.0, OY + 3.0),
+            ((OX + 25.0) / 1000.0, (OY + 3.0) / 1000.0),
+        ]);
+        let strays = app.stray_light_ids();
+        assert_eq!(strays, vec![2, 4], "the two at 1/1000 scale must be the ones found");
+    }
+
+    /// A FITTING JUST OUTSIDE THE WALL IS LEGITIMATE — a façade light, a bollard by the door — and
+    /// deleting it would be destroying the user's work. The margin exists for exactly this.
+    #[test]
+    fn a_fitting_just_outside_the_wall_is_left_alone() {
+        let app = a_building_with(&[
+            (OX - 2.0, OY + 6.0),
+            (OX + 32.0, OY + 6.0),
+            (OX + 15.0, OY - 3.0),
+            (OX + 15.0, OY + 14.0),
+        ]);
+        assert!(
+            app.stray_light_ids().is_empty(),
+            "fittings a couple of metres off the wall are ordinary external lighting",
+        );
+    }
+
+    /// AND ONE WITH NO PLAN SYMBOL IS ORDINARY. Placing a fitting by hand produces exactly that, so
+    /// "has no symbol" would have deleted legitimate work — the test is DISTANCE.
+    #[test]
+    fn provenance_is_not_the_test() {
+        let app = a_building_with(&[(OX + 15.0, OY + 6.0)]);
+        assert!(app.light.luminaires[0].from_block.is_none(), "hand-placed: no symbol");
+        assert!(app.stray_light_ids().is_empty(), "and it is inside the building, so it stays");
+    }
+
+    /// WITH NO MODEL THERE IS NOTHING TO BE OUTSIDE OF. A plan-only project must not have its
+    /// entire scheme declared stray.
+    #[test]
+    fn a_project_with_no_model_reports_nothing() {
+        let mut app = a_building_with(&[(OX + 15.0, OY + 6.0), (99_999.0, 99_999.0)]);
+        app.factory = crate::factory::FactoryState::default();
+        assert!(app.stray_light_ids().is_empty(), "no building, no judgement");
+    }
+
+    /// LISTING DOES NOT DELETE. Somebody typing a command to look must not lose fittings by it.
+    #[test]
+    fn the_report_form_removes_nothing() {
+        let mut app = a_building_with(&[(OX + 15.0, OY + 6.0), (3.5, -6.85)]);
+        app.run_command("straylights");
+        assert_eq!(app.light.luminaires.len(), 2, "the report form must not delete anything");
+        assert!(
+            app.history.iter().any(|h| h.contains("straylights") && h.contains("purge")),
+            "…and must say how to: {:?}",
+            app.history.last(),
+        );
+    }
+
+    /// PURGE REMOVES EXACTLY THE STRAYS, and marks the result out of date — the schedule and the
+    /// installed load both change, so the answer on screen no longer describes the scheme.
+    #[test]
+    fn purge_removes_the_strays_and_nothing_else() {
+        let mut app = a_building_with(&[(OX + 15.0, OY + 6.0), (3.5, -6.85), (OX + 25.0, OY + 3.0)]);
+        app.light.results_fingerprint = Some(1);
+        app.run_command("straylights purge");
+        let left: Vec<u32> = app.light.luminaires.iter().map(|l| l.id).collect();
+        assert_eq!(left, vec![1, 3], "only the stray goes");
+        assert!(app.light.results_stale, "the scheme changed, so the answer is out of date");
+    }
+}
+
+#[cfg(test)]
+mod the_origin_is_the_blind_spot {
+    use super::fittings_outside_the_building_are_found::*;
+    use super::*;
+
+    /// A BUILDING DRAWN AT THE ORIGIN HIDES ITS OWN STRAYS, and this records that rather than
+    /// pretending otherwise.
+    ///
+    /// The detector is a distance test, and dividing a coordinate by 1000 only moves a fitting far
+    /// away when the coordinate is large. A 30 x 12 m building at (0, 0) maps its own fittings to
+    /// (0.015, 0.006) — inside itself. No position test can separate those from real ones, because
+    /// by position they ARE real ones.
+    ///
+    /// Found by writing the fixture at the origin out of habit and watching it report nothing. The
+    /// project this came from sits on survey coordinates at x 3500, which is the only reason its 37
+    /// strays were 3.5 km away and visible at all.
+    #[test]
+    fn a_model_at_the_origin_cannot_have_its_strays_seen_by_position() {
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(30.0, 0.0),
+            glam::Vec2::new(30.0, 12.0),
+            glam::Vec2::new(0.0, 12.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut app = CadApp::default();
+        app.factory = crate::factory::FactoryState::default();
+        app.factory.add_building_outline(&rect, 3.0).expect("building");
+        app.factory.recompute();
+        app.light.luminaires.clear();
+        for (i, (x, y)) in [(15.0_f32, 6.0_f32), (0.015, 0.006)].iter().enumerate() {
+            app.light.luminaires.push(cad_light::Luminaire {
+                id: i as u32 + 1,
+                profile: String::new(),
+                position: cad_light::Vertex::new(*x, *y, 3.0),
+                rotation_deg: 0.0,
+                tilt_deg: 0.0,
+                dimming: 1.0,
+                watts_override: None,
+                flux_override: None,
+                from_block: None,
+            });
+        }
+        assert!(
+            app.stray_light_ids().is_empty(),
+            "a 1/1000 fitting inside a building drawn at the origin is INDISTINGUISHABLE by \
+             position — this is a limit of the approach, not a bug to fix by tightening the \
+             margin, which would start deleting real external lighting instead",
+        );
+    }
+
+    /// AND THE SAME MODEL, MOVED OUT TO SURVEY COORDINATES, does show them — which is what makes
+    /// the check worth having on the projects it applies to.
+    #[test]
+    fn the_same_model_on_survey_coordinates_shows_them() {
+        let app = a_building_with(&[(OX + 15.0, OY + 6.0), ((OX + 15.0) / 1000.0, (OY + 6.0) / 1000.0)]);
+        assert_eq!(app.stray_light_ids().len(), 1);
     }
 }
