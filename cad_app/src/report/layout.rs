@@ -1006,6 +1006,47 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
 /// BY TYPE, not by fixture: "48 × OCULUS GRANDE 2.0" is what gets ordered and wired. Manufacturer
 /// and catalogue number come out of the photometric file's own header — so a file that declares
 /// none shows a dash, which is the file's omission rather than the report's.
+/// Cut `text` to `max_w`, ending in an ellipsis when it had to be cut.
+///
+/// Reported as: *"in report names conflict with each other if its too long."* The schedule wrote
+/// every cell at its column's x with no idea how wide that column was, so a long fitting name ran
+/// straight through the one beside it and the two overprinted — the name and the manufacturer
+/// sharing the same ink. Worse than unreadable: what a reader picks out of the overlap is a string
+/// that belongs to neither field.
+///
+/// TRUNCATED RATHER THAN WRAPPED, because a schedule row already carries a sub-line beneath it
+/// (catalogue, lamp) and rows sit at a fixed pitch; a name that grew to two lines would collide
+/// downwards instead of sideways, which is the same bug rotated ninety degrees. The full name is in
+/// the fitting list either way — this column identifies a row, it is not the record of it.
+fn fit_to(text: &str, max_w: f64, size: f64, font: Font) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    if crate::report::pdf::text_width(text, size, font) <= max_w {
+        return text.to_string();
+    }
+    let ell = crate::report::pdf::text_width("…", size, font);
+    let mut out = String::new();
+    let mut w = 0.0;
+    for ch in text.chars() {
+        let cw = crate::report::pdf::text_width(&ch.to_string(), size, font);
+        // The ellipsis has to fit as well, or trimming exactly to the limit puts the marker itself
+        // back over the line.
+        if w + cw + ell > max_w {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    // A LONE ELLIPSIS SAYS NOTHING. If not one character fits, the column is too narrow for this
+    // cell and an empty one is the honest result — a bare "…" reads as data that was there.
+    if out.trim().is_empty() {
+        return String::new();
+    }
+    out.push('…');
+    out
+}
+
 fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
     if rows.is_empty() {
         return;
@@ -1057,15 +1098,31 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
                 "—".into()
             }
         };
+        // WHAT EACH TEXT COLUMN ACTUALLY HAS. The two left-aligned cells are the only ones that
+            // can overrun -- every other column is right-aligned against a number of known size.
+        // The name starts 6 pt in and must stop before the manufacturer; the manufacturer must
+        // stop before the right-aligned Watts figure, with a gap so the two never touch.
+        const GAP: f64 = 8.0;
+        // WHERE THE WATTS CELL BEGINS, not where it is anchored. It is RIGHT-aligned at `cols[3]`,
+        // so its glyphs run leftward from there and the space to its left is shorter than the
+        // column looks by exactly the width of the number. Bounding against the anchor was the
+        // first attempt here and it still overprinted — by the width of "20.0 W".
+        let watts_s = dash(row.watts, " W", 1);
+        let watts_left = at(cols[3]) - crate::report::pdf::text_width(&watts_s, 8.0, Font::Regular);
+        let name_w = (at(cols[1]) - (at(cols[0]) + 6.0) - GAP).max(0.0);
+        let maker_w = (watts_left - at(cols[1]) - GAP).max(0.0);
+        // The sub-line sits under the name and has nothing left-aligned beside it, so it runs from
+        // the name's x to that same right edge.
+        let sub_w = (watts_left - (at(cols[0]) + 6.0) - GAP).max(0.0);
         let cells: [(f64, Align, String); 7] = [
             (at(cols[0]), Align::Right, format!("{}", row.count)),
-            (at(cols[0]), Align::Left, row.profile.clone()),
+            (at(cols[0]), Align::Left, fit_to(&row.profile, name_w, 8.0, Font::Bold)),
             (at(cols[1]), Align::Left, if row.manufacturer.trim().is_empty() {
                 "—".into()
             } else {
-                row.manufacturer.trim().to_string()
+                fit_to(row.manufacturer.trim(), maker_w, 8.0, Font::Regular)
             }),
-            (at(cols[3]), Align::Right, dash(row.watts, " W", 1)),
+            (at(cols[3]), Align::Right, watts_s.clone()),
             (at(cols[4]), Align::Right, dash(row.lumens, " lm", 0)),
             (at(cols[5]), Align::Right, row.efficacy().map(|e| format!("{e:.0}")).unwrap_or_else(|| "—".into())),
             (at(cols[6]), Align::Right, {
@@ -1108,7 +1165,10 @@ fn schedule(c: &mut Cursor, rows: &[ScheduleRow], title: &str) {
                 font: Font::Regular,
                 rgb: FAINT,
                 align: Align::Left,
-                text: sub.join(" · "),
+                // The sub-line starts under the NAME but runs the full width of the row -- there
+                // is nothing left-aligned beside it -- so it is bounded against the right-aligned
+                // Watts column, not against the name column above it.
+                text: fit_to(&sub.join(" · "), sub_w, 7.0, Font::Regular),
             });
         }
         c.y += 3.0;
@@ -5086,5 +5146,126 @@ mod the_walls_are_drawn_on_the_plan {
             });
             assert!(in_a_frame, "a wall stroke landed outside every plot: {x1},{y1} {x2},{y2}");
         }
+    }
+}
+
+/// "IN REPORT NAMES CONFLICT WITH EACH OTHER IF ITS TOO LONG."
+///
+/// The schedule wrote every cell at its column's x with no idea how wide that column was, so a long
+/// fitting name ran straight through the manufacturer beside it and the two overprinted. Worse than
+/// unreadable: what a reader picks out of the overlap is a string belonging to neither field.
+#[cfg(test)]
+mod schedule_cells_do_not_collide {
+    use super::tests::*;
+    use super::*;
+
+    const LONG: &str = "OCULUS GRANDE 2.0 - 24°+ELLIPTICAL LENS WIDE FLOOD ASYMMETRIC";
+
+    fn row(profile: &str, manufacturer: &str) -> ScheduleRow {
+        ScheduleRow {
+            profile: profile.into(),
+            count: 79,
+            manufacturer: manufacturer.into(),
+            catalogue: "SN4 - LED - 3000 - 90".into(),
+            lamp: "LED".into(),
+            watts: 20.0,
+            lumens: 2000.0,
+            size_m: (0.095, 0.0, 0.005),
+        }
+    }
+
+    fn doc_with(rows: Vec<ScheduleRow>) -> Doc {
+        let (g, p) = (grid(48, 36), plane());
+        let mut inp = input(&g, &p);
+        inp.rooms[0].schedule = rows;
+        layout(&inp, &Options::default())
+    }
+
+    /// Every text item on the page, with the horizontal span its glyphs actually occupy.
+    // PAGE INDEX INCLUDED, because two items on different pages routinely share a y and would
+    // otherwise compare as the same line -- the first run of this test "failed" on a heading and a
+    // title that are nowhere near each other.
+    fn spans(d: &Doc) -> Vec<(usize, f64, f64, f64, String)> {
+        d.pages
+            .iter()
+            .enumerate()
+            .flat_map(|(pi, p)| p.items.iter().map(move |i| (pi, i)))
+            .filter_map(|(pi, i)| match i {
+                Item::Text { x, y, size, font, align, text, .. } => {
+                    let w = crate::report::pdf::text_width(text, *size, *font);
+                    let x0 = match align {
+                        Align::Left => *x,
+                        Align::Right => *x - w,
+                        Align::Centre => *x - w * 0.5,
+                    };
+                    Some((pi, x0, x0 + w, *y, text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// NOTHING ON A LINE MAY OVERPRINT ANYTHING ELSE ON IT. This is the whole complaint, stated
+    /// over the rendered document rather than over the helper.
+    #[test]
+    fn no_two_cells_on_a_line_overlap() {
+        let d = doc_with(vec![row(LONG, "CABLES & LIGHTING INTERNATIONAL LIMITED")]);
+        let mut items = spans(&d);
+        items.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.3.partial_cmp(&b.3).unwrap())
+                .then(a.1.partial_cmp(&b.1).unwrap())
+        });
+        for w in items.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.0 != b.0 || (a.3 - b.3).abs() > 0.5 {
+                continue; // different page, or different line
+            }
+            assert!(
+                b.1 >= a.2 - 0.01,
+                "'{}' ends at {:.1} and '{}' starts at {:.1} on the same line — they overprint",
+                a.4, a.2, b.4, b.1,
+            );
+        }
+    }
+
+    /// A NAME THAT FITS IS LEFT ALONE. Truncating what did not need it would lose information for
+    /// nothing, and every ordinary schedule would grow ellipses.
+    #[test]
+    fn a_short_name_is_printed_whole() {
+        let d = doc_with(vec![row("DL-90", "HSI")]);
+        let texts: Vec<String> = spans(&d).into_iter().map(|s| s.4).collect();
+        assert!(texts.iter().any(|t| t == "DL-90"), "a short name must survive intact: {texts:?}");
+        assert!(texts.iter().any(|t| t == "HSI"));
+        assert!(!texts.iter().any(|t| t.contains('…')), "and nothing should be cut: {texts:?}");
+    }
+
+    /// A NAME THAT DOES NOT FIT IS MARKED AS CUT. Silently dropping the tail would read as the
+    /// fitting's real name, which is how somebody orders the wrong product.
+    #[test]
+    fn a_long_name_is_marked_where_it_was_cut() {
+        let d = doc_with(vec![row(LONG, "HSI")]);
+        let cut: Vec<String> =
+            spans(&d).into_iter().map(|s| s.4).filter(|t| t.contains('…')).collect();
+        assert!(!cut.is_empty(), "a name too long for its column must show that it was cut");
+        assert!(
+            cut.iter().any(|t| t.starts_with("OCULUS")),
+            "and must still start with the name it stands for: {cut:?}",
+        );
+    }
+
+    /// THE HELPER ITSELF, at the boundary. A cut string must never come out WIDER than the space
+    /// it was cut to — including the ellipsis, which Helvetica sets at 1000 units and the width
+    /// table's fallback would have guessed at 556.
+    #[test]
+    fn a_cut_string_never_exceeds_its_width() {
+        for max in [10.0, 25.0, 40.0, 80.0, 200.0] {
+            let out = fit_to(LONG, max, 8.0, Font::Bold);
+            let w = crate::report::pdf::text_width(&out, 8.0, Font::Bold);
+            assert!(w <= max + 1e-9, "cut to {max} but measures {w:.2}: {out:?}");
+        }
+        // Too narrow for even one character: an empty cell, never a bare ellipsis, which would
+        // read as data that had been there.
+        assert_eq!(fit_to(LONG, 1.0, 8.0, Font::Bold), "", "a lone ellipsis says nothing");
     }
 }

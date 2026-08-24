@@ -172,6 +172,9 @@ fn char_width(c: char, font: Font) -> f64 {
         119 => 722.0,
         123 | 125 => 334.0,
         124 => 260.0,
+        // ELLIPSIS. Tabulated because the fallback below is 556 and Helvetica sets this at 1000 --
+        // an under-measured ellipsis is exactly the overflow the truncation exists to prevent.
+        8230 => 1000.0,
         _ => 556.0,
     };
     match font {
@@ -231,6 +234,8 @@ fn winansi(c: char) -> u8 {
         '³' => 0xb3,
         'µ' => 0xb5,
         '€' => 0x80,
+        // Used by the schedule to mark a name it had to cut — see `layout::fit_to`.
+        '…' => 0x85,
         _ => b'?',
     }
 }
