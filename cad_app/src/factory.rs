@@ -3545,6 +3545,57 @@ impl Default for FactoryState {
     }
 }
 
+/// A unit box as 12 triangles, for tests that need a solid to section.
+#[cfg(test)]
+pub(crate) fn tests_box(mn: Vec3, mx: Vec3) -> Vec<[f32; 3]> {
+    let v = |i: usize| -> [f32; 3] {
+        [
+            if i & 1 == 0 { mn.x } else { mx.x },
+            if i & 2 == 0 { mn.y } else { mx.y },
+            if i & 4 == 0 { mn.z } else { mx.z },
+        ]
+    };
+    const FACES: [[usize; 3]; 12] = [
+        [0, 2, 3], [0, 3, 1], [4, 5, 7], [4, 7, 6],
+        [0, 1, 5], [0, 5, 4], [2, 6, 7], [2, 7, 3],
+        [0, 4, 6], [0, 6, 2], [1, 3, 7], [1, 7, 5],
+    ];
+    FACES.iter().flat_map(|f| f.iter().map(|&i| v(i))).collect()
+}
+
+/// Where a horizontal plane at `z` cuts one triangle — the segment, or `None` when it misses.
+///
+/// ABOVE-OR-ON vs BELOW, one consistent tie-break. A vertex exactly on the plane must fall on ONE
+/// side for every triangle that shares it, or a seam opens along any wall whose mesh happens to
+/// carry a horizontal edge at this height.
+///
+/// Shared by the wall section and the aperture section, so the two cannot drift apart on the
+/// tricky half — which is this one. The callers differ only in which triangles they hand it.
+fn tri_cut_at_z(t: &[Vec3; 3], z: f32) -> Option<[glam::Vec2; 2]> {
+    let side = |v: &Vec3| v.z >= z;
+    let (a, b, c) = (&t[0], &t[1], &t[2]);
+    let (sa, sb, sc) = (side(a), side(b), side(c));
+    if sa == sb && sb == sc {
+        return None; // wholly one side of the plane
+    }
+    let cross = |u: &Vec3, v: &Vec3| -> glam::Vec2 {
+        let d = v.z - u.z;
+        // The edge straddles the plane, so `d` cannot be zero — both ends would have to be exactly
+        // on it, and then both count as "above" and the edge never reaches here.
+        let k = ((z - u.z) / d).clamp(0.0, 1.0);
+        glam::Vec2::new(u.x + (v.x - u.x) * k, u.y + (v.y - u.y) * k)
+    };
+    let mut pts = [glam::Vec2::ZERO; 2];
+    let mut n = 0;
+    for (u, v, su, sv) in [(a, b, sa, sb), (b, c, sb, sc), (c, a, sc, sa)] {
+        if su != sv && n < 2 {
+            pts[n] = cross(u, v);
+            n += 1;
+        }
+    }
+    (n == 2 && pts[0].distance_squared(pts[1]) > 1e-12).then_some(pts)
+}
+
 impl FactoryState {
     pub fn add_box(&mut self) {
         let p = Primitive::Box { w: self.box_w, d: self.box_d, h: self.box_h };
@@ -4596,36 +4647,40 @@ impl FactoryState {
     /// draws strokes, and ordering thousands of segments into rings would be work with no visible
     /// result.
     pub fn section_at_z(&self, z: f32) -> Vec<[glam::Vec2; 2]> {
-        let p = &self.cached.positions;
-        let mut out = Vec::new();
-        for t in p.chunks_exact(3) {
-            // ABOVE-OR-ON vs BELOW, one consistent tie-break. A vertex exactly on the plane must
-            // fall on ONE side for every triangle that shares it, or a seam opens along any wall
-            // whose mesh happens to have a horizontal edge at this height.
-            let side = |v: &[f32; 3]| v[2] >= z;
-            let (a, b, c) = (&t[0], &t[1], &t[2]);
-            let (sa, sb, sc) = (side(a), side(b), side(c));
-            if sa == sb && sb == sc {
-                continue; // wholly one side of the plane
+        self.cached
+            .positions
+            .chunks_exact(3)
+            .filter_map(|t| {
+                tri_cut_at_z(&[Vec3::from(t[0]), Vec3::from(t[1]), Vec3::from(t[2])], z)
+            })
+            .collect()
+    }
+
+    /// THE DOORS AND WINDOWS at `z`, as world-metre segments — drawn into the gaps the wall
+    /// section leaves.
+    ///
+    /// Asked for as: *"why does it look completely open in places with window."* The wall section
+    /// is cut at the working plane and a window at that height is a VOID, so the wall simply stops
+    /// and the opening reads as a hole in the building. Correct as a section and wrong as a
+    /// drawing: a floor plan shows the aperture within the gap, which is how a reader tells a
+    /// window from a missing wall.
+    ///
+    /// APERTURES ARE THE INSTANCES WITH A `fit`. That field exists because a door or window is
+    /// stretched to fill the opening it was drawn on and nothing else in the library is, so it
+    /// identifies them without matching on a name — which would break on the first renamed asset.
+    ///
+    /// Sectioned from the oriented BOX, not the mesh: a window is a thin panel, and its box cut in
+    /// plan is exactly the pair of lines a floor plan draws across an opening. The mesh would add
+    /// every mullion and handle at 40 000 triangles a leaf, which is not what a lighting report is
+    /// read for.
+    pub fn aperture_section_at_z(&self, z: f32) -> Vec<[glam::Vec2; 2]> {
+        let mut out: Vec<[glam::Vec2; 2]> = Vec::new();
+        for (i, inst) in self.furniture.iter().enumerate() {
+            if inst.fit.is_none() {
+                continue; // ordinary furniture is not part of the building's fabric
             }
-            let cross = |u: &[f32; 3], v: &[f32; 3]| -> glam::Vec2 {
-                let d = v[2] - u[2];
-                // The edge straddles the plane, so `d` cannot be zero — both ends would have to be
-                // exactly on it, and then both are "above" and the edge never gets here.
-                let k = ((z - u[2]) / d).clamp(0.0, 1.0);
-                glam::Vec2::new(u[0] + (v[0] - u[0]) * k, u[1] + (v[1] - u[1]) * k)
-            };
-            let mut pts = [glam::Vec2::ZERO; 2];
-            let mut n = 0;
-            for (u, v, su, sv) in [(a, b, sa, sb), (b, c, sb, sc), (c, a, sc, sa)] {
-                if su != sv && n < 2 {
-                    pts[n] = cross(u, v);
-                    n += 1;
-                }
-            }
-            if n == 2 && pts[0].distance_squared(pts[1]) > 1e-12 {
-                out.push(pts);
-            }
+            let Some(tris) = crate::light::furniture_box_tris(self, i) else { continue };
+            out.extend(tris.iter().filter_map(|t| tri_cut_at_z(t, z)));
         }
         out
     }
@@ -16938,5 +16993,91 @@ mod the_section_is_a_floor_plan {
                 assert!(!inside_desk, "the desk was cut into the wall drawing at {p:?}");
             }
         }
+    }
+}
+
+/// "WHY DOES IT LOOK COMPLETELY OPEN IN PLACES WITH WINDOW."
+///
+/// The wall section is cut at the working plane, and a window at that height is a VOID — so the
+/// wall stops, nothing is drawn, and the opening reads as a hole in the building. Correct as a
+/// section and wrong as a drawing: a floor plan shows the aperture inside the gap, which is how a
+/// reader tells a window from a missing wall.
+#[cfg(test)]
+mod apertures_fill_the_gap_they_cut {
+    use super::*;
+
+    fn wall_with_a_hole() -> Vec<[f32; 3]> {
+        // Two stubs with a 1 m gap between them at x 1..2 — a doorway.
+        let mut t = crate::factory::tests_box(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.2, 2.5));
+        t.extend(crate::factory::tests_box(Vec3::new(2.0, 0.0, 0.0), Vec3::new(3.0, 0.2, 2.5)));
+        t
+    }
+
+    /// THE WALL SECTION LEAVES THE GAP — this is the behaviour being complained about, pinned so
+    /// the aperture pass is understood as an ADDITION rather than a change to the section.
+    #[test]
+    fn the_wall_section_alone_leaves_the_opening_empty() {
+        let mut f = FactoryState::default();
+        f.cached.positions = wall_with_a_hole();
+        for s in f.section_at_z(1.0) {
+            for p in s {
+                assert!(p.x <= 1.0001 || p.x >= 1.9999, "the wall must not cross the opening");
+            }
+        }
+    }
+
+    /// AND THE APERTURE FILLS IT. A window placed in that opening must put ink where the wall
+    /// could not.
+    #[test]
+    fn an_aperture_is_drawn_across_the_opening() {
+        let mut f = FactoryState::default();
+        f.cached.positions = wall_with_a_hole();
+        let idx = f.add_furniture_asset(
+            "Window".into(),
+            crate::mesh_io::ObjMesh {
+                positions: crate::factory::tests_box(
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 0.1, 1.5),
+                ),
+                normals: vec![[0.0, 0.0, 1.0]; 36],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, Vec3::new(1.0, 0.05, 0.0));
+        // A `fit` is what makes it an aperture rather than a piece of furniture.
+        f.furniture.last_mut().expect("placed").fit = Some([1.0, 1.0, 1.0]);
+
+        let segs = f.aperture_section_at_z(1.0);
+        assert!(!segs.is_empty(), "the window must be drawn — that is the whole complaint");
+        assert!(
+            segs.iter().flatten().any(|p| p.x > 1.0 && p.x < 2.0),
+            "and it must land IN the opening the wall left: {segs:?}",
+        );
+    }
+
+    /// ORDINARY FURNITURE IS STILL LEFT OUT. `fit` is the discriminator; a desk standing in the
+    /// room is not part of the building's fabric and must not be drawn as though it were a wall.
+    #[test]
+    fn furniture_without_a_fit_is_not_an_aperture() {
+        let mut f = FactoryState::default();
+        let idx = f.add_furniture_asset(
+            "desk".into(),
+            crate::mesh_io::ObjMesh {
+                positions: crate::factory::tests_box(
+                    Vec3::new(0.0, 0.0, 0.0),
+                    Vec3::new(1.0, 1.0, 1.2),
+                ),
+                normals: vec![[0.0, 0.0, 1.0]; 36],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, Vec3::new(0.0, 0.0, 0.0));
+        assert!(f.furniture.last().expect("placed").fit.is_none(), "a desk has no fit");
+        assert!(
+            f.aperture_section_at_z(0.8).is_empty(),
+            "furniture must not be drawn into the wall plan",
+        );
     }
 }

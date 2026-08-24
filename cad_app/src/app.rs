@@ -5479,21 +5479,32 @@ impl CadApp {
             if grid.values.is_empty() {
                 continue;
             }
-            let dx = plane.width / plane.cols.max(1) as f32;
-            let dy = plane.depth / plane.rows.max(1) as f32;
+            // THE SAME INTERPOLATED FIELD THE REPORT DRAWS, at the resolution the 3D view already
+            // uses. This painted one flat quad per GRID CELL — reported as *"in the simlux and 2d
+            // view the false color look like low poly cubes"* — while the report samples BETWEEN
+            // cells and bands the result, which is why its bands curve where these staircased at
+            // the grid pitch. Two pictures of one calculation that did not look like each other.
+            let (nx, ny) = Self::overlay_res(grid.cols as usize, grid.rows as usize);
+            let f = crate::isolux::sample(grid, &room.mask, nx, ny);
+            let dx = plane.width / nx.max(1) as f32;
+            let dy = plane.depth / ny.max(1) as f32;
             let mut mesh = egui::epaint::Mesh::default();
-            mesh.reserve_triangles((plane.cols * plane.rows) as usize * 2);
-            mesh.reserve_vertices((plane.cols * plane.rows) as usize * 4);
-            for row in 0..plane.rows {
-                for col in 0..plane.cols {
-                    let i = (row * plane.cols + col) as usize;
+            mesh.reserve_triangles(nx * ny * 2);
+            mesh.reserve_vertices(nx * ny * 4);
+            for row in 0..ny as u32 {
+                for col in 0..nx as u32 {
+                    let i = row as usize * nx + col as usize;
                     // Cells outside the room are not the room's result and are not painted. A grid
                     // is a rectangle and a room need not be; those cells were computed, but
                     // colouring them reports illuminance on ground the room does not occupy.
-                    if room.mask.get(i).is_some_and(|inside| !inside) {
+                    if !f.inside.get(i).copied().unwrap_or(true) {
                         continue;
                     }
-                    let v = grid.values[i];
+                    // The sub-cell's CENTRE — the mean of its four corners — so a band edge falls
+                    // between samples rather than on one.
+                    let (ci, cj) = (col as usize, row as usize);
+                    let v = 0.25
+                        * (f.at(ci, cj) + f.at(ci + 1, cj) + f.at(ci, cj + 1) + f.at(ci + 1, cj + 1));
                     let c = opts.lux_rgb(v, room_max, ramp);
                     let color = egui::Color32::from_rgb(c[0], c[1], c[2]);
                     let x0 = plane.origin.x + col as f32 * dx;
@@ -6050,10 +6061,25 @@ impl CadApp {
     /// work exists to remove. So the field is supersampled, and the factor is whatever the budget
     /// allows: the SIMLUX view rebuilds its whole vertex buffer every frame, and a sheet is the one
     /// thing here that scales with the grid rather than with the model.
+    /// The most sub-cells the false-colour overlay may draw, in 2D and in 3D.
+    ///
+    /// Public so the test asserts against THIS number rather than a copy of it — the first version
+    /// hard-coded 12 000 in both places, and raising one silently failed the other.
+    pub(crate) const OVERLAY_BUDGET: usize = 64_000;
+
     pub(crate) fn overlay_res(cols: usize, rows: usize) -> (usize, usize) {
-        const BUDGET: usize = 12_000;
+        // RAISED FROM 12 000, which was the whole of "the false color look like low poly cubes".
+        // The reference plan grids 132 x 52 = 6 864 cells: one subdivision is 27 456 quads, so the
+        // old budget rejected it and fell to ss = 1 -- a flat colour per 0.25 m cell, staircased,
+        // while the report subdivides four times and bands a smooth field. The two drawings of one
+        // calculation did not look like each other.
+        //
+        // 64 000 buys ss = 3 on that plan (396 x 156 = 61 776). The cost is vertices in the 3D
+        // buffer and quads in the 2D mesh, both of which are rebuilt per frame -- so this is a
+        // number to watch in the perf tap, not one to raise on the grounds that smoother is nicer.
+        const BUDGET: usize = CadApp::OVERLAY_BUDGET;
         let (c, r) = (cols.max(1), rows.max(1));
-        for ss in [3_usize, 2, 1] {
+        for ss in [4_usize, 3, 2, 1] {
             if c * ss * r * ss <= BUDGET {
                 return (c * ss, r * ss);
             }
@@ -27535,6 +27561,7 @@ impl CadApp {
             // that shaped the field printed over them — and openings read as gaps, because the
             // plane passes through them.
             walls: self.factory.section_at_z(self.light.plane_height),
+            apertures: self.factory.aperture_section_at_z(self.light.plane_height),
             surfaces: &self.light.surfaces,
             maintenance: self.light.maintenance,
             eye_height: self.light.eye_height,

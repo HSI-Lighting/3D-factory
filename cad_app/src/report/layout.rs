@@ -162,6 +162,13 @@ pub struct Input<'a> {
     /// Building-wide rather than per-room: it is one cut through one model, and every room's plot
     /// is a window onto the same segments.
     pub walls: Vec<[glam::Vec2; 2]>,
+    /// THE DOORS AND WINDOWS in the gaps the walls leave, drawn thinner.
+    ///
+    /// "why does it look completely open in places with window" -- a section at the working plane
+    /// passes THROUGH an opening, so the wall stops and nothing is drawn, and the gap reads as a
+    /// hole in the building rather than as a window. Kept separate from `walls` so it can be drawn
+    /// as a plan draws it: the fabric heavy, the aperture light.
+    pub apertures: Vec<[glam::Vec2; 2]>,
 }
 
 impl<'a> Input<'a> {
@@ -194,6 +201,7 @@ impl<'a> Input<'a> {
             ramp,
             mask,
             walls,
+            apertures,
         } = self;
         let mut h = crate::light::Fnv::new();
         h.u64(calc);
@@ -219,6 +227,7 @@ impl<'a> Input<'a> {
         // moves back — and the consequence is a stale PREVIEW until the dialog is reopened, never a
         // wrong number on the page.
         h.u64(walls.len() as u64);
+        h.u64(apertures.len() as u64);
         let mut ext = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for s in walls.iter().flatten() {
             ext = (ext.0.min(s.x), ext.1.min(s.y), ext.2.max(s.x), ext.3.max(s.y));
@@ -1513,29 +1522,30 @@ fn results_body(
     // part of it, so a segment belonging to the room next door would otherwise be drawn straddling
     // this room's frame. Whole segments are kept or dropped rather than split: a wall that leaves
     // the frame is one the reader can see leaves the frame.
-    if !inp.walls.is_empty() {
-        let (px0, py0) = (p.origin.x as f64, p.origin.y as f64);
-        let (pw, pd) = (p.width as f64, p.depth as f64);
-        let inside = |v: &glam::Vec2| {
-            let (u, w) = (v.x as f64 - px0, v.y as f64 - py0);
-            u >= -1e-6 && u <= pw + 1e-6 && w >= -1e-6 && w <= pd + 1e-6
-        };
-        for s in &inp.walls {
+    // APERTURES FIRST, THEN WALLS, so a wall stroke wins wherever the two meet at a jamb.
+    //
+    // Drawn lighter and thinner than the fabric, which is how a floor plan distinguishes them.
+    // Without the aperture pass the section simply stops at every opening — the plane is cut at the
+    // working height and a window is a VOID there — and the gap reads as a missing wall. Correct as
+    // a section, wrong as a drawing.
+    let (px0, py0) = (p.origin.x as f64, p.origin.y as f64);
+    let (pw, pd) = (p.width as f64, p.depth as f64);
+    let inside = |v: &glam::Vec2| {
+        let (u, w) = (v.x as f64 - px0, v.y as f64 - py0);
+        u >= -1e-6 && u <= pw + 1e-6 && w >= -1e-6 && w <= pd + 1e-6
+    };
+    for (segs, ink, wide) in
+        [(&inp.apertures, [110u8, 110, 110], 0.45f64), (&inp.walls, [25, 25, 25], 0.9)]
+    {
+        for s in segs {
+            // CLIPPED TO THE PLOT. The cut is of the whole building and each plot is a window onto
+            // part of it, so a segment from the room next door would straddle this room's frame.
             if !inside(&s[0]) || !inside(&s[1]) {
                 continue;
             }
             let (ax, ay) = to_page(&s[0]);
             let (bx, by) = to_page(&s[1]);
-            c.push(Item::Line {
-                x1: ax,
-                y1: ay,
-                x2: bx,
-                y2: by,
-                // Near-black and solid: this is the drawing's structure, not an annotation, and it
-                // has to read over both ends of the false-colour ramp.
-                rgb: [25, 25, 25],
-                width: 0.9,
-            });
+            c.push(Item::Line { x1: ax, y1: ay, x2: bx, y2: by, rgb: ink, width: wide });
         }
     }
 
@@ -2325,6 +2335,7 @@ mod tests {
             // No model behind the fixture, so no section -- the drawing is the field alone, which
             // is what every test here is about.
             walls: Vec::new(),
+            apertures: Vec::new(),
             maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
             surfaces: &[],
             eye_height: 1.2,
@@ -5117,6 +5128,40 @@ mod the_walls_are_drawn_on_the_plan {
             dark_lines(&doc_with_walls(mixed)).len(),
             dark_lines(&doc_with_walls(four_walls())).len(),
             "the far segment must be dropped and the near ones kept",
+        );
+    }
+
+    /// THE APERTURES ARE DRAWN TOO, and LIGHTER than the fabric. Without them the section simply
+    /// stops at every opening -- "why does it look completely open in places with window" -- and a
+    /// window reads as a missing wall. Drawn in the same ink as the walls they would be
+    /// indistinguishable from them, which is the other half of the same mistake.
+    #[test]
+    fn apertures_are_drawn_lighter_than_the_walls() {
+        let v = |x: f32, y: f32| glam::Vec2::new(x, y);
+        let (g, p) = (grid(48, 36), plane());
+        let mut inp = input(&g, &p);
+        inp.walls = four_walls();
+        inp.apertures = vec![[v(2.0, 1.0), v(3.0, 1.0)]];
+        let d = layout(&inp, &Options::default());
+
+        let inks: Vec<[u8; 3]> = d
+            .pages
+            .iter()
+            .flat_map(|pg| pg.items.iter())
+            .filter_map(|i| match i {
+                Item::Line { rgb, .. } if rgb[0] < 160 && rgb[0] == rgb[1] && rgb[1] == rgb[2] => {
+                    Some(*rgb)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            inks.iter().any(|c| c[0] == 25),
+            "the walls must still be drawn in the heavy ink: {inks:?}",
+        );
+        assert!(
+            inks.iter().any(|c| c[0] > 25 && c[0] < 160),
+            "the aperture must be drawn, and LIGHTER than the wall: {inks:?}",
         );
     }
 

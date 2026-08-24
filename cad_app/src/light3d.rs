@@ -7415,11 +7415,21 @@ mod the_lux_overlay {
         // the full grid and spend 98,000 vertices a frame on it.
         for (c, r) in [(38, 30), (128, 128), (16, 8), (200, 80), (128, 128), (16_384, 1)] {
             let (x, y) = crate::app::CadApp::overlay_res(c, r);
-            assert!(x * y <= 12_000, "a {c} × {r} grid asked for {x} × {y} = {} cells", x * y);
-            assert!(x >= 2 && y >= 2, "a {c} × {r} grid collapsed to {x} × {y}");
+            assert!(
+                x * y <= crate::app::CadApp::OVERLAY_BUDGET,
+                "a {c} × {r} grid asked for {x} × {y} = {} cells",
+                x * y,
+            );
+            // THE FLOOR OF TWO BELONGS TO THE COARSENING PATH, which is the only one that can
+            // degenerate an axis. A source grid that is genuinely one row deep is drawn one row
+            // deep, and asserting otherwise would demand the overlay invent detail the
+            // calculation does not have.
+            if x < c || y < r {
+                assert!(x >= 2 && y >= 2, "a {c} × {r} grid was coarsened to {x} × {y}");
+            }
             // Coarsening is only ever a LAST resort — while the budget allows it, the overlay must
             // be at least as fine as the data it is drawing.
-            if c * r <= 12_000 {
+            if c * r <= crate::app::CadApp::OVERLAY_BUDGET {
                 assert!(x >= c && y >= r, "a {c} × {r} grid was drawn COARSER, at {x} × {y}");
             }
         }
