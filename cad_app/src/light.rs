@@ -882,6 +882,13 @@ pub struct CalcJob {
     obstacles: Vec<Vec<Obstacle>>,
     /// The whole-model bounds, for a target with no footprint.
     fallback: (f32, f32, f32, f32),
+    /// THE WALLS, as a horizontal section through the building at the working plane.
+    ///
+    /// Carries the boundary the WALL ZONE is measured from when no room outline was drawn -- a
+    /// polygon offset needs an outline, and the building only has one because the geometry says so.
+    /// Gathered on the UI thread with the obstacles above, for the same reason: the worker cannot
+    /// see the Factory.
+    walls: Vec<[glam::Vec2; 2]>,
     cell_size: f32,
     plane_height: f32,
     eye_height: f32,
@@ -987,6 +994,10 @@ impl CalcJob {
             // either moves the fingerprint, and nothing else can move the obstacles. Hashing their
             // triangles a second time would be a second pass over the model for no new fact.
             obstacles: _,
+            // DERIVED TOO, and for the same reason: the section is a pure function of the scene
+            // triangles and the working plane, both hashed below. A model edit moves them, and
+            // nothing else can move the section.
+            walls: _,
             fallback,
             cell_size,
             plane_height,
@@ -1080,13 +1091,71 @@ impl CalcJob {
         1 + self.targets.len() as u32 * 3 + 1
     }
 
+    /// THE SAMPLING RECTANGLE, WHICH IS NO LONGER WHERE THE WALL ZONE IS APPLIED.
+    ///
+    /// This used to shrink the bounding rectangle by `wall_zone` on all four sides, and that is a
+    /// border from every wall only if the room IS a rectangle. On the plan this was reported
+    /// against — 33 × 13 m, angled walls, a curve along one side — a 0.5 m inset of the bounding
+    /// box leaves the grid running into the wall everywhere the wall is not axis-aligned, while
+    /// cutting 0.5 m off ground that has no wall near it at all.
+    ///
+    /// The zone is measured from the OUTLINE now, cell by cell, in [`Self::in_wall_zone`]. What is
+    /// left here is the nudge that stops a cell landing exactly on the boundary, where
+    /// point-in-polygon is a coin toss.
     fn inset_bounds(&self, b: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
-        let z = self.wall_zone.max(0.0);
+        const NUDGE: f32 = 1e-4;
         let (x0, y0, x1, y1) = b;
-        if x1 - x0 <= 2.0 * z || y1 - y0 <= 2.0 * z {
+        if x1 - x0 <= 2.0 * NUDGE || y1 - y0 <= 2.0 * NUDGE {
             return b;
         }
-        (x0 + z, y0 + z, x1 - z, y1 - z)
+        (x0 + NUDGE, y0 + NUDGE, x1 - NUDGE, y1 - NUDGE)
+    }
+
+    /// Is `(x, y)` within `zone` metres of the boundary — the border a report excludes?
+    ///
+    /// A TRUE OFFSET FROM THE OUTLINE, not an inset of the bounding rectangle. DIALux and Relux
+    /// both offset from the room boundary itself, and on anything but a rectangle the two are
+    /// different drawings: an inset box sits too close to the wall on every angled run and too far
+    /// from it in every corner.
+    ///
+    /// `boundary` is the room's own edges when an outline was drawn, and the building's walls —
+    /// [`crate::factory::FactoryState::section_at_z`] — when one was not. Internal walls count,
+    /// because a wall is a wall; openings do not, because the section leaves them as gaps and
+    /// nobody stands back from a doorway.
+    pub(crate) fn in_wall_zone(x: f32, y: f32, zone: f32, boundary: &[[glam::Vec2; 2]]) -> bool {
+        if zone <= 0.0 || boundary.is_empty() {
+            return false;
+        }
+        let p = glam::Vec2::new(x, y);
+        let z2 = zone * zone;
+        for s in boundary {
+            let (a, b) = (s[0], s[1]);
+            // Cheap reject on the segment's bounding box before any projection — a building's
+            // section is thousands of segments and all but a handful are nowhere near this cell.
+            if p.x < a.x.min(b.x) - zone
+                || p.x > a.x.max(b.x) + zone
+                || p.y < a.y.min(b.y) - zone
+                || p.y > a.y.max(b.y) + zone
+            {
+                continue;
+            }
+            let ab = b - a;
+            let len2 = ab.length_squared();
+            // A degenerate segment is a point, and clamping t to 0 measures to it — which is right.
+            let t = if len2 > 1e-12 { ((p - a).dot(ab) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            if p.distance_squared(a + ab * t) < z2 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The room's own edges as segments — the boundary a drawn outline offers.
+    pub(crate) fn poly_edges(poly: &[glam::Vec2]) -> Vec<[glam::Vec2; 2]> {
+        if poly.len() < 3 {
+            return Vec::new();
+        }
+        (0..poly.len()).map(|i| [poly[i], poly[(i + 1) % poly.len()]]).collect()
     }
 
     /// THE WORK. No `&self` on the app, no UI, no borrows — this is what runs on the worker.
@@ -1195,7 +1264,19 @@ impl CalcJob {
                 glam::Vec3::new(x, y, plane.origin.z - 1_000.0),
             )
         };
-        let mask = LightState::measurable_mask(&plane, poly, obstacles, Some(&floor_below));
+        // THE BOUNDARY THE WALL ZONE IS MEASURED FROM: the room's own edges when one was drawn, the
+        // building's walls when one was not. The same rule as the outline test — a drawn room is
+        // the room, and the geometry only stands in where there is nothing to stand in for.
+        let edges = CalcJob::poly_edges(poly);
+        let boundary: &[[glam::Vec2; 2]] = if edges.is_empty() { &self.walls } else { &edges };
+        let mask = LightState::measurable_mask(
+            &plane,
+            poly,
+            obstacles,
+            Some(&floor_below),
+            self.wall_zone,
+            boundary,
+        );
         if mask.iter().any(|k| !k) {
             LightState::apply_room_mask(&mut grid, &mask);
         }
@@ -1211,7 +1292,14 @@ impl CalcJob {
         // ground outside the walls into the figures a scheme is signed off on.
         let mut mask_en = Vec::new();
         {
-            let m = LightState::measurable_mask(&plane_en, poly, obstacles, Some(&floor_below));
+            let m = LightState::measurable_mask(
+                &plane_en,
+                poly,
+                obstacles,
+                Some(&floor_below),
+                self.wall_zone,
+                boundary,
+            );
             if m.iter().any(|k| !k) {
                 LightState::apply_room_mask(&mut grid_en, &m);
                 mask_en = m;
@@ -1705,7 +1793,17 @@ impl LightState {
             installation: None,
             eye_height: 1.2,
             cylindrical_avg: None,
-            wall_zone: 0.010,
+            // 0.5 m -- what DIALux and Relux default to, and what EN 12464-1 assumes when it
+            // treats the surrounding area separately from the task area.
+            //
+            // It was 0.010 m, and that number came from ONE DIALux fixture: the comparison room
+            // reports "Wall zone Working plane 0.010 m", the constant was copied into the test, and
+            // from there into the product as if it were a sensible default. It is a value specific
+            // to a 4 x 4 m validation room, and it made every project measure into the skirting --
+            // which is where illuminance collapses, so min and U0 read near zero on plans that were
+            // perfectly well lit. The fixture pins its own value (`identical_dialux.rs::WALL_ZONE`)
+            // and is unaffected by this.
+            wall_zone: 0.5,
             grid_mask: Vec::new(),
             model_fixtures: 0,
             surfaces: Vec::new(),
@@ -2563,7 +2661,11 @@ impl LightState {
                 glam::Vec3::new(x, y, plane.origin.z - 1_000.0),
             )
         };
-        let mask = Self::measurable_mask(&plane, poly, &[], Some(&floor_below));
+        // Only a drawn outline can bound the zone on this path -- it has no section to fall back
+        // on, and offsetting from nothing is better than offsetting from the wrong thing.
+        let edges = CalcJob::poly_edges(poly);
+        let mask =
+            Self::measurable_mask(&plane, poly, &[], Some(&floor_below), self.wall_zone, &edges);
         if !mask.is_empty() {
             Self::apply_room_mask(&mut grid, &mask);
         }
@@ -2573,7 +2675,14 @@ impl LightState {
         // Kept, for the same reason as the other path — see `RoomResult::mask_en`.
         let mut mask_en = Vec::new();
         {
-            let m = Self::measurable_mask(&plane_en, poly, &[], Some(&floor_below));
+            let m = Self::measurable_mask(
+                &plane_en,
+                poly,
+                &[],
+                Some(&floor_below),
+                self.wall_zone,
+                &edges,
+            );
             if !m.is_empty() {
                 Self::apply_room_mask(&mut grid_en, &m);
                 mask_en = m;
@@ -2734,6 +2843,8 @@ impl LightState {
         poly: &[glam::Vec2],
         obstacles: &[Obstacle],
         floor: Option<&dyn Fn(f32, f32) -> bool>,
+        zone: f32,
+        boundary: &[[glam::Vec2; 2]],
     ) -> Vec<bool> {
         let (dx, dy) = (
             plane.width / plane.cols.max(1) as f32,
@@ -2756,7 +2867,12 @@ impl LightState {
                     || !obstacles
                         .iter()
                         .any(|o| o.contains(glam::Vec3::new(x, y, plane.origin.z)));
-                m.push(in_room && free);
+                // AND OUT OF THE BORDER. The wall zone is the third test, applied here rather than
+                // by shrinking the grid, because a border is a distance from the OUTLINE and only
+                // a rectangle's outline is its bounding box.
+                let clear_of_wall =
+                    !in_room || !CalcJob::in_wall_zone(x, y, zone, boundary);
+                m.push(in_room && free && clear_of_wall);
             }
         }
         // NEVER MASK AWAY THE WHOLE RESULT. If nothing has floor under it the assumption behind the
@@ -2769,7 +2885,9 @@ impl LightState {
     }
     /// The outline test alone — the mask with nothing standing in the room.
     fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
-        Self::measurable_mask(plane, poly, &[], None)
+        // The OUTLINE alone: no obstacles, no floor test, no border. Callers wanting the border
+        // must ask for it, or a helper named for one test would quietly apply three.
+        Self::measurable_mask(plane, poly, &[], None, 0.0, &[])
     }
 
 
@@ -3313,6 +3431,10 @@ impl LightState {
             materials: self.materials.clone(),
             settings: self.settings,
             maintenance: self.maintenance,
+            // THE WALLS, cut at the working plane -- the boundary a wall zone is measured from
+            // when no room outline was drawn. Gathered here because the worker cannot see the
+            // Factory, exactly like the obstacles below.
+            walls: factory.map(|f| f.section_at_z(self.plane_height)).unwrap_or_default(),
             obstacles: match factory {
                 // One list per target, in the same order — see `CalcJob::obstacles`.
                 Some(f) => targets.iter().map(|(_, p)| obstacles_in_mode(f, p, self.mode)).collect(),
@@ -4924,6 +5046,11 @@ mod uniformity_is_quoted_with_its_grid {
 
         let mut s = LightState::new();
         s.cell_size = cell;
+        // NO BORDER. This fixture is about GRID COARSENESS, and the wall zone decides which cells
+        // exist to compare -- leaving it at whatever the product default happens to be couples
+        // every assertion here to a number the test never meant to exercise. It bit once already:
+        // the default moved from 0.010 m to 0.5 m and flipped a 0.324-against-0.326 comparison.
+        s.wall_zone = 0.0;
         // REAL FITTINGS, not the auto-centred stand-in. That one is a convenience for a first
         // look and its height follows the room's; a uniformity test needs a layout it controls,
         // and one that is deliberately NOT perfectly even — a room lit to a flat sheet has
@@ -5044,6 +5171,11 @@ mod uniformity_is_quoted_with_its_grid {
         let mut s = LightState::new();
         s.auto_center_light = false;
         s.cell_size = 0.5;
+        // NO BORDER, because this test compares the reported minimum against a mask it builds
+        // itself with `inside_mask` -- the OUTLINE test alone. A wall zone would exclude cells the
+        // hand-built mask still counts, and the two would disagree for a reason the test is not
+        // about.
+        s.wall_zone = 0.0;
         for (i, (x, y)) in [(3.0, 3.0), (9.0, 3.0), (3.0, 9.0)].into_iter().enumerate() {
             s.luminaires.push(Luminaire {
                 id: i as u32 + 1,
@@ -7361,7 +7493,9 @@ mod a_calculation_is_kept_while_it_is_still_true {
         s.plane_height = 0.9;
         assert_ne!(was, fp(&mut s, &f9), "the working plane moved");
         let (f10, mut s) = room();
-        s.wall_zone = 0.5;
+        // NOT 0.5 -- that IS the default now, and the assertion would compare the baseline with
+        // itself and pass for the one reason it must never pass.
+        s.wall_zone = 0.75;
         assert_ne!(was, fp(&mut s, &f10), "the wall zone changed");
         let (f11, mut s) = room();
         s.eye_height = 1.6;
@@ -7805,8 +7939,8 @@ mod a_point_inside_the_furniture_is_not_measured {
             glam::Vec3::new(2.0, 2.0, 0.0),
             glam::Vec3::new(4.0, 4.0, 2.0),
         ));
-        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard), None);
-        let without = LightState::measurable_mask(&plane, &poly, &[], None);
+        let with = LightState::measurable_mask(&plane, &poly, std::slice::from_ref(&cupboard), None, 0.0, &[]);
+        let without = LightState::measurable_mask(&plane, &poly, &[], None, 0.0, &[]);
 
         assert!(without.iter().all(|k| *k), "an empty room lost cells to nothing at all");
         let dropped = with.iter().filter(|k| !**k).count();
@@ -8965,7 +9099,7 @@ mod the_building_is_its_own_outline {
     /// WITH NO OUTLINE, THE FLOOR IS THE OUTLINE — and the empty corner is left out.
     #[test]
     fn with_no_room_outline_the_floor_decides() {
-        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&an_l_shaped_floor));
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&an_l_shaped_floor), 0.0, &[]);
         assert!(at(&m, 2, 2), "over floor, inside");
         assert!(at(&m, 7, 2), "the low-y arm has floor, so it is inside");
         assert!(
@@ -8986,7 +9120,7 @@ mod the_building_is_its_own_outline {
             glam::Vec2::new(9.0, 9.0),
             glam::Vec2::new(6.0, 9.0),
         ];
-        let m = LightState::measurable_mask(&a_plane(), &poly, &[], Some(&an_l_shaped_floor));
+        let m = LightState::measurable_mask(&a_plane(), &poly, &[], Some(&an_l_shaped_floor), 0.0, &[]);
         assert!(
             at(&m, 7, 7),
             "inside the DRAWN room, so it counts however the floor test would have voted",
@@ -8998,7 +9132,7 @@ mod the_building_is_its_own_outline {
     /// under it — and an empty grid is a worse answer than the rectangular one it replaced.
     #[test]
     fn a_scene_with_no_floor_at_all_keeps_every_cell() {
-        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&|_, _| false));
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], Some(&|_, _| false), 0.0, &[]);
         assert!(
             m.iter().all(|&k| k),
             "with no floor anywhere the assumption does not hold for this scene, so the old \
@@ -9010,7 +9144,7 @@ mod the_building_is_its_own_outline {
     /// validated fixture takes.
     #[test]
     fn without_a_floor_test_it_is_the_outline_test_it_always_was() {
-        let m = LightState::measurable_mask(&a_plane(), &[], &[], None);
+        let m = LightState::measurable_mask(&a_plane(), &[], &[], None, 0.0, &[]);
         assert!(m.iter().all(|&k| k), "no outline and no floor test means every cell, as before");
     }
 }
@@ -9077,7 +9211,7 @@ mod the_wall_zone_is_the_users_to_choose {
     fn changing_the_zone_marks_the_answer_out_of_date() {
         let mut s = LightState::new();
         let before = s.scene_sig(&Document::default(), None);
-        s.wall_zone = 0.5;
+        s.wall_zone = 0.75; // NOT the default -- see below
         let after = s.scene_sig(&Document::default(), None);
         // A 2D-only project declines to summarise, so this is about the FINGERPRINT either way.
         if before.is_some() {
@@ -9099,7 +9233,7 @@ mod the_wall_zone_is_the_users_to_choose {
 
         let mut a = LightState::new();
         let mut b = LightState::new();
-        b.wall_zone = 0.5;
+        b.wall_zone = 0.75; // NOT the default, or this compares a value against itself
         let fa = a.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
         let fb = b.prepare(&Document::default(), Some(&f)).map(|j| j.fingerprint());
         assert!(fa.is_some(), "the fixture must actually produce a job");
@@ -9109,5 +9243,121 @@ mod the_wall_zone_is_the_users_to_choose {
             "two zones must not produce the same fingerprint, or a restored result would be \
              adopted for a scene it does not describe",
         );
+    }
+}
+
+/// THE WALL ZONE IS AN OFFSET FROM THE OUTLINE, not an inset of the bounding rectangle.
+///
+/// The old version shrank the bounding box by `wall_zone` on all four sides, which is a border from
+/// every wall only if the room IS a rectangle. On the plan this was reported against — 33 × 13 m,
+/// angled walls, a curve along one side — an inset box runs into the wall everywhere the wall is
+/// not axis-aligned, while cutting half a metre off ground with no wall near it.
+#[cfg(test)]
+mod the_wall_zone_follows_the_wall {
+    use super::*;
+
+    fn v(x: f32, y: f32) -> glam::Vec2 {
+        glam::Vec2::new(x, y)
+    }
+
+    /// A DIAGONAL WALL is where an inset rectangle and a true offset disagree most. A point 0.1 m
+    /// from the diagonal is well inside the inset box and must still be excluded.
+    #[test]
+    fn a_point_close_to_a_diagonal_wall_is_in_the_zone() {
+        // The wall runs corner to corner across a 10 x 10 room.
+        let wall = [[v(0.0, 0.0), v(10.0, 10.0)]];
+        // Just off the diagonal, and nowhere near any bounding edge.
+        assert!(
+            CalcJob::in_wall_zone(5.0, 5.2, 0.5, &wall),
+            "0.14 m from a diagonal wall must be inside a 0.5 m zone — an inset RECTANGLE would \
+             have kept this cell, because it is 5 m from every side of the box",
+        );
+        assert!(
+            !CalcJob::in_wall_zone(5.0, 6.5, 0.5, &wall),
+            "and 1.06 m from it must not be",
+        );
+    }
+
+    /// THE CORNER CASE, the other direction. An inset rectangle cuts the full zone off a corner in
+    /// both axes at once; a true offset measures the actual distance, which is longer.
+    #[test]
+    fn the_zone_is_measured_as_a_distance_not_per_axis() {
+        let poly = vec![v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)];
+        let edges = CalcJob::poly_edges(&poly);
+        assert_eq!(edges.len(), 4, "a quad has four edges");
+        // 0.4 m in from BOTH walls at a corner: 0.4 from each, so inside a 0.5 m zone.
+        assert!(CalcJob::in_wall_zone(0.4, 0.4, 0.5, &edges));
+        // 0.6 m in from both: 0.6 from each wall, so outside it — even though the diagonal
+        // distance to the corner POINT is 0.85 m. The zone is distance to the wall, not the corner.
+        assert!(!CalcJob::in_wall_zone(0.6, 0.6, 0.5, &edges));
+    }
+
+    /// PAST THE END OF A WALL, the nearest point is its ENDPOINT and the distance is diagonal. A
+    /// per-axis test -- which is what an inset bounding box is -- says 0.4 m in x and 0.4 m in y,
+    /// both inside a 0.5 m zone; the real distance is 0.57 m and the cell is clear. This is the
+    /// case that separates a distance from a box, and it is every corner and every door jamb.
+    #[test]
+    fn distance_past_the_end_of_a_wall_is_diagonal() {
+        let wall = [[v(0.0, 0.0), v(5.0, 0.0)]];
+        assert!(
+            !CalcJob::in_wall_zone(-0.4, -0.4, 0.5, &wall),
+            "0.57 m from the wall end must be CLEAR -- a per-axis test would read 0.4 and 0.4 and \n             wrongly exclude it",
+        );
+        assert!(
+            CalcJob::in_wall_zone(-0.3, -0.3, 0.5, &wall),
+            "and 0.42 m from the same end must be inside the zone",
+        );
+    }
+
+    /// A WALL IS A SEGMENT, NOT AN INFINITE LINE. Without clamping the projection, a short stub
+    /// would exclude cells all the way along the line it happens to lie on -- a 1 m wall casting a
+    /// 33 m border across the building.
+    #[test]
+    fn a_short_wall_does_not_bar_the_whole_line() {
+        let stub = [[v(0.0, 0.0), v(1.0, 0.0)]];
+        assert!(
+            !CalcJob::in_wall_zone(10.0, 0.1, 0.5, &stub),
+            "9 m past the end of a 1 m wall must be clear, however close to its LINE it sits",
+        );
+        assert!(CalcJob::in_wall_zone(0.5, 0.1, 0.5, &stub), "beside the wall itself it is not");
+    }
+
+    /// A ZONE OF ZERO EXCLUDES NOTHING, and an empty boundary cannot exclude anything either —
+    /// a 2D-only project has no walls to measure from and must not lose its whole grid.
+    #[test]
+    fn nothing_to_measure_from_excludes_nothing() {
+        let edges = CalcJob::poly_edges(&[v(0.0, 0.0), v(10.0, 0.0), v(10.0, 10.0), v(0.0, 10.0)]);
+        assert!(!CalcJob::in_wall_zone(0.01, 0.01, 0.0, &edges), "a zero zone keeps the cell");
+        assert!(!CalcJob::in_wall_zone(0.01, 0.01, 0.5, &[]), "no boundary, nothing to be near");
+    }
+
+    /// AND IT REACHES THE MASK. The distance test is only worth having if the cells actually drop
+    /// out of the result.
+    #[test]
+    fn the_zone_removes_cells_from_the_mask() {
+        let poly = vec![v(0.0, 0.0), v(10.0, 0.0), v(10.0, 8.0), v(0.0, 8.0)];
+        let edges = CalcJob::poly_edges(&poly);
+        let plane = CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 10.0,
+            depth: 8.0,
+            cols: 20,
+            rows: 16,
+        };
+        let none = LightState::measurable_mask(&plane, &poly, &[], None, 0.0, &edges);
+        let half = LightState::measurable_mask(&plane, &poly, &[], None, 0.5, &edges);
+        let kept = |m: &[bool]| m.iter().filter(|k| **k).count();
+        assert_eq!(kept(&none), 20 * 16, "with no zone every cell of a rectangle is measurable");
+        assert!(
+            kept(&half) < kept(&none),
+            "a 0.5 m border must drop the cells beside the walls: {} vs {}",
+            kept(&half),
+            kept(&none),
+        );
+        assert!(kept(&half) > 0, "and must not empty the room");
+        // The border is one 0.25 m cell deep on each side at this resolution, so the survivors are
+        // the interior 18 x 14. Stated as a number because "fewer" would pass for a zone that
+        // removed nine tenths of the room.
+        assert_eq!(kept(&half), 18 * 14, "the surviving region is the room inset by one cell");
     }
 }
