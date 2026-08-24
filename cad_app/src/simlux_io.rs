@@ -472,6 +472,15 @@ pub struct SimluxConfig {
     pub wall_zone: f32,
     #[serde(default)]
     pub eye_height: f32,
+    /// EXPRESS OR THOROUGH. Not saved, so the switch reset to Thorough on every reopen — and
+    /// because the mode is an input to the calculation FINGERPRINT, a stored Express result then
+    /// failed to match and was silently refused. The work was on disk and unreachable, with
+    /// nothing on screen to say why.
+    ///
+    /// Defaulting to `false` reads a pre-existing sidecar as Thorough, which is right: nothing
+    /// persisted the mode before this, so no such file can be carrying an Express project.
+    #[serde(default)]
+    pub express: bool,
     /// APP-LAYER wall-style extension: wall-style NAME → centerline linetype NAME.
     /// Keyed by name (like everything else here) so it survives save/reopen even though
     /// style/linetype ids are positional. Kept out of cad_kernel's `WallStyle` (D5).

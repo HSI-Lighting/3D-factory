@@ -27744,6 +27744,9 @@ impl CadApp {
                 option_env!("SIMLUX_BUILD_NO").unwrap_or("?"),
                 option_env!("SIMLUX_BUILD").unwrap_or("unknown"),
             ),
+            // THE MODE THE ANSWER WAS COMPUTED IN, not the one the switch is on now -- those are
+            // different questions and `results_mode` is the one that describes these numbers.
+            self.light.results_mode == Some(crate::light::CalcMode::Express),
         );
         match crate::light_store::save(&path, &stored) {
             Ok(p) => self.history.push(format!(

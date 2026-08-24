@@ -3344,6 +3344,14 @@ impl LightState {
         self.last_timings.clear();
         self.rooms = rooms;
         self.results_fingerprint = Some(stored.fingerprint);
+        // THE LABEL COMES BACK WITH THE NUMBERS. Without this a restored Express result had
+        // `results_mode = None` and so no warning -- an Express figure on screen with a clean bill
+        // of health, which is the one thing this feature must never produce.
+        self.results_mode = Some(if stored.express {
+            CalcMode::Express
+        } else {
+            CalcMode::Thorough
+        });
         // A NEW ANSWER NEEDS A NEW REFERENCE. The old one describes the scene the PREVIOUS result
         // belonged to; keeping it would answer "has it moved?" against the wrong thing.
         self.stale_ref_sig = None;
@@ -3722,6 +3730,7 @@ impl LightState {
             cell_size: self.cell_size,
             wall_zone: self.wall_zone,
             eye_height: self.eye_height,
+            express: self.mode == CalcMode::Express,
             // App-layer wall centerline linetypes are filled in by the caller
             // (write_simlux_sidecar) — `light` doesn't own that map.
             wall_centerline: BTreeMap::new(),
@@ -3799,6 +3808,8 @@ impl LightState {
         // The same `> 0.0` guard, and for the same reason: a sidecar written before these were
         // saved carries 0.0 for them, which is a real value for `wall_zone` and a nonsense one for
         // `eye_height` -- adopting either would silently change a reopened project.
+        // The MODE, restored before anything asks for a fingerprint -- it is an input to one.
+        self.mode = if cfg.express { CalcMode::Express } else { CalcMode::Thorough };
         if cfg.wall_zone > 0.0 {
             self.wall_zone = cfg.wall_zone;
         }
@@ -4228,14 +4239,44 @@ impl LightState {
             });
 
             ui.separator();
+            // THE MODE, BESIDE THE BUTTON IT CHANGES.
+            //
+            // Reported as: *"but there is no option for user to select between either."* The
+            // picker existed — in `render_light_panel`, a separate window that bails when closed,
+            // so in practice it did not exist. This toolbar holds the Calculate button, so this is
+            // where the choice belongs, and the button names the mode it is about to run rather
+            // than leaving that to a panel nobody had open.
+            ui.selectable_value(&mut self.mode, CalcMode::Express, "Express").on_hover_text(
+                "Furniture as the box it occupies — 12 triangles a piece instead of half a \
+                 million. Same rays, same bounces, same grid; only the furniture is simplified.\n\n\
+                 A box is MORE occluding than the thing it replaces, so this reads low under and \
+                 beside furniture. For trying a layout — never a compliance figure.",
+            );
+            ui.selectable_value(&mut self.mode, CalcMode::Thorough, "Thorough").on_hover_text(
+                "Every triangle of every piece, plus the room-surface report. Slower, and the \
+                 answer to put in front of a client.",
+            );
             if ui
-                .button("⚡ Calculate")
+                .button(format!("⚡ Calculate ({})", self.mode.label()))
                 .on_hover_text("Trace the room and compute the lux grid")
                 .clicked()
             {
                 action.calculate = true;
             }
         });
+
+        // WHAT IS ON SCREEN, not what the switch says. Flipping to Thorough does not make the
+        // Express numbers beneath it Thorough ones, and this is the line that says so. It lived
+        // only in the Light panel, which is the window this whole control was hiding in.
+        if self.results_mode == Some(CalcMode::Express) {
+            ui.label(
+                egui::RichText::new(
+                    "⚠  Express result — furniture simplified to boxes. Not an EN 12464-1 \n                     compliance figure.",
+                )
+                .small()
+                .color(egui::Color32::from_rgb(226, 160, 60)),
+            );
+        }
 
         // The state line, exactly as the Factory reports features/tris/selection: what is loaded,
         // and what the last answer was.
@@ -7656,6 +7697,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
             &s.last_timings,
             fingerprint,
             "test",
+            false, // Thorough -- these fixtures are not about the mode
         );
         crate::light_store::save(&drawing, &stored).expect("written");
 
@@ -7696,7 +7738,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let before = s.rooms[0].grid.values.clone();
         assert!(before.len() > 50, "the fixture is too small to prove anything");
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let rooms = stored.rooms().expect("rebuilt");
         let after = &rooms[0].grid.values;
         assert_eq!(after.len(), before.len());
@@ -7732,7 +7774,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
             "the fixture is not L-shaped — the mask is all one value",
         );
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let rooms = stored.rooms().expect("rebuilt");
         assert_eq!(rooms[0].mask, before, "the room mask did not survive");
     }
@@ -7752,6 +7794,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
             &[],
             s.results_fingerprint.expect("a fingerprint"),
             "test",
+            false, // Thorough -- these fixtures are not about the mode
         );
 
         // The same project, with a wall moved.
@@ -7775,6 +7818,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
             &[],
             s.results_fingerprint.expect("a fingerprint"),
             "test",
+            false, // Thorough -- these fixtures are not about the mode
         );
 
         // The cells gone, everything else intact — the shape a truncated write leaves.
@@ -7823,7 +7867,7 @@ mod a_calculation_is_kept_while_it_is_still_true {
         let cells: usize = s.rooms.iter().map(|r| r.grid.values.len()).sum();
         assert!(cells > 2_000, "only {cells} cells — too few to measure against");
 
-        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test");
+        let stored = crate::light_store::StoredResults::of(&s.rooms, &s.surfaces, &[], 7, "test", false);
         let bytes = serde_json::to_string(&stored).expect("serialises").len();
         // MEASURED AGAINST THE ACTUAL ALTERNATIVE, not against a constant chosen to pass. What the
         // packing is INSTEAD OF is these same cells written as JSON numbers, so that is what it is
@@ -8194,6 +8238,7 @@ mod the_engine_is_part_of_the_fingerprint {
             version: 1,
             fingerprint: stale,
             build: "33 (c2eaf1c)".into(),
+            express: false,
             rooms: Vec::new(),
             surfaces: Vec::new(),
             timings: Vec::new(),
@@ -9359,5 +9404,110 @@ mod the_wall_zone_follows_the_wall {
         // the interior 18 x 14. Stated as a number because "fewer" would pass for a zone that
         // removed nine tenths of the room.
         assert_eq!(kept(&half), 18 * 14, "the surviving region is the room inset by one cell");
+    }
+}
+
+/// EXPRESS AND THOROUGH, WHERE THE USER CAN REACH THEM AND ACROSS A SAVE.
+///
+/// "now earlier we wanted to do simplified and through calculations with furniture? what did you do
+/// with it" / "but there is no option for user to select between either."
+///
+/// The mode existed, worked, and was wired through the fingerprint. Its only control lived in
+/// `render_light_panel` — a separate window that returns immediately when closed — so in practice
+/// there was no way to choose. And nothing persisted it, which made the failure worse than a
+/// missing switch: the mode is an INPUT to the calculation fingerprint, so an Express result saved
+/// and reopened no longer matched and was silently refused.
+#[cfg(test)]
+mod the_mode_is_reachable_and_survives {
+    use super::*;
+
+    /// THE PICKER IS BESIDE THE BUTTON PEOPLE ACTUALLY PRESS. A grep, because the alternative is
+    /// standing up an egui context; needles are assembled at run time because `include_str!`
+    /// includes this module and a literal would match the assertion instead of the code.
+    #[test]
+    fn the_toolbar_offers_both_modes() {
+        let src = include_str!("light.rs");
+        let n = |p: &[&str]| -> String { p.concat() };
+        let anchor = n(&["⚡ Calculate (", "{})"]);
+        let a = src.find(&anchor).expect("the toolbar Calculate button is gone");
+        let head = &src[a.saturating_sub(1_800)..a];
+        for needle in [
+            n(&["selectable_value(&mut self.mode, CalcMode::", "Express"]),
+            n(&["selectable_value(&mut self.mode, CalcMode::", "Thorough"]),
+        ] {
+            assert!(
+                head.contains(&needle),
+                "the mode must be chosen where Calculate is pressed, not in another window",
+            );
+        }
+    }
+
+    /// THE MODE SURVIVES A REOPEN. It is an input to the fingerprint, so losing it does not just
+    /// reset a switch — it strands the result that was computed with it.
+    #[test]
+    fn the_mode_round_trips_through_the_sidecar() {
+        for m in [CalcMode::Express, CalcMode::Thorough] {
+            let mut s = LightState::new();
+            s.mode = m;
+            let cfg = s.to_config(&Document::default());
+            let mut back = LightState::new();
+            back.apply_config(cfg, &Document::default());
+            assert_eq!(back.mode, m, "{} did not survive the round trip", m.label());
+        }
+    }
+
+    /// AND SO DOES THE WARNING ON THE NUMBERS. This is the dangerous half: restoring an Express
+    /// result without its label puts a figure on screen that reads as a compliance figure and is
+    /// not one.
+    #[test]
+    fn a_restored_express_result_keeps_its_warning() {
+        // A REAL STORED RESULT. `restore_results` returns early on an empty room list, so a
+        // hand-built husk would pass this test without ever reaching the line under test.
+        let rect = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(8.0, 0.0),
+            glam::Vec2::new(8.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+            glam::Vec2::new(0.0, 0.0),
+        ];
+        let mut f = crate::factory::FactoryState::default();
+        f.add_building_outline(&rect, 3.0).expect("building");
+        f.add_room(&rect).expect("room");
+        f.recompute();
+        let mut src = LightState::new();
+        src.cell_size = 2.0;
+        src.calculate(&Document::default(), Some(&f));
+        assert!(!src.rooms.is_empty(), "the fixture must actually have rooms to restore");
+
+        for (express, want) in [(true, CalcMode::Express), (false, CalcMode::Thorough)] {
+            let stored = crate::light_store::StoredResults::of(
+                &src.rooms,
+                &src.surfaces,
+                &[],
+                4242,
+                "test",
+                express,
+            );
+            let mut s = LightState::new();
+            s.restore_results(&stored, 4242);
+            assert_eq!(
+                s.results_mode,
+                Some(want),
+                "a restored {} result must carry its own label, not the switch's",
+                want.label(),
+            );
+        }
+    }
+
+    /// A FILE WRITTEN BEFORE ANY OF THIS reads as Thorough — which is right, because nothing
+    /// persisted the mode then, so no such file can be carrying an Express project.
+    #[test]
+    fn an_older_project_reads_as_thorough() {
+        let mut s = LightState::new();
+        s.mode = CalcMode::Express;
+        let mut cfg = s.to_config(&Document::default());
+        cfg.express = false; // as an older sidecar deserialises
+        s.apply_config(cfg, &Document::default());
+        assert_eq!(s.mode, CalcMode::Thorough);
     }
 }

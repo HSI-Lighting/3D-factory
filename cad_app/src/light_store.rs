@@ -102,6 +102,19 @@ pub struct StoredResults {
     /// whether the result is valid, which is the fingerprint's job alone.
     pub build: String,
     pub rooms: Vec<StoredRoom>,
+    /// EXPRESS OR THOROUGH -- the mode this answer was computed in.
+    ///
+    /// Stored because the warning that an Express result is not a compliance figure is attached to
+    /// `results_mode`, and restoring the numbers without it would put an Express figure on screen
+    /// with a clean bill of health. The fingerprint already refuses a result computed in the other
+    /// mode, so this is not a validity check -- it is the LABEL, and the label has to come back
+    /// with the numbers it belongs to.
+    ///
+    /// Defaulted, so a file written before this loads as Thorough. That is the safe direction only
+    /// because such a file cannot be an Express result: nothing persisted the mode, so nothing
+    /// could restore one.
+    #[serde(default)]
+    pub express: bool,
     pub surfaces: Vec<SurfaceResult>,
     pub timings: Vec<(String, f64)>,
 }
@@ -209,11 +222,13 @@ impl StoredResults {
         timings: &[(&'static str, f64)],
         fingerprint: u64,
         build: &str,
+        express: bool,
     ) -> Self {
         StoredResults {
             version: VERSION,
             fingerprint,
             build: build.to_string(),
+            express,
             rooms: rooms
                 .iter()
                 .map(|r| StoredRoom {
