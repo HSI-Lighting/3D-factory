@@ -510,16 +510,138 @@ pub fn load(drawing: &Path) -> Result<Option<SimluxConfig>, String> {
     Ok(Some(cfg))
 }
 
+/// PUT `tmp` IN PLACE OF `dest`, retrying, and NEVER destroying `tmp` if it cannot.
+///
+/// A rename onto a file another process holds open fails on Windows, and on a synced folder that
+/// is routine rather than exceptional: Dropbox opens a 300 MB file to upload it exactly when the
+/// app is finishing writing the next version of it. Observed twice in ten minutes on the same
+/// project, and the lock clears within a moment — so the first fix is simply to wait and ask again.
+///
+/// THE SECOND FIX MATTERS MORE. Both copies of this logic used to `remove_file(&tmp)` when the
+/// rename failed, which deletes the only copy of the work that was just written — the previous
+/// file is intact, but everything since is gone. The user's session survived that purely because
+/// the same lock that blocked the rename also blocked the delete. A failed save must LEAVE the
+/// data on disk; a stranded temp file is recoverable and a deleted one is not.
+pub fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    // Roughly 1.5 s in total, front-loaded — long enough to outlast a sync tool's grab, short
+    // enough that a genuinely unwritable path still reports promptly.
+    const WAITS_MS: [u64; 6] = [20, 60, 120, 250, 500, 500];
+    let mut last = match std::fs::rename(tmp, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    for ms in WAITS_MS {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        match std::fs::rename(tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last) // …and `tmp` is still there, deliberately. See above.
+}
+
 /// Write the sidecar for `drawing`. Returns the path written. Written ATOMICALLY (temp + rename)
 /// so an interrupted write (crash / close during autosave) can't corrupt the previous sidecar.
+///
+/// When the rename cannot be completed the temp file is KEPT and named in the error, because it
+/// holds work that exists nowhere else — see [`replace_file`].
 pub fn save(drawing: &Path, cfg: &SimluxConfig) -> Result<PathBuf, String> {
     let p = sidecar_path(drawing);
     let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     let tmp = p.with_extension("json.savetmp");
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &p).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        e.to_string()
+    replace_file(&tmp, &p).map_err(|e| {
+        format!(
+            "could not replace '{}': {e}. The new data IS saved, in '{}' — rename that over the \
+             original to keep it. (A sync tool holding the file open is the usual cause.)",
+            p.display(),
+            tmp.display(),
+        )
     })?;
     Ok(p)
+}
+
+/// A FAILED SAVE MUST NOT DESTROY THE DATA IT JUST WROTE.
+///
+/// Reported as "i made a calculation and saved the file. when i closed and opened the nothing was
+/// saved", and the folder showed exactly why: a complete 304 MB `.savetmp` beside a sidecar from
+/// half an hour earlier. Dropbox held the destination open to upload it, the rename failed, and
+/// the save reported itself as a success with the failure tacked on the end of the line.
+///
+/// Both copies of the write then called `remove_file` on the temp. That deletes the only copy of
+/// the work — the previous file survives, everything since does not. It did not fire here only
+/// because the lock that blocked the rename blocked the delete as well.
+#[cfg(test)]
+mod a_failed_replace_keeps_the_data {
+    use super::replace_file;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("simlux-replace-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    /// THE ORDINARY CASE still works: the bytes land at the destination and the temp is gone.
+    #[test]
+    fn a_replace_that_works_moves_the_bytes_and_clears_the_temp() {
+        let d = scratch("ok");
+        let tmp = d.join("f.json.savetmp");
+        let dest = d.join("f.json");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::write(&tmp, b"new work").unwrap();
+
+        replace_file(&tmp, &dest).expect("an unlocked destination must be replaceable");
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new work", "the new bytes are in place");
+        assert!(!tmp.exists(), "and the temp is consumed");
+    }
+
+    /// THE FAILING CASE IS THE POINT. When the destination cannot be written, the work that was
+    /// just serialised must still be on disk — recoverable by hand, which is exactly how this
+    /// user's session was recovered. A `remove_file` here would have made it unrecoverable.
+    #[test]
+    fn a_replace_that_fails_leaves_the_new_data_on_disk() {
+        let d = scratch("fail");
+        let tmp = d.join("f.json.savetmp");
+        // A destination inside a directory that does not exist: the rename cannot succeed, no
+        // matter how often it is retried.
+        let dest = d.join("no-such-directory").join("f.json");
+        std::fs::write(&tmp, b"an afternoon of work").unwrap();
+
+        let err = replace_file(&tmp, &dest).expect_err("this replace cannot succeed");
+        let _ = err;
+
+        assert!(
+            tmp.exists(),
+            "the temp MUST survive a failed replace — it is the only copy of the new work",
+        );
+        assert_eq!(
+            std::fs::read(&tmp).unwrap(),
+            b"an afternoon of work",
+            "…and survive intact, not truncated",
+        );
+    }
+
+    /// AND THE PREVIOUS FILE IS UNHARMED, which is the promise the temp-and-rename shape exists to
+    /// make: a save that fails leaves you exactly where you were, plus a recoverable temp.
+    #[test]
+    fn a_failed_replace_does_not_touch_the_existing_file() {
+        let d = scratch("intact");
+        let tmp = d.join("f.json.savetmp");
+        let dest = d.join("locked").join("f.json");
+        std::fs::create_dir_all(d.join("locked")).unwrap();
+        std::fs::write(&dest, b"the previous good save").unwrap();
+        std::fs::write(&tmp, b"new").unwrap();
+        // Renaming a file ONTO A DIRECTORY fails on every platform, standing in for the lock.
+        let blocked = d.join("locked");
+        let _ = replace_file(&tmp, &blocked);
+
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"the previous good save",
+            "the earlier save is still there and still readable",
+        );
+        assert!(tmp.exists(), "and the new work is still recoverable");
+    }
 }

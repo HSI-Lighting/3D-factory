@@ -809,12 +809,12 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
 /// `std::fs::rename` replaces the destination on Windows and POSIX, so a reader never sees a
 /// half-written file and an interrupted write leaves the previous file untouched.
 fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+    // The rename is RETRIED, and the temp is KEPT if it still cannot be done — see
+    // `simlux_io::replace_file`. This used to `remove_file(&tmp)` on failure, throwing away the
+    // only copy of what had just been written.
     let tmp = format!("{path}.savetmp");
     std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => { let _ = std::fs::remove_file(&tmp); Err(e) }
-    }
+    crate::simlux_io::replace_file(std::path::Path::new(&tmp), std::path::Path::new(path))
 }
 
 fn save_file_worker(
@@ -886,7 +886,18 @@ fn save_file_worker(
             "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s){imports}",
             path, bytes.len(), solids, walls),
         Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX{imports}", path, bytes.len()),
-        Err(e) => format!("  saved '{}'  ({} bytes) · ! SIMLUX save: {}", path, bytes.len(), e),
+        // NOT "saved". The drawing was written and the SIMLUX half — the 3D model, the furniture,
+        // the fittings, the results — was NOT, and a line that opens with the word "saved" is read
+        // as success and closed on. Reported as: made a calculation, saved, reopened, "nothing was
+        // saved" — because the only thing saying otherwise was a clause at the end of a line that
+        // began by claiming the opposite.
+        Err(e) => format!(
+            "  ⚠ SIMLUX DID NOT SAVE — the drawing '{}' was written ({} bytes) but the 3D model, \
+             furniture, fittings and results were NOT.\n     {}",
+            path,
+            bytes.len(),
+            e,
+        ),
     };
     Ok(SavePayload { bytes: bytes.len(), note })
 }
