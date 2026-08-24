@@ -152,6 +152,16 @@ pub struct Input<'a> {
     pub unassigned: usize,
     pub ramp: fn(f32) -> (f32, f32, f32),
     pub mask: Vec<bool>,
+    /// THE WALLS, as a horizontal section through the building at the working plane — world-metre
+    /// segments from `FactoryState::section_at_z`.
+    ///
+    /// Asked for as: *"show a solid wall out line so the user know which is the wall."* Without it
+    /// the false-colour field is a coloured shape on white, and a dark corner inside the building
+    /// looks exactly like the ground outside it.
+    ///
+    /// Building-wide rather than per-room: it is one cut through one model, and every room's plot
+    /// is a window onto the same segments.
+    pub walls: Vec<[glam::Vec2; 2]>,
 }
 
 impl<'a> Input<'a> {
@@ -173,8 +183,18 @@ impl<'a> Input<'a> {
     /// whether the preview should redraw for it. The failure otherwise is quiet and maddening —
     /// a control that does nothing until you close the dialog and open it again.
     pub fn preview_key(&self, opt: &Options, calc: u64) -> u64 {
-        let Input { rooms, surfaces, maintenance, eye_height, room_height, materials, unassigned, ramp, mask } =
-            self;
+        let Input {
+            rooms,
+            surfaces,
+            maintenance,
+            eye_height,
+            room_height,
+            materials,
+            unassigned,
+            ramp,
+            mask,
+            walls,
+        } = self;
         let mut h = crate::light::Fnv::new();
         h.u64(calc);
         // Every control in the dialog lives in `Options`, so its serialisation covers all of them
@@ -192,6 +212,23 @@ impl<'a> Input<'a> {
         crate::light::hash_json(&mut h, "materials", materials);
         h.u64(*unassigned as u64);
         h.u64(mask.len() as u64);
+        // THE WALLS, BY COUNT AND BY EXTENT. Hashing every segment would be thousands of floats on
+        // a key that runs whenever the dialog repaints; the cut only changes when the model does,
+        // and a model edit moves the segment count or the ground it spans in every case that
+        // matters. The gap is an edit preserving both — one wall moved exactly as far as another
+        // moves back — and the consequence is a stale PREVIEW until the dialog is reopened, never a
+        // wrong number on the page.
+        h.u64(walls.len() as u64);
+        let mut ext = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for s in walls.iter().flatten() {
+            ext = (ext.0.min(s.x), ext.1.min(s.y), ext.2.max(s.x), ext.3.max(s.y));
+        }
+        if !walls.is_empty() {
+            h.f32(ext.0);
+            h.f32(ext.1);
+            h.f32(ext.2);
+            h.f32(ext.3);
+        }
         // A FUNCTION POINTER — which palette the false colours are read through. It is not in
         // `Options` (it belongs to the light panel) and it repaints every field in the report.
         h.u64(*ramp as *const () as usize as u64);
@@ -1406,6 +1443,42 @@ fn results_body(
         }
     }
 
+    // THE WALLS, OVER THE FIELD AND UNDER THE NUMBERS. Over, or the colours would bury the one
+    // thing that says where the building is; under, so a value never has a black line through it.
+    //
+    // Asked for as: *"show a solid wall out line so the user know which is the wall."* A section
+    // through the model at the working plane — see `FactoryState::section_at_z`.
+    //
+    // CLIPPED TO THE PLOT. The cut is of the whole building and each room's plot is a window onto
+    // part of it, so a segment belonging to the room next door would otherwise be drawn straddling
+    // this room's frame. Whole segments are kept or dropped rather than split: a wall that leaves
+    // the frame is one the reader can see leaves the frame.
+    if !inp.walls.is_empty() {
+        let (px0, py0) = (p.origin.x as f64, p.origin.y as f64);
+        let (pw, pd) = (p.width as f64, p.depth as f64);
+        let inside = |v: &glam::Vec2| {
+            let (u, w) = (v.x as f64 - px0, v.y as f64 - py0);
+            u >= -1e-6 && u <= pw + 1e-6 && w >= -1e-6 && w <= pd + 1e-6
+        };
+        for s in &inp.walls {
+            if !inside(&s[0]) || !inside(&s[1]) {
+                continue;
+            }
+            let (ax, ay) = to_page(&s[0]);
+            let (bx, by) = to_page(&s[1]);
+            c.push(Item::Line {
+                x1: ax,
+                y1: ay,
+                x2: bx,
+                y2: by,
+                // Near-black and solid: this is the drawing's structure, not an annotation, and it
+                // has to read over both ends of the false-colour ramp.
+                rgb: [25, 25, 25],
+                width: 0.9,
+            });
+        }
+    }
+
     // THE VALUES, where the grid is coarse enough to carry them. A smooth field shows the shape of
     // the light; the numbers make it checkable, and on a small room there is room for both.
     let cell_w = plot_w / gc as f64;
@@ -2189,6 +2262,9 @@ mod tests {
     pub(super) fn input<'a>(g: &'a LuxGrid, p: &'a CalcPlane) -> Input<'a> {
         Input {
             rooms: vec![one_room(g, p, "")],
+            // No model behind the fixture, so no section -- the drawing is the field alone, which
+            // is what every test here is about.
+            walls: Vec::new(),
             maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
             surfaces: &[],
             eye_height: 1.2,
@@ -4899,6 +4975,116 @@ mod the_point_values_keep_fitting_their_cells {
                 "a point value is {a:.2} pt at 100% and {b:.2} pt at 150% — it no longer fits its \
                  cell",
             );
+        }
+    }
+}
+
+/// "SHOW A SOLID WALL OUT LINE SO THE USER KNOW WHICH IS THE WALL."
+///
+/// The false-colour plan was a coloured shape floating on white, so a dark corner inside the
+/// building and the ground outside it looked the same. The walls are now a horizontal section
+/// through the model at the working plane — see `FactoryState::section_at_z`.
+#[cfg(test)]
+mod the_walls_are_drawn_on_the_plan {
+    use super::tests::*;
+    use super::*;
+
+    /// A rectangle of wall segments in metres, inside the fixture room's plane.
+    fn four_walls() -> Vec<[glam::Vec2; 2]> {
+        let v = |x: f32, y: f32| glam::Vec2::new(x, y);
+        vec![
+            [v(1.0, 1.0), v(4.0, 1.0)],
+            [v(4.0, 1.0), v(4.0, 3.0)],
+            [v(4.0, 3.0), v(1.0, 3.0)],
+            [v(1.0, 3.0), v(1.0, 1.0)],
+        ]
+    }
+
+    fn dark_lines(d: &Doc) -> Vec<(f64, f64, f64, f64)> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                // The wall ink, distinguished from the grid rules (150) and the hairlines (235).
+                Item::Line { x1, y1, x2, y2, rgb, .. } if rgb[0] < 60 => Some((*x1, *y1, *x2, *y2)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn doc_with_walls(walls: Vec<[glam::Vec2; 2]>) -> Doc {
+        let (g, p) = (grid(48, 36), plane());
+        let mut inp = input(&g, &p);
+        inp.walls = walls;
+        layout(&inp, &Options::default())
+    }
+
+    /// THE WALLS REACH THE PAGE. Without this the whole feature is a field on a struct.
+    #[test]
+    fn the_section_is_drawn() {
+        let with = dark_lines(&doc_with_walls(four_walls()));
+        let without = dark_lines(&doc_with_walls(Vec::new()));
+        assert!(
+            with.len() >= without.len() + 4,
+            "four wall segments must add four strokes: {} vs {}",
+            with.len(),
+            without.len(),
+        );
+    }
+
+    /// A PROJECT WITH NO MODEL DRAWS NO WALLS, and must not draw a frame's worth of stray ink
+    /// either — a 2D-only project has nothing to section and the report has to stay clean.
+    #[test]
+    fn no_model_means_no_wall_ink() {
+        let d = doc_with_walls(Vec::new());
+        assert!(dark_lines(&d).is_empty(), "nothing to cut, so nothing to draw");
+    }
+
+    /// SEGMENTS OUTSIDE THIS ROOM'S PLOT ARE DROPPED. The cut is of the WHOLE building and each
+    /// plot is a window onto part of it, so a wall belonging to the room next door would be drawn
+    /// straddling this room's frame — ink that looks like structure and is not.
+    #[test]
+    fn a_wall_from_the_next_room_is_not_drawn_over_this_one() {
+        let v = |x: f32, y: f32| glam::Vec2::new(x, y);
+        let far = vec![[v(900.0, 900.0), v(905.0, 900.0)]];
+        assert!(
+            dark_lines(&doc_with_walls(far)).is_empty(),
+            "a segment far outside the plane must not be drawn",
+        );
+        let mut mixed = four_walls();
+        mixed.push([v(900.0, 900.0), v(905.0, 900.0)]);
+        assert_eq!(
+            dark_lines(&doc_with_walls(mixed)).len(),
+            dark_lines(&doc_with_walls(four_walls())).len(),
+            "the far segment must be dropped and the near ones kept",
+        );
+    }
+
+    /// AND THEY LAND INSIDE THE PLOT FRAME. A mapping error would put them on the page but in the
+    /// wrong place, which is worse than absent: it reads as a building that is not there.
+    #[test]
+    fn the_walls_land_inside_the_plot() {
+        let d = doc_with_walls(four_walls());
+        let frames: Vec<(f64, f64, f64, f64)> = d
+            .pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Frame { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+                _ => None,
+            })
+            .collect();
+        assert!(!frames.is_empty(), "the plot frame anchors this test");
+        let lines = dark_lines(&d);
+        assert!(!lines.is_empty());
+        for (x1, y1, x2, y2) in lines {
+            let in_a_frame = frames.iter().any(|(fx, fy, fw, fh)| {
+                let ok = |x: f64, y: f64| {
+                    x >= fx - 0.5 && x <= fx + fw + 0.5 && y >= fy - 0.5 && y <= fy + fh + 0.5
+                };
+                ok(x1, y1) && ok(x2, y2)
+            });
+            assert!(in_a_frame, "a wall stroke landed outside every plot: {x1},{y1} {x2},{y2}");
         }
     }
 }

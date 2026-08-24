@@ -4578,6 +4578,58 @@ impl FactoryState {
         self.selection_aabb().map(|(mn, mx)| (mn + mx) * 0.5)
     }
 
+    /// A HORIZONTAL SECTION THROUGH THE BUILDING AT `z`, as world-metre segments — a floor plan.
+    ///
+    /// Asked for as: *"show a solid wall out line so the user know which is the wall."* The report's
+    /// false-colour field was a coloured shape floating on white with nothing to say where the walls
+    /// were, so a reader could not tell a dark corner from outside the building.
+    ///
+    /// A CUT, NOT A SILHOUETTE, and cut at the height the light is measured at. Every wall shows,
+    /// external and internal; columns show; and door and window openings read as GAPS, because the
+    /// plane passes through them — which is the whole reason a floor plan is drawn as a section.
+    ///
+    /// FURNITURE IS ABSENT FOR FREE: this reads `cached`, the CSG model, and furniture is a
+    /// separate list of mesh instances that never enters it. Nothing has to filter it out, so
+    /// nothing can forget to.
+    ///
+    /// One segment per triangle the plane crosses. They are not chained into loops — the report
+    /// draws strokes, and ordering thousands of segments into rings would be work with no visible
+    /// result.
+    pub fn section_at_z(&self, z: f32) -> Vec<[glam::Vec2; 2]> {
+        let p = &self.cached.positions;
+        let mut out = Vec::new();
+        for t in p.chunks_exact(3) {
+            // ABOVE-OR-ON vs BELOW, one consistent tie-break. A vertex exactly on the plane must
+            // fall on ONE side for every triangle that shares it, or a seam opens along any wall
+            // whose mesh happens to have a horizontal edge at this height.
+            let side = |v: &[f32; 3]| v[2] >= z;
+            let (a, b, c) = (&t[0], &t[1], &t[2]);
+            let (sa, sb, sc) = (side(a), side(b), side(c));
+            if sa == sb && sb == sc {
+                continue; // wholly one side of the plane
+            }
+            let cross = |u: &[f32; 3], v: &[f32; 3]| -> glam::Vec2 {
+                let d = v[2] - u[2];
+                // The edge straddles the plane, so `d` cannot be zero — both ends would have to be
+                // exactly on it, and then both are "above" and the edge never gets here.
+                let k = ((z - u[2]) / d).clamp(0.0, 1.0);
+                glam::Vec2::new(u[0] + (v[0] - u[0]) * k, u[1] + (v[1] - u[1]) * k)
+            };
+            let mut pts = [glam::Vec2::ZERO; 2];
+            let mut n = 0;
+            for (u, v, su, sv) in [(a, b, sa, sb), (b, c, sb, sc), (c, a, sc, sa)] {
+                if su != sv && n < 2 {
+                    pts[n] = cross(u, v);
+                    n += 1;
+                }
+            }
+            if n == 2 && pts[0].distance_squared(pts[1]) > 1e-12 {
+                out.push(pts);
+            }
+        }
+        out
+    }
+
     /// World AABB of the whole model (every feature). `None` when there are no features.
     /// Used by the room tool to size a void against the ACTUAL building, not a UI default.
     pub fn features_aabb(&self) -> Option<(Vec3, Vec3)> {
@@ -16762,5 +16814,129 @@ mod the_translucent_key {
         let before = f.furniture_translucent_key(0).expect("a key");
         f.furniture[0].color = [0.1, 0.9, 0.2];
         assert_ne!(f.furniture_translucent_key(0), Some(before));
+    }
+}
+
+/// "SHOW A SOLID WALL OUT LINE SO THE USER KNOW WHICH IS THE WALL."
+///
+/// The report's false-colour field was a coloured shape on white with nothing to say where the
+/// walls were — so a dark corner and the ground outside the building looked the same.
+///
+/// A CUT, not a silhouette, at the height the light is measured at: openings read as gaps because
+/// the plane passes through them, which is the whole reason a floor plan is a section.
+#[cfg(test)]
+mod the_section_is_a_floor_plan {
+    use super::*;
+
+    /// One axis-aligned box, as 12 triangles. Sectioning a box at a height inside it must give a
+    /// closed rectangle, and outside it must give nothing.
+    fn box_tris(mn: Vec3, mx: Vec3) -> Vec<[f32; 3]> {
+        let v = |i: usize| -> [f32; 3] {
+            [
+                if i & 1 == 0 { mn.x } else { mx.x },
+                if i & 2 == 0 { mn.y } else { mx.y },
+                if i & 4 == 0 { mn.z } else { mx.z },
+            ]
+        };
+        const FACES: [[usize; 3]; 12] = [
+            [0, 2, 3], [0, 3, 1], [4, 5, 7], [4, 7, 6],
+            [0, 1, 5], [0, 5, 4], [2, 6, 7], [2, 7, 3],
+            [0, 4, 6], [0, 6, 2], [1, 3, 7], [1, 7, 5],
+        ];
+        FACES.iter().flat_map(|f| f.iter().map(|&i| v(i))).collect()
+    }
+
+    fn a_model(tris: Vec<[f32; 3]>) -> FactoryState {
+        let mut f = FactoryState::default();
+        f.cached.positions = tris;
+        f
+    }
+
+    /// CUT THROUGH A BOX AND YOU GET ITS FOOTPRINT. Every segment must lie on the box's outline,
+    /// and the segments must span the full extent in both axes — a cut that returned three walls
+    /// of four would still look plausible on a drawing.
+    #[test]
+    fn a_cut_through_a_box_traces_its_footprint() {
+        let f = a_model(box_tris(Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 3.0, 2.5)));
+        let segs = f.section_at_z(0.8);
+        assert!(!segs.is_empty(), "a plane through the box must cut something");
+
+        let on_outline = |p: glam::Vec2| {
+            let ex = p.x.abs() < 1e-4 || (p.x - 4.0).abs() < 1e-4;
+            let ey = p.y.abs() < 1e-4 || (p.y - 3.0).abs() < 1e-4;
+            (ex && (-1e-4..=3.0001).contains(&p.y)) || (ey && (-1e-4..=4.0001).contains(&p.x))
+        };
+        for s in &segs {
+            for p in s {
+                assert!(on_outline(*p), "a cut point sits off the box outline: {p:?}");
+            }
+        }
+        let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
+        for s in &segs {
+            for p in s {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+        }
+        assert!((lo.x).abs() < 1e-4 && (lo.y).abs() < 1e-4, "the cut must reach the near corner");
+        assert!(
+            (hi.x - 4.0).abs() < 1e-4 && (hi.y - 3.0).abs() < 1e-4,
+            "and the far one — a cut missing a wall still draws convincingly",
+        );
+    }
+
+    /// ABOVE AND BELOW THE SOLID THERE IS NOTHING TO CUT. A section that returned the silhouette
+    /// regardless of height would be a projection wearing a section's name, and openings would
+    /// never appear.
+    #[test]
+    fn a_plane_that_misses_the_solid_cuts_nothing() {
+        let f = a_model(box_tris(Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 3.0, 2.5)));
+        assert!(f.section_at_z(3.0).is_empty(), "above the box");
+        assert!(f.section_at_z(-1.0).is_empty(), "below it");
+    }
+
+    /// AN OPENING IS A GAP. Two wall stubs with a doorway between them: cut through the doorway's
+    /// height and the gap must survive into the drawing, because that gap is how a reader tells a
+    /// door from a wall.
+    #[test]
+    fn a_doorway_reads_as_a_gap() {
+        let mut tris = box_tris(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.2, 2.5));
+        tris.extend(box_tris(Vec3::new(2.0, 0.0, 0.0), Vec3::new(3.0, 0.2, 2.5)));
+        let f = a_model(tris);
+        let segs = f.section_at_z(1.0);
+        assert!(!segs.is_empty());
+        for s in &segs {
+            for p in s {
+                assert!(
+                    p.x <= 1.0001 || p.x >= 1.9999,
+                    "the doorway between x=1 and x=2 must stay empty, found a cut at {p:?}",
+                );
+            }
+        }
+    }
+
+    /// FURNITURE NEVER APPEARS, and not because anything filters it. The section reads `cached`,
+    /// the CSG model; furniture is a separate list of mesh instances that never enters it — so
+    /// there is no filter to forget.
+    #[test]
+    fn furniture_is_not_in_the_section() {
+        let mut f = a_model(box_tris(Vec3::new(0.0, 0.0, 0.0), Vec3::new(4.0, 3.0, 2.5)));
+        let idx = f.add_furniture_asset(
+            "desk".into(),
+            crate::mesh_io::ObjMesh {
+                positions: box_tris(Vec3::new(1.0, 1.0, 0.0), Vec3::new(2.0, 2.0, 1.2)),
+                normals: vec![[0.0, 0.0, 1.0]; 36],
+                color: Some([0.6, 0.6, 0.6]),
+                alpha: Vec::new(),
+            },
+        );
+        f.place_furniture(idx, Vec3::new(1.0, 1.0, 0.0));
+        let segs = f.section_at_z(0.8); // right through where the desk stands
+        for s in &segs {
+            for p in s {
+                let inside_desk = p.x > 1.0001 && p.x < 1.9999 && p.y > 1.0001 && p.y < 1.9999;
+                assert!(!inside_desk, "the desk was cut into the wall drawing at {p:?}");
+            }
+        }
     }
 }

@@ -27499,6 +27499,10 @@ impl CadApp {
             .collect();
         Some(crate::report::layout::Input {
             rooms,
+            // CUT AT THE HEIGHT THE LIGHT IS MEASURED AT, so the walls on the drawing are the ones
+            // that shaped the field printed over them — and openings read as gaps, because the
+            // plane passes through them.
+            walls: self.factory.section_at_z(self.light.plane_height),
             surfaces: &self.light.surfaces,
             maintenance: self.light.maintenance,
             eye_height: self.light.eye_height,
