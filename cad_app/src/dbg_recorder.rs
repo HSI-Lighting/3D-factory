@@ -260,6 +260,36 @@ pub enum DbgEvent {
         tris:            usize,
     },
 
+    /// ONE LIGHTING OPERATION — placing and deleting fittings, and the whole life of a
+    /// calculation. The recorder's last blind spot, and it was a total one: there was no lighting
+    /// event of any kind. `FactoryOp` records what happens to the model, `FactoryPerf` what a frame
+    /// costs, `FactoryScene` what the scene IS — and between them nothing said a fitting had been
+    /// placed or a calculation asked for.
+    ///
+    /// It was reported as "why is the calculations not being made. i noticed the lights were also
+    /// not being placed", and a full session recording of it could not show either half. What it
+    /// showed was one click on empty space.
+    ///
+    /// WHAT THIS IS REALLY FOR IS THE REFUSALS. Both operations decline in several places, and most
+    /// of those declines are silent — `place_illuminaire_at` returns `false` with no message at all
+    /// when no fitting is armed and again when the armed fitting is not in the library, and from
+    /// outside the app that is indistinguishable from a click that missed. `message` carries the
+    /// status line the op left behind, so an EMPTY message on a refusal is itself the finding.
+    LightOp {
+        /// Short verb: "place", "place refused", "delete", "calculate", "calculate refused",
+        /// "calculated", "calculation failed".
+        op:              String,
+        /// The specifics — the point, the fitting, the room count, or the reason for a refusal.
+        detail:          String,
+        fittings_before: usize,
+        fittings_after:  usize,
+        /// The status line AFTER the op — the app's own account of what it just did. Empty when the
+        /// op set no message, which for a refusal is the whole point.
+        message:         String,
+        /// Wall-clock for the ops that take time (a calculation); 0 for the rest.
+        elapsed_us:      u64,
+    },
+
     /// 3D-Factory RENDER LOAD & FRAME COST — the "why did the app get slow after I imported
     /// furniture" tap. Furniture is a triangle-soup mesh INSTANCE (not a CSG feature), so it
     /// never appears in `FactoryOp`'s body/feature counts; a 90k-triangle couch can tank the
@@ -851,6 +881,35 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             } else { "" };
             format!(
                 "🧱 FACTORY [{op}] src={source}  feat {features_before}→{features_after}  bodies={bodies} tris={tris}{flag}\n         {detail}"
+            )
+        }
+        DbgEvent::LightOp { op, detail, fittings_before, fittings_after, message, elapsed_us } => {
+            // A REFUSAL THAT SAID NOTHING is the finding, not a missing field. Both placement and
+            // calculation decline in places that set no status line, and from outside the app that
+            // is a button doing nothing. Call it out here so nobody has to notice the absence.
+            let refused = op.contains("refused") || op.contains("failed");
+            let msg = if message.is_empty() {
+                if refused {
+                    "  ⚠ NO MESSAGE — the app told the user nothing".to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                format!("\n         says: {message:?}")
+            };
+            // A placement that changed no count is the shape of "I clicked and nothing happened".
+            let flag = if op == "place" && fittings_after == fittings_before {
+                "  ⚠ FITTING COUNT UNCHANGED"
+            } else {
+                ""
+            };
+            let took = if *elapsed_us > 0 {
+                format!("  ⏱ {:.1} s", *elapsed_us as f64 / 1_000_000.0)
+            } else {
+                String::new()
+            };
+            format!(
+                "💡 LIGHT [{op}] fittings {fittings_before}→{fittings_after}{took}{flag}\n         {detail}{msg}"
             )
         }
         DbgEvent::FactoryPerf {

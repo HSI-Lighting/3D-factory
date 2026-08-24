@@ -4516,6 +4516,18 @@ impl CadApp {
             self.index_dirty = true;
             self.touch_view();
         }
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+            op: "delete".into(),
+            detail: format!(
+                "{lights} fitting(s) and {} plan symbol(s) removed; {} id(s) asked for",
+                idx.len(),
+                ids.len(),
+            ),
+            fittings_before: before,
+            fittings_after: self.light.luminaires.len(),
+            message: self.light.last_msg.clone(),
+            elapsed_us: 0,
+        });
         (lights, idx.len())
     }
 
@@ -4888,16 +4900,54 @@ impl CadApp {
     /// 2D drawing, and a SIMLUX luminaire carrying the linked photometry. The block is what a CAD
     /// package sees; the luminaire is what the calculation sees.
     fn place_illuminaire_at(&mut self, x: f32, y: f32) -> bool {
-        let Some(fid) = self.light.place_fitting else { return false };
+        // EVERY WAY THIS DECLINES IS RECORDED, because two of them say nothing to the user and the
+        // third is easy to miss. "the lights were also not being placed" was reported against a
+        // session recording that could not show a single one of them.
+        let n = self.light.luminaires.len();
+        let Some(fid) = self.light.place_fitting else {
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                op: "place refused".into(),
+                detail: format!(
+                    "at ({x:.2}, {y:.2}) — NO FITTING ARMED (light.place_fitting is None), so the \
+                     click is discarded. Arming happens in the fitting library; if the user \
+                     believes a fitting is selected, that is where it was lost."
+                ),
+                fittings_before: n,
+                fittings_after: n,
+                message: String::new(), // deliberately: this path tells the user nothing
+                elapsed_us: 0,
+            });
+            return false;
+        };
         // A FACE SKETCH IS A DIFFERENT DOCUMENT, in metres, on a wall. The luminaire markers are
         // world metres and are not drawn there at all (`paint_luminaires_2d` bails), so inserting
         // into it would put a block on the wall's sketch plane and a light nowhere visible.
         if self.factory.session.is_some() {
             self.light.last_msg = "Close the face sketch before placing fittings.".into();
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                op: "place refused".into(),
+                detail: format!("at ({x:.2}, {y:.2}) — a face sketch is open"),
+                fittings_before: n,
+                fittings_after: n,
+                message: self.light.last_msg.clone(),
+                elapsed_us: 0,
+            });
             return false;
         }
         let Some(f) = self.light.library.get(fid).cloned() else {
             self.light.place_fitting = None;
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                op: "place refused".into(),
+                detail: format!(
+                    "at ({x:.2}, {y:.2}) — armed fitting id {fid} is NOT IN THE LIBRARY ({} \
+                     entries), so the arming was silently cleared",
+                    self.light.library.fittings.len(),
+                ),
+                fittings_before: n,
+                fittings_after: n,
+                message: String::new(), // deliberately: this path tells the user nothing either
+                elapsed_us: 0,
+            });
             return false;
         };
         // Metres → DRAWING units. A plan in millimetres wants 3000, not 3.
@@ -4946,6 +4996,18 @@ impl CadApp {
             f.name,
             if f.profile.is_empty() { " (no photometry linked)" } else { "" },
         );
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+            op: "place".into(),
+            detail: format!(
+                "\"{}\" id={id} at ({x:.2}, {y:.2})  profile={}  symbol_block={block}",
+                f.name,
+                if f.profile.is_empty() { "NONE — no photometry linked" } else { &f.profile },
+            ),
+            fittings_before: n,
+            fittings_after: self.light.luminaires.len(),
+            message: self.light.last_msg.clone(),
+            elapsed_us: 0,
+        });
         true
     }
 
@@ -27440,11 +27502,57 @@ impl CadApp {
     /// `prepare` is the cheap half and stays here, because it inserts the profiles the model's own
     /// lights need. Everything after it takes no borrow on the app at all.
     fn start_calculation(&mut self) {
+        // "why is the calculations not being made" — asked against a recording that could not show
+        // the button being pressed, let alone which of these two paths swallowed it.
+        let n = self.light.luminaires.len();
         if self.calc_rx.is_some() {
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                op: "calculate refused".into(),
+                detail: "one is ALREADY RUNNING — a second would fight the first for every core. \
+                         A progress bar should be up; if there is none, this is the one to chase."
+                    .into(),
+                fittings_before: n,
+                fittings_after: n,
+                message: self.light.last_msg.clone(),
+                elapsed_us: 0,
+            });
             return; // one at a time — a second would fight the first for every core
         }
         let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
-        let Some(job) = self.light.prepare(&plan, Some(&self.factory)) else { return };
+        let Some(job) = self.light.prepare(&plan, Some(&self.factory)) else {
+            // `prepare` writes the reason to the status line and this returns without doing
+            // anything, which from outside is a button that does nothing at all.
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                op: "calculate refused".into(),
+                detail: format!(
+                    "`prepare` built no job — nothing to calculate. rooms={} factory_rooms={} \
+                     model_tris={}",
+                    self.light.rooms.len(),
+                    self.factory.rooms.len(),
+                    self.factory.cached.positions.len() / 3,
+                ),
+                fittings_before: n,
+                fittings_after: n,
+                message: self.light.last_msg.clone(),
+                elapsed_us: 0,
+            });
+            return;
+        };
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+            op: "calculate".into(),
+            detail: format!(
+                "started — mode={} scene={} tris steps={} cell={:.3} m plane_h={:.3} m",
+                self.light.mode.label(),
+                job.scene_triangle_count(),
+                job.steps(),
+                self.light.cell_size,
+                self.light.plane_height,
+            ),
+            fittings_before: n,
+            fittings_after: n,
+            message: self.light.last_msg.clone(),
+            elapsed_us: 0,
+        });
         let selected = crate::light::LightState::selected_room(Some(&self.factory));
 
         let progress = std::sync::Arc::new(crate::light::CalcProgress::default());
@@ -27560,10 +27668,30 @@ impl CadApp {
             Ok(out) => {
                 let cancelled = out.cancelled;
                 let took = self.calc_started.map(|t| t.elapsed()).unwrap_or_default();
+                let n = self.light.luminaires.len();
                 self.light.apply_outcome(out, self.calc_selected);
                 self.calc_rx = None;
                 self.calc_progress = None;
                 self.calc_started = None;
+                // THE OUTCOME, whichever it was. `apply_outcome` can take a finished job and still
+                // produce nothing — it returns early on "Nothing to calculate." — so a calculation
+                // that ran to completion and left the screen unchanged is a real state, and it has
+                // to be distinguishable from one that was never started.
+                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                    op: if cancelled { "calculation stopped".into() } else { "calculated".into() },
+                    detail: format!(
+                        "rooms={} grid={} plane={} overlay={} stale={}",
+                        self.light.rooms.len(),
+                        self.light.grid.is_some(),
+                        self.light.plane.is_some(),
+                        self.light.show_overlay,
+                        self.light.results_stale,
+                    ),
+                    fittings_before: n,
+                    fittings_after: self.light.luminaires.len(),
+                    message: self.light.last_msg.clone(),
+                    elapsed_us: took.as_micros() as u64,
+                });
                 if !cancelled {
                     self.history.push(format!("  calculated in {:.1} s", took.as_secs_f64()));
                     // WRITTEN OUT AS SOON AS IT EXISTS, not on the next project save. What this
@@ -27583,6 +27711,17 @@ impl CadApp {
                 self.calc_started = None;
                 self.light.last_msg = "The calculation stopped unexpectedly.".into();
                 self.history.push("  ! calculation thread ended without a result".into());
+                crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::LightOp {
+                    op: "calculation failed".into(),
+                    detail: "the worker thread ended WITHOUT sending a result — a panic inside the \
+                             engine. Its message went to stderr, which a dump cannot see; run from \
+                             a console to catch it."
+                        .into(),
+                    fittings_before: self.light.luminaires.len(),
+                    fittings_after: self.light.luminaires.len(),
+                    message: self.light.last_msg.clone(),
+                    elapsed_us: 0,
+                });
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -66670,5 +66809,209 @@ mod what_the_two_d_overlay_costs {
         println!("  one shape per cell (before) : {old_ms:>8.2} ms per frame");
         println!("  one mesh per room  (after)  : {new_ms:>8.2} ms per frame");
         println!("  {:.0}x less", old_ms / new_ms.max(1e-6));
+    }
+}
+
+/// THE RECORDER HAD NO LIGHTING EVENTS AT ALL.
+///
+/// "why is the calculations not being made. i noticed the lights were also not being placed" — and
+/// a full 59-second recording of it showed one click on empty space. `FactoryOp` records what
+/// happens to the model, `FactoryPerf` what a frame costs, `FactoryScene` what the scene IS, and
+/// between them nothing said a fitting had been placed or a calculation asked for.
+///
+/// The point of these is the REFUSALS. Placement declines in three places and calculation in two,
+/// and three of those five say nothing whatever to the user — from outside the app, a button that
+/// does nothing. Each one has to leave a line in the dump saying which it was.
+#[cfg(test)]
+mod the_recorder_sees_the_lighting {
+    use super::*;
+    use crate::dbg_recorder::{format_event_oneline, DbgEvent};
+
+    fn recording() -> CadApp {
+        let mut app = CadApp::default();
+        app.dbg.recording = true;
+        app.dbg.session_started = Some(std::time::Instant::now());
+        app
+    }
+
+    fn light_ops(app: &CadApp) -> Vec<(String, String, String)> {
+        app.dbg
+            .events
+            .iter()
+            .filter_map(|r| match &r.event {
+                DbgEvent::LightOp { op, detail, message, .. } => {
+                    Some((op.clone(), detail.clone(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// CLICKING WITH NO FITTING ARMED IS THE SILENT ONE. `place_illuminaire_at` returns `false`
+    /// without touching the status line, so the user sees a click that did nothing and the app has
+    /// no account of it. This is the single most likely shape of "the lights were not being placed".
+    #[test]
+    fn a_placement_with_nothing_armed_is_recorded_as_refused() {
+        let mut app = recording();
+        assert!(app.light.place_fitting.is_none(), "the fixture must start unarmed");
+
+        let placed = app.place_illuminaire_at(1.0, 2.0);
+        assert!(!placed, "nothing is armed, so nothing is placed");
+
+        let ops = light_ops(&app);
+        assert_eq!(ops.len(), 1, "the refusal must leave exactly one line");
+        assert_eq!(ops[0].0, "place refused");
+        assert!(
+            ops[0].1.contains("NO FITTING ARMED"),
+            "the line must name the reason, not just that it happened: {}",
+            ops[0].1,
+        );
+        assert!(
+            ops[0].2.is_empty(),
+            "and record that the app said NOTHING — that absence is the finding",
+        );
+    }
+
+    /// A SILENT REFUSAL IS FLAGGED AS SILENT in the rendered dump, so nobody has to notice that a
+    /// field is empty. A refusal that DID explain itself must not carry the flag.
+    #[test]
+    fn a_refusal_that_said_nothing_is_called_out() {
+        let ev = |message: &str| {
+            format_event_oneline(&DbgEvent::LightOp {
+                op: "place refused".into(),
+                detail: "d".into(),
+                fittings_before: 4,
+                fittings_after: 4,
+                message: message.into(),
+                elapsed_us: 0,
+            })
+        };
+        assert!(
+            ev("").contains("NO MESSAGE"),
+            "a refusal with no status line must say so: {}",
+            ev(""),
+        );
+        assert!(!ev("Close the face sketch first.").contains("NO MESSAGE"));
+        assert!(
+            ev("Close the face sketch first.").contains("Close the face sketch first."),
+            "and must quote what the app actually said",
+        );
+        // A successful op with no message is not a finding, so it must stay quiet.
+        let ok = format_event_oneline(&DbgEvent::LightOp {
+            op: "place".into(),
+            detail: "d".into(),
+            fittings_before: 4,
+            fittings_after: 5,
+            message: String::new(),
+            elapsed_us: 0,
+        });
+        assert!(!ok.contains("NO MESSAGE"), "only refusals are held to that standard");
+    }
+
+    /// A PLACEMENT THAT CHANGED NO COUNT is the shape of "I clicked and nothing happened", and the
+    /// dump flags it the way `FactoryOp` flags a cut that added no feature.
+    #[test]
+    fn a_placement_that_added_nothing_is_flagged() {
+        let ev = |before: usize, after: usize| {
+            format_event_oneline(&DbgEvent::LightOp {
+                op: "place".into(),
+                detail: "d".into(),
+                fittings_before: before,
+                fittings_after: after,
+                message: "m".into(),
+                elapsed_us: 0,
+            })
+        };
+        assert!(ev(4, 4).contains("FITTING COUNT UNCHANGED"));
+        assert!(!ev(4, 5).contains("FITTING COUNT UNCHANGED"));
+    }
+
+    /// PRESSING CALCULATE WITH NOTHING TO CALCULATE must leave a line carrying the message the user
+    /// was shown. `prepare` writes "No geometry — draw a closed room…" and then `start_calculation`
+    /// returns, which from outside is indistinguishable from a dead button.
+    ///
+    /// The project is emptied by hand because `CadApp::default()` is NOT empty — it carries a
+    /// 490-triangle starter scene, and the first version of this test passed a calculation it
+    /// believed it had refused.
+    #[test]
+    fn a_calculation_with_no_geometry_is_recorded_with_its_reason() {
+        let mut app = recording();
+        app.factory = crate::factory::FactoryState::default();
+        app.doc = Document::default();
+
+        app.start_calculation();
+
+        let ops = light_ops(&app);
+        assert_eq!(ops.len(), 1, "the refusal must leave exactly one line, got {ops:?}");
+        assert_eq!(ops[0].0, "calculate refused");
+        assert!(
+            ops[0].1.contains("no job"),
+            "the line must say the job was never built: {}",
+            ops[0].1,
+        );
+        assert!(
+            ops[0].2.contains("No geometry"),
+            "and must carry the status line the user was actually shown, which is the whole \
+             point of the field: {}",
+            ops[0].2,
+        );
+    }
+
+    /// A SECOND PRESS WHILE ONE IS RUNNING is the other refusal, and it says nothing at all — so
+    /// the dump has to. Set up with a channel that never sends, which is exactly the state a job
+    /// in flight leaves behind.
+    #[test]
+    fn a_second_calculation_while_one_runs_is_recorded_as_refused() {
+        let mut app = recording();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.calc_rx = Some(rx);
+
+        app.start_calculation();
+
+        let ops = light_ops(&app);
+        assert_eq!(ops.len(), 1, "the refusal must leave exactly one line, got {ops:?}");
+        assert_eq!(ops[0].0, "calculate refused");
+        assert!(
+            ops[0].1.contains("ALREADY RUNNING"),
+            "the line must distinguish this refusal from the no-geometry one: {}",
+            ops[0].1,
+        );
+    }
+
+    /// AND A CALCULATION THAT DOES START says what it started with. Mode, triangle count and step
+    /// count are the three numbers that separate "Express on boxes" from "Thorough on seven million
+    /// triangles" — the difference between eight seconds and twenty-three.
+    #[test]
+    fn a_calculation_that_starts_records_what_it_started_with() {
+        let mut app = recording();
+        app.start_calculation(); // the default project HAS geometry — see the test above
+
+        let ops = light_ops(&app);
+        assert_eq!(ops.len(), 1, "starting must leave exactly one line, got {ops:?}");
+        assert_eq!(ops[0].0, "calculate");
+        for needle in ["mode=", "tris", "steps=", "cell=", "plane_h="] {
+            assert!(
+                ops[0].1.contains(needle),
+                "the start line must carry `{needle}`: {}",
+                ops[0].1,
+            );
+        }
+    }
+
+    /// A DURATION IS SHOWN ONLY WHERE THERE IS ONE. Every placement would otherwise read "⏱ 0.0 s".
+    #[test]
+    fn only_the_timed_ops_report_a_time() {
+        let ev = |us: u64| {
+            format_event_oneline(&DbgEvent::LightOp {
+                op: "calculated".into(),
+                detail: "d".into(),
+                fittings_before: 1,
+                fittings_after: 1,
+                message: String::new(),
+                elapsed_us: us,
+            })
+        };
+        assert!(ev(8_600_000).contains("8.6 s"));
+        assert!(!ev(0).contains("⏱"), "an untimed op must not claim to have taken no time");
     }
 }
