@@ -68068,6 +68068,18 @@ mod the_real_projects_lux {
             app.light.plane_height,
         );
         println!("\n{:<10} {:>8} {:>8} {:>8} {:>7}  {}", "mode", "Ē", "Emin", "Emax", "U0", "grid");
+        // THE WALL ZONE IS SWEPT, because it is the leading suspect for the average sitting ~20%
+        // above DIALux: ours offsets from EVERY wall including internal partitions, DIALux offsets
+        // from the room boundary, and excluding dark near-wall floor raises an average. A sweep
+        // settles that in numbers instead of argument — if Ē falls toward 240 as the zone shrinks,
+        // the evaluated AREA is the difference, not the engine.
+        let zones: Vec<f32> = std::env::var("SIMLUX_ZONES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![app.light.wall_zone]);
+        for zone in zones {
+        app.light.wall_zone = zone;
+        println!("--- wall zone {zone:.2} m ---");
         for mode in [crate::light::CalcMode::Express, crate::light::CalcMode::Thorough] {
             app.light.mode = mode;
             let plan = app.doc.clone();
@@ -68158,6 +68170,7 @@ mod the_real_projects_lux {
                 kept,
                 m.len(),
             );
+        }
         }
         println!("\nDIALux, same plan, EN grid:      240.0     6.85    853.0   0.029");
     }
