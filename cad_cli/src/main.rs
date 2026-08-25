@@ -91,7 +91,7 @@ fn main() {
             | Ok(Command::Dim) | Ok(Command::DimStyle(_)) | Ok(Command::WallStyle(_))
             | Ok(Command::BlockDef(_)) | Ok(Command::Insert(_)) | Ok(Command::Explode)
             | Ok(Command::Card(_)) | Ok(Command::Units(..)) | Ok(Command::Diag) | Ok(Command::Dedupe)
-            | Ok(Command::RepairCuts) | Ok(Command::Scene)
+            | Ok(Command::RepairCuts) | Ok(Command::Scene) | Ok(Command::StrayLights(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)

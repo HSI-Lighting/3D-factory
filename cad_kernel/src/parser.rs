@@ -499,10 +499,16 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "diag" | "diagnose" => Ok(Command::Diag),
         "dedupe" | "dedup" => Ok(Command::Dedupe),
         "repaircuts" | "repaircut" | "fixcuts" => Ok(Command::RepairCuts),
+        // ONE WORD FOR EACH, because the command line cannot take a space: reported as "straylights
+        // pruge command cant be typed because space cant be entered". A command whose only
+        // destructive form needs an argument the prompt will not accept is a command that does not
+        // exist. `straylights purge` still parses where a space CAN be typed -- a script, a macro,
+        // a future prompt -- so nothing that worked stops working.
         "straylights" | "strays" | "orphanlights" => {
             let purge = toks.iter().skip(1).any(|t| t.eq_ignore_ascii_case("purge"));
             Ok(Command::StrayLights(purge))
         }
+        "straypurge" | "purgestrays" | "purgelights" => Ok(Command::StrayLights(true)),
         "scene" | "scenedump" | "3dstate" => Ok(Command::Scene),
         "units" | "unit" | "insunits" => {
             // `units` → report. `units mm|cm|m|in|ft` → set. A bare number is accepted as
@@ -806,4 +812,43 @@ fn parse_arc_cl(args: &[&str]) -> Result<Command, String> {
     let arc = construct::arc_chord_length(s, e, length, flip)
         .ok_or_else(|| "chord longer than arc length, or degenerate".to_string())?;
     Ok(Command::Add(Geom::Arc(arc)))
+}
+
+/// "STRAYLIGHTS PRUGE COMMAND CANT BE TYPED BECAUSE SPACE CANT BE ENTERED."
+///
+/// A command whose only destructive form needs an argument the prompt will not accept is a command
+/// that does not exist. Every action reachable from the command line has to be reachable in ONE
+/// token; the spaced form stays parseable for anywhere a space can be typed.
+#[cfg(test)]
+mod every_action_is_one_word {
+    use super::*;
+
+    #[test]
+    fn the_purge_is_reachable_without_a_space() {
+        for w in ["straypurge", "purgestrays", "purgelights"] {
+            assert!(
+                matches!(parse(w), Ok(Command::StrayLights(true))),
+                "`{w}` must purge — the prompt cannot take `straylights purge`",
+            );
+        }
+    }
+
+    /// AND THE REPORT FORM IS STILL ONE WORD TOO, and still does not delete. Somebody looking must
+    /// not lose fittings by looking.
+    #[test]
+    fn the_report_form_is_one_word_and_harmless() {
+        for w in ["straylights", "strays", "orphanlights"] {
+            assert!(
+                matches!(parse(w), Ok(Command::StrayLights(false))),
+                "`{w}` must REPORT, not purge",
+            );
+        }
+    }
+
+    /// THE SPACED FORM STILL PARSES, so nothing that worked stops working where a space can be
+    /// typed — a script, a macro, a prompt that grows the ability later.
+    #[test]
+    fn the_spaced_form_still_works() {
+        assert!(matches!(parse("straylights purge"), Ok(Command::StrayLights(true))));
+    }
 }
