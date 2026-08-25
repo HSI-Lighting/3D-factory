@@ -68029,3 +68029,136 @@ mod the_dwg_converter_explains_itself {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// THE LUX FIGURES ON THE REAL PROJECT, both modes, measured rather than argued.
+///
+///     SIMLUX_DIAG="D:\...\for3dfactorygym.dxf" \
+///       cargo test -p cad_app --release lux_of_real_project -- --ignored --nocapture
+///
+/// Exists because "I changed the burial rule" is a claim, and the only thing that settles it is
+/// the number it produces on the building the complaint came from. Reference figures from DIALux
+/// on the same plan, EN grid: Ē 240 lx, Emin 6.85 lx, Emax 853 lx, U₀ 0.029.
+#[cfg(test)]
+mod the_real_projects_lux {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn lux_of_real_project() {
+        let Ok(path) = std::env::var("SIMLUX_DIAG") else {
+            println!("set SIMLUX_DIAG to the drawing path");
+            return;
+        };
+        let p = std::path::Path::new(&path);
+        let cfg = crate::simlux_io::load(p).expect("sidecar read").expect("sidecar exists");
+        let mut app = CadApp::default();
+        let text = std::fs::read_to_string(p).expect("drawing");
+        app.doc = cad_io::dxf::read_dxf(&text).expect("parse");
+        let furniture =
+            crate::factory::FactoryState::decode_furniture_lib(cfg.factory.furniture_lib.clone());
+        app.install_simlux_config(cfg, furniture);
+        app.factory.recompute();
+
+        println!(
+            "fittings {}  furniture {}  wall_zone {:.2} m  cell {:.2} m  plane {:.2} m",
+            app.light.luminaires.len(),
+            app.factory.furniture.len(),
+            app.light.wall_zone,
+            app.light.cell_size,
+            app.light.plane_height,
+        );
+        println!("\n{:<10} {:>8} {:>8} {:>8} {:>7}  {}", "mode", "Ē", "Emin", "Emax", "U0", "grid");
+        for mode in [crate::light::CalcMode::Express, crate::light::CalcMode::Thorough] {
+            app.light.mode = mode;
+            let plan = app.doc.clone();
+            let t = std::time::Instant::now();
+            app.light.calculate(&plan, Some(&app.factory));
+            // THE EN GRID, because that is the one the report quotes and the one DIALux's figures
+            // came off. Reading the working grid here would compare two different questions.
+            // BOTH GRIDS. The EN one is what the report quotes and what DIALux's figures came off,
+            // but only ~35 of its 119 cells survive the mask on this plan -- a sample that small
+            // moves several percent on a single cell. The working grid is 132 x 52 and says
+            // whether a difference is real or an artefact of the coarse one.
+            let grids: Vec<(&cad_light::LuxGrid, &str)> = [
+                app.light.grid_en.as_ref().map(|g| (g, "EN 12464-1")),
+                app.light.grid.as_ref().map(|g| (g, "working")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if grids.is_empty() {
+                println!("{:<10}  no result", mode.label());
+                continue;
+            }
+            for (g, note) in &grids {
+                println!(
+                    "{:<10} {:>8.1} {:>8.2} {:>8.1} {:>7.3}  {} {}x{}",
+                    mode.label(),
+                    g.avg,
+                    g.min,
+                    g.max,
+                    if g.avg > 0.0 { g.min / g.avg } else { 0.0 },
+                    note,
+                    g.cols,
+                    g.rows,
+                );
+            }
+            let (g, note) = grids[0];
+            let _ = note;
+            println!("           took {:.1} s", t.elapsed().as_secs_f64());
+
+            // WHERE THE DARKEST POINT IS, and what is near it. The number alone cannot say whether
+            // a zero is a cell buried in furniture, a sealed room nobody lit, or a hole in the
+            // calculation — and those want three different fixes.
+            let (Some(g2), Some(pl)) = (app.light.grid_en.as_ref(), app.light.plane_en.as_ref())
+            else {
+                continue;
+            };
+            let (gc, gr) = (g2.cols as usize, g2.rows as usize);
+            let (dx, dy) = (pl.width as f64 / gc as f64, pl.depth as f64 / gr as f64);
+            let mut worst = (f64::MAX, 0usize, 0usize);
+            for j in 0..gr {
+                for i in 0..gc {
+                    let v = g2.values[j * gc + i];
+                    if v < worst.0 {
+                        worst = (v, i, j);
+                    }
+                }
+            }
+            let wx = pl.origin.x as f64 + (worst.1 as f64 + 0.5) * dx;
+            let wy = pl.origin.y as f64 + (worst.2 as f64 + 0.5) * dy;
+            let near = app
+                .light
+                .luminaires
+                .iter()
+                .map(|l| {
+                    ((l.position.x as f64 - wx).powi(2) + (l.position.y as f64 - wy).powi(2)).sqrt()
+                })
+                .fold(f64::MAX, f64::min);
+            let obs = crate::light::obstacles_in_mode(&app.factory, &[], mode);
+            let buried = obs
+                .iter()
+                .any(|o| o.contains(glam::Vec3::new(wx as f32, wy as f32, pl.origin.z)));
+            // AND WHETHER IT IS MASKED OUT. Both modes contain this cell and only one counts it,
+            // so the mask is where the difference lives — not the light.
+            let m = app.light.rooms.first().map(|r| r.mask_en.clone()).unwrap_or_default();
+            let k = worst.2 * gc + worst.1;
+            let masked_out = m.get(k).map(|inside| !*inside);
+            let kept = m.iter().filter(|b| **b).count();
+            println!(
+                "           darkest {:.2} lx at ({:.2}, {:.2}) — {:.2} m from a fitting, \
+                 buried={} obstacles={} masked_out={:?} kept={}/{}",
+                worst.0,
+                wx,
+                wy,
+                near,
+                buried,
+                obs.len(),
+                masked_out,
+                kept,
+                m.len(),
+            );
+        }
+        println!("\nDIALux, same plan, EN grid:      240.0     6.85    853.0   0.029");
+    }
+}

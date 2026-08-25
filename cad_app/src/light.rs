@@ -464,34 +464,33 @@ pub fn obstacles_in_mode(
 
     // ---- furniture, in world coordinates -------------------------------------------------------
     //
-    // EXPRESS IS THE MORE TRUSTWORTHY ONE HERE, which is the opposite of how a fast mode usually
-    // reads. `Obstacle::contains` is ray parity against the body's own triangles and its own doc
-    // says an unclosed mesh "counts evenly and encloses nothing" — an imported gym machine is not
-    // watertight, so on the full mesh this test returns whatever the non-manifold surface happens
-    // to produce. A box is closed by construction, and it costs 12 triangles per cell instead of
-    // half a million.
-    for (i, inst) in f.furniture.iter().enumerate() {
-        if mode == CalcMode::Express {
-            if let Some(tris) = furniture_box_tris(f, i) {
-                push(tris);
-            }
-            continue;
+    // THE BOX IN BOTH MODES, and the mode no longer reaches this list at all.
+    //
+    // `Obstacle` decides ONE thing: whether a working-plane cell is buried in something and so is
+    // not a place anybody takes a reading. It has nothing to do with how light is blocked — that is
+    // the Evaluator's BVH over `scene_meshes`, which still gets every triangle under Thorough. So
+    // this changes which cells are MEASURED, never what they measure.
+    //
+    // MEASURED ON THE REFERENCE PLAN, on the EN grid the report quotes:
+    //
+    //     Express   Ē 289.7   Emin 4.35   U₀ 0.015    35 of 119 cells kept
+    //     Thorough  Ē 265.0   Emin 0.00   U₀ 0.000    39 of 119 cells kept
+    //     DIALux    Ē 240.0   Emin 6.85   U₀ 0.029
+    //
+    // The two modes disagreed by four cells, and one of those four read 0.00 lx — 3.13 m from a
+    // fitting, in a corner, receiving nothing from any of 31 luminaires because it sits inside the
+    // frame of a machine. Outside the mesh's surface, so the real geometry did not bury it; inside
+    // the thing, so no light arrives. It took the minimum and the uniformity with it, and on a
+    // 17 × 7 grid where only ~35 cells survive, one such cell is the whole figure.
+    //
+    // A BOX IS THE CONSERVATIVE SHAPE and that is the point. It can exclude a cell beside a chair
+    // leg that a perfect test would keep, which raises the average a little. Keeping a cell sealed
+    // inside a machine takes U₀ to zero. The second failure is worse, it is the one being seen, and
+    // it is the one a scheme gets judged on.
+    for (i, _inst) in f.furniture.iter().enumerate() {
+        if let Some(tris) = furniture_box_tris(f, i) {
+            push(tris);
         }
-        let Some(asset) = f.furniture_lib.get(inst.asset) else { continue };
-        let Some(mm) = f.furniture_model_matrix(i) else { continue };
-        let mm = glam::Mat4::from_cols_array(&mm);
-        let tris: Vec<[glam::Vec3; 3]> = asset
-            .positions
-            .chunks_exact(3)
-            .map(|c| {
-                [
-                    mm.transform_point3(glam::Vec3::from(c[0])),
-                    mm.transform_point3(glam::Vec3::from(c[1])),
-                    mm.transform_point3(glam::Vec3::from(c[2])),
-                ]
-            })
-            .collect();
-        push(tris);
     }
 
     // ---- and drop the shell -------------------------------------------------------------------
@@ -8617,15 +8616,22 @@ mod express_and_thorough {
         );
     }
 
-    /// THE BURIED-CELL TEST IS BOXED TOO — and this is where Express is the more trustworthy of the
-    /// two, which is the opposite of how a fast mode usually reads.
+    /// THE BURIED-CELL TEST IS BOXED IN BOTH MODES, and the mode does not reach it.
     ///
-    /// `Obstacle::contains` is a ray-parity test against the body's OWN triangles, and its doc says
-    /// an unclosed mesh "counts evenly and encloses nothing". An imported machine is not watertight,
-    /// so on the full mesh the answer is whatever the non-manifold surface happens to produce. A box
-    /// is closed by construction — and costs 12 triangles per cell instead of the whole mesh.
+    /// This asserted the opposite — that Thorough walks all 200 triangles of the frame and finds a
+    /// point inside it measurable — and its own doc explained why that was wrong: `contains` is ray
+    /// parity, an unclosed mesh "counts evenly and encloses nothing", and an imported machine is not
+    /// watertight. It pinned a behaviour it argued against.
+    ///
+    /// It cost the reference plan its uniformity. On the EN grid the two modes disagreed by four
+    /// cells and one of those read 0.00 lx — sealed inside a machine frame, outside its surface, so
+    /// the mesh test kept it — taking Emin to 0 and U₀ to 0.000 against DIALux's 6.85 and 0.029.
+    ///
+    /// `Obstacle` decides only whether a cell is a place somebody can take a reading. Light
+    /// blocking is the Evaluator's BVH over `scene_meshes`, which still differs by mode — that is
+    /// what the test below this one holds.
     #[test]
-    fn express_boxes_the_obstacles_as_well_as_the_light_scene() {
+    fn the_buried_cell_test_is_boxed_in_both_modes() {
         let f = a_furnished_room();
         let room = vec![
             glam::Vec2::new(0.0, 0.0),
@@ -8634,16 +8640,24 @@ mod express_and_thorough {
             glam::Vec2::new(0.0, 6.0),
         ];
         let biggest = |obs: Vec<Obstacle>| obs.iter().map(|o| o.tri_count()).max().unwrap_or(0);
-        let thorough = biggest(obstacles_in_mode(&f, &room, CalcMode::Thorough));
-        let express = biggest(obstacles_in_mode(&f, &room, CalcMode::Express));
-        assert_eq!(thorough, 200, "Thorough walks every triangle of the cage");
-        assert_eq!(express, 12, "Express walks a box");
-        // The one the working plane runs through: a cell in the middle of the cage is INSIDE the
-        // box and, on the open frame, is not inside anything at all.
+        for m in [CalcMode::Express, CalcMode::Thorough] {
+            assert_eq!(
+                biggest(obstacles_in_mode(&f, &room, m)),
+                12,
+                "{} must bury against a BOX — 12 triangles, closed by construction",
+                m.label(),
+            );
+        }
+        // The one the working plane runs through: a cell in the middle of the cage is inside the
+        // box, and must read as buried whichever mode asked.
         let mid = glam::Vec3::new(4.0, 3.0, 0.45);
-        let inside = |m: CalcMode| obstacles_in_mode(&f, &room, m).iter().any(|o| o.contains(mid));
-        assert!(inside(CalcMode::Express), "a point inside the box reads as buried");
-        assert!(!inside(CalcMode::Thorough), "…and the open frame encloses nothing, as its doc says");
+        for m in [CalcMode::Express, CalcMode::Thorough] {
+            assert!(
+                obstacles_in_mode(&f, &room, m).iter().any(|o| o.contains(mid)),
+                "{}: a cell sealed inside the frame is not a measurement point",
+                m.label(),
+            );
+        }
     }
 
     /// Only Thorough may be quoted as compliance. One place says so, so the report and the panel
@@ -8772,16 +8786,21 @@ mod express_where_furniture_matters {
         );
     }
 
-    /// A BOX BURIES CELLS AN OPEN FRAME DOES NOT, and that is the honest, useful difference: the
-    /// buried-cell test is exact on a box and meaningless on a mesh that is not watertight.
+    /// THE TWO MODES NOW BURY THE SAME CELLS, and differ only in what blocks the light.
+    ///
+    /// This asserted that Express buries MORE — true when Thorough tested against the raw mesh, and
+    /// the source of the reference plan's Emin 0.00 / U₀ 0.000: the four cells Thorough kept and
+    /// Express dropped included one sealed inside a machine frame. Burial is boxed in both modes
+    /// now, so the counts agree and the remaining difference is occlusion, which is the difference
+    /// the mode is FOR.
     #[test]
-    fn the_box_excludes_cells_the_frame_leaves_measurable() {
+    fn both_modes_bury_the_same_cells() {
         let (_, _, _, _, edrop, _) = run(crate::light::CalcMode::Express);
         let (_, _, _, _, tdrop, _) = run(crate::light::CalcMode::Thorough);
-        assert!(
-            edrop > tdrop,
-            "the box stands where the frame is air, so it must bury more cells: \
-             Express {edrop}, Thorough {tdrop}",
+        assert_eq!(
+            edrop, tdrop,
+            "burial is a question about where somebody can stand, not about how finely the light \
+             was traced — Express {edrop}, Thorough {tdrop}",
         );
     }
 }
