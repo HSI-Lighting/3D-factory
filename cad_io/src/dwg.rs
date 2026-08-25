@@ -61,6 +61,29 @@ pub fn read_dwg(path: &std::path::Path) -> Result<(Document, Tally), String> {
 pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
     let mut doc = Document::default();
 
+    // ---- MODEL SPACE ONLY ------------------------------------------------------------------
+    //
+    // Reported as a drawing that opened with the plan DUPLICATED and symbol definitions strewn
+    // around it. `CadDocument::entities()` yields EVERY entity in the file -- its own doc says it
+    // hides the BLOCK/ENDBLK markers, and that is all it hides, so the CONTENTS of every block
+    // DEFINITION come through as loose geometry at their definition coordinates.
+    //
+    // On the file this was found with, that is the difference between a drawing and a mess:
+    //
+    //     *Model_Space                 5 577 entities   <- the drawing
+    //     REFERENCE 2                 17 732
+    //     REFERENCE                    6 424            <- three copies of the plan
+    //     REFRENCE                     6 399
+    //     furniture 1, VEGA MINI, ...     ~90            <- symbol definitions, drawn at origin
+    //
+    // Every entity carries the handle of the block record that owns it, so the filter is exact
+    // rather than a guess at coordinates.
+    let model_space = src
+        .block_records
+        .iter()
+        .find(|b| b.name.eq_ignore_ascii_case("*Model_Space"))
+        .map(|b| b.handle);
+
     // ---- units, from the drawing's own header -----------------------------------------------
     //
     // TAKEN, NOT ASSUMED. A metre drawing read as millimetres puts every fitting at a thousandth
@@ -94,9 +117,59 @@ pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
         });
     }
 
+    // ---- block DEFINITIONS, so the references in model space have something to point at ------
+    //
+    // Without this the filter above would be a net loss: model space is 231 INSERTs on the file
+    // this was found with, and dropping them takes every furniture and fitting symbol with them.
+    // The definitions are built from the SAME entity list, grouped by the owner handle that
+    // identifies each block record -- the exact inverse of the model-space filter.
+    let mut block_of: std::collections::HashMap<String, u32> = Default::default();
+    for br in src.block_records.iter() {
+        let name = br.name.trim();
+        // Layouts are not blocks anybody references; skipping them keeps paper space out.
+        if name.is_empty() || name.starts_with('*') {
+            continue;
+        }
+        let mut members: Vec<DObject> = Vec::new();
+        for e in src.entities() {
+            if common_of(e).is_some_and(|c| c.owner_handle == br.handle) {
+                if let Some(d) = build(e, &doc, &block_of) {
+                    members.push(d);
+                }
+            }
+        }
+        if members.is_empty() {
+            continue; // nothing drawable in it -- a reference to it would draw nothing anyway
+        }
+        let id = doc.blocks.blocks.len() as u32;
+        doc.blocks.blocks.push(cad_kernel::block::Block {
+            name: name.to_string(),
+            base: Vec2::new(0.0, 0.0),
+            dobjects: members,
+            smart: false,
+            params: Vec::new(),
+            cut_edges: Vec::new(),
+        });
+        block_of.insert(name.to_ascii_uppercase(), id);
+    }
+
     let mut tally = Tally::default();
     for e in src.entities() {
-        match build(e, &doc) {
+        // A drawing with no `*Model_Space` record is not one this can filter, and an EMPTY
+        // document reported as a successful open is the worst outcome there is -- so the filter
+        // only applies when there is something to filter by.
+        if let Some(ms) = model_space {
+            match common_of(e) {
+                Some(c) if c.owner_handle == ms => {}
+                // Not model space, or an entity with no common data to judge by. Counted as
+                // skipped, because "36 262 entities" and "5 577 kept" are different facts.
+                _ => {
+                    tally.skipped += 1;
+                    continue;
+                }
+            }
+        }
+        match build(e, &doc, &block_of) {
             Some(d) => {
                 doc.push(d);
                 tally.kept += 1;
@@ -108,7 +181,11 @@ pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
 }
 
 /// One entity, or `None` where there is nothing faithful to make of it.
-fn build(e: &acadrust::EntityType, doc: &Document) -> Option<DObject> {
+fn build(
+    e: &acadrust::EntityType,
+    doc: &Document,
+    blocks: &std::collections::HashMap<String, u32>,
+) -> Option<DObject> {
     use acadrust::EntityType as E;
     let geom = match e {
         E::Line(l) => {
@@ -162,6 +239,27 @@ fn build(e: &acadrust::EntityType, doc: &Document) -> Option<DObject> {
             style: 0,
             size: 0.0,
         }),
+        // A BLOCK REFERENCE, resolved against the definitions built above. Dropped when the block
+        // is unknown or had nothing drawable in it -- a reference that would draw nothing is not
+        // worth an object, and inserting it as loose geometry would move it to the wrong place.
+        E::Insert(ins) => {
+            let id = *blocks.get(&ins.block_name.trim().to_ascii_uppercase())?;
+            let (sx, sy) = (ins.x_scale(), ins.y_scale());
+            // SIGNS FACTOR OUT INTO A MIRROR, exactly as the DXF reader does it: `BlockRef`
+            // carries positive magnitudes plus `mirror_x`, so circles and arcs inside a mirrored
+            // block stay circles and arcs instead of being scaled negative.
+            let mirror_x = (sx < 0.0) != (sy < 0.0);
+            let extra = if sy < 0.0 { std::f64::consts::PI } else { 0.0 };
+            Geom::BlockRef(cad_kernel::block::BlockRef {
+                block: id,
+                insert: Vec2::new(ins.insert_point.x, ins.insert_point.y),
+                scale: sx.abs().max(1e-9),
+                scale_y: sy.abs().max(1e-9),
+                rotation: ins.rotation + extra,
+                mirror_x,
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            })
+        }
         // EVERYTHING ELSE IS SKIPPED, DELIBERATELY, AND COUNTED. Text, dimensions, hatches, 3D
         // solids and block references each have an honest representation here and each needs its
         // own care — a block reference in particular resolves against a table this does not yet
@@ -197,6 +295,10 @@ fn common_of(e: &acadrust::EntityType) -> Option<&acadrust::entities::EntityComm
         E::LwPolyline(x) => &x.common,
         E::Polyline2D(x) => &x.common,
         E::Point(x) => &x.common,
+        // MUST BE HERE, or the model-space filter drops every block reference before `build` ever
+        // sees one -- the filter judges by `owner_handle` and an entity this cannot answer for is
+        // treated as not-model-space.
+        E::Insert(x) => &x.common,
         _ => return None,
     })
 }
@@ -293,6 +395,44 @@ mod the_real_drawings {
         }
     }
 
+    /// BLOCK DEFINITIONS ARE NOT DRAWN AS LOOSE GEOMETRY, and the references that point at them
+    /// are. This is the bug the reader shipped with: `entities()` yields every entity in the file
+    /// — its own doc says it hides the BLOCK/ENDBLK markers, and that is ALL it hides — so the
+    /// contents of every definition arrived as geometry at their definition coordinates. The plan
+    /// opened duplicated, with symbol definitions strewn around it.
+    ///
+    /// On this file that is 5 577 entities of drawing against 30 685 of definitions.
+    #[test]
+    #[ignore]
+    fn only_model_space_is_drawn() {
+        let p = std::path::Path::new(r"D:\Dropbox\YASEEN\3d factory\tests\for lux.dwg");
+        // A MISSING FIXTURE SKIPS LOUDLY. The first version of this carried a mangled path, so the
+        // file never existed, the test returned here, and it PASSED against a build with block
+        // references deliberately deleted -- a test reporting success for doing nothing, and
+        // indistinguishable from a real pass in the output. The mutation run is what caught it.
+        if !p.exists() {
+            eprintln!("SKIPPED -- {} is not on this machine", p.display());
+            return;
+        }
+        let (doc, t) = super::read_dwg(p).expect("opens");
+        eprintln!(
+            "kept {} skipped {}  {} block defs  {} refs",
+            t.kept,
+            t.skipped,
+            doc.blocks.blocks.len(),
+            doc.dobjects.iter().filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_))).count(),
+        );
+        assert_eq!(t.kept, 5_577, "model space is 5 577 entities on this file");
+        assert!(t.skipped > 25_000, "the definitions must be excluded, not drawn: {}", t.skipped);
+
+        // AND THE REFERENCES SURVIVED. Filtering to model space without resolving INSERTs would
+        // be a net loss -- it would take every furniture and fitting symbol with it.
+        let refs =
+            doc.dobjects.iter().filter(|d| matches!(d.geom, cad_kernel::Geom::BlockRef(_))).count();
+        assert_eq!(refs, 231, "every block reference in model space must resolve");
+        assert!(!doc.blocks.blocks.is_empty(), "…against definitions that were actually built");
+    }
+
     /// THE DRAWING IS BUILDING-SIZED IN ITS OWN DECLARED UNIT — which is the invariant that
     /// actually matters, and the one a reader with the axes or the scale wrong would fail while
     /// still "opening" and still reporting entities.
@@ -326,3 +466,4 @@ mod the_real_drawings {
         }
     }
 }
+
