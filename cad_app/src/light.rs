@@ -2869,8 +2869,35 @@ impl LightState {
                 // AND OUT OF THE BORDER. The wall zone is the third test, applied here rather than
                 // by shrinking the grid, because a border is a distance from the OUTLINE and only
                 // a rectangle's outline is its bounding box.
-                let clear_of_wall =
-                    !in_room || !CalcJob::in_wall_zone(x, y, zone, boundary);
+                //
+                // MEASURED FROM THE EDGE OF THE MEASURABLE REGION, NOT FROM EVERY WALL. With no
+                // room drawn the boundary used to be `section_at_z` — every wall in the building,
+                // internal partitions included — so a cell stood off both faces of every partition
+                // it passed. DIALux offsets from the room boundary, and on this plan the difference
+                // is most of the floor: 35 of 119 EN cells survived a 0.5 m zone, and the average
+                // came out ~20% high because what it dropped was the dark near-wall ground.
+                //
+                //     zone   Ē      DIALux 240.0     cells kept
+                //     0.00   250.2                   53 / 119
+                //     0.25   270.6                   46 / 119
+                //     0.50   290.1                   35 / 119
+                //
+                // A DRAWN ROOM IS UNCHANGED and still offsets from its own polygon, which is
+                // exactly what DIALux does per space. Only the case with no outline moves, and it
+                // moves onto the building's own edge: a ring of samples at `zone`, asking the same
+                // question the outline test asks. An internal partition has floor on both sides, so
+                // it raises no border; the building's edge has none beyond it, so it does.
+                let clear_of_wall = if !in_room || zone <= 0.0 {
+                    true
+                } else if poly.len() >= 3 {
+                    !CalcJob::in_wall_zone(x, y, zone, boundary)
+                } else if let Some(f) = floor {
+                    !Self::near_region_edge(x, y, zone, f)
+                } else {
+                    // No outline and no way to ask the geometry — the wall segments are all there
+                    // is left to measure from, which is where this started.
+                    !CalcJob::in_wall_zone(x, y, zone, boundary)
+                };
                 m.push(in_room && free && clear_of_wall);
             }
         }
@@ -2882,6 +2909,28 @@ impl LightState {
         }
         m
     }
+    /// Is `(x, y)` within `zone` of the edge of the measurable region?
+    ///
+    /// Sampled as a RING at exactly `zone`, asking the same question the outline test asks: is
+    /// there floor there. A direction that lands outside means the edge is within reach, so the
+    /// cell is in the border.
+    ///
+    /// SIXTEEN DIRECTIONS is the compromise, and it is a compromise. It cannot see a boundary that
+    /// enters and leaves between two samples -- a slot narrower than about a fifth of the zone --
+    /// and the alternative is offsetting a polygon this case does not have. What it does get right
+    /// is the case that was wrong: an internal partition has floor on both sides and raises no
+    /// border, while the building's outer edge has none beyond it and does.
+    fn near_region_edge(x: f32, y: f32, zone: f32, floor: &dyn Fn(f32, f32) -> bool) -> bool {
+        const N: usize = 16;
+        for k in 0..N {
+            let a = std::f32::consts::TAU * k as f32 / N as f32;
+            if !floor(x + zone * a.cos(), y + zone * a.sin()) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The outline test alone — the mask with nothing standing in the room.
     fn inside_mask(plane: &CalcPlane, poly: &[glam::Vec2]) -> Vec<bool> {
         // The OUTLINE alone: no obstacles, no floor test, no border. Callers wanting the border
@@ -9549,5 +9598,134 @@ mod the_mode_is_reachable_and_survives {
         cfg.express = false; // as an older sidecar deserialises
         s.apply_config(cfg, &Document::default());
         assert_eq!(s.mode, CalcMode::Thorough);
+    }
+}
+
+/// THE BORDER IS MEASURED FROM THE EDGE OF THE MEASURABLE REGION, NOT FROM EVERY WALL.
+///
+/// With no room drawn the boundary was `section_at_z` — every wall in the building, internal
+/// partitions included — so a cell stood off BOTH FACES of every partition it passed. DIALux
+/// offsets from the room boundary, and on the reference plan the difference was most of the floor:
+/// 35 of 119 EN cells survived a 0.5 m zone, and the average came out ~20% above DIALux because
+/// what it dropped was the dark near-wall ground.
+///
+///     zone   Ē before   Ē after   DIALux   cells before → after
+///     0.25     270.6     250.2     240.0        46 → 53
+///     0.50     290.1     264.3     240.0        35 → 48
+#[cfg(test)]
+mod the_border_follows_the_region {
+    use super::*;
+
+    fn plane_10x10() -> CalcPlane {
+        CalcPlane {
+            origin: Vertex::new(0.0, 0.0, 0.8),
+            width: 10.0,
+            depth: 10.0,
+            cols: 20,
+            rows: 20,
+        }
+    }
+
+    /// A BUILDING WITH A PARTITION DOWN THE MIDDLE. "Floor" everywhere inside the outer walls —
+    /// which is what the real test sees, because a partition stands ON the slab and a ray cast
+    /// down from beside it still finds something.
+    fn floor_of_a_partitioned_room(x: f32, y: f32) -> bool {
+        (0.0..=10.0).contains(&x) && (0.0..=10.0).contains(&y)
+    }
+
+    fn kept(zone: f32, floor: &dyn Fn(f32, f32) -> bool) -> usize {
+        LightState::measurable_mask(&plane_10x10(), &[], &[], Some(floor), zone, &[])
+            .iter()
+            .filter(|k| **k)
+            .count()
+    }
+
+    /// AN INTERNAL PARTITION RAISES NO BORDER. This is the whole change: the old test measured to
+    /// the nearest wall SEGMENT, so a partition down the middle carved a 1 m dead strip out of the
+    /// room. The region continues through it, so the border does not.
+    #[test]
+    fn a_partition_does_not_carve_a_strip_out_of_the_room() {
+        // WHAT `section_at_z` ACTUALLY YIELDS: the outer walls AND the partition, all as equal
+        // segments with nothing to tell them apart. The first version of this fixture listed only
+        // the partition, so the old path had no outer wall to stand off and "kept more" -- a
+        // comparison that flattered the thing being replaced.
+        let v = |x: f32, y: f32| glam::Vec2::new(x, y);
+        let partition = [
+            [v(0.0, 0.0), v(10.0, 0.0)],
+            [v(10.0, 0.0), v(10.0, 10.0)],
+            [v(10.0, 10.0), v(0.0, 10.0)],
+            [v(0.0, 10.0), v(0.0, 0.0)],
+            [v(5.0, 0.0), v(5.0, 10.0)], // the partition down the middle
+        ];
+        let by_segment = LightState::measurable_mask(
+            &plane_10x10(),
+            &[],
+            &[],
+            None, // no floor test → falls back to the wall segments, the old behaviour
+            0.5,
+            &partition,
+        );
+        let by_region = kept(0.5, &floor_of_a_partitioned_room);
+        let seg_kept = by_segment.iter().filter(|k| **k).count();
+        assert!(
+            by_region > seg_kept,
+            "measuring from the region must keep more than measuring from every wall: \
+             region {by_region}, segments {seg_kept}",
+        );
+        // And specifically: nothing is excluded ALONG the partition.
+        let m = LightState::measurable_mask(
+            &plane_10x10(),
+            &[],
+            &[],
+            Some(&floor_of_a_partitioned_room),
+            0.5,
+            &[],
+        );
+        // Cell centres at x = 5.25 and 4.75 sit half a metre from the partition and well inside
+        // the building; both must survive.
+        for col in [9usize, 10] {
+            let i = 10 * 20 + col; // row 10, mid-height
+            assert!(m[i], "a cell beside the partition must still be measured (col {col})");
+        }
+    }
+
+    /// THE OUTER EDGE STILL RAISES ONE. A border that never fires is not a border — the whole
+    /// reason EN 12464-1 has one is that illuminance collapses against a wall.
+    #[test]
+    fn the_buildings_own_edge_still_makes_a_border() {
+        let none = kept(0.0, &floor_of_a_partitioned_room);
+        let half = kept(0.5, &floor_of_a_partitioned_room);
+        assert_eq!(none, 400, "with no zone every cell of the 20 × 20 grid is measured");
+        assert!(half < none, "a 0.5 m zone must drop the ring against the outer wall: {half}");
+        // One 0.5 m ring off a 10 × 10 m room at 0.5 m cells is the outer ring: 400 − 18×18.
+        assert_eq!(half, 324, "…and exactly the outer ring, not more");
+    }
+
+    /// A DRAWN ROOM IS UNTOUCHED. It offsets from its own polygon, which is what DIALux does per
+    /// space — this change was only ever about the case with no outline to offset from.
+    #[test]
+    fn a_drawn_room_still_offsets_from_its_polygon() {
+        let poly = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 10.0),
+            glam::Vec2::new(0.0, 10.0),
+        ];
+        let edges = CalcJob::poly_edges(&poly);
+        // The floor closure says "everything is floor", so if the polygon path were being skipped
+        // the zone would find no edge and keep all 400.
+        let m = LightState::measurable_mask(
+            &plane_10x10(),
+            &poly,
+            &[],
+            Some(&|_, _| true),
+            0.5,
+            &edges,
+        );
+        assert_eq!(
+            m.iter().filter(|k| **k).count(),
+            324,
+            "a drawn room must still lose its outer ring to the polygon offset",
+        );
     }
 }
