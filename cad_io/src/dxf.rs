@@ -88,6 +88,14 @@ fn parse_pairs(text: &str) -> Result<Vec<(i32, &str)>, String> {
 /// metres. The exotic codes (angstroms, parsecs, survey feet…) are deliberately left out: a
 /// drawing that really is in parsecs is not a drawing this app can help with, and guessing
 /// would be worse than leaving it `Assumed`.
+/// Exposed to the DWG reader's test, which keeps its own copy of this table and needs something
+/// to hold the two together -- a drawing that means one thing as DXF and another as DWG is the
+/// same class of bug as reading metres as millimetres.
+#[cfg(test)]
+pub(crate) fn insunits_to_metres_for_test(code: i32) -> Option<f64> {
+    insunits_to_metres(code)
+}
+
 fn insunits_to_metres(code: i32) -> Option<f64> {
     Some(match code {
         1  => 0.0254,      // inches

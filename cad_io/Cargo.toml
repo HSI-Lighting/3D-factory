@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 cad_kernel = { path = "../cad_kernel" }
+# DWG, read natively. MPL-2.0 — file-level copyleft, so it links into a proprietary binary and only
+# its own files carry the obligation. LibreDWG, the obvious alternative, is GPL-3.0 and would take
+# the whole application with it. Verified against the owner's AC1027 and AC1032 drawings, including
+# a 93 MB one, before it was adopted — see `src/dwg.rs`.
+acadrust = "0.4.1"

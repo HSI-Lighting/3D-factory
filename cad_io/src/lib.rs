@@ -14,6 +14,7 @@
 //! filesystem, threading, or UI — pass in / receive a `&[u8]` (RSM) or a
 //! `&str` (DXF) and let the caller handle I/O.
 
+pub mod dwg;
 pub mod dxf;
 pub mod pat;
 pub mod rsm;

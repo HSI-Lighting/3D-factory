@@ -710,6 +710,10 @@ struct LoadPayload {
     parse_ms: u64,
     sidecar_ms: u64,
     furn_ms: u64,
+    /// How the DWG was read -- natively or via the converter -- and what it dropped. `None` for
+    /// anything that is not a DWG. Carried rather than logged on the worker, because the worker
+    /// has no history panel to log to.
+    dwg_note: Option<String>,
 }
 
 /// Result of a save worker: bytes written + a note for the history log.
@@ -767,7 +771,9 @@ fn resolve_asset_path(rel: &str) -> Option<std::path::PathBuf> {
 fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
     let lower = path.to_ascii_lowercase();
     let t = std::time::Instant::now();
-    // ---- read + parse the 2D document (DWG is converted to DXF first) -----------------
+    // What the DWG path did, for the open log -- native or converted, and what it dropped.
+    let mut dwg_note: Option<String> = None;
+    // ---- read + parse the 2D document (DWG is read natively, or converted) ------------
     let (doc, read_ms, parse_ms) = if lower.ends_with(".dxf") {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read '{path}': {e}"))?;
         let read_ms = t.elapsed().as_millis() as u64;
@@ -781,16 +787,53 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
         let doc = cad_io::rsm::read_rsm(&bytes).map_err(|e| format!("parse rsm: {e}"))?;
         (doc, read_ms, t2.elapsed().as_millis() as u64)
     } else if lower.ends_with(".dwg") {
-        let conv = dwg_converter().ok_or_else(|| {
-            "no DWG converter found — set RUSTCAD_DWGCONV or build tools/dwgconv".to_string()
-        })?;
-        let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
-        run_dwg_conversion(&conv, path, &out)?;
-        let text = std::fs::read_to_string(&out).map_err(|e| format!("read converted dxf: {e}"))?;
-        let read_ms = t.elapsed().as_millis() as u64;
+        // NATIVELY FIRST, AND ON MOST MACHINES THAT IS THE WHOLE STORY. `cad_io::dwg` is compiled
+        // in, so a DWG opens with nothing installed — which is what "cant our installation file
+        // have just the required files so dwg can open without any hassel" was asking for, and the
+        // answer needs no extra files at all.
+        //
+        // THE CONVERTER STAYS AS THE FALLBACK. The native reader is new and DWG has thirty years of
+        // versions behind it; where it cannot read a file AutoCAD still can, and a user who has
+        // AutoCAD must not lose that because we added something. It costs nothing when unused.
         let t2 = std::time::Instant::now();
-        let doc = cad_io::dxf::read_dxf(&text).map_err(|e| format!("parse dxf: {e}"))?;
-        (doc, read_ms, t2.elapsed().as_millis() as u64)
+        match cad_io::dwg::read_dwg(std::path::Path::new(path)) {
+            Ok((doc, tally)) => {
+                // COUNTED, NOT INFERRED. "2336 entities" and "2336 kept" read identically in a log
+                // and mean very different things; a drawing that quietly lost its dimensions
+                // should say so on the way in.
+                if tally.skipped > 0 {
+                    dwg_note = Some(format!(
+                        "  dwg: read natively — {} entities, {} not yet supported (text, \
+                         dimensions, hatches and blocks are skipped rather than approximated)",
+                        tally.kept, tally.skipped,
+                    ));
+                } else {
+                    dwg_note = Some(format!("  dwg: read natively — {} entities", tally.kept));
+                }
+                (doc, t.elapsed().as_millis() as u64, t2.elapsed().as_millis() as u64)
+            }
+            Err(native) => {
+                let conv = dwg_converter().ok_or_else(|| {
+                    format!(
+                        "could not read '{path}'.\n    natively: {native}\n    and no DWG \
+                         converter is installed to fall back on — AutoCAD provides one, or set \
+                         RUSTCAD_DWGCONV to another as \"cmd {{in}} {{out}}\"."
+                    )
+                })?;
+                let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
+                run_dwg_conversion(&conv, path, &out)?;
+                let text =
+                    std::fs::read_to_string(&out).map_err(|e| format!("read converted dxf: {e}"))?;
+                let read_ms = t.elapsed().as_millis() as u64;
+                let t3 = std::time::Instant::now();
+                let doc = cad_io::dxf::read_dxf(&text).map_err(|e| format!("parse dxf: {e}"))?;
+                dwg_note = Some(format!(
+                    "  dwg: the native reader could not open this one ({native}) — converted via \
+                     the external converter instead"
+                ));
+                (doc, read_ms, t3.elapsed().as_millis() as u64)
+            }
+        }
     } else {
         return Err(format!("unknown extension on '{path}': expected .dxf, .dwg or .rsm"));
     };
@@ -811,7 +854,16 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
         None => Vec::new(),
     };
     let furn_ms = t4.elapsed().as_millis() as u64;
-    Ok(Box::new(LoadPayload { doc, sidecar, furniture, read_ms, parse_ms, sidecar_ms, furn_ms }))
+    Ok(Box::new(LoadPayload {
+        doc,
+        sidecar,
+        furniture,
+        read_ms,
+        parse_ms,
+        sidecar_ms,
+        furn_ms,
+        dwg_note,
+    }))
 }
 
 /// Serialize + write a drawing and its SIMLUX sidecar entirely OFF the UI thread. The caller
@@ -30996,7 +31048,16 @@ impl CadApp {
     /// an open (state install, view fit, sidecar apply, GL invalidate). Mirrors the install
     /// stages of the old synchronous `do_open_now`.
     fn apply_loaded(&mut self, path: &str, payload: Box<LoadPayload>) {
-        let LoadPayload { doc, sidecar, furniture, read_ms, parse_ms, sidecar_ms, furn_ms } = *payload;
+        let LoadPayload {
+            doc,
+            sidecar,
+            furniture,
+            read_ms,
+            parse_ms,
+            sidecar_ms,
+            furn_ms,
+            dwg_note,
+        } = *payload;
         let n = doc.dobjects.len();
         let l = doc.layers.len();
         // Commit any live face-sketch FIRST. `self.doc` is the sketch while a session is open,
@@ -31044,6 +31105,10 @@ impl CadApp {
         self.unsaved = false; // freshly opened → matches the file on disk
         self.history.push(format!(
             "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l));
+        // HOW the DWG was read, and what it left behind -- see `LoadPayload::dwg_note`.
+        if let Some(note) = dwg_note {
+            self.history.push(note);
+        }
         // Say so when the FILE declared its unit. Nothing was rescaled — the declaration only
         // changes how the 3D side reads the drawing from here on — but a scale that changed
         // without the user asking is exactly the kind of silence this whole problem came from.
@@ -54620,7 +54685,7 @@ fn calculate_on_real_project() {
         }
         let payload = Box::new(LoadPayload {
             doc: opened, sidecar: None, furniture: Vec::new(),
-            read_ms: 0, parse_ms: 0, sidecar_ms: 0, furn_ms: 0,
+            read_ms: 0, parse_ms: 0, sidecar_ms: 0, furn_ms: 0, dwg_note: None,
         });
         app.apply_loaded("C:/tmp/opened.rsm", payload);
 
@@ -57850,7 +57915,7 @@ mod imported_drawing_scale {
             read_ms: 0,
             parse_ms: 0,
             sidecar_ms: 0,
-            furn_ms: 0,
+            furn_ms: 0, dwg_note: None,
         })
     }
 
