@@ -27672,6 +27672,7 @@ impl CadApp {
             // CUT AT THE HEIGHT THE LIGHT IS MEASURED AT, so the walls on the drawing are the ones
             // that shaped the field printed over them — and openings read as gaps, because the
             // plane passes through them.
+            settings: self.light.settings,
             walls: self.factory.section_at_z(self.light.plane_height),
             apertures: self.factory.aperture_section_at_z(self.light.plane_height),
             surfaces: &self.light.surfaces,
@@ -68077,9 +68078,18 @@ mod the_real_projects_lux {
             .ok()
             .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
             .unwrap_or_else(|| vec![app.light.wall_zone]);
+        // AND THE BOUNCES, because the project runs at max_bounces = 1 and a 24-degree spot puts
+        // almost nothing on the floor BETWEEN fittings by direct light -- what fills those gaps is
+        // interreflection, which is exactly what one bounce cannot do.
+        let bounces: Vec<u32> = std::env::var("SIMLUX_BOUNCES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![app.light.settings.max_bounces]);
         for zone in zones {
+        for b in &bounces {
+        app.light.settings.max_bounces = *b;
         app.light.wall_zone = zone;
-        println!("--- wall zone {zone:.2} m ---");
+        println!("--- wall zone {zone:.2} m, {b} bounce(s) ---");
         for mode in [crate::light::CalcMode::Express, crate::light::CalcMode::Thorough] {
             app.light.mode = mode;
             let plan = app.doc.clone();
@@ -68128,10 +68138,18 @@ mod the_real_projects_lux {
             };
             let (gc, gr) = (g2.cols as usize, g2.rows as usize);
             let (dx, dy) = (pl.width as f64 / gc as f64, pl.depth as f64 / gr as f64);
+            // THE DARKEST CELL THAT IS ACTUALLY COUNTED. The raw minimum over all values includes
+            // cells the mask threw away, which is a different question -- and the reported Emin
+            // comes from the kept ones.
+            let mk = app.light.rooms.first().map(|r| r.mask_en.clone()).unwrap_or_default();
             let mut worst = (f64::MAX, 0usize, 0usize);
             for j in 0..gr {
                 for i in 0..gc {
-                    let v = g2.values[j * gc + i];
+                    let k = j * gc + i;
+                    if !mk.get(k).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    let v = g2.values[k];
                     if v < worst.0 {
                         worst = (v, i, j);
                     }
@@ -68170,6 +68188,7 @@ mod the_real_projects_lux {
                 kept,
                 m.len(),
             );
+        }
         }
         }
         println!("\nDIALux, same plan, EN grid:      240.0     6.85    853.0   0.029");

@@ -152,6 +152,14 @@ pub struct Input<'a> {
     pub unassigned: usize,
     pub ramp: fn(f32) -> (f32, f32, f32),
     pub mask: Vec<bool>,
+    /// THE RAY SETTINGS THE ANSWER WAS COMPUTED UNDER.
+    ///
+    /// The report printed "Ray-traced, 5 diffuse bounces" as a STRING LITERAL, whatever the
+    /// calculation actually used. The project this was found on runs at ONE bounce, and one bounce
+    /// against 24-degree spots leaves the floor between fittings almost unlit -- Emin 0.48 lx where
+    /// three bounces give 7.14 and DIALux gives 6.85. So the page named a method that produced a
+    /// different number from the one printed beside it, on a document somebody signs.
+    pub settings: cad_light::RaySettings,
     /// THE WALLS, as a horizontal section through the building at the working plane — world-metre
     /// segments from `FactoryState::section_at_z`.
     ///
@@ -200,6 +208,7 @@ impl<'a> Input<'a> {
             unassigned,
             ramp,
             mask,
+            settings,
             walls,
             apertures,
         } = self;
@@ -226,6 +235,7 @@ impl<'a> Input<'a> {
         // matters. The gap is an edit preserving both — one wall moved exactly as far as another
         // moves back — and the consequence is a stale PREVIEW until the dialog is reopened, never a
         // wrong number on the page.
+        crate::light::hash_json(&mut h, "raysettings", settings);
         h.u64(walls.len() as u64);
         h.u64(apertures.len() as u64);
         let mut ext = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -892,8 +902,13 @@ fn summary(c: &mut Cursor, room: &RoomInput, unassigned: usize) {
     let p = room.reported_plane();
     c.heading("Summary");
     c.row("Average E", &format!("{:.0} lx", g.avg));
-    c.row("Minimum E", &format!("{:.0} lx", g.min));
-    c.row("Maximum E", &format!("{:.0} lx", g.max));
+    // A MINIMUM UNDER 10 lx KEEPS A DECIMAL. Reported as "the min is back to 0" against a figure
+    // that was 0.48 lx — rounded to whole lux it reads as ZERO, and zero is a different claim:
+    // it says no light reaches that point at all. The average and the maximum are hundreds of lux
+    // and a decimal on them is noise; the minimum is the one figure that routinely lives in the
+    // range where rounding changes what it means.
+    c.row("Minimum E", &format!("{} lx", fmt_lux(g.min)));
+    c.row("Maximum E", &format!("{} lx", fmt_lux(g.max)));
     c.row(
         "Uniformity U0 = Emin/E",
         &if g.avg > 0.0 { format!("{:.2}", g.min / g.avg) } else { "—".into() },
@@ -945,7 +960,15 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
     // properties of a room's own installation; one figure quoted over three rooms describes none
     // of them.
     c.heading("General");
-    c.row("Calculation algorithm", "Ray-traced, 5 diffuse bounces");
+    c.row(
+        "Calculation algorithm",
+        &format!(
+            "Ray-traced, {} diffuse bounce{}, {} rays/point",
+            inp.settings.max_bounces,
+            if inp.settings.max_bounces == 1 { "" } else { "s" },
+            inp.settings.rays_per_point,
+        ),
+    );
     c.row(
         "Height of luminaire plane",
         &room
@@ -1015,6 +1038,19 @@ fn installation(c: &mut Cursor, room: &RoomInput, m: Maintenance, inp: &Input) {
 /// BY TYPE, not by fixture: "48 × OCULUS GRANDE 2.0" is what gets ordered and wired. Manufacturer
 /// and catalogue number come out of the photometric file's own header — so a file that declares
 /// none shows a dash, which is the file's omission rather than the report's.
+/// A lux figure, with a decimal only where one changes the meaning.
+///
+/// Under 10 lx a whole-number rounding turns 0.48 into "0", and zero is a claim -- that no light
+/// reaches the point at all -- rather than a rounding. Above that a decimal is noise on a number
+/// nobody quotes to better than a lux.
+pub fn fmt_lux(v: f64) -> String {
+    if v > 0.0 && v < 10.0 {
+        format!("{v:.2}")
+    } else {
+        format!("{v:.0}")
+    }
+}
+
 /// Cut `text` to `max_w`, ending in an ellipsis when it had to be cut.
 ///
 /// Reported as: *"in report names conflict with each other if its too long."* The schedule wrote
@@ -2334,6 +2370,7 @@ mod tests {
             rooms: vec![one_room(g, p, "")],
             // No model behind the fixture, so no section -- the drawing is the field alone, which
             // is what every test here is about.
+            settings: Default::default(),
             walls: Vec::new(),
             apertures: Vec::new(),
             maintenance: Maintenance { llmf: 0.8, lsf: 1.0, lmf: 1.0, rsmf: 1.0 },
@@ -5312,5 +5349,104 @@ mod schedule_cells_do_not_collide {
         // Too narrow for even one character: an empty cell, never a bare ellipsis, which would
         // read as data that had been there.
         assert_eq!(fit_to(LONG, 1.0, 8.0, Font::Bold), "", "a lone ellipsis says nothing");
+    }
+}
+
+/// "THE MIN IS BACK TO 0. WHY? THIS IS A REGRESSION."
+///
+/// Two separate things, and only one of them was the calculation.
+///
+/// The figure was 0.48 lx and the page rounded it to "0 lx" — a different claim, because zero says
+/// no light reaches that point at all. And the page said "Ray-traced, 5 diffuse bounces" as a
+/// STRING LITERAL while the project ran at ONE, which against 24° spots leaves the floor between
+/// fittings almost unlit: Emin 0.48 lx at one bounce, 7.14 at three, against DIALux's 6.85. The
+/// report named a method that produced a different number from the one printed beside it.
+#[cfg(test)]
+mod the_summary_says_what_was_actually_computed {
+    use super::tests::*;
+    use super::*;
+
+    fn texts(d: &Doc) -> Vec<String> {
+        d.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|i| match i {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A MINIMUM UNDER A LUX IS NOT ZERO. Rounding it to zero states that the point receives
+    /// nothing, which is a claim about the scheme rather than about the formatting.
+    #[test]
+    fn a_dark_minimum_keeps_its_decimal() {
+        assert_eq!(fmt_lux(0.48), "0.48", "0.48 lx must not print as 0");
+        assert_eq!(fmt_lux(0.0), "0", "…but a true zero still prints as 0");
+        assert_eq!(fmt_lux(7.14), "7.14");
+        assert_eq!(fmt_lux(264.3), "264", "hundreds of lux need no decimal");
+        assert_eq!(fmt_lux(853.0), "853");
+    }
+
+    /// AND IT REACHES THE PAGE, not just the helper.
+    ///
+    /// THE GRID IS BUILT WITH A SUB-LUX MINIMUM ON PURPOSE. The first version used the shared
+    /// fixture, whose minimum is 100 lx, and guarded the assertion with `if min < 10.0` -- so it
+    /// never asserted anything and passed against a build that still rounded to whole lux.
+    #[test]
+    fn the_page_shows_the_decimal() {
+        let (mut g, p) = (grid(8, 6), plane());
+        g.values[0] = 0.48;
+        g.min = 0.48;
+        let inp = input(&g, &p);
+        let d = layout(&inp, &Options::default());
+        let t = texts(&d);
+        assert!(
+            t.iter().any(|s| s.contains("0.48")),
+            "a sub-lux minimum must reach the page with its decimal: {:?}",
+            t.iter().filter(|s| s.ends_with(" lx")).take(6).collect::<Vec<_>>(),
+        );
+        assert!(
+            !t.iter().any(|s| s == "0 lx"),
+            "…and must not also appear rounded to nothing",
+        );
+    }
+
+    /// THE ALGORITHM LINE IS THE SETTINGS, NOT A SENTENCE. It was a literal saying "5 diffuse
+    /// bounces" over a calculation that used one — on a document somebody signs.
+    #[test]
+    fn the_algorithm_line_reports_the_real_settings() {
+        let (g, p) = (grid(8, 6), plane());
+        let mut inp = input(&g, &p);
+        // AN INSTALLATION, because the General block lives in `fn installation` and returns early
+        // without one -- the first version of this test rendered no algorithm line at all and
+        // failed for a reason that had nothing to do with what it was testing.
+        let inst = cad_light::Installation {
+            count: 4,
+            total_watts: 80.0,
+            total_lumens: 8000.0,
+            area_m2: 20.0,
+            power_density: 4.0,
+            efficacy: 100.0,
+            missing_watts: 0,
+            missing_lumens: 0,
+        };
+        inp.rooms[0].installation = Some(&inst);
+        inp.settings = cad_light::RaySettings { rays_per_point: 64, max_bounces: 1, shadows: true };
+        let one = texts(&layout(&inp, &Options::default()));
+        assert!(
+            one.iter().any(|t| t.contains("1 diffuse bounce") && !t.contains("bounces")),
+            "one bounce must read as one: {:?}",
+            one.iter().find(|t| t.contains("Ray-traced")),
+        );
+        assert!(one.iter().any(|t| t.contains("64 rays/point")), "and name the sample count");
+
+        inp.settings.max_bounces = 5;
+        let five = texts(&layout(&inp, &Options::default()));
+        assert!(
+            five.iter().any(|t| t.contains("5 diffuse bounces")),
+            "five must read as five: {:?}",
+            five.iter().find(|t| t.contains("Ray-traced")),
+        );
     }
 }
