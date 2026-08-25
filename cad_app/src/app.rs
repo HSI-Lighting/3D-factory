@@ -51636,8 +51636,47 @@ fn run_dwg_conversion(conv: &str, dwg: &str, out: &std::path::Path) -> Result<()
     };
     match status {
         Ok(_) if out.exists() => Ok(()),
-        Ok(s) => Err(format!("converter exited {s} (no DXF produced)")),
+        // WHY IT FAILED, NOT JUST THAT IT DID. This reported "converter exited 3 (no DXF
+        // produced)" and threw the converter's own stderr away -- which on the usual failure says,
+        // in full sentences, "accoreconsole.exe not found under C:\Program Files\Autodesk" and
+        // what to set instead. A GUI user never sees a console, so that explanation reached nobody
+        // and the symptom was an exit code.
+        Ok(s) => Err(format!(
+            "the DWG converter exited {s} and produced no DXF.
+{}",
+            converter_stderr(conv, dwg, &out_s),
+        )),
         Err(e) => Err(format!("could not run converter '{conv}': {e}")),
+    }
+}
+
+/// Re-run the converter capturing its output, so the REASON can be shown.
+///
+/// A second run rather than capturing the first: the first is spawned with the terminal inherited
+/// so a long conversion still shows progress where there is a console, and re-running a converter
+/// that has already failed costs nothing anybody notices.
+fn converter_stderr(conv: &str, dwg: &str, out_s: &str) -> String {
+    let o = if cfg!(windows)
+        && (conv.to_ascii_lowercase().ends_with(".cmd")
+            || conv.to_ascii_lowercase().ends_with(".bat"))
+    {
+        std::process::Command::new("cmd").arg("/c").arg(conv).arg(dwg).arg(out_s).output()
+    } else {
+        std::process::Command::new(conv).arg(dwg).arg(out_s).output()
+    };
+    match o {
+        Ok(o) => {
+            let e = String::from_utf8_lossy(&o.stderr);
+            let e = e.trim();
+            if e.is_empty() {
+                "The converter said nothing. DWG needs AutoCAD on this machine (its \n                 accoreconsole.exe does the work); set RUSTCAD_DWGCONV to another converter if \n                 there is none."
+                    .to_string()
+            } else {
+                e.lines().map(|l| format!("    {}", l.trim())).collect::<Vec<_>>().join("
+")
+            }
+        }
+        Err(e) => format!("    (could not re-run the converter to ask why: {e})"),
     }
 }
 
@@ -67828,5 +67867,100 @@ mod the_origin_is_the_blind_spot {
     fn the_same_model_on_survey_coordinates_shows_them() {
         let app = a_building_with(&[(OX + 15.0, OY + 6.0), ((OX + 15.0) / 1000.0, (OY + 6.0) / 1000.0)]);
         assert_eq!(app.stray_light_ids().len(), 1);
+    }
+}
+
+/// "WHEN I TRIED TO OPEN A DWG FILE IN ANOTHER ITS WAS SHOWING UN RECOGNISED FORMAT."
+///
+/// SIMLUX ships the DWG converter and always has — `tools\dwgconv\dwgconv.cmd` sits beside
+/// `simlux.exe` and the package's integrity check lists it. What it cannot ship is AutoCAD:
+/// the script drives `accoreconsole.exe`, AutoCAD's own headless core, found by scanning
+/// `C:\Program Files\Autodesk`. On a machine without AutoCAD there is nothing to drive.
+///
+/// The script says so, in full sentences, on stderr — and a GUI user has no console to read it in.
+/// The app reported "converter exited 3 (no DXF produced)": an exit code where an explanation had
+/// been written and thrown away.
+#[cfg(test)]
+mod the_dwg_converter_explains_itself {
+    use super::*;
+
+    /// THE REASON REACHES THE MESSAGE. A converter that fails and says why must have its words
+    /// carried, not replaced by its exit status.
+    #[test]
+    fn a_failing_converter_has_its_reason_carried() {
+        let dir = std::env::temp_dir().join(format!("simlux_dwgconv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A stand-in converter that fails exactly as `dwgconv.cmd` does with no AutoCAD present.
+        let script = dir.join("fake.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho accoreconsole.exe not found under Program Files Autodesk. 1>&2\r\nexit /b 3\r\n",
+        )
+        .expect("write");
+        let out = dir.join("out.dxf");
+
+        let err = run_dwg_conversion(
+            &script.to_string_lossy(),
+            &dir.join("in.dwg").to_string_lossy(),
+            &out,
+        )
+        .expect_err("a converter that produces no DXF must fail");
+
+        assert!(
+            err.contains("accoreconsole"),
+            "the converter's own explanation must survive into the message: {err}",
+        );
+        assert!(err.contains("no DXF"), "…and it must still say what went wrong: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SILENT FAILURE STILL EXPLAINS ITSELF. Some converters exit non-zero saying nothing, and
+    /// "exited 1" tells a user nothing they can act on — the standing cause is worth naming.
+    #[test]
+    fn a_silent_failure_still_names_the_usual_cause() {
+        let dir = std::env::temp_dir().join(format!("simlux_dwgquiet_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("quiet.cmd");
+        std::fs::write(&script, "@echo off\r\nexit /b 1\r\n").expect("write");
+
+        let err = run_dwg_conversion(
+            &script.to_string_lossy(),
+            &dir.join("in.dwg").to_string_lossy(),
+            &dir.join("out.dxf"),
+        )
+        .expect_err("no DXF, so it must fail");
+
+        assert!(
+            err.contains("AutoCAD") && err.contains("RUSTCAD_DWGCONV"),
+            "a converter that says nothing must still leave the user something to do: {err}",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AND A CONVERTER THAT WORKS IS NOT SECOND-GUESSED — the diagnostic re-run happens only on
+    /// failure, so a successful open costs one process, not two.
+    #[test]
+    fn a_working_converter_is_run_once() {
+        let dir = std::env::temp_dir().join(format!("simlux_dwgok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("ok.cmd");
+        // Appends a line each run, so a second invocation is visible.
+        std::fs::write(&script, "@echo off\r\necho ran>>\"%~dp0runs.txt\"\r\necho 0>\"%~2\"\r\n")
+            .expect("write");
+        let out = dir.join("out.dxf");
+
+        run_dwg_conversion(
+            &script.to_string_lossy(),
+            &dir.join("in.dwg").to_string_lossy(),
+            &out,
+        )
+        .expect("it produced a DXF, so it succeeded");
+
+        let runs = std::fs::read_to_string(dir.join("runs.txt")).unwrap_or_default();
+        assert_eq!(runs.lines().count(), 1, "a converter that worked must not be re-run: {runs:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
