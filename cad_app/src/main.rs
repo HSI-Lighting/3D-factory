@@ -38,6 +38,7 @@ mod solar;      // Radiance-based sun position for daylight rendering
 mod texture_set; // PBR texture-set folders: filename → map slot, and the loader that follows it
 mod theme;
 mod varreg;
+mod calc; // command-line calculator + lazy user variables (pure, no UI deps)
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {

@@ -515,6 +515,12 @@ pub struct SimluxConfig {
     /// way rather than silently acquiring a factor that would change every number in them.
     #[serde(default)]
     pub maintenance: Option<cad_light::Maintenance>,
+    /// Command-line calculator user variables — name → stored EXPRESSION
+    /// (lazy, so no float drift: the string is kept verbatim). `ans` is a
+    /// session value and never persisted. `#[serde(default)]` → a sidecar
+    /// written before this existed loads clean with an empty store.
+    #[serde(default)]
+    pub vars: std::collections::BTreeMap<String, String>,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.
@@ -566,12 +572,19 @@ pub fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
 /// Write the sidecar for `drawing`. Returns the path written. Written ATOMICALLY (temp + rename)
 /// so an interrupted write (crash / close during autosave) can't corrupt the previous sidecar.
 ///
+/// The temp is UNIQUE per call: the modal save worker, the silent autosave and the calculator
+/// variables patch all write the sidecar, and two writers sharing one `foo.simlux.json.savetmp`
+/// could truncate each other's temp mid-write. A per-call suffix makes the sequences
+/// independent; the rename still wins or retries atomically.
+///
 /// When the rename cannot be completed the temp file is KEPT and named in the error, because it
 /// holds work that exists nowhere else — see [`replace_file`].
 pub fn save(drawing: &Path, cfg: &SimluxConfig) -> Result<PathBuf, String> {
     let p = sidecar_path(drawing);
     let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
-    let tmp = p.with_extension("json.savetmp");
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = p.with_extension(format!("json.{}.savetmp", seq));
     std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
     replace_file(&tmp, &p).map_err(|e| {
         format!(

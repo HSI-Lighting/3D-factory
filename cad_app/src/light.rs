@@ -3740,6 +3740,9 @@ impl LightState {
             next_luminaire_id: self.next_id,
             symbol_of: self.symbol_of.clone(),
             maintenance: Some(self.maintenance),
+            // Command-line calculator variables — `light` doesn't own them
+            // either; the app fills the map (build_simlux_config_common).
+            vars: BTreeMap::new(),
         }
     }
 
@@ -3855,6 +3858,10 @@ impl LightState {
         // How many fittings stand outside the building -- see `CadApp::stray_light_ids`. Passed
         // in because this panel cannot see the Factory, and the answer is a fact about the model.
         strays: usize,
+        // Number-field parser for the shared false-colour scale editor — the report window
+        // passes the calculator (`2+3`, `x*2`); this panel must accept the same input in the
+        // same editor, or the two windows silently disagree.
+        num_parse: &dyn Fn(&str) -> Option<f64>,
     ) -> LightAction {
         let mut action = LightAction::default();
         ui.horizontal_wrapped(|ui| {
@@ -4209,7 +4216,8 @@ impl LightState {
                 // that nothing drew from any more — turning them changed nothing, which is
                 // indistinguishable from broken and was reported as exactly that. There is one
                 // editor now, and it edits the settings the report and both views all read.
-                crate::report::ui::scale_editor_ui(ui, report, room_max, self.ramp.rgb_fn());
+                crate::report::ui::scale_editor_ui(ui, report, room_max, self.ramp.rgb_fn(),
+                    num_parse);
                 // THE PALETTE, ONLY WHEN IT CAN CHANGE ANYTHING.
                 //
                 // "does this even do anything? it seems to be redundant." Fair, and nearly right:

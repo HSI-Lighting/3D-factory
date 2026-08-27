@@ -189,6 +189,9 @@ pub fn window_ui(
     // building. A report is the one output of this app that reaches a client, and a lux figure for
     // a layout that has since changed is indistinguishable, on paper, from one that is right.
     stale: bool,
+    // Number-field parser: plain numbers first, then the command-line
+    // calculator (`2+3`, `x*2`) — the app passes `CadApp::eval_number`.
+    num_parse: &dyn Fn(&str) -> Option<f64>,
 ) -> Action {
     let mut act = Action::default();
     *page = (*page).min(doc.pages.len().saturating_sub(1));
@@ -300,7 +303,7 @@ pub fn window_ui(
                         });
 
                         // THE SAME EDITOR THE SIMLUX WINDOW SHOWS — see `scale_editor_ui`.
-                        scale_editor_ui(ui, opt, room_max, ramp);
+                        scale_editor_ui(ui, opt, room_max, ramp, num_parse);
 
                         // ---- TEXT SIZE ----------------------------------------------------
                         //
@@ -322,7 +325,8 @@ pub fn window_ui(
                                         .range(
                                             super::options::TEXT_SCALE_MIN * 100.0
                                                 ..=super::options::TEXT_SCALE_MAX * 100.0,
-                                        ),
+                                        )
+                                        .custom_parser(|s| num_parse(s)),
                                 )
                                 .on_hover_text(
                                     "Scales every size in the report together — headings, tables, \
@@ -797,6 +801,7 @@ pub fn scale_editor_ui(
     opt: &mut Options,
     room_max: f64,
     ramp: fn(f32) -> (f32, f32, f32),
+    num_parse: &dyn Fn(&str) -> Option<f64>,
 ) {
 ui.label(egui::RichText::new("False-colour scale").strong());
 ui.horizontal(|ui| {
@@ -811,7 +816,8 @@ ui.horizontal(|ui| {
             egui::DragValue::new(t)
                 .speed(10.0)
                 .range(1.0..=100_000.0)
-                .suffix(" lx"),
+                .suffix(" lx")
+                .custom_parser(|s| num_parse(s)),
         );
     } else {
         ui.label(
@@ -925,7 +931,8 @@ for i in 0..opt.scale.bands.len() {
             egui::DragValue::new(&mut opt.scale.bands[i])
                 .speed(5.0)
                 .range(1.0..=100_000.0)
-                .suffix(" lx"),
+                .suffix(" lx")
+                .custom_parser(|s| num_parse(s)),
         );
     });
 }

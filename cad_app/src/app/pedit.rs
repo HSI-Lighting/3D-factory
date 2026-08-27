@@ -304,7 +304,9 @@ impl CadApp {
             }
             PeditState::Width(h) => {
                 if s.is_empty() { self.pedit_state = PeditState::Menu(h); self.pedit_reprompt(h); }
-                else if let Ok(mm) = s.parse::<f64>() {
+                // Evaluate the ORIGINAL case (`s` is lowercased; variables
+                // are case-sensitive).
+                else if let Ok(mm) = self.eval_number(raw) {
                     if mm < 0.0 {
                         self.history.push("  ! pedit width: must be ≥ 0".into());
                     } else {

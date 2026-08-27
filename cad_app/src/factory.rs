@@ -971,6 +971,7 @@ pub fn length_ui(
     speed_m: f64,
     min_m: f64,
     max_m: f64,
+    calc: &crate::calc::CalcStore,
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
@@ -978,7 +979,10 @@ pub fn length_ui(
             .speed(u.from_metres(speed_m))
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
-            .suffix(format!(" {}", u.label())),
+            .suffix(format!(" {}", u.label()))
+            // Expressions commit in the field too: `x*2` typed into any
+            // length spinner evaluates against the calculator store.
+            .custom_parser(move |s| crate::calc::parse_drag(calc, s)),
     );
     if r.changed() {
         *v = u.to_metres(shown) as f32;
@@ -995,6 +999,7 @@ pub fn length_ui_pre(
     speed_m: f64,
     min_m: f64,
     max_m: f64,
+    calc: &crate::calc::CalcStore,
 ) -> egui::Response {
     let mut shown = u.from_metres(*v as f64);
     let r = ui.add(
@@ -1003,7 +1008,8 @@ pub fn length_ui_pre(
             .range(u.from_metres(min_m)..=u.from_metres(max_m))
             .max_decimals(length_decimals(u))
             .prefix(prefix)
-            .suffix(format!(" {}", u.label())),
+            .suffix(format!(" {}", u.label()))
+            .custom_parser(move |s| crate::calc::parse_drag(calc, s)),
     );
     if r.changed() {
         *v = u.to_metres(shown) as f32;
@@ -1537,18 +1543,24 @@ pub fn primitive_dim_fields(
     ui: &mut egui::Ui,
     units: cad_kernel::DocUnits,
     p: &mut Primitive,
+    calc: &crate::calc::CalcStore,
 ) -> bool {
     let f = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            length_ui(ui, units, v, 0.02, min as f64, 1e5).changed()
+            length_ui(ui, units, v, 0.02, min as f64, 1e5, calc).changed()
         })
         .inner
     };
-    fn u(ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32) -> bool {
+    // INTEGER fields (counts/segments): the expression must come out whole —
+    // no silent rounding of a non-integral result.
+    fn u(ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32, calc: &crate::calc::CalcStore) -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            ui.add(egui::DragValue::new(v).update_while_editing(false).speed(1.0).range(min..=512)).changed()
+            ui.add(egui::DragValue::new(v).update_while_editing(false).speed(1.0).range(min..=512)
+                .custom_parser(move |s| {
+                    crate::calc::parse_drag_int(calc, s, min as i64, 512).map(|n| n as f64)
+                })).changed()
         })
         .inner
     }
@@ -1562,43 +1574,43 @@ pub fn primitive_dim_fields(
         Primitive::Cylinder { r, h, sides } => {
             c |= f(ui, "radius", r, 0.001);
             c |= f(ui, "height", h, 0.001);
-            c |= u(ui, "sides", sides, 3);
+            c |= u(ui, "sides", sides, 3, calc);
         }
         Primitive::Sphere { r, segments, stacks } => {
             c |= f(ui, "radius", r, 0.001);
-            c |= u(ui, "segments", segments, 3);
-            c |= u(ui, "stacks", stacks, 2);
+            c |= u(ui, "segments", segments, 3, calc);
+            c |= u(ui, "stacks", stacks, 2, calc);
         }
         Primitive::Frustum { r_bottom, r_top, h, sides } => {
             c |= f(ui, "r bottom", r_bottom, 0.0);
             c |= f(ui, "r top", r_top, 0.0);
             c |= f(ui, "height", h, 0.001);
-            c |= u(ui, "sides", sides, 3);
+            c |= u(ui, "sides", sides, 3, calc);
         }
         Primitive::Torus { major_r, minor_r, seg_major, seg_minor } => {
             c |= f(ui, "ring r", major_r, 0.001);
             c |= f(ui, "tube r", minor_r, 0.001);
-            c |= u(ui, "seg ring", seg_major, 3);
-            c |= u(ui, "seg tube", seg_minor, 3);
+            c |= u(ui, "seg ring", seg_major, 3, calc);
+            c |= u(ui, "seg tube", seg_minor, 3, calc);
         }
         Primitive::Capsule { r, h, segments, stacks } => {
             c |= f(ui, "radius", r, 0.001);
             c |= f(ui, "length", h, 0.001);
-            c |= u(ui, "segments", segments, 3);
-            c |= u(ui, "stacks", stacks, 2);
+            c |= u(ui, "segments", segments, 3, calc);
+            c |= u(ui, "stacks", stacks, 2, calc);
         }
         Primitive::Tube { r_outer, r_inner, h, sides } => {
             c |= f(ui, "r outer", r_outer, 0.001);
             c |= f(ui, "r inner", r_inner, 0.0);
             c |= f(ui, "height", h, 0.001);
-            c |= u(ui, "sides", sides, 3);
+            c |= u(ui, "sides", sides, 3, calc);
         }
         Primitive::Ellipsoid { rx, ry, rz, segments, stacks } => {
             c |= f(ui, "rx", rx, 0.001);
             c |= f(ui, "ry", ry, 0.001);
             c |= f(ui, "rz", rz, 0.001);
-            c |= u(ui, "segments", segments, 3);
-            c |= u(ui, "stacks", stacks, 2);
+            c |= u(ui, "segments", segments, 3, calc);
+            c |= u(ui, "stacks", stacks, 2, calc);
         }
         Primitive::Extrusion { h, .. } => {
             c |= f(ui, "height", h, 0.001);

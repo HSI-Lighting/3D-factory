@@ -1352,10 +1352,17 @@ fn ttr_foot(g: &Geom, c: Vec2) -> Vec2 {
     }
 }
 
-/// Parse a typed coordinate `x,y` into a point. None unless both parse.
-fn parse_xy(s: &str) -> Option<Vec2> {
+/// Parse a typed coordinate `x,y` into a point. None unless both sides are
+/// numbers — each side may be an expression (`2+1,3*2`), evaluated against
+/// the calculator store.
+fn parse_xy(store: &crate::calc::CalcStore, s: &str) -> Option<Vec2> {
     let (a, b) = s.split_once(',')?;
-    Some(Vec2::new(a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?))
+    Some(Vec2::new(
+        if let Ok(v) = a.trim().parse::<f64>() { v }
+        else { crate::calc::eval(store, a.trim()).ok()? },
+        if let Ok(v) = b.trim().parse::<f64>() { v }
+        else { crate::calc::eval(store, b.trim()).ok()? },
+    ))
 }
 
 /// Parse an `nX` relative-scale factor (case-insensitive), e.g. `2x` → 2.0,
@@ -1970,6 +1977,16 @@ pub struct CadApp {
     /// SYSVAR (after `setvar NAME` or a bare variable name). The next input is
     /// consumed as that value (validated via varreg::env_set). Esc cancels.
     var_set_pending: Option<String>,
+
+    /// Command-line calculator + lazy user variables (see calc.rs). Persisted
+    /// per drawing through the SIMLUX sidecar (`SimluxConfig.vars`); no
+    /// drawing open → session-only.
+    calc: crate::calc::CalcStore,
+    /// Result channel of the in-flight calculator-variables sidecar patch
+    /// (None = no patch running). The patch runs on a worker so a big sidecar
+    /// never freezes the command line, and one patch at a time keeps
+    /// consecutive assignments sequentially consistent.
+    calc_sidecar_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 
     // ---- Quick Access Toolbar (top line) -----------------------------
     /// Ordered list of file/common actions shown as icon shortcuts on the
@@ -3143,8 +3160,23 @@ impl InsertDialog {
             params: Vec::new(),
         }
     }
-    fn scale_f(&self) -> f64 { self.scale.trim().parse().unwrap_or(1.0) }
-    fn rot_rad(&self) -> f64 { self.rotation.trim().parse::<f64>().unwrap_or(0.0).to_radians() }
+    fn scale_f(&self, store: &crate::calc::CalcStore) -> Result<f64, String> {
+        if let Ok(v) = self.scale.trim().parse::<f64>() {
+            Ok(v)
+        } else {
+            crate::calc::eval(store, self.scale.trim())
+                .map_err(|e| format!("calc: scale — {}", e))
+        }
+    }
+    fn rot_rad(&self, store: &crate::calc::CalcStore) -> Result<f64, String> {
+        let deg = if let Ok(v) = self.rotation.trim().parse::<f64>() {
+            v
+        } else {
+            crate::calc::eval(store, self.rotation.trim())
+                .map_err(|e| format!("calc: rotation — {}", e))?
+        };
+        Ok(deg.to_radians())
+    }
     fn at(&self) -> Vec2 {
         Vec2::new(
             self.at_x.trim().parse().unwrap_or(0.0),
@@ -3218,13 +3250,23 @@ impl BlockDialog {
             smart: false,
         }
     }
-    /// Parse the X/Y text fields into a world point (falls back to 0 for
-    /// unparseable fields so a half-typed value never blocks OK).
-    fn base_point(&self) -> Vec2 {
-        Vec2::new(
-            self.base_x.trim().parse().unwrap_or(0.0),
-            self.base_y.trim().parse().unwrap_or(0.0),
-        )
+    /// Parse the X/Y text fields into a world point. Each field may be an
+    /// expression (`x*2`); on error the dialog stays open and reports it
+    /// (a half-typed value must not silently become 0).
+    fn base_point(&self, store: &crate::calc::CalcStore) -> Result<Vec2, String> {
+        let x = if let Ok(v) = self.base_x.trim().parse::<f64>() {
+            v
+        } else {
+            crate::calc::eval(store, self.base_x.trim())
+                .map_err(|e| format!("calc: X — {}", e))?
+        };
+        let y = if let Ok(v) = self.base_y.trim().parse::<f64>() {
+            v
+        } else {
+            crate::calc::eval(store, self.base_y.trim())
+                .map_err(|e| format!("calc: Y — {}", e))?
+        };
+        Ok(Vec2::new(x, y))
     }
 }
 
@@ -4156,6 +4198,8 @@ impl Default for CadApp {
             settings_open:     false,
             settings_section:  String::new(),
             var_set_pending:   None,
+            calc:              crate::calc::CalcStore::new(),
+            calc_sidecar_rx:   None,
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
             qat_just_opened:   false,
@@ -4480,12 +4524,24 @@ del N                                - delete dobject N
 clear                                - remove everything
 help                                 - this message
 
-toolbar:
+  toolbar:
   pointer  - no tool (commands only)
   line     - click two endpoints
   circle   - click center, then any point on the rim
   arc      - click center, start point, end point (CCW)
   Esc cancels an in-progress draw";
+
+/// The `calc` / `calc help` syntax summary (the idle-prompt calculator).
+const CALC_HELP: &str = "\
+calc — expression calculator + user variables
+  expressions : 2+3*4, (1+2)^3, sqrt(16), sin(30) [DEGREES], pi, e, ans
+  operators   : + - * / ^ %  (precedence: unary > ^ > * / % > + -)
+  functions   : sqrt abs round floor ceil min max sin cos tan
+                asin acos atan atan2 exp ln log10   (trig in degrees)
+  assignments : x=5   h=w*2  (LAZY — re-evaluated on every use)
+  variables   : [A-Za-z_][A-Za-z0-9_]*, case-sensitive, persisted per drawing
+  note        : typed expressions have NO spaces (Space=Enter submits);
+                pasted '2 + 3' works fine";
 
 /// Outcome of a command-internal "U" press. Drives whether `run_command`
 /// returns (handled), reports "nothing left", or falls back to global undo.
@@ -5199,8 +5255,8 @@ impl CadApp {
     /// The parentheses are optional because both forms were described and neither is wrong; the
     /// separator may be a comma or a space for the same reason. Numbers are in the FACTORY's
     /// working unit — reading a typed length as metres is the class of bug that built a 4.4 km
-    /// building.
-    fn parse_at_coords(raw: &str, u: cad_kernel::DocUnits) -> Option<[f32; 3]> {
+    /// building. Each number may be an expression (`@x*2,0,0`).
+    fn parse_at_coords(raw: &str, u: cad_kernel::DocUnits, store: &crate::calc::CalcStore) -> Option<[f32; 3]> {
         let s = raw.trim();
         let s = s.strip_prefix('@')?.trim();
         // `(x,y,z)` and `x,y,z` are the same thing said two ways.
@@ -5208,7 +5264,12 @@ impl CadApp {
         let parts: Vec<f64> = s
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|t| !t.is_empty())
-            .map(|t| t.parse::<f64>())
+            .map(|t| {
+                if let Ok(v) = t.parse::<f64>() {
+                    return Ok(v);
+                }
+                crate::calc::eval(store, t)
+            })
             .collect::<Result<_, _>>()
             .ok()?;
         if parts.len() < 2 || parts.len() > 3 {
@@ -5241,7 +5302,7 @@ impl CadApp {
         // for its click keeps waiting, which is what was asked for. Typing a distance from the
         // origin and placing the thing in front of you are two different intentions.
         if lc.starts_with('@') {
-            let Some(o) = Self::parse_at_coords(&lc, self.factory.units) else {
+            let Some(o) = Self::parse_at_coords(&lc, self.factory.units, &self.calc) else {
                 self.factory.status = "@X,Y,Z — two or three numbers, e.g. @900,0,0".into();
                 self.history.push("  @: expected @X,Y,Z".into());
                 return true;
@@ -5330,7 +5391,7 @@ impl CadApp {
         // says "X,Y,Z" is a way of rejecting the right answer.
         if self.place_coord_prompt && !lc.is_empty() {
             let with_at = if lc.starts_with('@') { lc.clone() } else { format!("@{lc}") };
-            let Some(o) = Self::parse_at_coords(&with_at, self.factory.units) else {
+            let Some(o) = Self::parse_at_coords(&with_at, self.factory.units, &self.calc) else {
                 self.history.push(format!("  '{lc}' is not a coordinate"));
                 self.set_place_coord_prompt();
                 return true;
@@ -9331,7 +9392,7 @@ impl CadApp {
                     for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
                         ui.horizontal(|ui| {
                             ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                            let r = crate::factory::length_ui(ui, ufu, &mut pos[axis], 0.02, -1e5, 1e5);
+                            let r = crate::factory::length_ui(ui, ufu, &mut pos[axis], 0.02, -1e5, 1e5, &self.calc);
                             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                             if r.changed() { self.factory.furniture[fi].pos[axis] = pos[axis]; }
                         });
@@ -9375,13 +9436,13 @@ impl CadApp {
                     ui.label(egui::RichText::new("Dimensions").small().weak());
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("height").small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut h, 0.02, 0.05, 100.0);
+                        let r = crate::factory::length_ui(ui, ufu, &mut h, 0.02, 0.05, 100.0, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_wall_height(fid, h); }
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("thickness").small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut t, 0.01, 0.02, 5.0);
+                        let r = crate::factory::length_ui(ui, ufu, &mut t, 0.01, 0.02, 5.0, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_wall_thickness(fid, t); }
                     });
@@ -9405,7 +9466,7 @@ impl CadApp {
                     let mut v = origin[axis];
                     ui.horizontal(|ui| {
                         ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(name).small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut v, 0.02, -1e5, 1e5);
+                        let r = crate::factory::length_ui(ui, ufu, &mut v, 0.02, -1e5, 1e5, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_feature_origin_axis(id, axis, v); }
                     });
@@ -9413,7 +9474,7 @@ impl CadApp {
                 ui.label(egui::RichText::new("Dimensions").small().weak());
                 // The dimension editor reports whether anything changed; snapshot on the
                 // first change of an interaction only (a held drag keeps the same undo step).
-                if crate::factory::primitive_dim_fields(ui, ufu, &mut prim) {
+                if crate::factory::primitive_dim_fields(ui, ufu, &mut prim, &self.calc) {
                     if !self.factory.dim_edit_active {
                         self.snapshot_factory();
                         self.factory.dim_edit_active = true;
@@ -10502,7 +10563,7 @@ impl CadApp {
                 }
                 if !through {
                     let mut d = cut.depth;
-                    if crate::factory::length_ui(ui, ufu, &mut d, 0.002, 0.001, 2.0).changed() {
+                    if crate::factory::length_ui(ui, ufu, &mut d, 0.002, 0.001, 2.0, &self.calc).changed() {
                         self.factory.furniture[fi].cuts[i].depth = d;
                         rebuild = true;
                     }
@@ -12123,7 +12184,7 @@ impl CadApp {
                             let mut shown = ulen.from_metres(*v as f64);
                             let s = ui.add(egui::Slider::new(&mut shown, ulen.from_metres(min as f64)..=ulen.from_metres(20.0)).show_value(false));
                             if s.changed() { *v = ulen.to_metres(shown) as f32; }
-                            let d = crate::factory::length_ui(ui, ulen, v, 0.05, min as f64, 1e4);
+                            let d = crate::factory::length_ui(ui, ulen, v, 0.05, min as f64, 1e4, &self.calc);
                             if s.changed() || d.changed() { changed.set(true); }
                         });
                         ui.end_row();
@@ -12374,7 +12435,7 @@ impl CadApp {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("height / depth").small().weak());
                                 let u = self.factory.units;
-                                crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.001, 1e4);
+                                crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.001, 1e4, &self.calc);
                                 if ui
                                     .button("⬆ Extrude")
                                     .on_hover_text("Extrude the drawn closed shape into a solid element on this face")
@@ -12534,11 +12595,11 @@ impl CadApp {
                         // where walls are created (the old always-on sliders are gone).
                         ui.horizontal(|ui| {
                             ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new("  new wall h").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_height, 0.02, 0.3, 50.0); }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_height, 0.02, 0.3, 50.0, &self.calc); }
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new("  new wall t").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_thickness, 0.01, 0.02, 2.0); }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_thickness, 0.01, 0.02, 2.0, &self.calc); }
                         });
                         if ui.button("⬓  Make floor").clicked() {
                             self.do_make_slab(true);
@@ -12599,7 +12660,7 @@ impl CadApp {
                                             rename = Some((r.id, name));
                                         }
                                         let mut h = r.height;
-                                        if crate::factory::length_ui(ui, u, &mut h, 0.02, 0.3, 30.0)
+                                        if crate::factory::length_ui(ui, u, &mut h, 0.02, 0.3, 30.0, &self.calc)
                                             .on_hover_text("Clear height — floor top to ceiling underside. The slabs are extra.")
                                             .changed()
                                         {
@@ -12616,7 +12677,7 @@ impl CadApp {
                                         ui.add_space(10.0);
                                         ui.label(egui::RichText::new("floor").small().weak());
                                         let mut ft = r.floor_t;
-                                        if crate::factory::length_ui(ui, u, &mut ft, 0.01, 0.02, 2.0)
+                                        if crate::factory::length_ui(ui, u, &mut ft, 0.01, 0.02, 2.0, &self.calc)
                                             .on_hover_text("Slab below the room")
                                             .changed()
                                         {
@@ -12624,7 +12685,7 @@ impl CadApp {
                                         }
                                         ui.label(egui::RichText::new("ceiling").small().weak());
                                         let mut ctk = r.ceiling_t;
-                                        if crate::factory::length_ui(ui, u, &mut ctk, 0.01, 0.02, 2.0)
+                                        if crate::factory::length_ui(ui, u, &mut ctk, 0.01, 0.02, 2.0, &self.calc)
                                             .on_hover_text("Slab above the room")
                                             .changed()
                                         {
@@ -12715,17 +12776,17 @@ impl CadApp {
                         // storey keeps its own floor.
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  room height").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_height, 0.02, 0.3, 30.0) }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_height, 0.02, 0.3, 30.0, &self.calc) }
                                 .on_hover_text("Clear height. The room opens through the storey top so it is visible; set higher than the storey to cut above it.");
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  floor thickness").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_floor, 0.01, 0.0, 2.0) }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_floor, 0.01, 0.0, 2.0, &self.calc) }
                                 .on_hover_text("Slab left BELOW the room on this storey");
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  ceiling thickness").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.ceiling_thickness, 0.01, 0.02, 2.0) }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.ceiling_thickness, 0.01, 0.02, 2.0, &self.calc) }
                                 .on_hover_text("Slab ABOVE the room. Counts toward the overall height, like the floor does.");
                         });
                         // SUGGEST a height that fits, rather than leaving the user to subtract two
@@ -12835,7 +12896,7 @@ impl CadApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.add_sized([94.0, 18.0], egui::Label::new(egui::RichText::new("  height / depth").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.02, 100.0); }
+                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.02, 100.0, &self.calc); }
                         });
                         ui.checkbox(&mut self.factory.keep_sketch, "  keep shape after")
                             .on_hover_text("Reuse the SAME outline for more than one action (e.g. recess then cut through)");
@@ -15556,7 +15617,8 @@ impl CadApp {
                 let room_max = self.light_room_max();
                 let mut ropts = std::mem::take(&mut self.report_opts);
                 let strays = self.stray_light_ids().len();
-                let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays);
+                let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays,
+                    &|s| crate::calc::parse_drag(&self.calc, s));
                 self.report_opts = ropts;
                 if act.import_photometry {
                     open_ies_picker = true;
@@ -16056,7 +16118,20 @@ impl CadApp {
             // (1) a running op consumes typed values (degrees / factor / R / C)
             if let Some(mut md) = self.factory.modify.take() {
                 let plane = cad_solid::Plane::default();
-                if let Some(f) = md.type_value(trimmed, &plane, &mut self.factory.model) {
+                // A VALUE may be an expression (`r*2`, `2+3`): rewrite the
+                // token through the calculator BEFORE the modifier sees it.
+                // Gated on the STRICT expression shape, never a bare word:
+                // `e` must stay erase, `r`/`c` stay reference/copy, and a
+                // defined variable named `r` must not hijack reference mode.
+                let tok = if crate::calc::looks_like_expr_token(trimmed) {
+                    match self.eval_number(trimmed) {
+                        Ok(v) => crate::calc::fmt_value(v),
+                        Err(_) => trimmed.to_string(),
+                    }
+                } else {
+                    trimmed.to_string()
+                };
+                if let Some(f) = md.type_value(&tok, &plane, &mut self.factory.model) {
                     self.factory_note(format!(
                         "3D {} typed '{trimmed}' [{}] → {f:?}", md.op.label(), md.pick_name()
                     ));
@@ -16217,7 +16292,10 @@ impl CadApp {
                 self.var_set_pending = None;
                 self.clear_prompt();
             } else {
-                match crate::varreg::env_set(&mut self.env, &name, trimmed) {
+                // Numeric SYSVARs go through the calculator — `setvar TxHt`
+                // then `0.3*2` sets 0.6. Text/Choice/Bool keep the raw reply.
+                let vstr = self.sysvar_value_string(&name, trimmed);
+                match crate::varreg::env_set(&mut self.env, &name, &vstr) {
                     Ok(_) => {
                         let _ = self.env.save();
                         let nv = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
@@ -16394,17 +16472,16 @@ impl CadApp {
                 self.history.push(format!(
                     "  text: height kept at {}", self.env.TxHt));
             } else {
-                match trimmed.parse::<f64>() {
+                match self.eval_number(trimmed) {
                     Ok(v) if v > 1e-9 => {
                         self.env.TxHt = v;
                         let _ = self.env.save();
                         self.history.push(format!(
-                            "  text: height → {}", v));
+                            "  text: height → {}", crate::calc::fmt_value(v)));
                     }
                     Ok(_) => self.history.push(
                         "  ! text: height must be positive".into()),
-                    Err(_) => self.history.push(format!(
-                        "  ! text: '{}' is not a number", trimmed)),
+                    Err(e) => self.history.push(format!("  ! {}", e)),
                 }
             }
             self.set_prompt(format!(
@@ -16459,20 +16536,22 @@ impl CadApp {
                         "text: enter height <{}>:  [Enter to keep]",
                         self.env.TxHt));
                 } else {
-                    match toks[1].parse::<f64>() {
+                    // Evaluate the ORIGINAL case (toks is lowercased, but
+                    // variables are case-sensitive).
+                    let val = trimmed.split_whitespace().nth(1).unwrap_or("");
+                    match self.eval_number(val) {
                         Ok(v) if v > 1e-9 => {
                             self.env.TxHt = v;
                             let _ = self.env.save();
                             self.history.push(format!(
-                                "  text: height → {}", v));
+                                "  text: height → {}", crate::calc::fmt_value(v)));
                             self.set_prompt(format!(
                                 "text: click anchor (H for height={}, Esc cancels)",
                                 self.env.TxHt));
                         }
                         Ok(_) => self.history.push(
                             "  ! text: height must be positive".into()),
-                        Err(_) => self.history.push(format!(
-                            "  ! text: '{}' is not a number", toks[1])),
+                        Err(e) => self.history.push(format!("  ! {}", e)),
                     }
                 }
                 return;
@@ -16491,8 +16570,11 @@ impl CadApp {
                 .filter(|s| !s.is_empty())
                 .collect();
             if toks.len() == 2 {
+                // Each token evaluates independently — `W H`, `W,H`, or
+                // pasted `w*2 h/2` (typed multi-token is foreclosed by
+                // Space=Enter; the paste path tolerates it).
                 if let (Ok(w), Ok(h)) =
-                    (toks[0].parse::<f64>(), toks[1].parse::<f64>())
+                    (self.eval_number(toks[0]), self.eval_number(toks[1]))
                 {
                     let a = self.pending[0];
                     self.pending.clear();
@@ -16558,7 +16640,7 @@ impl CadApp {
                     Some(base)
                 } else { None };
             if let Some(anchor) = dde_anchor {
-                if let Ok(dist) = trimmed.parse::<f64>() {
+                if let Ok(dist) = self.eval_number(trimmed) {
                     match self.last_cursor_raw_world {
                         Some(raw) => {
                             let constrained = self.apply_constraints(raw);
@@ -16639,11 +16721,11 @@ impl CadApp {
         // (manual command-line input alongside the drag-to-set flow).
         if self.insert_live.is_some() {
             if trimmed.is_empty() { return; } // wait for a value or a click
-            let v = match trimmed.parse::<f64>() {
+            let v = match self.eval_number(trimmed) {
                 Ok(v) => v,
-                Err(_) => {
+                Err(e) => {
                     self.history.push(format!(
-                        "  ! insert: '{}' is not a number — type a value or click", trimmed));
+                        "  ! insert: {} — type a value or click", e));
                     return;
                 }
             };
@@ -16675,12 +16757,12 @@ impl CadApp {
 
         // ---- Insert ANGLE step: typed degrees (Enter=0 handled in key cascade) ----
         if let InsertState::WaitingForAngle { block, insert } = self.insert_state {
-            let rot = match trimmed.parse::<f64>() {
+            let rot = match self.eval_number(trimmed) {
                 Ok(deg) => deg.to_radians(),
-                Err(_) => {
+                Err(e) => {
                     self.history.push(format!(
-                        "  ! insert: '{}' is not an angle — type degrees, click a \
-                         direction, or Enter=0", trimmed));
+                        "  ! insert: {} — type degrees, click a \
+                         direction, or Enter=0", e));
                     return;
                 }
             };
@@ -16698,12 +16780,12 @@ impl CadApp {
             let val = if trimmed.is_empty() {
                 p.defaults[idx]
             } else {
-                match trimmed.parse::<f64>() {
+                match self.eval_number(trimmed) {
                     Ok(v) => v,
-                    Err(_) => {
+                    Err(e) => {
                         self.history.push(format!(
-                            "  ! insert: '{}' is not a number — set {} [{}] or Esc",
-                            trimmed, p.names[idx], p.defaults[idx]));
+                            "  ! insert: {} — set {} [{}] or Esc",
+                            e, p.names[idx], p.defaults[idx]));
                         self.insert_param_prompt = Some(p);
                         return;
                     }
@@ -16739,7 +16821,7 @@ impl CadApp {
                 return;
             }
             // Lenient: accepts "2", "r=2", " 2 ", etc.
-            match parse_dist_lenient(trimmed) {
+            match parse_dist_lenient(&self.calc, trimmed) {
                 Some(v) => {
                     self.env.FltRad = v;
                     let _ = self.env.save();
@@ -16769,7 +16851,7 @@ impl CadApp {
                 let d1 = if trimmed.is_empty() {
                     self.env.ChmDs1
                 } else {
-                    match parse_dist_lenient(trimmed) {
+                    match parse_dist_lenient(&self.calc, trimmed) {
                         Some(v) => { self.env.ChmDs1 = v; let _ = self.env.save(); v }
                         None => {
                             self.history.push(format!(
@@ -16789,7 +16871,7 @@ impl CadApp {
                 let d2 = if trimmed.is_empty() {
                     d1
                 } else {
-                    match parse_dist_lenient(trimmed) {
+                    match parse_dist_lenient(&self.calc, trimmed) {
                         Some(v) => { v }
                         None => {
                             self.history.push(format!(
@@ -16862,7 +16944,7 @@ impl CadApp {
             // start (uniform). Takes priority over the letter match below.
             match self.pline_width_cap {
                 PlineWidthCap::AwaitingStart { half } => {
-                    if let Ok(v) = trimmed.parse::<f64>() {
+                    if let Ok(v) = self.eval_number(trimmed) {
                         if v < 0.0 {
                             self.history.push("  ! pline width: must be ≥ 0".into());
                             return;
@@ -16882,7 +16964,7 @@ impl CadApp {
                 PlineWidthCap::AwaitingEnd { half, start } => {
                     let end = if trimmed.is_empty() {
                         start
-                    } else if let Ok(v) = trimmed.parse::<f64>() {
+                    } else if let Ok(v) = self.eval_number(trimmed) {
                         if v < 0.0 {
                             self.history.push("  ! pline width: must be ≥ 0".into());
                             return;
@@ -16904,7 +16986,7 @@ impl CadApp {
             // PLINE Arc Direction: a typed angle (degrees) while awaiting the
             // start tangent sets it directly (alternative to clicking a point).
             if self.pline_arc_sub == PlineArcSub::AwaitingDirection {
-                if let Ok(deg) = trimmed.parse::<f64>() {
+                if let Ok(deg) = self.eval_number(trimmed) {
                     let r = deg.to_radians();
                     self.pline_dir_override = Some(Vec2::new(r.cos(), r.sin()));
                     self.pline_arc_sub = PlineArcSub::Normal;
@@ -17067,7 +17149,7 @@ impl CadApp {
                 Some("r") | Some("radius") => {
                     // Inline form: `r 2`, `r 2.5`, `r r=3`, `r,2` all
                     // accepted via parse_dist_tokens leniency.
-                    let nums = parse_dist_tokens(trimmed);
+                    let nums = parse_dist_tokens(&self.calc, trimmed);
                     // First token is "r"/"radius" itself — it parses
                     // as None, so parse_dist_tokens returns only the
                     // numeric tail.
@@ -17139,7 +17221,7 @@ impl CadApp {
                     //   d 2.5 4      → (2.5, 4)
                     // parse_dist_tokens strips the leading "d"/"distance"
                     // token (returns None) and the "d1="/"d2=" prefixes.
-                    let nums = parse_dist_tokens(trimmed);
+                    let nums = parse_dist_tokens(&self.calc, trimmed);
                     if let Some(&a) = nums.first() {
                         let b = nums.get(1).copied().unwrap_or(a);
                         self.env.ChmDs1 = a;
@@ -17175,6 +17257,7 @@ impl CadApp {
         if self.offset_state != OffsetState::Off {
             let lc = trimmed.to_ascii_lowercase();
             let mut toks = lc.split_ascii_whitespace();
+            let mut toks_raw = trimmed.split_ascii_whitespace();
             match toks.next() {
                 Some("t") | Some("through") => {
                     self.offset_state = OffsetState::WaitingForObject(OffsetMode::Through);
@@ -17231,8 +17314,10 @@ impl CadApp {
                 Some("d") | Some("distance") => {
                     // AutoCAD "D" = Distance option. Accept an inline value
                     // ("d 5") or, with none, switch to Distance mode and ask
-                    // for the number (the Some(num) arm below consumes it).
-                    if let Some(v) = toks.next().and_then(|s| s.parse::<f64>().ok()) {
+                    // for the number (the arm below consumes it). The value
+                    // is the SECOND token, in ORIGINAL case (toks is
+                    // lowercased, but variables are case-sensitive).
+                    if let Some(v) = toks_raw.nth(1).and_then(|s| self.eval_number(s).ok()) {
                         if v.abs() < 1e-12 {
                             self.history.push(
                                 "  ! offset: distance must be non-zero".into());
@@ -17252,20 +17337,26 @@ impl CadApp {
                     self.refresh_offset_prompt();
                     return;
                 }
-                Some(num) if num.parse::<f64>().is_ok() => {
-                    let v: f64 = num.parse().unwrap();
-                    if v.abs() < 1e-12 {
-                        self.history.push("  ! offset: distance must be non-zero".into());
-                        return;
+                _ => {
+                    // A bare number or expression ("5", "x*2", "d=2") sets
+                    // the distance directly — evaluated in ORIGINAL case.
+                    if let Some(raw) = toks_raw.next() {
+                        if let Ok(v) = self.eval_number(raw) {
+                            if v.abs() < 1e-12 {
+                                self.history.push(
+                                    "  ! offset: distance must be non-zero".into());
+                                return;
+                            }
+                            self.env.OfsDis = v;
+                            let _ = self.env.save();
+                            self.offset_state =
+                                OffsetState::WaitingForObject(OffsetMode::Distance(v));
+                            self.history.push(format!("  offset: distance → {}", v));
+                            self.refresh_offset_prompt();
+                            return;
+                        }
                     }
-                    self.env.OfsDis = v;
-                    let _ = self.env.save();
-                    self.offset_state = OffsetState::WaitingForObject(OffsetMode::Distance(v));
-                    self.history.push(format!("  offset: distance → {}", v));
-                    self.refresh_offset_prompt();
-                    return;
                 }
-                _ => {}
             }
         }
 
@@ -17291,7 +17382,7 @@ impl CadApp {
                     return;
                 }
                 _ => {
-                    if let Ok(deg) = trimmed.parse::<f64>() {
+                    if let Ok(deg) = self.eval_number(trimmed) {
                         let rad = deg.to_radians();
                         self.apply_rotate_or_copy(pivot, rad);
                         self.rotate_state = RotateState::Off;
@@ -17325,7 +17416,7 @@ impl CadApp {
                     return;
                 }
                 _ => {
-                    if let Ok(factor) = trimmed.parse::<f64>() {
+                    if let Ok(factor) = self.eval_number(trimmed) {
                         self.apply_scale_or_copy(pivot, factor);
                         self.scale_state = ScaleState::Off;
                         self.scale_copy  = false;
@@ -17336,7 +17427,7 @@ impl CadApp {
             }
         }
         if let ScaleState::WaitingForNewLength(pivot, ref_d) = self.scale_state {
-            if let Ok(new_len) = trimmed.parse::<f64>() {
+            if let Ok(new_len) = self.eval_number(trimmed) {
                 if new_len > EPS && ref_d > EPS {
                     self.apply_scale_or_copy(pivot, new_len / ref_d);
                 }
@@ -17349,7 +17440,7 @@ impl CadApp {
         // Rotate-R target step also accepts a typed angle (degrees).
         // dtheta = typed - src_angle.
         if let RotateState::WaitingForRefTgt(pivot, src_angle) = self.rotate_state {
-            if let Ok(deg) = trimmed.parse::<f64>() {
+            if let Ok(deg) = self.eval_number(trimmed) {
                 let tgt = deg.to_radians();
                 let mut dtheta = (tgt - src_angle).rem_euclid(std::f64::consts::TAU);
                 if dtheta > std::f64::consts::PI {
@@ -18447,8 +18538,188 @@ impl CadApp {
                 self.dist_state = DistState::WaitingForP1;
                 self.set_prompt("dist: click FIRST point  [Esc=cancel]");
             }
-            Err(e) => self.history.push(format!("  ! {}", e)),
+            Err(e) => {
+                // ---- Command-line calculator & user variables ------------
+                // The parser-Err path is the ONLY calc entry point, so
+                // commands and SYSVARs always win. Handled here:
+                //   calc / calc help      → syntax summary
+                //   name=expr             → define a lazy variable
+                //   expression / var name → evaluate, echo `= value`, store `ans`
+                // Anything else keeps today's "unknown command" error.
+                if self.calc_idle_input(trimmed) {
+                    return;
+                }
+                self.history.push(format!("  ! {}", e));
+            }
         }
+    }
+
+    /// The calculator fallback at the idle command prompt (parser `Err` path).
+    /// Returns true when the input was consumed by the calculator.
+    fn calc_idle_input(&mut self, trimmed: &str) -> bool {
+        // `calc` / `calc help` — the syntax summary.
+        let lc = trimmed.to_ascii_lowercase();
+        if lc == "calc" || lc == "calc help" {
+            for line in CALC_HELP.lines() {
+                self.history.push(format!("  {}", line));
+            }
+            return true;
+        }
+        // `name=expr` — define a variable (SYSVAR names rejected).
+        match crate::calc::try_assign(&mut self.calc, trimmed) {
+            Ok(Some((name, value))) => {
+                match value {
+                    Some(v) => self.history.push(format!(
+                        "  {} = {}", name, crate::calc::fmt_value(v))),
+                    // Lazy store: not evaluable yet (unknown vars) — echo the
+                    // stored expression so the definition is visible.
+                    None => {
+                        let expr = self.calc.expr_of(&name).unwrap_or("");
+                        self.history.push(format!("  {} = {}", name, expr));
+                    }
+                }
+                self.save_calc_sidecar();
+                return true;
+            }
+            Ok(None) => {} // not an assignment — fall through
+            Err(e) => {
+                self.history.push(format!("  ! calc: {}", e));
+                return true;
+            }
+        }
+        // Bare expression / defined variable name → evaluate + store `ans`.
+        let is_defined_name = self.calc.contains(trimmed)
+            && crate::calc::valid_name(trimmed);
+        if crate::calc::looks_like_expr(&self.calc, trimmed) || is_defined_name {
+            match crate::calc::eval(&self.calc, trimmed) {
+                Ok(v) => {
+                    self.history.push(format!("  = {}", crate::calc::fmt_value(v)));
+                    self.calc.set_ans(v);
+                    return true;
+                }
+                Err(e) => {
+                    self.history.push(format!("  ! calc: {}", e));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Parse a number the way every numeric prompt does: plain `f64::parse`
+    /// fast path first (untouched — validation ranges and positive-only
+    /// checks keep working), then the calculator. The error carries the
+    /// unified `calc: <reason>` prefix.
+    fn eval_number(&self, s: &str) -> Result<f64, String> {
+        let t = s.trim();
+        if let Ok(v) = t.parse::<f64>() {
+            return Ok(v);
+        }
+        crate::calc::eval(&self.calc, t).map_err(|e| format!("calc: {}", e))
+    }
+
+    /// Same as [`Self::eval_number`] for dialog text fields.
+    fn eval_field(&self, buf: &str) -> Result<f64, String> {
+        self.eval_number(buf)
+    }
+
+    /// The string handed to `env_set` for a SYSVAR value. Numeric kinds go
+    /// through the calculator (so `setvar TxHt` then `0.3*2` works); Text /
+    /// Choice / Bool / Color keep the raw text — an expression must never
+    /// rewrite a path or an option word.
+    fn sysvar_value_string(&self, name: &str, raw: &str) -> String {
+        use crate::varreg::Kind;
+        let numeric = match crate::varreg::find(name).map(|v| v.kind) {
+            Some(Kind::Float { .. } | Kind::Int { .. } | Kind::U8 { .. }) => true,
+            _ => false,
+        };
+        if numeric {
+            if let Ok(v) = self.eval_number(raw) {
+                return crate::calc::fmt_value(v);
+            }
+        }
+        raw.to_string()
+    }
+
+    /// Persist variables to the drawing's sidecar, on a WORKER so a large
+    /// sidecar (tens of MB of furniture geometry) never freezes the command
+    /// line. A sidecar that already exists gets ONLY its `vars` field patched
+    /// (cheap, and never risks the rest of the config — the factory block,
+    /// the materials — that a fresh config would drop); a drawing with no
+    /// sidecar yet gets a fresh one built from LIVE state on the main thread
+    /// (nothing is on disk to lose).
+    ///
+    /// Skipped — variables ride on the next save/autosave instead, no error —
+    /// while a modal save/load, an autosave, or a previous patch is in
+    /// flight: writing the sidecar concurrently with `save_file_worker` could
+    /// clobber the newer config it just wrote, and a second patch could read
+    /// stale state. No drawing open → session-only, no error.
+    fn save_calc_sidecar(&mut self) {
+        if self.busy.is_some() || self.autosave_rx.is_some() || self.calc_sidecar_rx.is_some() {
+            return;
+        }
+        let Some(path) = self.current_file.clone() else { return };
+        let vars = self.calc.persist_map();
+        // A cheap stat decides the path. The no-sidecar case builds the fresh
+        // config HERE (the worker cannot borrow the app), so the new sidecar
+        // carries the live layers/materials/settings, not an empty shell.
+        let fresh = if crate::simlux_io::sidecar_path(&path).exists() {
+            None
+        } else {
+            Some(self.build_simlux_config_common())
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        self.calc_sidecar_rx = Some(rx);
+        std::thread::spawn(move || {
+            let cfg = match fresh {
+                // Sidecar exists → patch ONLY `vars`; everything else on disk
+                // stays exactly as the last save wrote it.
+                None => {
+                    let cfg = match crate::simlux_io::load(&path) {
+                        Ok(Some(mut cfg)) => {
+                            cfg.vars = vars;
+                            cfg
+                        }
+                        // Vanished between the stat and here — fall back to a
+                        // minimal record (the next real save fills the rest).
+                        Ok(None) => {
+                            let mut cfg = crate::simlux_io::SimluxConfig::default();
+                            cfg.vars = vars;
+                            cfg
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(format!(
+                                "variables stay in this session — sidecar read failed: {}", e)));
+                            return;
+                        }
+                    };
+                    cfg
+                }
+                Some(mut cfg) => {
+                    cfg.vars = vars;
+                    cfg
+                }
+            };
+            if let Err(e) = crate::simlux_io::save(&path, &cfg) {
+                let _ = tx.send(Err(format!(
+                    "variables stay in this session — sidecar save failed: {}", e)));
+                return;
+            }
+            let _ = tx.send(Ok(()));
+        });
+    }
+
+    /// Drain the calculator-variables sidecar patch result (once per frame).
+    fn tick_calc_sidecar(&mut self) {
+        let Some(rx) = &self.calc_sidecar_rx else { return };
+        use std::sync::mpsc::TryRecvError;
+        match rx.try_recv() {
+            Ok(Err(e)) => self.history.push(format!("  ! calc: {}", e)),
+            Ok(Ok(())) => {}
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {}
+        }
+        self.calc_sidecar_rx = None;
     }
 
     /// One-stop "wipe everything geometry-related". Called from the toolbar's
@@ -25819,7 +26090,7 @@ impl CadApp {
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([110.0, 18.0], egui::Label::new("Thins above").selectable(false));
-                        crate::factory::length_ui(ui, ufu, &mut f.base_z, 0.5, -1e5, 1e5)
+                        crate::factory::length_ui(ui, ufu, &mut f.base_z, 0.5, -1e5, 1e5, &self.calc)
                             .on_hover_text("The height the density above is measured at — usually ground level.");
                         ui.add(
                             egui::Slider::new(&mut f.falloff, 0.0..=0.2)
@@ -25971,7 +26242,7 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.ao.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.ao.radius, 0.02, 0.05, 3.0)
+                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.ao.radius, 0.02, 0.05, 3.0, &self.calc)
                             .on_hover_text("How far a crease reaches, in metres. 0.5 m suits rooms and furniture; raise it for large exteriors.");
                         ui.add(egui::DragValue::new(&mut s.ao.strength).update_while_editing(false).speed(0.02).range(0.0..=2.0).prefix("strength "))
                             .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
@@ -25991,7 +26262,7 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.gi.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.gi.radius, 0.05, 0.1, 8.0)
+                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.gi.radius, 0.05, 0.1, 8.0, &self.calc)
                             .on_hover_text("How far a bounce reaches. 1.5 m suits rooms; raise it for large interiors.");
                         ui.add(egui::DragValue::new(&mut s.gi.strength).update_while_editing(false).speed(0.05).range(0.0..=4.0).prefix("strength "))
                             .on_hover_text(
@@ -26022,7 +26293,7 @@ impl CadApp {
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut s.refract.ior).update_while_editing(false).speed(0.01).range(1.0..=2.5).prefix("IOR "))
                             .on_hover_text("Window glass is 1.52, water 1.33, acrylic 1.49. 1.0 is no bend at all.");
-                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.refract.thickness, 0.005, 0.0, 0.5)
+                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.refract.thickness, 0.005, 0.0, 0.5, &self.calc)
                             .on_hover_text(
                                 "How far the displacement reaches. The pass has one surface to work \
                                  with rather than a front and a back, so this stands in for the \
@@ -26045,9 +26316,9 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.ssr.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "reach ", &mut s.ssr.distance, 1.0, 1.0, 200.0)
+                        crate::factory::length_ui_pre(ui, ufu, "reach ", &mut s.ssr.distance, 1.0, 1.0, 200.0, &self.calc)
                             .on_hover_text("How far a reflected ray may travel. Longer spans a whole site and costs proportionally more steps.");
-                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.ssr.thickness, 0.05, 0.05, 5.0)
+                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.ssr.thickness, 0.05, 0.05, 5.0, &self.calc)
                             .on_hover_text(
                                 "How far behind a surface a ray may pass and still count as hitting \
                                  it. The depth buffer records one surface per pixel with no \
@@ -28060,6 +28331,7 @@ impl CadApp {
             room_max,
             self.light.ramp.rgb_fn(),
             self.light.results_stale,
+            &|s| crate::calc::parse_drag(&self.calc, s),
         );
         self.report_opts = opts;
         let n = self.report_opts.images.len().min(tex.len());
@@ -28580,23 +28852,26 @@ impl CadApp {
         // The Factory working unit — every length row below is typed and shown in it.
         let u = self.factory.units;
 
-        /// One labelled metre DragValue row.
-        fn num(ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32) {
+        // A closure (not a nested fn) so the rows can carry the calculator
+        // store — every numeric field accepts expressions like `x*2`.
+        let calc_ref = &self.calc;
+        let num = |ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32| {
             ui.horizontal(|ui| {
                 ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false));
-                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64);
+                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64, calc_ref);
             });
-        }
-        /// The same row, with the one sentence that says what the number is measured FROM. Ranges
-        /// alone don't stop someone entering a backset from the wrong edge.
-        fn num_tip(ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32, tip: &str) {
+        };
+        // Same row, with the one sentence that says what the number is
+        // measured FROM — ranges alone don't stop someone entering a backset
+        // from the wrong floor.
+        let num_tip = |ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32, tip: &str| {
             ui.horizontal(|ui| {
                 ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false))
                     .on_hover_text(tip);
-                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64)
+                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64, calc_ref)
                     .on_hover_text(tip);
             });
-        }
+        };
         fn feedback(ui: &mut egui::Ui, text: String) {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(text).small().color(crate::theme::color::ACCENT));
@@ -29119,7 +29394,7 @@ impl CadApp {
                                     ui.selectable_value(&mut m.kind, k, k.label());
                                 }
                             });
-                        crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0);
+                        crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
                         if matches!(m.kind, BaseKind::Door | BaseKind::Drawers) {
                             ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                 .on_hover_text(if m.kind == BaseKind::Door { "door leaves" } else { "drawers" });
@@ -29146,7 +29421,7 @@ impl CadApp {
                                         ui.selectable_value(&mut m.kind, k, k.label());
                                     }
                                 });
-                            crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0);
+                            crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
                             if matches!(m.kind, WallKind::Door | WallKind::Open) {
                                 ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                     .on_hover_text(if m.kind == WallKind::Door { "door leaves" } else { "shelves" });
@@ -29284,7 +29559,7 @@ impl CadApp {
                     ui.label(egui::RichText::new("Open pose").small().weak());
                     ui.add(egui::DragValue::new(&mut cb.open_deg).update_while_editing(false).speed(1.0).range(0.0..=110.0).suffix("°"))
                         .on_hover_text("swing every door leaf open by this angle (0 = shut)");
-                    crate::factory::length_ui(ui, u, &mut cb.drawer_out, 0.005, 0.0, 0.6)
+                    crate::factory::length_ui(ui, u, &mut cb.drawer_out, 0.005, 0.0, 0.6, &self.calc)
                         .on_hover_text("pull every drawer front out by this much");
                 });
 
@@ -29597,10 +29872,10 @@ impl CadApp {
                 for (i, g) in d.grommets.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
-                        crate::factory::length_ui_pre(ui, u, "x ", &mut g.x, 0.01, -1e4, 1e4);
+                        crate::factory::length_ui_pre(ui, u, "x ", &mut g.x, 0.01, -1e4, 1e4, &self.calc);
                         ui.checkbox(&mut g.rear, "rear");
                         if !g.rear {
-                            crate::factory::length_ui_pre(ui, u, "y ", &mut g.y, 0.01, -1e4, 1e4);
+                            crate::factory::length_ui_pre(ui, u, "y ", &mut g.y, 0.01, -1e4, 1e4, &self.calc);
                         }
                     });
                 }
@@ -29664,7 +29939,7 @@ impl CadApp {
                 for (i, r) in c.runs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
-                        crate::factory::length_ui(ui, u, &mut r.length, 0.01, 0.4, 6.0);
+                        crate::factory::length_ui(ui, u, &mut r.length, 0.01, 0.4, 6.0, &self.calc);
                         ui.add(
                             egui::DragValue::new(&mut r.cushions).update_while_editing(false)
                                 .speed(0.1)
@@ -30795,6 +31070,8 @@ impl CadApp {
                 Some((sname, lname))
             })
             .collect();
+        // Command-line calculator variables (minus `ans` — a session value).
+        cfg.vars = self.calc.persist_map();
         cfg
     }
 
@@ -30842,10 +31119,16 @@ impl CadApp {
     /// but does NOT touch furniture geometry, so it stays fast even for a huge asset.
     fn install_simlux_config(
         &mut self,
-        cfg: crate::simlux_io::SimluxConfig,
+        mut cfg: crate::simlux_io::SimluxConfig,
         furniture: Vec<crate::factory::FurnitureAsset>,
     ) {
         {
+                // Command-line calculator variables, BEFORE `cfg` is consumed
+                // below. Loading REPLACES the session store — the drawing's
+                // variables are the drawing's.
+                self.calc = crate::calc::CalcStore::from_persist(
+                    std::mem::take(&mut cfg.vars),
+                );
                 // Resolve wall centerline linetypes by NAME → current ids (positional).
                 self.wall_centerline_ltype.clear();
                 for (sname, lname) in &cfg.wall_centerline {
@@ -33881,7 +34164,16 @@ impl CadApp {
                     "  ! block: select objects first (Select objects…)".into());
                 self.block_dialog = Some(dialog);
             } else {
-                let base = dialog.base_point();
+                let base = match dialog.base_point(&self.calc) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Expression error — keep the dialog open, keep the
+                        // typed text, show why.
+                        self.history.push(format!("  ! {e}"));
+                        self.block_dialog = Some(dialog);
+                        return;
+                    }
+                };
                 let smart = dialog.smart;
                 self.apply_block_create(&name, base, dialog.color_aci, smart);
                 // Smart block → jump STRAIGHT into the isolated Block Editor to
@@ -34007,14 +34299,38 @@ impl CadApp {
                 let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
                 for (k, (_, txt)) in dlg.params.iter().enumerate() {
                     if k < cad_kernel::MAX_BLOCK_PARAMS {
-                        pv[k] = txt.trim().parse().unwrap_or(0.0);
+                        match self.eval_field(txt) {
+                            Ok(v) => pv[k] = v,
+                            Err(e) => {
+                                // Expression error — keep the dialog open.
+                                self.history.push(format!("  ! {e}"));
+                                self.insert_dialog = Some(dlg);
+                                return;
+                            }
+                        }
                     }
                 }
+                let scale = match dlg.scale_f(&self.calc) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.history.push(format!("  ! {e}"));
+                        self.insert_dialog = Some(dlg);
+                        return;
+                    }
+                };
+                let rotation = match dlg.rot_rad(&self.calc) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.history.push(format!("  ! {e}"));
+                        self.insert_dialog = Some(dlg);
+                        return;
+                    }
+                };
                 // Do NOT place yet — insert ALWAYS follows a click. Arm the
                 // configured block; the next canvas click sets its insertion
                 // point (with a live shade preview following the cursor).
                 self.pending_insert = Some(PendingInsert {
-                    block: id, scale: dlg.scale_f(), rotation: dlg.rot_rad(),
+                    block: id, scale, rotation,
                     param_values: pv,
                 });
                 self.insert_state = InsertState::WaitingForPoint { block: id };
@@ -34758,7 +35074,7 @@ impl CadApp {
             return;
         }
         // A typed coordinate `x,y` is a POINT answer in every step.
-        if let Some(p) = parse_xy(raw) { self.flow_input_point(p); return; }
+        if let Some(p) = parse_xy(&self.calc, raw) { self.flow_input_point(p); return; }
         match step {
             CircleStep::Center => match low.as_str() {
                 "3p" => self.flow_to("3P", CircleStep::P3a),
@@ -34772,21 +35088,21 @@ impl CadApp {
             CircleStep::Radius(c) => {
                 if low == "d" || low == "diameter" {
                     self.flow_to("D", CircleStep::Diameter(c));
-                } else if let Ok(rad) = low.parse::<f64>() {
+                } else if let Ok(rad) = self.eval_number(raw) {
                     self.flow_finish_circle(format!("{}", rad), c, rad);
                 } else {
                     self.history.push("  ! need a radius number, D, or a point".into());
                 }
             }
             CircleStep::Diameter(c) => {
-                if let Ok(d) = low.parse::<f64>() {
+                if let Ok(d) = self.eval_number(raw) {
                     self.flow_finish_circle(format!("{}", d), c, d * 0.5);
                 } else {
                     self.history.push("  ! need a diameter number".into());
                 }
             }
             CircleStep::TtrRadius(o1, pk1, o2, pk2) => {
-                if let Ok(rad) = low.parse::<f64>() {
+                if let Ok(rad) = self.eval_number(raw) {
                     if rad <= 1e-9 {
                         self.history.push("  ! radius must be > 0".into());
                         return;
@@ -35104,7 +35420,7 @@ impl CadApp {
             ZoomState::Off => {}
             ZoomState::Menu => {
                 // (empty Enter → real-time is handled in the update() cascade)
-                if let Some(p) = parse_xy(s) {
+                if let Some(p) = parse_xy(&self.calc, s) {
                     // typed coordinate = first corner of an implicit Window
                     self.zoom_set_state(ZoomState::WinSecond(p),
                         "zoom window: specify OPPOSITE corner");
@@ -35141,7 +35457,7 @@ impl CadApp {
                 }
             }
             ZoomState::CenterPoint => {
-                if let Some(p) = parse_xy(s) {
+                if let Some(p) = parse_xy(&self.calc, s) {
                     self.zoom_set_state(ZoomState::CenterMag(p),
                         "zoom center: enter magnification (nX) or height <Enter=keep>");
                 } else {
@@ -35153,7 +35469,7 @@ impl CadApp {
                 if let Some(f) = parse_scale_x(&low) {
                     self.zoom_center(c, None, Some(f));
                     self.zoom_finish();
-                } else if let Ok(h) = low.parse::<f64>() {
+                } else if let Ok(h) = self.eval_number(s) {
                     self.zoom_center(c, Some(h), None);
                     self.zoom_finish();
                 } else {
@@ -35161,7 +35477,7 @@ impl CadApp {
                 }
             }
             ZoomState::WinFirst => {
-                if let Some(p) = parse_xy(s) {
+                if let Some(p) = parse_xy(&self.calc, s) {
                     self.zoom_set_state(ZoomState::WinSecond(p),
                         "zoom window: specify OPPOSITE corner");
                 } else {
@@ -35169,7 +35485,7 @@ impl CadApp {
                 }
             }
             ZoomState::WinSecond(a) => {
-                if let Some(p) = parse_xy(s) {
+                if let Some(p) = parse_xy(&self.calc, s) {
                     self.zoom_window(a, p);
                     self.zoom_finish();
                 } else {
@@ -36560,21 +36876,33 @@ impl CadApp {
             }
             Kind::U8 { min, max } => {
                 let mut n: u8 = cur.parse().unwrap_or(min);
-                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)).changed() {
+                // Expressions commit too, but an integer setting must come
+                // out WHOLE — no silent rounding of `2.5*2`.
+                let calc = &self.calc;
+                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)
+                    .custom_parser(move |s| {
+                        crate::calc::parse_drag_int(calc, s, min as i64, max as i64).map(|n| n as f64)
+                    })).changed() {
                     changed = Some(n.to_string());
                 }
             }
             Kind::Int { min, max } => {
                 let mut n: i64 = cur.parse().unwrap_or(min);
-                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)).changed() {
+                let calc = &self.calc;
+                if ui.add(egui::DragValue::new(&mut n).update_while_editing(false).range(min..=max)
+                    .custom_parser(move |s| {
+                        crate::calc::parse_drag_int(calc, s, min, max).map(|n| n as f64)
+                    })).changed() {
                     changed = Some(n.to_string());
                 }
             }
             Kind::Float { min, max } => {
                 let mut f: f64 = cur.parse().unwrap_or(0.0);
                 let speed = ((max - min) / 500.0).clamp(0.001, 1.0);
-                if ui.add(egui::DragValue::new(&mut f).update_while_editing(false).range(min..=max).speed(speed)).changed() {
-                    changed = Some(format!("{}", f));
+                let calc = &self.calc;
+                if ui.add(egui::DragValue::new(&mut f).update_while_editing(false).range(min..=max).speed(speed)
+                    .custom_parser(move |s| crate::calc::parse_drag(calc, s))).changed() {
+                    changed = Some(crate::calc::fmt_value(f));
                 }
             }
             Kind::Choice(names) => {
@@ -36628,7 +36956,10 @@ impl CadApp {
         };
         let canon = var.name;
         if !value.trim().is_empty() {
-            match crate::varreg::env_set(&mut self.env, canon, value.trim()) {
+            // Numeric SYSVARs go through the calculator — `setvar TxHt 0.3*2`
+            // sets 0.6, same as the two-step `setvar TxHt` → reply form.
+            let vstr = self.sysvar_value_string(canon, value.trim());
+            match crate::varreg::env_set(&mut self.env, canon, &vstr) {
                 Ok(_) => {
                     let _ = self.env.save();
                     let nv = crate::varreg::env_get(&self.env, canon).unwrap_or_default();
@@ -42107,6 +42438,8 @@ impl eframe::App for CadApp {
 
         // Autosave: silent background re-save of the current file a few minutes after an edit.
         self.tick_autosave();
+        // Calculator-variables sidecar patch (worker) — drain its result.
+        self.tick_calc_sidecar();
 
         // Menu-layout recorder: arm geometry capture for THIS whole frame and
         // reset the shared buffer BEFORE any panel/menu renders. Every menu that
@@ -42896,10 +43229,13 @@ impl eframe::App for CadApp {
                 self.set_prompt(format!(
                     "wall: type thickness then Enter  (current {})", self.env.WlThk));
                 handled = true;
-            } else if let Some(rest) = s.strip_prefix('t') {
-                if let Ok(v) = rest.trim().parse::<f64>() { new_thk = Some(v); handled = true; }
+            } else if s.starts_with('t') && s.len() > 1 {
+                // `t <expr>` — evaluate the ORIGINAL case (variables are
+                // case-sensitive, so a lowercased copy must not be used).
+                let rest_raw = &self.cmd.trim()[1..];
+                if let Ok(v) = self.eval_number(rest_raw.trim()) { new_thk = Some(v); handled = true; }
             } else if self.wall_waiting_thickness {
-                if let Ok(v) = s.parse::<f64>() { new_thk = Some(v); handled = true; }
+                if let Ok(v) = self.eval_number(&self.cmd) { new_thk = Some(v); handled = true; }
             }
             if let Some(v) = new_thk {
                 if v > 1e-9 {
@@ -43488,7 +43824,7 @@ impl eframe::App for CadApp {
                                 set_active = Some(i);
                             }
                             let u = self.factory.units;
-                            if crate::factory::length_ui(ui, u, &mut h, 0.05, 0.1, 30.0)
+                            if crate::factory::length_ui(ui, u, &mut h, 0.05, 0.1, 30.0, &self.calc)
                                 .on_hover_text("Floor-to-floor height — levels above move to suit")
                                 .changed()
                             {
@@ -43558,7 +43894,7 @@ impl eframe::App for CadApp {
                         ui.label("Building height");
                         let u = self.factory.units;
                         let mut bh = self.factory.building_height;
-                        let r = crate::factory::length_ui(ui, u, &mut bh, 0.05, 0.05, 500.0)
+                        let r = crate::factory::length_ui(ui, u, &mut bh, 0.05, 0.05, 500.0, &self.calc)
                             .on_hover_text(
                                 "Storey height the structure rises to.\n\
                                  Changing it RESIZES a building already standing — it is not only \
@@ -43878,17 +44214,31 @@ impl eframe::App for CadApp {
 
                         ui.horizontal(|ui| {
                             ui.label("columns");
+                            // Count fields are integers: `3*3` commits, `2.5*2`
+                            // does not (no silent rounding).
+                            let calc = &self.calc;
                             ui.add(egui::DragValue::new(&mut self.array_cols).update_while_editing(false)
-                                .range(1..=3000_usize).speed(1));
+                                .range(1..=3000_usize).speed(1)
+                                .custom_parser(move |s| {
+                                    crate::calc::parse_drag_int(calc, s, 1, 3000).map(|n| n as f64)
+                                }));
                             ui.label("× rows");
+                            let calc = &self.calc;
                             ui.add(egui::DragValue::new(&mut self.array_rows).update_while_editing(false)
-                                .range(1..=3000_usize).speed(1));
+                                .range(1..=3000_usize).speed(1)
+                                .custom_parser(move |s| {
+                                    crate::calc::parse_drag_int(calc, s, 1, 3000).map(|n| n as f64)
+                                }));
                         });
                         ui.horizontal(|ui| {
                             ui.label("dx");
-                            ui.add(egui::DragValue::new(&mut self.array_dx).update_while_editing(false).speed(1.0));
+                            let calc = &self.calc;
+                            ui.add(egui::DragValue::new(&mut self.array_dx).update_while_editing(false).speed(1.0)
+                                .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
                             ui.label("    dy");
-                            ui.add(egui::DragValue::new(&mut self.array_dy).update_while_editing(false).speed(1.0));
+                            let calc = &self.calc;
+                            ui.add(egui::DragValue::new(&mut self.array_dy).update_while_editing(false).speed(1.0)
+                                .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
                         });
                         let cells = self.array_cols * self.array_rows;
                         let new_dobjects = cells.saturating_sub(1) * sources.len().max(1);
@@ -49484,26 +49834,34 @@ fn draw_polyline_full_ellipse(
 ///   " 2.5 "      → Some(2.5)
 ///   "d1=2"       → Some(2.0)   (strips "d1=", "d2=", "r=" prefixes)
 ///   "r=3"        → Some(3.0)
+///   "r=2*2"      → Some(4.0)   (the rest goes through the calculator)
 /// Returns None for anything else (including empty string — caller
 /// should test for empty before calling).
-fn parse_dist_lenient(raw: &str) -> Option<f64> {
+fn parse_dist_lenient(store: &crate::calc::CalcStore, raw: &str) -> Option<f64> {
     let t = raw.trim();
     if t.is_empty() { return None; }
+    // Match the prefix case-insensitively, but slice it off the ORIGINAL-case
+    // string — variables are case-sensitive, so `r=H` must evaluate `H`, not
+    // a lowercased `h`. The prefixes are ASCII, so byte slicing is safe.
     let lower = t.to_ascii_lowercase();
-    let cleaned = if let Some(rest) = lower.strip_prefix("d1=") { rest.to_string() }
-        else if let Some(rest) = lower.strip_prefix("d2=")      { rest.to_string() }
-        else if let Some(rest) = lower.strip_prefix("r=")       { rest.to_string() }
-        else { t.to_string() };
-    cleaned.trim().parse::<f64>().ok()
+    let cleaned: &str = if lower.starts_with("d1=") { &t[3..] }
+        else if lower.starts_with("d2=")      { &t[3..] }
+        else if lower.starts_with("r=")       { &t[2..] }
+        else { t };
+    let c = cleaned.trim();
+    if let Ok(v) = c.parse::<f64>() {
+        return Some(v);
+    }
+    crate::calc::eval(store, c).ok()
 }
 
 /// Tokenize a distance phrase into numeric values, lenient about
 /// separators. Accepts both whitespace and commas (and "d1=", "d2=",
 /// "r=" prefixes on each token). E.g. "2,3" → [2,3]; "d1=2 d2=3" →
-/// [2,3]; "2 3 4" → [2,3,4].
-fn parse_dist_tokens(raw: &str) -> Vec<f64> {
+/// [2,3]; "2 3 4" → [2,3,4]. Each numeric token may be an expression.
+fn parse_dist_tokens(store: &crate::calc::CalcStore, raw: &str) -> Vec<f64> {
     raw.split(|c: char| c.is_whitespace() || c == ',')
-        .filter_map(|s| if s.is_empty() { None } else { parse_dist_lenient(s) })
+        .filter_map(|s| if s.is_empty() { None } else { parse_dist_lenient(store, s) })
         .collect()
 }
 
@@ -58433,14 +58791,14 @@ mod command_target {
     fn the_coordinate_may_be_written_several_ways() {
         let u = cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
         for form in ["@900,0,0", "@(900,0,0)", "@(900, 0, 0)", "@900 0 0", "@900,0"] {
-            let got = CadApp::parse_at_coords(form, u)
+            let got = CadApp::parse_at_coords(form, u, &crate::calc::CalcStore::new())
                 .unwrap_or_else(|| panic!("{form} must parse"));
             assert!((got[0] - 900.0).abs() < 1e-3, "{form} → {got:?}");
             assert!(got[1].abs() < 1e-6 && got[2].abs() < 1e-6, "{form} → {got:?}");
         }
         // …and nonsense is refused rather than silently read as zero.
         for bad in ["@", "@abc", "@1", "@1,2,3,4", "900,0,0"] {
-            assert!(CadApp::parse_at_coords(bad, u).is_none(), "{bad} must not parse");
+            assert!(CadApp::parse_at_coords(bad, u, &crate::calc::CalcStore::new()).is_none(), "{bad} must not parse");
         }
     }
 
@@ -68160,5 +68518,167 @@ mod the_real_projects_lux {
             );
         }
         println!("\nDIALux, same plan, EN grid:      240.0     6.85    853.0   0.029");
+    }
+}
+
+#[cfg(test)]
+mod calc_command_tests {
+    use super::*;
+
+    /// The idle-prompt calculator: bare expressions evaluate, echo `= value`,
+    /// and store `ans`. Commands still win (a known command never reaches it).
+    #[test]
+    fn idle_expressions_evaluate_and_store_ans() {
+        let mut app = CadApp::default();
+        app.run_command("2+3*4");
+        assert!(app.history.iter().any(|h| h == "  = 14"), "history: {:?}", app.history);
+        assert!(app.calc.contains("ans"));
+        app.run_command("ans/5");
+        assert!(app.history.iter().any(|h| h == "  = 2.8"), "history: {:?}", app.history);
+    }
+
+    #[test]
+    fn assignments_define_lazy_variables() {
+        let mut app = CadApp::default();
+        app.run_command("x=5");
+        assert!(app.history.iter().any(|h| h == "  x = 5"), "history: {:?}", app.history);
+        app.run_command("x*2");
+        assert!(app.history.iter().any(|h| h == "  = 10"), "history: {:?}", app.history);
+        // Lazy: re-evaluation after the definition changes.
+        app.run_command("w=3");
+        app.run_command("hh=w*2");
+        app.run_command("hh");
+        assert!(app.history.iter().any(|h| h == "  = 6"), "history: {:?}", app.history);
+        app.run_command("w=7");
+        app.run_command("hh");
+        assert!(app.history.iter().any(|h| h == "  = 14"), "history: {:?}", app.history);
+    }
+
+    /// A lazy definition that references an undefined variable stores fine —
+    /// the error surfaces at USE, not at definition.
+    #[test]
+    fn unknown_variables_error_at_use_not_definition() {
+        let mut app = CadApp::default();
+        app.run_command("hh=w*2");
+        assert!(!app.history.last().unwrap().starts_with("  !"),
+            "definition must succeed: {:?}", app.history.last());
+        app.run_command("hh+0");
+        assert!(app.history.iter().any(|h| h.starts_with("  ! calc: unknown variable 'w'")),
+            "history: {:?}", app.history);
+    }
+
+    #[test]
+    fn cycles_are_reported() {
+        let mut app = CadApp::default();
+        app.run_command("q1=q2");
+        app.run_command("q2=q1");
+        app.run_command("q1");
+        assert!(app.history.iter().any(|h| h.starts_with("  ! calc: variable cycle: q1 → q2 → q1")),
+            "history: {:?}", app.history);
+    }
+
+    #[test]
+    fn trig_is_in_degrees_and_functions_work() {
+        let mut app = CadApp::default();
+        app.run_command("sin(30)");
+        assert!(app.history.iter().any(|h| h == "  = 0.5"), "history: {:?}", app.history);
+        app.run_command("sqrt(16)+2^3");
+        assert!(app.history.iter().any(|h| h == "  = 12"), "history: {:?}", app.history);
+    }
+
+    #[test]
+    fn pasted_spaces_are_tolerated() {
+        let mut app = CadApp::default();
+        app.run_command("2 + 3");
+        assert!(app.history.iter().any(|h| h == "  = 5"), "history: {:?}", app.history);
+    }
+
+    /// SYSVAR names keep today's meaning: a bare name is a SYSVAR query/set,
+    /// and defining a VARIABLE with a SYSVAR name is rejected.
+    #[test]
+    fn sysvar_names_are_reserved() {
+        let mut app = CadApp::default();
+        app.run_command("CrsHrS=5");
+        assert!(app.history.iter().any(|h| h.starts_with("  ! calc: 'CrsHrS' is a system variable")),
+            "history: {:?}", app.history);
+        assert!(!app.calc.contains("CrsHrS"), "nothing stored");
+        // A bare SYSVAR name still behaves as a SYSVAR (today's path).
+        app.run_command("CrsHrS");
+        assert!(app.history.iter().any(|h| h.contains("CrsHrS")), "history: {:?}", app.history);
+    }
+
+    /// Commands always win: `m` is Move even if a variable named `m` exists.
+    #[test]
+    fn commands_beat_variables_at_the_idle_prompt() {
+        let mut app = CadApp::default();
+        app.run_command("m=5");
+        app.run_command("m");
+        // `m` ran MOVE — no `= 5` echo for it, and a move flow started.
+        assert!(app.history.iter().all(|h| h != "  = 5"), "history: {:?}", app.history);
+    }
+
+    /// A malformed expression reports `! calc: …` and keeps the unknown
+    /// command error quiet.
+    #[test]
+    fn syntax_errors_are_calc_errors() {
+        let mut app = CadApp::default();
+        app.run_command("2+");
+        assert!(app.history.iter().any(|h| h.starts_with("  ! calc: syntax error")),
+            "history: {:?}", app.history);
+    }
+
+    /// `calc` prints the syntax summary.
+    #[test]
+    fn calc_help_prints_the_summary() {
+        let mut app = CadApp::default();
+        app.run_command("calc");
+        assert!(app.history.iter().any(|h| h.contains("expression calculator")),
+            "history: {:?}", app.history);
+    }
+
+    /// Assignment with a drawing open patches the sidecar immediately; the
+    /// expressions come back verbatim (string storage — no float drift).
+    #[test]
+    fn variables_survive_the_sidecar_round_trip() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::DocUnits::default();
+        let dir = std::env::temp_dir().join("calc_sidecar_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("calcvars.rsm");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(&path));
+        app.current_file = Some(path.clone());
+        app.run_command("w=2");
+        // The sidecar write is a background patch — wait for it (and let the
+        // NEXT assignment see the finished state, one patch at a time).
+        wait_for_calc_sidecar(&mut app);
+        // No spaces around `=` (Space=Enter submits; a spaced form like
+        // "hh = w*2.5" parses as a Hatch command and commands win).
+        app.run_command("hh=w*2.5");
+        wait_for_calc_sidecar(&mut app);
+        // The sidecar write happened at assignment time.
+        let side = crate::simlux_io::sidecar_path(&path);
+        assert!(side.exists(), "assignment with a drawing open writes the sidecar");
+        let cfg = crate::simlux_io::load(&path).expect("load").expect("sidecar present");
+        assert_eq!(cfg.vars.get("hh").map(String::as_str), Some("w*2.5"));
+        // Reopen: the store is rebuilt from the sidecar (a fresh app).
+        let mut reopened = CadApp::default();
+        reopened.calc = crate::calc::CalcStore::from_persist(cfg.vars);
+        reopened.run_command("hh+0");
+        assert!(reopened.history.iter().any(|h| h == "  = 5"), "history: {:?}", reopened.history);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&side);
+    }
+
+    /// Poll the calculator sidecar patch worker until it finishes.
+    fn wait_for_calc_sidecar(app: &mut CadApp) {
+        for _ in 0..400 {
+            if app.calc_sidecar_rx.is_none() {
+                return;
+            }
+            app.tick_calc_sidecar();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("calc sidecar patch did not finish");
     }
 }
