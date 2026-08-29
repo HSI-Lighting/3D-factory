@@ -69,6 +69,11 @@ pub struct LineInstance {
     pub by:     f32,
     pub half_w: f32,   // world-space HALF stroke width (screen-min applied CPU-side)
     pub color:  u32,
+    /// Cap flags — bit0: round cap at A, bit1: round cap at B. Chained
+    /// segments (polyline/spline/wall interiors) set both ends so the
+    /// overlapping half-discs union into a seamless ROUND JOIN; terminal
+    /// ends stay butt. Zero-length flag = butt both ends (classic line).
+    pub flags:  u32,
 }
 
 /// One vertex of a filled triangle. Fills are NOT instanced — the CPU emits
@@ -90,6 +95,10 @@ struct GpuPipeline {
     vao:          glow::VertexArray,
     instance_vbo: glow::Buffer,
     u_view:       Option<glow::UniformLocation>,
+    /// Stroke AA head-room added to the analytic quad radius/axes (world
+    /// units). The quad must extend past the ring/SDF band or the outline
+    /// clips at the quad edge (issue #30).
+    u_pad:        Option<glow::UniformLocation>,
 }
 
 pub struct GpuShapeRenderer {
@@ -99,6 +108,22 @@ pub struct GpuShapeRenderer {
     line:     Option<GpuPipeline>,
     fill:     Option<GpuPipeline>,
     quad_vbo: Option<glow::Buffer>,
+    /// Set ONCE if GL init (shader compile / link / buffer or VAO creation)
+    /// fails — e.g. a GLES/ANGLE or GL<3.3 context that can't handle
+    /// `#version 330 core`. Then `ensure_init` no-ops (no per-frame retry spam)
+    /// and the main thread reverts to CPU. `None` = not yet failed. (GP4/WP1.7.)
+    init_error: Option<String>,
+    /// P0 render profiling — GL-thread upload+draw µs of the last `render()`
+    /// call (dominated by the per-frame `buffer_data` uploads that B25 caches).
+    pub last_frame_us: u64,
+    /// P0.1 — when true, `render()` calls `gl.finish()` so `last_frame_us`
+    /// includes GPU draw EXECUTION (not just the CPU-side submit). A full
+    /// pipeline stall — enabled ONLY while the P-Test runs.
+    pub profile_finish: bool,
+    /// B25: vertex/instance counts of the last uploaded buffers, so a cached
+    /// frame can redraw the persisted VBOs without re-uploading. Order:
+    /// [fill_verts, circles, arcs, ellipses, lines].
+    pub last_counts: [usize; 5],
 }
 
 // Safety: see module note — glow handles are integer ids; only *use* happens on
@@ -108,7 +133,9 @@ unsafe impl Sync for GpuShapeRenderer {}
 
 impl Default for GpuShapeRenderer {
     fn default() -> Self {
-        Self { circle: None, arc: None, ellipse: None, line: None, fill: None, quad_vbo: None }
+        Self { circle: None, arc: None, ellipse: None, line: None, fill: None,
+               quad_vbo: None, init_error: None, last_frame_us: 0, profile_finish: false,
+               last_counts: [0; 5] }
     }
 }
 
@@ -120,11 +147,12 @@ const CIRCLE_VS: &str = r#"
     layout(location=1) in vec3  a_circ;     // x, y, r
     layout(location=2) in uint  a_color;
     uniform mat4 u_view;
+    uniform float u_pad;
     out vec2       v_local;
     flat out vec4  v_color;
     void main() {
         v_local = a_quad;
-        vec2 world = a_circ.xy + a_quad * a_circ.z;
+        vec2 world = a_circ.xy + a_quad * (a_circ.z + u_pad);
         gl_Position = u_view * vec4(world, 0.0, 1.0);
         v_color = vec4(
             float((a_color >> 24) & 0xFFu) / 255.0,
@@ -165,13 +193,14 @@ const ARC_VS: &str = r#"
     layout(location=2) in vec2  a_ang;      // a0, sweep (CCW, 0..TAU)
     layout(location=3) in uint  a_color;
     uniform mat4 u_view;
+    uniform float u_pad;
     out vec2       v_local;
     flat out float v_a0;
     flat out float v_sweep;
     flat out vec4  v_color;
     void main() {
         v_local = a_quad;
-        vec2 world = a_arc.xy + a_quad * a_arc.z;
+        vec2 world = a_arc.xy + a_quad * (a_arc.z + u_pad);
         gl_Position = u_view * vec4(world, 0.0, 1.0);
         v_a0 = a_ang.x;
         v_sweep = a_ang.y;
@@ -222,6 +251,7 @@ const ELLIPSE_VS: &str = r#"
     layout(location=2) in float a_rot;
     layout(location=3) in uint  a_color;
     uniform mat4 u_view;
+    uniform float u_pad;
     out vec2       v_local;
     flat out float v_a;
     flat out float v_b;
@@ -229,7 +259,7 @@ const ELLIPSE_VS: &str = r#"
     flat out vec4  v_color;
     void main() {
         v_local = a_quad;
-        vec2 world = a_el.xy + a_quad * a_el.z;   // a_el.z = semi-major
+        vec2 world = a_el.xy + a_quad * (a_el.z + u_pad);   // a_el.z = semi-major
         gl_Position = u_view * vec4(world, 0.0, 1.0);
         v_a = a_el.z; v_b = a_el.w; v_rot = a_rot;
         v_color = vec4(
@@ -272,17 +302,22 @@ const ELLIPSE_FS: &str = r#"
 // Line: the unit quad is oriented along the segment and extruded ±(half_w*PAD)
 // perpendicular so the SDF anti-aliasing band has room. Width comes from the
 // per-instance half_w (fix: NOT re-derived from fwidth), so lineweights work.
+// The quad extends half_w PAST the endpoints where a round cap flag is set —
+// the fragment shader's distance-to-endpoint SDF then draws the half-disc, and
+// chained segments' overlapping discs union into seamless round joins.
 const LINE_VS: &str = r#"
     #version 330 core
     layout(location=0) in vec2  a_quad;      // unit quad corners [-1,1]
     layout(location=1) in vec4  a_line_ab;   // ax,ay,bx,by (camera-relative)
     layout(location=2) in float a_half_w;    // world-space half stroke width
     layout(location=3) in uint  a_color;
+    layout(location=4) in uint  a_flags;     // bit0/bit1: round cap at A/B
     uniform mat4 u_view;
     flat out vec4  v_color;
     flat out vec2  v_a;
     flat out vec2  v_b;
     flat out float v_half_w;
+    flat out vec2  v_caps;
     out vec2       v_pos;
     void main() {
         vec2 a = a_line_ab.xy;
@@ -293,11 +328,14 @@ const LINE_VS: &str = r#"
         vec2 n = vec2(-d.y, d.x);
         float PAD = 2.5;                       // AA head-room around the stroke
         float ext = a_half_w * PAD;
-        float u = (a_quad.x * 0.5 + 0.5) * len;
+        float cap_a = ((a_flags & 1u) != 0u) ? a_half_w : 0.0;
+        float cap_b = ((a_flags & 2u) != 0u) ? a_half_w : 0.0;
+        float u = mix(-cap_a, len + cap_b, a_quad.x * 0.5 + 0.5);
         float v = a_quad.y * ext;
         vec2 world = a + d * u + n * v;
         gl_Position = u_view * vec4(world, 0.0, 1.0);
         v_pos = world; v_a = a; v_b = b; v_half_w = a_half_w;
+        v_caps = vec2(cap_a > 0.0 ? 1.0 : 0.0, cap_b > 0.0 ? 1.0 : 0.0);
         v_color = vec4(
             float((a_color >> 24) & 0xFFu) / 255.0,
             float((a_color >> 16) & 0xFFu) / 255.0,
@@ -313,15 +351,18 @@ const LINE_FS: &str = r#"
     flat in vec2  v_a;
     flat in vec2  v_b;
     flat in float v_half_w;
+    flat in vec2  v_caps;
     in vec2       v_pos;
     out vec4 frag;
-    float sd_line(vec2 p, vec2 a, vec2 b) {
-        vec2 pa = p - a, ba = b - a;
-        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-9), 0.0, 1.0);
-        return length(pa - ba * h);
-    }
     void main() {
-        float dist = sd_line(v_pos, v_a, v_b);
+        vec2 pa = v_pos - v_a, ba = v_b - v_a;
+        float h = dot(pa, ba) / max(dot(ba, ba), 1e-9);
+        // Beyond an end without its round-cap flag: butt cut (the quad ends at
+        // the end plane). With the flag: distance to the endpoint = half-disc.
+        if (h < 0.0 && v_caps.x < 0.5) discard;
+        if (h > 1.0 && v_caps.y < 0.5) discard;
+        float hc = clamp(h, 0.0, 1.0);
+        float dist = length(pa - ba * hc);
         float aa = fwidth(dist);
         float half_w = max(v_half_w, 0.5 * aa);   // never thinner than ~1px on screen
         if (dist > half_w + aa) discard;
@@ -359,59 +400,89 @@ const FILL_FS: &str = r#"
 "#;
 
 impl GpuShapeRenderer {
-    /// Compile programs + create buffers, idempotently.
+    /// True once GL init has FAILED (fail-soft — the main thread reverts to CPU).
+    pub fn init_failed(&self) -> bool { self.init_error.is_some() }
+
+    /// The GL-init failure message, if any (for the CPU-revert notice / logs).
+    pub fn init_error(&self) -> Option<&str> { self.init_error.as_deref() }
+
+    /// Test-only: force the init-failed state (a unit test has no GL context to
+    /// trigger a real shader-compile failure).
+    #[cfg(test)]
+    pub fn set_init_error_for_test(&mut self, e: String) { self.init_error = Some(e); }
+
+    /// Compile programs + create buffers, idempotently. FAIL-SOFT (GP4/WP1.7):
+    /// on ANY GL error (shader compile/link, buffer/VAO creation — common on a
+    /// GLES/ANGLE or GL<3.3 context) it records `init_error`, clears any partial
+    /// state, and returns WITHOUT drawing. Once failed it no-ops (no retry spam);
+    /// the draw path then no-ops on the `None` pipelines and the main thread
+    /// reverts render_mode to CPU.
     pub fn ensure_init(&mut self, gl: &glow::Context) {
-        if self.quad_vbo.is_some() { return; }
-        unsafe {
-            let quad: [f32; 12] = [
-                -1.0, -1.0,  1.0, -1.0,  1.0,  1.0,
-                -1.0, -1.0,  1.0,  1.0, -1.0,  1.0,
-            ];
-            let qvbo = gl.create_buffer().unwrap();
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(qvbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&quad), glow::STATIC_DRAW);
-            self.quad_vbo = Some(qvbo);
-
-            self.circle  = Some(Self::build_circle(gl, qvbo));
-            self.arc     = Some(Self::build_arc(gl, qvbo));
-            self.ellipse = Some(Self::build_ellipse(gl, qvbo));
-            self.line    = Some(Self::build_line(gl, qvbo));
-            self.fill    = Some(Self::build_fill(gl));
-
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
-            gl.bind_vertex_array(None);
+        if self.init_error.is_some() || self.quad_vbo.is_some() { return; }
+        if let Err(e) = unsafe { self.try_init(gl) } {
+            // Drop any half-built state so the draw path stays a clean no-op.
+            self.circle = None; self.arc = None; self.ellipse = None;
+            self.line = None; self.fill = None; self.quad_vbo = None;
+            eprintln!("GPU init failed — reverting to CPU:\n{}", e);
+            self.init_error = Some(e);
         }
     }
 
-    unsafe fn compile(gl: &glow::Context, vs_src: &str, fs_src: &str) -> glow::Program {
-        let program = gl.create_program().expect("create_program");
-        let compile = |src: &str, kind: u32| -> glow::Shader {
-            let s = gl.create_shader(kind).expect("create_shader");
+    unsafe fn try_init(&mut self, gl: &glow::Context) -> Result<(), String> {
+        let quad: [f32; 12] = [
+            -1.0, -1.0,  1.0, -1.0,  1.0,  1.0,
+            -1.0, -1.0,  1.0,  1.0, -1.0,  1.0,
+        ];
+        let qvbo = gl.create_buffer()?;
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(qvbo));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(&quad), glow::STATIC_DRAW);
+        self.quad_vbo = Some(qvbo);
+
+        self.circle  = Some(Self::build_circle(gl, qvbo)?);
+        self.arc     = Some(Self::build_arc(gl, qvbo)?);
+        self.ellipse = Some(Self::build_ellipse(gl, qvbo)?);
+        self.line    = Some(Self::build_line(gl, qvbo)?);
+        self.fill    = Some(Self::build_fill(gl)?);
+
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        gl.bind_vertex_array(None);
+        Ok(())
+    }
+
+    unsafe fn compile(gl: &glow::Context, vs_src: &str, fs_src: &str)
+        -> Result<glow::Program, String>
+    {
+        let program = gl.create_program()?;
+        let compile = |src: &str, kind: u32| -> Result<glow::Shader, String> {
+            let s = gl.create_shader(kind)?;
             gl.shader_source(s, src);
             gl.compile_shader(s);
             if !gl.get_shader_compile_status(s) {
-                panic!("GPU shader compile failed:\n{}", gl.get_shader_info_log(s));
+                return Err(format!("GPU shader compile failed:\n{}",
+                    gl.get_shader_info_log(s)));
             }
-            s
+            Ok(s)
         };
-        let vs = compile(vs_src, glow::VERTEX_SHADER);
-        let fs = compile(fs_src, glow::FRAGMENT_SHADER);
+        let vs = compile(vs_src, glow::VERTEX_SHADER)?;
+        let fs = compile(fs_src, glow::FRAGMENT_SHADER)?;
         gl.attach_shader(program, vs);
         gl.attach_shader(program, fs);
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
-            panic!("GPU program link failed:\n{}", gl.get_program_info_log(program));
+            return Err(format!("GPU program link failed:\n{}",
+                gl.get_program_info_log(program)));
         }
         gl.delete_shader(vs);
         gl.delete_shader(fs);
-        program
+        Ok(program)
     }
 
-    unsafe fn build_circle(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
-        let program = Self::compile(gl, CIRCLE_VS, CIRCLE_FS);
+    unsafe fn build_circle(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+        let program = Self::compile(gl, CIRCLE_VS, CIRCLE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let ivbo = gl.create_buffer().unwrap();
-        let vao = gl.create_vertex_array().unwrap();
+        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let ivbo = gl.create_buffer()?;
+        let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
         gl.enable_vertex_attrib_array(0);
@@ -424,14 +495,15 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(2);
         gl.vertex_attrib_pointer_i32(2, 1, glow::UNSIGNED_INT, stride, 12);
         gl.vertex_attrib_divisor(2, 1);
-        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
     }
 
-    unsafe fn build_arc(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
-        let program = Self::compile(gl, ARC_VS, ARC_FS);
+    unsafe fn build_arc(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+        let program = Self::compile(gl, ARC_VS, ARC_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let ivbo = gl.create_buffer().unwrap();
-        let vao = gl.create_vertex_array().unwrap();
+        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let ivbo = gl.create_buffer()?;
+        let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
         gl.enable_vertex_attrib_array(0);
@@ -447,14 +519,15 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(3);               // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
     }
 
-    unsafe fn build_ellipse(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
-        let program = Self::compile(gl, ELLIPSE_VS, ELLIPSE_FS);
+    unsafe fn build_ellipse(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+        let program = Self::compile(gl, ELLIPSE_VS, ELLIPSE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let ivbo = gl.create_buffer().unwrap();
-        let vao = gl.create_vertex_array().unwrap();
+        let u_pad  = gl.get_uniform_location(program, "u_pad");
+        let ivbo = gl.create_buffer()?;
+        let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
         gl.enable_vertex_attrib_array(0);
@@ -470,20 +543,20 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(3);                   // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad })
     }
 
-    unsafe fn build_line(gl: &glow::Context, quad_vbo: glow::Buffer) -> GpuPipeline {
-        let program = Self::compile(gl, LINE_VS, LINE_FS);
+    unsafe fn build_line(gl: &glow::Context, quad_vbo: glow::Buffer) -> Result<GpuPipeline, String> {
+        let program = Self::compile(gl, LINE_VS, LINE_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let ivbo = gl.create_buffer().unwrap();
-        let vao = gl.create_vertex_array().unwrap();
+        let ivbo = gl.create_buffer()?;
+        let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(quad_vbo));
         gl.enable_vertex_attrib_array(0);
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(ivbo));
-        let stride = size_of::<LineInstance>() as i32;   // 24
+        let stride = size_of::<LineInstance>() as i32;   // 28
         gl.enable_vertex_attrib_array(1);                // ax,ay,bx,by
         gl.vertex_attrib_pointer_f32(1, 4, glow::FLOAT, false, stride, 0);
         gl.vertex_attrib_divisor(1, 1);
@@ -493,16 +566,20 @@ impl GpuShapeRenderer {
         gl.enable_vertex_attrib_array(3);                // color
         gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_INT, stride, 20);
         gl.vertex_attrib_divisor(3, 1);
-        GpuPipeline { program, vao, instance_vbo: ivbo, u_view }
+        gl.enable_vertex_attrib_array(4);                // cap flags
+        gl.vertex_attrib_pointer_i32(4, 1, glow::UNSIGNED_INT, stride, 24);
+        gl.vertex_attrib_divisor(4, 1);
+        // LINE_VS pads its own quad (PAD = 2.5·half_w) — no u_pad uniform.
+        Ok(GpuPipeline { program, vao, instance_vbo: ivbo, u_view, u_pad: None })
     }
 
     // Triangle-soup fill pipeline: per-VERTEX position + color, NO instancing,
     // NO shared quad. `instance_vbo` is reused as the vertex buffer.
-    unsafe fn build_fill(gl: &glow::Context) -> GpuPipeline {
-        let program = Self::compile(gl, FILL_VS, FILL_FS);
+    unsafe fn build_fill(gl: &glow::Context) -> Result<GpuPipeline, String> {
+        let program = Self::compile(gl, FILL_VS, FILL_FS)?;
         let u_view = gl.get_uniform_location(program, "u_view");
-        let vbo = gl.create_buffer().unwrap();
-        let vao = gl.create_vertex_array().unwrap();
+        let vbo = gl.create_buffer()?;
+        let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(vao));
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         let stride = size_of::<FillVertex>() as i32;   // 12
@@ -510,7 +587,8 @@ impl GpuShapeRenderer {
         gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
         gl.enable_vertex_attrib_array(1);              // color
         gl.vertex_attrib_pointer_i32(1, 1, glow::UNSIGNED_INT, stride, 8);
-        GpuPipeline { program, vao, instance_vbo: vbo, u_view }
+        // The fill pipeline has no quad/ring SDF — no u_pad uniform.
+        Ok(GpuPipeline { program, vao, instance_vbo: vbo, u_view, u_pad: None })
     }
 
     /// Upload both instance buffers and draw (one call per non-empty pipeline).
@@ -523,18 +601,46 @@ impl GpuShapeRenderer {
         ellipses: &[EllipseInstance],
         lines: &[LineInstance],
         view: &[f32; 16],
+        pad: f32,
     ) {
+        let _p0 = std::time::Instant::now();
         unsafe {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
         }
         // Fills first so strokes (faces, outlines) land ON TOP of areas.
-        Self::draw_fill(gl, &self.fill, bytes(fills), fills.len(), view);
-        Self::draw(gl, &self.circle,  bytes(circles),  circles.len(),  view);
-        Self::draw(gl, &self.arc,     bytes(arcs),     arcs.len(),     view);
-        Self::draw(gl, &self.ellipse, bytes(ellipses), ellipses.len(), view);
-        Self::draw(gl, &self.line,    bytes(lines),    lines.len(),    view);
+        Self::draw_fill(gl, &self.fill, Some(bytes(fills)), fills.len(), view);
+        Self::draw(gl, &self.circle,  Some(bytes(circles)),  circles.len(),  view, pad);
+        Self::draw(gl, &self.arc,     Some(bytes(arcs)),     arcs.len(),     view, pad);
+        Self::draw(gl, &self.ellipse, Some(bytes(ellipses)), ellipses.len(), view, pad);
+        Self::draw(gl, &self.line,    Some(bytes(lines)),    lines.len(),    view, 0.0);
         unsafe { gl.use_program(None); }
+        // B25: remember counts so render_cached can redraw the VBOs without upload.
+        self.last_counts = [fills.len(), circles.len(), arcs.len(), ellipses.len(), lines.len()];
+        // P0.1: with profiling on, block for GPU completion so last_frame_us
+        // captures actual draw EXECUTION, not just the CPU-side submit.
+        if self.profile_finish { unsafe { gl.finish(); } }
+        // P0: upload+draw µs (the buffer_data DYNAMIC_DRAW cost B25 targets).
+        self.last_frame_us = _p0.elapsed().as_micros() as u64;
+    }
+
+    /// B25: redraw the ALREADY-UPLOADED instance buffers with a fresh `view`
+    /// matrix — no `buffer_data`, no CPU rebuild. Used when nothing affecting
+    /// the instances changed since the last `render()` (idle / static frames).
+    pub fn render_cached(&mut self, gl: &glow::Context, view: &[f32; 16], pad: f32) {
+        let _p0 = std::time::Instant::now();
+        unsafe {
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        }
+        Self::draw_fill(gl, &self.fill, None, self.last_counts[0], view);
+        Self::draw(gl, &self.circle,  None, self.last_counts[1], view, pad);
+        Self::draw(gl, &self.arc,     None, self.last_counts[2], view, pad);
+        Self::draw(gl, &self.ellipse, None, self.last_counts[3], view, pad);
+        Self::draw(gl, &self.line,    None, self.last_counts[4], view, 0.0);
+        unsafe { gl.use_program(None); }
+        if self.profile_finish { unsafe { gl.finish(); } }
+        self.last_frame_us = _p0.elapsed().as_micros() as u64;
     }
 
     /// Draw the triangle-soup fill buffer (non-instanced). `vert_count` is
@@ -542,7 +648,7 @@ impl GpuShapeRenderer {
     fn draw_fill(
         gl: &glow::Context,
         pipe: &Option<GpuPipeline>,
-        data: &[u8],
+        data: Option<&[u8]>,
         vert_count: usize,
         view: &[f32; 16],
     ) {
@@ -550,7 +656,7 @@ impl GpuShapeRenderer {
         let p = match pipe { Some(p) => p, None => return };
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, data, glow::DYNAMIC_DRAW);
+            if let Some(d) = data { gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW); }
             gl.use_program(Some(p.program));
             if let Some(loc) = &p.u_view {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, view);
@@ -564,18 +670,22 @@ impl GpuShapeRenderer {
     fn draw(
         gl: &glow::Context,
         pipe: &Option<GpuPipeline>,
-        data: &[u8],
+        data: Option<&[u8]>,
         count: usize,
         view: &[f32; 16],
+        pad: f32,
     ) {
         if count == 0 { return; }
         let p = match pipe { Some(p) => p, None => return };
         unsafe {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(p.instance_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, data, glow::DYNAMIC_DRAW);
+            if let Some(d) = data { gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, d, glow::DYNAMIC_DRAW); }
             gl.use_program(Some(p.program));
             if let Some(loc) = &p.u_view {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, view);
+            }
+            if let Some(loc) = &p.u_pad {
+                gl.uniform_1_f32(Some(loc), pad);
             }
             gl.bind_vertex_array(Some(p.vao));
             gl.draw_arrays_instanced(glow::TRIANGLES, 0, 6, count as i32);

@@ -1,0 +1,27 @@
+[package]
+name = "cad_script"
+version = "0.1.0"
+edition = "2021"
+
+# WP-SCRIPT: embedded Python scripting engine (D2 — the ONLY crate that sees
+# pyo3; cad_app talks to a plain-Rust facade). Kernel stays zero-dep.
+#
+# Runtime linking (mentor addendum item 1): pyo3 with the STABLE ABI
+# (`abi3-py311`) — the compiled binary works across CPython 3.11+ and is NOT
+# locked to the dev box's 3.14.4. Building against a newer-than-pyo3-supports
+# interpreter (3.14) is allowed via PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+# (see cad_script/.cargo or build docs); abi3 avoids version-specific symbols.
+#
+# EMBEDDING (not an extension module): the default (no `extension-module`
+# feature) links libpython so the interpreter runs in-process. `auto-initialize`
+# is OFF (spec §1.1) — the engine calls `prepare_freethreaded_python()` once,
+# then holds the GIL on its single worker thread via `Python::with_gil`
+# (mentor addendum item 3 — standard GIL CPython, NOT the free-threaded build).
+#
+# Windows: needs `python3.dll` + `python3.lib` (stable-ABI import lib) present
+# at build; the app needs a CPython 3.11+ runtime present at LOAD (deployment
+# story — bundle it, or scope scripting to machines that have it).
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["abi3-py311"] }
+cad_kernel = { path = "../cad_kernel" }

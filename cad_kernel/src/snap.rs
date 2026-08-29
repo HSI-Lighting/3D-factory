@@ -21,7 +21,7 @@
 use crate::dobject::DObject;
 use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line};
 use crate::intersect::intersect;
-use crate::math::{newton_roots_periodic, Vec2, EPS};
+use crate::math::{newton_roots_periodic, scaled_tol, Vec2, EPS};
 use crate::spatial::UniformGrid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -349,15 +349,14 @@ fn candidate_points(
             Geom::EllipseArc(ea)  => { let (p1, p2) = ea.endpoints(); plain([p1, p2]) }
             // Point's location IS its endpoint; useful to snap to.
             Geom::Point(pt)       => plain([pt.location]),
-            // Polyline endpoints = first and last vertex (or all vertices when
-            // closed — every vertex is an "end" of a segment).
+            // Polyline END = EVERY vertex. Each vertex is the end of a
+            // segment, so AutoCAD's ENDpoint osnap lands on all of them
+            // (open or closed) — not just the two extreme ends. This is
+            // also what makes a polyline-in-progress snap to each already
+            // placed vertex during the ghost preview, not only the start.
             Geom::Polyline(p) => {
                 if p.vertices.is_empty() { Vec::new() }
-                else if p.closed {
-                    plain(p.vertices.iter().map(|v| v.pos).collect::<Vec<_>>())
-                } else {
-                    plain([p.vertices[0].pos, p.vertices[p.vertices.len() - 1].pos])
-                }
+                else { plain(p.vertices.iter().map(|v| v.pos).collect::<Vec<_>>()) }
             }
             // Spline endpoints = first and last control point (clamped
             // curves interpolate their endpoint control points exactly).
@@ -369,14 +368,13 @@ fn candidate_points(
                 }
             }
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Hatch(_) => Vec::new(),
-            // Wall — endpoints of BOTH visible side lines (the user
-            // sees them; snapping there matches expectations).
-            Geom::Wall(w) => {
-                let mut out: Vec<Vec2> = Vec::new();
-                if let Some(l) = w.left_line()  { out.push(l.a); out.push(l.b); }
-                if let Some(r) = w.right_line() { out.push(r.a); out.push(r.b); }
-                plain(out)
-            }
+            // Wall END = the two CENTERLINE endpoints (the wall's TRUE
+            // endpoints, and the exact nodes `cad_wall::solve_faces` mitres
+            // on). Snapping a new wall's endpoint here makes the two
+            // centerlines coincide, so the corner auto-cleans. The face
+            // corners are deliberately NOT offered: they drift as neighbours
+            // mitre (unstable target) and snapping there left walls unjoined.
+            Geom::Wall(w) => plain([w.start, w.end]),
             // Text — anchor point is the only snap "endpoint".
             Geom::Text(t) => plain([t.position]),
             // Dimension — its three def points act as snap endpoints.
@@ -384,6 +382,30 @@ fn candidate_points(
             // BlockRef — insertion point only (v1; snap-through to the
             // contained geometry needs Document access — deferred).
             Geom::BlockRef(br) => plain([br.insert]),
+            // Leader END = EVERY chain vertex (like Polyline — each
+            // vertex is a segment end). The arrow tip + landing included.
+            Geom::Leader(l) => {
+                if l.pts.is_empty() { Vec::new() }
+                else { plain(l.pts.clone()) }
+            }
+            // AttrDef — its position is the only "endpoint".
+            Geom::AttrDef(a) => plain([a.position]),
+            // CenterMark END — all four arm tips.
+            Geom::CenterMark(cm) => plain(cm.tips().to_vec()),
+            // Xline — infinite: no endpoints.
+            Geom::Xline(_) => Vec::new(),
+            // Ray — the base is the one real endpoint.
+            Geom::Ray(r) => plain([r.base]),
+            // Wipeout / Region END — every loop vertex.
+            Geom::Wipeout(w) => plain(w.pts.clone()),
+            Geom::Region(rg) => plain(rg.loop_pts.clone()),
+            // Donut — no endpoints.
+            Geom::Donut(_) => Vec::new(),
+            // Table — annotation, no endpoints.
+            Geom::Table(_) => Vec::new(),
+            // Xref — resolved by exploding; no direct endpoints.
+            Geom::Xref(_) => Vec::new(),
+            Geom::Viewport(_) => Vec::new(),
         },
         SnapKind::Mid => match e {
             Geom::Line(l) => plain([(l.a + l.b) * 0.5]),
@@ -417,12 +439,34 @@ fn candidate_points(
             }
             // Text has no MID concept (no segment); empty.
             Geom::Text(_) => Vec::new(),
+            // Leader MID — midpoint of every chain segment.
+            Geom::Leader(l) => {
+                if l.pts.len() < 2 { return Vec::new(); }
+                let pts: Vec<Vec2> = l.pts.windows(2)
+                    .map(|w| (w[0] + w[1]) * 0.5).collect();
+                plain(pts)
+            }
+            // AttrDef has no segments; empty.
+            Geom::AttrDef(_) => Vec::new(),
+            // CenterMark MID — midpoints of the two arms (the center twice).
+            Geom::CenterMark(cm) => {
+                let [t0, _t1, t2, _t3] = cm.tips();
+                plain([(t0 + t2) * 0.5])
+            }
             // Dimension MID — midpoint between the first two def points.
             Geom::Dimension(d) => {
                 let g = d.grip_points();
                 if g.len() >= 2 { plain([(g[0] + g[1]) * 0.5]) } else { Vec::new() }
             }
             Geom::BlockRef(_) => Vec::new(),
+            Geom::Xline(_) => Vec::new(),
+            Geom::Ray(_) => Vec::new(),
+            Geom::Donut(_) => Vec::new(),
+            Geom::Wipeout(_) => Vec::new(),
+            Geom::Region(_) => Vec::new(),
+            Geom::Table(_) => Vec::new(),
+            Geom::Xref(_) => Vec::new(),
+            Geom::Viewport(_) => Vec::new(),
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -443,18 +487,48 @@ fn candidate_points(
                     DimKind::Radius { center, .. } |
                     DimKind::Diameter { center, .. } => plain([*center]),
                     DimKind::Linear { .. } => Vec::new(),
+                    // Angular CEN — the vertex (the angle's apex).
+                    DimKind::Angular { vertex, .. } => plain([*vertex]),
+                    // ArcLen CEN — the arc center.
+                    DimKind::ArcLen { center, .. } => plain([*center]),
+                    // Ordinate CEN — the datum doubles as the centre.
+                    DimKind::Ordinate { datum, .. } => plain([*datum]),
+                    // JoggedRadius CEN — the circle center.
+                    DimKind::JoggedRadius { center, .. } => plain([*center]),
                 }
             }
             // BlockRef CEN — the insertion point (mirrors AutoCAD's INS
             // snap until a dedicated SnapKind::Ins exists).
             Geom::BlockRef(br) => plain([br.insert]),
-        },
+            // Leader has no canonical centre; AttrDef — position doubles
+            // as its "centre" like Text.
+            Geom::Leader(_) => Vec::new(),
+            Geom::AttrDef(a) => plain([a.position]),
+            // CenterMark CEN — the cross center.
+             Geom::CenterMark(cm) => plain([cm.center]),
+             Geom::Xline(_) => Vec::new(),
+             Geom::Ray(_) => Vec::new(),
+             Geom::Donut(d) => plain([d.center]),
+             Geom::Wipeout(w) => {
+                 let mut c = Vec2::ZERO;
+                 for p in &w.pts { c = c + *p; }
+                 if w.pts.is_empty() { Vec::new() } else { plain([c / w.pts.len() as f64]) }
+             }
+             Geom::Region(rg) => {
+                 let mut c = Vec2::ZERO;
+                 for p in &rg.loop_pts { c = c + *p; }
+                 if rg.loop_pts.is_empty() { Vec::new() } else { plain([c / rg.loop_pts.len() as f64]) }
+             }
+             Geom::Table(_) => Vec::new(),
+             Geom::Xref(_) => Vec::new(),
+             Geom::Viewport(_) => Vec::new(),
+         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) | Geom::Text(_) | Geom::Dimension(_) | Geom::BlockRef(_) => Vec::new(),
+            Geom::Line(_) | Geom::Xline(_) | Geom::Ray(_) | Geom::Donut(_) | Geom::Wipeout(_) | Geom::Region(_) | Geom::Table(_) | Geom::Xref(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) | Geom::Text(_) | Geom::Dimension(_) | Geom::BlockRef(_) | Geom::Leader(_) | Geom::AttrDef(_) | Geom::CenterMark(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -491,6 +565,7 @@ fn candidate_points(
                     .map(|t| (ea.ellipse.point_at(*t), None))
                     .collect()
             }
+            Geom::Viewport(_) => Vec::new(),
         },
         SnapKind::Nea => match nearest_point_on(e, cursor) {
             Some(p) => plain([p]),
@@ -524,6 +599,53 @@ fn candidate_points(
 pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
     match e {
         Geom::Line(l)        => nearest_on_line(p, l),
+        Geom::Xline(x)       => {
+            let d = x.dir;
+            if d.len_sq() < EPS { return None; }
+            Some(x.base + d * (p - x.base).dot(d) / d.len_sq())
+        }
+        Geom::Ray(r)         => {
+            let d = r.dir;
+            if d.len_sq() < EPS { return None; }
+            let t = (p - r.base).dot(d) / d.len_sq();
+            if t < 0.0 { Some(r.base) } else { Some(r.base + d * t) }
+        }
+        Geom::Donut(d)       => {
+            // Nearest on the ring's two circles.
+            let dv = p - d.center;
+            let dir = if dv.len_sq() < EPS { Vec2::new(1.0, 0.0) } else { dv.normalized() };
+            let on_outer = d.center + dir * d.outer_radius;
+            if d.inner_radius <= 1e-9 { return Some(on_outer); }
+            let dist_p = p.dist(d.center);
+            let on_inner = d.center + dir * d.inner_radius;
+            if dist_p >= d.inner_radius { Some(on_outer) } else { Some(on_inner) }
+        }
+        Geom::Wipeout(w)     => nearest_on_loop(p, &w.pts),
+        Geom::Region(rg)     => nearest_on_loop(p, &rg.loop_pts),
+        // Xref — nearest resolved child.
+        Geom::Xref(x) => {
+            let mut best: Option<Vec2> = None;
+            let mut bd = f64::INFINITY;
+            for d in &x.cached {
+                if let Some(q) = nearest_point_on(&x.transform_geom(&d.geom), p) {
+                    let dd = q.dist(p);
+                    if dd < bd { bd = dd; best = Some(q); }
+                }
+            }
+            best
+        }
+        // Table — nearest grid rule or cell text (annotation pick).
+        Geom::Table(t) => {
+            let mut best: Option<Vec2> = None;
+            let mut bd = f64::INFINITY;
+            for (a, b) in t.grid_lines() {
+                if let Some(q) = nearest_on_line(p, &crate::geom::Line { a, b }) {
+                    let d = q.dist(p);
+                    if d < bd { bd = d; best = Some(q); }
+                }
+            }
+            best
+        }
         Geom::Circle(c)      => nearest_on_circle(p, c),
         Geom::Arc(a)         => nearest_on_arc(p, a),
         Geom::Ellipse(el)    => {
@@ -603,6 +725,39 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
         }
         // Text — nearest point on the entity = its anchor.
         Geom::Text(t) => Some(t.position),
+        // Leader — nearest point on the chain (like Polyline).
+        Geom::Leader(l) => {
+            if l.pts.is_empty() { return None; }
+            if l.pts.len() == 1 { return Some(l.pts[0]); }
+            let mut best: Option<(Vec2, f64)> = None;
+            for w in l.pts.windows(2) {
+                let a = w[0]; let b = w[1];
+                let l2 = Line { a, b };
+                if let Some(foot) = nearest_on_line(p, &l2) {
+                    let d = p.dist(foot);
+                    if best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((foot, d));
+                    }
+                }
+            }
+            best.map(|(pt, _)| pt)
+        }
+        // AttrDef — nearest point = its position.
+        Geom::AttrDef(a) => Some(a.position),
+        // CenterMark — nearest point on the two arms.
+        Geom::CenterMark(cm) => {
+            let mut best: Option<(Vec2, f64)> = None;
+            for (a, b) in cm.segments() {
+                let l2 = Line { a, b };
+                if let Some(foot) = nearest_on_line(p, &l2) {
+                    let d = p.dist(foot);
+                    if best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((foot, d));
+                    }
+                }
+            }
+            best.map(|(pt, _)| pt)
+        }
         // Dimension — nearest def point.
         Geom::Dimension(d) => {
             let mut best: Option<(Vec2, f64)> = None;
@@ -616,6 +771,7 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
         }
         // BlockRef — insertion point (contents need Document access).
         Geom::BlockRef(br) => Some(br.insert),
+        Geom::Viewport(_) => None,
     }
 }
 
@@ -686,6 +842,44 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
 {
     match geom {
         Geom::Line(l)        => per_to_line(from, l).into_iter().collect(),
+        Geom::Xline(x)       => {
+            let d = x.dir;
+            if d.len_sq() < EPS { return Vec::new(); }
+            let foot = x.base + d * (from - x.base).dot(d) / d.len_sq();
+            vec![(foot, None)]
+        }
+        Geom::Ray(r)         => {
+            let d = r.dir;
+            if d.len_sq() < EPS { return Vec::new(); }
+            let t = (from - r.base).dot(d) / d.len_sq();
+            let foot = if t < 0.0 { r.base } else { r.base + d * t };
+            vec![(foot, None)]
+        }
+        Geom::Donut(d)       => {
+            let dv = from - d.center;
+            let dir = if dv.len_sq() < EPS { Vec2::new(1.0, 0.0) } else { dv.normalized() };
+            vec![(d.center + dir * d.outer_radius, None)]
+        }
+        Geom::Wipeout(w)     => per_to_loop(from, &w.pts),
+        Geom::Region(rg)     => per_to_loop(from, &rg.loop_pts),
+        // Xref — feet onto the resolved children.
+        Geom::Xref(x) => {
+            let mut out = Vec::new();
+            for d in &x.cached {
+                out.extend(perpendicular_extended(from, &x.transform_geom(&d.geom)));
+            }
+            out
+        }
+        // Table — perpendicular feet onto the nearest grid rule.
+        Geom::Table(t) => {
+            let mut out = Vec::new();
+            for (a, b) in t.grid_lines() {
+                if let Some(f) = per_to_line(from, &crate::geom::Line { a, b }) {
+                    out.push(f);
+                }
+            }
+            out
+        }
         Geom::Circle(c)      => per_to_circle(from, c),
         Geom::Arc(a)         => per_to_arc(from, a),
         Geom::Ellipse(e)     => per_to_ellipse(from, e),
@@ -734,10 +928,31 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
         }
         // Text — perpendicular foot is just the anchor.
         Geom::Text(t) => vec![(t.position, None)],
+        // Leader PER — feet onto each chain segment.
+        Geom::Leader(l) => {
+            let mut out = Vec::new();
+            for w in l.pts.windows(2) {
+                let seg = Line { a: w[0], b: w[1] };
+                if let Some(hit) = per_to_line(from, &seg) { out.push(hit); }
+            }
+            out
+        }
+        // AttrDef — foot is just the position.
+        Geom::AttrDef(a) => vec![(a.position, None)],
+        // CenterMark PER — feet onto the two arms.
+        Geom::CenterMark(cm) => {
+            let mut out = Vec::new();
+            for (a, b) in cm.segments() {
+                let seg = Line { a, b };
+                if let Some(hit) = per_to_line(from, &seg) { out.push(hit); }
+            }
+            out
+        }
         // Dimension PER — def points (anchor-less, since they're discrete).
         Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
         // BlockRef PER — insertion point only (v1).
         Geom::BlockRef(br) => vec![(br.insert, None)],
+        Geom::Viewport(_) => Vec::new(),
     }
 }
 
@@ -810,6 +1025,44 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
 {
     match e {
         Geom::Line(l) => per_to_line(from, l).into_iter().collect(),
+        Geom::Xline(x) => {
+            let d = x.dir;
+            if d.len_sq() < EPS { return Vec::new(); }
+            let foot = x.base + d * (from - x.base).dot(d) / d.len_sq();
+            vec![(foot, None)]
+        }
+        Geom::Ray(r) => {
+            let d = r.dir;
+            if d.len_sq() < EPS { return Vec::new(); }
+            let t = (from - r.base).dot(d) / d.len_sq();
+            let foot = if t < 0.0 { r.base } else { r.base + d * t };
+            vec![(foot, None)]
+        }
+        Geom::Donut(d) => {
+            let dv = from - d.center;
+            let dir = if dv.len_sq() < EPS { Vec2::new(1.0, 0.0) } else { dv.normalized() };
+            vec![(d.center + dir * d.outer_radius, None)]
+        }
+        Geom::Wipeout(w) => per_to_loop(from, &w.pts),
+        Geom::Region(rg) => per_to_loop(from, &rg.loop_pts),
+        // Xref — tangents onto the resolved children.
+        Geom::Xref(x) => {
+            let mut out = Vec::new();
+            for d in &x.cached {
+                out.extend(tangent_points_extended(from, &x.transform_geom(&d.geom), _cursor));
+            }
+            out
+        }
+        // Table — line-like: perpendicular foot on the nearest rule.
+        Geom::Table(t) => {
+            let mut out = Vec::new();
+            for (a, b) in t.grid_lines() {
+                if let Some(f) = per_to_line(from, &crate::geom::Line { a, b }) {
+                    out.push(f);
+                }
+            }
+            out
+        }
         Geom::Circle(c) => tangent_to_circle(from, c.center, c.radius)
             .into_iter().map(|p| (p, None)).collect(),
         Geom::Arc(a) => {
@@ -872,10 +1125,31 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
         }
         // Text — no tangent concept; anchor as the only candidate.
         Geom::Text(t) => vec![(t.position, None)],
+        // Leader — no tangent concept; feet onto each chain segment.
+        Geom::Leader(l) => {
+            let mut out = Vec::new();
+            for w in l.pts.windows(2) {
+                let seg = Line { a: w[0], b: w[1] };
+                if let Some(hit) = per_to_line(from, &seg) { out.push(hit); }
+            }
+            out
+        }
+        // AttrDef — no tangent concept; position as candidate.
+        Geom::AttrDef(a) => vec![(a.position, None)],
+        // CenterMark — no tangent concept; feet onto the arms as candidates.
+        Geom::CenterMark(cm) => {
+            let mut out = Vec::new();
+            for (a, b) in cm.segments() {
+                let seg = Line { a, b };
+                if let Some(hit) = per_to_line(from, &seg) { out.push(hit); }
+            }
+            out
+        }
         // Dimension — no tangent concept; def points as candidates.
         Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
         // BlockRef — no tangent concept; insertion point as candidate.
         Geom::BlockRef(br) => vec![(br.insert, None)],
+        Geom::Viewport(_) => Vec::new(),
     }
 }
 
@@ -908,7 +1182,19 @@ fn per_to_ellipse(from: Vec2, el: &Ellipse) -> Vec<(Vec2, Option<Vec2>)> {
         let d2 = u * (-a * t.cos()) + v * (-b * t.sin());
         (pt - from).dot(d2) + dp.dot(dp)
     };
-    newton_roots_periodic(f, fd, 8).into_iter()
+    // FIX 1 (B16, G1 family): the residual f = (E(t) − from) · E'(t) is a DOT of
+    // two length vectors → length², so it scales with coordinate² and a fixed 1e-6
+    // rejects real feet at large scale. `char` must bound BOTH factors of the
+    // product: |E'| scales with the ellipse (≈ a), but |E(t) − from| scales with
+    // how far the ANCHOR sits from the curve — and `from` is a user click, which
+    // can be arbitrarily distant. So char = a.max(from.dist(center)): a
+    // semi_major-ONLY char under-scales for a distant anchor on a small ellipse
+    // and rejects real feet — the G1 failure reached from the other side. The
+    // residual stays length²-scaled — do NOT "simplify" it back to a constant.
+    let char = a.max(from.dist(el.center));
+    let residual_tol = 1e-6 * (char * char).max(1.0);
+    let dedup_tol = scaled_tol(a) / a;   // G7: param-space dedup, a = |E'| char (guarded > EPS)
+    newton_roots_periodic(f, fd, 16, residual_tol, dedup_tol).into_iter()
         .map(|t| (el.point_at(t), None))
         .collect()
 }
@@ -958,7 +1244,15 @@ fn tan_to_ellipse(from: Vec2, el: &Ellipse) -> Vec<(Vec2, Option<Vec2>)> {
         let d2 = u * (-a * t.cos()) + v * (-b * t.sin());
         cross(from - pt, d2)
     };
-    newton_roots_periodic(f, fd, 8).into_iter()
+    // FIX 1 (B16, G1 family): the residual f = (from − E(t)) × E'(t) is a CROSS of
+    // two length vectors → length², the same scaling as `per_to_ellipse`. `char`
+    // must bound both |from − E(t)| (grows with the anchor distance — `from` is a
+    // possibly-distant user click) and |E'| (≈ a), so char = a.max(from.dist(
+    // center)). Length²-scaled — do NOT revert it to a constant.
+    let char = a.max(from.dist(el.center));
+    let residual_tol = 1e-6 * (char * char).max(1.0);
+    let dedup_tol = scaled_tol(a) / a;   // G7: param-space dedup, a = |E'| char (guarded > EPS)
+    newton_roots_periodic(f, fd, 16, residual_tol, dedup_tol).into_iter()
         .map(|t| (el.point_at(t), None))
         .collect()
 }
@@ -1068,6 +1362,56 @@ mod tests {
             // 2D cross product zero means parallel.
             assert!((chord.x * tangent.y - chord.y * tangent.x).abs() < 1e-4,
                 "tangent point {:?} not collinear with tangent line", p);
+        }
+    }
+
+    // ---- FIX 1 (B16): snap residuals are length²-scaled ---------------------
+    // MEASURED: the residual only binds when the ELLIPSE is large (a big residual
+    // derivative). For a small ellipse the Newton residual stays < 1e-6 at any
+    // scale, so those cases are vacuous. Discriminator below uses a=1e6 at 1e10:
+    // fixed-1e-6 → 0 feet, char² → 2. (`a.max(dist)` vs `a` alone never differed
+    // observably in testing — it's belt-and-braces; see the report.)
+
+    // Scale-free perpendicularity: cos(angle between (foot−from) and tangent) ≈ 0.
+    fn is_perp_foot(from: Vec2, foot: Vec2, el: &Ellipse) -> bool {
+        let t = el.nearest_param(foot);
+        let tan = el.tangent_at(t);
+        let chord = foot - from;
+        (chord.dot(tan) / (chord.len() * tan.len())).abs() < 1e-6
+    }
+
+    #[test]
+    fn per_feet_found_on_large_ellipse_at_scale() {
+        // a=1e6 ellipse at 1e10 coords. The residual at the true feet exceeds
+        // 1e-6, so fixed-1e-6 returns EMPTY; the char²-scaled threshold finds both
+        // feet. (Fails-before verified: revert residual_tol → 1e-6 → empty.)
+        let el = Ellipse { center: Vec2::new(1.0e10, 1.0e10),
+                           major: Vec2::new(1.0e6, 0.0), ratio: 0.6 };
+        let from = Vec2::new(1.0e10 + 3.0e6, 1.0e10 + 1.7e6);
+        let pts = per_to_ellipse(from, &el);
+        assert!(!pts.is_empty(),
+            "perpendicular feet rejected on a large ellipse at scale (residual > 1e-6)");
+        for (foot, _) in &pts {
+            assert!(is_perp_foot(from, *foot, &el),
+                "foot {foot:?} is not a true perpendicular foot");
+        }
+    }
+
+    #[test]
+    fn tan_points_found_on_large_ellipse_at_scale() {
+        // Same regime for the tangent cross residual.
+        let el = Ellipse { center: Vec2::new(1.0e10, 1.0e10),
+                           major: Vec2::new(1.0e6, 0.0), ratio: 0.6 };
+        let from = Vec2::new(1.0e10 + 5.0e6, 1.0e10 + 3.0e6);   // outside → tangents
+        let pts = tan_to_ellipse(from, &el);
+        assert!(!pts.is_empty(),
+            "tangent points rejected on a large ellipse at scale (residual > 1e-6)");
+        for (tp, _) in &pts {
+            let t = el.nearest_param(*tp);
+            let tan = el.tangent_at(t);
+            let chord = from - *tp;
+            let s = (chord.x * tan.y - chord.y * tan.x) / (chord.len() * tan.len());
+            assert!(s.abs() < 1e-6, "tangent point {tp:?} not parallel (sin={s})");
         }
     }
 
@@ -1287,4 +1631,118 @@ mod tests {
         assert_eq!(hit.kind, SnapKind::End);
         assert!(close(hit.point, 0.0, 0.0));
     }
+
+    #[test]
+    fn open_polyline_end_snap_fires_on_a_middle_vertex() {
+        // An OPEN polyline's ENDpoint osnap must land on EVERY vertex, not
+        // just the first/last — so a pline-in-progress snaps to each already
+        // placed vertex during the ghost preview. Cursor near the MIDDLE
+        // vertex (10,0) of a 3-vertex open polyline.
+        use crate::geom::{Polyline, PolyVertex};
+        let ents: Vec<DObject> = vec![Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        }.into()];
+        let mut set = SnapSet::default();
+        set.end = true;
+        let hit = find_snap(
+            Vec2::new(10.05, 0.05), 1.0, set, None, None, &ents, None,
+        ).expect("END snap should fire on the middle vertex");
+        assert_eq!(hit.kind, SnapKind::End);
+        assert!(close(hit.point, 10.0, 0.0));
+    }
+
+    #[test]
+    fn leader_end_mid_nea_and_per_snaps() {
+        // MLEADER chain (1,1)→(6,4)→(12,5): END at every vertex, MID on
+        // every segment, NEA on the curve, PER foot on the segments.
+        let l = crate::text::Leader {
+            pts: vec![
+                Vec2::new(1.0, 1.0),
+                Vec2::new(6.0, 4.0),
+                Vec2::new(12.0, 5.0),
+            ],
+            label: crate::text::Text::empty(),
+            arrow: true,
+        };
+        let g = Geom::Leader(l);
+        // END — all three vertices.
+        let ends = candidate_points(SnapKind::End, &g, Vec2::ZERO, None);
+        assert_eq!(ends.len(), 3);
+        assert!(ends.iter().any(|(p, _)| close(*p, 6.0, 4.0)));
+        // MID — two segment midpoints.
+        let mids = candidate_points(SnapKind::Mid, &g, Vec2::ZERO, None);
+        assert_eq!(mids.len(), 2);
+        assert!(mids.iter().any(|(p, _)| close(*p, 3.5, 2.5)));
+        // NEA — nearest point on the chain (a foot slightly past (6,4)
+        // on the second segment).
+        let nea = nearest_point_on(&g, Vec2::new(6.1, 3.9));
+        assert!(nea.is_some());
+        let n = nea.unwrap();
+        assert!((n - Vec2::new(6.0, 4.0)).len() < 0.1);
+        assert!(n.x > 6.0 - 1e-9 && n.y > 4.0 - 1e-9);
+        // PER — a foot onto the first segment.
+        let pers = candidate_points(SnapKind::Per, &g, Vec2::new(1.0, 4.0), Some(Vec2::ZERO));
+        assert!(!pers.is_empty());
+        // CEN — none (a leader has no canonical centre).
+        assert!(candidate_points(SnapKind::Cen, &g, Vec2::ZERO, None).is_empty());
+    }
+
+    #[test]
+    fn attdef_snaps_like_text() {
+        let ad = crate::block::AttrDef {
+            tag: "TAG".into(), prompt: String::new(), default: String::new(),
+            position: Vec2::new(3.0, 3.0), height: 0.5, angle: 0.0,
+            style: 0, visible: true,
+        };
+        let g = Geom::AttrDef(ad);
+        let ends = candidate_points(SnapKind::End, &g, Vec2::ZERO, None);
+        assert_eq!(ends.len(), 1);
+        assert!(close(ends[0].0, 3.0, 3.0));
+        assert!(candidate_points(SnapKind::Mid, &g, Vec2::ZERO, None).is_empty());
+        assert!(candidate_points(SnapKind::Qua, &g, Vec2::ZERO, None).is_empty());
+        assert_eq!(nearest_point_on(&g, Vec2::new(3.2, 3.1)),
+            Some(Vec2::new(3.0, 3.0)));
+    }
+}
+
+/// Nearest point ON a closed vertex loop (edge-projection, boundary counts).
+fn nearest_on_loop(p: Vec2, pts: &[Vec2]) -> Option<Vec2> {
+    let n = pts.len();
+    if n == 0 { return None; }
+    if n == 1 { return Some(pts[0]); }
+    let mut best: Option<(Vec2, f64)> = None;
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let d = b - a;
+        let l2 = d.len_sq();
+        if l2 < EPS { continue; }
+        let t = ((p - a).dot(d) / l2).clamp(0.0, 1.0);
+        let foot = a + d * t;
+        let dist = foot.dist(p);
+        if best.map_or(true, |(_, bd)| dist < bd) { best = Some((foot, dist)); }
+    }
+    best.map(|(f, _)| f)
+}
+
+/// Perpendicular feet from `from` onto a closed loop's edges.
+fn per_to_loop(from: Vec2, pts: &[Vec2]) -> Vec<(Vec2, Option<Vec2>)> {
+    let n = pts.len();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let a = pts[i];
+        let b = pts[(i + 1) % n];
+        let d = b - a;
+        let l2 = d.len_sq();
+        if l2 < EPS { continue; }
+        let t = ((from - a).dot(d) / l2).clamp(0.0, 1.0);
+        out.push((a + d * t, None));
+    }
+    out
 }

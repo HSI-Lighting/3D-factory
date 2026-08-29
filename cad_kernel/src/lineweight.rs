@@ -65,7 +65,7 @@ mod tests {
             linetype:   0,
             lineweight: Lineweight::Custom(1.0),
             visible:    true, locked: false, frozen: false, plottable: true,
-        });
+            order:      0,});
         assert_eq!(resolve_lineweight(Lineweight::ByLayer, id, &t), 1.0);
     }
 }

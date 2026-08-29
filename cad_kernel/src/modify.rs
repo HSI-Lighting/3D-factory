@@ -5,7 +5,7 @@
 //! operations.
 
 use crate::math::{Vec2, EPS};
-use crate::geom::{Arc, Circle, Ellipse, Geom, Line, PolyVertex, Polyline, Wall};
+use crate::geom::{Arc, Circle, Donut, Ellipse, Geom, Line, PolyVertex, Polyline, Ray, Spline, Wall, Xline};
 use crate::join::bulge_arc;
 
 impl Geom {
@@ -53,9 +53,10 @@ impl Geom {
                 // True offset of an ellipse is a quartic, NOT an ellipse —
                 // so we return a Polyline approximation. Each sample point
                 // is offset along its local outward normal; `side` picks
-                // inside vs outside.
+                // inside vs outside. Inward offsets beyond the minimum
+                // radius of curvature are rejected (issue #20).
                 let pts = offset_ellipse_samples(*el, 0.0, std::f64::consts::TAU,
-                                                  dist, side, true);
+                                                  dist, side, true)?;
                 if pts.len() < 3 { return Err("offset: ellipse degenerate"); }
                 Ok(Geom::Polyline(Polyline {
                     vertices: pts.into_iter()
@@ -69,7 +70,7 @@ impl Geom {
                 // Same polyline approximation, but only over the swept range.
                 let end_param = ea.start_param + ea.sweep_param;
                 let pts = offset_ellipse_samples(ea.ellipse, ea.start_param,
-                                                  end_param, dist, side, false);
+                                                  end_param, dist, side, false)?;
                 if pts.len() < 2 { return Err("offset: ellipse arc degenerate"); }
                 Ok(Geom::Polyline(Polyline {
                     vertices: pts.into_iter()
@@ -84,8 +85,52 @@ impl Geom {
                 Err("offset on point is undefined"),
             Geom::Hatch(_) =>
                 Err("offset on hatch is undefined (offset the boundary instead)"),
-            Geom::Spline(_) =>
-                Err("offset on spline not implemented yet (true offset of a NURBS isn't a NURBS — needs sampling + refit)"),
+            Geom::Spline(s) => {
+                // True parallel of a NURBS is not a NURBS, so (like the ellipse)
+                // we sample the curve, shift each sample along its local normal,
+                // and return a smooth Polyline approximation. `side` picks the
+                // hand. A refit back to a spline is a future refinement.
+                let pts = offset_spline_samples(s, dist, side);
+                if pts.len() < 2 { return Err("offset: spline degenerate"); }
+                Ok(Geom::Polyline(Polyline {
+                    vertices: pts.into_iter()
+                        .map(|p| PolyVertex { pos: p, bulge: 0.0 })
+                        .collect(),
+                    closed: false,
+                    widths: Vec::new(),
+                }))
+            }
+            Geom::Xline(x) => {
+                // Parallel infinite line: shift the base along the normal.
+                let n = x.dir.perp();
+                let sgn = if (side - x.base).dot(n) >= 0.0 { 1.0 } else { -1.0 };
+                Ok(Geom::Xline(Xline {
+                    base: x.base + n * (dist * sgn),
+                    dir: x.dir,
+                }))
+            }
+            Geom::Ray(r) => {
+                // Parallel ray: shift the base along the normal (dir stays).
+                let n = r.dir.perp();
+                let sgn = if (side - r.base).dot(n) >= 0.0 { 1.0 } else { -1.0 };
+                Ok(Geom::Ray(Ray {
+                    base: r.base + n * (dist * sgn),
+                    dir: r.dir,
+                }))
+            }
+            Geom::Donut(d) => {
+                // Offset a donut = grow/shrink the ring (both radii move
+                // by `dist`; the ring flips when dist exceeds the outer).
+                let sgn = if (side - d.center).dot(Vec2::new(1.0, 0.0)) >= 0.0 { 1.0 } else { -1.0 };
+                let delta = dist * sgn;
+                let outer = (d.outer_radius + delta).max(1e-9);
+                let inner = (d.inner_radius + delta).clamp(0.0, outer);
+                Ok(Geom::Donut(Donut::new(d.center, inner, outer)))
+            }
+            Geom::Wipeout(_) =>
+                Err("offset: a wipeout mask cannot be offset"),
+            Geom::Region(_) =>
+                Err("offset: a region cannot be offset — use a polyline"),
             Geom::Wall(w) => {
                 // Offset the centerline; new Wall keeps the same
                 // thickness on the offset centerline.
@@ -97,12 +142,24 @@ impl Geom {
                     }))
                 } else { Err("offset wall: unexpected non-Line result") }
             }
+            Geom::Table(_) =>
+                Err("offset on a table is undefined"),
+            Geom::Xref(_) =>
+                Err("offset: explode the xref first"),
             Geom::Text(_) =>
                 Err("offset on text is undefined"),
+            Geom::Leader(_) =>
+                Err("offset on leader is undefined"),
+            Geom::CenterMark(_) =>
+                Err("offset on a center mark is undefined"),
+            Geom::AttrDef(_) =>
+                Err("offset on attribute definition is undefined"),
             Geom::Dimension(_) =>
                 Err("offset on dimension is undefined"),
             Geom::BlockRef(_) =>
                 Err("offset: explode the block first"),
+            Geom::Viewport(_) =>
+                Err("offset: viewport is a paper-space entity"),
         }
     }
 }
@@ -129,8 +186,9 @@ impl Geom {
 // ---------------------------------------------------------------------------
 
 /// Point-to-segment distance — used only to find the nearest segment when
-/// resolving which hand the click is on.
-fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+/// resolving which hand the click is on (and by the spline trim/split arms
+/// in `trim.rs` for parameter projection).
+pub(crate) fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
     let d = b - a;
     let l2 = d.len_sq();
     if l2 < EPS { return p.dist(a); }
@@ -146,6 +204,22 @@ fn line_line_inf(p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2) -> Option<Vec2> {
     let dp = p1 - p0;
     let t = (dp.x * d1.y - dp.y * d1.x) / denom;
     Some(p0 + d0 * t)
+}
+
+/// True when segments a0→a1 and b0→b1 cross at an interior point of BOTH
+/// (a "proper" crossing). Shared/touching endpoints and collinear overlaps
+/// return false — only a genuine X counts. Used to catch a self-intersecting
+/// (bow-tie) offset polyline.
+fn segs_cross(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> bool {
+    let d1 = a1 - a0;
+    let d2 = b1 - b0;
+    let denom = d1.x * d2.y - d1.y * d2.x;
+    if denom.abs() < 1e-12 { return false; } // parallel / collinear
+    let dp = b0 - a0;
+    let t = (dp.x * d2.y - dp.y * d2.x) / denom;
+    let u = (dp.x * d1.y - dp.y * d1.x) / denom;
+    const E: f64 = 1e-9;
+    t > E && t < 1.0 - E && u > E && u < 1.0 - E
 }
 
 fn offset_polyline(p: &Polyline, dist: f64, side: Vec2) -> Result<Geom, &'static str> {
@@ -221,6 +295,52 @@ fn offset_polyline(p: &Polyline, dist: f64, side: Vec2) -> Result<Geom, &'static
         }
         out.push(PolyVertex { pos: segs[seg_count - 1].b, bulge: 0.0 });
     }
+
+    // --- 4. reject a self-crossing / collapsed CLOSED offset -----------
+    // When an inward offset is larger than the shape can absorb, adjacent
+    // segment joins cross over: the polygon inverts (edges reverse) or
+    // self-intersects (a bow-tie). Either way the result is garbage, so
+    // refuse it and tell the user to reduce the value — instead of silently
+    // emitting a tangled shape (owner: "edges cross, reduce the value").
+    // Open polylines can't fold onto themselves this way, so only closed
+    // ones are checked. `out` has one vertex per segment here.
+    if p.closed && out.len() == seg_count && seg_count >= 3 {
+        // (a) Direction reversal — each output edge must still run the SAME
+        //     way as its source edge. A collapsed segment flips 180°. This
+        //     is the common convex case (a pentagon over-offset inward).
+        for i in 0..seg_count {
+            let src_dir = v[(i + 1) % n].pos - v[i].pos;
+            let out_dir = out[(i + 1) % seg_count].pos - out[i].pos;
+            if src_dir.len() > EPS && out_dir.len() > EPS
+                && out_dir.dot(src_dir) < 0.0
+            {
+                return Err("edges cross — reduce the offset value");
+            }
+        }
+        // (b) Genuine self-intersection among the STRAIGHT edges — catches
+        //     concave bow-ties that reverse no single edge. Arc edges are
+        //     skipped (their over-collapse is already caught by the rp≤EPS
+        //     guard above). Bounded so it stays cheap on large polylines.
+        if seg_count <= 512 {
+            let line_edge = |i: usize| -> Option<(Vec2, Vec2)> {
+                if segs[i].line {
+                    Some((out[i].pos, out[(i + 1) % seg_count].pos))
+                } else { None }
+            };
+            for i in 0..seg_count {
+                let Some((a0, a1)) = line_edge(i) else { continue };
+                for j in (i + 2)..seg_count {
+                    // Skip the adjacent pair that wraps around the closure.
+                    if i == 0 && j == seg_count - 1 { continue; }
+                    let Some((b0, b1)) = line_edge(j) else { continue };
+                    if segs_cross(a0, a1, b0, b1) {
+                        return Err("edges cross — reduce the offset value");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Geom::Polyline(Polyline { vertices: out, closed: p.closed, widths: Vec::new() }))
 }
 
@@ -231,9 +351,10 @@ fn offset_ellipse_samples(
     dist: f64,
     side: Vec2,
     closed: bool,
-) -> Vec<Vec2> {
+) -> Result<Vec<Vec2>, &'static str> {
     let a = el.semi_major();
-    if a < EPS { return Vec::new(); }
+    if a < EPS { return Ok(Vec::new()); }
+    let b = (a * el.ratio).max(EPS);
     // Sample density scales with size; minimum 64 for visual smoothness.
     let n = (64.0_f64 + a.log10().max(0.0) * 32.0).round().max(48.0) as usize;
     // Sign: compare `side` direction to the CCW-perp tangent at t_start.
@@ -241,20 +362,75 @@ fn offset_ellipse_samples(
     let tg0 = el.tangent_at(t_start);
     let nrm0 = tg0.perp();
     let nl   = nrm0.len();
-    if nl < EPS { return Vec::new(); }
+    if nl < EPS { return Ok(Vec::new()); }
     let n0u  = nrm0 / nl;
     let sgn  = if (side - p0).dot(n0u) >= 0.0 { 1.0 } else { -1.0 };
+    let amt  = dist.abs();
+    // The CCW-perp of the tangent points toward the loop's INSIDE (the
+    // existing convention: a click outside the ellipse yields sgn = -1 and
+    // the samples push outward). Inward = pushing along the perp.
+    let inward = sgn > 0.0;
     let span = t_end - t_start;
     let count = if closed { n } else { n + 1 };
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let t = t_start + (i as f64 / n as f64) * span;
+        // Issue #20 — an INWARD offset beyond the local radius of curvature
+        // flips the offset normal: the parallel crosses itself (the "weird
+        // self-intersecting shapes" report). Radius of curvature of an
+        // ellipse at parameter t: ρ = (a²sin²t + b²cos²t)^(3/2) / (ab);
+        // the minimum over the FULL ellipse is b²/a at the minor-axis ends.
+        // Checking per sample lets arcs that never reach the high-curvature
+        // region offset further than a full ellipse would allow.
+        if inward {
+            let s2 = t.sin().powi(2);
+            let c2 = t.cos().powi(2);
+            let rho = (a * a * s2 + b * b * c2).powf(1.5) / (a * b);
+            if amt > rho - 1e-9 {
+                return Err(
+                    "offset beyond the curve's radius of curvature — reduce the value");
+            }
+        }
         let p = el.point_at(t);
         let tg = el.tangent_at(t);
         let nm = tg.perp();
         let nl = nm.len();
         if nl < EPS { continue; }
-        out.push(p + (nm / nl) * (dist.abs() * sgn));
+        out.push(p + (nm / nl) * amt * sgn);
+    }
+    Ok(out)
+}
+
+/// Offset a NURBS spline by sampling it and shifting each sample along its
+/// local normal (perp of the finite-difference tangent). The true parallel of
+/// a NURBS is not a NURBS, so — like the ellipse — the result is a Polyline
+/// approximation. `side` picks inside/outside via the normal at the first
+/// sample, so the whole offset stays on one hand.
+fn offset_spline_samples(sp: &Spline, dist: f64, side: Vec2) -> Vec<Vec2> {
+    // Sample density scales with the control-polygon span; min 96 for a smooth
+    // result at typical zoom, capped so huge splines stay cheap.
+    let (mn, mx) = sp.bbox();
+    let span = (mx - mn).len().max(1.0);
+    let n = (96.0 + span.log10().max(0.0) * 48.0).round().clamp(96.0, 512.0) as usize;
+    let pts = sp.tessellate(n);
+    if pts.len() < 2 { return Vec::new(); }
+    // Central-difference tangent (clamped at the ends).
+    let tangent = |i: usize| -> Vec2 {
+        let a = if i == 0 { pts[0] } else { pts[i - 1] };
+        let b = if i + 1 >= pts.len() { pts[pts.len() - 1] } else { pts[i + 1] };
+        b - a
+    };
+    // Sign from the FIRST sample so every point offsets to the same hand.
+    let n0  = tangent(0).perp();
+    let nl0 = n0.len();
+    if nl0 < EPS { return Vec::new(); }
+    let sgn = if (side - pts[0]).dot(n0 / nl0) >= 0.0 { 1.0 } else { -1.0 };
+    let mut out = Vec::with_capacity(pts.len());
+    for i in 0..pts.len() {
+        let nm = tangent(i).perp();
+        let nl = nm.len();
+        if nl < EPS { continue; }
+        out.push(pts[i] + (nm / nl) * (dist.abs() * sgn));
     }
     out
 }

@@ -20,6 +20,12 @@ pub struct Style {
     pub linetype_scale: f32,
     pub lineweight:     Lineweight,
     pub visible:        bool,
+    /// Synthetic hatch boundary: a non-rendering auxiliary polyline the
+    /// pick-point trace creates so the Hatch has something to reference by
+    /// handle. `visible` stays false (never drawn), but hatch-loop
+    /// resolution must still honour it — unlike a user-hidden boundary,
+    /// which is deliberately excluded.
+    pub hatch_aux:      bool,
 }
 
 impl Default for Style {
@@ -33,6 +39,7 @@ impl Default for Style {
             linetype_scale: 1.0,
             lineweight:     Lineweight::ByLayer,
             visible:        true,
+            hatch_aux:      false,
         }
     }
 }

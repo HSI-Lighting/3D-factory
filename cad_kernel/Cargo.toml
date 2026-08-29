@@ -6,3 +6,7 @@ description = "Pure-Rust 2D CAD math kernel — primitives, intersections, parse
 
 [dependencies]
 cad_nurbs = { path = "../cad_nurbs" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

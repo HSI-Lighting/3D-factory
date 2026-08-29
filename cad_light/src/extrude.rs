@@ -343,7 +343,7 @@ mod tests {
 
     fn room_doc(unit_m: f64, side: f64) -> Document {
         let mut d = Document::default();
-        d.units = cad_kernel::DocUnits::new(unit_m, cad_kernel::UnitSource::Declared);
+        d.units = cad_kernel::Units::from_metres_per_unit(unit_m, cad_kernel::UnitSource::Declared);
         let verts: Vec<PolyVertex> = [(0.0, 0.0), (side, 0.0), (side, side), (0.0, side)]
             .iter()
             .map(|&(x, y)| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 })
@@ -568,7 +568,7 @@ mod tests {
     fn a_spline_room_closes_whatever_unit_it_was_drafted_in() {
         for (unit_m, side) in [(1.0, 4.0), (0.001, 4000.0), (0.01, 400.0)] {
             let mut d = Document::default();
-            d.units = cad_kernel::DocUnits::new(unit_m, cad_kernel::UnitSource::Declared);
+            d.units = cad_kernel::Units::from_metres_per_unit(unit_m, cad_kernel::UnitSource::Declared);
             d.push(DObject::new(cad_kernel::Geom::Spline(closed_spline(side))));
             let m = extrude(&d, 2.7);
             assert!(

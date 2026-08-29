@@ -106,6 +106,11 @@ impl LinetypeTable {
     /// The reserved id of the "Continuous" linetype.
     pub const CONTINUOUS: u32 = 0;
 
+    /// Sentinel id meaning "By Layer" for a CURRENT-spec linetype (there is no
+    /// ByLayer variant on the plain `u32` linetype id). New dobjects resolve it to
+    /// the active layer's linetype at draw time; it is never a real table index.
+    pub const BYLAYER: u32 = u32::MAX;
+
     pub fn get(&self, id: u32) -> Option<&Linetype> {
         self.linetypes.get(id as usize)
     }

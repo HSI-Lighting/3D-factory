@@ -503,6 +503,7 @@ pub fn insert(doc: &mut Document, fitting: &Fitting, at: Vec2, doc_unit_m: f64) 
         rotation: 0.0,
         mirror_x: false,
         param_values: [0.0; cad_kernel::block::MAX_BLOCK_PARAMS],
+        attr_values: Vec::new(),
     })));
     block
 }
@@ -1648,6 +1649,7 @@ mod tests {
                     rotation: 0.0,
                     mirror_x: false,
                     param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+                attr_values: Vec::new(),
                 })),
             ],
             smart: false,
@@ -1949,7 +1951,7 @@ mod tests {
         let refs: Vec<u32> = doc
             .dobjects
             .iter()
-            .filter_map(|d| match d.geom {
+            .filter_map(|d| match &d.geom {
                 Geom::BlockRef(b) => Some(b.block),
                 _ => None,
             })
@@ -2075,8 +2077,8 @@ mod tests {
         let refs: Vec<cad_kernel::BlockRef> = doc
             .dobjects
             .iter()
-            .filter_map(|d| match d.geom {
-                Geom::BlockRef(br) => Some(br),
+            .filter_map(|d| match &d.geom {
+                Geom::BlockRef(br) => Some(br.clone()),
                 _ => None,
             })
             .collect();
@@ -2097,8 +2099,8 @@ mod tests {
         let br = metres
             .dobjects
             .iter()
-            .find_map(|d| match d.geom {
-                Geom::BlockRef(b) => Some(b),
+            .find_map(|d| match &d.geom {
+                Geom::BlockRef(b) => Some(b.clone()),
                 _ => None,
             })
             .expect("an instance must be on the drawing");

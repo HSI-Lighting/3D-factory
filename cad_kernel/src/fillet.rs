@@ -21,7 +21,7 @@
 
 use std::f64::consts::{PI, TAU};
 
-use crate::math::{Vec2, EPS};
+use crate::math::{scaled_tol, Vec2, EPS};
 use crate::geom::{Arc, Geom, Line, PolyVertex, Polyline};
 use crate::join::{bulge_arc, bulge_from_arc};
 use crate::modify::{ChamferOut, FilletOut};
@@ -215,13 +215,49 @@ fn solve_fillet(
                 let (Some(tp1), Some(tp2)) =
                     (p1.tangent_point(center, r), p2.tangent_point(center, r))
                 else { continue };
-                if ((tp1 - center).len() - r).abs() > 1e-6 { continue; }
-                if ((tp2 - center).len() - r).abs() > 1e-6 { continue; }
-                let score = center.dist(corner);
+                // G4: accept the tangent points with a radius-relative tolerance
+                // — `(tp - center).len()` carries noise ~ r·1e-16, so a fixed
+                // 1e-6 rejected valid fillets at large radius.
+                if ((tp1 - center).len() - r).abs() > scaled_tol(r) { continue; }
+                if ((tp2 - center).len() - r).abs() > scaled_tol(r) { continue; }
+                // Reject a DEGENERATE fillet whose circle coincides with one of
+                // the input ARCS. When the fillet radius ≈ an arc's radius, that
+                // arc's inner offset locus |rr−r| collapses onto the arc's own
+                // centre, so a candidate centre lands on the arc centre and the
+                // "fillet" is just the arc itself (owner dump: filleting an arc
+                // of r=6.841 with fillet r=6.8415 returned the arc unchanged).
+                let coincides_with_arc = |pc: &Piece| -> bool {
+                    if let Piece::Arc { c, r: rr, .. } = *pc {
+                        let tol = 1e-3 * r.max(1.0);
+                        (center - c).len() < tol && (r - rr).abs() < tol
+                    } else { false }
+                };
+                if coincides_with_arc(p1) || coincides_with_arc(p2) { continue; }
+                // Score = how close each TANGENT POINT lands to the point the
+                // user wants to keep (`keep1`/`keep2` — the pick clicks for two
+                // separate objects, the far segment ends for a polyline corner).
+                // This is what makes the fillet land on the CLICKED side, instead
+                // of the old `center.dist(corner)` (degenerate for a line↔arc pair:
+                // the clicked-side and far-side centres are near-equidistant from
+                // the corner). `corner` still drives the bisector fallback below.
+                //
+                // THE LINE PICK DECIDES WHICH CORNER — weight the SEGMENT 3×. Owner:
+                // "I pick the line's LEFT end, so the fillet happens at that end."
+                // A line spans both candidate corners, so its pick is the reliable
+                // "which corner" signal. (WHICH END of the arc grows to reach that
+                // corner is a SEPARATE decision, made from the ARC pick in
+                // `arc_keep` / `rebuild_side`.)
+                let w = |pc: &Piece| if matches!(pc, Piece::Seg { .. }) { 3.0 } else { 1.0 };
+                let score = w(p1) * tp1.dist(keep1) + w(p2) * tp2.dist(keep2);
                 if best_any.map_or(true, |x| score < x.0) {
                     best_any = Some((score, center, tp1, tp2));
                 }
-                // Prefer centres on the inside-of-corner (bisector) side.
+                // `best` additionally requires the centre to sit on the inside-
+                // of-corner (bisector) side. Kept only as a FALLBACK — the pick-
+                // distance `score` above is now the primary selector, so `best_any`
+                // (global min score) wins. The bisector must NOT veto a better
+                // pick-honouring solution (that veto was what let a fillet flip to
+                // the wrong side of an arc).
                 if bis.len() > EPS && (center - corner).dot(bis) <= 1e-9 { continue; }
                 if best.map_or(true, |x| score < x.0) {
                     best = Some((score, center, tp1, tp2));
@@ -229,7 +265,7 @@ fn solve_fillet(
             }
         }
     }
-    best.or(best_any).map(|(_, c, t1, t2)| (c, t1, t2))
+    best_any.or(best).map(|(_, c, t1, t2)| (c, t1, t2))
 }
 
 /// The minor fillet arc between two tangent points about `center`, as a
@@ -256,21 +292,45 @@ fn fillet_arc_bulge(center: Vec2, tp1: Vec2, tp2: Vec2) -> f64 {
     (signed / 4.0).tan()
 }
 
-/// Sub-arc of a bare (CCW, positive-sweep) arc, keeping the portion on the
-/// side of tangent point `tp` that contains `pick`.
+/// Rebuild an arc after a fillet/chamfer trims OR extends it to tangent point
+/// `tp`. If `tp` lies ON the arc → TRIM to `tp`, keeping the side that contains
+/// `pick`. If `tp` lies OFF the arc (the fillet is beyond one end) → EXTEND the
+/// arc, growing the NEAR end to `tp` the SHORT way and keeping the whole arc.
+/// Owner rule: the end nearest the click extends toward the line; the old code
+/// wrapped the long way round (a near-full arc) when the tangent sat just past
+/// an end.
 fn arc_keep(center: Vec2, r: f64, a0: f64, sweep: f64, tp: Vec2, pick: Vec2) -> Geom {
-    let tp_delta = ((tp - center).angle() - a0).rem_euclid(TAU);
-    let pick_delta = ((pick - center).angle() - a0).rem_euclid(TAU);
-    let (start, sw) = if pick_delta <= tp_delta {
-        (a0, tp_delta)                       // keep [a0 .. tp]
+    let ta = (tp - center).angle();
+    let tp_delta = (ta - a0).rem_euclid(TAU);        // CCW from a0, 0..TAU
+    let (start, sw) = if tp_delta <= sweep + 1e-9 {
+        // TRIM — tangent is on the arc; keep the pick side.
+        let pick_delta = ((pick - center).angle() - a0).rem_euclid(TAU);
+        if pick_delta <= tp_delta {
+            (a0, tp_delta)                           // keep [a0 .. tp]
+        } else {
+            (ta, sweep - tp_delta)                   // keep [tp .. end]
+        }
     } else {
-        ((tp - center).angle(), sweep - tp_delta) // keep [tp .. end]
+        // EXTEND — tangent is beyond an end. Grow the end nearest the CLICK (`pick`)
+        // to reach `tp`, keeping the whole arc. Owner rule: the arc's clicked end is
+        // the one that grows toward the line — click the arc's right end → the right
+        // (a0) end grows; click the left → the far end grows. (This can wrap most of
+        // the way round when the corner is on the far side from the clicked end —
+        // that IS the intended "grow the clicked end all the way to the line".)
+        let pick_delta = ((pick - center).angle() - a0).rem_euclid(TAU);  // ∈ [0, sweep]
+        if pick_delta <= sweep * 0.5 {
+            let gap_before = TAU - tp_delta;         // CW from a0 to tp
+            (ta, sweep + gap_before)                 // grow the a0 (start) end to tp
+        } else {
+            let gap_after = tp_delta - sweep;        // CCW past the far end to tp
+            (a0, sweep + gap_after)                  // grow the far end to tp
+        }
     };
     Geom::Arc(Arc {
         center,
         radius: r,
         start_angle: start.rem_euclid(TAU),
-        sweep_angle: sw.max(0.0),
+        sweep_angle: sw.max(0.0).min(TAU),
     })
 }
 
@@ -407,10 +467,16 @@ fn rebuild_side(ctx: &Ctx, piece: &Piece, tp: Vec2, pick: Vec2) -> Geom {
         }
         Ctx::Arc { center, r, a0, sweep } => arc_keep(*center, *r, *a0, *sweep, tp, pick),
         Ctx::Poly { pl, seg } => {
-            // Move the corner-side vertex (farther from the pick) to tp; keep
-            // the rest of the polyline. Recompute the clicked segment's bulge
-            // so an arc segment stays on its circle.
-            let (move_i, _) = poly_moved_vertex(pl, *seg, pick);
+            // Keep the vertex on the SAME side of the tangent point as the PICK,
+            // measured ALONG the segment (so a bulged/arc segment is handled
+            // right), and move the OTHER vertex to tp. Recompute the clicked
+            // segment's bulge so an arc segment stays on its circle.
+            // (The old rule moved the vertex farther from the pick by straight-line
+            // distance, which kept the WRONG side when the pick sat PAST tp along a
+            // curved segment — owner report: it trimmed the picked side.)
+            let t_tp = along_param(piece, tp);
+            let t_pick = along_param(piece, pick);
+            let move_i = if t_pick <= t_tp { *seg + 1 } else { *seg };
             let va = pl.vertices[*seg].pos;
             let vb = pl.vertices[*seg + 1].pos;
             let mut np = pl.clone();
@@ -474,8 +540,16 @@ pub fn chamfer_geoms(
     if !poly_move_ok(&ctx1, p1) || !poly_move_ok(&ctx2, p2) {
         return Err("chamfer: can't chamfer that polyline segment to a separate object in place — its corner-side end isn't free. Explode the polyline first.".into());
     }
-    let mid = (p1 + p2) * 0.5;
-    let corner = nearest_point(&piece_intersect(&pc1, &pc2), mid)
+    // THE LINE PICK DECIDES WHICH CORNER (mirror of the fillet rule): choose the
+    // crossing nearest the SEGMENT (line) pick — a line spans both corners, so its
+    // pick is the reliable "which corner" signal. (Chamfer walks a fixed distance
+    // from the corner, so unlike fillet there's no separate "grow the arc end".)
+    let seg_pick = match (matches!(pc1, Piece::Seg { .. }), matches!(pc2, Piece::Seg { .. })) {
+        (true, false) => p1,   // pc1 is the segment (line)
+        (false, true) => p2,   // pc2 is the segment (line)
+        _ => (p1 + p2) * 0.5,
+    };
+    let corner = nearest_point(&piece_intersect(&pc1, &pc2), seg_pick)
         .or_else(|| infinite_corner(&pc1, &pc2))
         .ok_or_else(|| "chamfer: objects do not meet".to_string())?;
 
@@ -880,6 +954,182 @@ mod tests {
     }
 
     #[test]
+    fn fillet_line_arc_lands_on_the_clicked_side_not_the_far_side() {
+        // Regression (owner dump 2026-07-29): a line crossing a big arc has TWO
+        // valid same-radius fillet solutions — one on each side of the arc. The
+        // fillet must land where the user CLICKED, not flip to the far side.
+        // Line a=(-40,-20)→(40,20); Arc = upper half of circle c=(0,0) r=45.
+        let l = Geom::Line(Line { a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0) });
+        let arc = Geom::Arc(Arc {
+            center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI,
+        });
+        // Picks (from the dump) sit on the lower-right pocket.
+        let p_line = Vec2::new(33.657, 16.849);
+        let p_arc  = Vec2::new(43.053, 12.152);
+        let out = fillet_geoms(&l, p_line, &arc, p_arc, 8.498).unwrap();
+        let Geom::Arc(a) = out.arc.expect("expected a fillet arc") else { panic!("not an arc") };
+        assert!((a.radius - 8.498).abs() < 1e-3, "radius {}", a.radius);
+        // The CLICKED-side solution (a same-radius circle tangent to both near the
+        // picks) is centred ~(35.56, 8.29); the WRONG far side is ~(27.95, 23.48).
+        let clicked = Vec2::new(35.557, 8.286);
+        let far     = Vec2::new(27.950, 23.477);
+        assert!(a.center.dist(clicked) < a.center.dist(far),
+            "fillet flipped to the far side of the arc: center {:?}", a.center);
+        assert!(a.center.dist(clicked) < 3.0, "center {:?} not near the clicked pocket", a.center);
+    }
+
+    #[test]
+    fn chamfer_line_pick_decides_the_corner() {
+        // Chamfer corner follows the LINE pick (same as the fillet CORNER rule).
+        // Horizontal line y=30 crosses the 180° arc at ±33.54. Click the LINE's
+        // right half → bevel at the RIGHT crossing; left half → LEFT.
+        let arc = Geom::Arc(Arc { center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI });
+        let line = Geom::Line(Line { a: Vec2::new(-50.0, 30.0), b: Vec2::new(50.0, 30.0) });
+        let arc_pick = Vec2::new(0.0, 45.0);   // arc top — neutral
+        let right = chamfer_geoms(&arc, arc_pick, &line, Vec2::new(40.0, 30.0), 5.0, 5.0).unwrap();
+        if let Geom::Line(b) = right.bridge {
+            assert!((b.a + b.b).x * 0.5 > 0.0, "line clicked right → bridge on the right, got {:?}", b);
+        }
+        let left = chamfer_geoms(&arc, arc_pick, &line, Vec2::new(-40.0, 30.0), 5.0, 5.0).unwrap();
+        if let Geom::Line(b) = left.bridge {
+            assert!((b.a + b.b).x * 0.5 < 0.0, "line clicked left → bridge on the left, got {:?}", b);
+        }
+    }
+
+    #[test]
+    fn fillet_arc_extends_the_near_end_not_the_long_way() {
+        // Owner: hovering the arc's RIGHT end must extend the RIGHT end a few
+        // degrees toward the line — NOT wrap the arc the long way into a near-full
+        // circle. Line y=-5 crosses the circle just below both ends; arc=upper 180°.
+        let line = Geom::Line(Line { a: Vec2::new(-50.0, -15.0), b: Vec2::new(50.0, -15.0) });
+        let arc = Geom::Arc(Arc { center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI });
+        // First pick = line (neutral); SECOND = arc on the RIGHT (~19°).
+        let out = fillet_geoms(&line, Vec2::new(0.0, -15.0), &arc, Vec2::new(42.4, 15.0), 5.0).unwrap();
+        let Geom::Arc(kept) = out.g2_new else { panic!("g2 should stay an arc") };
+        let sw = kept.sweep_angle.to_degrees();
+        assert!(sw > 180.0 && sw < 220.0,
+            "arc should extend the near end a little (>180°, ≪360°), got {sw:.0}° (long-way wrap = bug)");
+    }
+
+    #[test]
+    fn fillet_arc_hover_side_decides_the_corner() {
+        // Owner image 1/2: line through the arc's centre, ARC picked SECOND. Hover
+        // the arc's LEFT → fillet at the left corner; the RIGHT → right corner. The
+        // 2nd pick (the arc) must decide, so the two sides differ.
+        let line = Geom::Line(Line { a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0) });
+        let arc = Geom::Arc(Arc { center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI });
+        let line_pick = Vec2::new(0.0, 0.0);   // neutral centre of the line
+        // Arc points: LEFT ~170° and RIGHT ~10° (both on the 0..180° arc).
+        let l = 170f64.to_radians(); let r = 10f64.to_radians();
+        let left = fillet_geoms(&line, line_pick, &arc, Vec2::new(45.0*l.cos(), 45.0*l.sin()), 5.0).unwrap();
+        let right = fillet_geoms(&line, line_pick, &arc, Vec2::new(45.0*r.cos(), 45.0*r.sin()), 5.0).unwrap();
+        let cl = if let Some(Geom::Arc(a)) = left.arc { a.center } else { panic!() };
+        let cr = if let Some(Geom::Arc(a)) = right.arc { a.center } else { panic!() };
+        assert!(cl.x < 0.0, "arc hovered LEFT → fillet on the left, got {:?}", cl);
+        assert!(cr.x > 0.0, "arc hovered RIGHT → fillet on the right, got {:?}", cr);
+    }
+
+    #[test]
+    fn fillet_line_sets_corner_arc_pick_sets_which_end_grows() {
+        // Owner 2026-07-29 (detailed): TWO separate decisions. The LINE pick sets
+        // WHICH CORNER (line clicked LEFT → left corner). The ARC pick sets WHICH
+        // END of the arc grows to reach it: arc clicked RIGHT → the right end grows
+        // all the way round (big arc); arc clicked LEFT → the near end grows a
+        // little. Both cases fillet at the SAME (line-left) corner.
+        let line = Geom::Line(Line { a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0) });
+        let arc = Geom::Arc(Arc { center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: std::f64::consts::PI });
+        let line_left = Vec2::new(-31.167, -15.21);
+        let ar = fillet_geoms(&line, line_left, &arc, Vec2::new(44.167, 3.79), 5.0).unwrap();   // arc RIGHT
+        let al = fillet_geoms(&line, line_left, &arc, Vec2::new(-43.5, 10.79), 5.0).unwrap();    // arc LEFT
+        // Both fillets land at the LEFT (line-pick) corner.
+        let cr = if let Some(Geom::Arc(a)) = ar.arc { a.center } else { panic!() };
+        let cl = if let Some(Geom::Arc(a)) = al.arc { a.center } else { panic!() };
+        assert!(cr.x < 0.0 && cl.x < 0.0, "both should be the LEFT corner: {cr:?} {cl:?}");
+        // Arc-RIGHT click grows the far (right) end round → big arc; arc-LEFT → small.
+        let sw_r = if let Geom::Arc(a) = ar.g2_new { a.sweep_angle.to_degrees() } else { panic!() };
+        let sw_l = if let Geom::Arc(a) = al.g2_new { a.sweep_angle.to_degrees() } else { panic!() };
+        assert!(sw_r > 300.0, "arc clicked RIGHT → right end grows round (big), got {sw_r:.0}°");
+        assert!(sw_l < 220.0, "arc clicked LEFT → near end grows a little, got {sw_l:.0}°");
+    }
+
+    #[test]
+    fn fillet_short_arc_tangent_lands_on_the_arc_extent() {
+        // Owner report 2026-07-29: "the short arc doesn't fillet with the line".
+        // A short arc must fillet where it ACTUALLY is. Two arcs of the same
+        // circle (c=0, r=45): a LONG one (0..180°) and a SHORT one (190..220°,
+        // the lower-left corner where the line y=0.5x re-crosses the circle at
+        // ~206.6°). Filleting the line to the SHORT arc must place the arc-side
+        // tangent within/near the short arc's extent, not up at ~26° (the OTHER,
+        // upper-right crossing) which the short arc doesn't cover.
+        let line = Geom::Line(Line { a: Vec2::new(-60.0, -30.0), b: Vec2::new(60.0, 30.0) });
+        let short = Geom::Arc(Arc { center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 190.0_f64.to_radians(), sweep_angle: 30.0_f64.to_radians() });
+        // Pick the arc in the lower-left (~206°) and the line just outside there.
+        let arc_pick = Vec2::new(45.0 * 206f64.to_radians().cos(), 45.0 * 206f64.to_radians().sin());
+        let line_pick = Vec2::new(-42.0, -21.0);
+        let out = fillet_geoms(&line, line_pick, &short, arc_pick, 6.0).unwrap();
+        let Geom::Arc(fa) = out.arc.expect("fillet arc") else { panic!("not an arc") };
+        // The fillet arc's endpoint that sits on the r=45 circle = the arc-side
+        // tangent. Its angle must be in the lower-left (near 190..220°), NOT ~26°.
+        let e1 = fa.center + Vec2::new(fa.radius * fa.start_angle.cos(), fa.radius * fa.start_angle.sin());
+        let e2 = fa.center + Vec2::new(fa.radius * (fa.start_angle + fa.sweep_angle).cos(),
+                                       fa.radius * (fa.start_angle + fa.sweep_angle).sin());
+        let tp = if (e1.len() - 45.0).abs() < (e2.len() - 45.0).abs() { e1 } else { e2 };
+        let ang = tp.angle().to_degrees().rem_euclid(360.0);
+        assert!((150.0..=260.0).contains(&ang),
+            "short-arc fillet tangent landed at {ang:.1}°, off the 190..220° arc");
+    }
+
+    #[test]
+    fn fillet_radius_equal_to_arc_radius_does_not_return_the_arc_itself() {
+        // Owner dump 2026-07-29 #3: filleting an arc of r≈6.841 to another arc
+        // with fillet radius 6.8415 (≈ the arc's own radius) returned a "fillet"
+        // arc IDENTICAL to the input arc (its inner offset locus |rr−r|≈0 collapsed
+        // onto the arc centre). The result must NOT coincide with either input arc.
+        let arc7 = Geom::Arc(Arc { center: Vec2::new(10.813, 1.262), radius: 14.368,
+            start_angle: 253.92_f64.to_radians(), sweep_angle: 108.04_f64.to_radians() });
+        let arc8 = Geom::Arc(Arc { center: Vec2::new(18.335, 1.519), radius: 6.841,
+            start_angle: 1.95_f64.to_radians(), sweep_angle: 114.61_f64.to_radians() });
+        let r = 6.841459993376525;   // ≈ arc8.radius
+        if let Ok(out) = fillet_geoms(&arc8, Vec2::new(19.333, 7.79),
+                                      &arc7, Vec2::new(24.5, -2.71), r) {
+            if let Some(Geom::Arc(a)) = out.arc {
+                // Not coincident with arc8 (the degenerate result).
+                let same_as_arc8 = a.center.dist(Vec2::new(18.335, 1.519)) < 0.1
+                    && (a.radius - 6.841).abs() < 0.1;
+                assert!(!same_as_arc8,
+                    "fillet returned a copy of the input arc: center {:?} r {}", a.center, a.radius);
+            }
+        }
+    }
+
+    #[test]
+    fn fillet_line_inside_arc_circle_stays_on_clicked_side() {
+        // Owner dump 2026-07-29 #2: the whole LINE sits INSIDE the arc's circle
+        // (both ends radius < 45) and the arc is a partial 193° sweep. Fillet
+        // still flipped to the far side (result centre ~(-35.54,-8.25)).
+        let l = Geom::Line(Line { a: Vec2::new(40.0, 20.0), b: Vec2::new(-31.734, -15.867) });
+        let arc = Geom::Arc(Arc {
+            center: Vec2::new(0.0, 0.0), radius: 45.0,
+            start_angle: 0.0, sweep_angle: 193.07_f64.to_radians(),
+        });
+        let out = fillet_geoms(&l, Vec2::new(33.167, 16.457),
+                               &arc, Vec2::new(43.667, 11.623), 8.513).unwrap();
+        let Geom::Arc(a) = out.arc.expect("expected a fillet arc") else { panic!("not an arc") };
+        // Clicked pocket is Q1 near ~(35.55, 8.26); the flipped far side is
+        // ~(-35.54, -8.25).
+        assert!(a.center.x > 0.0 && a.center.y > 0.0,
+            "fillet flipped off the clicked (Q1) side: center {:?}", a.center);
+        assert!(a.center.dist(Vec2::new(35.55, 8.26)) < 3.0,
+            "center {:?} not in the clicked pocket", a.center);
+    }
+
+    #[test]
     fn fillet_line_to_polyline_end_segment_moves_free_tip() {
         // Open polyline: free tip (10,0) → interior (0,0) → free (0,10).
         // Vertical line at x=20. Fillet the horizontal end segment (whose free
@@ -903,6 +1153,30 @@ mod tests {
             "tip moved to {:?}", np.vertices[0].pos);
         assert!(np.vertices[1].pos.dist(Vec2::new(0.0, 0.0)) < 1e-9, "interior moved!");
         assert!(np.vertices[2].pos.dist(Vec2::new(0.0, 10.0)) < 1e-9, "far end moved!");
+    }
+
+    #[test]
+    fn fillet_bulged_polyline_keeps_the_picked_side_when_pick_is_past_tp() {
+        // Owner dump 2026-07-29: a 2-vertex BULGED polyline (an arc stored as a
+        // polyline) filleted with a line. The pick is nearest v00 by straight line,
+        // but ALONG the arc it sits PAST the tangent point (on the v01 side). The
+        // fillet must keep the v01 (picked) side — i.e. move v00 to tp, leave v01.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(185.174, -92.434), bulge: -0.3655 },
+                PolyVertex { pos: Vec2::new(408.011, 95.594), bulge: 0.0 },
+            ],
+            closed: false, widths: Vec::new(),
+        };
+        let line = Geom::Line(Line { a: Vec2::new(160.359, -102.118), b: Vec2::new(236.160, -72.537) });
+        let out = fillet_geoms(&Geom::Polyline(pl), Vec2::new(205.938, -26.606),
+                               &line, Vec2::new(216.361, -78.719), 5.0).unwrap();
+        let Geom::Polyline(np) = out.g1_new else { panic!("poly side stays a polyline") };
+        // v01 (the PICKED side) is untouched; v00 moved to the tangent point.
+        assert!(np.vertices[1].pos.dist(Vec2::new(408.011, 95.594)) < 1e-6,
+            "picked-side vertex v01 was moved: {:?}", np.vertices[1].pos);
+        assert!(np.vertices[0].pos.dist(Vec2::new(185.174, -92.434)) > 1e-3,
+            "v00 should have moved to tp (kept the picked v01 side)");
     }
 
     #[test]

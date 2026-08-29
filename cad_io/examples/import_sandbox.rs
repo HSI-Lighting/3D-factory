@@ -42,6 +42,16 @@ fn geom_kind(g: &Geom) -> &'static str {
         Geom::Spline(_) => "Spline",      Geom::Wall(_) => "Wall",
         Geom::Text(_) => "Text",          Geom::Dimension(_) => "Dimension",
         Geom::BlockRef(_) => "BlockRef",
+        Geom::Leader(_) => "Leader",      Geom::AttrDef(_) => "AttrDef",
+        Geom::CenterMark(_) => "CenterMark",
+        Geom::Xline(_) => "Xline",
+        Geom::Ray(_) => "Ray",
+        Geom::Donut(_) => "Donut",
+        Geom::Wipeout(_) => "Wipeout",
+        Geom::Region(_) => "Region",
+        Geom::Table(_) => "Table",
+        Geom::Xref(_) => "Xref",
+        Geom::Viewport(_) => "Viewport",
     }
 }
 

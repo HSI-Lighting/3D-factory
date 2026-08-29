@@ -107,9 +107,10 @@ impl From<crate::geom::Spline> for DObject {
 
 // ---- handle allocation -----------------------------------------------------
 //
-// Global counter is fine for now — handles are unique per process. When DXF
-// import lands we'll need handle preservation (load files keep their hex
-// handles), so this becomes per-Document. Today it's simple and sufficient.
+// Global counter — handles are unique per process. It starts at 1 EVERY session,
+// so any loader that PRESERVES handles must raise it past what it loaded (see
+// `reserve_handles_above`). That was once a future DXF concern; RSM already
+// preserves handles today, so it is a present one.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -118,35 +119,25 @@ pub fn next_handle() -> Handle {
     HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Guarantee every future [`next_handle`] is greater than `max`.
+/// Raise the handle counter so the next `next_handle()` is strictly greater than
+/// `max`. **Every loader that preserves handles MUST call this** with the highest
+/// handle it loaded, or the next dobject drawn is handed a handle a loaded
+/// dobject already owns.
 ///
-/// A LOADER MUST CALL THIS. Handles are preserved by RSM, and the counter is a fresh
-/// process-global starting at 1 — so opening a file saved in a long session hands the next object
-/// drawn a handle a loaded object already owns. Nothing announces it.
+/// Why this matters beyond duplicate IDs: `Hatch.boundary_handles` resolves its
+/// boundary **by handle**, so a collision can bind a hatch to the **wrong
+/// geometry**. `Document::index_of_handle` / `find_by_handle` return the FIRST
+/// match, so the newer dobject is silently shadowed.
 ///
-/// A duplicate handle is not cosmetic, because handles are how objects REFER to each other:
+/// Monotonic and idempotent (`fetch_max`): calling it with a lower value is a
+/// no-op, so it is safe to call from every loader and in any order. Saturating,
+/// so `Handle::MAX` cannot wrap to 0.
 ///
-///   * `cad_light::extrude_handles` resolves a lit room with `find_by_handle`, so a collision
-///     silently lights the WRONG GEOMETRY — the validated calculation, run on the wrong room.
-///   * `Hatch.boundary_handles` binds a hatch to its boundary the same way.
-///
-/// `find_by_handle` returns the FIRST match, so a collision resolves to whichever object sits
-/// earlier in the document: stable, arbitrary, and wrong.
-///
-/// Idempotent, and it never lowers the counter — two documents loaded in one session each raise
-/// the floor, and a load after drawing cannot reissue handles already handed out.
-/// Compare-exchange rather than load-then-store, because a concurrent allocation between the read
-/// and the write would otherwise be lost.
+/// Found by 3D_Factory (`FOR_UPSTREAM_AGENT.md` §5.1) — reported, not fixed
+/// there; their `#[ignore]`d probe is ported as
+/// `cad_io::rsm::tests::next_handle_does_not_collide_with_a_loaded_handle`.
 pub fn reserve_handles_above(max: Handle) {
-    let mut cur = HANDLE_COUNTER.load(Ordering::Relaxed);
-    while cur <= max {
-        match HANDLE_COUNTER.compare_exchange_weak(
-            cur, max + 1, Ordering::Relaxed, Ordering::Relaxed,
-        ) {
-            Ok(_) => return,
-            Err(seen) => cur = seen,
-        }
-    }
+    HANDLE_COUNTER.fetch_max(max.saturating_add(1), Ordering::Relaxed);
 }
 
 #[cfg(test)]

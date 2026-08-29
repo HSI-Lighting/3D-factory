@@ -10,6 +10,55 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
     use Geom::*;
     match (a, b) {
         (Line(l1),   Line(l2))   => intersect_line_line(*l1, *l2),
+        // Xline ∩ anything — the infinite line as a very long finite
+        // segment (±1e6). Exact enough for any CAD-scale intersection;
+        // nearly-parallel pairs yield a hit far away that the caller
+        // filters by pick distance. Xline ∩ Xline reuses the same arm.
+        (Xline(x), other) | (other, Xline(x)) => {
+            let seg = Geom::Line(x.line_segment(1e6));
+            match other {
+                Xline(x2) => intersect(&seg, &Geom::Line(x2.line_segment(1e6))),
+                _         => intersect(&seg, other),
+            }
+        }
+        // Ray ∩ anything — the ray as a long finite segment from the base
+        // forward (±1e6 like the Xline arm; Ray ∩ Ray reuses it too).
+        (Ray(r), other) | (other, Ray(r)) => {
+            let seg = Geom::Line(r.ray_segment(1e6));
+            match other {
+                Ray(r2) => intersect(&seg, &Geom::Line(r2.ray_segment(1e6))),
+                _       => intersect(&seg, other),
+            }
+        }
+        // Donut ∩ anything — the ring's two circles (outer + hole).
+        (Donut(d), other) | (other, Donut(d)) => {
+            let outer = crate::geom::Circle { center: d.center, radius: d.outer_radius };
+            let mut hits = intersect(&Geom::Circle(outer), other);
+            if d.inner_radius > 1e-9 {
+                let inner = crate::geom::Circle { center: d.center, radius: d.inner_radius };
+                hits.extend(intersect(&Geom::Circle(inner), other));
+            }
+            hits
+        }
+        // Wipeout/Region ∩ anything — the closed loop as segments.
+        (Wipeout(w), other) | (other, Wipeout(w)) => {
+            let mut hits = Vec::new();
+            for i in 0..w.pts.len() {
+                let a = w.pts[i];
+                let b = w.pts[(i + 1) % w.pts.len()];
+                hits.extend(intersect(&Geom::Line(crate::geom::Line { a, b }), other));
+            }
+            hits
+        }
+        (Region(rg), other) | (other, Region(rg)) => {
+            let mut hits = Vec::new();
+            for i in 0..rg.loop_pts.len() {
+                let a = rg.loop_pts[i];
+                let b = rg.loop_pts[(i + 1) % rg.loop_pts.len()];
+                hits.extend(intersect(&Geom::Line(crate::geom::Line { a, b }), other));
+            }
+            hits
+        }
         (Line(l),    Circle(c))  | (Circle(c), Line(l))  => intersect_line_circle(*l, *c),
         (Line(l),    Arc(ar))    | (Arc(ar),   Line(l))  => intersect_line_arc(*l, *ar),
         (Circle(c1), Circle(c2)) => intersect_circle_circle(*c1, *c2),
@@ -54,11 +103,22 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // Hatch entity itself contributes no intersections.
         (Hatch(_), _) | (_, Hatch(_)) => Vec::new(),
 
-        // Spline ∩ anything: not implemented yet — NURBS curve
-        // intersection is a non-trivial numerical problem (typically
-        // Bézier-subdivision + Newton refinement). Return empty for
-        // v1; trim/extend against splines is also gated upstream.
-        (Spline(_), _) | (_, Spline(_)) => Vec::new(),
+        // Spline ∩ anything (issue #21): tessellated approximation — each
+        // sample segment intersects like a polyline (the same approach the
+        // spline CUTTER path uses). Spline ∩ Spline recurses through the
+        // polyline arm and terminates (both sides tessellate).
+        (Spline(sp), other) | (other, Spline(sp)) => {
+            let samples = sp.tessellate(64);
+            if samples.len() < 2 { return Vec::new(); }
+            let pl = Geom::Polyline(crate::geom::Polyline {
+                vertices: samples.into_iter()
+                    .map(|p| PolyVertex { pos: p, bulge: 0.0 })
+                    .collect(),
+                closed: false,
+                widths: Vec::new(),
+            });
+            intersect(&pl, other)
+        }
 
         // Wall ∩ anything — intersect the WALL's CENTERLINE with the
         // other geom. The centerline is the smart-dobject's identity;
@@ -78,6 +138,59 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // Text ∩ anything: text has no curve; trim/extend never need
         // to compute intersections against it. Empty.
         (Text(_), _) | (_, Text(_)) => Vec::new(),
+        // Table ∩ anything: annotation — no curve to meet.
+        (Table(_), _) | (_, Table(_)) => Vec::new(),
+        // Xref ∩ anything: resolve by exploding (like BlockRef).
+        (Xref(_), _) | (_, Xref(_)) => Vec::new(),
+
+        // Leader ∩ anything: the leader CHAIN is a polyline — intersect
+        // per segment so cutters can find the callout's landing line.
+        (Leader(l), other) | (other, Leader(l)) => {
+            let pl = Geom::Polyline(crate::geom::Polyline {
+                vertices: l.pts.iter().map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                closed: false,
+                widths: Vec::new(),
+            });
+            match other {
+                Leader(l2) => {
+                    let pl2 = Geom::Polyline(crate::geom::Polyline {
+                        vertices: l2.pts.iter().map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                        closed: false,
+                        widths: Vec::new(),
+                    });
+                    intersect(&pl, &pl2)
+                }
+                _ => intersect(&pl, other),
+            }
+        }
+
+        // AttrDef ∩ anything: an attribute value is annotation text.
+        (AttrDef(_), _) | (_, AttrDef(_)) => Vec::new(),
+
+        // CenterMark ∩ anything: the two crossing arms are real lines —
+        // intersect against each arm so cutters/boundaries can meet them.
+        (CenterMark(cm), other) | (other, CenterMark(cm)) => {
+            let arms = cm.segments();
+            let l1 = Geom::Line(crate::geom::Line { a: arms[0].0, b: arms[0].1 });
+            let l2 = Geom::Line(crate::geom::Line { a: arms[1].0, b: arms[1].1 });
+            match other {
+                CenterMark(cm2) => {
+                    let arms2 = cm2.segments();
+                    let l3 = Geom::Line(crate::geom::Line { a: arms2[0].0, b: arms2[0].1 });
+                    let l4 = Geom::Line(crate::geom::Line { a: arms2[1].0, b: arms2[1].1 });
+                    let mut out = intersect(&l1, &l3);
+                    out.extend(intersect(&l1, &l4));
+                    out.extend(intersect(&l2, &l3));
+                    out.extend(intersect(&l2, &l4));
+                    out
+                }
+                _ => {
+                    let mut out = intersect(&l1, other);
+                    out.extend(intersect(&l2, other));
+                    out
+                }
+            }
+        }
 
         // Dimension ∩ anything: dimensions are annotations, not
         // boundary curves; no meaningful intersection contribution.
@@ -86,6 +199,9 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // BlockRef ∩ anything: contents resolve through the Document,
         // which intersect() can't reach. Empty (explode to intersect).
         (BlockRef(_), _) | (_, BlockRef(_)) => Vec::new(),
+
+        // Viewport ∩ anything: viewports are paper-space entities.
+        (Viewport(_), _) | (_, Viewport(_)) => Vec::new(),
     }
 }
 
@@ -165,7 +281,18 @@ pub fn intersect_line_line(a: Line, b: Line) -> Vec<Vec2> {
     let d1 = a.b - a.a;
     let d2 = b.b - b.a;
     let denom = d1.cross(d2);
-    if approx_zero(denom) {
+    // G8: denom = |d1|·|d2|·sinθ scales with the operands' lengths. A RELATIVE
+    // threshold tests |sinθ| directly — scale-free for both tiny and huge lines.
+    // (Relative, NOT `scaled_tol`: the latter's .max(1.0) floor makes it absolute
+    // for sub-unit products and wrongly calls short segments parallel — B16 FIX 4
+    // regression, mentor-corrected.)
+    //
+    // SQUARED form — `|denom| ≤ k·|d1|·|d2|` ⟺ `denom² ≤ k²·|d1|²·|d2|²` (both
+    // sides ≥ 0), which avoids TWO sqrts on this HOT path: the window-select
+    // narrow phase runs this per polyline-segment × window-edge over the whole
+    // candidate set. `len_sq()` is a bare dot, no sqrt.
+    const PARALLEL_SIN_EPS_SQ: f64 = PARALLEL_SIN_EPS * PARALLEL_SIN_EPS;
+    if denom * denom <= PARALLEL_SIN_EPS_SQ * d1.len_sq() * d2.len_sq() {
         return vec![];                        // parallel or collinear
     }
     let diff = b.a - a.a;
@@ -366,7 +493,16 @@ pub fn intersect_circle_ellipse(circle: Circle, el: Ellipse) -> Vec<Vec2> {
         let p = el.point_at(t);
         2.0 * (p - circle.center).dot(el.tangent_at(t))
     };
-    crate::math::newton_roots_periodic(f, fd, 8)
+    // G1: `f` is a SQUARED-distance residual (`|E(t)−c|² − r²`), so its
+    // floating-point noise scales with coordinate² — a fixed 1e-6 rejects every
+    // real root at large scale. Scale the accept threshold by char² where char
+    // is the pair's larger characteristic size.
+    let char = circle.radius.max(el.semi_major());
+    let residual_tol = 1e-6 * (char * char).max(1.0);
+    // G7 dedup: param-space, from the parametrized curve's derivative magnitude
+    // (≈ el.semi_major()). Independent of residual_tol. semi_major ≥ EPS (guarded).
+    let dedup_tol = scaled_tol(el.semi_major()) / el.semi_major();
+    crate::math::newton_roots_periodic(f, fd, 16, residual_tol, dedup_tol)
         .into_iter().map(|t| el.point_at(t)).collect()
 }
 
@@ -386,7 +522,19 @@ pub fn intersect_ellipse_ellipse(a: Ellipse, b: Ellipse) -> Vec<Vec2> {
     // f'(t) = ∇F_b(E_a(t)) · E_a'(t)
     let f = |t: f64| ellipse_implicit(&b, a.point_at(t)) - 1.0;
     let fd = |t: f64| ellipse_implicit_grad(&b, a.point_at(t)).dot(a.tangent_at(t));
-    crate::math::newton_roots_periodic(f, fd, 8)
+    // DELIBERATELY a FIXED 1e-6, NOT char²: unlike circle∩ellipse, `f` here is
+    // the DIMENSIONLESS ellipse-implicit form `((q·û)/a)² + ((q·v̂)/b)² − 1`
+    // (each term is length/length), so it is O(1) at any coordinate scale and
+    // its residual noise stays ~1e-16 regardless of size. Scaling this by char²
+    // (≈1e10 at survey scale) would set the accept threshold to ~1e4 on an O(1)
+    // residual and admit false roots everywhere. This preserves the prior
+    // (correct) behavior (B15's sharpest call).
+    // G7: the DEDUP tolerance is a DIFFERENT quantity from the residual and must
+    // still be scale-aware — the parameter t rides ellipse `a`, whose derivative
+    // magnitude ≈ a.semi_major(), so convert a small world tol to param there.
+    // Conflating this with the fixed 1e-6 residual is the easy mistake.
+    let dedup_tol = scaled_tol(a.semi_major()) / a.semi_major();
+    crate::math::newton_roots_periodic(f, fd, 16, 1e-6, dedup_tol)
         .into_iter().map(|t| a.point_at(t)).collect()
 }
 
@@ -586,4 +734,64 @@ mod tests {
             assert!((ellipse_implicit(&b, *p) - 1.0).abs() < 1e-6);
         }
     }
+
+    // ---- FIX 4a (G8): line∩line parallel test is relative -------------------
+
+    // ---- FIX 4a (G8): RELATIVE parallel test (mentor-corrected) --------------
+    // denom = |d1|·|d2|·sinθ. The test is on |sinθ| = |denom|/(|d1||d2|), scale-
+    // free. The pre-B15 absolute EPS wrongly calls SHORT crossing segments
+    // parallel; the bdd2319 `scaled_tol` form did too (its .max(1.0) floor).
+
+    #[test]
+    fn line_line_short_perpendicular_segments_intersect() {
+        // REAL G8: two perpendicular segments, L=1e-5, crossing at the origin.
+        // denom = 4e-10. Original EPS (1e-9) AND bdd2319 scaled_tol (floored 1e-6)
+        // both call this parallel → empty. The relative 1e-9·|d1||d2| = 4e-19
+        // threshold finds the intersection. (Fails-before vs BOTH.)
+        let l = 1.0e-5;
+        let a = Line { a: Vec2::new(-l, 0.0), b: Vec2::new(l, 0.0) };
+        let b = Line { a: Vec2::new(0.0, -l), b: Vec2::new(0.0, l) };
+        let pts = intersect_line_line(a, b);
+        assert_eq!(pts.len(), 1, "short ⟂ segments must intersect, got {}", pts.len());
+        assert!(pts[0].len() < 1e-9, "intersection should be ~origin, got {:?}", pts[0]);
+    }
+
+    #[test]
+    fn line_line_perpendicular_pins_the_bdd2319_regression() {
+        // REGRESSION GUARD: L=1e-4 perpendicular, denom = 4e-8. The ORIGINAL EPS
+        // handled this (4e-8 > 1e-9), but bdd2319's floored scaled_tol (1e-6)
+        // called it parallel → empty. Pins that specific regression.
+        let l = 1.0e-4;
+        let a = Line { a: Vec2::new(-l, 0.0), b: Vec2::new(l, 0.0) };
+        let b = Line { a: Vec2::new(0.0, -l), b: Vec2::new(0.0, l) };
+        assert_eq!(intersect_line_line(a, b).len(), 1,
+            "L=1e-4 ⟂ segments must intersect (bdd2319 regression)");
+    }
+
+    #[test]
+    fn line_line_truly_parallel_still_empty() {
+        // Relative threshold must still reject genuinely parallel lines.
+        let a = Line { a: Vec2::new(-1.0e7, 0.0), b: Vec2::new(1.0e7, 0.0) };
+        let b = Line { a: Vec2::new(-1.0e7, 5.0), b: Vec2::new(1.0e7, 5.0) };
+        assert!(intersect_line_line(a, b).is_empty(), "parallel lines must not intersect");
+    }
+
+    // ---- FIX 2 (G7): circle∩ellipse finds all 4 roots at large scale --------
+
+    #[test]
+    fn circle_ellipse_four_roots_survive_at_large_scale() {
+        // A circle crossing an ellipse at 4 points, at 1e6 scale. The dedup is now
+        // scale-aware (param-space), so distinct roots are not merged, and the
+        // char²-residual accepts them. Count must match unit scale.
+        fn hits(s: f64) -> usize {
+            let el = Ellipse { center: Vec2::ZERO, major: Vec2::new(60.0 * s, 0.0), ratio: 0.5 };
+            let c  = Circle { center: Vec2::ZERO, radius: 40.0 * s };
+            intersect_circle_ellipse(c, el).len()
+        }
+        let base = hits(1.0);
+        assert!(base >= 4, "sanity: circle∩ellipse should hit 4 at 1× (got {base})");
+        assert_eq!(hits(1e6), base,
+            "hit count must be scale-invariant (1e6×: {} vs {base})", hits(1e6));
+    }
 }
+

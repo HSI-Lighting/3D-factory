@@ -271,7 +271,7 @@ mod tests {
             locked:     false,
             frozen:     false,
             plottable:  true,
-        });
+            order:      0,});
         assert_eq!(resolve_color(Color::ByLayer, id, &t, &tc), (0, 255, 0));
     }
 

@@ -45,6 +45,38 @@ pub fn bulge_from_arc(start: Vec2, end: Vec2, center: Vec2, sweep_abs: f64) -> f
     sign * (mag * 0.25).tan()
 }
 
+/// The arc a polyline segment with `bulge` sweeps from `a` to `b`: center,
+/// radius, start angle and SIGNED sweep (positive = CCW, like a positive
+/// bulge). None for a zero/near-zero bulge, a degenerate chord, or a
+/// full-circle bulge (whose center can't be derived from a chord alone).
+/// Inverse of [`bulge_from_arc`].
+pub fn arc_from_bulge(a: Vec2, b: Vec2, bulge: f64) -> Option<(Vec2, f64, f64, f64)> {
+    use crate::math::EPS;
+    if bulge.abs() < 1e-12 { return None; }
+    let chord = b - a;
+    let chord_len = chord.len();
+    if chord_len < EPS { return None; }
+    let theta = 4.0 * bulge.atan();
+    if theta.abs() >= std::f64::consts::TAU - 1e-9 { return None; }   // full circle
+    let half = theta * 0.5;
+    let sin_half = half.sin();
+    if sin_half.abs() < EPS { return None; }
+    let r = chord_len / (2.0 * sin_half.abs());
+    let chord_hat = chord / chord_len;
+    let perp = Vec2::new(-chord_hat.y, chord_hat.x);
+    let mid = (a + b) * 0.5;
+    let centre_off = r * half.cos();
+    let center = mid + perp * (if bulge > 0.0 { centre_off } else { -centre_off });
+    let start_ang = (a - center).angle();
+    let end_ang = (b - center).angle();
+    let sweep = if bulge > 0.0 {
+        (end_ang - start_ang).rem_euclid(std::f64::consts::TAU)
+    } else {
+        -((start_ang - end_ang).rem_euclid(std::f64::consts::TAU))
+    };
+    Some((center, r, start_ang, sweep))
+}
+
 // ---------------------------------------------------------------------------
 // Polyline segments — explode into independent Line / Arc geoms.
 //
@@ -262,43 +294,46 @@ fn find_concentric_arc_group(items: &[(usize, Geom)]) -> Vec<usize> {
     Vec::new()
 }
 
+/// True iff the arcs' angular sweeps union into a SINGLE contiguous range (or
+/// the whole circle). G6: routed through `circular_union` (gap-rotation), so a
+/// chain that crosses the 0°/360° SEAM is recognised — the old sort-low→high
+/// sweep treated 0° as a hard wall and rejected any wrapping chain. Two-or-more
+/// merged intervals ⇒ a genuine gap ⇒ not a chain. Strict superset of the old
+/// behaviour: every non-wrapping chain it accepted still collapses to one
+/// interval. (`circular_union`'s internal eps is `1e-6`, same as `JOIN_EPS`, so
+/// the touching threshold is unchanged.)
 fn arcs_form_a_chain(arcs: &[Arc]) -> bool {
-    // True iff the union of sweep intervals (mod 2π) forms a single
-    // contiguous range (or full circle).
     if arcs.len() < 2 { return false; }
-    let mut spans: Vec<(f64, f64)> = arcs.iter()
-        .map(|a| {
-            let s = a.start_angle.rem_euclid(std::f64::consts::TAU);
-            (s, s + a.sweep_angle)
-        })
-        .collect();
-    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let mut hi = spans[0].1;
-    for i in 1..spans.len() {
-        if spans[i].0 > hi + JOIN_EPS { return false; }
-        if spans[i].1 > hi { hi = spans[i].1; }
-    }
-    true
+    let ivs = arc_intervals(arcs);
+    let (merged, full) = crate::math::circular_union(&ivs);
+    full || merged.len() == 1
 }
 
 fn merge_concentric_arcs(arcs: &[Arc]) -> Option<Arc> {
     if arcs.is_empty() { return None; }
-    let mut spans: Vec<(f64, f64)> = arcs.iter()
-        .map(|a| {
-            let s = a.start_angle.rem_euclid(std::f64::consts::TAU);
-            (s, s + a.sweep_angle)
-        })
-        .collect();
-    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let start = spans[0].0;
-    let end   = spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
-    let sweep = (end - start).min(std::f64::consts::TAU);
-    Some(Arc {
-        center: arcs[0].center,
-        radius: arcs[0].radius,
-        start_angle: start,
-        sweep_angle: sweep,
-    })
+    let ivs = arc_intervals(arcs);
+    let (merged, full) = crate::math::circular_union(&ivs);
+    // Concentric ⇒ centre/radius are shared; take them from arcs[0] (as before).
+    let (center, radius) = (arcs[0].center, arcs[0].radius);
+    if full {
+        return Some(Arc { center, radius,
+            start_angle: 0.0, sweep_angle: std::f64::consts::TAU });
+    }
+    match merged.as_slice() {
+        // Single contiguous range (incl. across the seam) → that IS the arc.
+        [(s, len)] => Some(Arc { center, radius, start_angle: *s, sweep_angle: *len }),
+        // A gap remains: merge is only called after `arcs_form_a_chain`, so this
+        // shouldn't happen — return None rather than fabricate a span.
+        _ => None,
+    }
+}
+
+/// `(start.rem_euclid(τ), sweep)` intervals — exactly `circular_union`'s
+/// `(start, LENGTH)` form.
+fn arc_intervals(arcs: &[Arc]) -> Vec<(f64, f64)> {
+    arcs.iter()
+        .map(|a| (a.start_angle.rem_euclid(std::f64::consts::TAU), a.sweep_angle))
+        .collect()
 }
 
 fn endpoints_of(g: &Geom) -> Option<(Vec2, Vec2)> {
@@ -409,4 +444,98 @@ fn chain_to_polyline(geoms: &[Geom]) -> Option<Polyline> {
     }
 
     Some(Polyline { vertices: verts, closed: chain_closed, widths: Vec::new() })
+}
+
+#[cfg(test)]
+mod concentric_arc_join_tests {
+    use super::*;
+    use std::f64::consts::TAU;
+
+    fn arc(start_deg: f64, sweep_deg: f64) -> Arc {
+        Arc { center: Vec2::ZERO, radius: 5.0,
+              start_angle: start_deg.to_radians(),
+              sweep_angle: sweep_deg.to_radians() }
+    }
+    fn deg(r: f64) -> f64 { r.to_degrees() }
+
+    // G6 — the fix: a chain that CROSSES the 0°/360° seam. A covers 350°→10°,
+    // B covers 10°→30°; together a contiguous 350°→30° arc. The old low→high
+    // sweep treated 0° as a wall and called this "not a chain".
+    #[test]
+    fn wrap_around_chain_is_recognised_and_merged() {
+        let arcs = [arc(350.0, 20.0), arc(10.0, 20.0)];
+        assert!(arcs_form_a_chain(&arcs), "wrap chain must be a chain");
+        let m = merge_concentric_arcs(&arcs).expect("wrap chain merges");
+        assert!((deg(m.start_angle) - 350.0).abs() < 1e-4, "start {}", deg(m.start_angle));
+        assert!((deg(m.sweep_angle) - 40.0).abs() < 1e-4, "sweep {}", deg(m.sweep_angle));
+    }
+
+    // Two half-arcs cover the whole circle → full.
+    #[test]
+    fn two_half_arcs_are_a_full_circle() {
+        let arcs = [arc(0.0, 180.0), arc(180.0, 180.0)];
+        assert!(arcs_form_a_chain(&arcs));
+        let m = merge_concentric_arcs(&arcs).unwrap();
+        assert!((m.sweep_angle - TAU).abs() < 1e-6, "sweep {}", deg(m.sweep_angle));
+    }
+
+    // ⚠️ THE TRAP GUARD: overlapping arcs whose sweeps SUM past τ (400°) but only
+    // COVER 300°. Must merge to 300°, NOT a full circle. Fails if the disjoint-
+    // only `total >= τ` shortcut is reintroduced.
+    #[test]
+    fn overlapping_arcs_summing_past_tau_are_not_a_full_circle() {
+        let arcs = [arc(0.0, 200.0), arc(100.0, 200.0)];
+        assert!(arcs_form_a_chain(&arcs));
+        let m = merge_concentric_arcs(&arcs).unwrap();
+        assert!((deg(m.sweep_angle) - 300.0).abs() < 1e-4,
+            "overlap covers 300°, got {}", deg(m.sweep_angle));
+        assert!(m.sweep_angle < TAU - 1e-6, "must NOT be a full circle");
+    }
+
+    // A genuine gap → not a chain, no merge.
+    #[test]
+    fn disjoint_arcs_with_a_gap_are_not_a_chain() {
+        let arcs = [arc(0.0, 30.0), arc(90.0, 30.0)];
+        assert!(!arcs_form_a_chain(&arcs), "a real gap is not a chain");
+        assert!(merge_concentric_arcs(&arcs).is_none(),
+            "two disjoint intervals → no single merged arc");
+    }
+
+    // Non-wrapping regression: the case that already worked must still work.
+    #[test]
+    fn adjacent_non_wrapping_arcs_still_chain() {
+        let arcs = [arc(0.0, 30.0), arc(30.0, 30.0)];
+        assert!(arcs_form_a_chain(&arcs));
+        let m = merge_concentric_arcs(&arcs).unwrap();
+        assert!((deg(m.start_angle) - 0.0).abs() < 1e-4, "start {}", deg(m.start_angle));
+        assert!((deg(m.sweep_angle) - 60.0).abs() < 1e-4, "sweep {}", deg(m.sweep_angle));
+    }
+
+    // NESTED overlap (B entirely inside A): a nested input still merges to A's
+    // span, not a false gap/circle.
+    #[test]
+    fn nested_overlap_merges_to_the_outer_span() {
+        let arcs = [arc(0.0, 300.0), arc(90.0, 30.0)];
+        assert!(arcs_form_a_chain(&arcs));
+        let m = merge_concentric_arcs(&arcs).unwrap();
+        assert!((deg(m.sweep_angle) - 300.0).abs() < 1e-4,
+            "nested union is the outer 300° span, got {}", deg(m.sweep_angle));
+    }
+
+    // ⚠️ NESTED TRIPLE (mentor-caught B16b bug): outer 0°→300° with TWO small
+    // inners at 10°→15° and 20°→25°. The shipped per-interval gap-finder found a
+    // FALSE gap between the two inners (inside the outer) and stranded one inner
+    // as a spurious 2nd interval → chain FALSE. The running-`cover_end` finder
+    // sees the real gap at 330° → one [0,300] cover → chain true. (Fails-before
+    // against the per-interval finder.)
+    #[test]
+    fn nested_triple_with_two_inners_is_a_single_cover() {
+        let arcs = [arc(0.0, 300.0), arc(10.0, 5.0), arc(20.0, 5.0)];
+        assert!(arcs_form_a_chain(&arcs),
+            "outer + two nested inners is a single 300° cover, not a gap");
+        let m = merge_concentric_arcs(&arcs).unwrap();
+        assert!((deg(m.start_angle) - 0.0).abs() < 1e-4, "start {}", deg(m.start_angle));
+        assert!((deg(m.sweep_angle) - 300.0).abs() < 1e-4,
+            "merged span is the outer 300°, got {}", deg(m.sweep_angle));
+    }
 }

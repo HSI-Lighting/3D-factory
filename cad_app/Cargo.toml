@@ -9,10 +9,17 @@ path = "src/main.rs"
 
 [dependencies]
 cad_kernel = { path = "../cad_kernel" }
+cad_text   = { path = "../cad_text" }
 cad_io     = { path = "../cad_io" }
+cad_plot   = { path = "../cad_plot" }
 cad_wall   = { path = "../cad_wall" }
 cad_raster = { path = "../cad_raster" }
 cad_param  = { path = "../cad_param" }
+# WP-SCRIPT: the plain-Rust scripting facade. This is the ONLY pyo3 path into
+# the app (Rule 1 — no `pyo3::` is ever compiled inside cad_app). NOTE: linking
+# cad_script embeds CPython, so cad_app.exe requires a CPython 3.11+ runtime
+# (python3.dll) present at LOAD — see PYTHON_SCRIPTING.md "Deployment".
+cad_script = { path = "../cad_script" }
 serde      = { version = "1", features = ["derive"] }   # SIMLUX sidecar (drawing.simlux.json)
 # `float_roundtrip` IS NOT DECORATION HERE. serde_json's default float parser is fast and is NOT
 # always correctly rounded — it can hand back a value one ULP from the one that was written.

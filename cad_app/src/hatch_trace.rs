@@ -168,6 +168,52 @@ fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
         Geom::Line(l) => {
             out.push(TessSeg { a: l.a, b: l.b, src });
         }
+        Geom::Xline(x) => {
+            let seg = x.line_segment(1e4);
+            out.push(TessSeg { a: seg.a, b: seg.b, src });
+        }
+        Geom::Ray(r) => {
+            let seg = r.ray_segment(1e4);
+            out.push(TessSeg { a: seg.a, b: seg.b, src });
+        }
+        Geom::Donut(d) => {
+            let n = 48;
+            let mut ring = |r: f64| {
+                let mut last = d.center + Vec2::new(r, 0.0);
+                for i in 1..=n {
+                    let t = std::f64::consts::TAU * (i as f64 / n as f64);
+                    let p = d.center + Vec2::new(r * t.cos(), r * t.sin());
+                    out.push(TessSeg { a: last, b: p, src });
+                    last = p;
+                }
+            };
+            ring(d.outer_radius);
+            if d.inner_radius > 1e-9 { ring(d.inner_radius); }
+        }
+        Geom::Wipeout(w) => {
+            let n = w.pts.len();
+            for i in 0..n {
+                out.push(TessSeg { a: w.pts[i], b: w.pts[(i + 1) % n], src });
+            }
+        }
+        Geom::Region(rg) => {
+            let n = rg.loop_pts.len();
+            for i in 0..n {
+                out.push(TessSeg { a: rg.loop_pts[i], b: rg.loop_pts[(i + 1) % n], src });
+            }
+        }
+        Geom::Table(t) => {
+            for (a, b) in t.grid_lines() {
+                out.push(TessSeg { a, b, src });
+            }
+        }
+        Geom::Xref(x) => {
+            for d in &x.cached {
+                let mut td = d.clone();
+                td.geom = x.transform_geom(&d.geom);
+                tessellate_one(&td, src, out);
+            }
+        }
         Geom::Arc(a) => {
             push_arc(a.center, a.radius, a.start_angle, a.sweep_angle, 32, src, out);
         }
@@ -223,8 +269,15 @@ fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
         // BlockRef: instances don't contribute hatch-boundary segments in
         // v1 (contents resolve through the Document, which the
         // tessellator doesn't carry). Explode to hatch against contents.
+        // Leader chains DO contribute (they're real geometry).
+        Geom::Leader(l) => {
+            for w in l.pts.windows(2) {
+                out.push(TessSeg { a: w[0], b: w[1], src });
+            }
+        }
         Geom::Point(_) | Geom::Hatch(_) | Geom::Text(_) | Geom::Dimension(_)
-            | Geom::BlockRef(_) => {}
+            | Geom::BlockRef(_) | Geom::AttrDef(_) | Geom::CenterMark(_)
+            | Geom::Viewport(_) => {}
     }
 }
 
@@ -899,7 +952,7 @@ fn trace_boundary_from_segs(segs: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoun
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cad_kernel::{Circle, DObject, Document, Line, Polyline, PolyVertex};
+    use cad_kernel::{Arc, Circle, DObject, Document, Ellipse, Line, Point, Polyline, PolyVertex};
 
     fn doc_from(dobjects: Vec<DObject>) -> Document {
         let mut doc = Document::default();
@@ -1140,5 +1193,100 @@ mod tests {
         ];
         let out = split_at_intersections(&segs);
         assert_eq!(out.len(), 2, "same-source segs should NOT be split");
+    }
+
+    /// REGRESSION: the default demo scene — circle (r=30, origin) with the
+    /// diagonal line (-40,-20)→(40,20) (a diameter through the centre) PLUS the
+    /// other demo dobjects (arc, ellipse, point, closed polyline). A seed in
+    /// either half must trace a half-disc, not the full circle.
+    #[test]
+    fn demo_scene_diagonal_line_traces_half_disc() {
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0) }.into(),
+            Circle { center: Vec2::new(0.0, 0.0), radius: 30.0 }.into(),
+            Arc {
+                center: Vec2::new(0.0, 0.0), radius: 45.0,
+                start_angle: 0.0, sweep_angle: std::f64::consts::PI,
+            }.into(),
+            Ellipse {
+                center: Vec2::new(-60.0, -30.0), major: Vec2::new(25.0, 12.0), ratio: 0.55,
+            }.into(),
+            Point { location: Vec2::new(60.0, -40.0), style: 0, size: 0.0 }.into(),
+            Polyline {
+                vertices: vec![
+                    PolyVertex { pos: Vec2::new(50.0, 40.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(70.0, 60.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(90.0, 40.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(80.0, 20.0), bulge: 0.0 },
+                    PolyVertex { pos: Vec2::new(55.0, 25.0), bulge: 0.0 },
+                ],
+                closed: true,
+                widths: Vec::new(),
+            }.into(),
+        ]);
+        let full = std::f64::consts::PI * 900.0;
+        for seed in [Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0),
+                     Vec2::new(15.0, -8.0), Vec2::new(-15.0, 12.0)] {
+            let tb = trace_boundary_at(&doc, seed)
+                .unwrap_or_else(|| panic!("seed {:?}: must trace a half-disc", seed));
+            let area = polygon_signed_area(&tb.outer).abs();
+            let ratio = area / full;
+            assert!(ratio > 0.3 && ratio < 0.7,
+                "seed {:?}: half-disc area ratio {:.3} — expected ~0.5", seed, ratio);
+            assert!(tb.islands.is_empty());
+        }
+    }
+
+    /// REGRESSION: diameters whose ENDPOINTS lie ON the circle boundary —
+    /// the intersections sit at tessellation vertices / line endpoints, so
+    /// the split pass skips them; the trace must still turn onto the chord.
+    #[test]
+    fn diameter_endpoints_on_circle_traces_half_disc() {
+        for (la, lb, seeds) in [
+            (Vec2::new(-30.0, 0.0), Vec2::new(30.0, 0.0),
+             vec![Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0)]),
+            (Vec2::new(0.0, 30.0), Vec2::new(0.0, -30.0),
+             vec![Vec2::new(10.0, 0.0), Vec2::new(-10.0, 0.0)]),
+            (Vec2::new(-30.0, -30.0), Vec2::new(30.0, 30.0),
+             vec![Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0)]),
+            // Non-vertex angles (a diameter snapped to the circle with
+            // osnap lands here) — 30° / 210°.
+            (Vec2::new(-25.9808, -15.0), Vec2::new(25.9808, 15.0),
+             vec![Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0)]),
+        ] {
+            let doc = doc_from(vec![
+                Line { a: la, b: lb }.into(),
+                Circle { center: Vec2::new(0.0, 0.0), radius: 30.0 }.into(),
+            ]);
+            let full = std::f64::consts::PI * 900.0;
+            for seed in seeds {
+                let tb = trace_boundary_at(&doc, seed)
+                    .unwrap_or_else(|| panic!("line {:?}→{:?} seed {:?}: must trace", la, lb, seed));
+                let ratio = polygon_signed_area(&tb.outer).abs() / full;
+                assert!(ratio > 0.3 && ratio < 0.7,
+                    "line {:?}→{:?} seed {:?}: ratio {:.3} — expected ~0.5", la, lb, seed, ratio);
+            }
+        }
+    }
+
+    /// REGRESSION: a chord floating entirely INSIDE the circle (endpoints
+    /// don't touch the boundary) creates NO closed sub-region — the trace
+    /// must fall back to the full disc (AutoCAD semantics: a boundary needs
+    /// to touch the outer).
+    #[test]
+    fn chord_inside_circle_keeps_full_disc() {
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(-15.0, 0.0), b: Vec2::new(15.0, 0.0) }.into(),
+            Circle { center: Vec2::new(0.0, 0.0), radius: 30.0 }.into(),
+        ]);
+        let full = std::f64::consts::PI * 900.0;
+        for seed in [Vec2::new(0.0, 20.0), Vec2::new(0.0, -20.0)] {
+            let tb = trace_boundary_at(&doc, seed)
+                .unwrap_or_else(|| panic!("seed {:?}: must trace", seed));
+            let ratio = polygon_signed_area(&tb.outer).abs() / full;
+            assert!(ratio > 0.9,
+                "seed {:?}: floating chord cannot bound a sub-region — ratio {:.3} \
+                 should be the full disc", seed, ratio);
+        }
     }
 }

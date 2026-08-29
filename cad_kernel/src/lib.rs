@@ -29,12 +29,14 @@ pub mod modify;
 pub mod fillet;
 pub mod color;
 pub mod lineweight;
+pub mod plotstyle;
 pub mod linetype;
 pub mod layer;
 pub mod style;
 pub mod pen;
 pub mod dobject;
 pub mod document;
+pub mod layout;
 pub mod intersect;
 pub mod parser;
 pub mod construct;
@@ -45,14 +47,29 @@ pub mod dim;
 pub mod wallstyle;
 pub mod block;
 pub mod blockdiff;
+pub mod hatch_resolve;
+pub mod vector_primitive;
+pub mod dedupe;
+pub mod purge;
+pub mod laystate;
+pub mod ucs;
+pub mod pagesetup;
+pub mod table;
+pub mod xref;
+pub mod mtext;
+pub mod units;
 
 // Convenience re-exports
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
-pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line, Point, PolyVertex, Polyline, Spline, Wall};
-pub use text::{HAlign as TextHAlign, Text, TextStyle, TextStyleTable, VAlign as TextVAlign};
-pub use dim::{Dim, DimKind, DimStyle, DimStyleTable, LinearOrtho};
+pub use geom::{point_in_polygon, Arc, CenterMark, Circle, Donut, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line, Point, PolyVertex, Polyline, Ray, Region, Spline, Wall, Wipeout, Xline};
+pub use table::Table;
+pub use xref::Xref;
+pub use text::{HAlign as TextHAlign, Leader, Text, TextListKind, TextStyle, TextStyleTable, VAlign as TextVAlign};
+pub use dim::{Dim, DimKind, DimRenderGeometry, DimStyle, DimStyleTable, LinearOrtho};
 pub use wallstyle::{WallStyle, WallStyleTable};
-pub use block::{Block, BlockParam, BlockRef, BlockTable, ParamVector, MAX_BLOCK_PARAMS};
+pub use block::{AttrDef, Block, BlockParam, BlockRef, BlockTable, ParamVector, MAX_BLOCK_PARAMS};
+pub use hatch_resolve::resolve_hatch_loops;
+pub use vector_primitive::VectorPrimitive;
 pub use blockdiff::{diff_blocks, BlockDiff, ParamCluster};
 pub use join::{bulge_arc, bulge_from_arc};
 pub mod patterns;
@@ -67,12 +84,19 @@ pub use fillet::{
 };
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
+pub use plotstyle::{
+    plot_width_mm, EndStyle, FillStyle, JoinStyle, Offset, Orientation, PaperSize, PenNum,
+    PlotArea, PlotColor, PlotConfig, PlotLinetype, PlotScale, PlotStyle, PlotStyleTable,
+    PlotTarget, PlotWidth, AUTOCAD_LADDER,
+};
 pub use linetype::{Linetype, LinetypeTable};
 pub use layer::{Layer, LayerId, LayerTable};
 pub use style::Style;
 pub use pen::{Pen, PenTable};
 pub use dobject::{next_handle, reserve_handles_above, DObject, Handle};
-pub use document::{DocUnits, Document, RasterImage, UnitSource};
+pub use document::{Document, RasterImage};
+pub use layout::{Layout, LayoutCamera, ViewportData, ViewportGeom};
+pub use units::{Units, UnitSource, LengthFormat, AngleFormat, INSERT_UNITS};
 pub use intersect::intersect;
 pub use parser::{parse, Command, ToolKind};
 pub use construct::{

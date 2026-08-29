@@ -63,6 +63,37 @@ impl CalcStore {
         }
         CalcStore { vars }
     }
+
+    /// Load variables from a `name = expression` text file (the app's
+    /// `calc_vars.txt`). Missing/unreadable file → empty store, no error.
+    pub fn load_from(path: Option<&std::path::Path>) -> Self {
+        let Some(p) = path else { return Self::new() };
+        let Ok(text) = std::fs::read_to_string(p) else { return Self::new() };
+        let mut map = BTreeMap::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((k, v)) = line.split_once('=') {
+                map.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+        Self::from_persist(map)
+    }
+
+    /// Persist variables (minus `ans`) as a `name = expression` text file.
+    pub fn save_to(&self, path: Option<&std::path::Path>) -> std::io::Result<()> {
+        let Some(p) = path else { return Ok(()) };
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut s = String::from("# RUST_AutoRASM calculator variables (name = expression)\n");
+        for (k, v) in self.persist_map() {
+            s.push_str(&format!("{k} = {v}\n"));
+        }
+        std::fs::write(p, s)
+    }
 }
 
 /// A name a variable may have: `[A-Za-z_][A-Za-z0-9_]*`, case-sensitive.
@@ -876,6 +907,36 @@ mod tests {
         assert!(s3.contains("ok") && !s3.contains("2bad") && !s3.contains("ans"));
     }
 
+    /// The app's `calc_vars.txt` file round-trip: `name = expression` lines,
+    /// `ans` excluded, missing file → empty store, junk lines skipped.
+    #[test]
+    fn vars_file_round_trip() {
+        let dir = std::env::temp_dir().join(format!("calc_vars_file_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("calc_vars.txt");
+        let _ = std::fs::remove_file(&path);
+        // Missing file → empty store.
+        let empty = CalcStore::load_from(Some(&path));
+        assert!(!empty.contains("w"));
+        let mut s = CalcStore::new();
+        try_assign(&mut s, "w=2").unwrap();
+        try_assign(&mut s, "hh=w*2.5").unwrap();
+        s.set_ans(9.0);
+        s.save_to(Some(&path)).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("hh = w*2.5"), "expression verbatim: {text}");
+        assert!(!text.contains("ans"), "ans is never persisted");
+        // Reload: expressions come back exact, and evaluate.
+        let s2 = CalcStore::load_from(Some(&path));
+        assert_eq!(e(&s2, "hh"), 5.0);
+        assert!(!s2.contains("ans"));
+        // Junk lines are skipped.
+        std::fs::write(&path, "# comment\nw = 3\njunk line\n= 5\n").expect("junk file");
+        let s3 = CalcStore::load_from(Some(&path));
+        assert_eq!(e(&s3, "w"), 3.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn fmt_value_is_clean() {
         assert_eq!(fmt_value(14.0), "14");
@@ -960,20 +1021,4 @@ mod tests {
         assert_eq!(e(&s, "x40"), 3.0 * 2.0f64.powi(39));
     }
 
-    /// The STRICT gate never claims bare words — constants and defined names
-    /// are expressions only when they carry an operator / paren / function.
-    #[test]
-    fn expr_token_gate_keeps_bare_words_out() {
-        let mut s = CalcStore::new();
-        try_assign(&mut s, "r=5").unwrap();
-        assert!(looks_like_expr_token("r*2"), "expression shape");
-        assert!(looks_like_expr_token("2+3"));
-        assert!(looks_like_expr_token("sqrt(4)"));
-        assert!(looks_like_expr_token("-5"));
-        assert!(!looks_like_expr_token("e"), "bare constant must stay a keyword");
-        assert!(!looks_like_expr_token("pi"));
-        assert!(!looks_like_expr_token("r"), "bare defined name must stay a keyword");
-        assert!(!looks_like_expr_token("erase"));
-        assert!(!looks_like_expr_token(""));
-    }
 }

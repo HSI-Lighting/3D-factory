@@ -101,10 +101,10 @@ pub static VARS: &[Var] = &[
     // ───────────────────────────────────────────────────────────────────
     Var { name: "OsnCrd",  section: "Object Snaps & Precision", desc: "Osnap coordinate override keyboard", kind: Kind::Bool, status: Status::Planned, default: "true", wired: false },
     Var { name: "PkBxSz",  section: "Object Snaps & Precision", desc: "Pickbox height (pixels)", kind: Kind::U8 { min: 1, max: 40 }, status: Status::Tentative, default: "10", wired: true },
-    Var { name: "PolAdA",  section: "Object Snaps & Precision", desc: "Polar additional angles", kind: Kind::Text, status: Status::Planned, default: "", wired: false },
-    Var { name: "PolAng",  section: "Object Snaps & Precision", desc: "Polar angle setting", kind: Kind::Int { min: 0, max: 360 }, status: Status::Planned, default: "90", wired: false },
-    Var { name: "PolDst",  section: "Object Snaps & Precision", desc: "Polar snap distance", kind: Kind::Float { min: -1e9, max: 1e9 }, status: Status::Planned, default: "1", wired: false },
-    Var { name: "PolMod",  section: "Object Snaps & Precision", desc: "Polar tracking mode", kind: Kind::Bool, status: Status::Planned, default: "true", wired: false },
+    Var { name: "PolAdA",  section: "Object Snaps & Precision", desc: "Polar additional angles (comma list, degrees)", kind: Kind::Text, status: Status::Active, default: "", wired: true },
+    Var { name: "PolAng",  section: "Object Snaps & Precision", desc: "Polar angle increment (degrees)", kind: Kind::Int { min: 1, max: 360 }, status: Status::Active, default: "90", wired: true },
+    Var { name: "PolDst",  section: "Object Snaps & Precision", desc: "Polar snap distance (0 = off)", kind: Kind::Float { min: 0.0, max: 1e9 }, status: Status::Active, default: "0", wired: true },
+    Var { name: "PolMod",  section: "Object Snaps & Precision", desc: "Polar tracking ON/OFF", kind: Kind::Bool, status: Status::Active, default: "false", wired: true },
     Var { name: "SpTGSZ",  section: "Object Snaps & Precision", desc: "Object-snap target height (pixels)", kind: Kind::U8 { min: 4, max: 80 }, status: Status::Active, default: "16", wired: true },
     Var { name: "TmpOvr",  section: "Object Snaps & Precision", desc: "Temporary override keys", kind: Kind::Bool, status: Status::Planned, default: "true", wired: false },
 
@@ -445,8 +445,10 @@ pub fn env_get(env: &UserEnv, name: &str) -> Option<String> {
         "GrdEnb" => bool_disp(env.GrdEnb),
         "GrdSnp" => bool_disp(env.GrdSnp),
         "CrdEnb" => bool_disp(env.CrdEnb),
+        "PolMod" => bool_disp(env.PolMod),
         "UcsIcn" => bool_disp(env.UcsIcn),
         // Float
+        "PolDst"  => env.PolDst.to_string(),
         "FltRad" => env.FltRad.to_string(),
         "ChmDs1" => env.ChmDs1.to_string(),
         "ChmDs2" => env.ChmDs2.to_string(),
@@ -456,6 +458,7 @@ pub fn env_get(env: &UserEnv, name: &str) -> Option<String> {
         "GrdSpc" => env.GrdSpc.to_string(),
         // Int
         "SelDmTm" => env.SelDmTm.to_string(),
+        "PolAng"  => env.PolAng.to_string(),
         // Choice
         "DrDspM" => choice(env.DrDspM),
         "WpFrmM" => choice(env.WpFrmM),
@@ -468,6 +471,7 @@ pub fn env_get(env: &UserEnv, name: &str) -> Option<String> {
         // Text
         "UcsAvP" => env.UcsAvP.clone(),
         "XrTmpP" => env.XrTmpP.clone(),
+        "PolAdA" => env.PolAdA.clone(),
         _ => return None,
     };
     Some(out)
@@ -547,6 +551,7 @@ fn set_bool(env: &mut UserEnv, name: &str, b: bool) {
         "GrdEnb" => env.GrdEnb = b,
         "GrdSnp" => env.GrdSnp = b,
         "CrdEnb" => env.CrdEnb = b,
+        "PolMod" => env.PolMod = b,
         "UcsIcn" => env.UcsIcn = b,
         _ => {}
     }
@@ -572,6 +577,7 @@ fn set_u8(env: &mut UserEnv, name: &str, n: u8) {
 fn set_int(env: &mut UserEnv, name: &str, n: i64) {
     match name {
         "SelDmTm" => env.SelDmTm = n as u16,
+        "PolAng"  => env.PolAng = n,
         _ => {}
     }
 }
@@ -585,6 +591,7 @@ fn set_float(env: &mut UserEnv, name: &str, f: f64) {
         "WlThk"  => env.WlThk = f,
         "TxHt"   => env.TxHt = f,
         "GrdSpc" => env.GrdSpc = f,
+        "PolDst" => env.PolDst = f,
         _ => {}
     }
 }
@@ -601,6 +608,7 @@ fn set_text(env: &mut UserEnv, name: &str, s: &str) {
     match name {
         "UcsAvP" => env.UcsAvP = s.to_string(),
         "XrTmpP" => env.XrTmpP = s.to_string(),
+        "PolAdA" => env.PolAdA = s.to_string(),
         _ => {}
     }
 }

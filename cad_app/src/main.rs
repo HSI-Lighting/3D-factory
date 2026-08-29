@@ -39,6 +39,7 @@ mod texture_set; // PBR texture-set folders: filename → map slot, and the load
 mod theme;
 mod varreg;
 mod calc; // command-line calculator + lazy user variables (pure, no UI deps)
+mod layer_glyphs; // 2D glyph helpers shared by the canvas rails (dim/zoom rail icons)
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {

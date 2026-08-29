@@ -934,7 +934,7 @@ const MAX_OUTLINE_EDGES: usize = 20_000;
 /// A millimetre field showing `2700.00` is noise — nobody dimensions a building to a hundredth of a
 /// millimetre. A metre field showing `2` instead of `2.700` has lost the dimension entirely. The
 /// right number of decimals is a property of the unit, not a constant.
-pub fn length_decimals(u: cad_kernel::DocUnits) -> usize {
+pub fn length_decimals(u: &cad_kernel::Units) -> usize {
     match u.metres_per_unit {
         m if m <= 0.0015 => 0, // mm — whole millimetres
         m if m <= 0.015 => 1,  // cm
@@ -966,7 +966,7 @@ pub fn length_decimals(u: cad_kernel::DocUnits) -> usize {
 /// field. 105 fields carried the same behaviour; all of them are fixed, not just the reported one.
 pub fn length_ui(
     ui: &mut egui::Ui,
-    u: cad_kernel::DocUnits,
+    u: &cad_kernel::Units,
     v: &mut f32,
     speed_m: f64,
     min_m: f64,
@@ -993,7 +993,7 @@ pub fn length_ui(
 /// [`length_ui`] with a label printed inside the field — `x`, `radius`, `reach` and so on.
 pub fn length_ui_pre(
     ui: &mut egui::Ui,
-    u: cad_kernel::DocUnits,
+    u: &cad_kernel::Units,
     prefix: &str,
     v: &mut f32,
     speed_m: f64,
@@ -1018,7 +1018,7 @@ pub fn length_ui_pre(
 }
 
 /// Format a length held in metres for display in `u`, with its unit.
-pub fn length_str(u: cad_kernel::DocUnits, metres: f32) -> String {
+pub fn length_str(u: &cad_kernel::Units, metres: f32) -> String {
     format!("{:.*} {}", length_decimals(u), u.from_metres(metres as f64), u.label())
 }
 
@@ -1077,7 +1077,7 @@ pub struct FactoryState {
     /// drawing's unit exactly as before — this setting is not in that path at all.
     ///
     /// Millimetres by default, because that is what building drawings are dimensioned in.
-    pub units: cad_kernel::DocUnits,
+    pub units: cad_kernel::Units,
     pub model: Model,
     /// Evaluated CSG mesh, rebuilt only when `dirty` (csgrs is not cheap).
     pub cached: SolidMesh,
@@ -1541,14 +1541,14 @@ impl Draw3dKind {
 /// reported. It covers every primitive's dimensions, not just the extrusion that was noticed.
 pub fn primitive_dim_fields(
     ui: &mut egui::Ui,
-    units: cad_kernel::DocUnits,
+    units: cad_kernel::Units,
     p: &mut Primitive,
     calc: &crate::calc::CalcStore,
 ) -> bool {
     let f = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| -> bool {
         ui.horizontal(|ui| {
             ui.add_sized([64.0, 18.0], egui::Label::new(egui::RichText::new(label).small().weak()));
-            length_ui(ui, units, v, 0.02, min as f64, 1e5, calc).changed()
+            length_ui(ui, &units, v, 0.02, min as f64, 1e5, calc).changed()
         })
         .inner
     };
@@ -3437,7 +3437,7 @@ impl Default for FactoryState {
         Self {
             open: false,
             // Millimetres — what building drawings are dimensioned in. Storage stays metres.
-            units: cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User),
+            units: cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::MM, cad_kernel::UnitSource::User),
             model: Model::default(),
             cached: SolidMesh::default(),
             dirty: false,
@@ -6169,17 +6169,17 @@ impl FactoryState {
         let overall = floor_t + h + ct;
         self.status = format!(
             "Room: {} clear, {} overall ({} floor + {} clear{}).{}",
-            length_str(self.units, h),
-            length_str(self.units, overall),
-            length_str(self.units, floor_t),
-            length_str(self.units, h),
-            if ct > 0.0 { format!(" + {} ceiling", length_str(self.units, ct)) } else { String::new() },
+            length_str(&self.units, h),
+            length_str(&self.units, overall),
+            length_str(&self.units, floor_t),
+            length_str(&self.units, h),
+            if ct > 0.0 { format!(" + {} ceiling", length_str(&self.units, ct)) } else { String::new() },
             if overall > self.effective_building_height() + 1e-4 {
                 format!(
                     "  ⚠ {} taller than the {} building — the room stands proud of the top. \
                      Room height is the CLEAR height; the slabs are extra.",
-                    length_str(self.units, overall - self.effective_building_height()),
-                    length_str(self.units, self.effective_building_height()),
+                    length_str(&self.units, overall - self.effective_building_height()),
+                    length_str(&self.units, self.effective_building_height()),
                 )
             } else {
                 String::new()
@@ -6258,8 +6258,8 @@ impl FactoryState {
         self.status = format!(
             "{}: clear height {} · {} overall.",
             self.rooms[i].name,
-            length_str(self.units, h),
-            length_str(self.units, self.rooms[i].overall_height()),
+            length_str(&self.units, h),
+            length_str(&self.units, self.rooms[i].overall_height()),
         );
     }
 
@@ -6427,7 +6427,7 @@ impl FactoryState {
         self.dirty = true;
         self.status = format!(
             "Building height {} — {} mass(es) resized.",
-            length_str(self.units, h),
+            length_str(&self.units, h),
             ids.len(),
         );
         ids.len()
@@ -6950,7 +6950,7 @@ impl FactoryState {
         // was authored with; a sidecar written before this existed says nothing, and the default
         // stands rather than the geometry being reinterpreted.
         if d.working_unit_m > 0.0 {
-            self.units = cad_kernel::DocUnits::new(d.working_unit_m, cad_kernel::UnitSource::User);
+            self.units = cad_kernel::Units::from_metres_per_unit(d.working_unit_m, cad_kernel::UnitSource::User);
         }
         // Placement preference. Absent from a file written before it existed, and then the default
         // stands — the same rule as the working unit above.
@@ -13932,10 +13932,10 @@ mod water_material {
 #[cfg(test)]
 mod working_unit {
     use super::*;
-    use cad_kernel::{DocUnits, UnitSource};
+    use cad_kernel::{UnitSource, Units};
 
-    fn mm() -> DocUnits {
-        DocUnits::new(DocUnits::MM, UnitSource::User)
+    fn mm() -> Units {
+        Units::from_metres_per_unit(Units::MM, UnitSource::User)
     }
 
     /// The default is millimetres, because that is what building drawings are dimensioned in and
@@ -13943,7 +13943,7 @@ mod working_unit {
     #[test]
     fn a_new_factory_works_in_millimetres() {
         let f = FactoryState::default();
-        assert!((f.units.metres_per_unit - DocUnits::MM).abs() < 1e-12);
+        assert!((f.units.metres_per_unit - Units::MM).abs() < 1e-12);
         assert_eq!(f.units.label(), "mm");
     }
 
@@ -13966,8 +13966,8 @@ mod working_unit {
         f.wall_thickness = 0.2;
         let before = format!("{:?}", f.model.features[0].primitive);
 
-        for m in [DocUnits::M, DocUnits::INCH, DocUnits::FOOT, DocUnits::CM, DocUnits::MM] {
-            f.units = DocUnits::new(m, UnitSource::User);
+        for m in [Units::M, Units::INCH, Units::FOOT, Units::CM, Units::MM] {
+            f.units = Units::from_metres_per_unit(m, UnitSource::User);
             assert_eq!(
                 format!("{:?}", f.model.features[0].primitive),
                 before,
@@ -13983,12 +13983,12 @@ mod working_unit {
     #[test]
     fn the_same_length_reads_correctly_in_every_unit() {
         let cases = [
-            (DocUnits::MM, 2700.0, "mm"),
-            (DocUnits::CM, 270.0, "cm"),
-            (DocUnits::M, 2.7, "m"),
+            (Units::MM, 2700.0, "mm"),
+            (Units::CM, 270.0, "cm"),
+            (Units::M, 2.7, "m"),
         ];
         for (m, want, label) in cases {
-            let u = DocUnits::new(m, UnitSource::User);
+            let u = Units::from_metres_per_unit(m, UnitSource::User);
             assert_eq!(u.label(), label);
             assert!(
                 (u.from_metres(2.7) - want).abs() < 1e-6,
@@ -14004,24 +14004,24 @@ mod working_unit {
     /// hundredths is noise, and a metre field showing none has thrown the dimension away.
     #[test]
     fn a_length_is_shown_to_a_useful_precision() {
-        assert_eq!(length_decimals(DocUnits::new(DocUnits::MM, UnitSource::User)), 0);
-        assert_eq!(length_decimals(DocUnits::new(DocUnits::CM, UnitSource::User)), 1);
-        assert_eq!(length_decimals(DocUnits::new(DocUnits::M, UnitSource::User)), 3);
-        assert_eq!(length_str(mm(), 2.7), "2700 mm");
-        assert_eq!(length_str(DocUnits::new(DocUnits::M, UnitSource::User), 2.7), "2.700 m");
+        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::MM, UnitSource::User)), 0);
+        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::CM, UnitSource::User)), 1);
+        assert_eq!(length_decimals(&Units::from_metres_per_unit(Units::M, UnitSource::User)), 3);
+        assert_eq!(length_str(&mm(), 2.7), "2700 mm");
+        assert_eq!(length_str(&Units::from_metres_per_unit(Units::M, UnitSource::User), 2.7), "2.700 m");
     }
 
     /// The unit survives a save, so a project reopens showing the numbers it was authored with.
     #[test]
     fn the_working_unit_round_trips_through_the_sidecar() {
         let mut f = FactoryState::default();
-        f.units = cad_kernel::DocUnits::new(cad_kernel::DocUnits::INCH, UnitSource::User);
+        f.units = cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::INCH, UnitSource::User);
         let doc = f.to_persist();
-        assert!((doc.working_unit_m - DocUnits::INCH).abs() < 1e-12);
+        assert!((doc.working_unit_m - Units::INCH).abs() < 1e-12);
 
         let mut reopened = FactoryState::default();
         reopened.apply_persist(doc);
-        assert!((reopened.units.metres_per_unit - DocUnits::INCH).abs() < 1e-12);
+        assert!((reopened.units.metres_per_unit - Units::INCH).abs() < 1e-12);
         assert_eq!(reopened.units.label(), "in");
     }
 
@@ -14032,10 +14032,10 @@ mod working_unit {
         let mut f = FactoryState::default();
         let mut doc = f.to_persist();
         doc.working_unit_m = 0.0; // as written by a build that predates the field
-        f.units = cad_kernel::DocUnits::new(DocUnits::FOOT, UnitSource::User);
+        f.units = cad_kernel::Units::from_metres_per_unit(Units::FOOT, UnitSource::User);
         f.apply_persist(doc);
         assert!(
-            (f.units.metres_per_unit - DocUnits::FOOT).abs() < 1e-12,
+            (f.units.metres_per_unit - Units::FOOT).abs() < 1e-12,
             "an unrecorded unit must not silently reset the one in use"
         );
     }

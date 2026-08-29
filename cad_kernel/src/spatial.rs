@@ -69,6 +69,17 @@ pub struct UniformGrid {
 }
 
 impl UniformGrid {
+    /// World bounds of the whole grid (origin → origin + cols·cell_size).
+    /// `None` for an empty grid (cols or rows == 0).
+    pub fn world_bounds(&self) -> Option<(Vec2, Vec2)> {
+        if self.cols == 0 || self.rows == 0 { return None; }
+        Some((
+            self.origin,
+            Vec2::new(self.origin.x + self.cols as f64 * self.cell_size,
+                      self.origin.y + self.rows as f64 * self.cell_size),
+        ))
+    }
+
     pub fn empty() -> Self {
         Self {
             cell_size: 1.0,
@@ -128,6 +139,76 @@ impl UniformGrid {
                 continue;   // already in view_independent
             }
             let r = cell_range(&e.bbox(), min, cell_size, cols, rows);
+            ranges.push(r);
+            for cy in r[2]..=r[3] {
+                let row_start = cy as usize * cols;
+                for cx in r[0]..=r[1] {
+                    cells[row_start + cx as usize].push(i as u32);
+                }
+            }
+        }
+
+        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
+               n_entities: dobjects.len() }
+    }
+
+    /// [`Self::build`] with a resolved-bbox resolver: a dobject whose
+    /// `is_view_independent_bbox()` is true is bucketed by the resolver's
+    /// answer instead of being skipped (the same contract the original repo
+    /// uses for Hatch fills whose bbox is a degenerate placeholder).
+    pub fn build_with(
+        dobjects: &[DObject],
+        cell_size: f64,
+        bbox_of: &dyn Fn(&DObject) -> Option<(Vec2, Vec2)>,
+    ) -> Self {
+        assert!(cell_size > 0.0, "cell_size must be positive");
+        if dobjects.is_empty() { return Self::empty(); }
+
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut view_independent: Vec<u32> = Vec::new();
+        let mut boxes: Vec<Option<(Vec2, Vec2)>> = Vec::with_capacity(dobjects.len());
+        for (i, e) in dobjects.iter().enumerate() {
+            let b = if e.geom.is_view_independent_bbox() {
+                bbox_of(e)
+            } else {
+                Some(e.bbox())
+            };
+            match b {
+                Some((emin, emax)) if emax.x >= emin.x && emax.y >= emin.y => {
+                    if emin.x < min.x { min.x = emin.x; }
+                    if emin.y < min.y { min.y = emin.y; }
+                    if emax.x > max.x { max.x = emax.x; }
+                    if emax.y > max.y { max.y = emax.y; }
+                    boxes.push(Some((emin, emax)));
+                }
+                _ => {
+                    view_independent.push(i as u32);
+                    boxes.push(None);
+                }
+            }
+        }
+        if !min.x.is_finite() {
+            return Self {
+                cell_size, origin: Vec2::ZERO, cols: 0, rows: 0,
+                cells: Vec::new(),
+                ranges: vec![SKIP; dobjects.len()],
+                view_independent,
+                n_entities: dobjects.len(),
+            };
+        }
+
+        let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
+        let rows = (((max.y - min.y) / cell_size).floor() as isize + 1).max(1) as usize;
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+        let mut ranges: Vec<[u32; 4]> = Vec::with_capacity(dobjects.len());
+
+        for (i, b) in boxes.iter().enumerate() {
+            let Some((emin, emax)) = b else {
+                ranges.push(SKIP);
+                continue;   // already in view_independent
+            };
+            let r = cell_range(&(*emin, *emax), min, cell_size, cols, rows);
             ranges.push(r);
             for cy in r[2]..=r[3] {
                 let row_start = cy as usize * cols;
@@ -340,6 +421,39 @@ impl UniformGrid {
             if e.geom.is_view_independent_bbox() { continue; }
             count_real += 1;
             let (emin, emax) = e.bbox();
+            if emin.x < min.x { min.x = emin.x; }
+            if emin.y < min.y { min.y = emin.y; }
+            if emax.x > max.x { max.x = emax.x; }
+            if emax.y > max.y { max.y = emax.y; }
+        }
+        if count_real == 0 { return 1.0; }
+        let w = (max.x - min.x).max(1.0);
+        let h = (max.y - min.y).max(1.0);
+        let by_density = (w * h * target_per_cell / count_real as f64).sqrt();
+        by_density.max(0.001).min(1.0e6)
+    }
+
+    /// [`Self::auto_cell_size`] with the resolved-bbox resolver — a dobject
+    /// whose `is_view_independent_bbox()` is true is measured by the resolver
+    /// instead of skipped (same contract as [`Self::build_with`]).
+    pub fn auto_cell_size_with(
+        dobjects: &[DObject],
+        target_per_cell: f64,
+        bbox_of: &dyn Fn(&DObject) -> Option<(Vec2, Vec2)>,
+    ) -> f64 {
+        if dobjects.is_empty() { return 1.0; }
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut count_real: usize = 0;
+        for e in dobjects {
+            let b = if e.geom.is_view_independent_bbox() {
+                bbox_of(e)
+            } else {
+                Some(e.bbox())
+            };
+            let Some((emin, emax)) = b else { continue; };
+            if emax.x < emin.x || emax.y < emin.y { continue; }
+            count_real += 1;
             if emin.x < min.x { min.x = emin.x; }
             if emin.y < min.y { min.y = emin.y; }
             if emax.x > max.x { max.x = emax.x; }

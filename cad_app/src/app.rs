@@ -1186,7 +1186,7 @@ fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
         // selected block never moved on stretch (it fell through to the
         // clone-unchanged catch-all → "0/N changed"). BlockRef is Copy.
         Geom::BlockRef(br) if inside(br.insert) => {
-            let mut nb = *br;
+            let mut nb = br.clone();
             nb.insert = br.insert + v;
             Geom::BlockRef(nb)
         }
@@ -5256,7 +5256,7 @@ impl CadApp {
     /// separator may be a comma or a space for the same reason. Numbers are in the FACTORY's
     /// working unit — reading a typed length as metres is the class of bug that built a 4.4 km
     /// building. Each number may be an expression (`@x*2,0,0`).
-    fn parse_at_coords(raw: &str, u: cad_kernel::DocUnits, store: &crate::calc::CalcStore) -> Option<[f32; 3]> {
+    fn parse_at_coords(raw: &str, u: &cad_kernel::Units, store: &crate::calc::CalcStore) -> Option<[f32; 3]> {
         let s = raw.trim();
         let s = s.strip_prefix('@')?.trim();
         // `(x,y,z)` and `x,y,z` are the same thing said two ways.
@@ -5302,7 +5302,7 @@ impl CadApp {
         // for its click keeps waiting, which is what was asked for. Typing a distance from the
         // origin and placing the thing in front of you are two different intentions.
         if lc.starts_with('@') {
-            let Some(o) = Self::parse_at_coords(&lc, self.factory.units, &self.calc) else {
+            let Some(o) = Self::parse_at_coords(&lc, &self.factory.units, &self.calc) else {
                 self.factory.status = "@X,Y,Z — two or three numbers, e.g. @900,0,0".into();
                 self.history.push("  @: expected @X,Y,Z".into());
                 return true;
@@ -5317,12 +5317,12 @@ impl CadApp {
             self.factory.place_offset_once = true;
             self.factory.place_mode = PlaceMode::Offset;
             self.factory.awaiting_place = None;
-            let u = self.factory.units;
+            let u = self.factory.units.clone();
             let msg = format!(
                 "The next object lands at {}, {}, {} from the origin",
-                crate::factory::length_str(u, o[0]),
-                crate::factory::length_str(u, o[1]),
-                crate::factory::length_str(u, o[2]),
+                crate::factory::length_str(&u, o[0]),
+                crate::factory::length_str(&u, o[1]),
+                crate::factory::length_str(&u, o[2]),
             );
             self.history.push(format!("  {msg}"));
             self.factory.status = msg;
@@ -5391,7 +5391,7 @@ impl CadApp {
         // says "X,Y,Z" is a way of rejecting the right answer.
         if self.place_coord_prompt && !lc.is_empty() {
             let with_at = if lc.starts_with('@') { lc.clone() } else { format!("@{lc}") };
-            let Some(o) = Self::parse_at_coords(&with_at, self.factory.units, &self.calc) else {
+            let Some(o) = Self::parse_at_coords(&with_at, &self.factory.units, &self.calc) else {
                 self.history.push(format!("  '{lc}' is not a coordinate"));
                 self.set_place_coord_prompt();
                 return true;
@@ -5450,14 +5450,14 @@ impl CadApp {
     /// so, or the mode is invisible and the next five objects stack on the same point. The sticky
     /// version comes from the placement menu and says "New objects".
     fn place_offset_summary(&self) -> String {
-        let u = self.factory.units;
+        let u = self.factory.units.clone();
         let o = self.factory.place_offset;
         let who = if self.factory.place_offset_once { "The next object lands" } else { "New objects land" };
         format!(
             "{who} at {}, {}, {} from the origin",
-            crate::factory::length_str(u, o[0]),
-            crate::factory::length_str(u, o[1]),
-            crate::factory::length_str(u, o[2]),
+            crate::factory::length_str(&u, o[0]),
+            crate::factory::length_str(&u, o[1]),
+            crate::factory::length_str(&u, o[2]),
         )
     }
 
@@ -5465,13 +5465,13 @@ impl CadApp {
     fn set_place_coord_prompt(&mut self) {
         self.place_prompt_open = false;
         self.place_coord_prompt = true;
-        let u = self.factory.units;
+        let u = self.factory.units.clone();
         let o = self.factory.place_offset;
         self.current_prompt = format!(
             "Distance from origin  X,Y,Z <{}, {}, {}>:",
-            crate::factory::length_str(u, o[0]),
-            crate::factory::length_str(u, o[1]),
-            crate::factory::length_str(u, o[2]),
+            crate::factory::length_str(&u, o[0]),
+            crate::factory::length_str(&u, o[1]),
+            crate::factory::length_str(&u, o[2]),
         );
     }
 
@@ -5715,11 +5715,11 @@ impl CadApp {
             _ => "solid".into(),
         };
         self.factory.recompute();
-        let u = self.factory.units;
+        let u = self.factory.units.clone();
         self.factory.status = format!(
             "{name} placed at {}, {}",
-            crate::factory::length_str(u, at.x),
-            crate::factory::length_str(u, at.y),
+            crate::factory::length_str(&u, at.x),
+            crate::factory::length_str(&u, at.y),
         );
         self.factory_note(format!("place ✓ {name} ({:.2},{:.2})", at.x, at.y));
     }
@@ -5949,7 +5949,7 @@ impl CadApp {
             let label = format!(
                 "{}\n{}",
                 r.name,
-                crate::factory::length_str(self.factory.units, r.height),
+                crate::factory::length_str(&self.factory.units, r.height),
             );
             // A soft plate behind the text, because a name over a hatched or dense plan is
             // unreadable without one.
@@ -9357,7 +9357,7 @@ impl CadApp {
     /// it has something to say.
     fn factory_properties_panel(&mut self, ui: &mut egui::Ui) {
         // Lengths below are stored in metres and typed in the Factory working unit.
-        let ufu = self.factory.units;
+        let ufu = self.factory.units.clone();
         if !self.factory.has_any_selection() {
             ui.label(
                 egui::RichText::new("Select an object to edit its properties.")
@@ -9392,7 +9392,7 @@ impl CadApp {
                     for (axis, lbl) in [(0usize, "X"), (1, "Y"), (2, "Z")] {
                         ui.horizontal(|ui| {
                             ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(lbl).small().weak()));
-                            let r = crate::factory::length_ui(ui, ufu, &mut pos[axis], 0.02, -1e5, 1e5, &self.calc);
+                            let r = crate::factory::length_ui(ui, &ufu, &mut pos[axis], 0.02, -1e5, 1e5, &self.calc);
                             if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                             if r.changed() { self.factory.furniture[fi].pos[axis] = pos[axis]; }
                         });
@@ -9436,13 +9436,13 @@ impl CadApp {
                     ui.label(egui::RichText::new("Dimensions").small().weak());
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("height").small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut h, 0.02, 0.05, 100.0, &self.calc);
+                        let r = crate::factory::length_ui(ui, &ufu, &mut h, 0.02, 0.05, 100.0, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_wall_height(fid, h); }
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(egui::RichText::new("thickness").small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut t, 0.01, 0.02, 5.0, &self.calc);
+                        let r = crate::factory::length_ui(ui, &ufu, &mut t, 0.01, 0.02, 5.0, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_wall_thickness(fid, t); }
                     });
@@ -9466,7 +9466,7 @@ impl CadApp {
                     let mut v = origin[axis];
                     ui.horizontal(|ui| {
                         ui.add_sized([36.0, 18.0], egui::Label::new(egui::RichText::new(name).small().weak()));
-                        let r = crate::factory::length_ui(ui, ufu, &mut v, 0.02, -1e5, 1e5, &self.calc);
+                        let r = crate::factory::length_ui(ui, &ufu, &mut v, 0.02, -1e5, 1e5, &self.calc);
                         if r.drag_started() || (r.changed() && !r.dragged()) { self.snapshot_factory(); }
                         if r.changed() { self.factory.set_feature_origin_axis(id, axis, v); }
                     });
@@ -9971,6 +9971,14 @@ impl CadApp {
         // every index-holding field still points into the model-space doc we just
         // parked, and the app panics on a stale `doc.dobjects[i]`.
         self.factory_reset_doc_state();
+        // THE SKETCH IS METRE-SPACE BY DESIGN. A face sketch's coordinates ARE the
+        // 3D world's (1:1 with the plane's u/v), and the whole 3D side works in
+        // metres — so the sketch document always reads 1 unit = 1 metre, regardless
+        // of the plan's declared unit (which `adopt_tables_from` deliberately does
+        // NOT carry: a sketch that adopted the plan's mm would draw everything
+        // 1000x too small and cut nothing).
+        self.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::Assumed);
         // Frame the projected object (the sketch starts empty, so `zoom_extents` has nothing
         // to fit) — so you land looking straight at the face's 2D view, not an empty void.
         if let Some((mn, mx)) = Self::sketch_ref_bbox(&self.factory.sketch_ref) {
@@ -10521,7 +10529,7 @@ impl CadApp {
     /// the whole list against the untouched original. Switching them all off gives back exactly the
     /// piece that was there before anything was cut, which is the property the list exists for.
     fn factory_cuts_panel(&mut self, ui: &mut egui::Ui) {
-        let ufu = self.factory.units;
+        let ufu = self.factory.units.clone();
         let Some(fi) = self.factory.sel_furn_primary() else { return };
         let n = self.factory.furniture.get(fi).map_or(0, |f| f.cuts.len());
         ui.add_space(4.0);
@@ -10563,7 +10571,7 @@ impl CadApp {
                 }
                 if !through {
                     let mut d = cut.depth;
-                    if crate::factory::length_ui(ui, ufu, &mut d, 0.002, 0.001, 2.0, &self.calc).changed() {
+                    if crate::factory::length_ui(ui, &ufu, &mut d, 0.002, 0.001, 2.0, &self.calc).changed() {
                         self.factory.furniture[fi].cuts[i].depth = d;
                         rebuild = true;
                     }
@@ -11537,7 +11545,7 @@ impl CadApp {
         //
         // `doc_k()` itself is left alone: the sketch-lift paths depend on its current meaning.
         let plan = self.plan_doc();
-        let u = plan.units;
+        let u = plan.units.clone();
         model_lines.push(format!(
             "doc units: {:.6} m/unit ({:?})   ·   factory working unit: {}   ·   plan↔3D scale {:.6}{}",
             u.metres_per_unit, u.source, self.factory.units.label(), u.metres_per_unit,
@@ -12174,7 +12182,7 @@ impl CadApp {
                     // a DragValue (type any value, unbounded past the 20 m drag range) — the
                     // same control the Hatch dialog uses. One helper ⇒ every primitive's
                     // L/W/H/radius gets the slider, which is what "all these dialogs" means.
-                    let ulen = self.factory.units;
+                    let ulen = self.factory.units.clone();
                     let mut len = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| {
                         ui.label(label);
                         ui.horizontal(|ui| {
@@ -12184,7 +12192,7 @@ impl CadApp {
                             let mut shown = ulen.from_metres(*v as f64);
                             let s = ui.add(egui::Slider::new(&mut shown, ulen.from_metres(min as f64)..=ulen.from_metres(20.0)).show_value(false));
                             if s.changed() { *v = ulen.to_metres(shown) as f32; }
-                            let d = crate::factory::length_ui(ui, ulen, v, 0.05, min as f64, 1e4, &self.calc);
+                            let d = crate::factory::length_ui(ui, &ulen, v, 0.05, min as f64, 1e4, &self.calc);
                             if s.changed() || d.changed() { changed.set(true); }
                         });
                         ui.end_row();
@@ -12434,8 +12442,8 @@ impl CadApp {
                             ui.separator();
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("height / depth").small().weak());
-                                let u = self.factory.units;
-                                crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.001, 1e4, &self.calc);
+                                let u = self.factory.units.clone();
+                                crate::factory::length_ui(ui, &u, &mut self.factory.element_height, 0.05, 0.001, 1e4, &self.calc);
                                 if ui
                                     .button("⬆ Extrude")
                                     .on_hover_text("Extrude the drawn closed shape into a solid element on this face")
@@ -12518,20 +12526,20 @@ impl CadApp {
                     // what the person doing it expects. Changing it NEVER moves geometry — the
                     // model is stored in metres either way — so it is safe to switch at any point
                     // and safe to switch back.
-                    let cur = self.factory.units;
+                    let cur = self.factory.units.clone();
                     click_menu_button(ui, format!("▼ {}", cur.label()), |ui| {
                         ui.label(egui::RichText::new("working unit — what you type in").small().weak());
                         for (label, m) in [
-                            ("millimetres  mm", cad_kernel::DocUnits::MM),
-                            ("centimetres  cm", cad_kernel::DocUnits::CM),
-                            ("metres  m", cad_kernel::DocUnits::M),
-                            ("inches  in", cad_kernel::DocUnits::INCH),
-                            ("feet  ft", cad_kernel::DocUnits::FOOT),
+                            ("millimetres  mm", cad_kernel::Units::MM),
+                            ("centimetres  cm", cad_kernel::Units::CM),
+                            ("metres  m", cad_kernel::Units::M),
+                            ("inches  in", cad_kernel::Units::INCH),
+                            ("feet  ft", cad_kernel::Units::FOOT),
                         ] {
                             let on = (cur.metres_per_unit - m).abs() < 1e-9;
                             if ui.selectable_label(on, label).clicked() {
                                 self.factory.units =
-                                    cad_kernel::DocUnits::new(m, cad_kernel::UnitSource::User);
+                                    cad_kernel::Units::from_metres_per_unit(m, cad_kernel::UnitSource::User);
                                 self.factory.status = format!(
                                     "Working unit is now {}. Nothing moved — the model is stored in \
                                      metres and only the numbers you type and read have changed.",
@@ -12595,11 +12603,11 @@ impl CadApp {
                         // where walls are created (the old always-on sliders are gone).
                         ui.horizontal(|ui| {
                             ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new("  new wall h").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_height, 0.02, 0.3, 50.0, &self.calc); }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.wall_height, 0.02, 0.3, 50.0, &self.calc); }
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([70.0, 18.0], egui::Label::new(egui::RichText::new("  new wall t").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.wall_thickness, 0.01, 0.02, 2.0, &self.calc); }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.wall_thickness, 0.01, 0.02, 2.0, &self.calc); }
                         });
                         if ui.button("⬓  Make floor").clicked() {
                             self.do_make_slab(true);
@@ -12637,7 +12645,7 @@ impl CadApp {
                                     .small()
                                     .weak(),
                             );
-                            let u = self.factory.units;
+                            let u = self.factory.units.clone();
                             let mut rename: Option<(u32, String)> = None;
                             let mut set_h: Option<(u32, f32)> = None;
                             let mut select: Option<u32> = None;
@@ -12660,7 +12668,7 @@ impl CadApp {
                                             rename = Some((r.id, name));
                                         }
                                         let mut h = r.height;
-                                        if crate::factory::length_ui(ui, u, &mut h, 0.02, 0.3, 30.0, &self.calc)
+                                        if crate::factory::length_ui(ui, &u, &mut h, 0.02, 0.3, 30.0, &self.calc)
                                             .on_hover_text("Clear height — floor top to ceiling underside. The slabs are extra.")
                                             .changed()
                                         {
@@ -12677,7 +12685,7 @@ impl CadApp {
                                         ui.add_space(10.0);
                                         ui.label(egui::RichText::new("floor").small().weak());
                                         let mut ft = r.floor_t;
-                                        if crate::factory::length_ui(ui, u, &mut ft, 0.01, 0.02, 2.0, &self.calc)
+                                        if crate::factory::length_ui(ui, &u, &mut ft, 0.01, 0.02, 2.0, &self.calc)
                                             .on_hover_text("Slab below the room")
                                             .changed()
                                         {
@@ -12685,7 +12693,7 @@ impl CadApp {
                                         }
                                         ui.label(egui::RichText::new("ceiling").small().weak());
                                         let mut ctk = r.ceiling_t;
-                                        if crate::factory::length_ui(ui, u, &mut ctk, 0.01, 0.02, 2.0, &self.calc)
+                                        if crate::factory::length_ui(ui, &u, &mut ctk, 0.01, 0.02, 2.0, &self.calc)
                                             .on_hover_text("Slab above the room")
                                             .changed()
                                         {
@@ -12700,7 +12708,7 @@ impl CadApp {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "      {} overall · {} openings{}",
-                                            crate::factory::length_str(u, over),
+                                            crate::factory::length_str(&u, over),
                                             self.factory.openings_in_room(r.id).len(),
                                             if fits {
                                                 String::new()
@@ -12708,7 +12716,7 @@ impl CadApp {
                                                 format!(
                                                     "   ⚠ {} over the building",
                                                     crate::factory::length_str(
-                                                        u,
+                        &u,
                                                         over - self.factory.effective_building_height(),
                                                     )
                                                 )
@@ -12776,17 +12784,17 @@ impl CadApp {
                         // storey keeps its own floor.
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  room height").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_height, 0.02, 0.3, 30.0, &self.calc) }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.room_height, 0.02, 0.3, 30.0, &self.calc) }
                                 .on_hover_text("Clear height. The room opens through the storey top so it is visible; set higher than the storey to cut above it.");
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  floor thickness").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.room_floor, 0.01, 0.0, 2.0, &self.calc) }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.room_floor, 0.01, 0.0, 2.0, &self.calc) }
                                 .on_hover_text("Slab left BELOW the room on this storey");
                         });
                         ui.horizontal(|ui| {
                             ui.add_sized([84.0, 18.0], egui::Label::new(egui::RichText::new("  ceiling thickness").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.ceiling_thickness, 0.01, 0.02, 2.0, &self.calc) }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.ceiling_thickness, 0.01, 0.02, 2.0, &self.calc) }
                                 .on_hover_text("Slab ABOVE the room. Counts toward the overall height, like the floor does.");
                         });
                         // SUGGEST a height that fits, rather than leaving the user to subtract two
@@ -12794,13 +12802,13 @@ impl CadApp {
                         // the sum they were getting wrong.
                         {
                             let want = self.factory.suggested_room_height();
-                            let u = self.factory.units;
+                            let u = self.factory.units.clone();
                             if (self.factory.room_height - want).abs() > 1e-3
                                 && ui
                                     .button(format!(
                                         "  ⤓ Use {} — fills the {} building",
-                                        crate::factory::length_str(u, want),
-                                        crate::factory::length_str(u, self.factory.building_height),
+                                        crate::factory::length_str(&u, want),
+                                        crate::factory::length_str(&u, self.factory.building_height),
                                     ))
                                     .on_hover_text("Building height less the floor and ceiling slabs")
                                     .clicked()
@@ -12825,18 +12833,18 @@ impl CadApp {
                         // room 3900, why is the room taller?".
                         {
                             let f = &self.factory;
-                            let u = f.units;
+                            let u = f.units.clone();
                             let ct = if f.room_open_top { 0.0 } else { f.ceiling_thickness.max(0.02) };
                             let overall = f.room_floor.max(0.02) + f.room_height.max(0.05) + ct;
                             let fits = overall <= f.effective_building_height() + 1e-4;
                             ui.label(
                                 egui::RichText::new(format!(
                                     "  overall {}  =  {} floor + {} clear{}",
-                                    crate::factory::length_str(u, overall),
-                                    crate::factory::length_str(u, f.room_floor.max(0.02)),
-                                    crate::factory::length_str(u, f.room_height.max(0.05)),
+                                    crate::factory::length_str(&u, overall),
+                                    crate::factory::length_str(&u, f.room_floor.max(0.02)),
+                                    crate::factory::length_str(&u, f.room_height.max(0.05)),
                                     if ct > 0.0 {
-                                        format!(" + {} ceiling", crate::factory::length_str(u, ct))
+                                        format!(" + {} ceiling", crate::factory::length_str(&u, ct))
                                     } else {
                                         String::new()
                                     },
@@ -12857,8 +12865,8 @@ impl CadApp {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "  ⚠ {} taller than the {} building — it will stand proud of the top",
-                                        crate::factory::length_str(u, overall - f.building_height),
-                                        crate::factory::length_str(u, f.building_height),
+                                        crate::factory::length_str(&u, overall - f.building_height),
+                                        crate::factory::length_str(&u, f.building_height),
                                     ))
                                     .small()
                                     .color(egui::Color32::from_rgb(230, 170, 90)),
@@ -12896,7 +12904,7 @@ impl CadApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.add_sized([94.0, 18.0], egui::Label::new(egui::RichText::new("  height / depth").small().weak()));
-                            { let u = self.factory.units; crate::factory::length_ui(ui, u, &mut self.factory.element_height, 0.05, 0.02, 100.0, &self.calc); }
+                            { let u = self.factory.units.clone(); crate::factory::length_ui(ui, &u, &mut self.factory.element_height, 0.05, 0.02, 100.0, &self.calc); }
                         });
                         ui.checkbox(&mut self.factory.keep_sketch, "  keep shape after")
                             .on_hover_text("Reuse the SAME outline for more than one action (e.g. recess then cut through)");
@@ -17551,6 +17559,11 @@ impl CadApp {
                     ToolKind::Polyline   => Tool::Polyline,
                     ToolKind::Spline     => Tool::Spline,
                     ToolKind::Rectangle  => Tool::Rectangle,
+                    // Merged-in RUST-AutoRASM tools: map onto the nearest
+                    // existing tool so the command still does something sane.
+                    ToolKind::Polygon | ToolKind::QuadBezier => Tool::Polyline,
+                    ToolKind::Leader => Tool::Text,
+                    ToolKind::AttrDef | ToolKind::AttEdit => Tool::Text,
                 };
                 self.pending.clear();
                 self.set_prompt(current_hint(self.tool, self.arc_method, 0));
@@ -18057,7 +18070,7 @@ impl CadApp {
                 // costs nothing but a re-promote.
                 match set_opt {
                     None => {
-                        let u = self.doc.units;
+                        let u = self.doc.units.clone();
                         let how = match u.source {
                             cad_kernel::UnitSource::Assumed  => "assumed (never set)",
                             cad_kernel::UnitSource::Declared => "declared by the file",
@@ -18073,9 +18086,9 @@ impl CadApp {
                     }
                     Some(k) => {
                         self.snapshot_doc();
-                        let was = self.doc.units;
+                        let was = self.doc.units.clone();
                         self.doc.units =
-                            cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::User);
+                            cad_kernel::Units::from_metres_per_unit(k, cad_kernel::UnitSource::User);
                         if rescale {
                             // The RATIO between the old and new reading of the same drawing
                             // numbers. A model built while the drawing was read as metres
@@ -18550,6 +18563,13 @@ impl CadApp {
                     return;
                 }
                 self.history.push(format!("  ! {}", e));
+            }
+            // ---- Commands the merged RUST-AutoRASM kernel parses but this
+            // build does not implement. Reported, not silent. ----------------
+            _ => {
+                self.history.push(format!(
+                    "  ! '{}' is recognised but not available in this build",
+                    trimmed));
             }
         }
     }
@@ -21643,6 +21663,10 @@ impl CadApp {
                 width_factor:   1.0,
                 oblique:        0.0,
                 default_height: dialog.default_height,
+                bold:           false,
+                outline_only:   false,
+                outline_width:  0.0,
+                underline:      false,
             };
             match dialog.editing_id {
                 Some(id) => {
@@ -23893,6 +23917,7 @@ impl CadApp {
             // flush_body: the Inspector paints its own padding (panel-edge 16,
             // panel-header→content 24) per INSPECTOR_DESIGN §2.
             resizable: true, flush_body: true, float_w: 264.0, float_max_h_frac: 0.5,
+            alt_region: None, dockable: true, rail_header: false, collapsible: false,
         };
         let mut state = self.inspector_dock_state;
         let mut open = self.info_window_open;
@@ -24876,6 +24901,7 @@ impl CadApp {
                 dock_region: crate::dock::DockRegion::Left,
                 size: w, min: w, max: w, resizable: false,
                 flush_body: true, float_w: w, float_max_h_frac: 0.92,
+                alt_region: None, dockable: false, rail_header: false, collapsible: false,
             };
             let mut state = self.draw_rail_dock_state;
             let mut open = self.draw_rail_open;
@@ -24900,6 +24926,7 @@ impl CadApp {
                 dock_region: crate::dock::DockRegion::Left,
                 size: w, min: w, max: w, resizable: false,
                 flush_body: true, float_w: w, float_max_h_frac: 0.92,
+                alt_region: None, dockable: false, rail_header: false, collapsible: false,
             };
             let mut state = self.modify_rail_dock_state;
             let mut open = self.modify_rail_open;
@@ -24977,6 +25004,9 @@ impl CadApp {
             Geom::Spline(_)     => 8,  Geom::Wall(_)       => 9,
             Geom::Text(_)       => 10, Geom::Dimension(_)  => 11,
             Geom::BlockRef(_)   => 12,
+            // Merged-in RUST-AutoRASM variants: no dedicated property UI in
+            // this build yet, so they get a generic tag.
+            _ => 13,
         }
     }
 
@@ -25997,7 +26027,7 @@ impl CadApp {
     /// lights the whole scene. Shows the computed altitude/bearing so it can be matched in a later
     /// Radiance/Blender render.
     fn render_sun_dialog(&mut self, ctx: &egui::Context) {
-        let ufu = self.factory.units;
+        let ufu = self.factory.units.clone();
         let mut open = self.sun_modal_open;
         // The environment's own controls are edited as LOCALS and written back after the window
         // closes. Inside, `self.factory.sun` is held as `&mut`, and a closure captures all of
@@ -26090,7 +26120,7 @@ impl CadApp {
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([110.0, 18.0], egui::Label::new("Thins above").selectable(false));
-                        crate::factory::length_ui(ui, ufu, &mut f.base_z, 0.5, -1e5, 1e5, &self.calc)
+                        crate::factory::length_ui(ui, &ufu, &mut f.base_z, 0.5, -1e5, 1e5, &self.calc)
                             .on_hover_text("The height the density above is measured at — usually ground level.");
                         ui.add(
                             egui::Slider::new(&mut f.falloff, 0.0..=0.2)
@@ -26242,7 +26272,7 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.ao.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.ao.radius, 0.02, 0.05, 3.0, &self.calc)
+                        crate::factory::length_ui_pre(ui, &ufu, "radius ", &mut s.ao.radius, 0.02, 0.05, 3.0, &self.calc)
                             .on_hover_text("How far a crease reaches, in metres. 0.5 m suits rooms and furniture; raise it for large exteriors.");
                         ui.add(egui::DragValue::new(&mut s.ao.strength).update_while_editing(false).speed(0.02).range(0.0..=2.0).prefix("strength "))
                             .on_hover_text("1.0 is the geometric estimate. Above that is artistic licence.");
@@ -26262,7 +26292,7 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.gi.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "radius ", &mut s.gi.radius, 0.05, 0.1, 8.0, &self.calc)
+                        crate::factory::length_ui_pre(ui, &ufu, "radius ", &mut s.gi.radius, 0.05, 0.1, 8.0, &self.calc)
                             .on_hover_text("How far a bounce reaches. 1.5 m suits rooms; raise it for large interiors.");
                         ui.add(egui::DragValue::new(&mut s.gi.strength).update_while_editing(false).speed(0.05).range(0.0..=4.0).prefix("strength "))
                             .on_hover_text(
@@ -26293,7 +26323,7 @@ impl CadApp {
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut s.refract.ior).update_while_editing(false).speed(0.01).range(1.0..=2.5).prefix("IOR "))
                             .on_hover_text("Window glass is 1.52, water 1.33, acrylic 1.49. 1.0 is no bend at all.");
-                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.refract.thickness, 0.005, 0.0, 0.5, &self.calc)
+                        crate::factory::length_ui_pre(ui, &ufu, "thickness ", &mut s.refract.thickness, 0.005, 0.0, 0.5, &self.calc)
                             .on_hover_text(
                                 "How far the displacement reaches. The pass has one surface to work \
                                  with rather than a front and a back, so this stands in for the \
@@ -26316,9 +26346,9 @@ impl CadApp {
                     );
                 ui.add_enabled_ui(s.ssr.enabled, |ui| {
                     ui.horizontal(|ui| {
-                        crate::factory::length_ui_pre(ui, ufu, "reach ", &mut s.ssr.distance, 1.0, 1.0, 200.0, &self.calc)
+                        crate::factory::length_ui_pre(ui, &ufu, "reach ", &mut s.ssr.distance, 1.0, 1.0, 200.0, &self.calc)
                             .on_hover_text("How far a reflected ray may travel. Longer spans a whole site and costs proportionally more steps.");
-                        crate::factory::length_ui_pre(ui, ufu, "thickness ", &mut s.ssr.thickness, 0.05, 0.05, 5.0, &self.calc)
+                        crate::factory::length_ui_pre(ui, &ufu, "thickness ", &mut s.ssr.thickness, 0.05, 0.05, 5.0, &self.calc)
                             .on_hover_text(
                                 "How far behind a surface a ray may pass and still count as hitting \
                                  it. The depth buffer records one surface per pixel with no \
@@ -27806,7 +27836,7 @@ impl CadApp {
         // Unmissable. `3D command:` already carries the unit and the placement mode as a live
         // readout (see `command_bar_body`), so this makes sure it is on screen to be read.
         self.cmd_window_open = true;
-        let u = self.factory.units;
+        let u = self.factory.units.clone();
         self.history.push(format!(
             "  3D Factory — working unit: {}. Everything you type is in {}.",
             u.label(),
@@ -27828,7 +27858,7 @@ impl CadApp {
         if !self.factory.ask_unit {
             return;
         }
-        let cur = self.factory.units;
+        let cur = self.factory.units.clone();
         let mut chosen: Option<f64> = None;
         egui::Window::new("What unit are you building in?")
             .collapsible(false)
@@ -27842,11 +27872,11 @@ impl CadApp {
                 );
                 ui.add_space(6.0);
                 for (label, m) in [
-                    ("Millimetres   mm", cad_kernel::DocUnits::MM),
-                    ("Centimetres   cm", cad_kernel::DocUnits::CM),
-                    ("Metres   m", cad_kernel::DocUnits::M),
-                    ("Inches   in", cad_kernel::DocUnits::INCH),
-                    ("Feet   ft", cad_kernel::DocUnits::FOOT),
+                    ("Millimetres   mm", cad_kernel::Units::MM),
+                    ("Centimetres   cm", cad_kernel::Units::CM),
+                    ("Metres   m", cad_kernel::Units::M),
+                    ("Inches   in", cad_kernel::Units::INCH),
+                    ("Feet   ft", cad_kernel::Units::FOOT),
                 ] {
                     let on = (cur.metres_per_unit - m).abs() < 1e-9;
                     if ui.add_sized([340.0, 26.0], egui::SelectableLabel::new(on, label)).clicked() {
@@ -27865,7 +27895,7 @@ impl CadApp {
                 );
             });
         if let Some(m) = chosen {
-            self.factory.units = cad_kernel::DocUnits::new(m, cad_kernel::UnitSource::User);
+            self.factory.units = cad_kernel::Units::from_metres_per_unit(m, cad_kernel::UnitSource::User);
             self.factory.unit_asked = true;
             self.factory.ask_unit = false;
             let l = self.factory.units.label();
@@ -28850,25 +28880,25 @@ impl CadApp {
     fn arch_dialog_body(&mut self, ui: &mut egui::Ui) {
         use cad_solid::architecture as arch;
         // The Factory working unit — every length row below is typed and shown in it.
-        let u = self.factory.units;
+        let u = self.factory.units.clone();
 
         // A closure (not a nested fn) so the rows can carry the calculator
         // store — every numeric field accepts expressions like `x*2`.
         let calc_ref = &self.calc;
-        let num = |ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32| {
+        let num = |ui: &mut egui::Ui, u: &cad_kernel::Units, label: &str, v: &mut f32, speed: f32, min: f32, max: f32| {
             ui.horizontal(|ui| {
                 ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false));
-                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64, calc_ref);
+                crate::factory::length_ui(ui, &u, v, speed as f64, min as f64, max as f64, calc_ref);
             });
         };
         // Same row, with the one sentence that says what the number is
         // measured FROM — ranges alone don't stop someone entering a backset
         // from the wrong floor.
-        let num_tip = |ui: &mut egui::Ui, u: cad_kernel::DocUnits, label: &str, v: &mut f32, speed: f32, min: f32, max: f32, tip: &str| {
+        let num_tip = |ui: &mut egui::Ui, u: &cad_kernel::Units, label: &str, v: &mut f32, speed: f32, min: f32, max: f32, tip: &str| {
             ui.horizontal(|ui| {
                 ui.add_sized([150.0, 18.0], egui::Label::new(label).selectable(false))
                     .on_hover_text(tip);
-                crate::factory::length_ui(ui, u, v, speed as f64, min as f64, max as f64, calc_ref)
+                crate::factory::length_ui(ui, &u, v, speed as f64, min as f64, max as f64, calc_ref)
                     .on_hover_text(tip);
             });
         };
@@ -28921,22 +28951,22 @@ impl CadApp {
                             ui.selectable_value(&mut s.layout, l, l.label());
                         }
                     });
-                num(ui, u, "Floor-to-floor height", &mut s.total_height, 0.05, 0.1, 100.0);
-                num(ui, u, "Stair width", &mut s.step_width, 0.05, 0.3, 20.0);
-                num(ui, u, "Tread going (run)", &mut s.step_depth, 0.01, 0.1, 2.0);
-                num(ui, u, "Target riser height", &mut s.desired_riser_height, 0.005, 0.05, 0.5);
-                num(ui, u, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
-                num(ui, u, "Riser thickness", &mut s.thickness_riser, 0.005, 0.01, 0.3);
+                num(ui, &u, "Floor-to-floor height", &mut s.total_height, 0.05, 0.1, 100.0);
+                num(ui, &u, "Stair width", &mut s.step_width, 0.05, 0.3, 20.0);
+                num(ui, &u, "Tread going (run)", &mut s.step_depth, 0.01, 0.1, 2.0);
+                num(ui, &u, "Target riser height", &mut s.desired_riser_height, 0.005, 0.05, 0.5);
+                num(ui, &u, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
+                num(ui, &u, "Riser thickness", &mut s.thickness_riser, 0.005, 0.01, 0.3);
                 ui.checkbox(&mut s.has_handrails, "Handrails (balustrade)");
                 if s.has_handrails {
-                    num(ui, u, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
+                    num(ui, &u, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
                 }
                 ui.checkbox(&mut s.has_stringers, "Side stringers (solid slab)");
 
                 let is_u = s.layout == arch::StairLayout::UShape;
                 if is_u {
                     ui.separator();
-                    num(ui, u, "Landing depth", &mut s.landing_depth, 0.05, 0.1, 20.0);
+                    num(ui, &u, "Landing depth", &mut s.landing_depth, 0.05, 0.1, 20.0);
                     if s.landing_depth < s.step_width {
                         error(ui, format!("landing depth must be ≥ stair width ({:.2} m) to turn", s.step_width));
                     }
@@ -28971,10 +29001,10 @@ impl CadApp {
             }
             ArchTab::Spiral => {
                 let s = &mut self.arch_spiral;
-                num(ui, u, "Total height", &mut s.total_height, 0.05, 0.1, 100.0);
-                num(ui, u, "Tread length (radial)", &mut s.step_width, 0.05, 0.3, 10.0);
-                num(ui, u, "Inner radius", &mut s.center_radius, 0.02, 0.0, 10.0);
-                num(ui, u, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
+                num(ui, &u, "Total height", &mut s.total_height, 0.05, 0.1, 100.0);
+                num(ui, &u, "Tread length (radial)", &mut s.step_width, 0.05, 0.3, 10.0);
+                num(ui, &u, "Inner radius", &mut s.center_radius, 0.02, 0.0, 10.0);
+                num(ui, &u, "Tread thickness", &mut s.thickness_tread, 0.005, 0.01, 0.3);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Steps per turn").selectable(false));
                     ui.add(egui::DragValue::new(&mut s.steps_per_turn).update_while_editing(false).speed(0.2).range(3..=64));
@@ -28985,7 +29015,7 @@ impl CadApp {
                 });
                 ui.checkbox(&mut s.has_handrail, "Outer handrail");
                 if s.has_handrail {
-                    num(ui, u, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
+                    num(ui, &u, "Handrail height", &mut s.handrail_height, 0.02, 0.4, 1.5);
                 }
                 let params = *s;
                 ui.separator();
@@ -29004,10 +29034,10 @@ impl CadApp {
             }
             ArchTab::Ramp => {
                 let s = &mut self.arch_ramp;
-                num(ui, u, "Vertical height", &mut s.vertical_height, 0.05, 0.05, 50.0);
-                num(ui, u, "Horizontal length", &mut s.horizontal_length, 0.05, 0.1, 100.0);
-                num(ui, u, "Width", &mut s.width, 0.05, 0.2, 20.0);
-                num(ui, u, "Deck thickness", &mut s.thickness, 0.005, 0.02, 1.0);
+                num(ui, &u, "Vertical height", &mut s.vertical_height, 0.05, 0.05, 50.0);
+                num(ui, &u, "Horizontal length", &mut s.horizontal_length, 0.05, 0.1, 100.0);
+                num(ui, &u, "Width", &mut s.width, 0.05, 0.2, 20.0);
+                num(ui, &u, "Deck thickness", &mut s.thickness, 0.005, 0.02, 1.0);
                 let params = *s;
                 ui.separator();
                 feedback(ui, format!("slope {:.1}°", arch::ramp_slope_deg(&params)));
@@ -29026,10 +29056,10 @@ impl CadApp {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Upper-flight steps").selectable(false));
                     ui.add(egui::DragValue::new(&mut d.n_upper).update_while_editing(false).speed(0.2).range(1..=100));
                 });
-                num(ui, u, "Going (tread depth)", &mut d.going, 0.01, 0.1, 1.0);
-                num(ui, u, "Stair width", &mut d.width, 0.05, 0.3, 4.0);
-                num(ui, u, "Well (gap)", &mut d.well, 0.01, 0.0, 2.0);
-                num(ui, u, "Floor-to-floor rise", &mut d.total_rise, 0.05, 0.2, 12.0);
+                num(ui, &u, "Going (tread depth)", &mut d.going, 0.01, 0.1, 1.0);
+                num(ui, &u, "Stair width", &mut d.width, 0.05, 0.3, 4.0);
+                num(ui, &u, "Well (gap)", &mut d.well, 0.01, 0.0, 2.0);
+                num(ui, &u, "Floor-to-floor rise", &mut d.total_rise, 0.05, 0.2, 12.0);
                 ui.checkbox(&mut self.arch_dogleg_treads, "Stone tread slabs");
                 let inp = self.arch_dogleg;
                 ui.separator();
@@ -29060,14 +29090,14 @@ impl CadApp {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Number of steps").selectable(false));
                     ui.add(egui::DragValue::new(&mut s.n_steps).update_while_editing(false).speed(0.2).range(3..=200));
                 });
-                num(ui, u, "Number of turns", &mut s.turns, 0.02, 0.25, 6.0);
-                num(ui, u, "Overall height", &mut s.total_height, 0.05, 0.2, 20.0);
-                num(ui, u, "Outer radius (width)", &mut s.radius, 0.02, 0.3, 4.0);
+                num(ui, &u, "Number of turns", &mut s.turns, 0.02, 0.25, 6.0);
+                num(ui, &u, "Overall height", &mut s.total_height, 0.05, 0.2, 20.0);
+                num(ui, &u, "Outer radius (width)", &mut s.radius, 0.02, 0.3, 4.0);
                 ui.checkbox(&mut s.clockwise, "Clockwise going up");
                 ui.checkbox(&mut s.brackets, "Support brackets");
                 ui.checkbox(&mut s.handrail, "Balustrade (rails + handrail)");
                 if s.handrail {
-                    num(ui, u, "Handrail height", &mut s.handrail_height, 0.02, 0.3, 1.3);
+                    num(ui, &u, "Handrail height", &mut s.handrail_height, 0.02, 0.3, 1.3);
                     ui.horizontal(|ui| {
                         ui.add_sized([150.0, 18.0], egui::Label::new("Infill rails").selectable(false));
                         ui.add(egui::DragValue::new(&mut s.n_infill).update_while_editing(false).speed(0.1).range(0..=10));
@@ -29100,19 +29130,19 @@ impl CadApp {
                 // All sizes in metres. Same "Door classic" proportions as the drawn-aperture door.
                 let d = &mut self.arch_door;
                 ui.label(egui::RichText::new("Leaf").small().weak());
-                num(ui, u, "Leaf width", &mut d.door_width, 0.005, 0.4, 1.6);
-                num(ui, u, "Leaf height", &mut d.door_height, 0.01, 1.2, 3.2);
-                num(ui, u, "Leaf thickness", &mut d.door_thickness, 0.002, 0.02, 0.1);
+                num(ui, &u, "Leaf width", &mut d.door_width, 0.005, 0.4, 1.6);
+                num(ui, &u, "Leaf height", &mut d.door_height, 0.01, 1.2, 3.2);
+                num(ui, &u, "Leaf thickness", &mut d.door_thickness, 0.002, 0.02, 0.1);
                 ui.label(egui::RichText::new("Frame / lining").small().weak());
-                num(ui, u, "Wall thickness (depth)", &mut d.frame_depth, 0.005, 0.05, 0.6);
-                num(ui, u, "Lining reveal (face)", &mut d.frame_face_width, 0.002, 0.005, 0.1);
-                num(ui, u, "Stop / rebate depth", &mut d.frame_stop_depth, 0.002, 0.005, 0.05);
+                num(ui, &u, "Wall thickness (depth)", &mut d.frame_depth, 0.005, 0.05, 0.6);
+                num(ui, &u, "Lining reveal (face)", &mut d.frame_face_width, 0.002, 0.005, 0.1);
+                num(ui, &u, "Stop / rebate depth", &mut d.frame_stop_depth, 0.002, 0.005, 0.05);
                 ui.label(egui::RichText::new("Architrave (casing)").small().weak());
                 // Legs and head are separate boards. A deeper head over equal legs is a deliberate
                 // joinery choice, so it gets its own number rather than following the legs.
-                num(ui, u, "Side width", &mut d.arch_width, 0.005, 0.02, 0.30);
-                num(ui, u, "Head height", &mut d.arch_head_width, 0.005, 0.02, 0.40);
-                num(ui, u, "Projection", &mut d.arch_thickness, 0.001, 0.004, 0.06);
+                num(ui, &u, "Side width", &mut d.arch_width, 0.005, 0.02, 0.30);
+                num(ui, &u, "Head height", &mut d.arch_head_width, 0.005, 0.02, 0.40);
+                num(ui, &u, "Projection", &mut d.arch_thickness, 0.001, 0.004, 0.06);
                 if ui
                     .small_button("= match head to sides")
                     .on_hover_text("the measured 'Door classic' has both at 81 mm")
@@ -29124,13 +29154,11 @@ impl CadApp {
                 // The two numbers that decide where the lever actually lands, at the ranges asked
                 // for. Backset is measured from the leaf's LEADING edge (the one away from the
                 // hinges) — that is where a lock's backset is measured from on site.
-                num_tip(
-                    ui, u, "Handle backset", &mut d.handle_backset, 0.002, 0.050, 0.150,
+                num_tip(ui, &u, "Handle backset", &mut d.handle_backset, 0.002, 0.050, 0.150,
                     "50–150 mm. Spindle centre in from the leaf's LEADING edge — the one away from\n\
                      the hinges, and the edge a lock's backset is measured from on site.",
                 );
-                num_tip(
-                    ui, u, "Handle height", &mut d.handle_height, 0.005, 0.750, 1.300,
+                num_tip(ui, &u, "Handle height", &mut d.handle_height, 0.005, 0.750, 1.300,
                     "750–1300 mm above the FINISHED FLOOR, which is how handle heights are\n\
                      specified and set out. The leaf's own bottom sits ~2 mm above that.",
                 );
@@ -29222,20 +29250,20 @@ impl CadApp {
                 // A sloped annular deck winding around a free inner edge — built as a furniture mesh.
                 use cad_solid::architecture::BalustradeEdges;
                 let r = &mut self.arch_helical;
-                num(ui, u, "Ramp height (rise)", &mut r.ramp_height, 0.05, 0.2, 40.0);
-                num(ui, u, "Inner radius", &mut r.r_inner, 0.02, 0.0, 20.0);
-                num(ui, u, "Outer radius", &mut r.r_outer, 0.02, 0.3, 30.0);
+                num(ui, &u, "Ramp height (rise)", &mut r.ramp_height, 0.05, 0.2, 40.0);
+                num(ui, &u, "Inner radius", &mut r.r_inner, 0.02, 0.0, 20.0);
+                num(ui, &u, "Outer radius", &mut r.r_outer, 0.02, 0.3, 30.0);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Turns").selectable(false));
                     ui.add(egui::DragValue::new(&mut r.turns).update_while_editing(false).speed(0.05).range(0.1..=20.0));
                 });
-                num(ui, u, "Slab thickness", &mut r.slab_thickness, 0.005, 0.02, 1.0);
+                num(ui, &u, "Slab thickness", &mut r.slab_thickness, 0.005, 0.02, 1.0);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Direction").selectable(false));
                     ui.selectable_value(&mut r.direction, 1.0, "Anticlockwise");
                     ui.selectable_value(&mut r.direction, -1.0, "Clockwise");
                 });
-                num(ui, u, "Rail height", &mut r.rail_height, 0.02, 0.3, 1.5);
+                num(ui, &u, "Rail height", &mut r.rail_height, 0.02, 0.3, 1.5);
                 ui.horizontal(|ui| {
                     ui.add_sized([150.0, 18.0], egui::Label::new("Rails per edge").selectable(false));
                     ui.add(egui::DragValue::new(&mut r.rail_count).update_while_editing(false).speed(0.1).range(1..=8));
@@ -29276,9 +29304,9 @@ impl CadApp {
                 // the grid, never typed (spec §B1.4). Built as a multi-material furniture mesh.
                 use cad_solid::cupboard::Cell;
                 let cup = &mut self.arch_cupboard;
-                num(ui, u, "Carcass width", &mut cup.width, 0.01, 0.3, 6.0);
-                num(ui, u, "Carcass height", &mut cup.carcass_height, 0.01, 0.3, 3.0);
-                num(ui, u, "Depth", &mut cup.depth, 0.005, 0.1, 1.0);
+                num(ui, &u, "Carcass width", &mut cup.width, 0.01, 0.3, 6.0);
+                num(ui, &u, "Carcass height", &mut cup.carcass_height, 0.01, 0.3, 3.0);
+                num(ui, &u, "Depth", &mut cup.depth, 0.005, 0.1, 1.0);
 
                 // Grid size — resize cols/rows/layout to match (new cells default to a door).
                 let (mut n_cols, mut n_rows) = (cup.cols.len(), cup.rows.len());
@@ -29367,12 +29395,12 @@ impl CadApp {
                             }
                         });
                 });
-                num(ui, u, "Main run length", &mut kt.length, 0.02, 0.3, 12.0);
+                num(ui, &u, "Main run length", &mut kt.length, 0.02, 0.3, 12.0);
                 if matches!(kt.shape, KitchenShape::L | KitchenShape::U) {
-                    num(ui, u, "Return leg B length", &mut kt.length_b, 0.02, 0.3, 12.0);
+                    num(ui, &u, "Return leg B length", &mut kt.length_b, 0.02, 0.3, 12.0);
                 }
                 if matches!(kt.shape, KitchenShape::U) {
-                    num(ui, u, "Return leg C length", &mut kt.length_c, 0.02, 0.3, 12.0);
+                    num(ui, &u, "Return leg C length", &mut kt.length_c, 0.02, 0.3, 12.0);
                 }
                 if matches!(kt.shape, KitchenShape::L | KitchenShape::U) {
                     ui.label(egui::RichText::new("return legs auto-fill to length; edit the main run below").small().weak());
@@ -29394,7 +29422,7 @@ impl CadApp {
                                     ui.selectable_value(&mut m.kind, k, k.label());
                                 }
                             });
-                        crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
+                        crate::factory::length_ui(ui, &u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
                         if matches!(m.kind, BaseKind::Door | BaseKind::Drawers) {
                             ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                 .on_hover_text(if m.kind == BaseKind::Door { "door leaves" } else { "drawers" });
@@ -29421,7 +29449,7 @@ impl CadApp {
                                         ui.selectable_value(&mut m.kind, k, k.label());
                                     }
                                 });
-                            crate::factory::length_ui(ui, u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
+                            crate::factory::length_ui(ui, &u, &mut m.width, 0.01, 0.0, 3.0, &self.calc);
                             if matches!(m.kind, WallKind::Door | WallKind::Open) {
                                 ui.add(egui::DragValue::new(&mut m.count).update_while_editing(false).range(1..=6))
                                     .on_hover_text(if m.kind == WallKind::Door { "door leaves" } else { "shelves" });
@@ -29462,9 +29490,9 @@ impl CadApp {
                 // panel order and banding. Full-overlay fronts tile the outline; counts are DERIVED.
                 use cad_solid::cabin::{Cell, EdgeBand, Grip, PanelOrder};
                 let cb = &mut self.arch_cabin;
-                num(ui, u, "Width", &mut cb.width, 0.01, 0.2, 3.0);
-                num(ui, u, "Height", &mut cb.height, 0.01, 0.2, 3.0);
-                num(ui, u, "Depth (nominal, incl. leaf)", &mut cb.depth_nominal, 0.005, 0.1, 1.0);
+                num(ui, &u, "Width", &mut cb.width, 0.01, 0.2, 3.0);
+                num(ui, &u, "Height", &mut cb.height, 0.01, 0.2, 3.0);
+                num(ui, &u, "Depth (nominal, incl. leaf)", &mut cb.depth_nominal, 0.005, 0.1, 1.0);
 
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Grip").small().weak());
@@ -29559,7 +29587,7 @@ impl CadApp {
                     ui.label(egui::RichText::new("Open pose").small().weak());
                     ui.add(egui::DragValue::new(&mut cb.open_deg).update_while_editing(false).speed(1.0).range(0.0..=110.0).suffix("°"))
                         .on_hover_text("swing every door leaf open by this angle (0 = shut)");
-                    crate::factory::length_ui(ui, u, &mut cb.drawer_out, 0.005, 0.0, 0.6, &self.calc)
+                    crate::factory::length_ui(ui, &u, &mut cb.drawer_out, 0.005, 0.0, 0.6, &self.calc)
                         .on_hover_text("pull every drawer front out by this much");
                 });
 
@@ -29616,15 +29644,15 @@ impl CadApp {
                 });
                 let mut grab = false;
                 match &mut s.path {
-                    PathKind::Ring { radius } => num(ui, u, "Ring radius", radius, 0.01, 0.05, 5.0),
+                    PathKind::Ring { radius } => num(ui, &u, "Ring radius", radius, 0.01, 0.05, 5.0),
                     PathKind::Racetrack { w, d, fillet } => {
-                        num(ui, u, "Length", w, 0.02, 0.3, 8.0);
-                        num(ui, u, "Depth", d, 0.02, 0.3, 8.0);
-                        num(ui, u, "Corner fillet", fillet, 0.01, 0.03, 1.0);
+                        num(ui, &u, "Length", w, 0.02, 0.3, 8.0);
+                        num(ui, &u, "Depth", d, 0.02, 0.3, 8.0);
+                        num(ui, &u, "Corner fillet", fillet, 0.01, 0.03, 1.0);
                     }
                     PathKind::SCurve { length, width } => {
-                        num(ui, u, "Run length", length, 0.05, 0.5, 15.0);
-                        num(ui, u, "Swing (±)", width, 0.02, 0.0, 3.0);
+                        num(ui, &u, "Run length", length, 0.05, 0.5, 15.0);
+                        num(ui, &u, "Swing (±)", width, 0.02, 0.0, 3.0);
                     }
                     PathKind::Custom { pts, closed, fillet } => {
                         // Draw a polyline/arc/circle/ellipse in the 2D view, select it, then grab it.
@@ -29647,7 +29675,7 @@ impl CadApp {
                                     .weak(),
                             );
                         }
-                        num(ui, u, "Corner fillet", fillet, 0.01, 0.0, 1.0);
+                        num(ui, &u, "Corner fillet", fillet, 0.01, 0.0, 1.0);
                     }
                 }
                 if grab {
@@ -29705,17 +29733,17 @@ impl CadApp {
                         }
                     });
                 });
-                num(ui, u, "Profile width", &mut s.width, 0.002, 0.02, 0.3);
-                num(ui, u, "Profile height", &mut s.height, 0.002, 0.02, 0.4);
-                num(ui, u, "Lens size", &mut s.lens, 0.002, 0.01, 0.3);
+                num(ui, &u, "Profile width", &mut s.width, 0.002, 0.02, 0.3);
+                num(ui, &u, "Profile height", &mut s.height, 0.002, 0.02, 0.4);
+                num(ui, &u, "Lens size", &mut s.lens, 0.002, 0.01, 0.3);
                 // Drop (md C9 control 2) + spacing (control 3).
-                num(ui, u, "Drop (ceiling→top)", &mut s.drop, 0.01, 0.1, 4.0);
+                num(ui, &u, "Drop (ceiling→top)", &mut s.drop, 0.01, 0.1, 4.0);
                 if matches!(s.path, PathKind::SCurve { .. }) {
-                    num(ui, u, "Drop at far end", &mut s.drop_end, 0.01, 0.1, 4.0);
+                    num(ui, &u, "Drop at far end", &mut s.drop_end, 0.01, 0.1, 4.0);
                 } else {
                     s.drop_end = s.drop;
                 }
-                num(ui, u, "Hanger spacing", &mut s.spacing, 0.02, 0.3, 3.0);
+                num(ui, &u, "Hanger spacing", &mut s.spacing, 0.02, 0.3, 3.0);
 
                 // ---- OUTPUT: what makes this a light rather than a glowing shape ----------------
                 //
@@ -29810,9 +29838,9 @@ impl CadApp {
                     });
                 });
                 let d = &mut self.arch_desk;
-                num(ui, u, "Length", &mut d.length, 0.01, 1.0, 3.0);
-                num(ui, u, "Depth", &mut d.width, 0.01, 0.5, 1.4);
-                num(ui, u, "Surface height", &mut d.height, 0.005, 0.60, 0.90);
+                num(ui, &u, "Length", &mut d.length, 0.01, 1.0, 3.0);
+                num(ui, &u, "Depth", &mut d.width, 0.01, 0.5, 1.4);
+                num(ui, &u, "Surface height", &mut d.height, 0.005, 0.60, 0.90);
 
                 ui.separator();
                 ui.checkbox(&mut d.partition, "Privacy screen");
@@ -29825,8 +29853,8 @@ impl CadApp {
                             }
                         });
                     });
-                    num(ui, u, "Screen span", &mut d.part_w, 0.01, 0.3, 3.0);
-                    num(ui, u, "Screen height", &mut d.part_h, 0.01, 0.1, 1.0);
+                    num(ui, &u, "Screen span", &mut d.part_w, 0.01, 0.3, 3.0);
+                    num(ui, &u, "Screen height", &mut d.part_h, 0.01, 0.1, 1.0);
                     ui.checkbox(&mut d.part_band, "Organiser band at the base");
                 }
 
@@ -29842,7 +29870,7 @@ impl CadApp {
                     });
                 }
                 if d.sup_l == Support::Drawers || d.sup_r == Support::Drawers {
-                    num(ui, u, "Pedestal width", &mut d.ped_w, 0.01, 0.25, 0.8);
+                    num(ui, &u, "Pedestal width", &mut d.ped_w, 0.01, 0.25, 0.8);
                     ui.horizontal(|ui| {
                         ui.add_sized([150.0, 18.0], egui::Label::new("Drawers").selectable(false));
                         ui.add(egui::DragValue::new(&mut d.ped_n).update_while_editing(false).speed(0.1).range(1..=6));
@@ -29872,10 +29900,10 @@ impl CadApp {
                 for (i, g) in d.grommets.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
-                        crate::factory::length_ui_pre(ui, u, "x ", &mut g.x, 0.01, -1e4, 1e4, &self.calc);
+                        crate::factory::length_ui_pre(ui, &u, "x ", &mut g.x, 0.01, -1e4, 1e4, &self.calc);
                         ui.checkbox(&mut g.rear, "rear");
                         if !g.rear {
-                            crate::factory::length_ui_pre(ui, u, "y ", &mut g.y, 0.01, -1e4, 1e4, &self.calc);
+                            crate::factory::length_ui_pre(ui, &u, "y ", &mut g.y, 0.01, -1e4, 1e4, &self.calc);
                         }
                     });
                 }
@@ -29939,7 +29967,7 @@ impl CadApp {
                 for (i, r) in c.runs.iter_mut().enumerate() {
                     ui.horizontal(|ui| {
                         ui.add_sized([56.0, 18.0], egui::Label::new(format!("  #{}", i + 1)).selectable(false));
-                        crate::factory::length_ui(ui, u, &mut r.length, 0.01, 0.4, 6.0, &self.calc);
+                        crate::factory::length_ui(ui, &u, &mut r.length, 0.01, 0.4, 6.0, &self.calc);
                         ui.add(
                             egui::DragValue::new(&mut r.cushions).update_while_editing(false)
                                 .speed(0.1)
@@ -29951,11 +29979,11 @@ impl CadApp {
                 }
 
                 ui.separator();
-                num(ui, u, "Depth", &mut c.depth, 0.01, 0.5, 1.2);
-                num(ui, u, "Seat height", &mut c.seat_top, 0.005, 0.25, 0.6);
-                num(ui, u, "Back height", &mut c.back_h, 0.005, 0.3, 1.1);
-                num(ui, u, "Arm height", &mut c.arm_h, 0.005, 0.2, 0.9);
-                num(ui, u, "Cushion thickness", &mut c.cushion_t, 0.005, 0.05, 0.35);
+                num(ui, &u, "Depth", &mut c.depth, 0.01, 0.5, 1.2);
+                num(ui, &u, "Seat height", &mut c.seat_top, 0.005, 0.25, 0.6);
+                num(ui, &u, "Back height", &mut c.back_h, 0.005, 0.3, 1.1);
+                num(ui, &u, "Arm height", &mut c.arm_h, 0.005, 0.2, 0.9);
+                num(ui, &u, "Cushion thickness", &mut c.cushion_t, 0.005, 0.05, 0.35);
 
                 ui.separator();
                 ui.label(egui::RichText::new("  Features — switch any of these off").small().weak());
@@ -31417,8 +31445,8 @@ impl CadApp {
             //
             // Only on IMPORT. Geometry built in memory is in whatever units its author meant, and
             // has no file to have declared anything.
-            let u = self.factory.units;
-            self.doc.units = cad_kernel::DocUnits::new(u.metres_per_unit, cad_kernel::UnitSource::User);
+            let u = self.factory.units.clone();
+            self.doc.units = cad_kernel::Units::from_metres_per_unit(u.metres_per_unit, cad_kernel::UnitSource::User);
             self.history.push(format!(
                 "  units: the file declares none — read as {} (the 3D Factory working unit). \
                  Nothing was rescaled. If this drawing is in something else, `units <unit>` now, \
@@ -33257,6 +33285,15 @@ impl CadApp {
                 }
                 out
             }
+            // Merged-in RUST-AutoRASM variants: render their bbox rectangle.
+            _ => {
+                let (mn, mx) = g.bbox();
+                vec![vec![
+                    Vec2::new(mn.x, mn.y), Vec2::new(mx.x, mn.y),
+                    Vec2::new(mx.x, mx.y), Vec2::new(mn.x, mx.y),
+                    Vec2::new(mn.x, mn.y),
+                ]]
+            }
         }
     }
 
@@ -34358,8 +34395,9 @@ impl CadApp {
             block, insert, scale: s, scale_y: s, rotation,
             mirror_x: false,
             param_values,
+            attr_values: Vec::new(),
         };
-        self.add_dobject(Geom::BlockRef(br), "insert");
+        self.add_dobject(Geom::BlockRef(br.clone()), "insert");
         self.apply_block_cut(br);
         self.index_dirty = true;
         self.touch_view();
@@ -34408,6 +34446,7 @@ impl CadApp {
             block: id, insert: base, scale: 1.0, scale_y: 1.0, rotation: 0.0,
             mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        attr_values: Vec::new(),
         });
         let mut d = match inst_style {
             Some(st) => DObject::with_style(geom, st),
@@ -34593,7 +34632,7 @@ impl CadApp {
         let br = self.selection.iter().copied()
             .chain(self.selected)
             .filter_map(|i| match self.doc.dobjects.get(i).map(|d| &d.geom) {
-                Some(Geom::BlockRef(b)) => Some(*b),
+                Some(Geom::BlockRef(b)) => Some(b.clone()),
                 _ => None,
             })
             .next();
@@ -35539,8 +35578,9 @@ impl CadApp {
                 block, insert, scale: 1.0, scale_y: 1.0, rotation,
                 mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
             };
-            self.add_dobject(Geom::BlockRef(br), "insert");
+            self.add_dobject(Geom::BlockRef(br.clone()), "insert");
             self.apply_block_cut(br);
             return;
         }
@@ -35563,8 +35603,9 @@ impl CadApp {
         let br = cad_kernel::BlockRef {
             block: p.block, insert: p.insert, scale: 1.0, scale_y: 1.0,
             rotation: p.rotation, mirror_x: false, param_values,
+            attr_values: Vec::new(),
         };
-        self.add_dobject(Geom::BlockRef(br), "insert");
+        self.add_dobject(Geom::BlockRef(br.clone()), "insert");
         self.apply_block_cut(br);
         self.clear_prompt();
     }
@@ -36391,6 +36432,7 @@ impl CadApp {
         let preview = Geom::BlockRef(cad_kernel::BlockRef {
             block,
             insert,
+            attr_values: Vec::new(),
             scale: s,
             scale_y: s,
             rotation,
@@ -36430,6 +36472,7 @@ impl CadApp {
             block: live.block, insert: live.insert, scale: live.scale,
             scale_y: live.scale, rotation: live.rotation, mirror_x: false,
             param_values: pv,
+            attr_values: Vec::new(),
         };
         let ghost = egui::Color32::from_rgba_unmultiplied(150, 200, 255, 180);
         for g in &derived {
@@ -36535,6 +36578,7 @@ impl CadApp {
                     Some(Geom::Text(_))       => "Text",
                     Some(Geom::Dimension(_))  => "Dimension",
                     Some(Geom::BlockRef(_))   => "BlockRef",
+                    Some(_)                   => "Other",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
@@ -37789,6 +37833,15 @@ impl CadApp {
                 h_align: cad_kernel::TextHAlign::Left,
                 v_align: cad_kernel::TextVAlign::Baseline,
                 style,
+                font_name:     String::new(),
+                bold:          false,
+                oblique:       0.0,
+                width_factor:  1.0,
+                outline_only:  false,
+                outline_width: 0.0,
+                underline:     false,
+                list_mode:     cad_kernel::TextListKind::None,
+                line_spacing:  1.0,
             }),
             "canvas");
         self.history.push(format!(
@@ -38208,7 +38261,7 @@ impl CadApp {
     /// Uses the ACTIVE document's unit, matching `w2s`: with a face sketch open the canvas IS
     /// the sketch (metre-space, k = 1), where this is the identity — which is correct.
     fn w2s_m(&self, world_m: Vec2, rect: egui::Rect) -> egui::Pos2 {
-        let u = self.doc.units;
+        let u = self.doc.units.clone();
         self.w2s(Vec2::new(u.from_metres(world_m.x), u.from_metres(world_m.y)), rect)
     }
 
@@ -38225,7 +38278,7 @@ impl CadApp {
     #[allow(dead_code)]
     fn s2w_m(&self, s: egui::Pos2, rect: egui::Rect) -> Vec2 {
         let d = self.s2w(s, rect);
-        let u = self.doc.units;
+        let u = self.doc.units.clone();
         Vec2::new(u.to_metres(d.x), u.to_metres(d.y))
     }
 
@@ -39723,6 +39776,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Text(_)       => "Text",
         Geom::Dimension(_)  => "Dimension",
         Geom::BlockRef(_)   => "Block",
+        _                   => "Entity",
     }
 }
 
@@ -39792,6 +39846,7 @@ fn describe(g: &Geom) -> String {
                 },
                 DimKind::Radius { .. }   => "dim radius",
                 DimKind::Diameter { .. } => "dim diameter",
+                _                        => "dim",
             };
             format!("{} = {:.3} style={}", kind_name, d.measured_value(), d.style)
         }
@@ -39799,6 +39854,7 @@ fn describe(g: &Geom) -> String {
             "block #{} @ ({:.3},{:.3}) s={:.3} rot={:.2}°",
             br.block, br.insert.x, br.insert.y, br.scale,
             br.rotation.to_degrees()),
+        _ => format!("{}", dobject_kind_name(g)),
     }
 }
 
@@ -39995,6 +40051,7 @@ fn list_full_details(g: &Geom) -> Vec<String> {
                     out.push(format!("leader_end     : ({:.4}, {:.4})",
                         leader_end.x, leader_end.y));
                 }
+                _ => out.push(format!("kind           : other")),
             }
             out.push(format!("measured value : {:.6}", d.measured_value()));
             out.push(format!("style id       : {}", d.style));
@@ -40010,6 +40067,7 @@ fn list_full_details(g: &Geom) -> Vec<String> {
             out.push(format!("scale          : {:.4}", br.scale));
             out.push(format!("rotation       : {:.4}°", br.rotation.to_degrees()));
         }
+        _ => out.push(format!("type           : {}", dobject_kind_name(g))),
     }
     out
 }
@@ -40108,6 +40166,7 @@ fn describe_verbose(g: &Geom) -> String {
             br.block, br.insert.x, br.insert.y, br.scale,
             br.rotation.to_degrees(),
         ),
+        _ => dobject_kind_name(g).to_string(),
     }
 }
 
@@ -43823,8 +43882,8 @@ impl eframe::App for CadApp {
                             {
                                 set_active = Some(i);
                             }
-                            let u = self.factory.units;
-                            if crate::factory::length_ui(ui, u, &mut h, 0.05, 0.1, 30.0, &self.calc)
+                            let u = self.factory.units.clone();
+                            if crate::factory::length_ui(ui, &u, &mut h, 0.05, 0.1, 30.0, &self.calc)
                                 .on_hover_text("Floor-to-floor height — levels above move to suit")
                                 .changed()
                             {
@@ -43892,9 +43951,9 @@ impl eframe::App for CadApp {
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         ui.label("Building height");
-                        let u = self.factory.units;
+                        let u = self.factory.units.clone();
                         let mut bh = self.factory.building_height;
-                        let r = crate::factory::length_ui(ui, u, &mut bh, 0.05, 0.05, 500.0, &self.calc)
+                        let r = crate::factory::length_ui(ui, &u, &mut bh, 0.05, 0.05, 500.0, &self.calc)
                             .on_hover_text(
                                 "Storey height the structure rises to.\n\
                                  Changing it RESIZES a building already standing — it is not only \
@@ -44756,6 +44815,7 @@ impl eframe::App for CadApp {
                 dock_region: crate::dock::DockRegion::Bottom,
                 size: 150.0, min: 96.0, max: 320.0,
                 resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
+                alt_region: None, dockable: true, rail_header: false, collapsible: false,
             };
             let mut state = self.cmd_dock_state;
             let mut open = self.cmd_window_open;
@@ -46920,6 +46980,7 @@ impl eframe::App for CadApp {
                         self.scale, 0.0, 0.0,
                     );
                     let renderer = self.gpu_renderer.clone();
+                    let gpu_pad = 2.0 / self.scale.max(1e-6) as f32;
                     let cb = egui::PaintCallback {
                         rect,
                         callback: StdArc::new(
@@ -46928,7 +46989,7 @@ impl eframe::App for CadApp {
                                     let gl = gl_painter.gl();
                                     let mut r = renderer.lock().unwrap();
                                     r.ensure_init(gl);
-                                    r.render(gl, &[], &dots, &[], &[], &[], &view);
+                                    r.render(gl, &[], &dots, &[], &[], &[], &view, gpu_pad);
                                 },
                             ),
                         ),
@@ -47430,6 +47491,7 @@ impl eframe::App for CadApp {
                             self.scale, 0.0, 0.0,
                         );
                         let renderer = self.gpu_renderer.clone();
+                        let gpu_pad = 2.0 / self.scale.max(1e-6) as f32;
                         let cb = egui::PaintCallback {
                             rect,
                             callback: StdArc::new(
@@ -47438,7 +47500,7 @@ impl eframe::App for CadApp {
                                         let gl = gl_painter.gl();
                                         let mut r = renderer.lock().unwrap();
                                         r.ensure_init(gl);
-                                        r.render(gl, &fills, &circles, &arcs, &ellipses, &lines, &view);
+                                        r.render(gl, &fills, &circles, &arcs, &ellipses, &lines, &view, gpu_pad);
                                     },
                                 ),
                             ),
@@ -49766,6 +49828,7 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             // BlockRef — one grip at the insertion point (drag = move).
             draw(br.insert);
         }
+        _ => {}
     }
 }
 
@@ -50651,6 +50714,7 @@ fn draw_dobject_thick(
         Geom::BlockRef(br) => {
             draw_blockref(painter, rect, app, br, color, width, 0);
         }
+        _ => {}
     }
 }
 
@@ -50838,6 +50902,7 @@ fn dim_render_geometry(d: &cad_kernel::Dim, style: &cad_kernel::DimStyle) -> Dim
             g.text_pos = *leader_end + outward * (text_gap_w + text_h_w * 0.5);
             g
         }
+        _ => g,
     }
 }
 
@@ -51427,6 +51492,7 @@ fn draw_dobject_dashed(
                 }
             }
         }
+        _ => {}
     }
 }
 
@@ -51466,7 +51532,7 @@ fn gpu_push_seg(lines: &mut Vec<LineInstance>, a: Vec2, b: Vec2,
     lines.push(LineInstance {
         ax: (a.x + ox) as f32, ay: (a.y + oy) as f32,
         bx: (b.x + ox) as f32, by: (b.y + oy) as f32,
-        half_w, color,
+        half_w, color, flags: 0,
     });
 }
 
@@ -53650,8 +53716,8 @@ mod factory_sketch_tests {
     fn a_millimetre_plan_promotes_to_metres() {
         let mut app = CadApp::default();
         app.doc.dobjects.clear();
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         // A 3 m wall, drawn the way an architectural plan draws it: 3000 units.
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
             a: Vec2::new(0.0, 0.0),
@@ -53669,9 +53735,10 @@ mod factory_sketch_tests {
     }
 
     /// Zero-delta: the same drawing with NO unit set behaves exactly as it always did — the
-    /// numbers are taken as metres. This is what keeps every existing file unchanged.
+    /// numbers are taken as millimetres (1 unit = 1 mm, Assumed) — the merged
+    /// default, matching the plotting convention. A 3-unit line builds a 3 mm wall.
     #[test]
-    fn without_a_unit_the_numbers_are_still_taken_as_metres() {
+    fn without_a_unit_the_numbers_are_still_taken_as_millimetres() {
         let mut app = CadApp::default();
         app.doc.dobjects.clear();
         assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Assumed);
@@ -53682,7 +53749,7 @@ mod factory_sketch_tests {
         app.selection = vec![app.doc.dobjects.len() - 1];
         assert_eq!(app.make_3d_wall_from_selection().0, 1);
         let (mn, mx) = app.factory.features_aabb().expect("bounds");
-        assert!((mx.x - mn.x - 3.0).abs() < 0.05, "unchanged behaviour at k = 1");
+        assert!((mx.x - mn.x - 0.003).abs() < 0.05, "3 units = 3 mm at k = 0.001");
     }
 
     /// A wall DRAWN at the default thickness and an imported centerline promoted with the
@@ -53691,8 +53758,8 @@ mod factory_sketch_tests {
     #[test]
     fn drawn_and_imported_walls_agree_on_thickness_in_millimetres() {
         let mut app = CadApp::default();
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         // What the Wall tool stores for the current default thickness.
         let stored = app.doc.units.from_metres(app.env.WlThk);
         // What promotion turns that back into.
@@ -53711,7 +53778,10 @@ mod factory_sketch_tests {
     fn declaring_a_unit_with_rescale_fixes_an_already_built_model() {
         let mut app = CadApp::default();
         app.doc.dobjects.clear();
-        // Built the old way: a 3000-unit wall read as 3000 METRES.
+        // Built the old way: a 3000-unit wall read as 3000 METRES (the merged
+        // default is mm, so simulate the old reading by declaring metres first).
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::User);
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
             a: Vec2::new(0.0, 0.0),
             b: Vec2::new(3000.0, 0.0),
@@ -53760,8 +53830,8 @@ mod factory_sketch_tests {
         app.factory.add_box();
         app.factory.recompute();
         let before = app.factory.features_aabb().expect("bounds");
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         let after = app.factory.features_aabb().expect("bounds");
         assert_eq!(before, after, "setting a unit is a declaration, not a transform");
     }
@@ -54401,6 +54471,8 @@ fn calculate_on_real_project() {
             v: glam::Vec3::Z,
         };
         let mut sk = cad_solid::Sketch::new(frame);
+        sk.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::Assumed);
         let rect = [(-0.6, -0.8), (0.6, -0.8), (0.6, 0.8), (-0.6, 0.8), (-0.6, -0.8)];
         sk.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: rect.iter()
@@ -54662,6 +54734,10 @@ fn calculate_on_real_project() {
             v: glam::Vec3::Z,
         };
         let mut sk = cad_solid::Sketch::new(frame);
+        // Sketch docs are metre-space (1:1 with the 3D world) — same invariant
+        // `factory_enter_sketch` now enforces on the live sketch.
+        sk.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::Assumed);
         // 3.2 m wide: its centre is over the gap, its ends are over both panels.
         let rect = [(-1.6, -0.7), (1.6, -0.7), (1.6, 0.7), (-1.6, 0.7), (-1.6, -0.7)];
         sk.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(cad_kernel::Polyline {
@@ -55298,8 +55374,8 @@ fn calculate_on_real_project() {
     fn the_depth_tested_plan_is_scaled_to_metres() {
         let mut app = CadApp::default();
         app.doc.dobjects.clear();
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
             a: Vec2::new(0.0, 0.0),
             b: Vec2::new(3000.0, 0.0),
@@ -55318,12 +55394,14 @@ fn calculate_on_real_project() {
 
         // A metre drawing: 3 m in the world is 3 units on the canvas.
         let mut app = CadApp::default();
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::User);
         let metres = app.w2s_m(Vec2::new(3.0, 0.0), rect);
         assert_eq!(metres, app.w2s(Vec2::new(3.0, 0.0), rect), "k = 1 is the identity");
 
         // A millimetre drawing: the same 3 m must land at 3000 drawing units.
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         let mm = app.w2s_m(Vec2::new(3.0, 0.0), rect);
         assert_eq!(
             mm,
@@ -55338,8 +55416,8 @@ fn calculate_on_real_project() {
     fn the_plan_projection_round_trips_in_millimetres() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let mut app = CadApp::default();
-        app.doc.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         let world = Vec2::new(12.5, -4.25);
         let back = app.s2w_m(app.w2s_m(world, rect), rect);
         assert!(
@@ -55502,6 +55580,11 @@ fn calculate_on_real_project() {
     #[cfg(test)]
     fn curved_extruded_wall(radius: f32, thickness: f32, sweep: f32) -> CadApp {
         let mut app = CadApp::default();
+        // The wall is built in metre-space; declare metres so the face-sketch
+        // coordinates drawn in the test match the world (the merged default
+        // is 1 unit = 1 mm).
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::User);
         app.doc.dobjects.clear();
         let n = 48;
         let ro = radius + thickness * 0.5;
@@ -56115,6 +56198,10 @@ fn calculate_on_real_project() {
     #[test]
     fn extrude_works_on_a_2d_selection() {
         let mut app = CadApp::default();
+        // Declared metres so the shape's doc coords are also world metres
+        // (the merged default is 1 unit = 1 mm).
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::User);
         let idx = app.doc.dobjects.len();
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Circle(cad_kernel::Circle {
             center: Vec2::new(5.0, 3.0),
@@ -58296,11 +58383,11 @@ mod imported_drawing_scale {
     #[test]
     fn an_undeclared_file_is_read_at_the_factory_working_unit() {
         let mut app = CadApp::default();
-        assert!((app.factory.units.metres_per_unit - cad_kernel::DocUnits::MM).abs() < 1e-12);
+        assert!((app.factory.units.metres_per_unit - cad_kernel::Units::MM).abs() < 1e-12);
         app.apply_loaded("plan.dxf", payload(square(4400.0)));
 
         assert!(
-            (app.doc.units.metres_per_unit - cad_kernel::DocUnits::MM).abs() < 1e-12,
+            (app.doc.units.metres_per_unit - cad_kernel::Units::MM).abs() < 1e-12,
             "the drawing should now declare millimetres, not sit at an assumed metre",
         );
         assert_eq!(app.doc.units.source, cad_kernel::UnitSource::User);
@@ -58342,7 +58429,7 @@ mod imported_drawing_scale {
         let mut app = CadApp::default();
         let mut doc = square(3.0);
         doc.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::Declared);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::M, cad_kernel::UnitSource::Declared);
         app.apply_loaded("plan.dxf", payload(doc));
         assert!((app.doc.units.metres_per_unit - 1.0).abs() < 1e-12);
         assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Declared);
@@ -58355,7 +58442,7 @@ mod imported_drawing_scale {
     fn a_metre_working_unit_reads_an_undeclared_file_as_metres() {
         let mut app = CadApp::default();
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::M, cad_kernel::UnitSource::User);
         app.apply_loaded("plan.dxf", payload(square(3.0)));
         assert!((app.doc_k() - 1.0).abs() < 1e-12);
     }
@@ -58363,10 +58450,10 @@ mod imported_drawing_scale {
     /// Geometry built IN MEMORY is untouched — it has no file to have declared anything, and its
     /// author meant whatever they typed. This is what keeps every existing behaviour intact.
     #[test]
-    fn an_in_memory_document_keeps_assuming_metres() {
+    fn an_in_memory_document_keeps_assuming_millimetres() {
         let app = CadApp::default();
         assert_eq!(app.doc.units.source, cad_kernel::UnitSource::Assumed);
-        assert!((app.doc_k() - 1.0).abs() < 1e-12, "nothing imported, nothing changed");
+        assert!((app.doc_k() - 0.001).abs() < 1e-12, "nothing imported, nothing changed");
     }
 }
 
@@ -58776,8 +58863,8 @@ mod command_target {
     #[test]
     fn at_coordinates_are_typed_in_the_working_unit() {
         let mut app = app_in_3d();
-        app.factory.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::MM,
+        app.factory.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::MM,
             cad_kernel::UnitSource::User,
         );
         app.run_command("@900,0,0");
@@ -58789,16 +58876,16 @@ mod command_target {
     /// both parse, with a comma or a space between the numbers.
     #[test]
     fn the_coordinate_may_be_written_several_ways() {
-        let u = cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+        let u = cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::M, cad_kernel::UnitSource::User);
         for form in ["@900,0,0", "@(900,0,0)", "@(900, 0, 0)", "@900 0 0", "@900,0"] {
-            let got = CadApp::parse_at_coords(form, u, &crate::calc::CalcStore::new())
+            let got = CadApp::parse_at_coords(form, &u, &crate::calc::CalcStore::new())
                 .unwrap_or_else(|| panic!("{form} must parse"));
             assert!((got[0] - 900.0).abs() < 1e-3, "{form} → {got:?}");
             assert!(got[1].abs() < 1e-6 && got[2].abs() < 1e-6, "{form} → {got:?}");
         }
         // …and nonsense is refused rather than silently read as zero.
         for bad in ["@", "@abc", "@1", "@1,2,3,4", "900,0,0"] {
-            assert!(CadApp::parse_at_coords(bad, u, &crate::calc::CalcStore::new()).is_none(), "{bad} must not parse");
+            assert!(CadApp::parse_at_coords(bad, &u, &crate::calc::CalcStore::new()).is_none(), "{bad} must not parse");
         }
     }
 
@@ -58808,8 +58895,8 @@ mod command_target {
     #[test]
     fn a_typed_coordinate_leaves_a_waiting_object_waiting() {
         let mut app = app_in_3d();
-        app.factory.units = cad_kernel::DocUnits::new(
-            cad_kernel::DocUnits::M,
+        app.factory.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::M,
             cad_kernel::UnitSource::User,
         );
         app.factory.add_box();
@@ -58910,7 +58997,7 @@ mod command_target {
     fn the_coordinate_answer_needs_no_at_sign() {
         let mut app = app_in_3d();
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         app.run_command("place");
         app.run_command("offset");
         app.run_command("200,300,500");
@@ -58930,7 +59017,7 @@ mod command_target {
     fn a_new_coordinate_replaces_the_old_one() {
         let mut app = app_in_3d();
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::M, cad_kernel::UnitSource::User);
         app.run_command("@1,2,3");
         assert!((app.factory.place_offset[0] - 1.0).abs() < 1e-6);
         app.run_command("place");
@@ -58948,7 +59035,7 @@ mod command_target {
     fn the_coordinate_prompt_has_a_default() {
         let mut app = app_in_3d();
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::M, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::M, cad_kernel::UnitSource::User);
         app.run_command("@4,5,6");
         app.run_command("place");
         app.run_command("offset");
@@ -59377,7 +59464,7 @@ mod unit_prompt {
         tick(&mut app);
         // Answer it, the way the dialog does.
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::CM, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::CM, cad_kernel::UnitSource::User);
         app.factory.unit_asked = true;
         app.factory.ask_unit = false;
 
@@ -59390,7 +59477,7 @@ mod unit_prompt {
             assert!(!app.factory.ask_unit, "asked again after it had been answered");
         }
         assert!(
-            (app.factory.units.metres_per_unit - cad_kernel::DocUnits::CM).abs() < 1e-12,
+            (app.factory.units.metres_per_unit - cad_kernel::Units::CM).abs() < 1e-12,
             "…and the answer stands",
         );
     }
@@ -59416,7 +59503,7 @@ mod unit_prompt {
         let mut app = CadApp::default();
         app.factory.unit_asked = true;
         app.factory.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::FOOT, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::FOOT, cad_kernel::UnitSource::User);
         app.factory.open = true;
         tick(&mut app);
         let last = app.history.last().cloned().unwrap_or_default();
@@ -59459,7 +59546,7 @@ mod unit_prompt {
     fn an_older_project_that_declares_a_unit_is_not_asked() {
         let mut st = crate::factory::FactoryState::default();
         st.units =
-            cad_kernel::DocUnits::new(cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+            cad_kernel::Units::from_metres_per_unit(cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         let mut doc = st.to_persist();
         doc.unit_asked = None; // as written by a build that predates the flag
         assert!(doc.working_unit_m > 0.0, "precondition: it does record a unit");
@@ -61174,7 +61261,7 @@ mod a_plane_shares_the_drawings_tables {
     #[test]
     fn the_unit_is_not_carried_across_by_the_table_merge() {
         let mut app = a_plan_with_its_own_tables();
-        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(0.001, cad_kernel::UnitSource::Declared);
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
         assert!(
             (app.doc.units.metres_per_unit - 1.0).abs() < 1e-12,
@@ -61310,7 +61397,7 @@ mod two_unit_spaces {
     /// A plan in millimetres with a wall on it, and nothing else.
     fn mm_plan() -> CadApp {
         let mut app = CadApp::default();
-        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(0.001, cad_kernel::UnitSource::Declared);
         app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
             a: Vec2::new(0.0, 0.0),
             b: Vec2::new(3000.0, 0.0), // a 3 m wall, in millimetres
@@ -61348,7 +61435,7 @@ mod two_unit_spaces {
     fn the_grid_is_untouched_with_no_sketch_open() {
         for unit in [1.0_f64, 0.001, 0.01, 25.4 / 1000.0] {
             let mut app = CadApp::default();
-            app.doc.units = cad_kernel::DocUnits::new(unit, cad_kernel::UnitSource::Declared);
+            app.doc.units = cad_kernel::Units::from_metres_per_unit(unit, cad_kernel::UnitSource::Declared);
             app.env.GrdSpc = 7.5;
             assert_eq!(
                 app.grid_spacing(), 7.5,
@@ -62378,6 +62465,7 @@ mod the_viewport_sees_what_the_drawing_has {
         cad_kernel::BlockRef {
             block: id, insert, scale: 1.0, scale_y: 1.0, rotation: 0.0, mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        attr_values: Vec::new(),
         }
     }
 
@@ -62810,8 +62898,8 @@ mod the_line_cache_cannot_go_stale {
     fn redeclaring_the_unit_invalidates_it() {
         let mut app = app_with_a_plan();
         assert!(rebuilds_after(&mut app, |a| {
-            a.doc.units = cad_kernel::DocUnits::new(
-                cad_kernel::DocUnits::MM, cad_kernel::UnitSource::User);
+            a.doc.units = cad_kernel::Units::from_metres_per_unit(
+                cad_kernel::Units::MM, cad_kernel::UnitSource::User);
         }), "a unit change did not invalidate the cache — every line is at the wrong scale");
     }
 
@@ -63443,8 +63531,8 @@ mod the_illuminaire_window_runs {
             .doc
             .dobjects
             .iter()
-            .filter_map(|d| match d.geom {
-                cad_kernel::Geom::BlockRef(b) => Some(b),
+            .filter_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b.clone()),
                 _ => None,
             })
             .collect();
@@ -63908,8 +63996,8 @@ mod deleting_a_placed_fitting {
             .doc
             .dobjects
             .iter()
-            .find_map(|d| match d.geom {
-                cad_kernel::Geom::BlockRef(b) => Some(b),
+            .find_map(|d| match &d.geom {
+                cad_kernel::Geom::BlockRef(b) => Some(b.clone()),
                 _ => None,
             })
             .expect("a block landed");
@@ -68034,7 +68122,7 @@ mod the_declared_unit_is_checked_against_the_drawing {
     fn drawing(span: f64, k: f64) -> CadApp {
         let mut app = CadApp::default();
         app.doc = Document::default();
-        app.doc.units = cad_kernel::DocUnits::new(k, cad_kernel::UnitSource::Declared);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(k, cad_kernel::UnitSource::Declared);
         app.doc.push(Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(span, span * 0.4) }.into());
         app
     }
@@ -68089,7 +68177,7 @@ mod the_declared_unit_is_checked_against_the_drawing {
     fn an_empty_drawing_is_silent() {
         let mut app = CadApp::default();
         app.doc = Document::default();
-        app.doc.units = cad_kernel::DocUnits::new(0.001, cad_kernel::UnitSource::Declared);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(0.001, cad_kernel::UnitSource::Declared);
         assert!(app.unit_sanity_note().is_none(), "nothing drawn, nothing to check");
     }
 
@@ -68100,7 +68188,7 @@ mod the_declared_unit_is_checked_against_the_drawing {
     fn a_drawing_far_from_the_origin_is_judged_on_its_size() {
         let mut app = CadApp::default();
         app.doc = Document::default();
-        app.doc.units = cad_kernel::DocUnits::new(1.0, cad_kernel::UnitSource::Declared);
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::Declared);
         app.doc.push(
             Line { a: Vec2::new(3_499.6, -6_852.6), b: Vec2::new(3_532.7, -6_839.6) }.into(),
         );
@@ -68641,7 +68729,7 @@ mod calc_command_tests {
     #[test]
     fn variables_survive_the_sidecar_round_trip() {
         let mut app = CadApp::default();
-        app.doc.units = cad_kernel::DocUnits::default();
+        app.doc.units = cad_kernel::Units::default();
         let dir = std::env::temp_dir().join("calc_sidecar_test");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("calcvars.rsm");

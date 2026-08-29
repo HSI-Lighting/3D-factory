@@ -62,6 +62,11 @@ pub struct AciPickerState {
     /// Hovered ACI (whether from wheel or excluded rows), for the
     /// readout line. Recomputed each frame.
     pub hovered_aci:       Option<u8>,
+    /// PENDING selection — the color the user has clicked but NOT yet
+    /// confirmed. The picker window applies it to its target only when
+    /// the dialog's **Set** button is clicked (and closes); Cancel / ×
+    /// discards it. Reset to None whenever the picker is closed.
+    pub selected:          Option<u8>,
     /// Manual-entry buffer for the "ACI #" text box.
     pub manual_entry:      String,
 }
@@ -76,6 +81,7 @@ impl Default for AciPickerState {
             swap_mode: false,
             selected_for_swap: None,
             hovered_aci: None,
+            selected: None,
             manual_entry: String::new(),
         }
     }

@@ -10,3 +10,4 @@ cad_kernel = { path = "../cad_kernel" }
 # the whole application with it. Verified against the owner's AC1027 and AC1032 drawings, including
 # a 93 MB one, before it was adopted — see `src/dwg.rs`.
 acadrust = "0.4.1"
+serde_json = "1"

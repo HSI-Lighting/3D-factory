@@ -11,7 +11,7 @@
 // degenerate (collinear / chord longer than 2·radius / chord longer than arc length).
 
 use crate::geom::{Arc, Ellipse, Line};
-use crate::math::{norm_angle, Vec2, EPS};
+use crate::math::{norm_angle, PARALLEL_SIN_EPS, Vec2, EPS};
 use std::f64::consts::{PI, TAU};
 
 // ---- Wall: two parallel lines from a centerline + thickness -----------------
@@ -86,7 +86,18 @@ pub fn arc_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> Option<Arc> {
     let d = 2.0 * (p1.x * (p2.y - p3.y)
                  + p2.x * (p3.y - p1.y)
                  + p3.x * (p1.y - p2.y));
-    if d.abs() < EPS { return None; }
+    // G8: `d` ≈ 2·area = |e1|·|e2|·sin(angle)·2. A RELATIVE collinearity test on
+    // sin(angle) — `PARALLEL_SIN_EPS · |e1| · |e2|` — is scale-free for tiny and
+    // huge triangles alike. (Bare, NOT `scaled_tol`: its .max(1.0) floor makes the
+    // threshold absolute for sub-unit edge products and wrongly calls SMALL
+    // triangles collinear — B16 FIX 4 regression, mentor-corrected.) `d` itself is
+    // UNCHANGED — it stays the circumcenter denominator below.
+    let e1 = p2 - p1;
+    let e2 = p3 - p1;
+    // Squared form (avoids two sqrts; identical since both sides ≥ 0).
+    if d * d <= (PARALLEL_SIN_EPS * PARALLEL_SIN_EPS) * e1.len_sq() * e2.len_sq() {
+        return None;
+    }
 
     let p1_sq = p1.x * p1.x + p1.y * p1.y;
     let p2_sq = p2.x * p2.x + p2.y * p2.y;
@@ -196,14 +207,23 @@ pub fn arc_chord_length(start: Vec2, end: Vec2, arc_length: f64, flip: bool) -> 
     let mut lo = 1e-9_f64;
     let mut hi = TAU - 1e-9_f64;
     // If chord ≈ length the answer is θ → 0, which is a degenerate straight line.
-    // Treat it as no arc to construct.
-    if f(lo) < 0.0 { return None; }
+    // Treat it as no arc to construct. G5: the boundary case `ratio == 1` gives
+    // `f(lo) == 0.0` exactly, which the strict `< 0.0` let slip through — then
+    // bisection drives θ → 0 and `radius = arc_length/θ` explodes to ~1e10. Reject
+    // `<= 0.0` so an exact straight line is `None`, not a vast bogus arc.
+    if f(lo) <= 0.0 { return None; }
     for _ in 0..100 {
         let mid = 0.5 * (lo + hi);
         if f(mid) > 0.0 { lo = mid; } else { hi = mid; }
         if (hi - lo).abs() < 1e-13 { break; }
     }
     let theta = 0.5 * (lo + hi);
+    // Belt-and-braces for the NEAR-miss `ratio = 1 − 1e-15`: there `f(lo) ≈ 1e-15
+    // > 0` slips the strict boundary above, bisection lands θ ≈ 1e-7, and radius
+    // ≈ 1e7·arc_length — the same explosion one ULP away. A sub-µrad sweep is a
+    // straight line at any real scale. (θ is a scale-free angle, so an absolute
+    // floor is the right convention here, like the 1e-13 bisection stop above.)
+    if theta < 1e-6 { return None; }
     let radius = arc_length / theta;
 
     // Now we have radius + chord → two candidate arcs (major flag matters).
@@ -388,5 +408,79 @@ mod tests {
             Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0).is_none());
         assert!(wall_sides(
             Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), -1.0).is_none());
+    }
+
+    // ---- FIX 3 (G5): arc_chord_length degenerate straight line --------------
+
+    #[test]
+    fn arc_chord_length_straight_line_is_none_not_giant_arc() {
+        // chord == arc_length exactly (ratio == 1): a straight line. Pre-fix the
+        // strict `f(lo) < 0.0` let this through and radius = arc_length/θ blew up
+        // to ~1e10. Must be None.
+        let s = Vec2::new(0.0, 0.0);
+        let e = Vec2::new(100.0, 0.0);
+        assert!(arc_chord_length(s, e, 100.0, false).is_none(),
+            "chord == length must be None, not a giant bogus arc");
+    }
+
+    #[test]
+    fn arc_chord_length_near_straight_line_is_none() {
+        // The one-ULP-away near-miss ratio = 1 − 1e-15 that slips the boundary
+        // check; the θ-floor guard must still reject it (no ~1e7-radius arc).
+        let s = Vec2::new(0.0, 0.0);
+        let e = Vec2::new(100.0, 0.0);
+        let arc_length = 100.0 * (1.0 + 1.0e-15);   // chord/length = 1 − ~1e-15
+        match arc_chord_length(s, e, arc_length, false) {
+            None => {}
+            Some(a) => panic!("near-straight line produced radius={} (should be None)", a.radius),
+        }
+    }
+
+    #[test]
+    fn arc_chord_length_genuine_arc_still_builds() {
+        // Regression guard: a real semicircle (arc_length = π·r, chord = 2r) must
+        // still construct. r=50 → chord 100, arc_length 50π.
+        let s = Vec2::new(0.0, 0.0);
+        let e = Vec2::new(100.0, 0.0);
+        let arc = arc_chord_length(s, e, 50.0 * PI, false).expect("semicircle must build");
+        assert!((arc.radius - 50.0).abs() < 1e-6, "radius {} != 50", arc.radius);
+    }
+
+    // ---- FIX 4b (G8): arc_three_points relative collinearity ----------------
+
+    #[test]
+    fn arc_three_points_small_right_angle_builds_not_none() {
+        // REGRESSION GUARD (mentor): a genuine right angle with LEGS 1e-4. d = 2e-8.
+        // bdd2319's floored scaled_tol (1e-6) called this collinear → None; the
+        // relative 1e-9·|e1||e2| = 1e-17 threshold builds the arc. (Fails-before
+        // specifically vs bdd2319.)
+        let l = 1.0e-4;
+        let p1 = Vec2::new(0.0, 0.0);
+        let p2 = Vec2::new(l, 0.0);
+        let p3 = Vec2::new(0.0, l);
+        let arc = arc_three_points(p1, p2, p3)
+            .expect("a small right-angle triple must build an arc, not None");
+        // Right angle → hypotenuse is the diameter; centre at the midpoint of p2p3.
+        let mid = (p2 + p3) * 0.5;
+        assert!((arc.center - mid).len() < 1e-9, "circumcentre off: {:?}", arc.center);
+    }
+
+    #[test]
+    fn arc_three_points_collinear_at_scale_is_none_not_bogus_arc() {
+        // Collinear points SPANNING large coordinates (small base + large
+        // asymmetric multiples of an irrational dir). |d| ≈ 6.7e7 — far above the
+        // absolute EPS (1e-9), so the PRE-B15 code built a bogus finite "circle"
+        // through a straight line. The relative threshold (≈ 6e14 here, from the
+        // ~1e12 edge lengths) recognises collinearity → None. (Fails-before vs the
+        // original `d.abs() < EPS`.) Points must SPAN the scale — three CLOSE
+        // points at a far base are genuinely non-collinear once rounded, and
+        // correctly build an arc, so they are not a valid collinearity test.
+        let (bx, by) = (1.3e6, -4.1e6);
+        let (dx, dy) = (1.0, 0.31731);
+        let p1 = Vec2::new(bx, by);
+        let p2 = Vec2::new(bx + 4.83e11 * dx, by + 4.83e11 * dy);
+        let p3 = Vec2::new(bx + 1.17e12 * dx, by + 1.17e12 * dy);
+        assert!(arc_three_points(p1, p2, p3).is_none(),
+            "collinear points spanning 1e12 must be None, not a bogus arc");
     }
 }

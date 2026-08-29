@@ -9,3 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 cad_kernel = { path = "../cad_kernel" }
+# WP-SCRIPT slice 2: headless `py` runs on the same engine + ScriptOp queue
+# as the GUI (needs a CPython 3.11+ runtime present at load — see
+# PYTHON_SCRIPTING.md "Deployment").
+cad_script = { path = "../cad_script" }
+# P4: headless `rasm.save(path)` writes real .rsm / .dxf files.
+cad_io = { path = "../cad_io" }

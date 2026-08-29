@@ -50,6 +50,10 @@ pub enum DbgEvent {
     /// reader can mark "this is where the bug fired".
     Note { message: String },
 
+    /// The command-line prompt text changed (cleared → idle, or a new
+    /// prompt). Lets a dump show what the user was being asked at each step.
+    PromptChange { text: String },
+
     /// One full `Document` snapshot. Heavy. Tagged with the reason
     /// (auto-cadence / manual / pre-undo / post-snapshot_doc).
     DocSnapshot {
@@ -85,6 +89,17 @@ pub enum DbgEvent {
         action:   String, // resolved sub-command: "window armed", "extents", "in", …
         before:   String, // screen zoom status before
         after:    String, // screen zoom status after
+    },
+
+    /// A ZOOM step with numeric scales — the 2D-canvas zoom events that
+    /// compare before/after scale factors directly (the legacy RUST-CAD
+    /// form; the SIMLUX line favours [`Self::ZoomOp`]).
+    ZoomChange {
+        source:             String,
+        scale_before:       f64,
+        scale_after:        f64,
+        viewport_dobjects:  usize,
+        total_dobjects:     usize,
     },
 
     /// Canvas mouse click — fully decoded.
@@ -761,6 +776,9 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             format!("◆ SESSION STOP — {} ({} events)", reason, event_count),
         DbgEvent::Note { message } =>
             format!("📝 NOTE: {}", message),
+        DbgEvent::PromptChange { text } =>
+            if text.is_empty() { "⌨ PROMPT ▸ (cleared → idle)".to_string() }
+            else { format!("⌨ PROMPT ▸ {}", text) },
         DbgEvent::SlowFrame { total_us, query_us, draw_us, candidates, drawn, capped } => {
             format!(
                 "🐢 SLOW FRAME {:.1} ms  (query {:.1} · draw {:.1})  candidates={} drawn={}{}",
@@ -797,6 +815,15 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             format!(
                 "🔍 ZOOM \"{cmd}\" → {action}{delta}\n        choices: [{choices}]\n        before: {before}\n        after : {after}"
             )
+        }
+        DbgEvent::ZoomChange { source, scale_before, scale_after, viewport_dobjects, total_dobjects } => {
+            let pct = if *scale_before != 0.0 {
+                (scale_after / scale_before - 1.0) * 100.0
+            } else { 0.0 };
+            let dir = if scale_after > scale_before { "IN" }
+                      else if scale_after < scale_before { "OUT" } else { "—" };
+            format!("🔎 ZOOM {source} {dir} {scale_before:.4}→{scale_after:.4} ({pct:+.1}%)  \
+                     viewport={viewport_dobjects}/{total_dobjects} dobj")
         }
         DbgEvent::CanvasClick { world, hit_dobject, active_tool, active_state, .. } =>
             format!("🖱 CLICK world=({:.3},{:.3})  hit={:?}  tool={}  state={}",

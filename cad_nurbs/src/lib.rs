@@ -195,6 +195,87 @@ impl BSplineCurve {
     /// Curve domain (start..=end parameter values).
     pub fn domain(&self) -> (f64, f64) { self.knots.domain() }
 
+    /// Insert the knot `u` once (Algorithm A5.1, De Boor). Returns the new
+    /// control points and knot vector (one more of each). No-op when `u`
+    /// already has full multiplicity (degree). The curve shape is unchanged.
+    pub fn insert_knot(&self, u: f64) -> (Vec<Vec2>, KnotVector) {
+        let p = self.degree;
+        let n = self.control_points.len();
+        let U = self.knots.knots();
+        let s = self.knots.find_span(u, n);
+        // Multiplicity of u among the knots at-or-below the span.
+        let m = U[..=s].iter().filter(|&&k| (k - u).abs() < 1e-9).count();
+        if m >= p {
+            return (self.control_points.clone(), self.knots.clone());
+        }
+        let mut Q: Vec<Vec2> = Vec::with_capacity(n + 1);
+        for i in 0..=s - p {
+            Q.push(self.control_points[i]);
+        }
+        for i in (s - p + 1)..=(s - m) {
+            let alpha = (u - U[i]) / (U[i + p] - U[i]);
+            let pa = self.control_points[i - 1];
+            let pb = self.control_points[i];
+            Q.push(Vec2::new(
+                pa.x * (1.0 - alpha) + pb.x * alpha,
+                pa.y * (1.0 - alpha) + pb.y * alpha,
+            ));
+        }
+        for i in (s - m)..n {
+            Q.push(self.control_points[i]);
+        }
+        let mut U2 = U.to_vec();
+        U2.insert(s + 1, u);
+        (Q, KnotVector::from_raw(U2, p))
+    }
+
+    /// Split the curve at parameter `u` (inside the domain) into two clamped
+    /// sub-curves (issue #21 — spline trim/extend). The split knot is
+    /// inserted until full multiplicity, then the control points and knots
+    /// are extracted on each side; both halves evaluate to the original
+    /// curve (left over [u_min, u], right over [u, u_max]), meeting at C(u).
+    pub fn split(&self, u: f64) -> (BSplineCurve, BSplineCurve) {
+        let (u_min, u_max) = self.domain();
+        let u = u.clamp(u_min, u_max);
+        let p = self.degree;
+        if u <= u_min + 1e-9 || u >= u_max - 1e-9 {
+            return (self.clone(), self.clone());   // degenerate split at an end
+        }
+        let mut pts = self.control_points.clone();
+        let mut knots = self.knots.clone();
+        // Insert u until its multiplicity reaches the degree (C⁰ at the cut).
+        loop {
+            let s = knots.find_span(u, pts.len());
+            let m = knots.knots()[..=s].iter()
+                .filter(|&&k| (k - u).abs() < 1e-9).count();
+            if m >= p { break; }
+            let curve = BSplineCurve { degree: p, control_points: pts, knots };
+            let (np, nk) = curve.insert_knot(u);
+            pts = np;
+            knots = nk;
+        }
+        let U = knots.knots().to_vec();
+        let n = pts.len();
+        let s = knots.find_span(u, n);   // u's last copy index (multiplicity p)
+        // With multiplicity p at u the window sits at s-p+1..s; the sub-curve
+        // extractions (validated numerically for degrees 1-3, exact to 1e-15):
+        //   LEFT:  control points P_0..P_{s-p};  knots U_0..U_s then one more u
+        //          (the window's p copies + the appended one clamp the end).
+        //   RIGHT: control points P_{s-p}..P_{n-1}; knots p+1 copies of u then
+        //          the knots after the window (U_{s+1}.., ending in the
+        //          original's u_max run, so the right end stays clamped).
+        let left_pts = pts[..=s - p].to_vec();
+        let mut lk = U[..=s].to_vec();
+        lk.push(u);
+        let right_pts = pts[s - p..].to_vec();
+        let mut rk = vec![u; p + 1];
+        rk.extend_from_slice(&U[s + 1..]);
+        (
+            BSplineCurve::new(p, left_pts, KnotVector::from_raw(lk, p)),
+            BSplineCurve::new(p, right_pts, KnotVector::from_raw(rk, p)),
+        )
+    }
+
     /// Evaluate the curve at parameter `u` — Algorithm A3.1. `u` is
     /// clamped to the curve's domain so callers don't have to worry
     /// about off-end queries during tessellation.
@@ -469,4 +550,44 @@ mod tests {
                 u, pb.x, pb.y, pn.x, pn.y);
         }
     }
+
+    /// Issue #21 — splitting a clamped curve at an interior parameter must
+    /// reproduce the original curve: both halves evaluate to the original
+    /// over their domains, meet at C(u), and stay clamped.
+    #[test]
+    fn split_reproduces_the_original_curve() {
+        for &p in &[1_usize, 2, 3] {
+            let cps: Vec<Vec2> = (0..=p + 3)
+                .map(|i| Vec2::new(i as f64 * 0.7, (i as f64 * 1.3).sin()))
+                .collect();
+            let c = BSplineCurve::new_clamped(p, cps);
+            let u = 0.4_f64;
+            let (l, r) = c.split(u);
+            let (l0, l1) = l.domain();
+            let (r0, r1) = r.domain();
+            // Domains partition the original.
+            assert!(approx(l0, 0.0, 1e-9) && approx(l1, u, 1e-9), "left domain");
+            assert!(approx(r0, u, 1e-9) && approx(r1, 1.0, 1e-9), "right domain");
+            // Clamped halves: endpoints interpolate their control points.
+            let lp = l.control_points.clone();
+            let rp = r.control_points.clone();
+            assert!(approx_v(l.evaluate(l0), lp[0], 1e-9), "left start clamped");
+            assert!(approx_v(l.evaluate(l1), *lp.last().unwrap(), 1e-9), "left end clamped");
+            assert!(approx_v(r.evaluate(r0), rp[0], 1e-9), "right start clamped");
+            assert!(approx_v(r.evaluate(r1), *rp.last().unwrap(), 1e-9), "right end clamped");
+            // The halves meet at C(u) and agree with the original curve.
+            let meet = l.evaluate(l1);
+            assert!(approx_v(meet, r.evaluate(r0), 1e-9), "halves meet at C(u)");
+            assert!(approx_v(meet, c.evaluate(u), 1e-9), "meeting point is C(u)");
+            // Sampling agreement across the whole domain.
+            for i in 0..=40 {
+                let t = i as f64 / 40.0;
+                let orig = c.evaluate(t);
+                let half = if t <= u { l.evaluate(t) } else { r.evaluate(t) };
+                assert!(approx_v(orig, half, 1e-8),
+                    "degree {p}: original vs half diverge at t={t}");
+            }
+        }
+    }
+
 }

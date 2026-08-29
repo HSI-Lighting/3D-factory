@@ -1,0 +1,11 @@
+[package]
+name    = "cad_plot"
+version = "0.1.0"
+edition = "2021"
+description = "Plot/print pipeline — flattens a Document to a PDF applying a color->thickness plot-style table. Pure-Rust PDF backend (printpdf)."
+
+[dependencies]
+cad_kernel = { path = "../cad_kernel" }
+cad_text   = { path = "../cad_text" }
+printpdf   = { version = "0.7.0", default-features = false }
+image      = { version = "0.25", default-features = false, features = ["png"] }

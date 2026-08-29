@@ -34,6 +34,24 @@ pub struct DockConfig<'a> {
     /// so dragging it toward any other edge just leaves it floating (the command
     /// bar docks only Bottom, the rails only Left, the Inspector only Right).
     pub dock_region: DockRegion,
+    /// An optional SECOND edge this panel may dock to (INSPECTOR_DESIGN §7 — the
+    /// Inspector docks Right *or* Left). `None` = single-edge (the historical
+    /// behaviour). The stored `DockState::Docked(region)` picks between them.
+    pub alt_region: Option<DockRegion>,
+    /// When FALSE the panel is FLOATING-ONLY: it can never dock, and a stale
+    /// `Docked` state is migrated to `Floating` on show. Only the Inspector is
+    /// dockable (owner: the right column must not grab other dialogs).
+    pub dockable: bool,
+    /// Render the header in the **rail style** (INSPECTOR_DESIGN §Header band):
+    /// `#34414B` band, no hairline (soft shadow instead), title in the menu-bar
+    /// CATEGORY font, right-end grip → right-click → "Close" flyout, plus a
+    /// visible × close button just left of the grip. When
+    /// false the shared chrome `header_band` (title + ×) is used.
+    pub rail_header: bool,
+    /// When true, the rail header shows a **collapse chevron** at the left that
+    /// minimises the panel to just its header band (click again to restore). The
+    /// collapsed state persists in ctx memory keyed by `id`.
+    pub collapsible: bool,
     /// Docked size on the variable axis (width for L/R, height for Bottom).
     pub size: f32,
     pub min: f32,
@@ -151,6 +169,163 @@ pub(crate) fn header_band(ui: &mut Ui, title: &str, badge: Option<&str>,
     HeaderBand { close_clicked, band, action_slot }
 }
 
+/// Rail-style header (INSPECTOR_DESIGN §Header band) — the Inspector's header,
+/// styled like the tool-rail header instead of the chrome `header_band`:
+/// `#34414B` band at the rail header height, NO bottom hairline (depth comes
+/// from a soft drop shadow onto the body), the title at panel-edge in the
+/// menu-bar CATEGORY font (egui `TextStyle::Button` — the File/Edit/Draw… size),
+/// a right-end grip whose **right-click opens a single-row "Close" flyout**,
+/// and a visible × close button left of the grip. The whole band is the drag
+/// handle. Returns `(close_clicked, band)`.
+fn rail_header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
+    const RAIL_HEADER_H: f32 = 30.0;   // = app SPECS_TRAY_H (rail header height)
+    let edge = crate::theme::space::PANEL_EDGE;
+    let hdr_fill = crate::theme::color::BORDER;    // #34414B (rail-header tone)
+    let grip_col = crate::theme::color::SURFACE_1; // #1A2430
+    let w = ui.available_width();
+    let (rect, band) = ui.allocate_exact_size(
+        egui::vec2(w, RAIL_HEADER_H), Sense::click_and_drag());
+    // Paint into a rect a few px taller so the drop-shadow bands below the band
+    // aren't clipped by the header's own paint region.
+    let p = ui.painter_at(rect.expand2(egui::vec2(0.0, 8.0)));
+    p.rect_filled(rect, 0.0, hdr_fill);            // §Header: NO hairline
+    // Soft drop shadow onto the body — mirrors the tool-rail header (DRAW_RAIL §2).
+    for i in 0..5 {
+        let a = (66.0 * (1.0 - i as f32 / 5.0)).max(8.0) as u8;
+        p.rect_filled(Rect::from_min_max(
+            egui::pos2(rect.left(),  rect.bottom() + i as f32),
+            egui::pos2(rect.right(), rect.bottom() + i as f32 + 1.0)),
+            egui::Rounding::ZERO, Color32::from_black_alpha(a));
+    }
+    // Collapse chevron (left) — minimises the panel to its header (▾ expanded /
+    // ▸ collapsed). Toggles a `(id,"collapsed")` bool in ctx memory; the dock
+    // host reads it to skip the body. Shifts the title right when present.
+    let mut title_x = rect.left() + edge;
+    let mut collapse_hovered = false;
+    if cfg.collapsible {
+        let cid = Id::new((cfg.id, "collapsed"));
+        let collapsed = ui.ctx().data(|d| d.get_temp::<bool>(cid).unwrap_or(false));
+        let cc = egui::pos2(rect.left() + 11.0, rect.center().y);
+        let s = 4.0_f32;
+        let tri = if collapsed {
+            vec![egui::pos2(cc.x - s*0.5, cc.y - s), egui::pos2(cc.x - s*0.5, cc.y + s),
+                 egui::pos2(cc.x + s*0.7, cc.y)]                          // ▸
+        } else {
+            vec![egui::pos2(cc.x - s, cc.y - s*0.5), egui::pos2(cc.x + s, cc.y - s*0.5),
+                 egui::pos2(cc.x, cc.y + s*0.7)]                          // ▾
+        };
+        p.add(egui::Shape::convex_polygon(tri, TEXT, Stroke::NONE));
+        let cr = Rect::from_center_size(cc, egui::vec2(18.0, RAIL_HEADER_H));
+        let cresp = ui.interact(cr, ui.id().with((cfg.id, "hdr_collapse")), Sense::click());
+        collapse_hovered = cresp.hovered();
+        if cresp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+        if cresp.clicked() { ui.ctx().data_mut(|d| d.insert_temp(cid, !collapsed)); }
+        title_x = rect.left() + edge + 12.0;
+    }
+    // Title — menu-bar CATEGORY font (TextStyle::Button), panel-edge, centered.
+    if !cfg.title.is_empty() {
+        let font = ui.style().text_styles.get(&egui::TextStyle::Button).cloned()
+            .unwrap_or_else(|| egui::FontId::proportional(14.0));
+        p.text(egui::pos2(title_x, rect.center().y),
+            Align2::LEFT_CENTER, cfg.title, font, TEXT);
+    }
+    // Grip (right end) — 5 lines, 5×1.5px, #1A2430; right-click → Close flyout.
+    let grip_w = 5.0;
+    let grip_x = rect.right() - 5.0 - grip_w;
+    let total_h = 5.0 * 1.5 + 4.0 * 1.5;
+    let mut gy = rect.center().y - total_h * 0.5;
+    for _ in 0..5 {
+        p.rect_filled(Rect::from_min_size(
+            egui::pos2(grip_x, gy), egui::vec2(grip_w, 1.5)), 0.0, grip_col);
+        gy += 3.0;
+    }
+    let grip_r = Rect::from_min_size(
+        egui::pos2(grip_x - 2.0, rect.top()), egui::vec2(grip_w + 4.0, RAIL_HEADER_H));
+    let grip_resp = ui.interact(grip_r, ui.id().with((cfg.id, "hdr_grip")), Sense::click());
+    // Visible × close just LEFT of the grip — the grip's right-click
+    // "Close" flyout alone was undiscoverable ("no way to close the
+    // panel"). Same hit behaviour as the chrome header's ×: a click on
+    // it closes instead of dragging.
+    let xr = Rect::from_center_size(
+        egui::pos2(grip_x - 16.0, rect.center().y), egui::vec2(18.0, 18.0));
+    let over_x = ui.rect_contains_pointer(xr);
+    let xcol = if over_x { TEXT } else { MUTED };
+    let c = xr.center();
+    let s = 4.5;
+    let st = Stroke::new(1.5, xcol);
+    p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
+    p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
+    if band.hovered() && !grip_resp.hovered() && !collapse_hovered && !over_x {
+        // owner: the header shows the default ARROW cursor (like other areas) —
+        // only the grip / collapse chevron / × use the pointing hand.
+        ui.ctx().set_cursor_icon(CursorIcon::Default);
+    }
+    // Grip right-click → sticky single-row "Close" flyout (state in ctx memory).
+    // Click detection is done in SCREEN space (pointer released over the flyout
+    // rect) rather than via the nested Area's own click — the latter proved
+    // unreliable for the FLOATING panel (owner: "close flyout doesn't function").
+    let menu_id = Id::new((cfg.id, "hdr_grip_menu"));
+    let mut menu_open = ui.ctx().data(|d| d.get_temp::<bool>(menu_id).unwrap_or(false));
+    let just_opened = grip_resp.secondary_clicked();
+    if just_opened { menu_open = true; }
+    let mut close_clicked = false;
+    if menu_open {
+        let anchor = egui::pos2(grip_r.left(), rect.bottom() + 2.0);
+        let fly_rect = paint_close_flyout(ui.ctx(), Id::new((cfg.id, "hdr_grip_fly")), anchor);
+        let pointer = ui.ctx().input(|i| i.pointer.hover_pos());
+        let over = pointer.is_some_and(|pp| fly_rect.contains(pp));
+        let released = ui.ctx().input(|i| i.pointer.primary_released());
+        let pressed  = ui.ctx().input(|i| i.pointer.any_pressed());
+        if over && released {
+            close_clicked = true; menu_open = false;          // clicked "Close"
+        } else if !just_opened && !over && pressed {
+            menu_open = false;                                // click-away dismiss
+        }
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(menu_id, menu_open));
+    // The × click closes directly (same semantics as the flyout's "Close").
+    if band.clicked() && over_x {
+        close_clicked = true;
+        menu_open = false;
+        ui.ctx().data_mut(|d| d.insert_temp(menu_id, menu_open));
+    }
+    (close_clicked, band)
+}
+
+/// Paint the single-row "Close" flyout under the header grip (surface-3 fill,
+/// 1px border, r4, soft shadow, hover band) and RETURN its screen rect so the
+/// caller can do robust screen-space click detection. (Rendering only — the
+/// nested Area's own click was unreliable on floating panels.)
+fn paint_close_flyout(ctx: &Context, id: Id, anchor: Pos2) -> Rect {
+    let surf = crate::theme::color::SURFACE_3;
+    let brd  = border();
+    let band = crate::theme::color::SURFACE_2;   // hover band
+    let font = crate::theme::typ::body();
+    let label = "Close";
+    let pad_x = 12.0_f32;
+    let h = 26.0_f32;
+    let tw = ctx.fonts(|f| f.layout_no_wrap(label.to_owned(), font.clone(), TEXT)).size().x;
+    let w = tw + pad_x * 2.0;
+    let rect = Rect::from_min_size(anchor, egui::vec2(w, h));
+    let over = ctx.input(|i| i.pointer.hover_pos()).is_some_and(|pp| rect.contains(pp));
+    egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .show(ctx, |ui| {
+            let p = ui.painter();
+            p.rect_filled(rect.translate(egui::vec2(0.0, 2.0)).expand(1.0),
+                egui::Rounding::same(4.0), Color32::from_black_alpha(70));
+            p.rect(rect, egui::Rounding::same(4.0), surf, Stroke::new(1.0, brd));
+            if over {
+                p.rect_filled(rect.shrink(1.5), egui::Rounding::same(3.0), band);
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            }
+            p.text(egui::pos2(rect.left() + pad_x, rect.center().y),
+                Align2::LEFT_CENTER, label, font.clone(), TEXT);
+        });
+    rect
+}
+
 /// Docked-panel header — drag the band out to undock. Returns
 /// `(close_clicked, undock_to)`.
 fn docked_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Option<Pos2>) {
@@ -177,6 +352,24 @@ impl DockHost for EguiDockHost {
     fn show(&self, ctx: &Context, cfg: &DockConfig, state: &mut DockState,
             open: &mut bool, body: impl FnOnce(&mut Ui, Option<f32>)) -> Rect {
         if !*open { return Rect::NOTHING; }
+        // Floating-only panels never dock; migrate a stale Docked state (e.g.
+        // persisted from before the panel became floating-only) to Floating so
+        // the column renderer can't pick it up.
+        if !cfg.dockable {
+            if let DockState::Docked(r) = *state {
+                let sr = ctx.screen_rect();
+                let pos = match r {
+                    DockRegion::Left   => egui::pos2(sr.left() + 60.0, sr.center().y - 120.0),
+                    DockRegion::Right  => egui::pos2((sr.right() - cfg.float_w - 60.0).max(20.0), sr.center().y - 120.0),
+                    DockRegion::Bottom => egui::pos2(sr.center().x - cfg.float_w * 0.5, (sr.bottom() - 240.0).max(sr.top() + 60.0)),
+                };
+                *state = DockState::Floating(pos);
+            }
+        }
+        // Collapsed (minimised to header) — the rail header's chevron sets this;
+        // when true, render the header only and skip the body.
+        let collapsed = cfg.collapsible
+            && ctx.data(|d| d.get_temp::<bool>(Id::new((cfg.id, "collapsed"))).unwrap_or(false));
         let frame = egui::Frame::none().fill(BG).stroke(Stroke::new(1.0, border()))
             .inner_margin(egui::Margin::ZERO);
 
@@ -263,7 +456,10 @@ impl DockHost for EguiDockHost {
                 let mut delta = Vec2::ZERO;
                 let mut released = false;
                 let area = egui::Area::new(Id::new((cfg.id, "float")))
-                    .order(egui::Order::Middle)
+                    // Foreground: a float must stay ABOVE the Middle painter-layer
+                    // rail/panel shadows (the "shadows over undocked toolbars /
+                    // dialogs" rule).
+                    .order(egui::Order::Foreground)
                     .fixed_pos(pos)
                     .constrain(true)
                     .show(ctx, |ui| {
@@ -293,15 +489,25 @@ impl DockHost for EguiDockHost {
                 // never grabs the wrong side and never re-docks mid-move.
                 let np = egui::pos2((pos.x + delta.x).max(0.0), (pos.y + delta.y).max(44.0));
                 let sr = ctx.screen_rect();
-                let near_edge = match cfg.dock_region {
+                let edge_near = |r: DockRegion| match r {
                     DockRegion::Right  => wr.right()  >= sr.right()  - 48.0,
                     DockRegion::Left   => wr.left()   <= sr.left()   + 48.0,
                     DockRegion::Bottom => wr.bottom() >= sr.bottom() - 48.0,
                 };
-                *state = if released && near_edge {
-                    DockState::Docked(cfg.dock_region)
-                } else {
-                    DockState::Floating(np)
+                // Dock to whichever allowed edge the panel's own edge is inside;
+                // the primary wins if both are somehow near. A panel docks to its
+                // `dock_region`/`alt_region` and nowhere else — and only when it
+                // is dockable at all (floating-only dialogs stay floating).
+                let dock_to = if cfg.dockable {
+                    if edge_near(cfg.dock_region) {
+                        Some(cfg.dock_region)
+                    } else if cfg.alt_region.is_some_and(edge_near) {
+                        cfg.alt_region
+                    } else { None }
+                } else { None };
+                *state = match (released, dock_to) {
+                    (true, Some(r)) => DockState::Docked(r),
+                    _ => DockState::Floating(np),
                 };
                 wr
             }

@@ -154,6 +154,26 @@ pub fn install_fonts(ctx: &egui::Context) {
         .or_default()
         .insert(0, "JetBrainsMono".to_owned());
 
+    // RTL glyph fallback: the cad_text engine's embedded DejaVu Sans carries
+    // the Arabic + Hebrew blocks. Register it at the END of the fallback chain
+    // so Arabic/Persian font names + text typed in dialog boxes show real
+    // glyphs (egui does no bidi shaping, but the shapes are correct).
+    let rtl_fallback: &[u8] = cad_text::rtl_fallback_font_bytes();
+    fonts.font_data.insert(
+        "DejaVuSansRtl".to_owned(),
+        Arc::new(FontData::from_static(rtl_fallback)),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("DejaVuSansRtl".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("DejaVuSansRtl".to_owned());
+
     // Medium is a *separate named family* (egui has no weight axis). Its fallback
     // chain = GeistMedium, then whatever Proportional resolves to (Geist Regular +
     // egui defaults), so missing glyphs still render.

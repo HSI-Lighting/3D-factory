@@ -31,7 +31,7 @@ use crate::math::Vec2;
 pub const MAX_BLOCK_PARAMS: usize = 8;
 
 /// A placed instance of a block definition.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BlockRef {
     /// Id into `Document.blocks`.
     pub block:    u32,
@@ -53,9 +53,14 @@ pub struct BlockRef {
     pub mirror_x: bool,
     /// Per-instance values for the block's parametric `params` (parallel by
     /// index; unused slots ignored). Empty/non-parametric blocks ignore
-    /// this. Fixed array so `BlockRef` stays `Copy`. Defaults to 0.0;
-    /// the inserter sets each to the param's `source_value`.
+    /// this. Fixed array so the render/explode hot paths stay cheap.
+    /// Defaults to 0.0; the inserter sets each to the param's `source_value`.
     pub param_values: [f64; MAX_BLOCK_PARAMS],
+    /// Per-instance attribute VALUES, parallel by index to the definition's
+    /// `AttrDef` dobjects (in definition order). A block without attributes
+    /// keeps this empty. Grows with the definition's attr count at insert;
+    /// ATTEDIT rewrites entries in place.
+    pub attr_values: Vec<String>,
 }
 
 /// One MODIFIER VECTOR of a parametric block — a stretch window + a unit
@@ -89,6 +94,47 @@ pub struct BlockParam {
     pub original: f64,
     /// The modifier vectors this variable drives together (≥1).
     pub vectors:  Vec<ParamVector>,
+}
+
+/// One attribute DEFINITION slot (AutoCAD ATTDEF). Lives as a `Geom::AttrDef`
+/// inside a block definition's dobjects (definition space). At INSERT the app
+/// prompts for a value per tag and stores it in the instance's
+/// `BlockRef.attr_values` (parallel by index); rendering replaces the tag
+/// with the VALUE at the def's position/height/angle.
+#[derive(Clone, Debug)]
+pub struct AttrDef {
+    /// The tag name (the slot key the value is stored under).
+    pub tag:     String,
+    /// Prompt text shown at insert time (AutoCAD group 3).
+    pub prompt:  String,
+    /// Default value used when the user accepts without typing.
+    pub default: String,
+    /// Position in definition space (where the value renders).
+    pub position: crate::math::Vec2,
+    /// Cap height in world units (like `Text.height`).
+    pub height:   f64,
+    /// Rotation in radians CCW (like `Text.angle`).
+    pub angle:    f64,
+    /// Index into `Document.text_styles`.
+    pub style:    u32,
+    /// Whether the attribute is visible at render time.
+    pub visible:  bool,
+}
+
+impl AttrDef {
+    /// Empty def at origin with sensible defaults for interactive prompts.
+    pub fn empty() -> Self {
+        Self {
+            tag: String::new(),
+            prompt: String::new(),
+            default: String::new(),
+            position: crate::math::Vec2::ZERO,
+            height: 1.0,
+            angle: 0.0,
+            style: crate::text::TextStyleTable::STANDARD,
+            visible: true,
+        }
+    }
 }
 
 impl BlockRef {
@@ -179,19 +225,22 @@ mod tests {
 
     fn close(p: Vec2, q: Vec2) -> bool { (p - q).len() < 1e-9 }
 
+    fn test_blockref(block: u32, insert: Vec2, scale: f64, scale_y: f64) -> BlockRef {
+        BlockRef {
+            block, insert, scale, scale_y,
+            rotation: 0.0, mirror_x: false,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
+        }
+    }
+
     #[test]
     fn transform_geom_composes_scale_rotate_translate() {
         // Definition: line (1,0)→(2,0), base (1,0). Instance at (10,10),
         // scale 2, rotation 90° CCW. Expected: start lands ON the insert
         // point; end = insert + R90·2·(1,0) = (10,12).
-        let br = BlockRef {
-            block: 0,
-            insert: Vec2::new(10.0, 10.0),
-            scale: 2.0, scale_y: 2.0,
-            rotation: std::f64::consts::FRAC_PI_2,
-            mirror_x: false,
-            param_values: [0.0; MAX_BLOCK_PARAMS],
-        };
+        let mut br = test_blockref(0, Vec2::new(10.0, 10.0), 2.0, 2.0);
+        br.rotation = std::f64::consts::FRAC_PI_2;
         let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
         let out = br.transform_geom(&g, Vec2::new(1.0, 0.0));
         let Geom::Line(l) = out else { panic!("expected line") };
@@ -203,12 +252,10 @@ mod tests {
     fn transform_geom_keeps_circles_circular() {
         // Uniform scale ⇒ circle stays a circle with scaled radius.
         let br = BlockRef {
-            block: 0,
-            insert: Vec2::new(5.0, 0.0),
-            scale: 3.0, scale_y: 3.0,
-            rotation: 1.234,
-            mirror_x: false,
-            param_values: [0.0; MAX_BLOCK_PARAMS],
+            block: 0, insert: Vec2::new(5.0, 0.0),
+            scale: 3.0, scale_y: 3.0, rotation: 1.234,
+            mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
         let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 2.0 });
         let out = br.transform_geom(&g, Vec2::new(0.0, 0.0));
@@ -225,6 +272,7 @@ mod tests {
         let br = BlockRef {
             block: 0, insert: Vec2::new(0.0, 0.0), scale: 1.0, scale_y: 1.0, rotation: 0.0,
             mirror_x: true, param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
         let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
         let Geom::Line(l) = br.transform_geom(&g, Vec2::new(0.0, 0.0)) else { panic!() };
@@ -239,6 +287,7 @@ mod tests {
         let br = BlockRef {
             block: 0, insert: Vec2::new(0.0, 0.0), scale: 2.0, scale_y: 1.0,
             rotation: 0.0, mirror_x: false, param_values: [0.0; MAX_BLOCK_PARAMS],
+            attr_values: Vec::new(),
         };
         let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 1.0 });
         match br.transform_geom(&g, Vec2::new(0.0, 0.0)) {

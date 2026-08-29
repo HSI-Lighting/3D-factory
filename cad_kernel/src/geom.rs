@@ -1,10 +1,142 @@
 // Geometric primitives. Tight, Copy, no virtual dispatch.
 
+use crate::layout::ViewportGeom;
 use crate::math::{Vec2, EPS, norm_angle};
 use crate::join::{bulge_arc, polyline_segments};
+use crate::text::Leader;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Line { pub a: Vec2, pub b: Vec2 }
+
+/// Infinite construction line (AutoCAD XLINE) — passes through `base` along
+/// the direction `dir` (kept normalized). Used for drafting guides; renders
+/// clipped to the viewport and always spans the visible area. The kernel
+/// bbox is a very large finite box (±1e6) so view culls never drop it; the
+/// APP resolves a viewport-clipped bbox for the spatial grid (see
+/// `resolve_grid_bbox`).
+#[derive(Clone, Copy, Debug)]
+pub struct Xline {
+    pub base: Vec2,
+    pub dir: Vec2,
+}
+
+impl Xline {
+    /// Build from a base point + direction vector (direction normalized).
+    pub fn new(base: Vec2, dir: Vec2) -> Self {
+        let len = dir.len();
+        let dir = if len > 1e-12 { dir / len } else { Vec2::new(1.0, 0.0) };
+        Xline { base, dir }
+    }
+
+    /// Point on the line at parameter `t` (world units along `dir`).
+    pub fn point_at(&self, t: f64) -> Vec2 { self.base + self.dir * t }
+
+    /// A long finite segment (for intersections, previews, bbox fallbacks).
+    pub fn line_segment(&self, extent: f64) -> Line {
+        Line { a: self.point_at(-extent), b: self.point_at(extent) }
+    }
+
+    /// Signed perpendicular distance from a point to the infinite line.
+    pub fn signed_distance(&self, p: Vec2) -> f64 {
+        (p - self.base).cross(self.dir)
+    }
+
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        self.signed_distance(p).abs()
+    }
+
+    /// Clip the infinite line to `rect` → the visible segment, if any.
+    /// Standard slab clip over the parameter `t`.
+    pub fn clip_to_rect(&self, mn: Vec2, mx: Vec2) -> Option<Line> {
+        let mut t0 = f64::NEG_INFINITY;
+        let mut t1 = f64::INFINITY;
+        for (axis, lo, hi) in [(0, mn.x, mx.x), (1, mn.y, mx.y)] {
+            let (b, d) = if axis == 0 { (self.base.x, self.dir.x) } else { (self.base.y, self.dir.y) };
+            if d.abs() < 1e-12 {
+                if b < lo || b > hi { return None; }
+            } else {
+                let ta = (lo - b) / d;
+                let tb = (hi - b) / d;
+                let (tl, th) = if ta < tb { (ta, tb) } else { (tb, ta) };
+                t0 = t0.max(tl);
+                t1 = t1.min(th);
+                if t0 > t1 { return None; }
+            }
+        }
+        Some(Line { a: self.point_at(t0), b: self.point_at(t1) })
+    }
+
+    /// The line's own bbox: a very large finite box along the direction.
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        let e = Vec2::new(self.dir.x.abs(), self.dir.y.abs()) * 1e6;
+        (
+            Vec2::new(self.base.x - e.x, self.base.y - e.y),
+            Vec2::new(self.base.x + e.x, self.base.y + e.y),
+        )
+    }
+}
+
+/// Semi-infinite construction line (AutoCAD RAY): starts at `base` and
+/// extends in `dir` only (parameter `t >= 0`). Rendered viewport-clipped
+/// like an Xline, but only on the forward side of `base`.
+#[derive(Clone, Copy, Debug)]
+pub struct Ray {
+    pub base: Vec2,
+    pub dir: Vec2,
+}
+
+impl Ray {
+    /// Build from a base point + direction vector (direction normalized).
+    pub fn new(base: Vec2, dir: Vec2) -> Self {
+        let len = dir.len();
+        let dir = if len > 1e-12 { dir / len } else { Vec2::new(1.0, 0.0) };
+        Ray { base, dir }
+    }
+
+    /// Point on the ray at parameter `t` (world units along `dir`, `t >= 0`).
+    pub fn point_at(&self, t: f64) -> Vec2 { self.base + self.dir * t }
+
+    /// A long finite segment from the base along the ray (for
+    /// intersections, previews, bbox fallbacks).
+    pub fn ray_segment(&self, extent: f64) -> Line {
+        Line { a: self.base, b: self.point_at(extent) }
+    }
+
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        let t = (p - self.base).dot(self.dir);
+        if t < 0.0 { p.dist(self.base) } else { (p - self.base).cross(self.dir).abs() }
+    }
+
+    /// Clip the ray to `rect` → the visible segment, if any. Slab clip over
+    /// the parameter `t`, clamped to `t >= 0` (forward-only).
+    pub fn clip_to_rect(&self, mn: Vec2, mx: Vec2) -> Option<Line> {
+        let mut t0 = 0.0_f64;
+        let mut t1 = f64::INFINITY;
+        for (axis, lo, hi) in [(0, mn.x, mx.x), (1, mn.y, mx.y)] {
+            let (b, d) = if axis == 0 { (self.base.x, self.dir.x) } else { (self.base.y, self.dir.y) };
+            if d.abs() < 1e-12 {
+                if b < lo || b > hi { return None; }
+            } else {
+                let ta = (lo - b) / d;
+                let tb = (hi - b) / d;
+                let (tl, th) = if ta < tb { (ta, tb) } else { (tb, ta) };
+                t0 = t0.max(tl);
+                t1 = t1.min(th);
+                if t0 > t1 { return None; }
+            }
+        }
+        Some(Line { a: self.point_at(t0), b: self.point_at(t1) })
+    }
+
+    /// The ray's own bbox: from the base, a very large finite box forward.
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        let e = Vec2::new(self.dir.x.abs(), self.dir.y.abs()) * 1e6;
+        (
+            Vec2::new(self.base.x.min(self.base.x + e.x), self.base.y.min(self.base.y + e.y)),
+            Vec2::new(self.base.x.max(self.base.x + e.x), self.base.y.max(self.base.y + e.y)),
+        )
+    }
+}
 
 /// Architectural smart-dobject: a wall is its IMPLICIT centerline
 /// (`start` → `end`) plus a perpendicular `thickness`. Renders as two
@@ -195,6 +327,62 @@ pub struct Point {
     pub size:     f32,   // PDSIZE — drawing units; 0.0 = use renderer default
 }
 
+/// A center mark — AutoCAD CENTERMARK. A symmetric cross (two lines
+/// through `center` at `rotation` and `rotation + 90°`), each arm
+/// extending `size` world units from the center (total width 2·size).
+/// The standard annotation for circle/arc centres; rendered thin and
+/// typically on a CENTER linetype.
+#[derive(Clone, Copy, Debug)]
+pub struct CenterMark {
+    pub center:   Vec2,
+    /// Half-width of the cross: each arm reaches `size` from the center.
+    pub size:     f64,
+    /// Rotation in radians CCW; the arms point along `rotation` and
+    /// `rotation + π/2` (0 = axis-aligned cross).
+    pub rotation: f64,
+}
+
+impl CenterMark {
+    /// The four arm tips in world coords: [r, r+π/2, r+π, r+3π/2].
+    pub fn tips(&self) -> [Vec2; 4] {
+        let c = self.rotation.cos();
+        let s = self.rotation.sin();
+        let u = Vec2::new(c, s) * self.size;
+        let v = Vec2::new(-s, c) * self.size;
+        [self.center + u, self.center + v,
+         self.center - u, self.center - v]
+    }
+
+    /// The two crossing line segments.
+    pub fn segments(&self) -> [(Vec2, Vec2); 2] {
+        let [t0, t1, t2, t3] = self.tips();
+        [(t0, t2), (t1, t3)]
+    }
+
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        let [t0, t1, t2, t3] = self.tips();
+        let mn = Vec2::new(
+            t0.x.min(t1.x).min(t2.x).min(t3.x),
+            t0.y.min(t1.y).min(t2.y).min(t3.y),
+        );
+        let mx = Vec2::new(
+            t0.x.max(t1.x).max(t2.x).max(t3.x),
+            t0.y.max(t1.y).max(t2.y).max(t3.y),
+        );
+        (mn, mx)
+    }
+
+    /// Distance to the two crossing arms.
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        let mut best = f64::INFINITY;
+        for (a, b) in self.segments() {
+            let d = Line { a, b }.distance_to_point(p);
+            if d < best { best = d; }
+        }
+        best
+    }
+}
+
 /// A 2D polyline — AutoCAD LWPOLYLINE. Stores vertices with optional
 /// per-vertex `bulge` (tan of one-quarter the arc segment's included
 /// angle). Bulge = 0 means a straight segment to the next vertex; bulge
@@ -276,6 +464,67 @@ impl Polyline {
             sum += self.vertices[i].pos.dist(self.vertices[(i + 1) % n].pos);
         }
         sum
+    }
+
+    /// Build an AutoCAD-style REVCLOUD rectangle: a CLOSED polyline whose
+    /// edges are scalloped arc segments (each edge split into
+    /// `edge_len / chord` arcs of the given `arc_len`, every arc bulging
+    /// OUTWARD from the rect centre, `sagitta ≈ 0.2 × arc_len`). The
+    /// resulting cloud is slightly larger than the corner rect.
+    ///
+    /// `mn`/`mx` are any two opposite corners (normalized inside).
+    pub fn revcloud_rect(mn: Vec2, mx: Vec2, arc_len: f64) -> Option<Polyline> {
+        let arc_len = arc_len.max(1e-6);
+        let lo = Vec2::new(mn.x.min(mx.x), mn.y.min(mx.y));
+        let hi = Vec2::new(mn.x.max(mx.x), mn.y.max(mx.y));
+        let w = hi.x - lo.x;
+        let h = hi.y - lo.y;
+        if w < 1e-9 || h < 1e-9 {
+            return None; // degenerate rect
+        }
+        // CCW corners: bottom-left → bottom-right → top-right → top-left.
+        let corners = [
+            Vec2::new(lo.x, lo.y),
+            Vec2::new(hi.x, lo.y),
+            Vec2::new(hi.x, hi.y),
+            Vec2::new(lo.x, hi.y),
+        ];
+        let chord = arc_len * 0.9;
+        let sagitta = arc_len * 0.2;
+        // Sub-arc bulge for a chord `c` + sagitta `s` (CCW positive).
+        let sub_bulge = |c: f64| -> f64 {
+            if c < 1e-9 { return 0.0; }
+            let r = (c * c / 4.0 + sagitta * sagitta) / (2.0 * sagitta);
+            let sweep = 2.0 * (c / (2.0 * r)).asin();
+            (sweep / 4.0).tan()
+        };
+        // Outward side per edge (CCW winding): every edge's outward normal
+        // is RIGHT of travel (bottom −Y, right +X, top +Y, left −X), and in
+        // this codebase positive bulge = arc on the right of travel.
+        let signs = [1.0, 1.0, 1.0, 1.0];
+
+        let mut vertices: Vec<PolyVertex> = Vec::new();
+        for (i, &a) in corners.iter().enumerate() {
+            let b = corners[(i + 1) % 4];
+            let edge = b - a;
+            let len = edge.len();
+            if len < 1e-9 { continue; }
+            let n = (len / chord).round().max(1.0) as usize;
+            let seg = edge / n as f64;
+            let bl = sub_bulge(len / n as f64) * signs[i];
+            // All sub-arcs on this edge (skip the last vertex — it is the
+            // next edge's first vertex, whose bulge belongs to THAT edge).
+            for k in 0..n {
+                vertices.push(PolyVertex {
+                    pos: a + seg * k as f64,
+                    bulge: bl,
+                });
+            }
+        }
+        if vertices.len() < 3 {
+            return None;
+        }
+        Some(Polyline { vertices, closed: true, widths: Vec::new() })
     }
 }
 
@@ -376,6 +625,12 @@ pub struct Spline {
     /// Use `Spline::new_bspline` to build a non-rational (all-1)
     /// variant without constructing the weight vector by hand.
     pub weights:        Vec<f64>,
+    /// Explicit knot vector (length degree + control_points.len() + 1).
+    /// `None` = clamped/open uniform — the `new_bspline` default, and what
+    /// every shape-creation path uses. `Spline::split_at` produces trimmed
+    /// halves with `Some(non-uniform knots)` so a trimmed spline still
+    /// evaluates exactly (issue #21).
+    pub knots:          Option<Vec<f64>>,
 }
 
 impl Spline {
@@ -387,7 +642,7 @@ impl Spline {
             "Spline: weights count must match control_points count");
         assert!(control_points.len() > degree,
             "Spline: need more control points than degree");
-        Self { degree, control_points, weights }
+        Self { degree, control_points, weights, knots: None }
     }
 
     /// Non-rational B-spline (all weights = 1.0). Same constraints as
@@ -420,13 +675,47 @@ impl Spline {
     /// rational evaluator — converts to/from the kernel's Vec2 type at
     /// the boundary.
     pub fn tessellate(&self, n_samples: usize) -> Vec<Vec2> {
-        use cad_nurbs::{NurbsCurve, Vec2 as NV};
+        use cad_nurbs::{BSplineCurve, KnotVector, NurbsCurve, Vec2 as NV};
         let ctrls: Vec<NV> = self.control_points.iter()
             .map(|v| NV::new(v.x, v.y)).collect();
-        let curve = NurbsCurve::new_clamped(self.degree, ctrls, self.weights.clone());
+        // Trimmed splines carry their explicit (non-uniform) knots; plain
+        // splines use the clamped-uniform default (issue #21).
+        let curve = match &self.knots {
+            Some(k) => NurbsCurve::new(
+                BSplineCurve::new(self.degree, ctrls, KnotVector::from_raw(k.clone(), self.degree)),
+                self.weights.clone()),
+            None => NurbsCurve::new_clamped(self.degree, ctrls, self.weights.clone()),
+        };
         curve.tessellate(n_samples).into_iter()
             .map(|p| Vec2::new(p.x, p.y))
             .collect()
+    }
+
+    /// Split this spline at the normalized parameter `u` (0..1) into two
+    /// clamped sub-curves via knot insertion (issue #21). The halves carry
+    /// their explicit knot vectors, so both evaluate to the original curve.
+    pub fn split_at(&self, u: f64) -> (Spline, Spline) {
+        use cad_nurbs::{BSplineCurve, KnotVector, Vec2 as NV};
+        let (u_min, u_max) = match &self.knots {
+            Some(k) => (k[0], k[k.len() - 1]),
+            None    => (0.0, 1.0),
+        };
+        let u = u_min + u.clamp(0.0, 1.0) * (u_max - u_min);
+        let ctrls: Vec<NV> = self.control_points.iter()
+            .map(|v| NV::new(v.x, v.y)).collect();
+        let curve = match &self.knots {
+            Some(k) => BSplineCurve::new(self.degree, ctrls, KnotVector::from_raw(k.clone(), self.degree)),
+            None    => BSplineCurve::new_clamped(self.degree, ctrls),
+        };
+        let (l, r) = curve.split(u);
+        let to_spline = |c: BSplineCurve| Spline {
+            degree: c.degree,
+            control_points: c.control_points.iter()
+                .map(|p| Vec2::new(p.x, p.y)).collect(),
+            weights: self.weights.clone(),
+            knots: Some(c.knots.knots().to_vec()),
+        };
+        (to_spline(l), to_spline(r))
     }
 
     /// Distance from the visible curve to a point. Uses a 64-sample
@@ -453,6 +742,116 @@ impl Spline {
     }
 }
 
+/// Filled ring (AutoCAD DONUT): a disc with a concentric circular hole.
+/// `inner_radius` may be 0 (filled disc). Renders as a solid ring.
+#[derive(Clone, Copy, Debug)]
+pub struct Donut {
+    pub center: Vec2,
+    pub inner_radius: f64,
+    pub outer_radius: f64,
+}
+
+impl Donut {
+    /// Build with the radii clamped to a valid ring (inner <= outer).
+    pub fn new(center: Vec2, inner: f64, outer: f64) -> Self {
+        Donut {
+            center,
+            inner_radius: inner.max(0.0).min(outer.max(0.0)),
+            outer_radius: outer.max(0.0),
+        }
+    }
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        let d = p.dist(self.center);
+        let inner = self.inner_radius;
+        let outer = self.outer_radius;
+        if d >= inner && d <= outer {
+            0.0
+        } else if d < inner {
+            inner - d
+        } else {
+            d - outer
+        }
+    }
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        (self.center - Vec2::new(self.outer_radius, self.outer_radius),
+         self.center + Vec2::new(self.outer_radius, self.outer_radius))
+    }
+}
+
+/// Opaque mask (AutoCAD WIPEOUT): a closed polygon filled with the
+/// paper color, drawn ON TOP of everything so geometry behind it is
+/// hidden. `pts` is the closed vertex loop.
+#[derive(Clone, Debug)]
+pub struct Wipeout {
+    pub pts: Vec<Vec2>,
+}
+
+impl Wipeout {
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &self.pts {
+            mn = Vec2::new(mn.x.min(p.x), mn.y.min(p.y));
+            mx = Vec2::new(mx.x.max(p.x), mx.y.max(p.y));
+        }
+        if mn.x.is_infinite() { (Vec2::ZERO, Vec2::ZERO) } else { (mn, mx) }
+    }
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        if point_in_polygon(p, &self.pts) { 0.0 } else {
+            // Distance to the nearest edge.
+            let n = self.pts.len();
+            let mut best = f64::INFINITY;
+            for i in 0..n {
+                let a = self.pts[i];
+                let b = self.pts[(i + 1) % n];
+                let d = b - a;
+                let l2 = d.len_sq();
+                let t = if l2 < 1e-12 { 0.0 } else {
+                    ((p - a).dot(d) / l2).clamp(0.0, 1.0)
+                };
+                best = best.min(p.dist(a + d * t));
+            }
+            best
+        }
+    }
+}
+
+/// 2D filled region (AutoCAD REGION v1): a closed vertex loop filled
+/// solid. Booleans (union/subtract) are outside v1 scope.
+#[derive(Clone, Debug)]
+pub struct Region {
+    pub loop_pts: Vec<Vec2>,
+}
+
+impl Region {
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &self.loop_pts {
+            mn = Vec2::new(mn.x.min(p.x), mn.y.min(p.y));
+            mx = Vec2::new(mx.x.max(p.x), mx.y.max(p.y));
+        }
+        if mn.x.is_infinite() { (Vec2::ZERO, Vec2::ZERO) } else { (mn, mx) }
+    }
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        if point_in_polygon(p, &self.loop_pts) { 0.0 } else {
+            let n = self.loop_pts.len();
+            let mut best = f64::INFINITY;
+            for i in 0..n {
+                let a = self.loop_pts[i];
+                let b = self.loop_pts[(i + 1) % n];
+                let d = b - a;
+                let l2 = d.len_sq();
+                let t = if l2 < 1e-12 { 0.0 } else {
+                    ((p - a).dot(d) / l2).clamp(0.0, 1.0)
+                };
+                best = best.min(p.dist(a + d * t));
+            }
+            best
+        }
+    }
+}
+
 /// Pure geometry — the shape side of a `DObject`. Style / layer / handle
 /// live on the outer `DObject` struct (see [`crate::dobject`]).
 ///
@@ -462,6 +861,24 @@ impl Spline {
 #[derive(Clone, Debug)]
 pub enum Geom {
     Line(Line),
+    /// Table grid (AutoCAD TABLE v1) — uniform rows/cols of text cells.
+    Table(crate::table::Table),
+    /// External reference (AutoCAD XREF v1) — a snapshot of an external
+    /// file's dobjects + the instance transform. See `xref::Xref`.
+    Xref(crate::xref::Xref),
+    /// Infinite construction line — see `geom::Xline`. The kernel bbox is a
+    /// very large finite box so view culls never drop it; the app clips it to
+    /// the viewport when resolving the spatial-grid bbox.
+    Xline(Xline),
+    /// Semi-infinite construction line — see `geom::Ray`. Forward-only
+    /// from the base; same viewport-clip rendering as Xline.
+    Ray(Ray),
+    /// Filled ring — see `geom::Donut`.
+    Donut(Donut),
+    /// Opaque mask — see `geom::Wipeout`. Drawn on top of geometry.
+    Wipeout(Wipeout),
+    /// Filled 2D region — see `geom::Region`.
+    Region(Region),
     Circle(Circle),
     Arc(Arc),
     Ellipse(Ellipse),
@@ -491,6 +908,22 @@ pub enum Geom {
     /// Document, so kernel-level bbox/distance are placeholders and the
     /// app resolves through the block table. See `block::BlockRef`.
     BlockRef(crate::block::BlockRef),
+    /// MLEADER-style callout — a leader line chain with an arrowhead at
+    /// the first vertex plus an optional Text label at the last. See
+    /// `text::Leader` for the data definition.
+    Leader(crate::text::Leader),
+    /// Center mark — a symmetric cross at `center` with arms of length
+    /// `size` (AutoCAD CENTERMARK). See `geom::CenterMark`.
+    CenterMark(crate::geom::CenterMark),
+    /// Attribute DEFINITION (AutoCAD ATTDEF) — a tagged text slot used
+    /// inside block definitions; when the block is inserted, the app
+    /// prompts for values and renders the VALUE in place of the tag.
+    /// See `block::AttrDef` for the data definition.
+    AttrDef(crate::block::AttrDef),
+    /// Paper-space viewport — a rectangular window on paper that peers
+    /// into model space with its own camera. Lives in `Layout.entities`,
+    /// not in `Document.dobjects`. See `layout::ViewportGeom`.
+    Viewport(crate::layout::ViewportGeom),
 }
 
 impl Geom {
@@ -524,6 +957,41 @@ impl Geom {
         };
         match self {
             Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            // Xline — base scales; direction re-normalizes under the axis
+            // squish (the infinite line through the new base, same visual).
+            Geom::Xline(x) => Geom::Xline(Xline::new(
+                sc(x.base),
+                Vec2::new(x.dir.x * sx, x.dir.y * sy),
+            )),
+            Geom::Ray(r) => Geom::Ray(Ray::new(
+                sc(r.base),
+                Vec2::new(r.dir.x * sx, r.dir.y * sy),
+            )),
+            Geom::Donut(d) => Geom::Donut(Donut::new(
+                sc(d.center),
+                d.inner_radius * sx.abs().min(sy.abs()),
+                d.outer_radius * sx.abs().min(sy.abs()),
+            )),
+            Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
+                pts: w.pts.iter().map(|p| sc(*p)).collect(),
+            }),
+            Geom::Region(rg) => Geom::Region(Region {
+                loop_pts: rg.loop_pts.iter().map(|p| sc(*p)).collect(),
+            }),
+            // Table — base scales; cell sizes scale with the axis.
+            Geom::Table(t) => Geom::Table(crate::table::Table {
+                insert: sc(t.insert),
+                row_h: t.row_h * sy,
+                col_w: t.col_w * sx,
+                font_height: t.font_height * sy,
+                ..t.clone()
+            }),
+            // Xref — the instance transform scales; content re-derives.
+            Geom::Xref(x) => Geom::Xref(crate::xref::Xref {
+                insert: sc(x.insert),
+                scale: x.scale * 0.5 * (sx.abs() + sy.abs()).max(1e-6),
+                ..x.clone()
+            }),
             Geom::Point(pt) => Geom::Point(Point { location: sc(pt.location),
                 style: pt.style, size: pt.size }),
             Geom::Polyline(p) => {
@@ -538,7 +1006,8 @@ impl Geom {
             }
             Geom::Spline(s) => Geom::Spline(Spline { degree: s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
-                weights: s.weights.clone() }),
+                weights: s.weights.clone(),
+                knots: s.knots.clone() }),
             Geom::Circle(c) => {
                 let (major, ratio, _) = to_axes(
                     Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
@@ -570,7 +1039,30 @@ impl Geom {
             Geom::Text(t) => { let mut nt = t.clone(); nt.position = sc(t.position);
                 nt.height *= sy; Geom::Text(nt) }
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
-                insert: sc(br.insert), scale: br.scale * sx, scale_y: br.scale_y * sy, ..*br }),
+                insert: sc(br.insert), scale: br.scale * sx, scale_y: br.scale_y * sy, ..br.clone() }),
+            Geom::Leader(l) => Geom::Leader(Leader {
+                pts: l.pts.iter().map(|p| sc(*p)).collect(),
+                label: { let mut nt = l.label.clone(); nt.position = sc(l.label.position);
+                    nt.height *= sy; nt },
+                arrow: l.arrow,
+            }),
+            Geom::AttrDef(a) => Geom::AttrDef(crate::block::AttrDef {
+                position: sc(a.position), height: a.height * sy, ..a.clone() }),
+            // CenterMark — scale the arms non-uniformly (like Point).
+            Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
+                center: sc(cm.center),
+                size:   cm.size * sy,
+                rotation: cm.rotation,
+            }),
+            Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
+                center: sc(vp.center),
+                width: vp.width * sx.abs(),
+                height: vp.height * sy.abs(),
+                model_center: sc(vp.model_center),
+                model_zoom: vp.model_zoom,  // zoom is scale-independent
+                model_scale: vp.model_scale, // paper scale stays
+                frame_visible: vp.frame_visible,
+            }),
         }
     }
 
@@ -587,6 +1079,27 @@ impl Geom {
         };
         match self {
             Geom::Line(l) => Geom::Line(Line { a: rot(l.a), b: rot(l.b) }),
+            Geom::Xline(x) => Geom::Xline(Xline::new(rot(x.base), rot_dir(x.dir))),
+            Geom::Ray(r) => Geom::Ray(Ray::new(rot(r.base), rot_dir(r.dir))),
+            Geom::Donut(d) => Geom::Donut(Donut::new(rot(d.center), d.inner_radius, d.outer_radius)),
+            Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
+                pts: w.pts.iter().map(|p| rot(*p)).collect(),
+            }),
+            Geom::Region(rg) => Geom::Region(Region {
+                loop_pts: rg.loop_pts.iter().map(|p| rot(*p)).collect(),
+            }),
+            // Table — rotate the anchor + the grid.
+            Geom::Table(t) => Geom::Table(crate::table::Table {
+                insert: rot(t.insert),
+                rotation: t.rotation + angle,
+                ..t.clone()
+            }),
+            // Xref — rotate the instance (content follows via the transform).
+            Geom::Xref(x) => Geom::Xref(crate::xref::Xref {
+                insert: rot(x.insert),
+                rotation: x.rotation + angle,
+                ..x.clone()
+            }),
             Geom::Circle(c) => Geom::Circle(Circle { center: rot(c.center), radius: c.radius }),
             Geom::Arc(a) => Geom::Arc(Arc {
                 center: rot(a.center),
@@ -637,6 +1150,7 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| rot(*p)).collect(),
                 weights:        s.weights.clone(),
+                knots:          s.knots.clone(),
             }),
             // Wall — rotate the centerline; thickness is direction-
             // invariant. Side lines re-derive from the new endpoints.
@@ -663,7 +1177,36 @@ impl Geom {
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
                 insert:   rot(br.insert),
                 rotation: br.rotation + angle,
-                ..*br
+                ..br.clone()
+            }),
+            // Leader — rotate the chain + the label anchor (the label's own
+            // angle rotates with it, like Text).
+            Geom::Leader(l) => Geom::Leader(Leader {
+                pts: l.pts.iter().map(|p| rot(*p)).collect(),
+                label: {
+                    let mut nt = l.label.clone();
+                    nt.position = rot(l.label.position);
+                    nt.angle    = l.label.angle + angle;
+                    nt
+                },
+                arrow: l.arrow,
+            }),
+            // AttrDef — rotate the position + bump the angle like Text.
+            Geom::AttrDef(a) => Geom::AttrDef(crate::block::AttrDef {
+                position: rot(a.position),
+                angle: a.angle + angle,
+                ..a.clone()
+            }),
+            // CenterMark — rotate the position + the cross itself.
+            Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
+                center:   rot(cm.center),
+                rotation: cm.rotation + angle,
+                ..*cm
+            }),
+            Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
+                center: rot(vp.center),
+                model_center: rot(vp.model_center),
+                ..vp.clone()
             }),
         }
     }
@@ -679,6 +1222,31 @@ impl Geom {
         let f_abs = factor.abs();
         match self {
             Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            // Xline — base scales, direction stays (a line's direction is
+            // scale-invariant; re-normalize for safety).
+            Geom::Xline(x) => Geom::Xline(Xline::new(sc(x.base), x.dir)),
+            Geom::Ray(r) => Geom::Ray(Ray::new(sc(r.base), r.dir)),
+            Geom::Donut(d) => Geom::Donut(Donut::new(sc(d.center), d.inner_radius * f_abs, d.outer_radius * f_abs)),
+            Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
+                pts: w.pts.iter().map(|p| sc(*p)).collect(),
+            }),
+            Geom::Region(rg) => Geom::Region(Region {
+                loop_pts: rg.loop_pts.iter().map(|p| sc(*p)).collect(),
+            }),
+            // Table — uniform scale of the grid.
+            Geom::Table(t) => Geom::Table(crate::table::Table {
+                insert: sc(t.insert),
+                row_h: t.row_h * f_abs,
+                col_w: t.col_w * f_abs,
+                font_height: t.font_height * f_abs,
+                ..t.clone()
+            }),
+            // Xref — instance scale.
+            Geom::Xref(x) => Geom::Xref(crate::xref::Xref {
+                insert: sc(x.insert),
+                scale: x.scale * f_abs,
+                ..x.clone()
+            }),
             Geom::Circle(c) => Geom::Circle(Circle {
                 center: sc(c.center), radius: c.radius * f_abs,
             }),
@@ -713,6 +1281,7 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
                 weights:        s.weights.clone(),
+                knots:          s.knots.clone(),
             }),
             // Wall — scale the centerline + thickness uniformly so
             // the wall stays geometrically similar.
@@ -742,7 +1311,35 @@ impl Geom {
                 insert: sc(br.insert),
                 scale:   br.scale   * f_abs,
                 scale_y: br.scale_y * f_abs,
-                ..*br
+                ..br.clone()
+            }),
+            Geom::Leader(l) => Geom::Leader(Leader {
+                pts: l.pts.iter().map(|p| sc(*p)).collect(),
+                label: {
+                    let mut nt = l.label.clone();
+                    nt.position = sc(l.label.position);
+                    nt.height   = l.label.height * f_abs;
+                    nt
+                },
+                arrow: l.arrow,
+            }),
+            Geom::AttrDef(a) => Geom::AttrDef(crate::block::AttrDef {
+                position: sc(a.position),
+                height: a.height * f_abs,
+                ..a.clone()
+            }),
+            // CenterMark — uniform scale of the arms.
+            Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
+                center: sc(cm.center),
+                size:   cm.size * f_abs,
+                ..*cm
+            }),
+            Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
+                center: sc(vp.center),
+                width: vp.width * f_abs,
+                height: vp.height * f_abs,
+                model_center: sc(vp.model_center),
+                ..vp.clone()
             }),
         }
     }
@@ -768,6 +1365,33 @@ impl Geom {
         };
         match self {
             Geom::Line(l) => Geom::Line(Line { a: mirror(l.a), b: mirror(l.b) }),
+            Geom::Xline(x) => Geom::Xline(Xline::new(mirror(x.base), mirror(x.dir))),
+            Geom::Ray(r) => Geom::Ray(Ray::new(mirror(r.base), mirror(r.dir))),
+            Geom::Donut(d) => Geom::Donut(Donut::new(mirror(d.center), d.inner_radius, d.outer_radius)),
+            Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
+                pts: w.pts.iter().map(|p| mirror(*p)).collect(),
+            }),
+            Geom::Region(rg) => Geom::Region(Region {
+                loop_pts: rg.loop_pts.iter().map(|p| mirror(*p)).collect(),
+            }),
+            // Table — mirror the anchor + rotation (cells are text data).
+            Geom::Table(t) => {
+                let axis_angle = (b - a).angle();
+                Geom::Table(crate::table::Table {
+                    insert: mirror(t.insert),
+                    rotation: 2.0 * axis_angle - t.rotation,
+                    ..t.clone()
+                })
+            }
+            // Xref — mirror the instance (content follows the transform).
+            Geom::Xref(x) => {
+                let axis_angle = (b - a).angle();
+                Geom::Xref(crate::xref::Xref {
+                    insert: mirror(x.insert),
+                    rotation: 2.0 * axis_angle - x.rotation,
+                    ..x.clone()
+                })
+            }
             Geom::Circle(c) => Geom::Circle(Circle {
                 center: mirror(c.center), radius: c.radius,
             }),
@@ -811,6 +1435,7 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| mirror(*p)).collect(),
                 weights:        s.weights.clone(),
+                knots:          s.knots.clone(),
             }),
             // Wall — mirror the centerline; thickness unchanged.
             Geom::Wall(w) => Geom::Wall(Wall {
@@ -848,9 +1473,47 @@ impl Geom {
                     insert:   mirror(br.insert),
                     rotation: 2.0 * axis_angle - br.rotation,
                     mirror_x: !br.mirror_x,   // reflecting flips the parity
-                    ..*br
+                    ..br.clone()
                 })
             }
+            // Leader — mirror the chain + label anchor; reflect the label
+            // angle by the mirror axis (same as Text).
+            Geom::Leader(l) => {
+                let axis_angle = (b - a).angle();
+                Geom::Leader(Leader {
+                    pts: l.pts.iter().map(|p| mirror(*p)).collect(),
+                    label: {
+                        let mut nt = l.label.clone();
+                        nt.position = mirror(l.label.position);
+                        nt.angle = 2.0 * axis_angle - l.label.angle;
+                        nt
+                    },
+                    arrow: l.arrow,
+                })
+            }
+            // AttrDef — mirror position + reflected angle.
+            Geom::AttrDef(ad) => {
+                let axis_angle = (b - a).angle();
+                Geom::AttrDef(crate::block::AttrDef {
+                    position: mirror(ad.position),
+                    angle: 2.0 * axis_angle - ad.angle,
+                    ..ad.clone()
+                })
+            }
+            // CenterMark — mirror position + reflected rotation.
+            Geom::CenterMark(cm) => {
+                let axis_angle = (b - a).angle();
+                Geom::CenterMark(CenterMark {
+                    center:   mirror(cm.center),
+                    rotation: 2.0 * axis_angle - cm.rotation,
+                    ..*cm
+                })
+            }
+            Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
+                center: mirror(vp.center),
+                model_center: mirror(vp.model_center),
+                ..vp.clone()
+            }),
         }
     }
 
@@ -996,6 +1659,17 @@ impl Geom {
     pub fn reversed(&self) -> Geom {
         match self {
             Geom::Line(l) => Geom::Line(Line { a: l.b, b: l.a }),
+            // Xline — the line occupies the same infinite set; flip dir for
+            // traversal parity with Line.
+            Geom::Xline(x) => Geom::Xline(Xline { base: x.base, dir: -x.dir }),
+            Geom::Ray(r) => Geom::Ray(Ray { base: r.base, dir: -r.dir }),
+            Geom::Donut(d) => Geom::Donut(*d),
+            Geom::Wipeout(w) => Geom::Wipeout(w.clone()),
+            Geom::Region(rg) => Geom::Region(rg.clone()),
+            // Table — direction-agnostic; clone.
+            Geom::Table(t) => Geom::Table(t.clone()),
+            // Xref — direction-agnostic; clone.
+            Geom::Xref(x) => Geom::Xref(x.clone()),
             // An Arc stores only a POSITIVE CCW sweep, so it cannot encode a
             // traversal direction — the reversed arc occupies the IDENTICAL
             // set of points. Return it unchanged. (The old code set
@@ -1043,6 +1717,7 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().rev().copied().collect(),
                 weights:        s.weights.iter().rev().copied().collect(),
+                knots:          s.knots.clone(),
             }),
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
             // Wall — reverse the centerline; thickness unchanged. The
@@ -1057,7 +1732,14 @@ impl Geom {
             // Dimension — direction-agnostic; clone.
             Geom::Dimension(d) => Geom::Dimension(d.clone()),
             // BlockRef — direction-agnostic; clone.
-            Geom::BlockRef(br) => Geom::BlockRef(*br),
+            Geom::BlockRef(br) => Geom::BlockRef(br.clone()),
+            // Leader — reversal has no geometric meaning. Clone.
+            Geom::Leader(l) => Geom::Leader(l.clone()),
+            // AttrDef — direction-agnostic; clone.
+            Geom::AttrDef(a) => Geom::AttrDef(a.clone()),
+            // CenterMark — direction-agnostic; clone.
+            Geom::CenterMark(_) => self.clone(),
+            Geom::Viewport(_) => self.clone(),
         }
     }
 
@@ -1066,6 +1748,30 @@ impl Geom {
         match self {
             Geom::Line(l) => Geom::Line(Line {
                 a: l.a + off, b: l.b + off,
+            }),
+            Geom::Xline(x) => Geom::Xline(Xline {
+                base: x.base + off, dir: x.dir,
+            }),
+            Geom::Ray(r) => Geom::Ray(Ray {
+                base: r.base + off, dir: r.dir,
+            }),
+            Geom::Donut(d) => Geom::Donut(Donut {
+                center: d.center + off,
+                inner_radius: d.inner_radius, outer_radius: d.outer_radius,
+            }),
+            Geom::Wipeout(w) => Geom::Wipeout(Wipeout {
+                pts: w.pts.iter().map(|p| *p + off).collect(),
+            }),
+            Geom::Region(rg) => Geom::Region(Region {
+                loop_pts: rg.loop_pts.iter().map(|p| *p + off).collect(),
+            }),
+            Geom::Table(t) => Geom::Table(crate::table::Table {
+                insert: t.insert + off,
+                ..t.clone()
+            }),
+            Geom::Xref(x) => Geom::Xref(crate::xref::Xref {
+                insert: x.insert + off,
+                ..x.clone()
             }),
             Geom::Circle(c) => Geom::Circle(Circle {
                 center: c.center + off, radius: c.radius,
@@ -1108,6 +1814,7 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| *p + off).collect(),
                 weights:        s.weights.clone(),
+                knots:          s.knots.clone(),
             }),
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.start + off, end: w.end + off, thickness: w.thickness,
@@ -1121,7 +1828,32 @@ impl Geom {
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(|p| p + off)),
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
                 insert: br.insert + off,
-                ..*br
+                ..br.clone()
+            }),
+            // Leader — translate the chain + label anchor.
+            Geom::Leader(l) => Geom::Leader(Leader {
+                pts: l.pts.iter().map(|p| *p + off).collect(),
+                label: {
+                    let mut nt = l.label.clone();
+                    nt.position = l.label.position + off;
+                    nt
+                },
+                arrow: l.arrow,
+            }),
+            // AttrDef — translate the position.
+            Geom::AttrDef(a) => Geom::AttrDef(crate::block::AttrDef {
+                position: a.position + off,
+                ..a.clone()
+            }),
+            // CenterMark — translate the center.
+            Geom::CenterMark(cm) => Geom::CenterMark(CenterMark {
+                center: cm.center + off,
+                ..*cm
+            }),
+            Geom::Viewport(vp) => Geom::Viewport(ViewportGeom {
+                center: vp.center + off,
+                model_center: vp.model_center + off,
+                ..vp.clone()
             }),
         }
     }
@@ -1130,6 +1862,15 @@ impl Geom {
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         match self {
             Geom::Line(l)        => l.distance_to_point(p),
+            Geom::Xline(x)       => x.distance_to_point(p),
+            Geom::Ray(r)         => r.distance_to_point(p),
+            Geom::Donut(d)       => d.distance_to_point(p),
+            Geom::Wipeout(w)     => w.distance_to_point(p),
+            Geom::Region(rg)     => rg.distance_to_point(p),
+            // Table — nearest grid rule or cell text.
+            Geom::Table(t)      => t.distance_to_point(p),
+            // Xref — nearest resolved child (transformed).
+            Geom::Xref(x)       => x.distance_to_point(p),
             Geom::Circle(c)      => c.distance_to_point(p),
             Geom::Arc(a)         => a.distance_to_point(p),
             Geom::Ellipse(e)     => e.distance_to_point(p),
@@ -1150,10 +1891,9 @@ impl Geom {
                     _ => f64::INFINITY,
                 }
             }
-            // Text — distance to the anchor point. Good enough for
-            // click-pick; refine to bbox-distance when text starts
-            // occupying significant screen area.
-            Geom::Text(t) => t.position.dist(p),
+            // Text — distance to the (rotated) glyph bounding box, so a click
+            // ANYWHERE on the text picks it (not just near the anchor corner).
+            Geom::Text(t) => t.distance_to_point(p),
             // Dimension — distance to the VISIBLE outline (extension lines +
             // dim line, or leader for radius/diameter) so the user can click
             // ON the line, plus the def/grip points (text anchor + def pts)
@@ -1175,6 +1915,33 @@ impl Geom {
             // INFINITY keeps the generic pick loop from matching; the
             // app resolves block contents in its pick fallback.
             Geom::BlockRef(_) => f64::INFINITY,
+            // Leader — distance to the chain or the label box.
+            Geom::Leader(l) => l.distance_to_point(p),
+            // CenterMark — distance to the two crossing arms.
+            Geom::CenterMark(cm) => cm.distance_to_point(p),
+            // AttrDef — distance to the value-text box (treat like Text).
+            Geom::AttrDef(a) => {
+                let t = crate::text::Text {
+                    position: a.position, height: a.height, angle: a.angle,
+                    text: a.tag.clone(),
+                    h_align: crate::text::HAlign::Left,
+                    v_align: crate::text::VAlign::Baseline,
+                    style: a.style,
+                    ..crate::text::Text::empty()
+                };
+                t.distance_to_point(p)
+            }
+            // Viewport — distance to the outline of the viewport rect.
+            Geom::Viewport(vp) => {
+                let (mn, mx) = vp.bbox_world();
+                let cw = mx.x - mn.x;
+                let ch = mx.y - mn.y;
+                if cw < 1e-9 || ch < 1e-9 { return f64::INFINITY; }
+                // Signed distance to the rect interior (negative inside).
+                let dx = (mn.x - p.x).max(0.0).max(p.x - mx.x);
+                let dy = (mn.y - p.y).max(0.0).max(p.y - mx.y);
+                (dx * dx + dy * dy).sqrt()
+            }
         }
     }
 }
@@ -1216,6 +1983,113 @@ impl Arc {
 }
 
 impl Geom {
+    /// Signed area of a CLOSED curve (CCW positive), computed consistently
+    /// with what renders: arc segments are sampled (8 pts) instead of using
+    /// their chord, so bulged polylines report their true curved area.
+    /// `None` for open curves / shapes with no measurable area.
+    pub fn measured_area(&self) -> Option<f64> {
+        use crate::join::polyline_segments;
+        match self {
+            Geom::Circle(c) => Some(std::f64::consts::PI * c.radius * c.radius),
+            Geom::Ellipse(e) => {
+                let a = e.semi_major();
+                let b = a * e.ratio;
+                Some(std::f64::consts::PI * a * b)
+            }
+            Geom::Polyline(p) => {
+                if !p.closed || p.vertices.len() < 3 { return None; }
+                let mut area2 = 0.0;
+                for seg in polyline_segments(p) {
+                    match seg {
+                        Geom::Line(l) => area2 += l.a.x * l.b.y - l.b.x * l.a.y,
+                        Geom::Arc(a) => {
+                            // Sample the arc chain (64 pts) — replaces the
+                            // chord so the bulge counts toward the area
+                            // (inscribed-polygon error < 0.1% for a semicircle).
+                            let n = 64usize;
+                            let pt = |t: f64| {
+                                let ang = a.start_angle + t * a.sweep_angle;
+                                Vec2::new(a.center.x + a.radius * ang.cos(),
+                                          a.center.y + a.radius * ang.sin())
+                            };
+                            let mut p0 = pt(0.0);
+                            for k in 1..=n {
+                                let p1 = pt(k as f64 / n as f64);
+                                area2 += p0.x * p1.y - p1.x * p0.y;
+                                p0 = p1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(area2 * 0.5)
+            }
+            Geom::Spline(s) => {
+                let pts = s.tessellate(64);
+                if pts.len() < 4 { return None; }
+                if pts[0].dist(pts[pts.len() - 1]) > 1e-6 { return None; }
+                let mut area2 = 0.0;
+                for i in 0..pts.len() - 1 {
+                    let a = pts[i];
+                    let b = pts[i + 1];
+                    area2 += a.x * b.y - b.x * a.y;
+                }
+                Some(area2 * 0.5)
+            }
+            _ => None,
+        }
+    }
+
+    /// Length of the visible curve (perimeter for closed shapes). Arc bulges
+    /// count their true arc length; splines tessellate.
+    pub fn measured_perimeter(&self) -> Option<f64> {
+        use crate::join::polyline_segments;
+        match self {
+            Geom::Line(l) => Some(l.a.dist(l.b)),
+            Geom::Circle(c) => Some(std::f64::consts::TAU * c.radius),
+            Geom::Arc(a) => Some(a.radius * a.sweep_angle.abs()),
+            Geom::Ellipse(e) => {
+                // Ramanujan approximation.
+                let a = e.semi_major();
+                let b = a * e.ratio;
+                let h = (a - b) * (a - b) / ((a + b) * (a + b));
+                Some(std::f64::consts::PI * (a + b) * (1.0 + 3.0 * h
+                    / (10.0 + (4.0 - 3.0 * h).sqrt())))
+            }
+            Geom::EllipseArc(ea) => {
+                let n = 32usize;
+                let mut len = 0.0;
+                let mut prev = ea.ellipse.point_at(ea.start_param);
+                for k in 1..=n {
+                    let cur = ea.ellipse.point_at(
+                        ea.start_param + ea.sweep_param * k as f64 / n as f64);
+                    len += prev.dist(cur);
+                    prev = cur;
+                }
+                Some(len)
+            }
+            Geom::Polyline(p) => {
+                if p.vertices.len() < 2 { return None; }
+                let mut len = 0.0;
+                for seg in polyline_segments(p) {
+                    match seg {
+                        Geom::Line(l) => len += l.a.dist(l.b),
+                        Geom::Arc(a) => len += a.radius * a.sweep_angle.abs(),
+                        _ => {}
+                    }
+                }
+                Some(len)
+            }
+            Geom::Spline(s) => {
+                let pts = s.tessellate(64);
+                let mut len = 0.0;
+                for w in pts.windows(2) { len += w[0].dist(w[1]); }
+                Some(len)
+            }
+            _ => None,
+        }
+    }
+
     /// Axis-aligned bounding box (min, max). For arcs / elliptical arcs this
     /// is the conservative bbox of the full underlying curve, not the tight
     /// per-quadrant one — good enough for viewport culling and fast to compute.
@@ -1288,6 +2162,18 @@ impl Geom {
             // Text — unrotated bbox (loose; ignores `angle`). Same
             // approximation Wall uses for its rotated side-line corners.
             Geom::Text(t) => t.bbox_unrotated(),
+            // Xline — a very large finite box (±1e6 along the direction) so
+            // view culls never drop it. The app clips to the viewport when
+            // building the spatial grid.
+            Geom::Xline(x) => x.bbox(),
+            Geom::Ray(r) => r.bbox(),
+            Geom::Donut(d) => d.bbox(),
+            Geom::Wipeout(w) => w.bbox(),
+            Geom::Region(rg) => rg.bbox(),
+            // Table — the grid's own bbox.
+            Geom::Table(t) => t.bbox(),
+            // Xref — bbox of the resolved content.
+            Geom::Xref(x) => x.bbox(),
             // Dimension — bbox of the def points. The renderer's text
             // and extension lines can fall slightly outside this; v1
             // accepts the loose bbox.
@@ -1297,6 +2183,23 @@ impl Geom {
             // spatial indexes never cull on this; the app computes the
             // real resolved bbox where it matters (window selection).
             Geom::BlockRef(br) => (br.insert, br.insert),
+            // Leader — chain + label bbox (real, kernel-computable).
+            Geom::Leader(l) => l.bbox(),
+            // CenterMark — the cross's own bbox.
+            Geom::CenterMark(cm) => cm.bbox(),
+            // AttrDef — value-text bbox at angle 0 (loose, like Text).
+            Geom::AttrDef(a) => {
+                let t = crate::text::Text {
+                    position: a.position, height: a.height, angle: a.angle,
+                    text: a.tag.clone(),
+                    h_align: crate::text::HAlign::Left,
+                    v_align: crate::text::VAlign::Baseline,
+                    style: a.style,
+                    ..crate::text::Text::empty()
+                };
+                t.bbox_unrotated()
+            }
+            Geom::Viewport(vp) => vp.bbox_world(),
         }
     }
 
@@ -1400,8 +2303,23 @@ impl Ellipse {
     /// Closest parameter t to a world point `p`, found by Newton iteration on
     /// `f(t) = (P(t) - p) · P'(t) = 0`. Closed-form solving requires a
     /// quartic; this is fast, robust, and accurate enough for snap / hit-test.
-    /// The initial guess is the angle of `p - center` in the ellipse's local
-    /// frame, which is usually 1–2 iterations from the true root.
+    ///
+    /// G9: this function `f` has up to FOUR stationary points, so Newton from a
+    /// single seed can converge to a LOCAL nearest, not the global one — and this
+    /// maps trim/intersection hits onto parameters, so a wrong root cuts a trim at
+    /// the wrong place, silently.
+    ///
+    /// So we take FOUR candidate start angles a quarter-turn apart (the atan2
+    /// guess + the other quadrants — one per basin), pick the one whose ELLIPSE
+    /// POINT is closest to `p` by raw distance (cheap: 4 `point_at`, no Newton),
+    /// and run Newton ONCE from that basin. This is a hot path (pick/snap loop it
+    /// per candidate over the whole zoom-scaled query set), so we do NOT run
+    /// Newton four times — that measured ~4× slower (756 vs 184 ns) and was a
+    /// real regression. Best-of-4-then-one-Newton is ~256 ns and still escapes the
+    /// wrong-local-root basin (the actual G9 bug: a far major vertex shadowing a
+    /// near minor vertex). At a near-symmetric query the two feet differ by a
+    /// geometrically-irrelevant amount, so refining only the closest basin is
+    /// correct in every case that matters.
     pub fn nearest_param(&self, p: Vec2) -> f64 {
         let a = self.semi_major();
         if a < EPS { return 0.0; }
@@ -1411,9 +2329,18 @@ impl Ellipse {
         let d = p - self.center;
         let lx = d.dot(self.u_hat());
         let ly = d.dot(self.v_hat());
-        let mut t = (ly * a).atan2(lx * b);
-        // 5 Newton iterations is more than enough for 1e-9 convergence in
-        // double precision for any reasonable ratio.
+        let t0 = (ly * a).atan2(lx * b);
+        // Pick the closest basin by RAW distance (no Newton yet).
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let mut t = t0;
+        let mut best_d2 = f64::INFINITY;
+        for k in 0..4 {
+            let cand = t0 + k as f64 * quarter;
+            let dist2 = (self.point_at(cand) - p).len_sq();
+            if dist2 < best_d2 { best_d2 = dist2; t = cand; }
+        }
+        // ONE Newton refine from the chosen basin. 5 iterations is more than
+        // enough for 1e-9 convergence in double precision for any reasonable ratio.
         for _ in 0..5 {
             let pt = self.point_at(t);
             let dp = self.tangent_at(t);
@@ -1627,6 +2554,75 @@ mod transform_tests {
         for w in &want {
             assert!(corners.iter().any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
                 "missing grown corner {:?} in {:?}", w, corners);
+        }
+    }
+
+    #[test]
+    fn offset_closed_polygon_inward_past_collapse_is_rejected() {
+        // 10×6 rectangle. Offsetting inward by 4 would make the short (height
+        // = 6) axis go negative (6 − 2·4 = −2) — the top/bottom edges cross.
+        // The offset must be REFUSED with an "edges cross" message rather than
+        // returning an inverted rectangle (owner: "edges cross, reduce value").
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        let err = g.offset(4.0, Vec2::new(5.0, 3.0)).unwrap_err();
+        assert!(err.contains("edges cross"), "unexpected error: {}", err);
+        // Just under the limit (3 → height 0? use 2.9) still succeeds.
+        assert!(g.offset(2.9, Vec2::new(5.0, 3.0)).is_ok(),
+            "a valid inward offset must not be rejected");
+    }
+
+    #[test]
+    fn offset_convex_pentagon_inward_still_works_until_it_collapses() {
+        // Regular-ish pentagon (the owner's spiral case). A modest inward
+        // offset is fine; a large one that inverts it is rejected.
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(47.712, 40.540), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(70.000, 62.828), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(92.434, 40.395), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(81.106, 17.739), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(53.470, 23.266), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        let inside = Vec2::new(70.0, 38.0);
+        assert!(g.offset(5.0, inside).is_ok(), "small inward offset should work");
+        // Way past the inradius → collapses/crosses → rejected.
+        assert!(g.offset(40.0, inside).unwrap_err().contains("edges cross"));
+    }
+
+    #[test]
+    fn offset_spline_returns_a_parallel_polyline() {
+        // A degree-3 B-spline. Offsetting samples the curve and shifts each
+        // point along its normal → a Polyline whose every vertex sits ~dist
+        // from the original curve, on the clicked side.
+        let sp = Spline::new_bspline(3, vec![
+            Vec2::new(0.0, 0.0), Vec2::new(10.0, 20.0), Vec2::new(30.0, -10.0),
+            Vec2::new(50.0, 15.0), Vec2::new(70.0, 0.0),
+        ]);
+        let g = Geom::Spline(sp.clone());
+        let dist = 2.0;
+        // Pick a side well below the curve's start tangent region.
+        let out = g.offset(dist, Vec2::new(0.0, -50.0)).expect("spline offset ok");
+        let Geom::Polyline(pl) = out else { panic!("spline offset must be a polyline") };
+        assert!(!pl.closed, "an open spline offsets to an open polyline");
+        assert!(pl.vertices.len() >= 96, "expected a dense sampling");
+        // Every offset vertex should be ~dist from the source curve (allow a
+        // little slack for discrete sampling + curvature).
+        for v in &pl.vertices {
+            let d = sp.distance_to_point(v.pos);
+            assert!((d - dist).abs() < 0.5,
+                "vertex {:?} is {:.3} from the curve, expected ~{}", v.pos, d, dist);
         }
     }
 
@@ -2160,6 +3156,8 @@ pub enum GripRole {
     DimP1,
     DimP2,
     DimLeader,
+    /// Angular dim's arc-position grip (moves the arc radius + side).
+    DimArc,
 }
 
 impl Geom {
@@ -2259,11 +3257,120 @@ impl Geom {
                         (*on_circle,  GripRole::DimP2),
                         (*leader_end, GripRole::DimLeader),
                     ],
+                    // Angular — 4 grips: vertex, the two ray points, and
+                    // the arc-position handle.
+                    DimKind::Angular { vertex, p1, p2, arc_pos } => vec![
+                        (*vertex,  GripRole::DimP1),
+                        (*p1,      GripRole::DimP2),
+                        (*p2,      GripRole::DimLeader),
+                        (*arc_pos, GripRole::DimArc),
+                    ],
+                    // ArcLen — center, arc start, arc end, leader.
+                    DimKind::ArcLen { center, radius, start_angle, sweep, leader_end } => vec![
+                        (*center, GripRole::DimP1),
+                        (*center + Vec2::new(start_angle.cos() * radius,
+                                             start_angle.sin() * radius), GripRole::DimP2),
+                        (*center + Vec2::new((start_angle + sweep).cos() * radius,
+                                             (start_angle + sweep).sin() * radius), GripRole::DimLeader),
+                        (*leader_end, GripRole::DimLeader),
+                    ],
+                    // Ordinate — datum, point, leader.
+                    DimKind::Ordinate { datum, point, leader_end, .. } => vec![
+                        (*datum,      GripRole::DimP1),
+                        (*point,      GripRole::DimP2),
+                        (*leader_end, GripRole::DimLeader),
+                    ],
+                    // JoggedRadius — center, on-circle, leader, jog.
+                    DimKind::JoggedRadius { center, on_circle, leader_end, jog_pos } => vec![
+                        (*center,     GripRole::DimP1),
+                        (*on_circle,  GripRole::DimP2),
+                        (*leader_end, GripRole::DimLeader),
+                        (*jog_pos,    GripRole::DimLeader),
+                    ],
                 }
             }
             // BlockRef — one grip at the insertion point; dragging it
             // translates the whole instance.
             Geom::BlockRef(br) => vec![(br.insert, GripRole::BlockInsert)],
+            // Leader — grips at every chain vertex (arrow tip, bends,
+            // landing) + the label anchor. Reuses LineEnd roles so the
+            // existing grip renderer + `with_grip_moved` handle them.
+            Geom::Leader(l) => {
+                let mut out: Vec<(Vec2, GripRole)> = l.pts.iter()
+                    .enumerate()
+                    .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
+                        else { GripRole::PolyVertex(i) }))
+                    .collect();
+                out.push((l.label.position, GripRole::PointLoc));
+                out
+            }
+            // AttrDef — one grip at the position (like Text).
+            Geom::AttrDef(a) => vec![(a.position, GripRole::PointLoc)],
+            // Xline — two grips: the base point (move) + a direction handle
+            // on the line (rotate the direction around the base).
+            Geom::Xline(x) => vec![
+                (x.base, GripRole::CircleCenter),
+                (x.point_at(1.0), GripRole::LineEndA),
+            ],
+            Geom::Ray(r) => vec![
+                (r.base, GripRole::CircleCenter),
+                (r.point_at(1.0), GripRole::LineEndA),
+            ],
+            Geom::Donut(d) => vec![
+                (d.center, GripRole::CircleCenter),
+                (d.center + Vec2::new(d.outer_radius, 0.0), GripRole::LineEndA),
+            ],
+            Geom::Wipeout(w) => w.pts.iter()
+                .enumerate()
+                .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
+                    else { GripRole::PolyVertex(i) }))
+                .collect(),
+            Geom::Region(rg) => rg.loop_pts.iter()
+                .enumerate()
+                .map(|(i, p)| (*p, if i == 0 { GripRole::LineEndA }
+                    else { GripRole::PolyVertex(i) }))
+                .collect(),
+            // Xref — insert grip (move) + a far grip (scale).
+            Geom::Xref(x) => {
+                let (mn, mx) = x.bbox();
+                let w = (mx.x - mn.x).max(x.scale);
+                let (sin, cos) = x.rotation.sin_cos();
+                vec![
+                    (x.insert, GripRole::BlockInsert),
+                    (x.insert + Vec2::new(w * cos, w * sin), GripRole::LineEndA),
+                ]
+            }
+            // Table — the anchor (move) + the far corner (resize both axes).
+            Geom::Table(t) => {
+                let s = t.size();
+                let (sin, cos) = t.rotation.sin_cos();
+                let far = t.insert + Vec2::new(
+                    s.x * cos + s.y * sin, s.x * sin - s.y * cos);
+                vec![(t.insert, GripRole::CircleCenter),
+                     (far, GripRole::LineEndA)]
+            }
+            // CenterMark — center grip (move) + 4 arm-tip grips (resize).
+            // Tip roles reuse the line-end slots so the existing grip
+            // renderer treats them uniformly.
+            Geom::CenterMark(cm) => {
+                let [t0, t1, t2, t3] = cm.tips();
+                vec![
+                    (cm.center, GripRole::CircleCenter),
+                    (t0, GripRole::LineEndA),
+                    (t1, GripRole::LineEndB),
+                    (t2, GripRole::ArcEndStart),
+                    (t3, GripRole::ArcEndEnd),
+                ]
+            }
+            // Viewport — grips at the four corners + center.
+            Geom::Viewport(vp) => {
+                let (mn, mx) = vp.bbox_world();
+                vec![
+                    (mn, GripRole::LineEndA),
+                    (mx, GripRole::LineEndB),
+                    (vp.center, GripRole::LineMid),
+                ]
+            }
         }
     }
 
@@ -2425,6 +3532,7 @@ impl Geom {
                     degree:         s.degree,
                     control_points: new_ctrls,
                     weights:        s.weights.clone(),
+                    knots:          s.knots.clone(),
                 })
             }
             // ---- Point -------------------------------------------------
@@ -2473,6 +3581,27 @@ impl Geom {
                     DimKind::Diameter { on_circle, leader_end, .. } => DimKind::Diameter {
                         center: new_pos, on_circle: *on_circle, leader_end: *leader_end,
                     },
+                    // Angular DimP1 = the vertex.
+                    DimKind::Angular { p1, p2, arc_pos, .. } => DimKind::Angular {
+                        vertex: new_pos, p1: *p1, p2: *p2, arc_pos: *arc_pos,
+                    },
+                    // ArcLen P1 = the center.
+                    DimKind::ArcLen { radius, start_angle, sweep, leader_end, .. } =>
+                        DimKind::ArcLen {
+                            center: new_pos, radius: *radius,
+                            start_angle: *start_angle, sweep: *sweep,
+                            leader_end: *leader_end,
+                        },
+                    // Ordinate P1 = the datum.
+                    DimKind::Ordinate { point, leader_end, is_x, .. } => DimKind::Ordinate {
+                        datum: new_pos, point: *point, leader_end: *leader_end, is_x: *is_x,
+                    },
+                    // JoggedRadius P1 = the center.
+                    DimKind::JoggedRadius { on_circle, leader_end, jog_pos, .. } =>
+                        DimKind::JoggedRadius {
+                            center: new_pos, on_circle: *on_circle,
+                            leader_end: *leader_end, jog_pos: *jog_pos,
+                        },
                 };
                 Geom::Dimension(crate::dim::Dim {
                     kind: new_kind, style: d.style, text_override: d.text_override.clone(),
@@ -2490,6 +3619,28 @@ impl Geom {
                     DimKind::Diameter { center, leader_end, .. } => DimKind::Diameter {
                         center: *center, on_circle: new_pos, leader_end: *leader_end,
                     },
+                    // Angular DimP2 = the first ray point.
+                    DimKind::Angular { vertex, p2, arc_pos, .. } => DimKind::Angular {
+                        vertex: *vertex, p1: new_pos, p2: *p2, arc_pos: *arc_pos,
+                    },
+                    // ArcLen P2 = the arc start point (re-anchor start angle).
+                    DimKind::ArcLen { center, radius, sweep, leader_end, .. } => {
+                        let start_angle = (new_pos - *center).angle();
+                        DimKind::ArcLen {
+                            center: *center, radius: *radius,
+                            start_angle, sweep: *sweep, leader_end: *leader_end,
+                        }
+                    }
+                    // Ordinate P2 = the measured point.
+                    DimKind::Ordinate { datum, leader_end, is_x, .. } => DimKind::Ordinate {
+                        datum: *datum, point: new_pos, leader_end: *leader_end, is_x: *is_x,
+                    },
+                    // JoggedRadius P2 = the on-circle point.
+                    DimKind::JoggedRadius { center, leader_end, jog_pos, .. } =>
+                        DimKind::JoggedRadius {
+                            center: *center, on_circle: new_pos,
+                            leader_end: *leader_end, jog_pos: *jog_pos,
+                        },
                 };
                 Geom::Dimension(crate::dim::Dim {
                     kind: new_kind, style: d.style, text_override: d.text_override.clone(),
@@ -2507,6 +3658,78 @@ impl Geom {
                     DimKind::Diameter { center, on_circle, .. } => DimKind::Diameter {
                         center: *center, on_circle: *on_circle, leader_end: new_pos,
                     },
+                    // Angular DimP1 = the vertex.
+                    DimKind::Angular { p1, p2, arc_pos, .. } => DimKind::Angular {
+                        vertex: new_pos, p1: *p1, p2: *p2, arc_pos: *arc_pos,
+                    },
+                    // ArcLen P1 = the center.
+                    DimKind::ArcLen { radius, start_angle, sweep, leader_end, .. } =>
+                        DimKind::ArcLen {
+                            center: new_pos, radius: *radius,
+                            start_angle: *start_angle, sweep: *sweep,
+                            leader_end: *leader_end,
+                        },
+                    // Ordinate P1 = the datum.
+                    DimKind::Ordinate { point, leader_end, is_x, .. } => DimKind::Ordinate {
+                        datum: new_pos, point: *point, leader_end: *leader_end, is_x: *is_x,
+                    },
+                    // JoggedRadius P1 = the center.
+                    DimKind::JoggedRadius { on_circle, leader_end, jog_pos, .. } =>
+                        DimKind::JoggedRadius {
+                            center: new_pos, on_circle: *on_circle,
+                            leader_end: *leader_end, jog_pos: *jog_pos,
+                        },
+                };
+                Geom::Dimension(crate::dim::Dim {
+                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                })
+            }
+            (Geom::Dimension(d), GripRole::DimLeader) => {
+                use crate::dim::DimKind;
+                let new_kind = match &d.kind {
+                    DimKind::Linear { p1, p2, ortho, .. } => DimKind::Linear {
+                        p1: *p1, p2: *p2, dimline_pos: new_pos, ortho: *ortho,
+                    },
+                    DimKind::Radius { center, on_circle, .. } => DimKind::Radius {
+                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    },
+                    DimKind::Diameter { center, on_circle, .. } => DimKind::Diameter {
+                        center: *center, on_circle: *on_circle, leader_end: new_pos,
+                    },
+                    // Angular DimLeader = the second ray point.
+                    DimKind::Angular { vertex, p1, arc_pos, .. } => DimKind::Angular {
+                        vertex: *vertex, p1: *p1, p2: new_pos, arc_pos: *arc_pos,
+                    },
+                    // ArcLen leader = the leader tail.
+                    DimKind::ArcLen { center, radius, start_angle, sweep, .. } =>
+                        DimKind::ArcLen {
+                            center: *center, radius: *radius,
+                            start_angle: *start_angle, sweep: *sweep,
+                            leader_end: new_pos,
+                        },
+                    // Ordinate leader = the leader tail.
+                    DimKind::Ordinate { datum, point, is_x, .. } => DimKind::Ordinate {
+                        datum: *datum, point: *point, leader_end: new_pos, is_x: *is_x,
+                    },
+                    // JoggedRadius leader = the leader tail.
+                    DimKind::JoggedRadius { center, on_circle, jog_pos, .. } =>
+                        DimKind::JoggedRadius {
+                            center: *center, on_circle: *on_circle,
+                            leader_end: new_pos, jog_pos: *jog_pos,
+                        },
+                };
+                Geom::Dimension(crate::dim::Dim {
+                    kind: new_kind, style: d.style, text_override: d.text_override.clone(),
+                })
+            }
+            // Angular arc-position grip: move the arc handle.
+            (Geom::Dimension(d), GripRole::DimArc) => {
+                use crate::dim::DimKind;
+                let new_kind = match &d.kind {
+                    DimKind::Angular { vertex, p1, p2, .. } => DimKind::Angular {
+                        vertex: *vertex, p1: *p1, p2: *p2, arc_pos: new_pos,
+                    },
+                    _ => return self.clone(),
                 };
                 Geom::Dimension(crate::dim::Dim {
                     kind: new_kind, style: d.style, text_override: d.text_override.clone(),
@@ -2515,11 +3738,190 @@ impl Geom {
             // BlockRef — the insertion grip carries the whole instance.
             (Geom::BlockRef(br), GripRole::BlockInsert) => {
                 Geom::BlockRef(crate::block::BlockRef {
-                    insert: new_pos, ..*br
+                    insert: new_pos, ..br.clone()
                 })
+            }
+            // ---- Leader — vertex grips reshape the chain; PointLoc moves
+            // the label anchor (and the landing vertex stays put).
+            (Geom::Leader(l), GripRole::PolyVertex(i)) => {
+                let mut new_pts = l.pts.clone();
+                if let Some(p) = new_pts.get_mut(i) { *p = new_pos; }
+                Geom::Leader(Leader { pts: new_pts, ..l.clone() })
+            }
+            (Geom::Leader(l), GripRole::LineEndA) => {
+                let mut new_pts = l.pts.clone();
+                if let Some(p) = new_pts.first_mut() { *p = new_pos; }
+                Geom::Leader(Leader { pts: new_pts, ..l.clone() })
+            }
+            (Geom::Leader(l), GripRole::PointLoc) => {
+                let mut nl = l.clone();
+                nl.label.position = new_pos;
+                Geom::Leader(nl)
+            }
+            // ---- AttrDef — move the position (like Text).
+            (Geom::AttrDef(a), GripRole::PointLoc) => {
+                Geom::AttrDef(crate::block::AttrDef { position: new_pos, ..a.clone() })
+            }
+            // ---- CenterMark — center grip translates; any arm-tip grip
+            // resizes the cross symmetrically (size = distance from the
+            // moved tip to the center, floored so it can't collapse).
+            (Geom::CenterMark(cm), GripRole::CircleCenter) => {
+                Geom::CenterMark(CenterMark { center: new_pos, ..*cm })
+            }
+            // ---- Xline — base grip translates; direction handle rotates
+            // the direction to point at the grip (keeps base fixed).
+            (Geom::Xline(x), GripRole::CircleCenter) => {
+                Geom::Xline(Xline { base: new_pos, dir: x.dir })
+            }
+            (Geom::Xline(x), GripRole::LineEndA) => {
+                Geom::Xline(Xline::new(x.base, new_pos - x.base))
+            }
+            // Xref — insert grip moves; far grip rescales.
+            (Geom::Xref(x), GripRole::BlockInsert) => {
+                Geom::Xref(crate::xref::Xref { insert: new_pos, ..x.clone() })
+            }
+            (Geom::Xref(x), GripRole::LineEndA) => {
+                let (mn, mx) = x.bbox();
+                let w = (mx.x - mn.x).max(x.scale).max(1e-9);
+                let d = (new_pos - x.insert).len();
+                let k = (d / w).clamp(0.01, 1e6);
+                Geom::Xref(crate::xref::Xref { scale: x.scale * k, ..x.clone() })
+            }
+            // Table — anchor grip moves; far-corner grip rescales (uniform
+            // factor from the anchor so rows/cols stay proportional).
+            (Geom::Table(t), GripRole::CircleCenter) => {
+                Geom::Table(crate::table::Table { insert: new_pos, ..t.clone() })
+            }
+            (Geom::Table(t), GripRole::LineEndA) => {
+                let s = t.size();
+                let (sin, cos) = t.rotation.sin_cos();
+                // Invert the rotation to get the dragged corner in grid space.
+                let d = new_pos - t.insert;
+                let gx = d.x * cos + d.y * sin;
+                let gy = -d.x * sin + d.y * cos;
+                if s.x.abs() < 1e-9 || s.y.abs() < 1e-9 { return self.clone(); }
+                let kx = gx / s.x;
+                let ky = (-gy) / s.y;
+                let k = kx.max(ky).max(0.05);
+                Geom::Table(crate::table::Table {
+                    row_h: t.row_h * k,
+                    col_w: t.col_w * k,
+                    font_height: t.font_height * k,
+                    ..t.clone()
+                })
+            }
+            (Geom::CenterMark(cm), GripRole::LineEndA)
+            | (Geom::CenterMark(cm), GripRole::LineEndB)
+            | (Geom::CenterMark(cm), GripRole::ArcEndStart)
+            | (Geom::CenterMark(cm), GripRole::ArcEndEnd) => {
+                let d = (new_pos - cm.center).len().max(1e-6);
+                Geom::CenterMark(CenterMark { size: d, ..*cm })
+            }
+            // Viewport grips
+            (Geom::Viewport(vp), GripRole::LineMid) => {
+                let delta = new_pos - vp.center;
+                Geom::Viewport(ViewportGeom {
+                    center: new_pos,
+                    model_center: vp.model_center + delta,
+                    ..vp.clone()
+                })
+            }
+            (Geom::Viewport(vp), GripRole::LineEndA) => {
+                // Moving the min corner: keeps max fixed, adjusts center + size.
+                let (_, mx) = vp.bbox_world();
+                let new_min = new_pos;
+                Geom::Viewport(ViewportGeom {
+                    center: (new_min + mx) * 0.5,
+                    width: (mx.x - new_min.x).max(1.0),
+                    height: (mx.y - new_min.y).max(1.0),
+                    ..vp.clone()
+                })
+            }
+            (Geom::Viewport(vp), GripRole::LineEndB) => {
+                // Moving the max corner: keeps min fixed, adjusts center + size.
+                let (mn, _) = vp.bbox_world();
+                let new_max = new_pos;
+                Geom::Viewport(ViewportGeom {
+                    center: (mn + new_max) * 0.5,
+                    width: (new_max.x - mn.x).max(1.0),
+                    height: (new_max.y - mn.y).max(1.0),
+                    ..vp.clone()
+                })
+            }
+            // ---- Donut ------------------------------------------------
+            (Geom::Donut(d), GripRole::CircleCenter) =>
+                Geom::Donut(Donut::new(new_pos, d.inner_radius, d.outer_radius)),
+            (Geom::Donut(d), GripRole::LineEndA) => {
+                // Outer grip: re-radius the ring; inner clamps to the new
+                // outer (Donut::new keeps inner <= outer).
+                let outer = (new_pos - d.center).len().max(EPS);
+                Geom::Donut(Donut::new(d.center, d.inner_radius, outer))
+            }
+            // ---- Wipeout / Region (vertex moves, like a polyline) -----
+            (Geom::Wipeout(w), GripRole::PolyVertex(i)) if i < w.pts.len() => {
+                let mut pts = w.pts.clone();
+                pts[i] = new_pos;
+                Geom::Wipeout(Wipeout { pts })
+            }
+            (Geom::Wipeout(w), GripRole::LineEndA) => {
+                let mut pts = w.pts.clone();
+                if let Some(p) = pts.first_mut() { *p = new_pos; }
+                Geom::Wipeout(Wipeout { pts })
+            }
+            (Geom::Region(rg), GripRole::PolyVertex(i)) if i < rg.loop_pts.len() => {
+                let mut loop_pts = rg.loop_pts.clone();
+                loop_pts[i] = new_pos;
+                Geom::Region(Region { loop_pts })
+            }
+            (Geom::Region(rg), GripRole::LineEndA) => {
+                let mut loop_pts = rg.loop_pts.clone();
+                if let Some(p) = loop_pts.first_mut() { *p = new_pos; }
+                Geom::Region(Region { loop_pts })
             }
             // Mismatched (role, geom) — return unchanged.
             (g, _) => g.clone(),
+        }
+    }
+
+    /// Issue #39 — corner-grip SCALE for a closed 4-vertex polyline (a
+    /// rectangle or parallelogram): dragging vertex `i` to `new_pos` keeps
+    /// the OPPOSITE vertex anchored and scales the two adjacent corners
+    /// along their edge vectors (a parallelogram decomposition in the shape's
+    /// own frame, so rotated rectangles work too). `uniform` (Shift) scales
+    /// every corner by one factor along the dragged diagonal. Crossing the
+    /// anchor flips the shape (negative factors) — the parallelogram math
+    /// handles that naturally. Returns `None` for non-quad / open / collapsed
+    /// polylines — callers fall back to the plain vertex move.
+    pub fn with_corner_scale(&self, i: usize, new_pos: Vec2, uniform: bool) -> Option<Geom> {
+        match self {
+            Geom::Polyline(p) if p.closed && p.vertices.len() == 4 => {
+                let anchor = p.vertices[(i + 2) % 4].pos;
+                let e1 = p.vertices[(i + 1) % 4].pos - anchor;
+                let e2 = p.vertices[(i + 3) % 4].pos - anchor;
+                let d = p.vertices[i].pos - anchor;      // = e1 + e2
+                if d.len() < EPS { return None; }
+                let rel = new_pos - anchor;
+                let (sx, sy) = if uniform {
+                    let s = rel.dot(d) / d.len_sq();
+                    (s, s)
+                } else {
+                    let denom = e1.x * e2.y - e1.y * e2.x;
+                    if denom.abs() < 1e-9 { return None; }
+                    let sx = (rel.x * e2.y - rel.y * e2.x) / denom;
+                    let sy = (e1.x * rel.y - e1.y * rel.x) / denom;
+                    (sx, sy)
+                };
+                // A scale to (near-)zero collapses the quad — refuse it.
+                if sx.abs() < 1e-6 || sy.abs() < 1e-6 { return None; }
+                let mut verts = p.vertices.clone();
+                verts[i].pos          = anchor + e1 * sx + e2 * sy;
+                verts[(i + 1) % 4].pos = anchor + e1 * sx;
+                verts[(i + 3) % 4].pos = anchor + e2 * sy;
+                Some(Geom::Polyline(Polyline {
+                    vertices: verts, closed: true, widths: p.widths.clone(),
+                }))
+            }
+            _ => None,
         }
     }
 }
@@ -2945,6 +4347,71 @@ mod fillet_chamfer_join_tests {
         } else { panic!(); }
     }
 
+    /// Issue #39 — corner-grip scale on a closed quad: dragging corner 0
+    /// scales the rectangle from the opposite corner (2,1); the anchor and
+    /// the two adjacent corners follow the parallelogram factors.
+    #[test]
+    fn grip_corner_scale_closed_quad() {
+        let pl = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 1.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        // Drag corner 0 (0,0) to (-1,-0.5): anchor stays (2,1); the other
+        // two corners scale to (-1,1) and (2,-0.5).
+        let out = pl.with_corner_scale(0, Vec2::new(-1.0, -0.5), false).expect("scale");
+        let Geom::Polyline(p) = out else { panic!("scaled quad stays a polyline") };
+        assert!(approx_eq(p.vertices[0].pos.x, -1.0) && approx_eq(p.vertices[0].pos.y, -0.5),
+            "dragged corner lands at the cursor");
+        assert!(approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
+            "opposite corner is the anchor");
+        assert!(approx_eq(p.vertices[1].pos.x, 2.0) && approx_eq(p.vertices[1].pos.y, -0.5),
+            "adjacent A scales along its edge");
+        assert!(approx_eq(p.vertices[3].pos.x, -1.0) && approx_eq(p.vertices[3].pos.y, 1.0),
+            "adjacent B scales along its edge");
+        // Uniform (Shift): dragging along the diagonal scales all corners by
+        // one factor — (2,1) stays put, (0,0) → (−2,−1) with s = 1.5.
+        let out = pl.with_corner_scale(0, Vec2::new(-1.0, -0.5), true).expect("uniform scale");
+        let Geom::Polyline(p) = out else { panic!("uniform scale") };
+        assert!(approx_eq(p.vertices[0].pos.x, -1.0) && approx_eq(p.vertices[0].pos.y, -0.5));
+        assert!(approx_eq(p.vertices[1].pos.x, 2.0) && approx_eq(p.vertices[1].pos.y, -0.5));
+        assert!(approx_eq(p.vertices[3].pos.x, -1.0) && approx_eq(p.vertices[3].pos.y, 1.0));
+        // Crossing the anchor flips (negative factors) but stays valid.
+        let out = pl.with_corner_scale(0, Vec2::new(3.0, 2.0), false).expect("flip");
+        let Geom::Polyline(p) = out else { panic!("flip") };
+        assert!(approx_eq(p.vertices[0].pos.x, 3.0) && approx_eq(p.vertices[0].pos.y, 2.0));
+        assert!(approx_eq(p.vertices[2].pos.x, 2.0) && approx_eq(p.vertices[2].pos.y, 1.0),
+            "anchor never moves");
+        // Non-quad / open polylines fall back to None (vertex move).
+        let open = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        });
+        assert!(open.with_corner_scale(0, Vec2::new(9.0, 9.0), false).is_none());
+        let pent = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 1.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(1.0, 2.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 2.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        assert!(pent.with_corner_scale(0, Vec2::new(9.0, 9.0), false).is_none());
+    }
+
     #[test]
     fn trim_polyline_segment_drops_clicked_sub_segment() {
         // Open polyline: (0,0) → (4,0) → (4,4). A vertical line at x=2
@@ -2964,22 +4431,154 @@ mod fillet_chamfer_join_tests {
             a: Vec2::new(2.0, -1.0), b: Vec2::new(2.0, 5.0),
         });
         let pieces = g.trim_at(&[cutter], Vec2::new(3.0, 0.0), false).unwrap();
-        // Open polylines now keep CONNECTED runs: the cut splits this into two
-        // polylines — (0,0)→(2,0) and (4,0)→(4,4) — instead of exploding to
-        // bare Lines, so the surviving structure stays a polyline.
-        assert_eq!(pieces.len(), 2);
-        for p in &pieces { assert!(matches!(p, Geom::Polyline(_))); }
-        // First run starts at (0,0) and ends at the cut (2,0); second is the
-        // untouched vertical leg.
+        // Nodes are vertices AND crossings, so the click removes ONLY the sub-edge
+        // it landed on — between the crossing (2,0) and the vertex (4,0). Two pieces
+        // survive: (0,0)→(2,0) and (4,0)→(4,4). The neighbour vertical arm is NOT
+        // carried off across the (4,0) vertex.
+        assert_eq!(pieces.len(), 2, "expected two survivors: {pieces:?}");
         let ends: Vec<(Vec2, Vec2)> = pieces.iter().map(|g| {
             if let Geom::Polyline(pl) = g {
                 (pl.vertices.first().unwrap().pos, pl.vertices.last().unwrap().pos)
             } else { unreachable!() }
         }).collect();
         assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 0.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 2.0) && approx_eq(b.y, 0.0)));
+            approx_eq(a.x, 0.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 2.0) && approx_eq(b.y, 0.0)),
+            "left piece (0,0)→(2,0): {ends:?}");
         assert!(ends.iter().any(|&(a, b)|
-            approx_eq(a.x, 4.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 4.0) && approx_eq(b.y, 4.0)));
+            approx_eq(a.x, 4.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 4.0) && approx_eq(b.y, 4.0)),
+            "far arm (4,0)→(4,4) survives intact: {ends:?}");
+    }
+
+    #[test]
+    fn trim_self_crossing_polyline_cuts_at_the_crossing_not_the_vertex() {
+        // Hourglass polyline (0,0)→(4,4)→(4,0)→(0,4): seg0 and seg2 cross at
+        // (2,2). Trimming it against ITSELF (no external cutter) and clicking the
+        // (0,0)→(2,2) stub must remove only up to the CROSSING, not the whole
+        // (0,0)→(4,4) vertex-to-vertex segment.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false, widths: Vec::new(),
+        };
+        // No external cutters (self-trim); click on the stub near (1,1).
+        let pieces = Geom::Polyline(pl).trim_at(&[], Vec2::new(1.0, 1.0), false).unwrap();
+        let verts: Vec<Vec2> = pieces.iter().flat_map(|g| {
+            if let Geom::Polyline(pl) = g { pl.vertices.iter().map(|v| v.pos).collect() }
+            else { Vec::new() }
+        }).collect();
+        // The (0,0) stub end is gone; the crossing (2,2) is a new endpoint.
+        assert!(!verts.iter().any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 0.0)),
+            "stub end (0,0) should be trimmed off: {verts:?}");
+        assert!(verts.iter().any(|p| approx_eq(p.x, 2.0) && approx_eq(p.y, 2.0)),
+            "crossing (2,2) should be the new cut end: {verts:?}");
+    }
+
+    #[test]
+    fn trim_self_crossing_arm_removes_only_the_clicked_arm_not_the_neighbour() {
+        // "W" polyline: (0,0)→(4,8)→(8,0)→(12,8)→(2,4)→(10,4). The last two
+        // segments cross the earlier arms, and (4,8)/(8,0) are plain vertices (no
+        // crossing). Clicking the left arm (0,0)→(4,8) must remove ONLY up to the
+        // (4,8) vertex — its neighbour arm (4,8)→(8,0) must stay.
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 8.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(8.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(12.0, 8.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(2.0, 4.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false, widths: Vec::new(),
+        };
+        // Self-trim (no external cutters); click the LEFT arm near (2,4)… use a
+        // point clearly on segment 0 below the crossing: (1,2).
+        let pieces = Geom::Polyline(pl).trim_at(&[], Vec2::new(1.0, 2.0), false).unwrap();
+        // The (4,8) vertex must still appear as an endpoint on a survivor — the
+        // neighbour arm (4,8)→(8,0) was NOT carried off with the clicked arm.
+        let keeps_neighbour_vertex = pieces.iter().any(|g| {
+            if let Geom::Polyline(pl) = g {
+                pl.vertices.iter().any(|v| approx_eq(v.pos.x, 4.0) && approx_eq(v.pos.y, 8.0))
+            } else { false }
+        });
+        assert!(keeps_neighbour_vertex,
+            "neighbour arm through vertex (4,8) must survive: {pieces:?}");
+        // And the clicked point (1,2) must be gone from every survivor.
+        let clicked_gone = !pieces.iter().any(|g| {
+            if let Geom::Polyline(pl) = g {
+                pl.vertices.iter().any(|v| approx_eq(v.pos.x, 1.0) && approx_eq(v.pos.y, 2.0))
+            } else { false }
+        });
+        assert!(clicked_gone, "clicked arm should be removed: {pieces:?}");
+    }
+
+    #[test]
+    fn trim_polyline_middle_piece_between_two_cutters() {
+        // Open polyline (0,0)→(10,0)→(10,10). Two vertical cutters at x=3 and
+        // x=7 both cross the horizontal leg. Click at (5,0) — the MIDDLE piece
+        // (3,0)→(7,0) is removed, leaving (0,0)→(3,0) and (7,0)→(10,0)→(10,10).
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+            ],
+            closed: false, widths: Vec::new(),
+        };
+        let cutters = vec![
+            Geom::Line(Line { a: Vec2::new(3.0, -1.0), b: Vec2::new(3.0, 1.0) }),
+            Geom::Line(Line { a: Vec2::new(7.0, -1.0), b: Vec2::new(7.0, 1.0) }),
+        ];
+        let pieces = Geom::Polyline(pl).trim_at(&cutters, Vec2::new(5.0, 0.0), false).unwrap();
+        assert_eq!(pieces.len(), 2, "expected two survivors, got {pieces:?}");
+        let ends: Vec<(Vec2, Vec2)> = pieces.iter().map(|g| {
+            if let Geom::Polyline(pl) = g {
+                (pl.vertices.first().unwrap().pos, pl.vertices.last().unwrap().pos)
+            } else { unreachable!() }
+        }).collect();
+        assert!(ends.iter().any(|&(a, b)|
+            approx_eq(a.x, 0.0) && approx_eq(b.x, 3.0) && approx_eq(b.y, 0.0)), "left piece: {ends:?}");
+        assert!(ends.iter().any(|&(a, b)|
+            approx_eq(a.x, 7.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 10.0) && approx_eq(b.y, 10.0)),
+            "right piece to the end: {ends:?}");
+    }
+
+    #[test]
+    fn trim_closed_polyline_removes_only_the_clicked_arc_keeps_the_rest_as_one() {
+        // Square closed polyline (0,0)→(10,0)→(10,10)→(0,10). Two short vertical
+        // cutters cross ONLY the bottom edge, at x=3 and x=7. Clicking the bottom
+        // middle (5,0) must remove just the (3,0)→(7,0) sub-arc and keep the rest
+        // as ONE open polyline wrapping through the corners — NOT explode the whole
+        // square into independent segments (the "over-crossed pline" report).
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        };
+        let cutters = vec![
+            Geom::Line(Line { a: Vec2::new(3.0, -1.0), b: Vec2::new(3.0, 1.0) }),
+            Geom::Line(Line { a: Vec2::new(7.0, -1.0), b: Vec2::new(7.0, 1.0) }),
+        ];
+        let pieces = Geom::Polyline(pl).trim_at(&cutters, Vec2::new(5.0, 0.0), false).unwrap();
+        assert_eq!(pieces.len(), 1, "closed loop → one surviving open piece, got {pieces:?}");
+        let Geom::Polyline(surv) = &pieces[0] else { panic!("expected a polyline") };
+        assert!(!surv.closed, "survivor must be OPEN");
+        let vs: Vec<Vec2> = surv.vertices.iter().map(|v| v.pos).collect();
+        assert!(approx_eq(vs.first().unwrap().x, 7.0) && approx_eq(vs.first().unwrap().y, 0.0),
+            "survivor starts at the (7,0) cut: {vs:?}");
+        assert!(approx_eq(vs.last().unwrap().x, 3.0) && approx_eq(vs.last().unwrap().y, 0.0),
+            "survivor ends at the (3,0) cut: {vs:?}");
+        assert!(vs.iter().any(|p| approx_eq(p.x, 0.0) && approx_eq(p.y, 10.0)),
+            "survivor wraps through corner (0,10): {vs:?}");
+        assert!(!vs.iter().any(|p| approx_eq(p.x, 5.0) && approx_eq(p.y, 0.0)),
+            "the clicked span must be gone: {vs:?}");
     }
 
     #[test]
@@ -3027,6 +4626,42 @@ mod fillet_chamfer_join_tests {
         });
         let hits = intersect(&g, &line);
         assert_eq!(hits.len(), 2);
+    }
+
+    /// Issue #20 — an INWARD ellipse offset beyond the minimum radius of
+    /// curvature (b²/a at the minor-axis ends) must error, not emit the
+    /// self-intersecting mess. Outward offsets are unaffected.
+    #[test]
+    fn offset_ellipse_inward_beyond_curvature_is_rejected() {
+        let el = Ellipse {
+            center: Vec2::ZERO,
+            major:  Vec2::new(4.0, 0.0),
+            ratio:  0.5,
+        };
+        // b²/a = (2²)/4 = 1.0 — anything above ~1 inward must fail.
+        let g = Geom::Ellipse(el);
+        let inside = Vec2::new(0.0, 0.0);          // click inside → inward
+        let err = g.offset(1.2, inside).unwrap_err();
+        assert!(err.contains("radius of curvature"), "got: {err}");
+        // Just under the limit still works.
+        let ok = g.offset(0.9, inside).unwrap();
+        if let Geom::Polyline(p) = ok {
+            assert!(p.closed);
+            assert!(p.vertices.len() >= 48);
+        } else {
+            panic!("inward ellipse offset must stay a polyline");
+        }
+        // A sweep that avoids the high-curvature major-axis ends can go
+        // deeper (ρ is ~8 there, vs ~1 at the tips).
+        let ea = Geom::EllipseArc(crate::EllipseArc {
+            ellipse: el,
+            start_param: std::f64::consts::FRAC_PI_2 - 0.3,
+            sweep_param: 0.6,                            // around the minor end only
+        });
+        assert!(ea.offset(1.2, inside).is_ok(),
+            "arc away from the high-curvature region may offset further");
+        // Outward is unlimited (no curvature bound applies).
+        assert!(g.offset(50.0, Vec2::new(100.0, 0.0)).is_ok());
     }
 
     #[test]
@@ -3226,5 +4861,575 @@ mod fillet_chamfer_join_tests {
         assert!((c2 - center).len() < 1e-6, "centre {:?}", c2);
         assert!((r2 - 5.0).abs() < 1e-6, "radius {}", r2);
         assert!((sw - sweep).abs() < 1e-6, "sweep {}", sw);
+    }
+}
+
+#[cfg(test)]
+mod nearest_param_tests {
+    use super::*;
+    use crate::math::Vec2;
+
+    // G9: single-seed Newton converges to a LOCAL foot. On an elongated ellipse
+    // (a=10, b=1), a query just off-centre has its atan2 seed pointing at the FAR
+    // major vertex (t≈0, dist≈10) where Newton stalls (step≈0), while the global
+    // nearest is a MINOR vertex (dist≈1). The multi-start must return a minor
+    // vertex, not the major. (Fails-before: the single-seed version returns t≈0.)
+    //
+    // Sign-agnostic: for a query near the centre the two minor-vertex feet are
+    // ~equidistant (differ by ~0.002), so best-of-4 may pick either — both are
+    // geometrically correct. The actual G9 bug is major-vs-minor (a ~9-unit error),
+    // which is what this pins.
+    #[test]
+    fn nearest_param_returns_global_not_local_foot() {
+        let c = Vec2::new(1.0e6, 1.0e6);
+        let el = Ellipse { center: c, major: Vec2::new(10.0, 0.0), ratio: 0.1 }; // a=10, b=1
+        let q = Vec2::new(c.x + 0.1, c.y + 0.001);
+        let t = el.nearest_param(q);
+        let foot = el.point_at(t);
+        let major = Vec2::new(c.x + 10.0, c.y);       // the local (wrong) foot, dist ≈ 10
+        assert!(foot.dist(q) < 2.0,
+            "foot {foot:?} is far from the query (dist {}) — a local root", foot.dist(q));
+        assert!(foot.dist(major) > 5.0,
+            "returned the FAR major vertex {major:?} — single-seed local root");
+        // near a MINOR vertex (|x| small in local frame), either ± sign.
+        assert!((foot.x - c.x).abs() < 1.0,
+            "foot {foot:?} not near a minor vertex (should be ~x=center)");
+    }
+}
+
+
+#[cfg(test)]
+mod centermark_tests {
+    use super::*;
+    use crate::math::Vec2;
+
+    fn cm() -> CenterMark {
+        CenterMark { center: Vec2::new(5.0, 5.0), size: 2.0, rotation: 0.0 }
+    }
+
+    #[test]
+    fn tips_form_two_perpendicular_arms() {
+        let m = cm();
+        let t = m.tips();
+        // r / r+90 / r+180 / r+270.
+        assert!((t[0] - Vec2::new(7.0, 5.0)).len() < 1e-12);
+        assert!((t[1] - Vec2::new(5.0, 7.0)).len() < 1e-12);
+        assert!((t[2] - Vec2::new(3.0, 5.0)).len() < 1e-12);
+        assert!((t[3] - Vec2::new(5.0, 3.0)).len() < 1e-12);
+    }
+
+    #[test]
+    fn bbox_covers_the_cross() {
+        let m = cm();
+        let (mn, mx) = m.bbox();
+        assert!((mn.x - 3.0).abs() < 1e-12 && (mn.y - 3.0).abs() < 1e-12);
+        assert!((mx.x - 7.0).abs() < 1e-12 && (mx.y - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn distance_to_point_is_zero_on_the_arm() {
+        let m = cm();
+        let on = Vec2::new(6.0, 5.0);   // on the horizontal arm
+        assert!(m.distance_to_point(on) < 1e-12);
+        let off = Vec2::new(6.0, 6.5);  // 1.0 from the vertical arm (x=5)
+        assert!((m.distance_to_point(off) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rotated_cross_turns() {
+        let m = cm();
+        let g = Geom::CenterMark(m).rotated(Vec2::new(5.0, 5.0), std::f64::consts::FRAC_PI_2);
+        if let Geom::CenterMark(r) = g {
+            assert!((r.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+            assert!((r.center - Vec2::new(5.0, 5.0)).len() < 1e-12);
+        } else { panic!("rotated lost the variant"); }
+    }
+
+    #[test]
+    fn scaled_and_translated() {
+        let g = Geom::CenterMark(cm()).translated(Vec2::new(10.0, 0.0));
+        if let Geom::CenterMark(m) = g {
+            assert!((m.center - Vec2::new(15.0, 5.0)).len() < 1e-12);
+        } else { panic!(); }
+        let g2 = Geom::CenterMark(cm()).scaled(Vec2::ZERO, 3.0);
+        if let Geom::CenterMark(m) = g2 {
+            assert!((m.size - 6.0).abs() < 1e-12);
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn intersects_other_geometry_through_arms() {
+        use crate::intersect::intersect;
+        let m = Geom::CenterMark(cm());
+        let line = Geom::Line(Line { a: Vec2::new(0.0, 6.0), b: Vec2::new(10.0, 6.0) });
+        let hits = intersect(&m, &line);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0] - Vec2::new(5.0, 6.0)).len() < 1e-9);
+    }
+
+    #[test]
+    fn grip_roles_and_moves() {
+        let g = Geom::CenterMark(cm());
+        let grips = g.grip_points();
+        assert_eq!(grips.len(), 5);
+        // Center grip translates; a tip grip resizes.
+        let moved = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(0.0, 0.0));
+        if let Geom::CenterMark(m) = moved {
+            assert!((m.center - Vec2::new(0.0, 0.0)).len() < 1e-12);
+            assert!((m.size - 2.0).abs() < 1e-12);
+        } else { panic!(); }
+        let resized = g.with_grip_moved(GripRole::LineEndA, Vec2::new(5.0, 9.0));
+        if let Geom::CenterMark(m) = resized {
+            assert!((m.size - 4.0).abs() < 1e-12, "size {}", m.size);
+        } else { panic!(); }
+    }
+}
+
+#[cfg(test)]
+mod xline_tests {
+    use super::*;
+
+    fn xl() -> Xline {
+        Xline::new(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0))
+    }
+
+    #[test]
+    fn direction_normalized_at_construction() {
+        let x = Xline::new(Vec2::new(1.0, 2.0), Vec2::new(0.0, 5.0));
+        assert!((x.dir.len() - 1.0).abs() < 1e-12);
+        assert!((x.dir.y - 1.0).abs() < 1e-12);
+        // Zero direction falls back to +X.
+        let z = Xline::new(Vec2::ZERO, Vec2::ZERO);
+        assert!((z.dir.x - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn distance_is_perpendicular() {
+        let x = xl();
+        assert!((x.distance_to_point(Vec2::new(7.0, 3.0)) - 3.0).abs() < 1e-9);
+        assert!((x.distance_to_point(Vec2::new(-4.0, 2.5)) - 2.5).abs() < 1e-9);
+        assert!(x.distance_to_point(Vec2::new(0.0, 0.0)) < 1e-9);
+    }
+
+    #[test]
+    fn clip_to_rect_returns_visible_segment() {
+        let x = xl();
+        let l = x.clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0)).unwrap();
+        assert!((l.a - Vec2::new(-5.0, 0.0)).len() < 1e-9);
+        assert!((l.b - Vec2::new(5.0, 0.0)).len() < 1e-9);
+        // Parallel-but-outside line clips to nothing.
+        let miss = Xline::new(Vec2::new(0.0, 10.0), Vec2::new(1.0, 0.0));
+        assert!(miss.clip_to_rect(Vec2::new(-5.0, -1.0), Vec2::new(5.0, 1.0)).is_none());
+    }
+
+    #[test]
+    fn transforms_keep_geometry_consistent() {
+        let x = Geom::Xline(xl());
+        let t = x.translated(Vec2::new(3.0, 4.0));
+        if let Geom::Xline(tx) = t { assert!((tx.base - Vec2::new(3.0, 4.0)).len() < 1e-9); }
+        else { panic!("translated must stay xline"); }
+        let r = x.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        if let Geom::Xline(rx) = r {
+            assert!((rx.dir.y - 1.0).abs() < 1e-9);
+            assert!(rx.distance_to_point(Vec2::new(0.0, 5.0)) < 1e-9);
+        } else { panic!("rotated must stay xline"); }
+        let m = x.mirrored(Vec2::new(0.0, 0.0), Vec2::new(0.0, 1.0));
+        if let Geom::Xline(mx) = m { assert!((mx.dir.x + 1.0).abs() < 1e-9); }
+        else { panic!("mirrored must stay xline"); }
+        let s = x.scaled(Vec2::ZERO, 2.0);
+        if let Geom::Xline(sx) = s { assert!((sx.dir.len() - 1.0).abs() < 1e-9); }
+        else { panic!("scaled must stay xline"); }
+    }
+
+    #[test]
+    fn offset_moves_base_along_normal() {
+        let x = Geom::Xline(xl());
+        let o = x.offset(2.0, Vec2::new(0.0, 1.0)).unwrap();
+        if let Geom::Xline(ox) = o {
+            assert!((ox.base.y - 2.0).abs() < 1e-9);
+            let orig = xl();
+            assert!((ox.dir - orig.dir).len() < 1e-9);
+        } else { panic!("offset must stay an xline"); }
+    }
+
+    #[test]
+    fn intersects_other_shapes() {
+        use crate::intersect::intersect;
+        let x = Geom::Xline(xl());
+        let l = Geom::Line(Line { a: Vec2::new(5.0, -1.0), b: Vec2::new(5.0, 1.0) });
+        let hits = intersect(&x, &l);
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0] - Vec2::new(5.0, 0.0)).len() < 1e-9);
+
+        let c = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 3.0 });
+        let hits = intersect(&x, &c);
+        assert_eq!(hits.len(), 2);
+        assert!((hits[0].x + 3.0).abs() < 1e-9 || (hits[0].x - 3.0).abs() < 1e-9);
+
+        // Parallel xlines never meet.
+        let x2 = Geom::Xline(Xline::new(Vec2::new(0.0, 1.0), Vec2::new(1.0, 0.0)));
+        assert!(intersect(&x, &x2).is_empty());
+    }
+
+    #[test]
+    fn bbox_is_finite_and_huge() {
+        let x = xl();
+        let (mn, mx) = x.bbox();
+        assert!(mn.x < -1e5 && mx.x > 1e5);
+        assert!(mn.y.abs() < 1e-9 && mx.y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn grips_move_base_or_direction() {
+        let g = Geom::Xline(xl());
+        let grips = g.grip_points();
+        assert_eq!(grips.len(), 2);
+        let moved = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(9.0, 9.0));
+        if let Geom::Xline(mx) = moved {
+            assert!((mx.base - Vec2::new(9.0, 9.0)).len() < 1e-9);
+        } else { panic!("grip must keep xline"); }
+        let turned = g.with_grip_moved(GripRole::LineEndA, Vec2::new(0.0, 1.0));
+        if let Geom::Xline(tx) = turned {
+            assert!((tx.dir.y - 1.0).abs() < 1e-9);
+        } else { panic!("grip must keep xline"); }
+    }
+}
+
+#[cfg(test)]
+mod revcloud_tests {
+    use super::*;
+
+    #[test]
+    fn rect_cloud_is_closed_with_bulges() {
+        let pl = Polyline::revcloud_rect(
+            Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
+        assert!(pl.closed);
+        assert!(pl.vertices.len() >= 4);
+        // Every segment has a non-zero outward bulge.
+        for v in &pl.vertices {
+            assert!(v.bulge.abs() > 1e-6, "every arc must bulge");
+        }
+        // All vertices lie on the rect's perimeter.
+        for v in &pl.vertices {
+            let on_x = (v.pos.x - 0.0).abs() < 1e-9 || (v.pos.x - 10.0).abs() < 1e-9;
+            let on_y = (v.pos.y - 0.0).abs() < 1e-9 || (v.pos.y - 6.0).abs() < 1e-9;
+            assert!(on_x || on_y, "vertex off rect perimeter: {:?}", v.pos);
+        }
+        // The bbox must EXCEED the rect (outward bulges).
+        let (mn, mx) = pl.bbox();
+        for seg in crate::join::polyline_segments(&pl) {
+            let (s1, s2) = seg.bbox();
+            eprintln!("seg bbox {s1:?}..{s2:?}");
+        }
+        assert!(mn.x < -0.01 && mn.y < -0.01 && mx.x > 10.01 && mx.y > 6.01,
+            "bbox {mn:?}..{mx:?} must exceed rect");
+    }
+
+    #[test]
+    fn degenerate_rect_is_rejected() {
+        assert!(Polyline::revcloud_rect(
+            Vec2::new(0.0, 0.0), Vec2::new(0.0, 5.0), 0.5).is_none());
+        assert!(Polyline::revcloud_rect(
+            Vec2::new(0.0, 0.0), Vec2::new(5.0, 5.0), 0.5).is_some());
+    }
+
+    #[test]
+    fn corner_order_does_not_matter() {
+        let a = Polyline::revcloud_rect(
+            Vec2::new(0.0, 0.0), Vec2::new(10.0, 6.0), 0.5).unwrap();
+        let b = Polyline::revcloud_rect(
+            Vec2::new(10.0, 6.0), Vec2::new(0.0, 0.0), 0.5).unwrap();
+        assert_eq!(a.vertices.len(), b.vertices.len());
+    }
+
+    #[test]
+    fn cloud_area_is_positive() {
+        let pl = Polyline::revcloud_rect(
+            Vec2::new(0.0, 0.0), Vec2::new(4.0, 3.0), 0.5).unwrap();
+        // Shoelace over the polygon approximates the cloud area > rect area.
+        let mut area2 = 0.0;
+        let n = pl.vertices.len();
+        for i in 0..n {
+            let a = pl.vertices[i].pos;
+            let b = pl.vertices[(i + 1) % n].pos;
+            area2 += a.x * b.y - b.x * a.y;
+        }
+        assert!(area2 > 0.0, "CCW winding");
+    }
+}
+
+#[cfg(test)]
+mod area_tests {
+    use super::*;
+
+    #[test]
+    fn circle_area_and_perimeter() {
+        let c = Geom::Circle(Circle { center: Vec2::ZERO, radius: 2.0 });
+        assert!((c.measured_area().unwrap() - std::f64::consts::PI * 4.0).abs() < 1e-9);
+        assert!((c.measured_perimeter().unwrap() - std::f64::consts::TAU * 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rect_polyline_area() {
+        let pl = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        assert!((pl.measured_area().unwrap() - 40.0).abs() < 1e-9);
+        assert!((pl.measured_perimeter().unwrap() - 28.0).abs() < 1e-9);
+        // Open polyline → no area.
+        let open = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        });
+        assert!(open.measured_area().is_none());
+    }
+
+    #[test]
+    fn bulged_polyline_area_is_larger_than_chord_area() {
+        // Semicircle bulge on the top edge of a 2x2 rect (bulge = 1 = 180°).
+        let pl = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(-1.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 1.0 },
+                PolyVertex { pos: Vec2::new(1.0, 2.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(-1.0, 2.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        });
+        let area = pl.measured_area().unwrap();
+        // Chord-based rect area would be 4.0; the top semicircle adds π/2.
+        assert!((area - (4.0 + std::f64::consts::FRAC_PI_2)).abs() < 1e-3,
+            "area {area} must include the bulge (64-pt sampling ~0.1%)");
+        let perim = pl.measured_perimeter().unwrap();
+        assert!((perim - (6.0 + std::f64::consts::PI)).abs() < 1e-6,
+            "perimeter {perim} must include the arc");
+    }
+
+    #[test]
+    fn ellipse_area() {
+        let e = Geom::Ellipse(Ellipse {
+            center: Vec2::ZERO,
+            major: Vec2::new(3.0, 0.0),
+            ratio: 0.5,
+        });
+        // a=3, b=1.5 → π·4.5
+        assert!((e.measured_area().unwrap() - std::f64::consts::PI * 4.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn text_has_no_area() {
+        let t = Geom::Text(crate::text::Text::empty());
+        assert!(t.measured_area().is_none());
+        assert!(t.measured_perimeter().is_none());
+    }
+}
+
+/// Ray-casting point-in-polygon test (closed vertex loop, CW or CCW).
+/// Boundary points count as inside. `pts` must have at least 3 vertices.
+pub fn point_in_polygon(p: Vec2, pts: &[Vec2]) -> bool {
+    let n = pts.len();
+    if n < 3 { return false; }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[j]);
+        // Boundary hit → inside (avoids the classic ray-grazing ambiguity).
+        let cross = (p - a).cross(b - a);
+        if cross.abs() < 1e-12 && p.x >= a.x.min(b.x) - 1e-12
+            && p.x <= a.x.max(b.x) + 1e-12
+            && p.y >= a.y.min(b.y) - 1e-12
+            && p.y <= a.y.max(b.y) + 1e-12
+        {
+            return true;
+        }
+        if ((a.y > p.y) != (b.y > p.y))
+            && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+#[cfg(test)]
+mod ray_tests {
+    use super::*;
+    use crate::math::approx_eq;
+
+    #[test]
+    fn ray_clips_forward_only() {
+        // Horizontal ray from (0,0) → +x. A rect fully BEHIND the base
+        // (x < 0) must clip to nothing; the base itself is included.
+        let r = Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0));
+        assert!(r.clip_to_rect(Vec2::new(-10.0, -1.0), Vec2::new(-2.0, 1.0)).is_none());
+        let seg = r.clip_to_rect(Vec2::new(-1.0, -1.0), Vec2::new(10.0, 1.0))
+            .expect("forward rect hits");
+        assert!(approx_eq(seg.a.x, 0.0) && approx_eq(seg.a.y, 0.0), "clip starts at base");
+        assert!(approx_eq(seg.b.x, 10.0) && approx_eq(seg.b.y, 0.0), "clip reaches rect edge");
+    }
+
+    #[test]
+    fn ray_distance_is_half_line() {
+        let r = Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0));
+        // Behind the base → distance to the base, not the perpendicular.
+        assert!(approx_eq(r.distance_to_point(Vec2::new(-5.0, 3.0)), 5.0_f64.hypot(3.0)));
+        // Ahead → perpendicular distance.
+        assert!(approx_eq(r.distance_to_point(Vec2::new(7.0, 4.0)), 4.0));
+    }
+
+    #[test]
+    fn ray_bbox_is_forward() {
+        let r = Ray::new(Vec2::new(1.0, 2.0), Vec2::new(0.0, 1.0));
+        let (mn, mx) = r.bbox();
+        // Forward +y only: mn.x = mx.x = 1, mn.y = 2.
+        assert!(approx_eq(mn.x, 1.0) && approx_eq(mx.x, 1.0));
+        assert!(approx_eq(mn.y, 2.0));
+        assert!(approx_eq(mx.y, 2.0 + 1e6));
+    }
+
+    #[test]
+    fn ray_transforms() {
+        let r = Geom::Ray(Ray::new(Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)));
+        let t = r.translated(Vec2::new(10.0, 10.0));
+        let Geom::Ray(t2) = t else { panic!("translated lost"); };
+        assert!(approx_eq(t2.base.x, 11.0) && approx_eq(t2.base.y, 10.0));
+        assert!(approx_eq(t2.dir.x, 0.0) && approx_eq(t2.dir.y, 1.0));
+        let rot = r.rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        let Geom::Ray(r2) = rot else { panic!("rotated lost"); };
+        // base (1,0) → (0,1); dir (0,1) → (-1,0).
+        assert!(approx_eq(r2.base.x, 0.0) && approx_eq(r2.base.y, 1.0));
+        assert!(approx_eq(r2.dir.x, -1.0) && approx_eq(r2.dir.y, 0.0));
+        let mir = r.mirrored(Vec2::new(-10.0, 0.0), Vec2::new(10.0, 0.0));
+        let Geom::Ray(m2) = mir else { panic!("mirror lost"); };
+        assert!(approx_eq(m2.base.x, 1.0) && approx_eq(m2.base.y, 0.0));
+        assert!(approx_eq(m2.dir.x, 0.0) && approx_eq(m2.dir.y, -1.0));
+    }
+
+    #[test]
+    fn point_in_polygon_ray_cast() {
+        let sq = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0),
+                      Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)];
+        assert!(point_in_polygon(Vec2::new(5.0, 5.0), &sq));
+        assert!(point_in_polygon(Vec2::new(0.0, 0.0), &sq), "vertex counts inside");
+        assert!(point_in_polygon(Vec2::new(10.0, 5.0), &sq), "edge counts inside");
+        assert!(!point_in_polygon(Vec2::new(-1.0, 5.0), &sq));
+        assert!(!point_in_polygon(Vec2::new(15.0, 15.0), &sq));
+        // Concave U: the notch is outside.
+        let u = vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0),
+                     Vec2::new(6.0, 10.0), Vec2::new(6.0, 4.0), Vec2::new(4.0, 4.0),
+                     Vec2::new(4.0, 10.0), Vec2::new(0.0, 10.0)];
+        assert!(!point_in_polygon(Vec2::new(5.0, 8.0), &u), "in the top notch");
+        assert!(point_in_polygon(Vec2::new(5.0, 2.0), &u), "inside the cavity floor");
+    }
+
+    #[test]
+    fn ray_offset_and_split_error() {
+        let g = Geom::Ray(Ray::new(Vec2::ZERO, Vec2::new(1.0, 0.0)));
+        let off = g.offset(2.0, Vec2::new(0.0, 1.0)).expect("offset");
+        let Geom::Ray(r) = off else { panic!("offset lost"); };
+        assert!(approx_eq(r.base.y, 2.0));
+        assert!(approx_eq(r.dir.x, 1.0));
+        assert!(g.split_at(Vec2::new(5.0, 0.0)).is_err(), "ray cannot be split");
+    }
+}
+
+#[cfg(test)]
+mod donut_wipeout_region_tests {
+    use super::*;
+    use crate::approx_eq;
+
+    #[test]
+    fn donut_new_clamps_radii() {
+        // inner > outer → clamped down to outer.
+        let d = Donut::new(Vec2::ZERO, 5.0, 3.0);
+        assert!(d.inner_radius <= d.outer_radius + 1e-12);
+        assert!(approx_eq(d.inner_radius, 3.0));
+        // negative inner → 0 (filled disc).
+        let d2 = Donut::new(Vec2::ZERO, -1.0, 4.0);
+        assert!(approx_eq(d2.inner_radius, 0.0));
+    }
+
+    #[test]
+    fn donut_distance_inside_hole_is_radial() {
+        let d = Donut::new(Vec2::new(10.0, 10.0), 2.0, 5.0);
+        // Center (inside the hole) → distance to the inner edge.
+        assert!(approx_eq(d.distance_to_point(Vec2::new(10.0, 10.0)), 2.0));
+        // On the ring → 0.
+        assert!(approx_eq(d.distance_to_point(Vec2::new(13.5, 10.0)), 0.0));
+        // Outside → distance to the outer edge.
+        assert!(approx_eq(d.distance_to_point(Vec2::new(17.0, 10.0)), 2.0));
+    }
+
+    #[test]
+    fn donut_bbox_is_outer_square() {
+        let d = Donut::new(Vec2::new(1.0, 2.0), 1.0, 4.0);
+        let (mn, mx) = d.bbox();
+        assert!((mn - Vec2::new(-3.0, -2.0)).len() < 1e-9);
+        assert!((mx - Vec2::new(5.0, 6.0)).len() < 1e-9);
+    }
+
+    #[test]
+    fn donut_transform_arms_preserve_geom() {
+        let g = Geom::Donut(Donut::new(Vec2::new(1.0, 1.0), 1.0, 2.0));
+        // Translated → center moves, radii unchanged.
+        let t = g.translated(Vec2::new(10.0, 0.0));
+        let Geom::Donut(td) = t else { panic!("translated must stay donut") };
+        assert!((td.center - Vec2::new(11.0, 1.0)).len() < 1e-9);
+        assert!(approx_eq(td.outer_radius, 2.0));
+        // Scaled about origin → radii scale, center scales.
+        let s = g.scaled(Vec2::ZERO, 2.0);
+        let Geom::Donut(sd) = s else { panic!("scaled must stay donut") };
+        assert!((sd.center - Vec2::new(2.0, 2.0)).len() < 1e-9);
+        assert!(approx_eq(sd.outer_radius, 4.0));
+        assert!(approx_eq(sd.inner_radius, 2.0));
+        // Offset → ring grows/shrinks in place (side picks the hand).
+        let o = g.offset(0.5, Vec2::new(0.0, 2.0)).expect("offset");
+        let Geom::Donut(od) = o else { panic!("offset must stay donut") };
+        assert!((od.center - Vec2::new(1.0, 1.0)).len() < 1e-9, "center unchanged");
+        assert!(approx_eq(od.outer_radius, 1.5), "ring shrinks on the inside hand");
+        assert!(approx_eq(od.inner_radius, 0.5));
+        // Grip move of the center repositions the ring.
+        let m = g.with_grip_moved(GripRole::CircleCenter, Vec2::new(9.0, 9.0));
+        let Geom::Donut(md) = m else { panic!("grip must keep donut") };
+        assert!((md.center - Vec2::new(9.0, 9.0)).len() < 1e-9);
+    }
+
+    #[test]
+    fn wipeout_and_region_bbox_distance_and_transform() {
+        let pts = vec![
+            Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0),
+            Vec2::new(4.0, 3.0), Vec2::new(0.0, 3.0),
+        ];
+        for g in [Geom::Wipeout(Wipeout { pts: pts.clone() }),
+                  Geom::Region(Region { loop_pts: pts.clone() })] {
+            // bbox spans the loop.
+            let (mn, mx) = g.bbox();
+            assert!((mn - Vec2::new(0.0, 0.0)).len() < 1e-9);
+            assert!((mx - Vec2::new(4.0, 3.0)).len() < 1e-9);
+            // Inside → 0 distance; outside → edge distance.
+            assert!(approx_eq(g.distance_to_point(Vec2::new(2.0, 1.5)), 0.0));
+            assert!(approx_eq(g.distance_to_point(Vec2::new(6.0, 1.5)), 2.0));
+            // Translate moves every vertex.
+            let t = g.translated(Vec2::new(10.0, -5.0));
+            let loop_pts = match &t {
+                Geom::Wipeout(w) => &w.pts,
+                Geom::Region(rg) => &rg.loop_pts,
+                _ => unreachable!(),
+            };
+            assert!((loop_pts[1] - Vec2::new(14.0, -5.0)).len() < 1e-9);
+        }
     }
 }

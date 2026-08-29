@@ -92,7 +92,8 @@ pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
     // an explicit absence of a claim rather than a claim of metres, and an exotic code is left
     // unmapped because a wrong guess beats no guess only if it is right.
     if let Some(m) = insunits_to_metres(src.header.insertion_units as i32) {
-        doc.units = cad_kernel::DocUnits::new(m, cad_kernel::UnitSource::Declared);
+        doc.units = cad_kernel::Units::from_metres_per_unit(
+            m, cad_kernel::UnitSource::Declared);
     }
 
     // ---- layers, before the entities that name them -----------------------------------------
@@ -113,6 +114,7 @@ pub fn convert(src: &acadrust::CadDocument) -> (Document, Tally) {
             visible: !l.is_off(),
             locked: l.is_locked(),
             frozen: l.is_frozen(),
+            order: 0,
             plottable: true,
         });
     }
@@ -258,6 +260,7 @@ fn build(
                 rotation: ins.rotation + extra,
                 mirror_x,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+                attr_values: Vec::new(),
             })
         }
         // EVERYTHING ELSE IS SKIPPED, DELIBERATELY, AND COUNTED. Text, dimensions, hatches, 3D

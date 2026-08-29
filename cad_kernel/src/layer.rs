@@ -31,6 +31,11 @@ pub struct Layer {
     pub frozen:     bool,
     /// Plottable — false skips this layer on plot/export.
     pub plottable:  bool,
+    /// Draw-order priority (issue #35) — layers render in ascending
+    /// `order` (lower = further back); ties fall back to dobject index.
+    /// Defaults to the table index; the Layer Manager's Up/Down buttons
+    /// swap orders to re-stack the drawing. Persisted in RSM v20+.
+    pub order:      u32,
 }
 
 impl Layer {
@@ -52,11 +57,12 @@ impl Layer {
             locked:     false,
             frozen:     false,
             plottable:  true,
+            order:      0,
         }
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LayerTable {
     pub layers: Vec<Layer>,            // index = LayerId
     /// The layer new Dobjects get assigned to. Index into `layers`.
@@ -90,6 +96,11 @@ impl LayerTable {
 
     pub fn add(&mut self, layer: Layer) -> LayerId {
         let id = self.layers.len() as LayerId;
+        // Default draw order = 0 for every layer, so the draw-order sort is a
+        // no-op and the Layer Manager keeps its alphabetical display (ties).
+        // The Manager's Up/Down reorder normalizes distinct orders 0..n-1.
+        let mut layer = layer;
+        layer.order = 0;
         self.layers.push(layer);
         id
     }

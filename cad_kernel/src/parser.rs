@@ -58,6 +58,15 @@ pub enum Command {
     /// selection basket. Distinct from `SelectPrevious` (which re-adds
     /// the whole last-finalised selection).
     SelectLast,
+    /// Arm fence-selection: the next two clicks define a line segment; any
+    /// dobject the line crosses joins the basket. Selection mode only.
+    SelectFence,
+    /// WPOLYGON — polygonal window selection: click vertices, Enter
+    /// finishes; only dobjects FULLY inside the polygon are added.
+    SelectWindowPolygon,
+    /// CPOLYGON — polygonal crossing: same click flow; any dobject
+    /// touching the polygon boundary (or inside) is added.
+    SelectCrossingPolygon,
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
@@ -132,6 +141,134 @@ pub enum Command {
     /// click target (circle/arc → radius; key 'D' → diameter; point
     /// → linear, ortho inferred from the dimline drag direction).
     Dim,
+    /// DIMCONTINUE — chain a linear dim from the last linear dim's
+    /// second extension origin, at the same dim-line offset.
+    DimContinue,
+    /// DIMBASELINE — chain a linear dim from the last linear dim's
+    /// FIRST extension origin (the baseline), same dim-line offset.
+    DimBaseline,
+    /// DIMANGULAR — 4-click angular dim: vertex → point on ray 1 →
+    /// point on ray 2 → arc position.
+    DimAngular,
+    /// CENTERMARK — click a circle/arc to place a center mark at its
+    /// centre (sized to the entity), or click empty space for a default
+    /// size at that point. Typed form: `centermark x,y [size]`.
+    CenterMark(Option<f64>),
+    /// XLINE — infinite construction line: click base, then a direction
+    /// point (or H/V/A/Off). The line passes through the base along the
+    /// direction and is clipped to the viewport when drawn.
+    Xline,
+    /// RAY — semi-infinite construction line: click base, then a
+    /// direction point (or H/V/A). The ray extends forward from the base
+    /// only, clipped to the viewport when drawn.
+    Ray,
+    /// DONUT — filled ring: click center, then outer radius, then inner
+    /// radius; place-multiple until Esc/Enter. Typed radii are not in v1
+    /// (the click flow sizes both).
+    Donut,
+    /// WIPEOUT — opaque paper-colored mask: two corner clicks define the
+    /// rectangle. Drawn on top of geometry, hiding what is behind it.
+    Wipeout,
+    /// SKETCH — press-drag freehand sampling; the stroke commits as an
+    /// open Polyline on release. Enter/Esc exits the command.
+    Sketch,
+    /// BLEND — click two open curves; a tangent-continuous cubic spline
+    /// connects their nearest endpoints (like AutoCAD BLEND's "Continuity
+    /// = Tangent").
+    Blend,
+    /// MLINE — click start then end; two parallel open polylines ±0.5
+    /// around the segment (v1: fixed half-width, no style).
+    Mline,
+    /// REGION — convert every closed curve in the selection (circle,
+    /// ellipse, closed polyline, closed spline) into a filled Region.
+    /// Select-first flow with QueuedOp::Region.
+    Region,
+    /// DIMARC — arc-length dimension: click an arc, then the leader end.
+    DimArcLen,
+    /// DIMORDINATE — X/Y ordinate dimension: datum → point → leader end.
+    DimOrdinate,
+    /// DIMJOGGED — jogged radius dimension: arc/circle → leader end → jog.
+    DimJogged,
+    /// QDIM — quick dimensioning: batch linear dims over the selection.
+    QDim,
+    /// MINSERT — array-insert a block in a rows×columns grid.
+    MInsert,
+    /// LAYISO — freeze every layer except the picked dobject's layer.
+    LayIso,
+    /// LAYFRZ — freeze the picked dobject's layer.
+    LayFrz,
+    /// LAYOFF — turn off the picked dobject's layer.
+    LayOff,
+    /// LAYON — turn every layer back on (visible + thawed).
+    LayOn,
+    /// LAYWALK — floating layer preview dialog (isolate-by-row).
+    LayWalk,
+    /// PUBLISH — batch-plot every layout + the model to PDF.
+    Publish,
+    /// ETRANSMIT — bundle the drawing + its xrefs into a transfer folder.
+    ETransmit,
+    /// MEASUREGEOM — combined inquiry hub (distance/radius/angle/area).
+    MeasureGeom,
+    /// QUICKCALC — in-app calculator panel.
+    QuickCalc,
+    /// FIND — find text strings in text dobjects (selects the matches).
+    Find(Vec<String>),
+    /// REPLACE — find + replace text in text dobjects.
+    Replace(Vec<String>),
+    /// ID — click any point to report its coordinates (world + current
+    /// UCS). Pure inquiry; no document change.
+    Id,
+    /// OOPS — restore the last-erased dobjects (independent of undo).
+    Oops,
+    /// RENAME — rename a named table entry: `rename <type> <old> <new>`
+    /// where type ∈ layer|block|linetype|textstyle|dimstyle|wallstyle.
+    Rename(Vec<String>),
+    /// SETBYLAYER — force color/linetype/lineweight back to ByLayer for
+    /// the selected dobjects.
+    SetByLayer,
+    /// REVCLOUD — click two corners of a rectangle; the command emits a
+    /// closed scalloped-arc polyline (revision cloud) around it. Arc length
+    /// adjustable via `a<len>` while waiting for the first corner.
+    RevCloud,
+    /// AREA — click a closed object to report its area + perimeter, or pick
+    /// points to measure a polygon. `a`/`s` add/subtract regions to a total.
+    Area,
+    /// OVERKILL — remove duplicate/overlapping dobjects (selected set, or
+    /// the whole drawing when nothing is selected). Keeps the first
+    /// occurrence of each coincident group.
+    Overkill,
+    /// PURGE — remove unreferenced layers, linetypes, text/dim/wall styles
+    /// and block definitions (AutoCAD PURGE).
+    Purge,
+    /// QSELECT — open the filter-based selection dialog (type/layer/color/
+    /// linetype, include/exclude). Builds a selection set from the matches.
+    QSelect,
+    /// UCS — user coordinate systems: `ucs` (list), `ucs world`, `ucs NAME`
+    /// (set), `ucs save NAME`, `ucs origin X,Y [rot]`, `ucs delete NAME`,
+    /// `ucs rename OLD NEW`.
+    Ucs(Vec<String>),
+    /// PAGESETUP — open the page-setup dialog (paper size, orientation,
+    /// margins, plot scale) saved into the document for model-space plots.
+    PageSetup,
+    /// TABLE — open the table dialog (rows/cols/sizes + cell text), then
+    /// click to place the grid.
+    Table,
+    /// XREF — external references: `xref attach <path>` (loads the file,
+    /// then click to place), `xref list`, `xref detach <name>`,
+    /// `xref reload <name>`.
+    Xref(Vec<String>),
+    /// LAYERSTATE — save/restore/delete/rename named layer-state snapshots:
+    /// `layerstate save NAME`, `layerstate NAME` (restore), `layerstate
+    /// delete NAME`, `layerstate rename OLD NEW`, `layerstate ?` (list).
+    LayerState(Vec<String>),
+    /// WBLOCK — write the selected dobjects to their OWN .rsm/.dxf file
+    /// (a reusable fixture/part library). Empty selection → whole drawing
+    /// (AutoCAD WBLOCK writes the full document when nothing is selected).
+    WBlock,
+    /// BOUNDARY / BPOLY — click a point inside a closed region; the app
+    /// traces its boundary (the same algorithm as hatch pick-point) and
+    /// emits it as a closed Polyline dobject (outer loop + islands).
+    Boundary,
     /// Open the Dim Style dialog. Bare `dimstyle` opens it for a NEW
     /// style; `dimstyle <name>` opens it on the existing style
     /// (case-insensitive). Mirrors AutoCAD DDIM / DIMSTYLE.
@@ -139,6 +276,9 @@ pub enum Command {
     /// Open the Wall Style Manager (Dry Wall / Structural / …). With a name,
     /// pre-select / edit that wall style.
     WallStyle(Option<String>),
+    /// Issue #16 — join wall centerlines whose ends were drawn near each
+    /// other so their faces miter at render.
+    WallCleanup,
     /// Create a block definition from the current selection: `block <name>`.
     /// App flow: select (universal model) → click base point → definition
     /// stored + selection replaced by one BlockRef instance.
@@ -198,6 +338,18 @@ pub enum Command {
     Lengthen(f64),
     /// Split a single selected dobject at the next click point.
     Break,
+    /// DIVIDE — place points that split a picked curve into N equal-length
+    /// segments. App drives the object pick + segment-count entry.
+    Divide,
+    /// MEASURE — place points at a fixed length along a picked curve. App
+    /// drives the object pick + length entry.
+    Measure,
+    /// PLOTSTYLE — open the Plot Style Table Editor (the CTB color→pen editor).
+    /// App-driven dialog; no geometry.
+    PlotStyle,
+    /// PLOT / PRINT — open the Plot dialog (paper/area/scale + table → PDF).
+    /// App-driven dialog; no geometry.
+    Plot,
     /// Align: 4 clicks (2 source + 2 target). Translate + rotate.
     Align,
     /// Stretch: crossing window + 2 clicks (base + dest). Vertices inside
@@ -231,6 +383,20 @@ pub enum Command {
     /// NO coordinate arguments. The app sets self.tool to the matching
     /// variant and the user proceeds with clicks.
     SetTool(ToolKind),
+    /// Python scripting (WP-SCRIPT). `py`/`python` with an inline expression
+    /// runs it on the script worker; bare `py` toggles the Python console
+    /// panel. Grammar only — all execution lives in `cad_script` + `cad_app`.
+    Python(Option<String>),
+    /// `pyfile <path>` — run a `.py` file on the script worker.
+    PythonFile(String),
+    /// Run a named script from the scripts folder: `run <name> [args…]`.
+    /// Bare `run` (no name) opens the script picker. Args pass through to
+    /// the script as `rasm.args` / `sys.argv` (grammar only — execution
+    /// lives in `cad_script` + `cad_app`/`cad_cli`).
+    Script(Option<String>, Vec<String>),
+    /// Show the full Python scripting API reference (the AI-agent document).
+    /// Display lives in `cad_app` (a floating window) / `cad_cli` (stdout).
+    PyApiDoc,
 }
 
 impl Command {
@@ -256,6 +422,9 @@ impl Command {
             Command::SelectWindow       => "SelectWindow",
             Command::SelectCrossing     => "SelectCrossing",
             Command::SelectLast         => "SelectLast",
+            Command::SelectFence        => "SelectFence",
+            Command::SelectWindowPolygon    => "SelectWindowPolygon",
+            Command::SelectCrossingPolygon  => "SelectCrossingPolygon",
             Command::Move               => "Move",
             Command::Copy               => "Copy",
             Command::Rotate             => "Rotate",
@@ -273,8 +442,53 @@ impl Command {
             Command::Text(_)            => "Text",
             Command::TextStyle(_)       => "TextStyle",
             Command::Dim                => "Dim",
+            Command::DimContinue        => "DimContinue",
+            Command::DimBaseline        => "DimBaseline",
+            Command::DimAngular         => "DimAngular",
+            Command::CenterMark(_)      => "CenterMark",
+            Command::Xline              => "Xline",
+            Command::Ray                => "Ray",
+            Command::Donut              => "Donut",
+            Command::Wipeout            => "Wipeout",
+            Command::Sketch             => "Sketch",
+            Command::Blend              => "Blend",
+            Command::Mline              => "Mline",
+            Command::Region             => "Region",
+            Command::DimArcLen          => "DimArcLen",
+            Command::DimOrdinate        => "DimOrdinate",
+            Command::DimJogged          => "DimJogged",
+            Command::QDim               => "QDim",
+            Command::MInsert            => "MInsert",
+            Command::LayIso             => "LayIso",
+            Command::LayFrz             => "LayFrz",
+            Command::LayOff             => "LayOff",
+            Command::LayOn              => "LayOn",
+            Command::LayWalk            => "LayWalk",
+            Command::Publish            => "Publish",
+            Command::ETransmit          => "ETransmit",
+            Command::MeasureGeom        => "MeasureGeom",
+            Command::QuickCalc          => "QuickCalc",
+            Command::Find(_)            => "Find",
+            Command::Replace(_)         => "Replace",
+            Command::Id                 => "Id",
+            Command::Oops               => "Oops",
+            Command::Rename(_)          => "Rename",
+            Command::SetByLayer         => "SetByLayer",
+            Command::RevCloud            => "RevCloud",
+            Command::Area                => "Area",
+            Command::Overkill            => "Overkill",
+            Command::Purge               => "Purge",
+            Command::LayerState(_)       => "LayerState",
+            Command::QSelect             => "QSelect",
+            Command::Ucs(_)              => "Ucs",
+            Command::PageSetup           => "PageSetup",
+            Command::Table               => "Table",
+            Command::Xref(_)             => "Xref",
+            Command::WBlock             => "WBlock",
+            Command::Boundary           => "Boundary",
             Command::DimStyle(_)        => "DimStyle",
             Command::WallStyle(_)       => "WallStyle",
+            Command::WallCleanup        => "WallCleanup",
             Command::BlockDef(_)        => "BlockDef",
             Command::Insert(_)          => "Insert",
             Command::Explode            => "Explode",
@@ -293,6 +507,10 @@ impl Command {
             Command::ChProp(_)          => "ChProp",
             Command::Lengthen(_)        => "Lengthen",
             Command::Break              => "Break",
+            Command::Divide             => "Divide",
+            Command::Measure            => "Measure",
+            Command::PlotStyle          => "PlotStyle",
+            Command::Plot               => "Plot",
             Command::Align              => "Align",
             Command::Stretch            => "Stretch",
             Command::Trim               => "Trim",
@@ -304,6 +522,10 @@ impl Command {
             Command::Open(_)            => "Open",
             Command::SaveAs(_)          => "SaveAs",
             Command::SetTool(_)         => "SetTool",
+            Command::Python(_)          => "Python",
+            Command::PythonFile(_)      => "PythonFile",
+            Command::Script(..)         => "Script",
+            Command::PyApiDoc           => "PyApiDoc",
         }
     }
 }
@@ -320,6 +542,10 @@ pub enum ToolKind {
     Point,
     Polyline,
     Spline,
+    /// Quadratic Bézier (AutoCAD-style QB): the spline tool driven at
+    /// degree 2 — three control clicks (P0, P1, P2), then Enter commits
+    /// a quadratic B-spline. Shares the Spline tool's click flow.
+    QuadBezier,
     Wall,
     Text,
     /// Axis-aligned rectangle. The app captures two opposite corners by
@@ -327,6 +553,20 @@ pub enum ToolKind {
     /// (signed; negatives extend left/down). Committed as a CLOSED 4-vertex
     /// Polyline (one LWPOLYLINE, matching AutoCAD RECTANG).
     Rectangle,
+    /// Regular N-gon (AutoCAD POLYGON). The app prompts for the side count, then
+    /// a centre + Inscribed/Circumscribed radius, or an Edge (two points).
+    /// Committed as a CLOSED N-vertex Polyline (one LWPOLYLINE).
+    Polygon,
+    /// Multi-leader callout (AutoCAD MLEADER). The app captures an arrow
+    /// point, then a landing/text position; the label is typed after.
+    /// Committed as `Geom::Leader`.
+    Leader,
+    /// Attribute DEFINITION (AutoCAD ATTDEF). Click to place a tagged
+    /// text slot; the app prompts for tag/prompt/default.
+    AttrDef,
+    /// Attribute EDIT (AutoCAD ATTEDIT). Pick a block insert to edit its
+    /// attribute values in a dialog.
+    AttEdit,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -357,7 +597,12 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "point"   | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
         "spline"   | "spl"          => Ok(Command::SetTool(ToolKind::Spline)),
+        "qb" | "quadbezier" | "quadratic" => Ok(Command::SetTool(ToolKind::QuadBezier)),
         "rectangle" | "rectang" | "rec" => Ok(Command::SetTool(ToolKind::Rectangle)),
+        "polygon" | "pol" => Ok(Command::SetTool(ToolKind::Polygon)),
+        "mleader" | "leader" | "mld" => Ok(Command::SetTool(ToolKind::Leader)),
+        "attdef" | "atd" => Ok(Command::SetTool(ToolKind::AttrDef)),
+        "attedit" | "ate" => Ok(Command::SetTool(ToolKind::AttEdit)),
         "arc"    | "a"  => parse_arc(&toks[1..]),
         "arc3p"         => parse_arc_3p(&toks[1..]),
         "arcse"         => parse_arc_se(&toks[1..]),
@@ -383,7 +628,13 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
         "window" | "win" => Ok(Command::SelectWindow),
-        "crossing"       => Ok(Command::SelectCrossing),
+        "crossing" | "cross" => Ok(Command::SelectCrossing),
+        // Fence: select-session sub-command only (gated in the app). NOTE: no
+        // `f` alias — `f` is Fillet (a main command); the "Fence" chip sends the
+        // full word `fence`, so the two never collide.
+        "fence"          => Ok(Command::SelectFence),
+        "wp" | "wpolygon" => Ok(Command::SelectWindowPolygon),
+        "cpol" | "cpolygon" => Ok(Command::SelectCrossingPolygon),
         "last"           => Ok(Command::SelectLast),
         "move" | "m"      => Ok(Command::Move),
         "copy" | "c" | "cp" | "co" => Ok(Command::Copy),
@@ -461,6 +712,64 @@ pub fn parse(line: &str) -> Result<Command, String> {
             // 2/3-click flow; sub-kind decided at first click.
             Ok(Command::Dim)
         }
+        "dimcontinue" | "dimcont" | "dimcon" => Ok(Command::DimContinue),
+        "dimbaseline" | "dimbase" => Ok(Command::DimBaseline),
+        "dimangular" | "dimang" | "dan" => Ok(Command::DimAngular),
+        // CENTERMARK — optional size arg. The app click flow sizes to the
+        // picked circle/arc; a typed size overrides that default.
+        "centermark" | "cenm" => {
+            let size = toks.get(1).and_then(|t| t.parse::<f64>().ok());
+            Ok(Command::CenterMark(size))
+        }
+        "xline" | "xl" => Ok(Command::Xline),
+        "ray" => Ok(Command::Ray),
+        "donut" | "doughnut" => Ok(Command::Donut),
+        "wipeout" | "wi" => Ok(Command::Wipeout),
+        "sketch" | "sk" => Ok(Command::Sketch),
+        "blend" => Ok(Command::Blend),
+        "mline" | "ml" => Ok(Command::Mline),
+        "region" | "reg" => Ok(Command::Region),
+        "dimarc" | "dar" => Ok(Command::DimArcLen),
+        "dimordinate" | "dimord" | "dor" => Ok(Command::DimOrdinate),
+        "dimjogged" | "dimjog" | "djo" => Ok(Command::DimJogged),
+        "qdim" | "qd" => Ok(Command::QDim),
+        "minsert" | "mi" => Ok(Command::MInsert),
+        "layiso" | "li" => Ok(Command::LayIso),
+        "layfrz" => Ok(Command::LayFrz),
+        "layoff" => Ok(Command::LayOff),
+        "layon" => Ok(Command::LayOn),
+        "laywalk" => Ok(Command::LayWalk),
+        "publish" | "pub" => Ok(Command::Publish),
+        "etransmit" | "et" => Ok(Command::ETransmit),
+        "measuregeom" | "meas" => Ok(Command::MeasureGeom),
+        "quickcalc" | "qc" => Ok(Command::QuickCalc),
+        "find" | "findtext" => Ok(Command::Find(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect())),
+        "replace" | "findreplace" => Ok(Command::Replace(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect())),
+        "id" | "pip" => Ok(Command::Id),
+        "oops" => Ok(Command::Oops),
+        "setbylayer" | "sbl" => Ok(Command::SetByLayer),
+        "rename" | "ren" => Ok(Command::Rename(
+            toks.iter().skip(1).map(|s| (*s).to_string()).collect())),
+        "revcloud" | "revc" => Ok(Command::RevCloud),
+        "area" | "aa" => Ok(Command::Area),
+        "overkill" | "ovk" => Ok(Command::Overkill),
+        "purge" | "pu" => Ok(Command::Purge),
+        "qselect" | "qs" => Ok(Command::QSelect),
+        "pagesetup" | "ps" => Ok(Command::PageSetup),
+        "table" | "tb" => Ok(Command::Table),
+        "xref" | "xr" => {
+            Ok(Command::Xref(toks.iter().skip(1).map(|s| (*s).to_string()).collect()))
+        }
+        "ucs" => {
+            Ok(Command::Ucs(toks.iter().skip(1).map(|s| (*s).to_string()).collect()))
+        }
+        "layerstate" | "layst" => {
+            Ok(Command::LayerState(toks.iter().skip(1).map(|s| (*s).to_string()).collect()))
+        }
+        "wblock" | "wb" => Ok(Command::WBlock),
+        "boundary" | "bpoly" | "bp" => Ok(Command::Boundary),
         "dimstyle" | "ddim" => {
             // `dimstyle`        → open dialog for a NEW dim style
             // `dimstyle <name>` → open dialog editing the named style
@@ -569,12 +878,44 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 }
             }
         }
+        "wallcleanup" | "wcleanup" => Ok(Command::WallCleanup),
         "lengthen" | "len" => {
             let d: f64 = toks.get(1).ok_or("usage: lengthen <delta>")?
                 .parse().map_err(|_| "bad delta".to_string())?;
             Ok(Command::Lengthen(d))
         }
-        "break" | "br"    => Ok(Command::Break),
+        "break" | "br" | "breakatpoint" | "brp" => Ok(Command::Break),
+        "divide" | "div"  => Ok(Command::Divide),
+        "measure" | "me"  => Ok(Command::Measure),
+        "plotstyle" | "pst" | "stylesmanager" => Ok(Command::PlotStyle),
+        "plot" | "print" => Ok(Command::Plot),
+        // Python scripting (WP-SCRIPT). `py <expr>` keeps the whole remainder
+        // (expressions contain spaces); bare `py` toggles the console.
+        "py" | "python" => {
+            match line.splitn(2, char::is_whitespace).nth(1).map(str::trim) {
+                None | Some("") => Ok(Command::Python(None)),
+                Some(expr)      => Ok(Command::Python(Some(expr.to_string()))),
+            }
+        }
+        "pyfile" => {
+            let path = toks.get(1)
+                .ok_or("usage: pyfile <path.py>")?
+                .to_string();
+            Ok(Command::PythonFile(path))
+        }
+        // WP-SCRIPT slice 5: `run <name> [args…]` executes scripts/<name>.py
+        // with the args exposed to the script; bare `run` opens the picker.
+        "run" | "script" => {
+            match toks.get(1) {
+                None => Ok(Command::Script(None, Vec::new())),
+                Some(name) => Ok(Command::Script(
+                    Some(name.to_string()),
+                    toks[2..].iter().map(|s| s.to_string()).collect(),
+                )),
+            }
+        }
+        // WP-SCRIPT: the full scripting API reference (AI-agent document).
+        "pyhelp" | "rasmhelp" => Ok(Command::PyApiDoc),
         "align"           => Ok(Command::Align),
         "stretch" | "st" | "s"   => Ok(Command::Stretch),
         "trim" | "tr"     => Ok(Command::Trim),
@@ -630,7 +971,38 @@ pub fn parse(line: &str) -> Result<Command, String> {
     }
 }
 
-fn parse_pt(s: &str) -> Result<Vec2, String> {
+/// Canonical command words for Tab-completion in the command line. One
+/// representative (primary) token per parser arm + the common aliases.
+pub fn command_words() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = vec![
+        "line", "l", "pline", "pl", "arc", "a", "circle", "c", "rectangle", "rec",
+        "polygon", "poly", "ellipse", "el", "ellipsearc", "point", "po",
+        "spline", "spl", "wall", "w", "hatch", "h", "text", "t", "mtext",
+        "dim", "dimcontinue", "dimbaseline", "dimangular", "dimstyle", "leader",
+        "mleader", "centermark", "xline", "xl", "ray", "revcloud", "revc",
+        "donut", "doughnut", "wipeout", "wi", "sketch", "sk", "blend",
+        "mline", "ml", "region", "reg",
+        "table", "tb", "wblock", "block", "insert", "i", "xref", "xr",
+        "boundary", "bpoly", "explode", "x", "move", "m", "copy", "c", "cp",
+        "rotate", "ro", "scale", "sc", "mirror", "mi", "stretch", "s",
+        "trim", "tr", "extend", "ex", "offset", "o", "fillet", "f", "chamfer",
+        "cha", "join", "j", "break", "br", "breakatpoint", "align", "al",
+        "lengthen", "len", "divide", "measure", "reverse", "matchprop",
+        "chprop", "chlayer", "setbylayer", "overkill", "purge", "rename",
+        "layers", "layer", "layerstate", "qselect", "ucs", "list", "ls",
+        "dist", "area", "id", "oops", "undo", "redo", "erase", "delete",
+        "select", "window", "crossing", "fence", "wpolygon", "cpolygon",
+        "zoom", "pan", "grid", "snap", "osnap", "ortho", "polar", "setvar",
+        "plot", "pagesetup", "plotstyle", "export", "import", "save", "open",
+        "new", "clear", "help", "preview", "script", "py", "python",
+        "style", "textstyle", "dimstyle", "wallstyle", "linetype", "ltscale",
+    ];
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+pub fn parse_pt(s: &str) -> Result<Vec2, String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 2 {
         return Err(format!("expected x,y, got '{}'", s));
@@ -655,8 +1027,13 @@ fn parse_line(args: &[&str]) -> Result<Command, String> {
 }
 
 fn parse_point(args: &[&str]) -> Result<Command, String> {
+    // Bare `point` / `po` → enter the interactive Point tool (click to place,
+    // stamping the current style/size). With a coordinate, add immediately.
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Point));
+    }
     if args.len() != 1 {
-        return Err("usage: point x,y".into());
+        return Err("usage: point  OR  point x,y".into());
     }
     Ok(Command::Add(Geom::Point(Point {
         location: parse_pt(args[0])?,
@@ -850,5 +1227,64 @@ mod every_action_is_one_word {
     #[test]
     fn the_spaced_form_still_works() {
         assert!(matches!(parse("straylights purge"), Ok(Command::StrayLights(true))));
+    }
+}
+
+#[cfg(test)]
+mod script_command_tests {
+    use super::*;
+
+    #[test]
+    fn py_expression_keeps_full_remainder() {
+        // Expressions contain spaces — the whole remainder is the code.
+        assert!(matches!(parse("py 1 + 1"), Ok(Command::Python(Some(s))) if s == "1 + 1"));
+        assert!(matches!(parse("python print('hi')"),
+            Ok(Command::Python(Some(s))) if s == "print('hi')"));
+    }
+
+    #[test]
+    fn bare_py_is_console_toggle() {
+        assert!(matches!(parse("py"), Ok(Command::Python(None))));
+        assert!(matches!(parse("python   "), Ok(Command::Python(None))));
+    }
+
+    #[test]
+    fn pyfile_takes_a_path() {
+        assert!(matches!(parse("pyfile demo.py"), Ok(Command::PythonFile(s)) if s == "demo.py"));
+        assert!(parse("pyfile").is_err());
+    }
+
+    #[test]
+    fn run_script_with_args() {
+        assert!(matches!(
+            parse("run grid 8 6"),
+            Ok(Command::Script(Some(n), a)) if n == "grid" && a == ["8", "6"]
+        ));
+        assert!(matches!(
+            parse("script grid 8 6 10"),
+            Ok(Command::Script(Some(n), a)) if n == "grid" && a == ["8", "6", "10"]
+        ));
+        assert!(matches!(
+            parse("run hello"),
+            Ok(Command::Script(Some(n), a)) if n == "hello" && a.is_empty()
+        ));
+    }
+
+    #[test]
+    fn bare_run_opens_picker() {
+        assert!(matches!(parse("run"), Ok(Command::Script(None, a)) if a.is_empty()));
+        assert!(matches!(parse("script   "), Ok(Command::Script(None, _))));
+    }
+
+    #[test]
+    fn pyhelp_opens_the_api_reference() {
+        assert!(matches!(parse("pyhelp"), Ok(Command::PyApiDoc)));
+        assert!(matches!(parse("rasmhelp"), Ok(Command::PyApiDoc)));
+    }
+
+    #[test]
+    fn command_names_present() {
+        assert_eq!(Command::Python(None).canonical_name(), "Python");
+        assert_eq!(Command::PythonFile(String::new()).canonical_name(), "PythonFile");
     }
 }
