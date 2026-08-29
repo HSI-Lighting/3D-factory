@@ -57073,6 +57073,12 @@ mod promote_tests {
         // Start from an empty drawing so indices and counts mean exactly what the test
         // says — a default app is not guaranteed to hold nothing.
         app.doc.dobjects.clear();
+        // The fixtures are written in METRE numbers (3-unit lines, 0.37 m thickness),
+        // but a default document is now millimetre space — declare metres or a 3-unit
+        // arc samples to chords below the factory's 1e-4 degenerate threshold and no
+        // wall is ever created.
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::M, cad_kernel::UnitSource::Declared);
         assert!(app.factory.walls.is_empty(), "fixture must start with no 3D walls");
         for g in geoms {
             app.doc.dobjects.push(cad_kernel::DObject::new(g));
@@ -62897,6 +62903,11 @@ mod the_line_cache_cannot_go_stale {
     #[test]
     fn redeclaring_the_unit_invalidates_it() {
         let mut app = app_with_a_plan();
+        // A default document is ALREADY millimetre space, so redeclaring millimetres
+        // would change nothing — first move the doc to metres, then the redeclaration
+        // back to millimetres is what must invalidate the cache.
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::M, cad_kernel::UnitSource::User);
         assert!(rebuilds_after(&mut app, |a| {
             a.doc.units = cad_kernel::Units::from_metres_per_unit(
                 cad_kernel::Units::MM, cad_kernel::UnitSource::User);
@@ -63090,6 +63101,12 @@ mod the_cull_never_drops_what_you_can_see {
     fn app_with_spread_plan() -> CadApp {
         let mut app = CadApp::default();
         app.doc.dobjects.clear();
+        // The fixture is written in METRE numbers (a 400 m plan under a 40 m view),
+        // but a default document is now millimetre space — declare metres or the plan
+        // shrinks to 0.4 m and a 40 m view culls nothing, which is the opposite of
+        // what this module exists to prove.
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(
+            cad_kernel::Units::M, cad_kernel::UnitSource::Declared);
         for i in 0..2_000 {
             let (x, y) = ((i % 50) as f64 * 8.0, (i / 50) as f64 * 8.0);
             app.doc.push(DObject::new(Geom::Line(Line {
