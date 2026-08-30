@@ -68685,6 +68685,13 @@ mod the_dwg_converter_is_where_the_app_looks {
     }
 
     /// And `dwg_converter` actually returns it, rather than falling through to the PATH probe.
+    ///
+    /// WINDOWS ONLY: the fork's converter drives AutoCAD's `accoreconsole.exe`,
+    /// which exists only on Windows — the fork ships no `tools/dwgconv/dwgconv.sh`
+    /// (no Linux converter to point it at). On Linux the honest search result is
+    /// None → "set RUSTCAD_DWGCONV" (see `convert_dwg_to_dxf`), which this test
+    /// would otherwise fight.
+    #[cfg(windows)]
     #[test]
     fn the_search_returns_it() {
         // The env override wins by design, so a machine that sets one is not being tested here.
@@ -73731,6 +73738,31 @@ mod the_origin_is_the_blind_spot {
 mod the_dwg_converter_explains_itself {
     use super::*;
 
+    /// Write a stand-in converter that runs on THIS platform: a `.cmd` batch on
+    /// Windows (spawned via `cmd /c` by `run_dwg_conversion`), an executable
+    /// `#!/bin/sh` script elsewhere (spawned directly). `body` is the platform's
+    /// own script text minus the shebang / `@echo off` preamble.
+    fn write_converter(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let script = if cfg!(windows) {
+            dir.join(format!("{}.cmd", name))
+        } else {
+            dir.join(format!("{}.sh", name))
+        };
+        if cfg!(windows) {
+            std::fs::write(&script, format!("@echo off\r\n{}\r\n", body)).expect("write");
+        } else {
+            std::fs::write(&script, format!("#!/bin/sh\n{}\n", body)).expect("write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).expect("chmod");
+            }
+        }
+        script
+    }
+
     /// THE REASON REACHES THE MESSAGE. A converter that fails and says why must have its words
     /// carried, not replaced by its exit status.
     #[test]
@@ -73739,12 +73771,11 @@ mod the_dwg_converter_explains_itself {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         // A stand-in converter that fails exactly as `dwgconv.cmd` does with no AutoCAD present.
-        let script = dir.join("fake.cmd");
-        std::fs::write(
-            &script,
-            "@echo off\r\necho accoreconsole.exe not found under Program Files Autodesk. 1>&2\r\nexit /b 3\r\n",
-        )
-        .expect("write");
+        let script = write_converter(
+            &dir,
+            "fake",
+            "echo accoreconsole.exe not found under Program Files Autodesk. 1>&2\nexit 3",
+        );
         let out = dir.join("out.dxf");
 
         let err = run_dwg_conversion(
@@ -73769,8 +73800,7 @@ mod the_dwg_converter_explains_itself {
         let dir = std::env::temp_dir().join(format!("simlux_dwgquiet_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let script = dir.join("quiet.cmd");
-        std::fs::write(&script, "@echo off\r\nexit /b 1\r\n").expect("write");
+        let script = write_converter(&dir, "quiet", "exit 1");
 
         let err = run_dwg_conversion(
             &script.to_string_lossy(),
@@ -73793,10 +73823,12 @@ mod the_dwg_converter_explains_itself {
         let dir = std::env::temp_dir().join(format!("simlux_dwgok_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let script = dir.join("ok.cmd");
         // Appends a line each run, so a second invocation is visible.
-        std::fs::write(&script, "@echo off\r\necho ran>>\"%~dp0runs.txt\"\r\necho 0>\"%~2\"\r\n")
-            .expect("write");
+        let script = write_converter(
+            &dir,
+            "ok",
+            "echo ran >> \"$(dirname \"$0\")/runs.txt\"\necho 0 > \"$2\"",
+        );
         let out = dir.join("out.dxf");
 
         run_dwg_conversion(

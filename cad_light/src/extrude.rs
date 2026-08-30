@@ -435,6 +435,11 @@ mod tests {
 
     fn doc_with(geom: cad_kernel::Geom) -> Document {
         let mut d = Document::default();
+        // The fixture geometries are written in METRE numbers (a 4 m spline room),
+        // but a default document is now millimetre space — declare metres or the
+        // bbox tests measure the room 1000x too small.
+        d.units = cad_kernel::Units::from_metres_per_unit(
+            1.0, cad_kernel::UnitSource::Declared);
         d.push(DObject::new(geom));
         d
     }

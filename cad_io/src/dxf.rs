@@ -2434,6 +2434,10 @@ mod tests {
         let doc = read_dxf(dxf).expect("parse");
         let Geom::Arc(a) = &doc.dobjects[0].geom else { panic!("arc") };
         // Under the mirror the endpoints are (x,y) → (−x,y) of the original 30°…120° arc.
+        // The sweep REVERSES under a mirror, so the stored (CCW, positive-sweep) arc
+        // necessarily STARTS at the mirrored original END and ENDS at the mirrored
+        // original START — the endpoint PAIR is what the mirror preserves (asserted as
+        // a set; which end is "start" swaps with the sweep).
         let arc_pt = |deg: f64| -> Vec2 {
             let t = deg.to_radians();
             a.center + Vec2::new(a.radius * t.cos(), a.radius * t.sin())
@@ -2444,8 +2448,20 @@ mod tests {
             let t = deg.to_radians();
             Vec2::new(-5.0 * t.cos(), 5.0 * t.sin())
         };
-        assert!((p1 - expect(30.0)).len() < 1e-9, "start end: {p1:?}");
-        assert!((p2 - expect(120.0)).len() < 1e-9, "end end: {p2:?}");
+        let e1 = expect(30.0);
+        let e2 = expect(120.0);
+        let same = |p: Vec2, q: Vec2| (p.x - q.x).abs() < 1e-9 && (p.y - q.y).abs() < 1e-9;
+        assert!(
+            (same(p1, e1) && same(p2, e2)) || (same(p1, e2) && same(p2, e1)),
+            "the mirrored arc does not span the same ground: ends {p1:?}..{p2:?}, \
+             expected the pair {{{e1:?}, {e2:?}}} (either order)",
+        );
+        assert!(
+            (a.sweep_angle.to_degrees() - 90.0).abs() < 1e-6,
+            "the sweep must keep its magnitude (90°) — a different one is the complement, \
+             not the arc: {}",
+            a.sweep_angle.to_degrees(),
+        );
     }
 
     #[test]
