@@ -531,6 +531,268 @@ fn pp_section(ui: &mut egui::Ui, id_src: &str, title: &str,
     ui.add_space(crate::theme::space::GROUP_GAP);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Text-dialog reusable widgets (ported from the upstream RUST-AutoRASM text
+// dialog). All draw the Inspector field look — surface-0 fill, UNCLIPPED 1px
+// border (`painter_at` clips it), radius SM, height PP_ROW_H — matching
+// `hatch_num_box` / `hatch_spec_bar`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A dropdown box (no swatch): label at the left + the solid ▼ arrow. Greyed
+/// (text-disabled, no click) when `enabled` is false.
+fn pp_dropdown_box(ui: &mut egui::Ui, w: f32, text: &str, enabled: bool) -> egui::Response {
+    use crate::theme::color as tc;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H),
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+        tc::SURFACE_0, egui::Stroke::new(1.0, tc::BORDER));
+    let p = ui.painter_at(rect);
+    pp_arrow(&p, rect);
+    let col = if enabled { tc::TEXT_PRIMARY } else { tc::TEXT_DISABLED };
+    // Clip the label so a long name doesn't run under the arrow.
+    let cl = p.with_clip_rect(egui::Rect::from_min_max(
+        rect.min, egui::pos2(rect.right() - 16.0, rect.bottom())));
+    cl.text(egui::pos2(rect.left() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER,
+        text, crate::theme::typ::body(), col);
+    if enabled && resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    resp
+}
+
+/// A static (read-only) value box — surface-0 field with left-aligned text in
+/// the Mono data font. Used for STUB fields (`Auto`); greyed when disabled.
+fn pp_value_static(ui: &mut egui::Ui, w: f32, text: &str, enabled: bool) -> egui::Response {
+    use crate::theme::color as tc;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::hover());
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+        tc::SURFACE_0, egui::Stroke::new(1.0, tc::BORDER));
+    let col = if enabled { tc::TEXT_PRIMARY } else { tc::TEXT_DISABLED };
+    ui.painter_at(rect).text(egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER, text, crate::theme::typ::data_value(), col);
+    resp
+}
+
+/// A pill button (New / Set current): rounded box, accent outline+text when
+/// `accent`, else neutral. Returns whether it was clicked.
+fn pp_pill(ui: &mut egui::Ui, w: f32, label: &str, accent: bool) -> bool {
+    use crate::theme::color as tc;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::click());
+    let hov = resp.hovered();
+    let border = if accent { tc::ACCENT } else { tc::BORDER };
+    let fill = if hov { tc::SURFACE_2 } else { tc::SURFACE_0 };
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM), fill,
+        egui::Stroke::new(1.0, border));
+    let col = if accent { tc::ACCENT } else { tc::TEXT_PRIMARY };
+    ui.painter_at(rect).text(rect.center(), egui::Align2::CENTER_CENTER, label,
+        crate::theme::typ::body(), col);
+    if hov { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    resp.clicked()
+}
+
+/// A square glyph toggle/button: `sz`×`sz`, surface-3 backfill when `active`,
+/// faint surface-2 on hover. The glyph is painted by `draw(painter, rect,
+/// color)` where color = accent (active) / muted (idle) / disabled. Returns the
+/// response (the caller decides what a click does).
+fn pp_glyph_btn(ui: &mut egui::Ui, sz: f32, active: bool, enabled: bool,
+    draw: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32)) -> egui::Response
+{
+    use crate::theme::color as tc;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz),
+        if enabled { egui::Sense::click() } else { egui::Sense::hover() });
+    let hov = resp.hovered() && enabled;
+    if active { ui.painter().rect_filled(rect, crate::theme::radius::SM, tc::SURFACE_3); }
+    else if hov { ui.painter().rect_filled(rect, crate::theme::radius::SM, tc::SURFACE_2); }
+    let col = if !enabled { tc::TEXT_DISABLED }
+              else if active { tc::ACCENT } else { tc::TEXT_MUTED };
+    draw(&ui.painter_at(rect), rect, col);
+    if hov { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    resp
+}
+
+/// A disabled (stub) checkbox row: empty box + label, greyed. For Spell Check /
+/// Edit Dictionary until those features exist.
+fn pp_check_stub(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    use crate::theme::color as tc;
+    let galley = ui.fonts(|f| f.layout_no_wrap(label.to_owned(),
+        crate::theme::typ::body(), tc::TEXT_DISABLED));
+    let bw = 15.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(bw + 8.0 + galley.size().x, 18.0), egui::Sense::hover());
+    let box_r = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), rect.center().y - bw * 0.5), egui::vec2(bw, bw));
+    ui.painter().rect(box_r, egui::Rounding::same(crate::theme::radius::SM),
+        tc::SURFACE_0, egui::Stroke::new(1.0, tc::BORDER));
+    ui.painter().galley(egui::pos2(box_r.right() + 8.0,
+        rect.center().y - galley.size().y * 0.5), galley, tc::TEXT_DISABLED);
+    resp.on_hover_text("Not in the kernel yet")
+}
+
+// ── Text-dialog parameter/tool glyphs (painter primitives; `c` = colour) ─────
+
+/// Height — a large `A` with a small `A` (cap-height marker).
+fn text_height_glyph(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let cy = r.center().y;
+    p.text(egui::pos2(r.left() + 5.0, cy), egui::Align2::LEFT_CENTER,
+        "A", egui::FontId::proportional(15.0), c);
+    p.text(egui::pos2(r.right() - 4.0, cy + 2.0), egui::Align2::RIGHT_CENTER,
+        "A", egui::FontId::proportional(9.0), c);
+}
+
+/// Line spacing — two stacked bars with a small vertical double-arrow.
+fn text_linespacing_glyph(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let s = egui::Stroke::new(1.2, c);
+    let x0 = r.left() + 8.0; let x1 = r.right() - 3.0;
+    let cy = r.center().y;
+    p.line_segment([egui::pos2(x0, cy - 5.0), egui::pos2(x1, cy - 5.0)], s);
+    p.line_segment([egui::pos2(x0, cy + 5.0), egui::pos2(x1, cy + 5.0)], s);
+    // vertical double-arrow on the left
+    let ax = r.left() + 4.0;
+    p.line_segment([egui::pos2(ax, cy - 5.0), egui::pos2(ax, cy + 5.0)], s);
+    p.line_segment([egui::pos2(ax, cy - 5.0), egui::pos2(ax - 2.0, cy - 2.5)], s);
+    p.line_segment([egui::pos2(ax, cy - 5.0), egui::pos2(ax + 2.0, cy - 2.5)], s);
+    p.line_segment([egui::pos2(ax, cy + 5.0), egui::pos2(ax - 2.0, cy + 2.5)], s);
+    p.line_segment([egui::pos2(ax, cy + 5.0), egui::pos2(ax + 2.0, cy + 2.5)], s);
+}
+
+/// Oblique — an upright `O` and a leaning slash, with a gap so the slash never
+/// touches the O (owner note).
+fn text_oblique_glyph(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let cy = r.center().y;
+    p.text(egui::pos2(r.left() + 3.0, cy), egui::Align2::LEFT_CENTER,
+        "O", egui::FontId::proportional(13.0), c);
+    let s = egui::Stroke::new(1.4, c);
+    let x = r.right() - 4.0;
+    p.line_segment([egui::pos2(x - 2.5, cy + 5.0), egui::pos2(x + 1.5, cy - 5.0)], s);
+}
+
+/// Tracking — `ab` over a horizontal double-arrow (letter spacing).
+fn text_tracking_glyph(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let cx = r.center().x; let cy = r.center().y;
+    p.text(egui::pos2(cx, cy - 4.0), egui::Align2::CENTER_CENTER,
+        "ab", egui::FontId::proportional(9.0), c);
+    let s = egui::Stroke::new(1.1, c);
+    let x0 = r.left() + 4.0; let x1 = r.right() - 4.0; let y = cy + 5.0;
+    p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], s);
+    p.line_segment([egui::pos2(x0, y), egui::pos2(x0 + 2.5, y - 2.0)], s);
+    p.line_segment([egui::pos2(x0, y), egui::pos2(x0 + 2.5, y + 2.0)], s);
+    p.line_segment([egui::pos2(x1, y), egui::pos2(x1 - 2.5, y - 2.0)], s);
+    p.line_segment([egui::pos2(x1, y), egui::pos2(x1 - 2.5, y + 2.0)], s);
+}
+
+/// List — three text lines with bullet dots (`bullet`) or numbered ticks.
+fn glyph_list(p: &egui::Painter, r: egui::Rect, c: egui::Color32, bullet: bool) {
+    let s = egui::Stroke::new(1.2, c);
+    let mx = r.left() + 6.0;
+    let x0 = r.left() + 11.0; let x1 = r.right() - 6.0;
+    for (k, dy) in [(-6.0_f32), 0.0, 6.0].iter().enumerate() {
+        let y = r.center().y + dy;
+        if bullet { p.circle_filled(egui::pos2(mx, y), 1.3, c); }
+        else {
+            // small numeral tick
+            p.line_segment([egui::pos2(mx, y - 2.0), egui::pos2(mx, y + 2.0)], s);
+        }
+        let _ = k;
+        p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], s);
+    }
+}
+
+/// Alignment — four text lines ragged per `mode` (0=L, 1=C, 2=R, 3=justify).
+fn glyph_align(p: &egui::Painter, r: egui::Rect, c: egui::Color32, mode: u8) {
+    let s = egui::Stroke::new(1.2, c);
+    let full_l = r.left() + 5.0; let full_r = r.right() - 5.0; let full = full_r - full_l;
+    let widths = [full, full * 0.6, full * 0.85, full * 0.5];
+    for (k, dy) in [(-6.0_f32), -2.0, 2.0, 6.0].iter().enumerate() {
+        let y = r.center().y + dy;
+        // last line of justify is short/left; others full
+        let w = if mode == 3 { if k == 3 { full * 0.6 } else { full } } else { widths[k] };
+        let (x0, x1) = match mode {
+            0 => (full_l, full_l + w),               // left
+            1 => (r.center().x - w * 0.5, r.center().x + w * 0.5), // center
+            2 => (full_r - w, full_r),               // right
+            _ => (full_l, full_l + w),               // justify
+        };
+        p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], s);
+    }
+}
+
+/// `abc` with an underline (stub toggle glyph).
+fn glyph_abc(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let cx = r.center().x; let cy = r.center().y;
+    p.text(egui::pos2(cx, cy - 2.0), egui::Align2::CENTER_CENTER,
+        "abc", egui::FontId::proportional(11.0), c);
+    p.line_segment([egui::pos2(cx - 8.0, cy + 6.0), egui::pos2(cx + 8.0, cy + 6.0)],
+        egui::Stroke::new(1.2, c));
+}
+
+/// Find — a magnifier with a small `a` inside the lens.
+fn glyph_find(p: &egui::Painter, r: egui::Rect, c: egui::Color32) {
+    let lens = egui::pos2(r.center().x - 1.5, r.center().y - 1.5);
+    let rad = 6.0;
+    p.circle_stroke(lens, rad, egui::Stroke::new(1.3, c));
+    p.text(lens, egui::Align2::CENTER_CENTER, "a", egui::FontId::proportional(8.0), c);
+    p.line_segment([lens + egui::vec2(rad * 0.7, rad * 0.7),
+                    lens + egui::vec2(rad * 1.5, rad * 1.5)], egui::Stroke::new(1.6, c));
+}
+
+/// §4 A Layer / Color "bar" — surface-0 box (r4, border) with a color swatch
+/// at the left, `label` text, and the category-style dropdown arrow (`pp_arrow`).
+/// Returns the click response so the caller can open its picker.
+fn hatch_spec_bar(ui: &mut egui::Ui, swatch: egui::Color32, label: &str) -> egui::Response {
+    use crate::theme::color as tc;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), PP_ROW_H), egui::Sense::click());
+    // Box (fill + border) with the UNCLIPPED ui painter — `painter_at(rect)`
+    // clips a boundary stroke to its inner half, so the 1px border showed only
+    // faintly (it looked "covered by the fill"). Matches the Inspector `pp_box`.
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+        tc::SURFACE_0, egui::Stroke::new(1.0, tc::BORDER));
+    let p = ui.painter_at(rect);
+    let sw = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + 5.0, rect.center().y - 7.0), egui::vec2(14.0, 14.0));
+    p.rect_filled(sw, 2.0, swatch);
+    p.rect_stroke(sw, 2.0, egui::Stroke::new(1.0, tc::BORDER));
+    let _arrow = pp_arrow(&p, rect);   // §4 SAME arrow as the Specs-rail color box
+    p.text(egui::pos2(sw.right() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER,
+        label, crate::theme::typ::body(), tc::TEXT_PRIMARY);
+    resp
+}
+
+/// An Inspector-style numeric value box (§6 field: surface-0 fill, 1px border,
+/// radius 4, Mono 12) sized `w × 24`, editable (type or drag). Matches
+/// `pp_num_field` but with a caller-set speed / range / suffix (the hatch Scale
+/// wants finer speed + a clamp than the Inspector default).
+fn hatch_num_box(ui: &mut egui::Ui, w: f32, v: &mut f64,
+                 speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &str,
+                 calc: &crate::calc::CalcStore)
+                 -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::hover());
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+        PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
+    let pad = crate::theme::space::INPUT_PAD;
+    let inner = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad, rect.center().y - 8.0),
+        egui::vec2((rect.width() - 2.0 * pad).max(10.0), 16.0));
+    let sf = ui.style().override_font_id.clone();
+    let sw = ui.visuals().widgets.clone();
+    ui.style_mut().override_font_id = Some(crate::theme::typ::data_value());
+    {
+        let vis = ui.visuals_mut();
+        for st in [&mut vis.widgets.inactive, &mut vis.widgets.hovered, &mut vis.widgets.active] {
+            st.weak_bg_fill = egui::Color32::TRANSPARENT;
+            st.bg_fill = egui::Color32::TRANSPARENT;
+            st.bg_stroke = egui::Stroke::NONE;
+            st.fg_stroke.color = PP_TEXT;
+        }
+    }
+    let r = ui.put(inner, egui::DragValue::new(v)
+        .speed(speed).range(range).max_decimals(2).suffix(suffix)
+        .update_while_editing(false)
+        // Expressions commit in the field too (`2+3`, `x*2`).
+        .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
+    ui.style_mut().override_font_id = sf;
+    ui.visuals_mut().widgets = sw;
+    r
+}
+
 /// Where the user's customised ACI-wheel permutation lives. Sits next to
 /// the other project-root files (Audit.html, Variables.md, etc.) so the
 /// arrangement travels with the codebase, not a per-user config dir.
@@ -2649,6 +2911,165 @@ pub struct CadApp {
     /// frame, the dialog committed a new style — auto-select it in
     /// the text input dialog. Sentinel `usize::MAX` = not armed.
     text_input_dialog_style_count_before: usize,
+    /// Dockable Text editor dialog (ported from upstream RUST-AutoRASM) — the
+    /// Inspector-style panel that replaces the old floating "Enter text" popup.
+    /// Reuses the `text_input_dialog_*` fields above for anchor / body / style /
+    /// height / auto-select machinery; these three carry the extra dialog state.
+    text_dialog_dock_state: crate::dock::DockState,
+    /// Oblique (italic shear) in DEGREES — mirrors the selected style's
+    /// `TextStyle.oblique` (radians); edits write back to that style.
+    text_dialog_oblique_deg: f64,
+    /// Rotation angle (degrees) for NEWLY placed text — captured into each
+    /// Text's `angle`. Replaces the old oblique box (italic is now a toggle).
+    text_dialog_angle_deg: f64,
+    /// Horizontal alignment for placed text (Parameter → align toggles).
+    text_dialog_halign: cad_kernel::TextHAlign,
+    /// Paragraph list mode (§3 PARAGRAPH/TOOLS): bulleted / numbered / none.
+    text_list_mode: cad_kernel::TextListKind,
+    /// Font-picker (properties panel) keyboard state: the arrow/type-ahead
+    /// highlighted row + the font armed when the popup opened. Live: the
+    /// highlighted font is applied to the style each frame so the ghost updates.
+    font_picker_highlight: usize,
+    /// The font the picker opened on — restored when Esc / click-out cancels.
+    font_picker_orig: Option<String>,
+    /// Text engine (cad_text) — real TTF fonts for the text dialog's preview
+    /// swatch + the placed-text ghost. Lazily loads fonts on first use.
+    font_manager: std::cell::RefCell<cad_text::FontManager>,
+    /// `text_waiting_angle` — armed by a bare `angle`/`a` during the text
+    /// anchor step: the next input IS the rotation angle in degrees.
+    text_waiting_angle: bool,
+    /// WP-SCRIPT Python engine (worker thread + embedded CPython). Lazily
+    /// created on the first `py`/`pyfile` so a session that never scripts pays
+    /// nothing. `cad_app` only ever touches the plain-Rust facade.
+    script: Option<cad_script::ScriptEngine>,
+    /// WP-SCRIPT slice 4 — docked Python REPL console panel.
+    py_console_open: bool,
+    /// Console output log (prints, values, tracebacks, submitted lines).
+    /// Capped so a runaway print loop can't grow memory (rule 11).
+    py_console_log: Vec<String>,
+    /// The console input line.
+    py_console_input: String,
+    /// File name for "Save as script" (scripts/<name>.py — slice 5).
+    py_console_name: String,
+    /// Submitted lines for ↑/↓ recall.
+    py_console_hist: Vec<String>,
+    /// Current position in the recall list (None = editing a fresh line).
+    py_console_hist_idx: Option<usize>,
+    /// Console dock state (Bottom by default, floatable).
+    py_console_dock: crate::dock::DockState,
+    /// Example scripts found in `scripts/*.py` (name, path) — scanned when the
+    /// console opens and on demand via the refresh button.
+    py_examples: Vec<(String, std::path::PathBuf)>,
+    /// Selected example index in the console's combo.
+    py_example_sel: usize,
+    /// WP-SCRIPT D5 (one run = one undo unit): undo depth captured when the
+    /// running script made its FIRST write. On `Finished` the per-op
+    /// snapshots collapse back to `base + 1` — the single pre-run state —
+    /// so one Ctrl+Z reverts the whole run. `None` = no script write so far.
+    script_undo_base: Option<usize>,
+    /// Explicit `rasm.undo_group()` boundary snapshots (indices into
+    /// `undo_stack`), reset per run. At `Finished` a grouped run keeps the
+    /// pre-run snapshot + one entry per boundary — each group = one undo unit.
+    script_group_snapshots: Vec<usize>,
+    // ---- Plot Style Table Editor (CTB color→pen) state ----
+    plotstyle_open: bool,
+    /// Screen rect of the Plot dialog's Edit-style pencil button + the Plot
+    /// dialog's own rect — so the editor can dock next to the pencil (6px) and
+    /// cap its height to the dialog.
+    plotstyle_edit_anchor: Option<egui::Rect>,
+    plot_dialog_rect: Option<egui::Rect>,
+    /// The editor's last rendered rect — so its own sub-menus (ladder, .pst)
+    /// open centred on it even after the user drags it (positioning §2b).
+    plotstyle_editor_rect: Option<egui::Rect>,
+    /// Open-transition trackers. `!prev` on a shown frame == "just opened this
+    /// frame" → force the child to its parent's centre (a dragged parent carries
+    /// its children); afterwards the child is freely draggable. Positioning §2b.
+    prev_plotstyle_open: bool,
+    prev_plot_ladder_open: bool,
+    prev_plot_preview_open: bool,
+    /// Open-counters. Bumped once per open → the child window gets a FRESH egui Id
+    /// each open, so egui has no remembered position and `default_pos(parent)`
+    /// always wins (a stale remembered spot can't hijack it); dragging still works
+    /// because the Id is stable for the whole open. Positioning §2b.
+    plotstyle_open_seq: u64,
+    plot_ladder_open_seq: u64,
+    plot_preview_open_seq: u64,
+    /// Menu-stack returns (avoid menu-on-menu): reopen the Plot dialog when the
+    /// editor closes; reopen the editor when a sub-dialog (ladder / .pst) closes.
+    plotstyle_return_to_plot: bool,
+    plotstyle_return_after_sub: bool,
+    /// Screen rect of the editor's footer button row (anchor for sub-dialogs).
+    plotstyle_footer_rect: Option<egui::Rect>,
+    /// Selected ACI colors (1..=255) in the editor's left list. Multi-select:
+    /// edits in the property panel apply to all of these.
+    plotstyle_sel: Vec<u8>,
+    /// Shift-range anchor for the color list.
+    plotstyle_anchor: Option<u8>,
+    /// Editor tab: 0 = General, 1 = Table View, 2 = Form View.
+    plotstyle_tab: u8,
+    /// Edit-Lineweights sub-dialog state.
+    plotstyle_ladder_open: bool,
+    /// Working copy of the ladder while the Edit-Lineweights dialog is open;
+    /// committed to `table.lineweight_ladder` on OK.
+    plotstyle_ladder_work: Vec<f32>,
+    plotstyle_ladder_sel:  Option<usize>,
+    /// Display units in the Edit-Lineweights dialog (values are stored mm).
+    plotstyle_ladder_inch: bool,
+    /// When set, the shared file dialog is targeting a `.pst` plot-style table:
+    /// Some(true) = Save As, Some(false) = Load. None = normal drawing I/O.
+    plotstyle_pst_io: Option<bool>,
+    /// The `.pst` file the Plot Style Table Editor is bound to when opened from
+    /// the CTB menu (New/Edit CTB) — "Save changes" writes the table back to
+    /// this path. None = the document's own table (Save As / Load .pst as before).
+    plotstyle_edit_file: Option<std::path::PathBuf>,
+    /// CTB menu → New CTB… — name-entry dialog state.
+    new_ctb_open: bool,
+    new_ctb_name: String,
+    /// Cache of the saved CTB tables (name → table) so the layout print-preview
+    /// applies each CTB's per-ACI colour rules without a per-frame file read.
+    /// Rebuilt by `refresh_ctb_tables` when the on-disk fingerprint (name, len,
+    /// mtime of every `.pst`) changes — covers in-app saves AND external edits.
+    ctb_table_cache: std::collections::HashMap<String, cad_kernel::plotstyle::PlotStyleTable>,
+    ctb_fingerprint: Vec<(String, u64, Option<std::time::SystemTime>)>,
+    /// Layer-status glyph textures (on/off/frozen/…), rasterised once from the
+    /// SVG snippets in `layer_glyphs.rs` and reused by every panel that blits
+    /// them (`blit_layer_glyph`).
+    layer_glyph_tex: std::collections::HashMap<&'static str, egui::TextureHandle>,
+
+    // ---- Plot dialog ----
+    plot_dialog_open: bool,
+    /// Output format: "pdf" (default), "svg" or "png".
+    plot_format:      String,
+    plot_suppress_viewer: bool,
+    plot_pdf_path:    String,        // output path (extension per `plot_format`)
+    plot_paper:       cad_kernel::plotstyle::PaperSize,
+    plot_landscape:   bool,
+    plot_area_kind:   u8,            // 0 = Extents, 1 = Window, 2 = Display
+    plot_window:      Option<(Vec2, Vec2)>,
+    plot_offset_center: bool,
+    plot_offset_x:    f32,
+    plot_offset_y:    f32,
+    plot_scale_fit:   bool,          // true = Fit, false = 1:N
+    plot_scale_n:     f64,           // the N in 1:N (model units per paper mm)
+    plot_scale_lw:    bool,          // "Scale lineweights" — default OFF
+    plot_with_styles: bool,          // "Plot with plot styles" — default ON
+    plot_object_lw:   bool,          // "Plot object lineweights" — default ON
+    plot_mono:        bool,          // "Plot all black" — default OFF
+    /// Window-area pick: 0 = idle, 1 = waiting first corner, 2 = waiting second.
+    plot_win_pick:    u8,
+    plot_win_p1:      Option<Vec2>,
+    /// When set, the shared file dialog is choosing the output PDF path.
+    plot_pdf_browse:  bool,
+    /// Paper-side scale/offset unit: false = mm (default), true = inch.
+    plot_unit_inch:   bool,
+    /// When the Save dialog was opened by the Plot button (choose path → write
+    /// → open the PDF), not by a standalone Browse.
+    plot_run_after_save: bool,
+    /// The full print-preview window (renders the real output + Confirm) is open.
+    plot_preview_open: bool,
+    /// Page Setup (dockable) dialog — model-space plot configuration.
+    pagesetup_open: bool,
+    pagesetup_dock_state: crate::dock::DockState,
     /// Session Recorder — captures every user action / state transition
     /// / doc mutation when armed. OFF by default; user pushes Start in
     /// the Recorder window before a debug session. See
@@ -4018,6 +4439,12 @@ pub enum AciPickRequest {
     WallStyleForm(WallColorSlot),
     /// Picker is editing the Block dialog's instance color.
     BlockForm,
+    /// Picker is editing the drawing's CURRENT color (text dialog parameter
+    /// section — the color new dobjects are born with).
+    CurrentColor,
+    /// Picker is editing the Plot Style Table Editor's color for the selected
+    /// plot styles.
+    PlotStyleColor,
 }
 
 /// Which viewport the user is currently working in.
@@ -4424,6 +4851,79 @@ impl Default for CadApp {
             text_input_dialog_height:   0.0,
             text_input_dialog_style_id: cad_kernel::TextStyleTable::STANDARD,
             text_input_dialog_style_count_before: usize::MAX,
+            text_dialog_dock_state: crate::dock::DockState::Floating(egui::pos2(1240.0, 420.0)),
+            text_dialog_oblique_deg: 0.0,
+            text_dialog_angle_deg: 0.0,
+            text_dialog_halign: cad_kernel::TextHAlign::Left,
+            text_list_mode: cad_kernel::TextListKind::None,
+            font_picker_highlight: 0,
+            font_picker_orig: None,
+            font_manager: std::cell::RefCell::new(cad_text::FontManager::new()),
+            text_waiting_angle: false,
+            script: None,
+            py_console_open: false,
+            py_console_log: Vec::new(),
+            py_console_input: String::new(),
+            py_console_name: String::new(),
+            py_console_hist: Vec::new(),
+            py_console_hist_idx: None,
+            py_console_dock: crate::dock::DockState::Docked(crate::dock::DockRegion::Bottom),
+            py_examples: Vec::new(),
+            py_example_sel: 0,
+            script_undo_base: None,
+            script_group_snapshots: Vec::new(),
+            plotstyle_open: false,
+            plotstyle_edit_anchor: None,
+            plot_dialog_rect: None,
+            plotstyle_editor_rect: None,
+            prev_plotstyle_open: false,
+            prev_plot_ladder_open: false,
+            prev_plot_preview_open: false,
+            plotstyle_open_seq: 0,
+            plot_ladder_open_seq: 0,
+            plot_preview_open_seq: 0,
+            plotstyle_return_to_plot: false,
+            plotstyle_return_after_sub: false,
+            plotstyle_footer_rect: None,
+            plotstyle_sel: Vec::new(),
+            plotstyle_anchor: None,
+            plotstyle_tab: 0,
+            plotstyle_ladder_open: false,
+            plotstyle_ladder_work: Vec::new(),
+            plotstyle_ladder_sel:  None,
+            plotstyle_ladder_inch: false,
+            plotstyle_pst_io:      None,
+            plotstyle_edit_file:   None,
+            new_ctb_open:  false,
+            new_ctb_name:  String::new(),
+            ctb_table_cache: std::collections::HashMap::new(),
+            ctb_fingerprint: Vec::new(),
+            layer_glyph_tex:    std::collections::HashMap::new(),
+            plot_dialog_open: false,
+            plot_format:      "pdf".into(),
+            plot_suppress_viewer: false,
+            plot_pdf_path:    String::new(),
+            plot_paper:       cad_kernel::plotstyle::PaperSize::A4,
+            plot_landscape:   false,
+            plot_area_kind:   0,
+            plot_window:      None,
+            plot_offset_center: true,
+            plot_offset_x:    0.0,
+            plot_offset_y:    0.0,
+            plot_scale_fit:   true,
+            plot_scale_n:     1.0,
+            plot_scale_lw:    false,
+            plot_with_styles: true,
+            plot_object_lw:   true,
+            plot_mono:        false,
+            plot_win_pick:    0,
+            plot_win_p1:      None,
+            plot_pdf_browse:  false,
+            plot_unit_inch:   false,
+            plot_run_after_save: false,
+            plot_preview_open: false,
+            pagesetup_open: false,
+            pagesetup_dock_state: crate::dock::DockState::Floating(egui::pos2(1240.0, 420.0)),
             dbg: crate::dbg_recorder::DbgRecorder::default(),
             dbg_window_open: false,
             dbg_note_buf:    String::new(),
@@ -16483,6 +16983,7 @@ impl CadApp {
                 match self.eval_number(trimmed) {
                     Ok(v) if v > 1e-9 => {
                         self.env.TxHt = v;
+                        self.text_input_dialog_height = v;
                         let _ = self.env.save();
                         self.history.push(format!(
                             "  text: height → {}", crate::calc::fmt_value(v)));
@@ -16492,9 +16993,30 @@ impl CadApp {
                     Err(e) => self.history.push(format!("  ! {}", e)),
                 }
             }
-            self.set_prompt(format!(
-                "text: click anchor (H for height={}, Esc cancels)",
-                self.env.TxHt));
+            let p = self.text_anchor_prompt(false);
+            self.set_prompt(p);
+            return;
+        }
+
+        // (a2) `text_waiting_angle` was armed by a bare `angle`; this input IS
+        //      the rotation angle in degrees (blank = keep).
+        if self.text_waiting_angle {
+            self.text_waiting_angle = false;
+            if trimmed.is_empty() {
+                self.history.push(format!(
+                    "  text: angle kept at {}\u{00B0}", self.text_dialog_angle_deg));
+            } else {
+                match self.eval_number(trimmed) {
+                    Ok(v) => {
+                        self.text_dialog_angle_deg = v;
+                        self.history.push(format!("  text: angle → {}\u{00B0}",
+                            crate::calc::fmt_value(v)));
+                    }
+                    Err(e) => self.history.push(format!("  ! {}", e)),
+                }
+            }
+            let p = self.text_anchor_prompt(false);
+            self.set_prompt(p);
             return;
         }
 
@@ -16536,32 +17058,55 @@ impl CadApp {
         if self.text_draft == TextDraftState::WaitingForPosition {
             let lc = trimmed.to_ascii_lowercase();
             let toks: Vec<&str> = lc.split_whitespace().collect();
-            if !toks.is_empty() && (toks[0] == "h" || toks[0] == "height") {
+            let kw = toks.first().copied().unwrap_or("");
+            // HEIGHT sub-command chip / keyword.
+            if kw == "h" || kw == "height" {
                 if toks.len() == 1 {
                     // Bare H — arm the next input as the value.
                     self.text_waiting_height = true;
-                    self.set_prompt(format!(
-                        "text: enter height <{}>:  [Enter to keep]",
-                        self.env.TxHt));
+                    self.set_prompt(format!("text: enter height <{}>", self.env.TxHt));
                 } else {
                     // Evaluate the ORIGINAL case (toks is lowercased, but
                     // variables are case-sensitive).
                     let val = trimmed.split_whitespace().nth(1).unwrap_or("");
                     match self.eval_number(val) {
                         Ok(v) if v > 1e-9 => {
-                            self.env.TxHt = v;
+                            self.env.TxHt = v; self.text_input_dialog_height = v;
                             let _ = self.env.save();
                             self.history.push(format!(
                                 "  text: height → {}", crate::calc::fmt_value(v)));
-                            self.set_prompt(format!(
-                                "text: click anchor (H for height={}, Esc cancels)",
-                                self.env.TxHt));
                         }
-                        Ok(_) => self.history.push(
-                            "  ! text: height must be positive".into()),
+                        Ok(_) => self.history.push("  ! text: height must be positive".into()),
                         Err(e) => self.history.push(format!("  ! {}", e)),
                     }
+                    let p = self.text_anchor_prompt(false);
+                    self.set_prompt(p);
                 }
+                return;
+            }
+            // ANGLE sub-command chip / keyword (rotation, degrees).
+            if kw == "a" || kw == "angle" {
+                if toks.len() == 1 {
+                    self.text_waiting_angle = true;
+                    self.set_prompt(format!(
+                        "text: enter angle\u{00B0} <{}>", self.text_dialog_angle_deg));
+                } else {
+                    match toks[1].parse::<f64>() {
+                        Ok(v) => {
+                            self.text_dialog_angle_deg = v;
+                            self.history.push(format!("  text: angle → {}\u{00B0}", v));
+                        }
+                        Err(_) => self.history.push(format!("  ! text: '{}' is not a number", toks[1])),
+                    }
+                    let p = self.text_anchor_prompt(false);
+                    self.set_prompt(p);
+                }
+                return;
+            }
+            // CLOSE chip / keyword — end the text session (mirrors grip→Close).
+            if kw == "close" {
+                self.close_text_dialog(true);
+                self.history.push("  text: finished".into());
                 return;
             }
         }
@@ -17955,16 +18500,42 @@ impl CadApp {
                 self.pending.clear();
                 self.text_draft = TextDraftState::WaitingForPosition;
                 self.text_waiting_height = false;
+                self.text_waiting_angle = false;
                 if let Some(string) = s_opt {
                     self.pending_text = Some(string.clone());
                     self.set_prompt(format!(
-                        "text: click anchor to place \"{}\"  (H for height={}, Esc cancels)",
-                        string, self.env.TxHt));
+                        "text: click anchor to place \"{}\"   h={}  a={}\u{00B0}   [ Height / Angle ]",
+                        string, self.env.TxHt, self.text_dialog_angle_deg));
                 } else {
                     self.pending_text = None;
-                    self.set_prompt(format!(
-                        "text: click anchor, then type the string  (H for height={}, Esc cancels)",
-                        self.env.TxHt));
+                    // Dockable command dialogs are MUTUALLY EXCLUSIVE — close the
+                    // Hatch panel before opening Text (two open at once caused a
+                    // hang; see TEXT_DIALOG_DESIGN.md). No-op if it isn't open.
+                    if self.hatch_dialog_open { self.hatch_dialog_open = false; }
+                    // Open the dockable Text editor panel (TEXT_DIALOG_DESIGN.md).
+                    // It stays open across placements; the first canvas click sets
+                    // the anchor, then the user types + Apply. Seed style/height/
+                    // oblique from the sticky style so the panel opens configured.
+                    self.text_input_dialog_open   = true;
+                    self.text_input_dialog_anchor = None;
+                    // Seed the dialog height from the sticky TxHt so the pill note,
+                    // the dialog field, and the placed text all agree from the start.
+                    self.text_input_dialog_height = self.env.TxHt.max(1e-3);
+                    // The write box takes focus only AFTER the anchor click
+                    // (WaitingForString). Before that, the command line owns the
+                    // keyboard so Height/Angle sub-commands can be typed.
+                    self.text_input_dialog_focus  = false;
+                    self.text_input_dialog_buf.clear();
+                    if (self.text_input_dialog_style_id as usize)
+                        >= self.doc.text_styles.len()
+                    {
+                        self.text_input_dialog_style_id =
+                            cad_kernel::TextStyleTable::STANDARD;
+                    }
+                    let sid = self.text_input_dialog_style_id;
+                    self.seed_text_dialog_from_style(sid);
+                    let p = self.text_anchor_prompt(false);
+                    self.set_prompt(p);
                 }
             }
             Ok(Command::Dim) => {
@@ -18550,6 +19121,104 @@ impl CadApp {
                 // distance + dx + dy + angle. Doesn't touch the doc.
                 self.dist_state = DistState::WaitingForP1;
                 self.set_prompt("dist: click FIRST point  [Esc=cancel]");
+            }
+            // WP-SCRIPT: run Python on the worker (never blocks here); replies
+            // are drained per-frame in `poll_script_engine`.
+            Ok(Command::Python(Some(code))) => {
+                self.history.push(format!("  py> {}", code));
+                self.script.get_or_insert_with(cad_script::ScriptEngine::new)
+                    .submit_text(code);
+            }
+            Ok(Command::Python(None)) => {
+                // Bare `py` toggles the docked Python console.
+                self.py_console_open = !self.py_console_open;
+                if self.py_console_open {
+                    self.scan_py_examples();
+                    self.history.push(
+                        "  python: console opened — `help(rasm)` lists the scripting surface; Esc stops a running script".into());
+                }
+            }
+            Ok(Command::PythonFile(path)) => {
+                self.history.push(format!("  pyfile> {}", path));
+                self.script.get_or_insert_with(cad_script::ScriptEngine::new)
+                    .submit_file(std::path::PathBuf::from(path));
+            }
+            // WP-SCRIPT: `run <name>` executes scripts/<name>.py; bare `run`
+            // opens the console and lists what's available.
+            Ok(Command::Script(name, _args)) => {
+                match name {
+                    None => {
+                        self.py_console_open = true;
+                        self.scan_py_examples();
+                        let list: Vec<String> =
+                            self.py_examples.iter().map(|(n, _)| n.clone()).collect();
+                        self.history.push(format!(
+                            "  run — scripts: {}  (type `run <name>` to execute)",
+                            if list.is_empty() { "none".into() } else { list.join(", ") },
+                        ));
+                    }
+                    Some(name) => {
+                        self.scan_py_examples();
+                        let resolved = Self::resolve_script(&name);
+                        match resolved {
+                            Some((stem, path)) => {
+                                self.history.push(format!("  run> {}", stem));
+                                self.script
+                                    .get_or_insert_with(cad_script::ScriptEngine::new)
+                                    .submit_file(path);
+                            }
+                            None => {
+                                let list: Vec<String> =
+                                    self.py_examples.iter().map(|(n, _)| n.clone()).collect();
+                                self.history.push(format!(
+                                    "  ! no script '{}' — available: {}",
+                                    name,
+                                    if list.is_empty() { "none".into() } else { list.join(", ") },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Command::PyApiDoc) => {
+                // The full API reference document is not bundled in this build;
+                // the console's `help(rasm)` covers the scripting surface.
+                self.py_console_open = true;
+                self.history.push(
+                    "  python: console opened — `help(rasm)` lists the scripting surface".into());
+            }
+            Ok(Command::PlotStyle) => {
+                // Open the Plot Style Table Editor (CTB color->pen editor). App
+                // dialog only — no geometry, no undo. Edits the document's own
+                // table; not bound to a CTB file (the CTB menu binds one).
+                self.plotstyle_edit_file = None;
+                self.plotstyle_open = true;
+                if self.plotstyle_sel.is_empty() { self.plotstyle_sel = vec![1]; self.plotstyle_anchor = Some(1); }
+                self.history.push("  plot style table editor".into());
+            }
+            Ok(Command::Plot) => {
+                // Open the Plot dialog (paper/area/scale + table -> PDF). App
+                // dialog only — read-only on the doc, no undo. Start from the
+                // document's saved PAGESETUP.
+                let ps = self.doc.page_setup.clone();
+                self.plot_paper = ps.paper;
+                self.plot_unit_inch = ps.unit_inch;
+                self.plot_scale_fit = ps.scale_fit;
+                if !ps.scale_fit && ps.scale_n > 1e-9 {
+                    self.plot_scale_n = ps.scale_n;
+                }
+                self.plot_dialog_open = true;
+                self.plot_win_pick = 0;   // defensive: never reopen mid-pick (parked)
+                self.plot_win_p1 = None;
+                if self.plot_pdf_path.is_empty() {
+                    self.plot_pdf_path = self.default_plot_pdf_path();
+                }
+                self.set_prompt("plot — set paper / area / scale in the dialog, then Plot");
+                self.history.push("  plot".into());
+            }
+            Ok(Command::PageSetup) => {
+                self.tool = Tool::None;
+                self.pagesetup_open = true;
             }
             Err(e) => {
                 // ---- Command-line calculator & user variables ------------
@@ -22570,159 +23239,3991 @@ impl CadApp {
             if now > self.text_input_dialog_style_count_before {
                 let new_id = (now - 1) as u32;
                 self.text_input_dialog_style_id = new_id;
-                if let Some(s) = self.doc.text_styles.get(new_id) {
-                    if s.default_height > 1e-9 {
-                        self.text_input_dialog_height = s.default_height;
-                    }
-                }
+                self.seed_text_dialog_from_style(new_id);
             }
             self.text_input_dialog_style_count_before = usize::MAX;
         }
-        // Anchor the window near the canvas position the user clicked
-        // — but only on the FIRST frame after open (signaled by the
-        // same `focus` flag that requests TextEdit focus). After that,
-        // the user is free to drag the window anywhere; we don't
-        // override their position every frame.
-        let initial_pos = match (self.text_input_dialog_anchor,
-                                 self.canvas_screen_rect) {
-            (Some(world), Some(rect)) => {
-                let p = self.w2s(world, rect);
-                Some(egui::pos2(p.x + 12.0, p.y + 12.0))
-            }
-            _ => None,
+        // Dialog-template shell: rail header, collapsible, dockable R/L, ~276.
+        let cfg = crate::dock::DockConfig {
+            id: "text", title: "Text", badge: None,
+            dock_region: crate::dock::DockRegion::Right,
+            alt_region: Some(crate::dock::DockRegion::Left),
+            dockable: false,             // floating-only (owner: Inspector docks)
+            rail_header: true,
+            collapsible: true,
+            size: 276.0, min: 276.0, max: 340.0,
+            resizable: false, flush_body: true, float_w: 276.0, float_max_h_frac: 0.9,
         };
-        let mut open      = true;
-        let mut do_ok     = false;
-        let mut do_cancel = false;
-        // Snapshot style choices for the combo. We can't borrow
-        // self.doc while the window closure also borrows &mut self —
-        // hand the closure a Vec of (id, name) pairs.
-        let style_choices: Vec<(u32, String)> = self.doc.text_styles.styles
-            .iter().enumerate()
-            .map(|(i, s)| (i as u32, s.name.clone()))
-            .collect();
-        let mut window = egui::Window::new("Enter text")
-            .id(egui::Id::new("text_input_dialog"))
-            .open(&mut open)
-            .resizable(true)
-            .collapsible(false)
-            .movable(true)
-            .default_width(340.0);
-        // Force position only on the just-opened frame so the dialog
-        // appears AT the click anchor. After that we drop .current_pos
-        // and egui remembers the user's drags.
-        if self.text_input_dialog_focus {
-            if let Some(p) = initial_pos {
-                window = window.current_pos(p);
-            }
+        let mut state = self.text_dialog_dock_state;
+        let mut open = true;
+        // Dialogue-box height RULE: cap the body at (canvas height − 300px); if the
+        // content is taller, it scrolls. Keeps a tall dialog from overrunning the
+        // canvas. `canvas_screen_rect` is the drawing area; fall back to the window.
+        let canvas_h = self.canvas_screen_rect.map(|r| r.height())
+            .unwrap_or_else(|| ctx.screen_rect().height());
+        let max_body_h = (canvas_h - 300.0).max(200.0);
+        // DOCKED → drawn by `render_dock_columns`; here only the FLOATING case.
+        if matches!(state, crate::dock::DockState::Floating(_)) {
+            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 12.0, bottom: 14.0 })
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(max_body_h)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| { self.text_dialog_body(ui); });
+                    });
+            });
         }
-        window.show(ctx, |ui| {
-            ui.label(egui::RichText::new(
-                "Type your text. Enter commits, Esc cancels. Drag the title bar to move.")
-                .small().weak());
-            ui.add_space(6.0);
-            let edit = egui::TextEdit::singleline(&mut self.text_input_dialog_buf)
-                .desired_width(320.0)
-                .hint_text("text...");
-            let resp = ui.add(edit);
-            if self.text_input_dialog_focus {
-                resp.request_focus();
-                self.text_input_dialog_focus = false;
+        self.text_dialog_dock_state = state;
+        // Grip → Close fully shuts the panel and ends the TEXT command.
+        if !open { self.close_text_dialog(true); }
+    }
+
+    /// Seed the panel's Height + Oblique from a text style (on open / style
+    /// pick / after "+ New…"). Height only overrides when the style forces one.
+    fn seed_text_dialog_from_style(&mut self, id: u32) {
+        if let Some(s) = self.doc.text_styles.get(id) {
+            if s.default_height > 1e-9 { self.text_input_dialog_height = s.default_height; }
+            self.text_dialog_oblique_deg = s.oblique.to_degrees();
+        }
+    }
+
+    /// Close the Text panel and (optionally) end the TEXT command.
+    fn close_text_dialog(&mut self, end_command: bool) {
+        self.text_input_dialog_open = false;
+        self.text_input_dialog_buf.clear();
+        self.text_input_dialog_anchor = None;
+        self.text_input_dialog_focus = false;
+        if end_command {
+            self.text_draft = TextDraftState::Off;
+            self.tool = Tool::None;
+            self.clear_prompt();
+        }
+    }
+
+    /// Live command-pill prompt for the text anchor step. Follows the COMMAND-
+    /// PILL RULE: current height/angle are plain NOTES; sub-commands are
+    /// clickable `[ … ]` chips (Height/Angle always; Close once a text was
+    /// placed, to end the multi-place session). Every chip word is handled by
+    /// the text intercepts in `run_command`.
+    fn text_anchor_prompt(&self, placed: bool) -> String {
+        let h = self.env.TxHt;
+        let a = self.text_dialog_angle_deg;
+        // Esc ends the session (after a placement) or cancels (before) — no
+        // Close chip needed. Height/Angle are the only sub-commands.
+        let verb = if placed { "click next anchor" } else { "click anchor position" };
+        format!("text: {verb}   h={h}  a={a}\u{00B0}   [ Height / Angle ]")
+    }
+
+    /// Body of the dockable Text dialog: STYLE / PARAMETER / PARAGRAPH-TOOLS
+    /// sections, then the Apply button, the "Write here" content box, and the
+    /// Enter/Esc hint. Also drives Apply(Enter) / Esc keyboard handling.
+    fn text_dialog_body(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::color as tc;
+        // Snapshot style list once (owned, so the section closures can also
+        // borrow &mut self without aliasing self.doc).
+        let styles: Vec<(u32, String)> = self.doc.text_styles.styles.iter()
+            .enumerate().map(|(i, s)| (i as u32, s.name.clone())).collect();
+        let sid = self.text_input_dialog_style_id;
+        let cur = self.doc.text_styles.get(sid).cloned()
+            .unwrap_or_else(cad_kernel::TextStyle::standard);
+
+        // ── §1 STYLE ─────────────────────────────────────────────────────
+        pp_section(ui, "text_style_sec", "STYLE", true, false, |ui| {
+            self.text_style_section(ui, &styles, sid, &cur);
+        });
+        // ── §2 PARAMETER ─────────────────────────────────────────────────
+        pp_section(ui, "text_param_sec", "PARAMETER", true, true, |ui| {
+            self.text_parameter_section(ui, sid);
+        });
+        // ── §3 PARAGRAPH / TOOLS ─────────────────────────────────────────
+        pp_section(ui, "text_para_sec", "PARAGRAPH / TOOLS", true, true, |ui| {
+            self.text_paragraph_section(ui);
+        });
+        // Divider closes the paragraph section (before Apply).
+        pp_divider(ui);
+
+        // Content-box focus stored LAST frame — drives the Apply-enabled gate
+        // (owner #6: Apply turns on as soon as you click the box). Refreshed after
+        // the box renders below.
+        let te_id = egui::Id::new("text_dialog_content_edit");
+        let focus_key = egui::Id::new("text_dialog_content_focused");
+        let was_focused = ui.data(|d| d.get_temp::<bool>(focus_key)).unwrap_or(false);
+
+        // ── Apply — the ONLY commit (owner #3). Enter / Space / Shift+Enter just
+        //    edit text; nothing but this button places the text. Enabled once an
+        //    anchor is set AND the box is focused or already has text (owner #6).
+        ui.add_space(12.0);
+        let ready = self.text_input_dialog_anchor.is_some()
+            && (was_focused || !self.text_input_dialog_buf.trim().is_empty());
+        let aw = (ui.available_width() * 0.6).floor();
+        let mut do_apply = false;
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - aw) * 0.5).max(0.0));
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(aw, 24.0), egui::Sense::click());
+            let p = ui.painter_at(rect);
+            let (fill, txt) = if ready {
+                let f = if resp.hovered() { tc::ACCENT } else { tc::ACCENT.gamma_multiply(0.88) };
+                (f, tc::ON_ACCENT)
+            } else { (tc::SURFACE_2, tc::TEXT_DISABLED) };
+            p.rect_filled(rect, 12.0, fill);
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, "Apply",
+                crate::theme::typ::body_strong(), txt);
+            if ready && resp.clicked() { do_apply = true; }
+            if ready && resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+        });
+
+        // ── Content box — a multi-line editor. SHIFT+ENTER inserts a new line
+        //    (keep typing), plain ENTER = Apply, Space inserts a space. NOTE:
+        //    egui 0.30's multiline TextEdit only inserts a newline for its
+        //    `return_key` (default = plain Enter); Shift+Enter is otherwise
+        //    IGNORED. We consume plain Enter for Apply (below) AND remap the
+        //    return_key to Shift+Enter, so Shift+Enter makes the newline and
+        //    plain Enter never inserts one.
+        ui.add_space(10.0);
+        let sf = ui.style().override_font_id.clone();
+        let sw = ui.visuals().widgets.clone();
+        {
+            let vis = ui.visuals_mut();
+            for st in [&mut vis.widgets.inactive, &mut vis.widgets.hovered, &mut vis.widgets.active] {
+                st.bg_fill = tc::SURFACE_0;
+                st.weak_bg_fill = tc::SURFACE_0;
+                st.bg_stroke = egui::Stroke::new(1.0, tc::BORDER);
+                st.fg_stroke.color = tc::TEXT_PRIMARY;
             }
-            ui.add_space(4.0);
-            // Style picker — pulls from doc.text_styles. Selecting a
-            // style with a non-zero default_height seeds the Height
-            // field below so the dialog reflects the style's choice.
-            // The "+ New…" button opens the standard TextStyleDialog
-            // (the same one the `style` command uses) so the user can
-            // create Title / Dimension / Drawing-Title / etc. without
-            // closing this dialog. After the new style commits, the
-            // combo picks it up automatically next frame.
-            let mut open_new_style = false;
-            ui.horizontal(|ui| {
-                ui.label("Style:");
-                let cur_name = style_choices.iter()
-                    .find(|(i, _)| *i == self.text_input_dialog_style_id)
-                    .map(|(_, n)| n.clone())
-                    .unwrap_or_else(|| "STANDARD".to_string());
-                egui::ComboBox::from_id_salt("text_input_dialog_style")
-                    .selected_text(cur_name)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &style_choices {
-                            let prev = self.text_input_dialog_style_id;
-                            if ui.selectable_value(
-                                &mut self.text_input_dialog_style_id,
-                                *id, name).changed()
-                                && *id != prev
-                            {
-                                if let Some(s) = self.doc.text_styles.get(*id) {
-                                    if s.default_height > 1e-9 {
-                                        self.text_input_dialog_height = s.default_height;
-                                    }
+            vis.extreme_bg_color = tc::SURFACE_0;
+            vis.widgets.inactive.rounding = egui::Rounding::same(crate::theme::radius::SM);
+        }
+        // While the font popup is open, the write box must NOT keep keyboard
+        // focus. The box's TextEdit renders BEFORE the popup, so if it stays
+        // focused it swallows the letters the popup's first-letter type-ahead
+        // needs (the intermittent "type-ahead sometimes doesn't work"). Surrender
+        // focus so keystrokes reach the picker; the picker owns Enter here too.
+        if ui.memory(|m| m.is_popup_open(egui::Id::new("text_font_popup"))) {
+            ui.memory_mut(|m| m.surrender_focus(te_id));
+        }
+        // Enter (NO modifiers) = Apply — consume it BEFORE the TextEdit so it
+        // never becomes text. Shift+Enter falls THROUGH to the editor's
+        // `return_key` to make a new line.
+        // ⚠ egui's `consume_key(NONE, …)` matches *logically* — a bare NONE
+        // pattern also matches Shift+Enter (it only checks the pattern's required
+        // modifiers are present, not that no extra ones are). So we guard on "no
+        // modifiers held" ourselves, or Shift+Enter would apply too.
+        // Fire Apply whenever a draft is active (`WaitingForString`), NOT only
+        // when the box has focus: the box misses focus for the ONE frame right
+        // after the anchor click, which made the FIRST Enter a no-op ("first
+        // Enter doesn't apply"). Exclude the font popup (Enter commits a font).
+        let drafting = matches!(self.text_draft, TextDraftState::WaitingForString(_));
+        let font_popup = ui.memory(|m| m.is_popup_open(egui::Id::new("text_font_popup")));
+        if (ui.memory(|m| m.has_focus(te_id)) || drafting)
+            && !font_popup
+            && ui.input(|i| !i.modifiers.any())
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
+            do_apply = true;
+        }
+        let edit = egui::TextEdit::multiline(&mut self.text_input_dialog_buf)
+            .id(te_id)
+            .desired_width(f32::INFINITY)
+            .desired_rows(3)
+            // Newline on SHIFT+Enter (not plain Enter — that's Apply).
+            .return_key(egui::KeyboardShortcut::new(
+                egui::Modifiers::SHIFT, egui::Key::Enter))
+            .hint_text("Write here");
+        let resp = ui.add_sized(egui::vec2(ui.available_width(), 72.0), edit);
+        ui.visuals_mut().widgets = sw;
+        ui.style_mut().override_font_id = sf;
+        // Store this frame's focus for next frame's Apply gate. Read has_focus()
+        // FIRST — egui's Context is one RwLock, so calling has_focus() (a read)
+        // INSIDE data_mut() (a write) self-deadlocks the whole app (HANG).
+        let content_focused = resp.has_focus();
+        ui.data_mut(|d| d.insert_temp(focus_key, content_focused));
+        if self.text_input_dialog_focus {
+            resp.request_focus();
+            self.text_input_dialog_focus = false;
+        }
+        // Owner feature: clicking into the write box RE-RUNS the text command —
+        // re-arm the tool so the next canvas click sets an anchor (no need to
+        // retype `text`). Only when it isn't already the active tool.
+        if (resp.gained_focus() || resp.clicked()) && self.tool != Tool::Text {
+            self.tool = Tool::Text;
+            self.text_draft = TextDraftState::WaitingForPosition;
+            let p = self.text_anchor_prompt(false);
+            self.set_prompt(p);
+        }
+
+        // ── Hint ─────────────────────────────────────────────────────────
+        ui.add_space(4.0);
+        let (hr, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
+        ui.painter().text(hr.center(), egui::Align2::CENTER_CENTER,
+            "Shift+Enter = new line   ·   Enter or Apply = place",
+            crate::theme::typ::hint(), tc::TEXT_MUTED);
+
+        if do_apply { self.commit_text_dialog(); }
+    }
+
+    /// §1 STYLE — two columns: three equal-width left dropdowns (Style / Font /
+    /// Variant) + a right column of New / Set-current pills over a live preview
+    /// box, bottom-aligned with the left column.
+    fn text_style_section(&mut self, ui: &mut egui::Ui,
+        styles: &[(u32, String)], sid: u32, cur: &cad_kernel::TextStyle)
+    {
+        use crate::theme::color as tc;
+        let cw = ui.available_width();
+        let gap = 8.0;
+        let lw = (cw * 0.46).floor();
+        let rw = cw - lw - gap;
+        let col_h = 3.0 * PP_ROW_H + 2.0 * 8.0;     // left column total height
+        let cur_name = styles.iter().find(|(i, _)| *i == sid).map(|(_, n)| n.clone())
+            .unwrap_or_else(|| "STANDARD".into());
+        let mut pick_style: Option<u32> = None;
+        let mut set_font: Option<String> = None;
+        let mut do_new = false;
+        let mut do_set_current = false;
+        // Real installed fonts (from the cad_text engine) offered alongside the
+        // two egui built-ins. Fetched once, before the UI closures capture `ui`.
+        let sys_fonts = self.font_manager.borrow().names();
+        // Font-picker keyboard state pulled into locals (nested egui closures
+        // can't also borrow `self`). Written back after the layout closure.
+        let font_popup_id = egui::Id::new("text_font_popup");
+        let mut pf_highlight = self.font_picker_highlight;
+        let mut pf_commit = false;   // click a row → keep highlighted, close
+        let mut pf_live: Option<String> = None;   // highlighted font (apply live)
+        let mut pf_open_init = false;   // popup just opened this frame
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            // Left column — 3 equal boxes.
+            ui.vertical(|ui| {
+                ui.set_width(lw);
+                // Style dropdown.
+                let r = pp_dropdown_box(ui, lw, &cur_name, true);
+                let id = egui::Id::new("text_style_popup");
+                if r.clicked() { ui.memory_mut(|m| m.toggle_popup(id)); }
+                egui::popup_below_widget(ui, id, &r,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(lw.max(120.0));
+                        for (i, n) in styles {
+                            if ui.selectable_label(*i == sid, n).clicked() { pick_style = Some(*i); }
+                        }
+                    });
+                ui.add_space(8.0);
+                // Font dropdown — keyboard-navigable (↑/↓ + type-to-filter) with
+                // LIVE preview: the highlighted font is applied each frame so the
+                // canvas ghost updates as you move through the list.
+                let fr = pp_dropdown_box(ui, lw, &cur.font_name, true);
+                let fid = font_popup_id;
+                if fr.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(fid));
+                    // Just opened → arm the picker at the current font.
+                    if ui.memory(|m| m.is_popup_open(fid)) {
+                        pf_open_init = true;
+                    }
+                }
+                egui::popup_below_widget(ui, fid, &fr,
+                    egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(lw.max(180.0));
+                        // Full list (built-ins + all system fonts). No search box:
+                        // type a LETTER to jump to fonts starting with it.
+                        let mut choices: Vec<String> =
+                            vec!["standard".into(), "monospace".into()];
+                        choices.extend(sys_fonts.iter().cloned());
+                        let n = choices.len();
+                        // Keyboard, all CONSUMED so nothing leaks to the text box:
+                        //   letter → jump to next font starting with it (cycles)
+                        //   ↑/↓    → move one row
+                        //   Enter  → commit + close
+                        let mut kb = false;
+                        // First-letter type-ahead: read the pressed LETTER via
+                        // Event::Key. A focused TextEdit consumes Event::Text but
+                        // NOT letter Key events, so this fires reliably regardless
+                        // of what holds focus (the old Text-based path was racy).
+                        // Jump to the next font whose name starts with the letter.
+                        let typed: Option<char> = ui.input(|i| {
+                            i.events.iter().rev().find_map(|e| match e {
+                                egui::Event::Key { key, pressed: true, modifiers, .. }
+                                    if !modifiers.ctrl && !modifiers.command
+                                        && !modifiers.alt =>
+                                {
+                                    let b = key.name().as_bytes();
+                                    (b.len() == 1 && b[0].is_ascii_alphabetic())
+                                        .then(|| (b[0] as char).to_ascii_lowercase())
+                                }
+                                _ => None,
+                            })
+                        });
+                        if let Some(lc) = typed {
+                            for k in 1..=n {
+                                let idx = (pf_highlight + k) % n.max(1);
+                                if choices[idx].to_lowercase().starts_with(lc) {
+                                    pf_highlight = idx; kb = true; break;
                                 }
                             }
                         }
+                        ui.input_mut(|i| {
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                                pf_highlight += 1; kb = true;
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                                pf_highlight = pf_highlight.saturating_sub(1); kb = true;
+                            }
+                            if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                                pf_commit = true;
+                            }
+                        });
+                        if pf_highlight >= n { pf_highlight = n.saturating_sub(1); }
+                        // Hover moves the highlight ONLY when the mouse actually
+                        // moves — otherwise a still pointer sitting over the list
+                        // would fight the arrow keys (kept snapping back).
+                        let mouse_moved =
+                            ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+                        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                            for (i, f) in choices.iter().enumerate() {
+                                let resp = ui.selectable_label(i == pf_highlight, f);
+                                if mouse_moved && resp.hovered() { pf_highlight = i; }
+                                if resp.clicked() { pf_highlight = i; pf_commit = true; }
+                                // Auto-scroll only on KEYBOARD nav so the mouse
+                                // isn't fought by scroll-to-highlight.
+                                if kb && i == pf_highlight {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                            }
+                        });
+                        pf_live = choices.get(pf_highlight).cloned();
                     });
-                if ui.button("+ New…").on_hover_text(
-                    "Create a new text style (name, font, default height). \
-                     The new style will be auto-selected when you save it.")
-                    .clicked()
+                ui.add_space(8.0);
+                // Variant — STUB (Bold/Italic land with the font loader).
+                pp_dropdown_box(ui, lw, "Regular", false)
+                    .on_hover_text("Bold / Italic variants — coming with the font loader");
+            });
+            ui.add_space(gap);
+            // Right column — preview on TOP, then the New / Set-current buttons
+            // (their combined width + spacing spans the preview box width).
+            ui.vertical(|ui| {
+                ui.set_width(rw);
+                let ph = (col_h - PP_ROW_H - 8.0).max(24.0);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(rw, ph), egui::Sense::hover());
+                ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+                    tc::SURFACE_0, egui::Stroke::new(1.0, tc::BORDER));
+                let p = ui.painter_at(rect);
+                // Preview in the ACTUAL selected font (+ italic/width); fall back
+                // to egui text when the engine has no fonts.
+                if !self.draw_ttf_swatch(&p, rect, "AaBbCc", &cur.font_name,
+                    cur.oblique, cur.width_factor, tc::TEXT_PRIMARY)
                 {
-                    open_new_style = true;
+                    let (letters, digits) = if cur.font_name == "monospace" {
+                        (egui::FontId::monospace(15.0), egui::FontId::monospace(12.0))
+                    } else {
+                        (egui::FontId::proportional(15.0), egui::FontId::proportional(12.0))
+                    };
+                    p.text(egui::pos2(rect.center().x, rect.center().y - 9.0),
+                        egui::Align2::CENTER_CENTER, "AaBbCc", letters, tc::TEXT_PRIMARY);
+                    p.text(egui::pos2(rect.center().x, rect.center().y + 9.0),
+                        egui::Align2::CENTER_CENTER, "0123456789", digits, tc::TEXT_MUTED);
                 }
+                ui.add_space(8.0);
+                // Pills sized to their OWN labels (original), left-aligned.
+                let neww = (ui.fonts(|f| f.layout_no_wrap("New".into(),
+                    crate::theme::typ::body(), tc::TEXT_PRIMARY).size().x) + 18.0).ceil();
+                let setw = (ui.fonts(|f| f.layout_no_wrap("Set current".into(),
+                    crate::theme::typ::body(), tc::TEXT_PRIMARY).size().x) + 18.0).ceil();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    if pp_pill(ui, neww, "New", true) { do_new = true; }
+                    if pp_pill(ui, setw, "Set current", false) { do_set_current = true; }
+                });
             });
-            if open_new_style && self.text_style_dialog.is_none() {
-                self.text_style_dialog = Some(TextStyleDialog::new_blank());
-                // Mark the count BEFORE the style dialog runs so that on
-                // a future frame, when count grows, we know which style
-                // was added and can auto-select it.
-                self.text_input_dialog_style_count_before =
-                    self.doc.text_styles.len();
+        });
+        if let Some(i) = pick_style {
+            self.text_input_dialog_style_id = i;
+            self.seed_text_dialog_from_style(i);
+        }
+        // ── Font-picker keyboard state: persist + live/commit/cancel ──────────
+        if pf_open_init {
+            // Arm at the current font: remember it (to restore on Esc) and put
+            // the highlight on it.
+            self.font_picker_orig = Some(cur.font_name.clone());
+            let mut list: Vec<String> = vec!["standard".into(), "monospace".into()];
+            list.extend(sys_fonts.iter().cloned());
+            pf_highlight = list.iter().position(|f| f == &cur.font_name).unwrap_or(0);
+        }
+        self.font_picker_highlight = pf_highlight;
+        let popup_open = ui.memory(|m| m.is_popup_open(font_popup_id));
+        if popup_open {
+            // LIVE preview: apply the highlighted font each frame so the canvas
+            // ghost updates as the arrow keys move through the list.
+            if let Some(f) = pf_live { set_font = Some(f); }
+        }
+        if pf_commit {
+            ui.memory_mut(|m| m.close_popup());
+            self.font_picker_orig = None;
+        }
+        if let Some(f) = set_font {
+            if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) { s.font_name = f; }
+        }
+        if do_new && self.text_style_dialog.is_none() {
+            self.text_style_dialog = Some(TextStyleDialog::new_blank());
+            self.text_input_dialog_style_count_before = self.doc.text_styles.len();
+        }
+        if do_set_current {
+            if cur.default_height > 1e-9 { self.env.TxHt = cur.default_height; let _ = self.env.save(); }
+            self.history.push(format!("  text: '{}' set current", cur_name));
+        }
+    }
+
+    /// §2 PARAMETER — Layer / Color spec bars, then Height / Line-spacing and
+    /// Oblique / Tracking (each = a small icon + a value box, two per row).
+    fn text_parameter_section(&mut self, ui: &mut egui::Ui, sid: u32) {
+        use crate::theme::color as tc;
+        let active = self.doc.layers.active;
+        let lname = self.doc.layers.get(active).map(|l| l.name.clone())
+            .unwrap_or_else(|| "0".into());
+        let lcolor = self.resolve_color32(Color::ByLayer, active);
+        let ccolor = self.resolve_color32(self.doc.current_color, active);
+        let clabel = match self.doc.current_color {
+            Color::ByLayer => "By Layer".to_string(),
+            Color::ByBlock => "By Block".to_string(),
+            Color::Aci(i)  => format!("ACI {}", i),
+            c @ Color::TrueColorRef(_) => { let cc = self.resolve_color32(c, active);
+                format!("#{:02X}{:02X}{:02X}", cc.r(), cc.g(), cc.b()) }
+        };
+        let layer_list: Vec<(u32, String)> = self.doc.layers.layers.iter()
+            .enumerate().map(|(i, l)| (i as u32, l.name.clone())).collect();
+        let mut set_active: Option<u32> = None;
+        let mut open_color = false;
+        let gap = 8.0;
+        let col_w = ((ui.available_width() - gap) / 2.0).floor();
+        let icon_w = 20.0;
+        let box_w = col_w - icon_w - 6.0;
+
+        // Row 1 — Layer | Color (functional spec bars, like Hatch).
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                let lr = hatch_spec_bar(ui, lcolor, &lname);
+                let lid = egui::Id::new("text_layer_popup");
+                if lr.clicked() { ui.memory_mut(|m| m.toggle_popup(lid)); }
+                egui::popup_below_widget(ui, lid, &lr,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(150.0);
+                        for (i, n) in &layer_list {
+                            if ui.selectable_label(*i == active, n).clicked() { set_active = Some(*i); }
+                        }
+                    });
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                if hatch_spec_bar(ui, ccolor, &clabel).clicked() { open_color = true; }
+            });
+        });
+        ui.add_space(8.0);
+        // Row 2 — Height | Line spacing (stub).
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    let (ir, _) = ui.allocate_exact_size(egui::vec2(icon_w, PP_ROW_H), egui::Sense::hover());
+                    text_height_glyph(&ui.painter_at(ir), ir, tc::TEXT_MUTED);
+                    let hr = hatch_num_box(ui, box_w, &mut self.text_input_dialog_height, 0.05, 1e-3..=1e6, "", &self.calc);
+                    if hr.changed() {
+                        // Memorize as the text-height sysvar so it persists across
+                        // placements and the next `text` run.
+                        self.env.TxHt = self.text_input_dialog_height.max(1e-3);
+                    }
+                    if hr.drag_stopped() || hr.lost_focus() { let _ = self.env.save(); }
+                });
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    let (ir, _) = ui.allocate_exact_size(egui::vec2(icon_w, PP_ROW_H), egui::Sense::hover());
+                    text_linespacing_glyph(&ui.painter_at(ir), ir, tc::TEXT_DISABLED);
+                    pp_value_static(ui, box_w, "Auto", false)
+                        .on_hover_text("Line spacing — arrives with multi-line (MTEXT)");
+                });
+            });
+        });
+        ui.add_space(8.0);
+        // Row 3 — Rotation angle (per-placement, → Text.angle) | Tracking (stub).
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    let (ir, _) = ui.allocate_exact_size(egui::vec2(icon_w, PP_ROW_H), egui::Sense::hover());
+                    text_oblique_glyph(&ui.painter_at(ir), ir, tc::TEXT_MUTED);
+                    hatch_num_box(ui, box_w, &mut self.text_dialog_angle_deg, 1.0, -360.0..=360.0, "°", &self.calc)
+                        .on_hover_text("Rotation angle for placed text");
+                });
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    let (ir, _) = ui.allocate_exact_size(egui::vec2(icon_w, PP_ROW_H), egui::Sense::hover());
+                    text_tracking_glyph(&ui.painter_at(ir), ir, tc::TEXT_DISABLED);
+                    pp_value_static(ui, box_w, "Auto", false)
+                        .on_hover_text("Letter spacing — not in the kernel yet");
+                });
+            });
+        });
+        ui.add_space(8.0);
+        // Row 4 — Bold + Italic | Outline mode + pen width (edit the style).
+        let (cur_bold, cur_italic, cur_outline, mut cur_owidth) = self.doc.text_styles.get(sid)
+            .map(|s| (s.bold, s.oblique.abs() > 1e-6, s.outline_only, s.outline_width))
+            .unwrap_or((false, false, false, 0.0));
+        // Standard synthetic-italic shear when the Italic toggle is on (~12°).
+        const ITALIC_RAD: f64 = 0.209_439_5;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    if ui.selectable_label(cur_bold, " Bold ").clicked() {
+                        if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                            s.bold = !cur_bold;
+                        }
+                    }
+                    if ui.selectable_label(cur_italic, " Italic ").clicked() {
+                        if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                            s.oblique = if cur_italic { 0.0 } else { ITALIC_RAD };
+                        }
+                    }
+                });
+            });
+            ui.add_space(gap);
+            ui.vertical(|ui| {
+                ui.set_width(col_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                    if ui.selectable_label(cur_outline, "Outline").clicked() {
+                        if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                            s.outline_only = !cur_outline;
+                        }
+                    }
+                    let r = hatch_num_box(ui, box_w * 0.7, &mut cur_owidth, 0.1, 0.0..=100.0, "", &self.calc)
+                        .on_hover_text("Outline pen width (0 = hairline)");
+                    if r.changed() {
+                        if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                            s.outline_width = cur_owidth.max(0.0);
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(id) = set_active { self.doc.layers.active = id; }
+        if open_color { self.aci_pick_request = Some(AciPickRequest::CurrentColor); }
+    }
+
+    /// §3 PARAGRAPH / TOOLS — list + alignment + abc toggles (alignment L/C/R
+    /// wired to `h_align`; the rest are UI stubs), then Spell-check / @ / find,
+    /// then Edit-Dictionary. Everything but alignment is visibly disabled.
+    fn text_paragraph_section(&mut self, ui: &mut egui::Ui) {
+        let sz = 26.0;
+        let ha = self.text_dialog_halign;
+        let lm = self.text_list_mode;
+        let mut set_ha: Option<cad_kernel::TextHAlign> = None;
+        // Deferred (avoids borrowing self inside the closure): the click sets
+        // this, we apply it after the closure.
+        let mut set_list: Option<cad_kernel::TextListKind> = None;
+        let mut toggle_underline = false;
+        let sid = self.text_input_dialog_style_id;
+        let cur_underline = self.doc.text_styles.get(sid)
+            .map(|s| s.underline).unwrap_or(false);
+        // Row 1 — grouped toggles.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
+            // Lists — bulleted / numbered, mutually exclusive toggles. Clicking
+            // the active one turns the list OFF. Applied as a per-line marker in
+            // the ghost preview + at commit.
+            let num_on = matches!(lm, cad_kernel::TextListKind::Numbered);
+            let bul_on = matches!(lm, cad_kernel::TextListKind::Bulleted);
+            if pp_glyph_btn(ui, sz, num_on, true, |p, r, c| glyph_list(p, r, c, false))
+                .on_hover_text("Numbered list (1. 2. 3.)").clicked()
+            {
+                set_list = Some(if num_on { cad_kernel::TextListKind::None } else { cad_kernel::TextListKind::Numbered });
             }
-            ui.horizontal(|ui| {
-                ui.label("Height:");
-                ui.add(egui::DragValue::new(&mut self.text_input_dialog_height).update_while_editing(false)
-                    .speed(0.05).range(1e-3..=1e6));
-            });
+            if pp_glyph_btn(ui, sz, bul_on, true, |p, r, c| glyph_list(p, r, c, true))
+                .on_hover_text("Bulleted list (•)").clicked()
+            {
+                set_list = Some(if bul_on { cad_kernel::TextListKind::None } else { cad_kernel::TextListKind::Bulleted });
+            }
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("OK").clicked()     { do_ok = true; }
-                if ui.button("Cancel").clicked() { do_cancel = true; }
-            });
-            if resp.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                do_ok = true;
+            // Alignment (L / C / R functional; justify stub).
+            for (mode, al) in [(0u8, Some(cad_kernel::TextHAlign::Left)),
+                               (1,  Some(cad_kernel::TextHAlign::Center)),
+                               (2,  Some(cad_kernel::TextHAlign::Right)),
+                               (3,  None)] {
+                let active = matches!((al, ha),
+                    (Some(cad_kernel::TextHAlign::Left),   cad_kernel::TextHAlign::Left)   |
+                    (Some(cad_kernel::TextHAlign::Center), cad_kernel::TextHAlign::Center) |
+                    (Some(cad_kernel::TextHAlign::Right),  cad_kernel::TextHAlign::Right));
+                let enabled = al.is_some();
+                let resp = pp_glyph_btn(ui, sz, active, enabled,
+                    move |p, r, c| glyph_align(p, r, c, mode));
+                if enabled && resp.clicked() { set_ha = al; }
+                if !enabled { resp.on_hover_text("Justify — arrives with multi-line (MTEXT)"); }
             }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                do_cancel = true;
+            ui.add_space(6.0);
+            // abc — underline toggle (edits the current style; snapshot onto
+            // each placed Text at commit, like Bold).
+            if pp_glyph_btn(ui, sz, cur_underline, true, glyph_abc)
+                .on_hover_text("Underline").clicked()
+            {
+                toggle_underline = true;
             }
         });
-        if !open { do_cancel = true; }
-
-        if do_ok {
-            let body     = self.text_input_dialog_buf.trim().to_string();
-            let anchor   = self.text_input_dialog_anchor;
-            let height   = self.text_input_dialog_height.max(1e-3);
-            let style_id = self.text_input_dialog_style_id;
-            self.text_input_dialog_open = false;
-            self.text_input_dialog_buf.clear();
-            self.text_input_dialog_anchor = None;
-            if body.is_empty() {
-                self.history.push("  text: cancelled (empty body)".into());
-            } else if let Some(pos) = anchor {
-                self.commit_text_at_with_style(pos, &body, height, style_id);
+        ui.add_space(10.0);
+        ui.small(egui::RichText::new(
+            "Inline codes: \\C1;red\\C0; reset · \\H2x; taller · \\fArial; font · \\P new line")
+            .color(egui::Color32::from_rgb(150, 165, 185)));
+        ui.add_space(6.0);
+        // Row 2 — Spell check checkbox … @ · find.
+        ui.horizontal(|ui| {
+            pp_check_stub(ui, "Spell Check");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+                pp_glyph_btn(ui, sz, false, false, glyph_find)
+                    .on_hover_text("Find in text — not in the kernel yet");
+                pp_glyph_btn(ui, sz, false, false, |p, r, c| {
+                    p.text(r.center(), egui::Align2::CENTER_CENTER, "@",
+                        crate::theme::typ::body(), c);
+                }).on_hover_text("Insert field / symbol — not in the kernel yet");
+            });
+        });
+        ui.add_space(8.0);
+        // Row 3 — Edit Dictionary.
+        pp_check_stub(ui, "Edit Dictionary");
+        if let Some(al) = set_ha { self.text_dialog_halign = al; }
+        if let Some(m) = set_list { self.text_list_mode = m; }
+        if toggle_underline {
+            if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                s.underline = !cur_underline;
             }
-            self.text_draft = TextDraftState::Off;
-            self.tool       = Tool::None;
-            self.clear_prompt();
-        } else if do_cancel {
-            self.text_input_dialog_open = false;
-            self.text_input_dialog_buf.clear();
-            self.text_input_dialog_anchor = None;
-            self.text_draft = TextDraftState::Off;
-            self.tool       = Tool::None;
-            self.clear_prompt();
-            self.history.push("  text: cancelled".into());
+        }
+    }
+
+    /// Shaped pen ADVANCE (world units) of `text` in the given font/height —
+    /// used to trim an underline past a list marker. 0 if the engine isn't ready.
+    fn ttf_advance(&self, text: &str, font_name: &str, height: f64,
+        slant: f64, x_scale: f64) -> f64
+    {
+        if text.is_empty() || !self.font_manager.borrow().is_ready() { return 0.0; }
+        let req = cad_text::TextRequest {
+            text, font_name, position: Vec2::ZERO, height, angle: 0.0,
+            h_align: cad_kernel::TextHAlign::Left,
+            v_align: cad_kernel::TextVAlign::Baseline,
+            fill_mode: cad_text::FillMode::Fill, slant,
+            x_scale: if x_scale.abs() < 1e-9 { 1.0 } else { x_scale },
+        };
+        self.font_manager.borrow_mut().render(&req).advance
+    }
+
+    /// Commit the panel's text at the current anchor as ONE paragraph dobject
+    /// (multi-line stored in a single `Text`; list markers are a render-time
+    /// property, never baked). Then STAY OPEN and re-arm for the next anchor
+    /// click (place-multiple, per the dialog template).
+    fn commit_text_dialog(&mut self) {
+        let Some(pos) = self.text_input_dialog_anchor else {
+            self.set_prompt(
+                "text: click anchor position".to_string());
+            return;
+        };
+        let raw = self.text_input_dialog_buf.clone();
+        if raw.trim().is_empty() { return; }
+        // Trim trailing blank lines / whitespace; keep interior line structure.
+        let body = raw.trim_end_matches(|c| c == '\n' || c == ' ' || c == '\t').to_string();
+        if body.trim().is_empty() { return; }
+        let height   = self.text_input_dialog_height.max(1e-3);
+        let style_id = self.text_input_dialog_style_id;
+        let halign   = self.text_dialog_halign;
+        // One undo entry, one dobject for the whole Apply.
+        self.snapshot_doc();
+        self.commit_text_line(pos, &body, height, style_id, halign);
+        // Stay open: clear the body + anchor, wait for the next anchor click.
+        self.text_input_dialog_buf.clear();
+        self.text_input_dialog_anchor = None;
+        self.text_draft = TextDraftState::WaitingForPosition;
+        self.tool = Tool::Text;
+        let p = self.text_anchor_prompt(true);
+        self.set_prompt(p);
+    }
+
+    /// Place ONE Text/paragraph dobject with an explicit horizontal alignment.
+    /// `string` may be multi-line ('\n'); the dialog's `list_mode` is stored as
+    /// a render-time PROPERTY (markers are never baked into the text). Snapshots
+    /// the style's render specs so the entity is independent.
+    fn commit_text_line(&mut self, pos: Vec2, string: &str, height: f64,
+        style_id: u32, halign: cad_kernel::TextHAlign)
+    {
+        if string.is_empty() || height <= 1e-9 { return; }
+        let style = if (style_id as usize) < self.doc.text_styles.len() {
+            style_id
+        } else { cad_kernel::TextStyleTable::STANDARD };
+        // SNAPSHOT the style's render specs onto the entity, so this text is
+        // independent — later edits to the style never retro-change it, and the
+        // next text placed can differ freely (owner: "individual, not related").
+        let s = self.doc.text_styles.get(style).cloned()
+            .unwrap_or_else(cad_kernel::TextStyle::standard);
+        self.add_dobject(
+            Geom::Text(cad_kernel::Text {
+                position: pos,
+                height,
+                angle:   self.text_dialog_angle_deg.to_radians(),
+                text:    string.into(),
+                h_align: halign,
+                v_align: cad_kernel::TextVAlign::Baseline,
+                style,
+                font_name:     s.font_name,
+                bold:          s.bold,
+                oblique:       s.oblique,
+                width_factor:  s.width_factor,
+                outline_only:  s.outline_only,
+                outline_width: s.outline_width,
+                underline:     s.underline,
+                list_mode:     self.text_list_mode,
+                line_spacing:  1.5,
+            }),
+            "canvas");
+    }
+
+    /// Render `text` in the given TTF font into `rect` as a coloured mesh —
+    /// the text-dialog style preview. Returns false (caller falls back to egui
+    /// text) when the engine isn't ready or produced no fills.
+    fn draw_ttf_swatch(
+        &self, painter: &egui::Painter, rect: egui::Rect, text: &str,
+        font_name: &str, slant: f64, x_scale: f64, color: egui::Color32,
+    ) -> bool {
+        if text.is_empty() || !self.font_manager.borrow().is_ready() {
+            return false;
+        }
+        let req = cad_text::TextRequest {
+            text, font_name, position: Vec2::ZERO, height: 1.0, angle: 0.0,
+            h_align: cad_kernel::TextHAlign::Left,
+            v_align: cad_kernel::TextVAlign::Baseline,
+            fill_mode: cad_text::FillMode::Fill, slant,
+            x_scale: if x_scale.abs() < 1e-9 { 1.0 } else { x_scale },
+        };
+        let g = self.font_manager.borrow_mut().render(&req);
+        if g.fills.is_empty() {
+            return false;
+        }
+        let (mn, mx) = g.bbox;
+        let w = (mx.x - mn.x).max(1e-6);
+        let h = (mx.y - mn.y).max(1e-6);
+        let pad = 12.0_f64;
+        let scale = (((rect.width() as f64) - pad) / w)
+            .min(((rect.height() as f64) - pad) / h);
+        let (bcx, bcy) = ((mn.x + mx.x) * 0.5, (mn.y + mx.y) * 0.5);
+        let (cx, cy) = (rect.center().x, rect.center().y);
+        let to_scr = |p: Vec2| egui::pos2(
+            cx + ((p.x - bcx) * scale) as f32,
+            cy - ((p.y - bcy) * scale) as f32);
+        let mut mesh = egui::Mesh::default();
+        for tri in &g.fills {
+            let base = mesh.vertices.len() as u32;
+            for pt in tri {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: to_scr(*pt), uv: egui::epaint::WHITE_UV, color,
+                });
+            }
+            mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+        painter.add(egui::Shape::mesh(mesh));
+        // Anti-alias the hard triangle-fill edge with a thin feathered perimeter
+        // stroke (egui feathers lines) — same trick as `draw_ttf_string`. Without
+        // it the swatch glyphs look jagged / low-res.
+        let stroke = egui::Stroke::new(1.0, color);
+        for contour in &g.outlines {
+            let pts: Vec<egui::Pos2> = contour.iter().map(|p| to_scr(*p)).collect();
+            painter.add(egui::Shape::closed_line(pts, stroke));
+        }
+        true
+    }
+
+    // ===================================================================
+    // WP-SCRIPT — Python engine + docked REPL console (ported from the
+    // upstream RUST-AutoRASM). The engine runs on a worker thread; cad_app
+    // only ever touches the plain-Rust facade (cad_script::ScriptEngine).
+    // ===================================================================
+
+    /// WP-SCRIPT: drain the Python engine's replies (Print / Value / Error /
+    /// Finished) into the command history, once per frame. Requests a repaint
+    /// when output arrives (rule 6). No-op when no engine exists / no output.
+    fn poll_script_engine(&mut self, ctx: &egui::Context) {
+        // 1) Service the reverse ScriptOp queue (slices 2–3): a running
+        //    script blocks (GIL-free) on each op until we answer here, so
+        //    this pump must run EVERY frame while a script is busy.
+        let ops = match &self.script {
+            Some(s) => s.drain_ops(),
+            None => return,
+        };
+        for msg in ops {
+            let reply = self.apply_script_op(msg.op);
+            if let Some(s) = &self.script {
+                s.reply_op(msg.id, reply);
+            }
+        }
+        // 2) Drain worker output into the history AND the console log.
+        let replies = match &self.script {
+            Some(s) => s.poll(),
+            None => return,
+        };
+        for r in &replies {
+            match r {
+                cad_script::ScriptReply::Print(s) => {
+                    for line in s.trim_end_matches('\n').split('\n') {
+                        self.history.push(format!("  {}", line));
+                        self.py_log(line.to_string());
+                    }
+                }
+                cad_script::ScriptReply::Value(v) => {
+                    self.history.push(format!("  = {}", v));
+                    self.py_log(format!("= {}", v));
+                }
+                cad_script::ScriptReply::Error(e) => {
+                    // Never silent (rule 10): traceback → history (red `!`) + status.
+                    for line in e.trim_end_matches('\n').split('\n') {
+                        self.history.push(format!("  ! {}", line));
+                        self.py_log(format!("! {}", line));
+                    }
+                    self.set_prompt("python: script raised — see the log");
+                }
+                cad_script::ScriptReply::Finished { ok } => {
+                    self.on_script_finished(*ok);
+                }
+                cad_script::ScriptReply::Meta(_) => {
+                    // The parameter-declaration machinery (slice 5 param
+                    // dialog) is not ported to this build — a Meta reply has
+                    // no consumer, so it is dropped.
+                }
+            }
+        }
+        // 3) Keep the pump alive while a script runs (ops arrive between
+        //    frames; the worker waits on our replies).
+        if !replies.is_empty()
+            || self.script.as_ref().is_some_and(|s| s.is_busy())
+        {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Cap the console log (rule 11 — a print-heavy script must not grow
+    /// memory without bound).
+    fn py_log(&mut self, line: String) {
+        self.py_console_log.push(line);
+        if self.py_console_log.len() > 800 {
+            let cut = self.py_console_log.len() - 500;
+            self.py_console_log.drain(0..cut);
+        }
+    }
+
+    /// Apply one script op against the live document (main thread — the
+    /// single writer of `self.doc`, D3). Read ops build owned replies; write
+    /// ops go through the SAME seams as typed commands so undo / index / GPU
+    /// dirty flags all behave identically (D4).
+    fn apply_script_op(
+        &mut self,
+        op: cad_script::ScriptOp,
+    ) -> cad_script::ScriptOpReply {
+        use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+        // D5 — lazy undo baseline: the first write of a run captures the
+        // pre-run depth; Finished collapses everything above it (see
+        // poll_script_engine). The group-boundary list belongs to the same
+        // run — reset it here.
+        if op.is_write() && self.script_undo_base.is_none() {
+            self.script_undo_base = Some(self.undo_stack.len());
+            self.script_group_snapshots.clear();
+        }
+        match op {
+            // ---- reads ----
+            Op::DocCount => R::Count(self.doc.dobjects.len()),
+            Op::DocGet { index } => match self.doc.dobjects.get(index) {
+                Some(d) => R::Entity(self.entity_snapshot(d)),
+                None => R::Error(format!(
+                    "no dobject #{} ({} total)",
+                    index,
+                    self.doc.dobjects.len()
+                )),
+            },
+            Op::DocAll => R::Entities(
+                self.doc.dobjects.iter().map(|d| self.entity_snapshot(d)).collect(),
+            ),
+            Op::SelectionGet => R::Indices(self.selection.clone()),
+            Op::LayersGet => R::Layers(
+                self.doc
+                    .layers
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| cad_script::LayerInfo {
+                        id: i as u32,
+                        name: l.name.clone(),
+                        visible: l.visible,
+                        locked: l.locked,
+                        frozen: l.frozen,
+                        plottable: l.plottable,
+                        color: format!("{:?}", l.color),
+                    })
+                    .collect(),
+            ),
+            Op::LayerActive => R::LayerActive(self.doc.layers.active),
+            Op::BlocksGet => R::Blocks(
+                self.doc.blocks.blocks.iter().map(|b| b.name.clone()).collect(),
+            ),
+            Op::SysVarGet { name } => {
+                R::SysVar(crate::varreg::env_get(&self.env, &name))
+            }
+            Op::ViewGet => R::View(cad_script::ViewInfo {
+                center: Vec2::new(
+                    -self.world_offset.x as f64,
+                    -self.world_offset.y as f64,
+                ),
+                scale: self.scale as f64,
+            }),
+
+            // ---- writes ----
+            Op::SelectionSet { indices } => {
+                let max = self.doc.dobjects.len();
+                let valid: Vec<usize> =
+                    indices.into_iter().filter(|&i| i < max).collect();
+                self.selection = valid.clone();
+                self.selected = None;
+                self.gpu_dirty = true;
+                self.history.push(format!(
+                    "  python: selection → {} dobject(s)",
+                    valid.len()
+                ));
+                R::Indices(valid)
+            }
+            Op::AddLine { a, b } => {
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(Geom::Line(Line { a, b }), "python");
+                R::Ok(idx)
+            }
+            Op::AddCircle { center, radius } => {
+                if !(radius > 0.0) {
+                    return R::Error("circle radius must be > 0".into());
+                }
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(Geom::Circle(Circle { center, radius }), "python");
+                R::Ok(idx)
+            }
+            Op::AddArc { center, radius, start_deg, sweep_deg } => {
+                if !(radius > 0.0) {
+                    return R::Error("arc radius must be > 0".into());
+                }
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(
+                    Geom::Arc(Arc {
+                        center,
+                        radius,
+                        start_angle: start_deg.to_radians(),
+                        sweep_angle: sweep_deg.to_radians(),
+                    }),
+                    "python",
+                );
+                R::Ok(idx)
+            }
+            Op::AddEllipse { center, major, ratio } => {
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(
+                    Geom::Ellipse(Ellipse { center, major, ratio }),
+                    "python",
+                );
+                R::Ok(idx)
+            }
+            Op::AddPolyline { vertices, closed } => {
+                if vertices.len() < 2 {
+                    return R::Error("a polyline needs at least 2 points".into());
+                }
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(
+                    Geom::Polyline(Polyline {
+                        vertices: vertices
+                            .iter()
+                            .map(|p| PolyVertex { pos: *p, bulge: 0.0 })
+                            .collect(),
+                        closed,
+                        widths: Vec::new(),
+                    }),
+                    "python",
+                );
+                R::Ok(idx)
+            }
+            Op::AddPoint { at } => {
+                let idx = self.next_add_index();
+                self.add_dobject_undoable(
+                    Geom::Point(cad_kernel::Point { location: at, style: 0, size: 0.0 }),
+                    "python",
+                );
+                R::Ok(idx)
+            }
+            Op::AddText { text, at, height, angle_deg } => {
+                let idx = self.next_add_index();
+                let mut t = cad_kernel::Text::empty();
+                t.position = at;
+                t.height = height;
+                t.angle = angle_deg.to_radians();
+                t.text = text;
+                self.add_dobject_undoable(Geom::Text(t), "python");
+                R::Ok(idx)
+            }
+            Op::Delete { indices } => {
+                self.snapshot_doc();
+                let mut sorted = indices;
+                sorted.sort_unstable();
+                sorted.dedup();
+                let n = sorted.len();
+                for &i in sorted.iter().rev() {
+                    if i < self.doc.dobjects.len() {
+                        self.doc.dobjects.remove(i);
+                    }
+                }
+                let gone: std::collections::HashSet<usize> =
+                    sorted.iter().copied().collect();
+                self.selection.retain(|i| !gone.contains(i));
+                self.selected = None;
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history.push(format!("  python: deleted {} dobject(s)", n));
+                R::Ok(n)
+            }
+            Op::LayerAdd { name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return R::Error("layer name cannot be empty".into());
+                }
+                if self.doc.layers.find(&name).is_some() {
+                    return R::Error(format!("layer '{}' already exists", name));
+                }
+                self.snapshot_doc();
+                let id = self.doc.layers.add(Layer {
+                    name: name.clone(),
+                    color: Color::Aci(7),
+                    linetype: 0,
+                    lineweight: cad_kernel::Lineweight::Custom(0.0),
+                    visible: true,
+                    locked: false,
+                    frozen: false,
+                    plottable: true,
+                    order: 0,
+                });
+                self.gpu_dirty = true;
+                self.history.push(format!("  python: + layer '{}' (#{})", name, id));
+                R::Ok(id as usize)
+            }
+            Op::LayerSetActive { name } => match self.doc.layers.find(&name) {
+                Some(id) => {
+                    self.doc.layers.active = id;
+                    self.gpu_dirty = true;
+                    self.history.push(format!(
+                        "  python: active layer → '{}' (#{})",
+                        name, id
+                    ));
+                    R::OkUnit
+                }
+                None => R::Error(format!("no layer named '{}'", name)),
+            },
+            Op::LayerSet { name, visible, locked, frozen, plottable, color_aci } => {
+                match self.doc.layers.find(&name) {
+                    None => R::Error(format!("no layer named '{}'", name)),
+                    Some(id) => {
+                        if id == self.doc.layers.active
+                            && (visible == Some(false) || frozen == Some(true))
+                        {
+                            return R::Error(
+                                "the active layer cannot be turned off or frozen"
+                                    .into(),
+                            );
+                        }
+                        self.snapshot_doc();
+                        if let Some(l) = self.doc.layers.get_mut(id) {
+                            if let Some(v) = visible { l.visible = v; }
+                            if let Some(v) = locked { l.locked = v; }
+                            if let Some(v) = frozen { l.frozen = v; }
+                            if let Some(v) = plottable { l.plottable = v; }
+                            if let Some(a) = color_aci { l.color = Color::Aci(a); }
+                        }
+                        self.gpu_dirty = true;
+                        self.history.push(format!("  python: layer '{}' updated", name));
+                        R::OkUnit
+                    }
+                }
+            }
+            Op::BlockCreate { name, base } => {
+                if name.trim().is_empty() {
+                    return R::Error("block name cannot be empty".into());
+                }
+                if self.doc.blocks.find(&name).is_some() {
+                    return R::Error(format!(
+                        "block '{}' already exists (no redefinition yet)",
+                        name
+                    ));
+                }
+                if self.selection.is_empty() {
+                    return R::Error(
+                        "create_block needs a selection — set it with rasm.set_selection first"
+                            .into(),
+                    );
+                }
+                self.apply_block_create(&name, base, None, false);
+                R::OkUnit
+            }
+            Op::BlockInsert { name, at, rotation } => {
+                match self.doc.blocks.find(&name) {
+                    None => R::Error(format!("no block named '{}'", name)),
+                    Some(id) => {
+                        if let Some(blk) = self.doc.blocks.get(id) {
+                            if !blk.params.is_empty() {
+                                return R::Error(format!(
+                                    "block '{}' is parametric — insert it from the UI (prompts for values)",
+                                    name
+                                ));
+                            }
+                        }
+                        self.apply_insert(id, at, rotation);
+                        R::OkUnit
+                    }
+                }
+            }
+            Op::Command { raw } => {
+                let h0 = self.history.len();
+                self.run_command(&raw);
+                let out: Vec<String> = self.history[h0..].to_vec();
+                R::CommandOutput(out)
+            }
+            Op::SysVarSet { name, value } => {
+                match crate::varreg::env_set(&mut self.env, &name, &value) {
+                    Ok(()) => {
+                        let _ = self.env.save();
+                        R::OkUnit
+                    }
+                    Err(e) => R::Error(e),
+                }
+            }
+            Op::ViewSet { center, scale } => {
+                if let Some(s) = scale {
+                    if !(s > 0.0 && s.is_finite()) {
+                        return R::Error("view scale must be a positive number".into());
+                    }
+                }
+                self.view_push_history();
+                self.world_offset = egui::vec2(-center.x as f32, -center.y as f32);
+                if let Some(s) = scale {
+                    self.scale = (s as f32).clamp(1e-6, 5000.0);
+                }
+                R::OkUnit
+            }
+            Op::Save { path } => {
+                let h0 = self.history.len();
+                self.do_save(&path);
+                let out: Vec<String> = self.history[h0..].to_vec();
+                R::CommandOutput(out)
+            }
+            Op::Open { path } => {
+                let h0 = self.history.len();
+                self.do_open(&path);
+                let out: Vec<String> = self.history[h0..].to_vec();
+                R::CommandOutput(out)
+            }
+
+            // ---- P1 entity modification ----
+            Op::ModifyMove { indices, delta } => {
+                if delta.len() < 1e-12 {
+                    return R::Error("move delta is zero".into());
+                }
+                let n = match self.script_transform(&indices, |g| g.translated(delta), "moved") {
+                    Ok(n) => n,
+                    Err(e) => return R::Error(e),
+                };
+                R::Ok(n)
+            }
+            Op::ModifyCopy { indices, delta } => {
+                if delta.len() < 1e-12 {
+                    return R::Error("copy delta is zero".into());
+                }
+                self.snapshot_doc();
+                let sources: Vec<DObject> = indices
+                    .iter()
+                    .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+                    .collect();
+                if sources.is_empty() {
+                    return R::Error("copy: none of the given indices exist".into());
+                }
+                let n0 = self.doc.dobjects.len();
+                let copies = duplicate_dobjects(&sources, |g| g.translated(delta));
+                for c in copies {
+                    self.doc.push(c);
+                }
+                let new_idx: Vec<usize> = (n0..self.doc.dobjects.len()).collect();
+                self.history
+                    .push(format!("  python: copied {} dobject(s)", new_idx.len()));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                R::Indices(new_idx)
+            }
+            Op::ModifyRotate { indices, pivot, angle_deg } => {
+                let angle = angle_deg.to_radians();
+                if angle.abs() < 1e-12 {
+                    return R::Error("rotate angle is zero".into());
+                }
+                let n = match self.script_transform(&indices, |g| g.rotated(pivot, angle), "rotated") {
+                    Ok(n) => n,
+                    Err(e) => return R::Error(e),
+                };
+                R::Ok(n)
+            }
+            Op::ModifyScale { indices, pivot, factor } => {
+                if !(factor > 0.0 && factor.is_finite()) {
+                    return R::Error("scale factor must be a positive number".into());
+                }
+                if (factor - 1.0).abs() < 1e-12 {
+                    return R::Error("scale factor is 1.0 (nothing to do)".into());
+                }
+                let n = match self.script_transform(&indices, |g| g.scaled(pivot, factor), "scaled") {
+                    Ok(n) => n,
+                    Err(e) => return R::Error(e),
+                };
+                R::Ok(n)
+            }
+            Op::ModifyMirror { indices, a, b } => {
+                if a.dist(b) < 1e-12 {
+                    return R::Error("mirror axis is degenerate (a == b)".into());
+                }
+                let n = match self.script_transform(&indices, |g| g.mirrored(a, b), "mirrored") {
+                    Ok(n) => n,
+                    Err(e) => return R::Error(e),
+                };
+                R::Ok(n)
+            }
+            Op::SetEntityColor { indices, color } => {
+                let c = match color {
+                    -1 => Color::ByLayer,
+                    -2 => Color::ByBlock,
+                    n if (0..=255).contains(&n) => Color::Aci(n as u8),
+                    other => {
+                        return R::Error(format!(
+                            "set_color: {} is not a color (0..=255, -1 = bylayer, -2 = byblock)",
+                            other
+                        ))
+                    }
+                };
+                let n = match self
+                    .script_style_set(&indices, |d| d.style.color = c)
+                {
+                        Ok(n) => n,
+                        Err(e) => return R::Error(e),
+                    };
+                self.history.push(format!("  python: set color on {} dobject(s)", n));
+                R::Ok(n)
+            }
+            Op::SetEntityLinetype { indices, name } => {
+                use cad_kernel::LinetypeTable;
+                let id = if name.is_empty() || name.eq_ignore_ascii_case("bylayer") {
+                    LinetypeTable::BYLAYER
+                } else {
+                    match self.doc.linetypes.find(&name) {
+                        Some(id) => id,
+                        None => {
+                            return R::Error(format!("no linetype named '{}'", name));
+                        }
+                    }
+                };
+                let n = match self
+                    .script_style_set(&indices, |d| d.style.linetype = id)
+                {
+                        Ok(n) => n,
+                        Err(e) => return R::Error(e),
+                    };
+                self.history
+                    .push(format!("  python: set linetype on {} dobject(s)", n));
+                R::Ok(n)
+            }
+            Op::SetEntityLayer { indices, name } => {
+                match self.doc.layers.find(&name) {
+                    None => R::Error(format!("no layer named '{}'", name)),
+                    Some(id) => {
+                        let n = match self
+                            .script_style_set(&indices, |d| d.style.layer = id)
+                        {
+                        Ok(n) => n,
+                        Err(e) => return R::Error(e),
+                    };
+                        self.history
+                            .push(format!("  python: moved {} dobject(s) to '{}'", n, name));
+                        R::Ok(n)
+                    }
+                }
+            }
+            Op::SetEntityLineweight { indices, mm } => {
+                let lw = if mm < 0.0 {
+                    Lineweight::ByLayer
+                } else {
+                    Lineweight::Custom(mm as f32)
+                };
+                let n = match self
+                    .script_style_set(&indices, |d| d.style.lineweight = lw)
+                {
+                        Ok(n) => n,
+                        Err(e) => return R::Error(e),
+                    };
+                self.history
+                    .push(format!("  python: set lineweight on {} dobject(s)", n));
+                R::Ok(n)
+            }
+            Op::SetEntityVisible { indices, visible } => {
+                let n = match self
+                    .script_style_set(&indices, |d| d.style.visible = visible)
+                {
+                        Ok(n) => n,
+                        Err(e) => return R::Error(e),
+                    };
+                self.history.push(format!(
+                    "  python: {} {} dobject(s)",
+                    if visible { "showed" } else { "hid" },
+                    n
+                ));
+                R::Ok(n)
+            }
+            Op::SetEntityGeom { index, geom } => {
+                if index >= self.doc.dobjects.len() {
+                    return R::Error(format!(
+                        "set_geom: no dobject #{} ({} total)",
+                        index,
+                        self.doc.dobjects.len()
+                    ));
+                }
+                self.snapshot_doc();
+                self.doc.dobjects[index].geom = geom;
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history
+                    .push(format!("  python: replaced geometry of #{}", index));
+                R::OkUnit
+            }
+
+            // ---- P2 document-state reads ----
+            Op::DocUnits => R::Units(cad_script::UnitsInfo {
+                name: self.doc.units.name.clone(),
+                scene_per_unit: self.doc.units.scene_per_unit,
+            }),
+            Op::DocBounds => {
+                let mut min: Option<Vec2> = None;
+                let mut max: Option<Vec2> = None;
+                for d in &self.doc.dobjects {
+                    if matches!(d.geom, Geom::Hatch(_)) {
+                        continue; // hatch bbox is a placeholder
+                    }
+                    let (lo, hi) = match &d.geom {
+                        Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                        _ => d.bbox(),
+                    };
+                    min = Some(match min {
+                        None => lo,
+                        Some(m) => Vec2::new(m.x.min(lo.x), m.y.min(lo.y)),
+                    });
+                    max = Some(match max {
+                        None => hi,
+                        Some(m) => Vec2::new(m.x.max(hi.x), m.y.max(hi.y)),
+                    });
+                }
+                R::Bounds(min.zip(max))
+            }
+            Op::LayoutsGet => R::Layouts(
+                self.doc
+                    .layouts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| cad_script::LayoutInfo {
+                        id: i as u32,
+                        name: l.name.clone(),
+                        active: self.doc.active_layout == Some(i),
+                    })
+                    .collect(),
+            ),
+            Op::LayoutSetActive { name } => {
+                // This build has no layout tabs — the model is the only space.
+                let _ = name;
+                R::Error("layouts are not available in this build".into())
+            }
+            Op::LinetypesGet => R::Linetypes(
+                self.doc.linetypes.linetypes.iter().map(|l| l.name.clone()).collect(),
+            ),
+
+            // ---- P3 ----
+            Op::UndoGroup => {
+                // An explicit boundary: the CURRENT state becomes the
+                // pre-state of the next undo unit. Record the snapshot's
+                // index; `on_script_finished` keeps pre-run + boundaries.
+                self.snapshot_doc();
+                self.script_group_snapshots.push(self.undo_stack.len() - 1);
+                R::OkUnit
+            }
+            Op::SetCurrentColor { color } => {
+                let c = match color {
+                    -1 => Color::ByLayer,
+                    -2 => Color::ByBlock,
+                    n if (0..=255).contains(&n) => Color::Aci(n as u8),
+                    other => {
+                        return R::Error(format!(
+                            "set_current_color: {} is not a color",
+                            other
+                        ))
+                    }
+                };
+                self.doc.current_color = c;
+                self.history.push(format!(
+                    "  python: current color → {}",
+                    Self::script_color_string(c, &self.doc)
+                ));
+                R::OkUnit
+            }
+            Op::SetCurrentLinetype { name } => {
+                match self.doc.linetypes.find(&name) {
+                    None => R::Error(format!("no linetype named '{}'", name)),
+                    Some(id) => {
+                        self.doc.current_linetype = id;
+                        self.history
+                            .push(format!("  python: current linetype → '{}'", name));
+                        R::OkUnit
+                    }
+                }
+            }
+            Op::SetCurrentLineweight { mm } => {
+                if !(mm >= 0.0 && mm.is_finite()) {
+                    return R::Error("lineweight mm must be >= 0".into());
+                }
+                self.doc.current_lineweight = Lineweight::Custom(mm as f32);
+                self.history
+                    .push(format!("  python: current lineweight → {:.2} mm", mm));
+                R::OkUnit
+            }
+
+            // ---- P4 ----
+            Op::ZoomExtents => {
+                self.zoom_extents();
+                R::OkUnit
+            }
+
+            // ---- hatching ----
+            Op::AddHatch { boundary_indices, pattern } => {
+                match self.script_hatch_pattern(&pattern) {
+                    Err(e) => R::Error(e),
+                    Ok(pat) => {
+                        // Accepted boundary kinds mirror apply_hatch: closed
+                        // polylines / circles / ellipses / closed splines.
+                        let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+                        let mut skipped = 0usize;
+                        for &i in &boundary_indices {
+                            let Some(d) = self.doc.dobjects.get(i) else {
+                                skipped += 1;
+                                continue;
+                            };
+                            let ok = match &d.geom {
+                                Geom::Polyline(p) => polyline_is_effectively_closed(p),
+                                Geom::Circle(_) | Geom::Ellipse(_) => true,
+                                Geom::Spline(s) => spline_is_effectively_closed(s),
+                                _ => false,
+                            };
+                            if ok {
+                                handles.push(d.handle);
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                        if handles.is_empty() {
+                            return R::Error(format!(
+                                "add_hatch: none of the {} given indices is a closed boundary (closed polyline / circle / ellipse / closed spline)",
+                                boundary_indices.len(),
+                            ));
+                        }
+                        let idx = self.script_commit_hatch(handles, pat, skipped);
+                        R::Ok(idx)
+                    }
+                }
+            }
+            Op::HatchAt { point, pattern } => {
+                match self.script_hatch_pattern(&pattern) {
+                    Err(e) => R::Error(e),
+                    Ok(pat) => {
+                        match self.find_smallest_containing_closed_scoped(point, None) {
+                            None => R::Indices(Vec::new()),
+                            Some(i) => {
+                                let mut boundary = vec![i];
+                                boundary.extend(self.collect_islands_inside_scoped(i, point, None));
+                                let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+                                for &bi in &boundary {
+                                    if let Some(d) = self.doc.dobjects.get(bi) {
+                                        handles.push(d.handle);
+                                    }
+                                }
+                                self.script_commit_hatch(handles, pat, 0);
+                                R::Indices(boundary)
+                            }
+                        }
+                    }
+                }
+            }
+            Op::HatchPatternsGet => R::Patterns(
+                cad_kernel::patterns::PATTERN_NAMES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+        }
+    }
+
+    /// End-of-run handling: collapse the per-op undo entries back to the
+    /// pre-run snapshot (D5 — one run = one undo unit; P3 — grouped runs
+    /// keep one entry per `rasm.undo_group()` boundary).
+    fn on_script_finished(&mut self, ok: bool) {
+        if ok {
+            self.history.push("  ✔ python: done".into());
+        }
+        self.py_log(format!("— run {}", if ok { "done" } else { "failed" }));
+        if let Some(base) = self.script_undo_base.take() {
+            if self.script_group_snapshots.is_empty() {
+                // D5 — one run = one undo unit.
+                let keep = (base + 1).min(self.undo_stack.len());
+                if self.undo_stack.len() > keep {
+                    self.undo_stack.truncate(keep);
+                }
+            } else {
+                // P3 — grouped run: keep the pre-run snapshot plus ONE
+                // entry per `rasm.undo_group()` boundary; each group is
+                // its own undo unit. Boundary indices are stack indices
+                // recorded at boundary time (the stack only appends
+                // during a run, so they stay valid).
+                let mut kept = Vec::with_capacity(self.script_group_snapshots.len() + 1);
+                kept.push(base);
+                kept.extend(self.script_group_snapshots.iter().copied());
+                let mut out = Vec::with_capacity(kept.len());
+                for &ix in &kept {
+                    if ix >= self.undo_stack.len() || ix < base {
+                        continue;
+                    }
+                    out.push(self.undo_stack[ix].clone());
+                }
+                if out.is_empty() {
+                    out.push(self.undo_stack[base.min(self.undo_stack.len().saturating_sub(1))].clone());
+                }
+                self.undo_stack.truncate(base);
+                self.undo_stack.extend(out);
+            }
+            self.script_group_snapshots.clear();
+        }
+    }
+
+    /// Parse a script hatch-pattern name: "SOLID" (any case) → Solid; a
+    /// catalog name (case-insensitive) → Pattern with scale 1, angle 0.
+    /// Unknown names fail loudly with the catalog list.
+    fn script_hatch_pattern(&self, name: &str) -> Result<HatchPattern, String> {
+        let trimmed = name.trim();
+        if trimmed.eq_ignore_ascii_case("solid") {
+            return Ok(HatchPattern::Solid);
+        }
+        let canonical = cad_kernel::patterns::PATTERN_NAMES
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(trimmed))
+            .map(|s| s.to_string());
+        match canonical {
+            Some(name) => Ok(HatchPattern::Pattern { name, scale: 1.0, angle_deg: 0.0 }),
+            None => Err(format!(
+                "no hatch pattern '{}' — available: {}",
+                trimmed,
+                cad_kernel::patterns::PATTERN_NAMES.join(", ")
+            )),
+        }
+    }
+
+    /// Build + push one hatch dobject from boundary handles (script path —
+    /// mirrors apply_hatch's push; snapshot taken by the caller's undo
+    /// machinery). Returns the new hatch's index.
+    fn script_commit_hatch(
+        &mut self,
+        handles: Vec<cad_kernel::Handle>,
+        pattern: HatchPattern,
+        skipped: usize,
+    ) -> usize {
+        self.snapshot_doc();
+        let label = match &pattern {
+            HatchPattern::Solid => "SOLID".to_string(),
+            HatchPattern::Pattern { name, .. } => name.clone(),
+        };
+        let loop_count = handles.len();
+        let hd: DObject = cad_kernel::Hatch {
+            boundary_handles: handles,
+            pattern,
+        }
+        .into();
+        self.doc.push(hd);
+        self.gpu_dirty = true;
+        self.index_dirty = true;
+        let idx = self.doc.dobjects.len() - 1;
+        self.history.push(format!(
+            "  + hatch ({}): {} boundary loop(s){}",
+            label,
+            loop_count,
+            if skipped > 0 {
+                format!("  ({} non-boundary dobject(s) skipped)", skipped)
+            } else {
+                String::new()
+            },
+        ));
+        idx
+    }
+
+    /// P1 — widen a script's explicit index set with the boundaries of any
+    /// hatch in it (a hatch transforms via its boundary dobjects).
+    fn script_transform_targets(&self, indices: &[usize]) -> Vec<usize> {
+        let mut targets: Vec<usize> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &i in indices {
+            if i < self.doc.dobjects.len() && seen.insert(i) {
+                targets.push(i);
+            }
+        }
+        let mut extra: Vec<cad_kernel::Handle> = Vec::new();
+        for &i in &targets {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                if let Geom::Hatch(h) = &d.geom {
+                    extra.extend(h.boundary_handles.iter().copied());
+                }
+            }
+        }
+        for handle in extra {
+            if let Some(bi) = self.doc.index_of_handle(handle) {
+                if seen.insert(bi) {
+                    targets.push(bi);
+                }
+            }
+        }
+        targets
+    }
+
+    /// P1 — apply an in-place geometry transform to the given entities
+    /// (snapshot once; hatch boundaries included). Returns the count;
+    /// errors loudly when NONE of the indices exist (rule 10).
+    fn script_transform(
+        &mut self,
+        indices: &[usize],
+        f: impl Fn(&Geom) -> Geom,
+        label: &str,
+    ) -> Result<usize, String> {
+        let targets = self.script_transform_targets(indices);
+        if targets.is_empty() {
+            return Err("none of the given entity indices exist".into());
+        }
+        self.snapshot_doc();
+        let n = targets.len();
+        for &i in &targets {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.geom = f(&d.geom);
+            }
+        }
+        if n > 0 {
+            self.history
+                .push(format!("  python: {} {} dobject(s)", label, n));
+        }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        Ok(n)
+    }
+
+    /// P1 — apply a per-entity STYLE change (snapshot once, GPU invalidate).
+    /// Returns the count touched; errors when none exist (rule 10).
+    fn script_style_set(
+        &mut self,
+        indices: &[usize],
+        mut f: impl FnMut(&mut DObject),
+    ) -> Result<usize, String> {
+        if indices.iter().all(|&i| i >= self.doc.dobjects.len()) {
+            return Err("none of the given entity indices exist".into());
+        }
+        self.snapshot_doc();
+        let mut n = 0;
+        for &i in indices {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                f(d);
+                n += 1;
+            }
+        }
+        self.gpu_dirty = true;
+        Ok(n)
+    }
+
+    /// Index the NEXT `add_dobject` will land at.
+    fn next_add_index(&self) -> usize {
+        self.doc.dobjects.len()
+    }
+
+    /// Owned snapshot of one dobject for the script boundary (D7).
+    fn entity_snapshot(&self, d: &DObject) -> cad_script::Entity {
+        let (color, linetype, lineweight, visible) = self.entity_style_summary(d);
+        cad_script::Entity {
+            handle: d.handle,
+            layer: self
+                .doc
+                .layers
+                .get(d.style.layer)
+                .map(|l| l.name.clone())
+                .unwrap_or_default(),
+            color,
+            linetype,
+            lineweight,
+            visible,
+            geom: d.geom.clone(),
+            style: d.style,
+        }
+    }
+
+    /// RESOLVED style of one dobject, script-facing (P1): color as
+    /// `"aci N"` / `"bylayer"` / `"byblock"` / `"#RRGGBB"`, linetype as its
+    /// NAME (ByLayer/Continuous → the layer's), lineweight in mm, visible.
+    fn entity_style_summary(&self, d: &DObject) -> (String, String, f32, bool) {
+        doc_entity_style_summary(&self.doc, d)
+    }
+
+    /// A `Color` → script-facing string (no layer resolution — the caller
+    /// resolves ByLayer first).
+    fn script_color_string(c: Color, doc: &Document) -> String {
+        match c {
+            Color::ByLayer => "bylayer".into(),
+            Color::ByBlock => "byblock".into(),
+            Color::Aci(n) => format!("aci {}", n),
+            Color::TrueColorRef(idx) => match c.rgb_bytes(&doc.truecolors) {
+                Some((r, g, b)) => format!("#{:02X}{:02X}{:02X}", r, g, b),
+                None => format!("truecolor {}", idx),
+            },
+        }
+    }
+
+    /// Snapshot once, then add — ONE undo entry for a single-object script
+    /// add (the same seam every canvas draw uses).
+    fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
+        self.snapshot_doc();
+        self.add_dobject(geom, origin);
+    }
+
+    /// The docked Python REPL console (WP-SCRIPT slice 4).
+    fn render_py_console(&mut self, ctx: &egui::Context) {
+        if !self.py_console_open { return; }
+        let cfg = crate::dock::DockConfig {
+            id: "py_console",
+            title: "Python console",
+            badge: None,
+            dock_region: crate::dock::DockRegion::Bottom,
+            alt_region: None,
+            dockable: true,
+            rail_header: false,
+            collapsible: false,
+            size: 230.0,
+            min: 110.0,
+            max: 480.0,
+            resizable: true,
+            flush_body: false,
+            float_w: 700.0,
+            float_max_h_frac: 0.6,
+        };
+        let mut open = self.py_console_open;
+        // Copy the dock state out so the body closure can borrow `self`.
+        let mut dock_state = self.py_console_dock;
+        crate::dock::HOST.show(ctx, &cfg, &mut dock_state, &mut open, |ui, _cap| {
+            self.py_console_body(ui);
+        });
+        self.py_console_dock = dock_state;
+        self.py_console_open = open;
+    }
+
+    /// Console body: output log, input row (Enter = run, ↑/↓ = recall), and
+    /// the example-script row.
+    fn py_console_body(&mut self, ui: &mut egui::Ui) {
+        let busy = self.script.as_ref().is_some_and(|s| s.is_busy());
+        // ---- output log (fills the panel above the input row) ----
+        let input_h = 64.0;
+        let log_h = (ui.available_height() - input_h).max(50.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), log_h),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        // SELECTABLE log (same pattern as the command
+                        // history): a per-frame TextEdit copy so the user
+                        // can drag-select and copy script output.
+                        let mut text = self.py_console_log.join("\n");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text)
+                                .id(egui::Id::new("py_console_log_text"))
+                                .frame(false)
+                                .desired_rows(self.py_console_log.len().max(1))
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+            },
+        );
+        ui.add_space(4.0);
+        // ---- input row ----
+        let mut submit = false;
+        ui.horizontal(|ui| {
+            let te = ui.add_sized(
+                [ui.available_width() - 64.0, 22.0],
+                egui::TextEdit::singleline(&mut self.py_console_input)
+                    .id(egui::Id::new("py_console_input"))
+                    .hint_text(if busy {
+                        "python is running — Esc stops it"
+                    } else {
+                        "python code — Enter to run, ↑/↓ recall, Esc stops a run"
+                    }),
+            );
+            if te.has_focus() {
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    self.py_console_recall(-1);
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    self.py_console_recall(1);
+                }
+            }
+            let enter = te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let run_btn = ui.add_enabled(
+                !busy,
+                egui::Button::new(if busy { "busy" } else { "Run" }),
+            );
+            submit = enter || run_btn.clicked();
+        });
+        // ---- save-as-script row (slice 5: scripts live in scripts/) ----
+        ui.horizontal(|ui| {
+            ui.label("script:");
+            let name_te = ui.add_sized(
+                [130.0, 20.0],
+                egui::TextEdit::singleline(&mut self.py_console_name)
+                    .id(egui::Id::new("py_console_name"))
+                    .hint_text("name"),
+            );
+            let save_btn = ui.button("Save as script")
+                .on_hover_text("saves the input above to scripts/<name>.py");
+            let entered = name_te.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if save_btn.clicked() || entered {
+                self.save_py_script();
+            }
+        });
+        // ---- example scripts ----
+        ui.horizontal(|ui| {
+            ui.label("examples:");
+            if self.py_examples.is_empty() {
+                ui.weak("none found (drop .py files in scripts/ and refresh)");
+            } else {
+                let sel = self.py_example_sel.min(self.py_examples.len() - 1);
+                egui::ComboBox::from_id_salt("py_examples")
+                    .selected_text(&self.py_examples[sel].0)
+                    .width(180.0)
+                    .show_ui(ui, |ui| {
+                        for (i, (n, _)) in self.py_examples.iter().enumerate() {
+                            ui.selectable_value(&mut self.py_example_sel, i, n);
+                        }
+                    });
+                if ui.button("Run file").clicked() {
+                    self.py_console_run_example();
+                }
+            }
+            if ui.button("refresh").on_hover_text("rescan scripts/").clicked() {
+                self.scan_py_examples();
+            }
+        });
+        if submit {
+            self.py_console_submit();
+            // Keep typing right away (Enter surrendered the TextEdit's focus).
+            ui.ctx()
+                .memory_mut(|m| m.request_focus(egui::Id::new("py_console_input")));
+        }
+    }
+
+    /// ↑/↓ recall over submitted lines. `dir` = -1 (older) / +1 (newer).
+    fn py_console_recall(&mut self, dir: i32) {
+        if self.py_console_hist.is_empty() {
+            return;
+        }
+        let n = self.py_console_hist.len();
+        let next = match self.py_console_hist_idx {
+            None => {
+                if dir < 0 {
+                    Some(n - 1)
+                } else {
+                    None // at the newest edge already
+                }
+            }
+            Some(i) => {
+                let j = i as i64 + dir as i64;
+                if j < 0 {
+                    self.py_console_hist_idx = None;
+                    self.py_console_input.clear();
+                    return;
+                }
+                if j >= n as i64 {
+                    self.py_console_hist_idx = None;
+                    self.py_console_input.clear();
+                    return;
+                }
+                Some(j as usize)
+            }
+        };
+        if let Some(i) = next {
+            self.py_console_hist_idx = Some(i);
+            self.py_console_input = self.py_console_hist[i].clone();
+        }
+    }
+
+    /// Submit the console input line to the script worker.
+    fn py_console_submit(&mut self) {
+        let code = self.py_console_input.trim().to_string();
+        if code.is_empty() {
+            return;
+        }
+        if self.py_console_hist.last() != Some(&code) {
+            self.py_console_hist.push(code.clone());
+        }
+        self.py_console_hist_idx = None;
+        self.py_log(format!(">>> {}", code));
+        self.script
+            .get_or_insert_with(cad_script::ScriptEngine::new)
+            .submit_text(code);
+        self.py_console_input.clear();
+    }
+
+    /// Run the selected example script file.
+    fn py_console_run_example(&mut self) {
+        let Some((name, path)) = self
+            .py_examples
+            .get(self.py_example_sel.min(self.py_examples.len().saturating_sub(1)))
+            .cloned()
+        else {
+            return;
+        };
+        self.py_log(format!(">>> pyfile {} ({})", name, path.display()));
+        self.script
+            .get_or_insert_with(cad_script::ScriptEngine::new)
+            .submit_file(path);
+    }
+
+    /// Scan `scripts/*.py` for the console's example list. Cheap one-shot
+    /// directory read — only on console open / refresh, never per frame.
+    fn scan_py_examples(&mut self) {
+        self.py_examples.clear();
+        if let Ok(rd) = std::fs::read_dir(Self::script_dir()) {
+            let mut found: Vec<(String, std::path::PathBuf)> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "py"))
+                .map(|p| {
+                    let name = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (name, p)
+                })
+                .collect();
+            found.sort();
+            self.py_examples = found;
+        }
+        if self.py_example_sel >= self.py_examples.len() {
+            self.py_example_sel = 0;
+        }
+    }
+
+    /// The scripts folder — the single home of named scripts (slice 5).
+    fn script_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("scripts")
+    }
+
+    /// Candidate script folders: `./scripts` (dev / repo-root launches),
+    /// then `<exe dir>/scripts` (a bundle next to the binary).
+    fn script_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![Self::script_dir()];
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                dirs.push(dir.join("scripts"));
+            }
+        }
+        dirs
+    }
+
+    /// Resolve a `run <name>` target to `(stem, scripts/<stem>.py)`. Accepts
+    /// the bare name or `name.py`; falls back to a case-insensitive match.
+    /// Searches `./scripts` then the exe's directory.
+    fn resolve_script(name: &str) -> Option<(String, std::path::PathBuf)> {
+        let raw = name.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        for dir in Self::script_dirs() {
+            let mut p = dir.join(raw);
+            if p.extension().is_none() {
+                p.set_extension("py");
+            }
+            if p.is_file() {
+                let stem = p.file_stem()?.to_string_lossy().into_owned();
+                return Some((stem, p));
+            }
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.filter_map(|e| e.ok()) {
+                    let path = e.path();
+                    if path.extension().is_some_and(|x| x == "py") {
+                        let stem = path
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if stem.eq_ignore_ascii_case(raw) {
+                            return Some((stem, path));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Save the console input as scripts/<name>.py.
+    fn save_py_script(&mut self) {
+        let name = self.py_console_name.trim().to_string();
+        let code = self.py_console_input.trim().to_string();
+        if name.is_empty() {
+            self.py_log("! script name cannot be empty".into());
+            return;
+        }
+        if code.is_empty() {
+            self.py_log("! input is empty — type the script body first".into());
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(Self::script_dir()) {
+            self.py_log(format!("! cannot create the scripts folder: {}", e));
+            return;
+        }
+        let mut p = Self::script_dir().join(&name);
+        if p.extension().is_none() {
+            p.set_extension("py");
+        }
+        match std::fs::write(&p, format!("{}\n", code)) {
+            Ok(()) => {
+                self.py_log(format!("saved → {}", p.display()));
+                self.scan_py_examples();
+            }
+            Err(e) => self.py_log(format!("! save failed: {}", e)),
+        }
+    }
+
+    // ===================================================================
+    // PLOT — dockable Page Setup, Plot dialog (model space), Plot Style
+    // Table Editor (CTB), preview window, and the run_plot pipeline.
+    // Ported from the upstream RUST-AutoRASM (model-space parts; the fork
+    // has no layout tabs, so the layout plot dialog is not ported).
+    // ===================================================================
+
+    /// Rasterise the layer-status glyphs (on/off/frozen/… from `layer_glyphs.rs`)
+    /// into `layer_glyph_tex` once, then blit them tinted wherever a panel needs
+    /// them. Idempotent — only fills missing keys.
+    fn ensure_layer_glyph_textures(&mut self, ctx: &egui::Context) {
+        use crate::layer_glyphs as lg;
+        const E: &[(&str, &str)] = &[
+            ("on", lg::SVG_ON), ("off", lg::SVG_OFF),
+            ("frozen", lg::SVG_FROZEN), ("thawed", lg::SVG_THAWED),
+            ("locked", lg::SVG_LOCKED), ("unlocked", lg::SVG_UNLOCKED),
+            ("check", lg::SVG_CHECK), ("close", lg::SVG_CLOSE),
+            ("stack", lg::SVG_STACK), ("spark", lg::SVG_SPARKLE),
+            ("bcur", lg::SVG_BADGE_CUR), ("bdel", lg::SVG_BADGE_DEL),
+            ("up", lg::SVG_UP), ("down", lg::SVG_DOWN),
+            ("reset", lg::SVG_RESET), ("gpick", lg::SVG_GLYPHPICK),
+            ("save", lg::SVG_SAVE), ("saveas", lg::SVG_SAVEAS),
+            ("new", lg::SVG_NEW), ("open", lg::SVG_OPEN),
+            ("import", lg::SVG_IMPORT), ("export", lg::SVG_EXPORT),
+        ];
+        for &(key, svg) in E {
+            if !self.layer_glyph_tex.contains_key(key) {
+                if let Some(t) = raster_layer_glyph(ctx, key, svg) {
+                    self.layer_glyph_tex.insert(key, t);
+                }
+            }
+        }
+    }
+
+    // ---- CTB manager (CTB menu) ------------------------------------------
+    //
+    // The CTB menu defines / edits / deletes plot-style tables stored as `.pst`
+    // files in the app's `<exe_dir>/ctb` folder. Editing reuses the Plot Style
+    // Table Editor (`doc.plot_styles` + `render_plot_style_editor`), bound to
+    // its file so "Save changes" writes back to the folder.
+
+    /// The CTB picker options: (display name, canonical stored key) for the
+    /// built-ins + every saved CTB (dedup'd case-insensitively against the
+    /// built-ins). `None` = unset.
+    fn ctb_choices(&self) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = CTB_BUILTINS.iter()
+            .map(|(d, k)| (d.to_string(), k.map(str::to_string)))
+            .collect();
+        for (name, _) in ctb_list() {
+            if !out.iter().any(|(d, _)| d.eq_ignore_ascii_case(&name)) {
+                out.push((name.clone(), Some(name)));
+            }
+        }
+        out
+    }
+
+    /// Picker state for the stored key `key`: the choice list plus the selected
+    /// index. A saved name whose `.pst` file no longer exists is APPENDED as its
+    /// own entry instead of collapsing to "None" — so opening a dialog (or its
+    /// per-frame rewrite) never silently erases the stored value.
+    fn ctb_picker_state(&self, key: &str) -> (Vec<(String, Option<String>)>, usize) {
+        let mut choices = self.ctb_choices();
+        let sel = choices.iter().position(|(_, k)| match k {
+            None => key.is_empty(),
+            Some(k) => k == key,
+        });
+        match sel {
+            Some(i) => (choices, i),
+            None => {
+                choices.push((key.to_string(), Some(key.to_string())));
+                let n = choices.len() - 1;
+                (choices, n)
+            }
+        }
+    }
+
+    /// Rebuild the saved-CTB table cache from the on-disk fingerprint
+    /// `(name, len, mtime)` of every `.pst` in the CTB folder. On change:
+    /// rebuild changed/new entries and drop missing ones. Runs every frame
+    /// from the update loop — cheap (one `read_dir` + stat of a few files),
+    /// and it picks up EXTERNAL edits (a `.pst` re-saved outside the app)
+    /// without a dirty flag.
+    fn refresh_ctb_tables(&mut self) {
+        let mut list: Vec<(String, u64, Option<std::time::SystemTime>)> = Vec::new();
+        let mut paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for (name, path) in ctb_list() {
+            let meta = std::fs::metadata(&path).ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta.and_then(|m| m.modified().ok());
+            list.push((name.clone(), len, mtime));
+            paths.push((name, path));
+        }
+        if list == self.ctb_fingerprint {
+            return;
+        }
+        // Drop entries whose file disappeared.
+        let names: std::collections::HashSet<&str> =
+            list.iter().map(|(n, _, _)| n.as_str()).collect();
+        self.ctb_table_cache.retain(|n, _| names.contains(n.as_str()));
+        // Rebuild only the entries that are new or changed.
+        for (name, path) in &paths {
+            let new_fp = list.iter().find(|(n, _, _)| n == name).cloned();
+            let unchanged = new_fp
+                .as_ref()
+                .map(|fp| self.ctb_fingerprint.contains(fp))
+                .unwrap_or(false);
+            if self.ctb_table_cache.contains_key(name) && unchanged {
+                continue; // unchanged — keep the cached table
+            }
+            if let Ok(t) = cad_io::load_plot_table(&path) {
+                self.ctb_table_cache.insert(name.clone(), t);
+            }
+        }
+        self.ctb_fingerprint = list;
+    }
+
+    /// Open a saved `.pst` CTB in the Plot Style Table Editor, bound to its file
+    /// so "Save changes" persists the table back to the CTB folder.
+    fn ctb_open_editor(&mut self, path: &std::path::Path) {
+        match cad_io::load_plot_table(path) {
+            Ok(t) => {
+                let name = t.name.clone();
+                self.doc.plot_styles = t;
+                self.plotstyle_edit_file = Some(path.to_path_buf());
+                self.plotstyle_open = true;
+                if self.plotstyle_sel.is_empty() {
+                    self.plotstyle_sel = vec![1];
+                    self.plotstyle_anchor = Some(1);
+                }
+                self.history.push(format!("  CTB '{}' opened for editing", name));
+            }
+            Err(e) => self.history.push(format!("  ! CTB load failed: {}", e)),
+        }
+    }
+
+    /// CTB menu → a BUILT-IN CTB (Monochrome / Grayscale / Full Color): opens
+    /// the Plot Style Table Editor bound to `ctb/<name>.pst` — seeded with the
+    /// built-in's semantics when no file exists yet ("Save changes" creates
+    /// it). Once the file exists, the plot pipeline applies the edited table
+    /// for that name instead of the hardcoded transform.
+    fn ctb_open_builtin(&mut self, name: &str) {
+        let path = ctb_folder().join(format!("{}.pst", name));
+        if path.exists() {
+            self.ctb_open_editor(&path);
+            return;
+        }
+        let Some(t) = ctb_builtin_seed(name) else {
+            self.history.push(format!("  ! CTB: unknown built-in '{}'", name));
+            return;
+        };
+        self.doc.plot_styles = t;
+        self.plotstyle_edit_file = Some(path);
+        self.plotstyle_open = true;
+        if self.plotstyle_sel.is_empty() {
+            self.plotstyle_sel = vec![1];
+            self.plotstyle_anchor = Some(1);
+        }
+        self.history.push(format!("  Built-in CTB '{}' opened for editing (unsaved)", name));
+    }
+
+    /// Define a NEW CTB: write a default table named `raw_name` into the app's
+    /// CTB folder, then open it in the editor (the user defines its pens there).
+    fn ctb_create(&mut self, raw_name: &str) {
+        let name: String = raw_name
+            .trim()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' { c } else { '_' })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.history.push("  ! CTB: enter a name".into());
+            return;
+        }
+        // Reject collisions with the built-ins and existing saved CTBs (case-
+        // insensitive): the pickers dedup case-insensitively, so a colliding
+        // file could never be selected anywhere.
+        let lower = name.to_ascii_lowercase();
+        if CTB_RESERVED.contains(&lower.as_str()) {
+            self.history.push(format!("  ! CTB name '{}' is reserved (built-in)", name));
+            return;
+        }
+        if ctb_list().iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+            self.history.push(format!("  ! CTB '{}' already exists", name));
+            return;
+        }
+        let path = ctb_folder().join(format!("{}.pst", name));
+        if path.exists() {
+            self.history.push(format!("  ! CTB '{}' already exists", name));
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(ctb_folder()) {
+            self.history.push(format!("  ! CTB folder create failed: {}", e));
+            return;
+        }
+        let table = cad_kernel::plotstyle::PlotStyleTable::named(name);
+        if let Err(e) = cad_io::save_plot_table(&path, &table) {
+            self.history.push(format!("  ! CTB save failed: {}", e));
+            return;
+        }
+        self.ctb_open_editor(&path);
+    }
+
+    /// Delete a saved CTB from the app's CTB folder.
+    fn ctb_delete(&mut self, name: &str) {
+        let path = ctb_folder().join(format!("{}.pst", name));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if self.plotstyle_edit_file.as_deref() == Some(path.as_path()) {
+                    self.plotstyle_edit_file = None;
+                }
+                self.history.push(format!("  CTB '{}' deleted", name));
+            }
+            Err(e) => self.history.push(format!("  ! CTB delete failed: {}", e)),
+        }
+    }
+
+    /// CTB menu → New CTB… — name entry; Create defines the CTB (default table
+    /// in the app's CTB folder) and opens it in the Plot Style Table Editor.
+    fn render_new_ctb_dialog(&mut self, ctx: &egui::Context) {
+        if !self.new_ctb_open { return; }
+        let mut ok = false;
+        let mut cancel = false;
+        egui::Window::new("New CTB")
+            .id(egui::Id::new("new_ctb"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut self.new_ctb_name);
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { cancel = true; }
+                    if ui.button("Create").clicked() { ok = true; }
+                });
+            });
+        if ok {
+            let name = self.new_ctb_name.clone();
+            self.new_ctb_open = false;
+            self.ctb_create(&name);
+        }
+        if cancel {
+            self.new_ctb_open = false;
+        }
+    }
+
+    // ---- Plot Style Table Editor ------------------------------------------
+
+    /// Selection helpers for the 255-color list (Form view) and the grid column
+    /// headers (Table view). `alt` removes one color; `shift` extends from the
+    /// anchor; `ctrl` toggles one; plain click selects just that color.
+    fn plotstyle_select(&mut self, n: u8, shift: bool, ctrl: bool, alt: bool) {
+        if alt {
+            if let Some(pos) = self.plotstyle_sel.iter().position(|&x| x == n) {
+                self.plotstyle_sel.remove(pos);
+            }
+            self.plotstyle_anchor = Some(n);
+        } else if shift {
+            // Add the in-between colors to the current selection (keep anchor so
+            // a further Shift+click keeps extending from the same start).
+            self.plotstyle_extend_to(n);
+        } else if ctrl {
+            if let Some(pos) = self.plotstyle_sel.iter().position(|&x| x == n) {
+                self.plotstyle_sel.remove(pos);
+            } else {
+                self.plotstyle_sel.push(n);
+            }
+            self.plotstyle_anchor = Some(n);
+        } else {
+            self.plotstyle_sel = vec![n];
+            self.plotstyle_anchor = Some(n);
+        }
+    }
+
+    /// Union every color between the anchor (or `n`) and `n` into the selection
+    /// (Shift+click / Shift+End / Shift+Home).
+    fn plotstyle_extend_to(&mut self, n: u8) {
+        let anchor = self.plotstyle_anchor.unwrap_or(n);
+        let (lo, hi) = if anchor <= n { (anchor, n) } else { (n, anchor) };
+        for c in lo..=hi {
+            if !self.plotstyle_sel.contains(&c) { self.plotstyle_sel.push(c); }
+        }
+    }
+
+    /// Select all 255 colors (Ctrl+A while the color list / grid is hovered).
+    fn plotstyle_select_all(&mut self) {
+        self.plotstyle_sel = (1..=255).collect();
+    }
+
+    /// Read the shared color-list keyboard shortcuts (gated by the caller on the
+    /// list/grid being hovered): Ctrl+A = all, Shift+End = extend to last,
+    /// Shift+Home = extend to first.
+    fn plotstyle_list_keys(&mut self, ui: &egui::Ui) {
+        let (all, to_last, to_first) = ui.input(|i| (
+            i.key_pressed(egui::Key::A) && (i.modifiers.command || i.modifiers.ctrl),
+            i.key_pressed(egui::Key::End) && i.modifiers.shift,
+            i.key_pressed(egui::Key::Home) && i.modifiers.shift,
+        ));
+        if all { self.plotstyle_select_all(); }
+        if to_last { self.plotstyle_extend_to(255); }
+        if to_first { self.plotstyle_extend_to(1); }
+    }
+
+    /// Open a child dialog LOCKED to its parent's exact top-left, so it appears in
+    /// the SAME position as the current menu (owner §2b). The window gets a FRESH
+    /// Id per open (`base_id` + `seq`) so egui holds NO remembered position and
+    /// `default_pos(parent.min)` always wins — a stale remembered spot can't
+    /// hijack it. Within one open the Id is stable, so the child stays freely
+    /// draggable. No parent (opened straight from a menu) → centre on the canvas.
+    fn place_child<'a>(win: egui::Window<'a>, base_id: &str, seq: u64,
+                       parent: Option<egui::Rect>, canvas: egui::Rect) -> egui::Window<'a> {
+        let win = win.id(egui::Id::new((base_id, seq)));
+        match parent {
+            Some(p) => win.pivot(egui::Align2::LEFT_TOP).default_pos(p.min),
+            None     => win.pivot(egui::Align2::CENTER_CENTER).default_pos(canvas.center()),
+        }
+    }
+
+    /// Clamp a desired centre so a `size`-big CENTER_CENTER-pivoted window sits
+    /// fully inside `cr`; if the window is bigger than the canvas on an axis, use
+    /// the canvas centre on that axis.
+    fn clamp_center_in(cr: egui::Rect, center: egui::Pos2, size: egui::Vec2) -> egui::Pos2 {
+        let (hx, hy) = (size.x * 0.5, size.y * 0.5);
+        let x = if cr.width()  >= size.x { center.x.clamp(cr.min.x + hx, cr.max.x - hx) } else { cr.center().x };
+        let y = if cr.height() >= size.y { center.y.clamp(cr.min.y + hy, cr.max.y - hy) } else { cr.center().y };
+        egui::pos2(x, y)
+    }
+
+    /// The Plot Style Table Editor (AutoCAD CTB editor analog) — Form View (A2).
+    /// Standalone floating window with DIALOG_STANDARD chrome (like the Layer
+    /// Manager). Left = 255-color list (multi-select); right = the 12 CTB
+    /// properties, applied to every selected color. Edits `doc.plot_styles`.
+    fn render_plot_style_editor(&mut self, ctx: &egui::Context) {
+        if !self.plotstyle_open { self.prev_plotstyle_open = false; return; }
+        let ed_just_opened = !self.prev_plotstyle_open;
+        self.prev_plotstyle_open = true;
+        if ed_just_opened { self.plotstyle_open_seq = self.plotstyle_open_seq.wrapping_add(1); }
+        self.ensure_layer_glyph_textures(ctx);
+        let gx_close = self.layer_glyph_tex.get("close").map(|t| (t.id(), t.size_vec2()));
+        use crate::theme::color as tc;
+
+        // Pre-clone the linetype list + ladder so the render closure needs no
+        // borrow of self.doc for them.
+        let ladder = self.doc.plot_styles.lineweight_ladder.clone();
+        let lt_list: Vec<(u32, String)> = self.doc.linetypes.linetypes.iter()
+            .enumerate().map(|(i, l)| (i as u32, l.name.clone())).collect();
+        let table_name = self.doc.plot_styles.name.clone();
+
+        let mut close_panel = false;
+        let mut save_close = false;
+        let mut open_color_picker = false;
+        let mut open_ladder = false;
+        let mut open_pst_save = false;
+        let mut open_pst_load = false;
+        let mut edit = PlotStyleEdit::default();
+
+        let frame = egui::Frame::none()
+            .fill(tc::SURFACE_1)
+            .rounding(egui::Rounding::same(12.0))
+            .stroke(egui::Stroke::new(1.0, tc::BORDER))
+            .inner_margin(egui::Margin::ZERO);
+        // FULLY FIXED size (NO auto-fit). body_h = Table View's 12 property
+        // rows + the "Set" corner + caption + 24px below Fill style. The window
+        // is header + tabs + body_h + footer — the SAME for all 3 tabs.
+        let ed_w = 600.0_f32;
+        let body_h = 24.0                    // "Set →" corner row
+            + 12.0 * 24.0 + 11.0 * 2.0       // 12 property rows @24 + 2px spacing
+            + 20.0                           // wrapped instruction caption + gap
+            + 24.0;                          // 24px below Fill style (owner)
+        let target_h = 30.0 + 34.0 + body_h + 78.0;   // header + tabs + body + footer
+        // Open LOCKED to the PARENT's top-left (the Plot dialog it replaces),
+        // forced on the opening frame so a dragged parent carries the editor.
+        let cr = self.canvas_screen_rect.unwrap_or_else(|| ctx.screen_rect());
+        let win = egui::Window::new("Plot Style Table Editor")
+            .order(egui::Order::Foreground)
+            .title_bar(false)
+            .frame(frame)
+            .fixed_size(egui::vec2(ed_w, target_h))
+            .movable(true);
+        let win = Self::place_child(win, "plot_style_editor", self.plotstyle_open_seq,
+                                    self.plot_dialog_rect, cr);
+        let resp = win.show(ctx, |ui| {
+            let area = ui.max_rect();
+            let full_w = area.width();
+            let hdr_font = egui::TextStyle::Button.resolve(ui.style());
+
+            // ===== header band (#34414B, title, Close ×) =====
+            let (hdr, _) = ui.allocate_exact_size(egui::vec2(full_w, 30.0), egui::Sense::hover());
+            {
+                let hp = ui.painter_at(hdr);
+                hp.rect_filled(hdr, egui::Rounding { nw: 12.0, ne: 12.0, sw: 0.0, se: 0.0 }, tc::BORDER);
+                hp.text(egui::pos2(area.left() + 14.0, hdr.center().y), egui::Align2::LEFT_CENTER,
+                    format!("Plot Style Table Editor — {}", table_name), hdr_font, tc::TEXT_PRIMARY);
+            }
+            let xr = egui::Rect::from_center_size(egui::pos2(area.right() - 13.0, hdr.center().y), egui::vec2(13.5, 13.5));
+            let xresp = ui.interact(xr, egui::Id::new("pse_close"), egui::Sense::click());
+            {
+                let hp = ui.painter_at(hdr);
+                let xcol = if xresp.hovered() {
+                    hp.rect_filled(xr.expand(3.0), 4.0, egui::Color32::from_rgba_unmultiplied(0xE5, 0x48, 0x4D, 45));
+                    LYR_DANGER
+                } else { LYR_MUTED };
+                blit_layer_glyph(&hp, xr, gx_close, xcol);
+            }
+            if xresp.clicked() { close_panel = true; }
+
+            // ===== tab bar: General | Table View | Form View =====
+            egui::Frame::none().inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 4.0, bottom: 0.0 }).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, name) in ["General", "Table View", "Form View"].iter().enumerate() {
+                        if ui.selectable_label(self.plotstyle_tab == i as u8, *name).clicked() {
+                            self.plotstyle_tab = i as u8;
+                        }
+                    }
+                });
+            });
+            ui.separator();
+
+            // ===== the active tab body — fixed-height scroll so the WINDOW
+            //       height is identical across the 3 tabs (unified). =====
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 6.0)).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).max_height(body_h).show(ui, |ui| {
+                    match self.plotstyle_tab {
+                        0 => self.plotstyle_general_body(ui),
+                        1 => self.plotstyle_table_body(ui, area, &ladder, &lt_list, &mut edit, &mut open_color_picker),
+                        _ => self.plotstyle_form_body(ui, area, &ladder, &lt_list, &mut edit, &mut open_color_picker),
+                    }
+                });
+            });
+
+            // ===== shared footer — shown for ALL tabs (keeps the height unified). =====
+            ui.separator();
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(14.0, 6.0)).show(ui, |ui| {
+                if self.plotstyle_tab != 0 {
+                    ui.label(egui::RichText::new(
+                        "Dither · Pen # · Virtual pen · Adaptive · Fill (marked *) are stored for CTB fidelity — no PDF effect yet.")
+                        .color(tc::TEXT_MUTED).small());
+                    ui.add_space(6.0);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Edit Lineweights…").clicked() { open_ladder = true; }
+                    if ui.button("Load .pst…").clicked() { open_pst_load = true; }
+                    if ui.button("Save As .pst…").clicked() { open_pst_save = true; }
+                    // Save changes — edits already apply live to doc.plot_styles, so
+                    // this confirms + closes (returns to the Plot dialog). When the
+                    // editor is bound to a CTB file (CTB menu → New/Edit CTB), the
+                    // table is ALSO written back to that file here.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let save = egui::Button::new(egui::RichText::new("Save changes").color(tc::ON_ACCENT).strong())
+                            .fill(tc::ACCENT).rounding(egui::Rounding::same(6.0));
+                        if ui.add(save).clicked() { save_close = true; }
+                    });
+                });
+                self.plotstyle_footer_rect = Some(ui.min_rect());
+            });
+        });
+        self.plotstyle_editor_rect = resp.as_ref().map(|r| r.response.rect);
+        self.raise_after_show("PlotStyleEditor", ctx, &resp);
+        let _ = resp;
+
+        // ---- apply pending edits to every selected color ----
+        if open_color_picker {
+            self.aci_pick_request = Some(AciPickRequest::PlotStyleColor);
+        }
+        let sel = self.plotstyle_sel.clone();
+        apply_plot_edit(&mut self.doc.plot_styles, &sel, &edit);
+
+        // "Save changes" while bound to a CTB file → write the table back to the
+        // app's CTB folder (after the final frame's edits applied above).
+        if save_close {
+            if let Some(path) = self.plotstyle_edit_file.clone() {
+                match cad_io::save_plot_table(&path, &self.doc.plot_styles) {
+                    Ok(()) => {
+                        self.history.push(format!(
+                            "  CTB '{}' saved → {}", self.doc.plot_styles.name, path.display()));
+                    }
+                    Err(e) => self.history.push(format!("  ! CTB save failed: {}", e)),
+                }
+            }
+            close_panel = true;
+        }
+
+        // Edit Lineweights / .pst — each REPLACES the editor (menu-stack): hide
+        // the editor now, mark it to return, and open the sub-dialog.
+        if open_ladder {
+            self.plotstyle_ladder_open = true;
+            self.plotstyle_ladder_work = self.doc.plot_styles.lineweight_ladder.clone();
+            self.plotstyle_ladder_sel = None;
+            self.plotstyle_open = false;
+            self.plotstyle_return_after_sub = true;
+        }
+        if open_pst_save {
+            self.plotstyle_pst_io = Some(true);
+            self.open_file_dialog(FileDialogMode::Save, ".pst");
+            self.plotstyle_open = false;
+            self.plotstyle_return_after_sub = true;
+        }
+        if open_pst_load {
+            self.plotstyle_pst_io = Some(false);
+            self.open_file_dialog(FileDialogMode::Open, ".pst");
+            self.plotstyle_open = false;
+            self.plotstyle_return_after_sub = true;
+        }
+
+        if close_panel {
+            self.plotstyle_open = false;
+            // return to the Plot dialog if the editor replaced it.
+            if self.plotstyle_return_to_plot {
+                self.plot_dialog_open = true;
+                self.plotstyle_return_to_plot = false;
+            }
+        }
+    }
+
+    /// Form View body — left color list + description; right = the 12 shared
+    /// property editors (`plotprop_editor`), applied to every selected color.
+    fn plotstyle_form_body(
+        &mut self, ui: &mut egui::Ui, _area: egui::Rect, ladder: &[f32],
+        lt_list: &[(u32, String)], edit: &mut PlotStyleEdit, open_color_picker: &mut bool,
+    ) {
+        use crate::theme::color as tc;
+        let sel = self.plotstyle_sel.clone();
+        ui.horizontal_top(|ui| {
+            // ---- LEFT: color list + description ----
+            ui.vertical(|ui| {
+                ui.set_width(188.0);
+                ui.label(egui::RichText::new("Plot styles").color(tc::COLUMN_HEADER).small());
+                // Show ~9 colors, then a scroll bar (owner). Row = 18px.
+                let list_h = 12.0 * 18.0;
+                let out = egui::ScrollArea::vertical().id_salt("pse_list")
+                    .max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+                    let row_w = ui.available_width();
+                    for n in 1u8..=255 {
+                        let is_sel = sel.contains(&n);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, 18.0), egui::Sense::click());
+                        if is_sel { ui.painter().rect_filled(rect, 3.0, tc::SURFACE_3); }
+                        else if resp.hovered() { ui.painter().rect_filled(rect, 3.0, tc::SURFACE_2); }
+                        let (r, g, b) = aci_palette(n);
+                        let sw = egui::Rect::from_min_size(egui::pos2(rect.left() + 4.0, rect.center().y - 6.0), egui::vec2(12.0, 12.0));
+                        ui.painter().rect_filled(sw, 2.0, egui::Color32::from_rgb(r, g, b));
+                        ui.painter().rect_stroke(sw, 2.0, egui::Stroke::new(1.0, tc::BORDER));
+                        ui.painter().text(egui::pos2(sw.right() + 8.0, rect.center().y), egui::Align2::LEFT_CENTER,
+                            format!("Color {}", n), egui::TextStyle::Body.resolve(ui.style()),
+                            if is_sel { tc::TEXT_PRIMARY } else { tc::TEXT_SECONDARY });
+                        if resp.clicked() {
+                            let m = ui.input(|i| i.modifiers);
+                            self.plotstyle_select(n, m.shift, m.command || m.ctrl, m.alt);
+                        }
+                    }
+                });
+                // Keyboard shortcuts while the color list is hovered.
+                if ui.rect_contains_pointer(out.inner_rect) { self.plotstyle_list_keys(ui); }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Description").color(tc::COLUMN_HEADER).small());
+                ui.add(egui::TextEdit::multiline(&mut self.doc.plot_styles.description)
+                    .desired_rows(2).desired_width(184.0));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled(false, egui::Button::new("Add Style"))
+                        .on_disabled_hover_text("Color-dependent table — the 255 colors are fixed");
+                    ui.add_enabled(false, egui::Button::new("Delete Style"))
+                        .on_disabled_hover_text("Color-dependent table — the 255 colors are fixed");
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // ---- RIGHT: the 12 shared property editors ----
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new(format!("Properties  ({} color{} selected)",
+                    sel.len(), if sel.len() == 1 { "" } else { "s" }))
+                    .color(tc::COLUMN_HEADER).small());
+                ui.add_space(6.0);
+                if sel.is_empty() {
+                    ui.label("Select one or more colors on the left.");
+                    return;
+                }
+                egui::Grid::new("pse_form_props").num_columns(2).spacing([10.0, 7.0]).show(ui, |ui| {
+                    for prop in PlotProp::ALL {
+                        let mut name = prop.label().to_string();
+                        if prop.store_only() { name.push_str(" *"); }
+                        let l = ui.label(name);
+                        if prop.store_only() { l.on_hover_text("Stored — no plot effect yet"); }
+                        plotprop_editor(ui, prop, &sel, &self.doc.plot_styles, ladder, lt_list, edit, open_color_picker, "form");
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+    }
+
+    /// Table View body — rows = the 12 properties, columns = the 255 colors.
+    /// Left: property name + the SAME shared editor (`plotprop_editor`) applied
+    /// to the selected column range. Right: a virtualized value grid (only the
+    /// visible columns are painted). Click a column header to select (Shift =
+    /// range, Ctrl = toggle).
+    fn plotstyle_table_body(
+        &mut self, ui: &mut egui::Ui, area: egui::Rect, ladder: &[f32],
+        lt_list: &[(u32, String)], edit: &mut PlotStyleEdit, open_color_picker: &mut bool,
+    ) {
+        use crate::theme::color as tc;
+        let sel = self.plotstyle_sel.clone();
+        ui.label(egui::RichText::new(
+            "Click column headers to select colors (Shift = range, Ctrl = toggle), then set a property on the left — it applies to all selected columns.")
+            .color(tc::TEXT_MUTED).small());
+        ui.add_space(6.0);
+        let (row_h, header_h, col_w) = (24.0_f32, 24.0_f32, 52.0_f32);
+        let cap = egui::TextStyle::Small.resolve(ui.style());
+        ui.horizontal_top(|ui| {
+            // ---- LEFT: property name + shared editor per row ----
+            ui.vertical(|ui| {
+                ui.set_width(266.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let (corner, _) = ui.allocate_exact_size(egui::vec2(266.0, header_h), egui::Sense::hover());
+                ui.painter().text(egui::pos2(corner.left(), corner.center().y), egui::Align2::LEFT_CENTER,
+                    format!("Set →  ({} selected)", sel.len()), cap.clone(), tc::COLUMN_HEADER);
+                for prop in PlotProp::ALL {
+                    ui.allocate_ui_with_layout(egui::vec2(266.0, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let mut nm = prop.label().to_string();
+                        if prop.store_only() { nm.push_str(" *"); }
+                        let l = ui.add_sized([104.0, row_h - 2.0], egui::Label::new(nm).truncate());
+                        if prop.store_only() { l.on_hover_text("Stored — no plot effect yet"); }
+                        if sel.is_empty() {
+                            ui.label("—");
+                        } else {
+                            plotprop_editor(ui, prop, &sel, &self.doc.plot_styles, ladder, lt_list, edit, open_color_picker, "tbl");
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+
+            // ---- RIGHT: virtualized value grid ----
+            let grid_h = (area.height() - 220.0).max(180.0).min(header_h + 12.0 * row_h + 6.0);
+            egui::ScrollArea::horizontal().id_salt("pse_tbl").max_height(grid_h)
+                .show_viewport(ui, |ui, vp| {
+                let ncol = 255usize;
+                let content = egui::vec2(ncol as f32 * col_w, header_h + 12.0 * row_h);
+                let (resp, p) = ui.allocate_painter(content, egui::Sense::click());
+                let o = resp.rect.min;
+                let first = ((vp.min.x / col_w).floor() as isize).max(0) as usize;
+                let last = (((vp.max.x / col_w).ceil() as usize) + 1).min(ncol);
+                for ci in first..last {
+                    let n = (ci + 1) as u8;
+                    let x = o.x + ci as f32 * col_w;
+                    let is_sel = sel.contains(&n);
+                    // header
+                    let hr = egui::Rect::from_min_size(egui::pos2(x, o.y), egui::vec2(col_w, header_h));
+                    if is_sel { p.rect_filled(hr, 0.0, tc::SURFACE_3); }
+                    p.rect_stroke(hr, 0.0, egui::Stroke::new(0.4, tc::BORDER));
+                    let (r, g, b) = aci_palette(n);
+                    let sw = egui::Rect::from_min_size(egui::pos2(x + 3.0, o.y + header_h / 2.0 - 5.0), egui::vec2(10.0, 10.0));
+                    p.rect_filled(sw, 2.0, egui::Color32::from_rgb(r, g, b));
+                    p.rect_stroke(sw, 2.0, egui::Stroke::new(0.5, tc::BORDER));
+                    p.text(egui::pos2(x + 16.0, o.y + header_h / 2.0), egui::Align2::LEFT_CENTER,
+                        format!("{n}"), cap.clone(), if is_sel { tc::TEXT_PRIMARY } else { tc::TEXT_SECONDARY });
+                    // value cells
+                    for (ri, prop) in PlotProp::ALL.iter().enumerate() {
+                        let y = o.y + header_h + ri as f32 * row_h;
+                        let cr = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(col_w, row_h));
+                        if is_sel { p.rect_filled(cr, 0.0, tc::SURFACE_2); }
+                        p.rect_stroke(cr, 0.0, egui::Stroke::new(0.3, tc::BORDER));
+                        let (label, swrgb) = plotprop_cell(*prop, self.doc.plot_styles.style(n), lt_list);
+                        let mut tx = cr.left() + 4.0;
+                        if let Some((r, g, b)) = swrgb {
+                            let d = egui::Rect::from_min_size(egui::pos2(cr.left() + 3.0, cr.center().y - 5.0), egui::vec2(10.0, 10.0));
+                            p.rect_filled(d, 2.0, egui::Color32::from_rgb(r, g, b));
+                            tx = cr.left() + 16.0;
+                        }
+                        p.clone().with_clip_rect(cr).text(egui::pos2(tx, cr.center().y),
+                            egui::Align2::LEFT_CENTER, label, cap.clone(), tc::TEXT_SECONDARY);
+                    }
+                }
+                // click a header cell → select that column
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if pos.y <= o.y + header_h {
+                            let ci = ((pos.x - o.x) / col_w).floor() as isize;
+                            if ci >= 0 && (ci as usize) < ncol {
+                                let n = (ci as u8).wrapping_add(1);
+                                let m = ui.input(|i| i.modifiers);
+                                self.plotstyle_select(n, m.shift, m.command || m.ctrl, m.alt);
+                            }
+                        }
+                    }
+                }
+                // Same keyboard shortcuts as the Form list when the grid is hovered.
+                if resp.hovered() { self.plotstyle_list_keys(ui); }
+            });
+        });
+    }
+
+    /// General tab — name (read-only), type, path, editable Description, and the
+    /// global-linetype-scale toggle + percent.
+    fn plotstyle_general_body(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::color as tc;
+        egui::Grid::new("pse_general").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+            ui.label("Table name");
+            ui.label(egui::RichText::new(self.doc.plot_styles.name.clone()).color(tc::TEXT_PRIMARY));
+            ui.end_row();
+            ui.label("Table type");
+            ui.label("Color-Dependent Plot Style Table");
+            ui.end_row();
+            ui.label("File");
+            ui.label(egui::RichText::new("— (not yet saved; .pst save/load)").color(tc::TEXT_MUTED));
+            ui.end_row();
+            ui.label("Description");
+            ui.add(egui::TextEdit::multiline(&mut self.doc.plot_styles.description)
+                .desired_rows(3).desired_width(340.0));
+            ui.end_row();
+            ui.label("Linetypes");
+            ui.checkbox(&mut self.doc.plot_styles.apply_global_ltscale,
+                "Apply global scale factor to non-ISO linetypes");
+            ui.end_row();
+            ui.label("Scale factor");
+            let mut pct = self.doc.plot_styles.ltscale_percent as f64;
+            let enabled = self.doc.plot_styles.apply_global_ltscale;
+            if ui.add_enabled(enabled, egui::DragValue::new(&mut pct)
+                .range(1.0..=10000.0).suffix(" %").update_while_editing(false)).changed() {
+                self.doc.plot_styles.ltscale_percent = pct as f32;
+            }
+            ui.end_row();
+        });
+    }
+
+    /// Edit Lineweights sub-dialog — edits the table's `lineweight_ladder` (the
+    /// mm set offered by every Lineweight dropdown). Values stored in mm; the
+    /// mm/inch toggle only changes the display. Save writes the sorted/deduped
+    /// set back to the table.
+    fn render_plot_ladder_dialog(&mut self, ctx: &egui::Context) {
+        if !self.plotstyle_ladder_open { self.prev_plot_ladder_open = false; return; }
+        let lad_just_opened = !self.prev_plot_ladder_open;
+        self.prev_plot_ladder_open = true;
+        if lad_just_opened { self.plot_ladder_open_seq = self.plot_ladder_open_seq.wrapping_add(1); }
+        use crate::theme::color as tc;
+        self.ensure_layer_glyph_textures(ctx);
+        let gx_close = self.layer_glyph_tex.get("close").map(|t| (t.id(), t.size_vec2()));
+        let mut commit = false;
+        let mut cancel = false;
+        let lcr = self.canvas_screen_rect.unwrap_or_else(|| ctx.screen_rect());
+        let lframe = egui::Frame::none().fill(tc::SURFACE_1).rounding(egui::Rounding::same(12.0))
+            .stroke(egui::Stroke::new(1.0, tc::BORDER)).inner_margin(egui::Margin::ZERO);
+        let lwin = egui::Window::new("Edit Lineweights")
+            .order(egui::Order::Foreground)
+            .title_bar(false).frame(lframe)
+            .default_size(egui::vec2(300.0, 440.0))
+            .resizable(false).movable(true);
+        Self::place_child(lwin, "plot_ladder_dialog", self.plot_ladder_open_seq,
+                          self.plotstyle_editor_rect, lcr)
+            .show(ctx, |ui| {
+                let larea = ui.max_rect();
+                let lhf = egui::TextStyle::Button.resolve(ui.style());
+                let (lhdr, _) = ui.allocate_exact_size(egui::vec2(larea.width(), 30.0), egui::Sense::hover());
+                {
+                    let hp = ui.painter_at(lhdr);
+                    hp.rect_filled(lhdr, egui::Rounding { nw: 12.0, ne: 12.0, sw: 0.0, se: 0.0 }, tc::BORDER);
+                    hp.text(egui::pos2(larea.left() + 14.0, lhdr.center().y), egui::Align2::LEFT_CENTER,
+                        "Edit Lineweights", lhf, tc::TEXT_PRIMARY);
+                }
+                let lxr = egui::Rect::from_center_size(egui::pos2(larea.right() - 13.0, lhdr.center().y), egui::vec2(13.5, 13.5));
+                let lxresp = ui.interact(lxr, egui::Id::new("ladder_close"), egui::Sense::click());
+                {
+                    let hp = ui.painter_at(lhdr);
+                    let xcol = if lxresp.hovered() {
+                        hp.rect_filled(lxr.expand(3.0), 4.0, egui::Color32::from_rgba_unmultiplied(0xE5, 0x48, 0x4D, 45));
+                        LYR_DANGER
+                    } else { LYR_MUTED };
+                    blit_layer_glyph(&hp, lxr, gx_close, xcol);
+                }
+                if lxresp.clicked() { cancel = true; }   // × = close (discard)
+
+                egui::Frame::none().inner_margin(egui::Margin::symmetric(12.0, 8.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Units:");
+                        ui.selectable_value(&mut self.plotstyle_ladder_inch, false, "mm");
+                        ui.selectable_value(&mut self.plotstyle_ladder_inch, true, "inch");
+                    });
+                    ui.separator();
+                    let inch = self.plotstyle_ladder_inch;
+                    egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, false]).show(ui, |ui| {
+                        let mut del: Option<usize> = None;
+                        for i in 0..self.plotstyle_ladder_work.len() {
+                            ui.horizontal(|ui| {
+                                let is_sel = self.plotstyle_ladder_sel == Some(i);
+                                if ui.selectable_label(is_sel, format!("{:>2}", i + 1)).clicked() {
+                                    self.plotstyle_ladder_sel = Some(i);
+                                }
+                                let (suffix, speed) = if inch { (" in", 0.001) } else { (" mm", 0.01) };
+                                let mut disp = if inch {
+                                    (self.plotstyle_ladder_work[i] / 25.4) as f64
+                                } else {
+                                    self.plotstyle_ladder_work[i] as f64
+                                };
+                                if ui.add(egui::DragValue::new(&mut disp).speed(speed)
+                                    .range(0.0..=100.0).suffix(suffix).update_while_editing(false)).changed() {
+                                    self.plotstyle_ladder_work[i] =
+                                        if inch { (disp * 25.4) as f32 } else { disp as f32 };
+                                }
+                                if ui.small_button("✕").on_hover_text("Remove").clicked() { del = Some(i); }
+                            });
+                        }
+                        if let Some(i) = del {
+                            if self.plotstyle_ladder_work.len() > 1 {
+                                self.plotstyle_ladder_work.remove(i);
+                                self.plotstyle_ladder_sel = None;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Add").clicked() {
+                            self.plotstyle_ladder_work.push(0.0);
+                            self.plotstyle_ladder_sel = Some(self.plotstyle_ladder_work.len() - 1);
+                        }
+                        if ui.button("Sort").clicked() {
+                            self.plotstyle_ladder_work
+                                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let save = egui::Button::new(egui::RichText::new("Save").color(tc::ON_ACCENT).strong())
+                                .fill(tc::ACCENT).rounding(egui::Rounding::same(6.0));
+                            if ui.add(save).clicked() { commit = true; }
+                        });
+                    });
+                });
+            });
+        if commit {
+            let mut v = self.plotstyle_ladder_work.clone();
+            v.retain(|w| *w >= 0.0);
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+            if v.is_empty() { v.push(0.0); }
+            self.doc.plot_styles.lineweight_ladder = v;
+            self.plotstyle_ladder_open = false;
+        }
+        if cancel { self.plotstyle_ladder_open = false; }
+        // when the ladder closes, reopen the editor it replaced.
+        if !self.plotstyle_ladder_open && self.plotstyle_return_after_sub {
+            self.plotstyle_open = true;
+            self.plotstyle_return_after_sub = false;
+        }
+    }
+
+    /// A sensible default plot output path: the drawing's name with the current
+    /// format's extension, else `plot.<ext>` in the last-used directory.
+    fn default_plot_pdf_path(&self) -> String {
+        let ext = match self.plot_format.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+        if let Some(p) = &self.current_file {
+            let mut pb = p.clone();
+            pb.set_extension(ext);
+            return pb.to_string_lossy().to_string();
+        }
+        let dir = self.file_dialog_dir.clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        dir.join(format!("plot.{}", ext)).to_string_lossy().to_string()
+    }
+
+    // ---- Plot dialog + pipeline ------------------------------------------
+
+    /// Fit readout: model units per paper-mm, computed live from the current
+    /// window/extents and paper. `None` when there is nothing to plot.
+    fn plot_fit_units_per_mm(&self) -> Option<f64> {
+        let (mn, mx) = match self.plot_area_kind {
+            1 => self.plot_window?,
+            _ => self.doc_extents()?,
+        };
+        let (bw, bh) = ((mx.x - mn.x).max(1e-9), (mx.y - mn.y).max(1e-9));
+        let (pw, ph) = self.plot_paper.dims_mm();
+        let (pw, ph) = if self.plot_landscape { (ph as f64, pw as f64) } else { (pw as f64, ph as f64) };
+        let m = 5.0;
+        let (prw, prh) = ((pw - 2.0 * m).max(1.0), (ph - 2.0 * m).max(1.0));
+        // mm-on-paper per model-unit, then invert to model-units per paper-mm.
+        let s = (prw / bw).min(prh / bh);
+        if s <= 1e-12 { None } else { Some(1.0 / s) }
+    }
+
+    /// Paint the paper preview. `full = false` (the dialog's small pane) draws the
+    /// sheet + a single **red footprint rectangle** = the plotted area's
+    /// proportion + position on the paper (nothing inside). `full = true` (the
+    /// Preview window) renders the **real geometry** — pens, linetypes, window
+    /// clip — exactly as it will print.
+    fn plot_preview_paint(&self, p: &egui::Painter, box_rect: egui::Rect, cap: egui::FontId, full: bool) {
+        use crate::theme::color as tc;
+        let (pw, ph) = self.plot_paper.dims_mm();
+        let (pw, ph) = if self.plot_landscape { (ph, pw) } else { (pw, ph) };
+        // Asymmetric margins: extra on the left for the height label, extra on
+        // the bottom for the width label — so neither is clipped by the box.
+        let (lm, rm, tm, bm) = (30.0_f32, 14.0_f32, 14.0_f32, 24.0_f32);
+        let avail = egui::vec2((box_rect.width() - lm - rm).max(10.0),
+                               (box_rect.height() - tm - bm).max(10.0));
+        let s = (avail.x / pw).min(avail.y / ph);
+        let sheet = egui::vec2(pw * s, ph * s);
+        let region = egui::Rect::from_min_size(
+            egui::pos2(box_rect.left() + lm, box_rect.top() + tm), avail);
+        let sheet_rect = egui::Rect::from_center_size(region.center(), sheet);
+        // sheet
+        p.rect_filled(sheet_rect, 2.0, egui::Color32::from_rgb(0xE9, 0xE7, 0xE2));
+        p.rect_stroke(sheet_rect, 2.0, egui::Stroke::new(1.0, tc::BORDER));
+        // printable margin (5 mm inset)
+        let inner = sheet_rect.shrink(5.0 * s);
+        p.rect_stroke(inner, 0.0, egui::Stroke::new(0.8, egui::Color32::from_rgb(0x9A, 0xA4, 0xAD)));
+        if full {
+            // FULL render: build the REAL plot scene (same pipeline as run_plot)
+            // and draw it into the sheet — pens, linetype dashes, window clip. `s`
+            // is preview px per paper-mm; the page origin is bottom-left.
+            let default_table;
+            let table: &cad_kernel::plotstyle::PlotStyleTable = if self.plot_with_styles {
+                &self.doc.plot_styles
+            } else {
+                default_table = cad_kernel::plotstyle::PlotStyleTable::default();
+                &default_table
+            };
+            let cfg = self.plot_config(cad_kernel::plotstyle::PlotTarget::PdfFile(std::path::PathBuf::new()));
+            let scene = cad_plot::build_scene(&self.doc, table, &cfg);
+            let map = |x: f64, y: f64| egui::pos2(
+                sheet_rect.left() + (x as f32) * s,
+                sheet_rect.bottom() - (y as f32) * s);
+            for prim in &scene.prims {
+                match prim {
+                    cad_plot::Prim::Stroke {
+                        pts, closed, width_mm, rgb, dash_mm, dash_offset_mm,
+                        cap, join, smooth, ..
+                    } => {
+                        let col = egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2);
+                        let w = (*width_mm * s).max(0.6);      // floor so it's visible
+                        let mut pl: Vec<egui::Pos2> = pts.iter().map(|&(x, y)| map(x, y)).collect();
+                        if *closed { if let Some(&f) = pl.first() { pl.push(f); } }
+                        // Cap/join emulation: Round/Miter keep the single
+                        // strip render (one shape per stroke); Bevel draws butt
+                        // segments so the bevel wedges are the only corner
+                        // geometry. `smooth` tessellations skip join wedges.
+                        let corners = !*smooth;
+                        let bevel = *join == cad_kernel::plotstyle::JoinStyle::Bevel;
+                        let draw_base = |pl: &[egui::Pos2]| {
+                            if bevel {
+                                paint_butt_polyline(p, pl, w, col);
+                            } else {
+                                p.add(egui::Shape::line(pl.to_vec(), egui::Stroke::new(w, col)));
+                            }
+                        };
+                        if dash_mm.is_empty() {
+                            draw_base(&pl);
+                            paint_caps_joins_screen(p, &pl, *closed, w, *cap, *join, col, corners);
+                        } else {
+                            // Walk the dash pattern continuously along the
+                            // polyline, starting at the scene's dash-phase
+                            // offset — the preview must match the exported
+                            // PDF/SVG/PNG (which all honour the adaptive
+                            // linetype phase). Each dash run is an open stroke:
+                            // the pen's cap applies at its ends and the join
+                            // style at any corner inside it.
+                            let total: f64 = dash_mm.iter().map(|&v| v.abs() as f64).sum();
+                            let mut phase = (*dash_offset_mm as f64 * s as f64).abs();
+                            phase = if total > 1e-9 { phase % total } else { 0.0 };
+                            let mut pi = 0usize;
+                            let mut remaining = dash_mm[0].abs() as f64;
+                            while phase > 1e-9 {
+                                let seg = dash_mm[pi].abs() as f64;
+                                if phase >= seg - 1e-9 {
+                                    phase -= seg;
+                                    pi = (pi + 1) % dash_mm.len();
+                                    remaining = dash_mm[pi].abs() as f64;
+                                } else {
+                                    remaining = seg - phase;
+                                    phase = 0.0;
+                                }
+                            }
+                            let mut on = pi % 2 == 0;
+                            let mut cur: Vec<egui::Pos2> = Vec::new();
+                            let flush_run = |cur: &mut Vec<egui::Pos2>| {
+                                if cur.len() >= 2 {
+                                    draw_base(cur);
+                                    paint_caps_joins_screen(p, cur, false, w, *cap, *join, col, corners);
+                                }
+                                cur.clear();
+                            };
+                            for seg in pl.windows(2) {
+                                let (a, b) = (seg[0], seg[1]);
+                                let len = (b - a).length().max(1e-6);
+                                let mut walked = 0.0_f32;
+                                while walked < len - 1e-6 {
+                                    let take = remaining.min((len - walked) as f64);
+                                    let t0 = walked / len;
+                                    let t1 = (walked + take as f32) / len;
+                                    let p0 = a + (b - a) * t0;
+                                    let p1 = a + (b - a) * t1;
+                                    if on {
+                                        cur.push(p0);
+                                        cur.push(p1);
+                                    }
+                                    walked += take as f32;
+                                    remaining -= take;
+                                    if remaining <= 1e-9 {
+                                        if on {
+                                            flush_run(&mut cur);
+                                        } else {
+                                            cur.clear();
+                                        }
+                                        on = !on;
+                                        pi = (pi + 1) % dash_mm.len();
+                                        remaining = dash_mm[pi].abs() as f64;
+                                    }
+                                }
+                            }
+                            if on {
+                                flush_run(&mut cur);
+                            }
+                        }
+                    }
+                    cad_plot::Prim::Fill { loops, rgb, .. } => {
+                        let col = egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2);
+                        if let Some(outer) = loops.first() {
+                            let poly: Vec<egui::Pos2> = outer.iter().map(|&(x, y)| map(x, y)).collect();
+                            p.add(egui::Shape::convex_polygon(poly, col, egui::Stroke::NONE));
+                        }
+                    }
+                    cad_plot::Prim::Tris { tris, rgb } => {
+                        let col = egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2);
+                        for t in tris {
+                            let poly: Vec<egui::Pos2> = t.iter().map(|&(x, y)| map(x, y)).collect();
+                            p.add(egui::Shape::convex_polygon(poly, col, egui::Stroke::NONE));
+                        }
+                    }
+                }
+            }
+        } else {
+            // SMALL pane: just the plotted-area footprint = its proportion +
+            // position on the paper (placed like the real plot; nothing inside).
+            let m = 5.0_f32;
+            let prw = (pw - 2.0 * m).max(1.0);
+            let prh = (ph - 2.0 * m).max(1.0);
+            let plotted = if self.plot_area_kind == 1 { self.plot_window } else { self.doc_extents() };
+            if let Some((mn, mx)) = plotted {
+                let (bw, bh) = ((mx.x - mn.x).max(1e-9), (mx.y - mn.y).max(1e-9));
+                let unit_mm = if self.plot_unit_inch { 25.4_f64 } else { 1.0 };
+                let ps = if self.plot_scale_fit {
+                    (prw as f64 / bw).min(prh as f64 / bh)
+                } else {
+                    unit_mm / (self.plot_scale_n.max(1e-6))
+                };
+                let cw = (bw * ps) as f32;
+                let ch = (bh * ps) as f32;
+                let (ox, oy) = if self.plot_offset_center {
+                    (m + (prw - cw) * 0.5, m + (prh - ch) * 0.5)
+                } else {
+                    (m + (self.plot_offset_x as f64 * unit_mm) as f32,
+                     m + (self.plot_offset_y as f64 * unit_mm) as f32)
+                };
+                let fpr = egui::Rect::from_min_size(
+                    egui::pos2(sheet_rect.left() + ox * s, sheet_rect.bottom() - (oy + ch) * s),
+                    egui::vec2(cw * s, ch * s));
+                p.rect_stroke(fpr, 0.0, egui::Stroke::new(1.5, tc::DANGER));
+            }
+        }
+        // dimension labels: width under the sheet (horizontal), height in the
+        // left margin ROTATED 90° (reads bottom-to-top) with a mm suffix.
+        p.text(egui::pos2(sheet_rect.center().x, sheet_rect.bottom() + 8.0),
+            egui::Align2::CENTER_CENTER, format!("{:.0} mm", pw), cap.clone(), tc::TEXT_SECONDARY);
+        let galley = p.layout_no_wrap(format!("{:.0} mm", ph), cap.clone(), tc::TEXT_SECONDARY);
+        let (gw, gh) = (galley.size().x, galley.size().y);
+        let gx = sheet_rect.left() - 10.0;                 // just left of the sheet
+        let cy = sheet_rect.center().y;
+        let mut ts = egui::epaint::TextShape::new(
+            egui::pos2(gx - gh * 0.5, cy + gw * 0.5), galley, tc::TEXT_SECONDARY);
+        ts.angle = -std::f32::consts::FRAC_PI_2;           // −90° → reads upward
+        p.add(egui::Shape::Text(ts));
+    }
+
+    /// The `PlotConfig` for the current dialog state — shared by the live preview
+    /// and `run_plot` so they can never diverge. `output` is the only per-caller
+    /// field (the preview passes a dummy; run_plot the real path). Honours the
+    /// mm/inch unit on the ratio's paper side and the X/Y offset.
+    fn plot_config(&self, output: cad_kernel::plotstyle::PlotTarget) -> cad_kernel::plotstyle::PlotConfig {
+        use cad_kernel::plotstyle::{Offset, Orientation, PlotArea, PlotConfig, PlotScale};
+        let area = match self.plot_area_kind {
+            1 => match self.plot_window {
+                Some((mn, mx)) => PlotArea::Window { min: mn, max: mx },
+                None => PlotArea::Extents,
+            },
+            _ => PlotArea::Extents, // Display has no view rect here → Extents.
+        };
+        let unit_mm = if self.plot_unit_inch { 25.4_f64 } else { 1.0 };
+        let scale = if self.plot_scale_fit {
+            PlotScale::Fit
+        } else {
+            PlotScale::Ratio { model: self.plot_scale_n.max(1e-6), paper_mm: unit_mm }
+        };
+        let offset = if self.plot_offset_center {
+            Offset::Center
+        } else {
+            Offset::Xy {
+                x_mm: (self.plot_offset_x as f64 * unit_mm) as f32,
+                y_mm: (self.plot_offset_y as f64 * unit_mm) as f32,
+            }
+        };
+        // "Scale lineweights" OFF = physical mm (the ruling). ON = scale with the
+        // drawing (Ratio only). "Plot object lineweights" OFF forces hairline.
+        let mut lw_scale = if self.plot_scale_lw {
+            match scale { PlotScale::Ratio { model, paper_mm } => (paper_mm / model) as f32, PlotScale::Fit => 1.0 }
+        } else { 1.0 };
+        if !self.plot_object_lw { lw_scale = 0.0; }
+        PlotConfig {
+            output,
+            paper: self.plot_paper,
+            orientation: if self.plot_landscape { Orientation::Landscape } else { Orientation::Portrait },
+            area, scale, offset, lw_scale,
+            // "Plot all black" — effective for MODEL plots only.
+            monochrome: self.plot_mono,
+            margins_mm: 5.0,
+            // The fork has no layout tabs → model-space plots only.
+            plot_layout_index: None,
+            // The saved CTBs, so a layout's named CTB applies its per-ACI
+            // colour rules in the plot output.
+            ctb_tables: {
+                let mut tables = std::collections::BTreeMap::new();
+                for (name, path) in ctb_list() {
+                    if let Ok(t) = cad_io::load_plot_table(&path) {
+                        tables.insert(name, t);
+                    }
+                }
+                // The Plot Style Table Editor's LIVE table overrides the disk
+                // copy while open — so Plot preview + the exported files show
+                // CTB edits (widths, joins, caps, …) before "Save changes".
+                if self.plotstyle_open {
+                    tables.insert(
+                        self.doc.plot_styles.name.clone(),
+                        self.doc.plot_styles.clone(),
+                    );
+                }
+                tables
+            },
+        }
+    }
+
+    /// Open a written file with the OS default handler (the PDF viewer).
+    fn open_in_viewer(path: &std::path::Path) {
+        let p = path.to_string_lossy().to_string();
+        #[cfg(target_os = "windows")]
+        { let _ = std::process::Command::new("explorer").arg(&p).spawn(); }
+        #[cfg(target_os = "macos")]
+        { let _ = std::process::Command::new("open").arg(&p).spawn(); }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        { let _ = std::process::Command::new("xdg-open").arg(&p).spawn(); }
+    }
+
+    /// Build a `PlotConfig` from the Plot dialog and run `cad_plot::plot`.
+    /// Read-only on the doc; reports the written PDF path in history, then opens
+    /// the PDF in the default viewer.
+    fn run_plot(&mut self) {
+        use cad_kernel::plotstyle::{PlotStyleTable, PlotTarget};
+        let raw = self.plot_pdf_path.trim().to_string();
+        if raw.is_empty() {
+            self.history.push("  ! plot: no output path — press Plot and choose a file.".into());
+            return;
+        }
+        // Output format: PDF default, SVG / PNG optional.
+        let fmt = self.plot_format.clone();
+        let ext = match fmt.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+        let mut path = std::path::PathBuf::from(&raw);
+        if path.extension().map(|e| e.to_ascii_lowercase() != ext).unwrap_or(true) {
+            path.set_extension(ext);
+        }
+        let cfg = self.plot_config(PlotTarget::PdfFile(path.clone()));
+        // Window-area only applies to MODEL plots — never demand a picked window
+        // for Extents.
+        if self.plot_area_kind == 1 && self.plot_window.is_none() {
+            self.history.push("  ! plot: pick the Window area first".into());
+            return;
+        }
+
+        // Table: with plot styles → the doc's table; without → a default table so
+        // object lineweights drive.
+        let default_table;
+        let table: &PlotStyleTable = if self.plot_with_styles {
+            &self.doc.plot_styles
+        } else {
+            default_table = PlotStyleTable::default();
+            &default_table
+        };
+
+        // A locked/read-only target (the file open in a viewer) is the common
+        // failure — give a short, actionable line instead of the raw OS error.
+        let locked_msg = |e: &cad_plot::PlotError| {
+            if let cad_plot::PlotError::Io(io) = e {
+                let raw = io.raw_os_error();
+                io.kind() == std::io::ErrorKind::PermissionDenied
+                    || raw == Some(32) || raw == Some(5)
+            } else { false }
+        };
+        let result: Result<(), String> = match fmt.as_str() {
+            "svg" => {
+                match cad_plot::export_svg_meta(&self.doc, table, &cfg, &path) {
+                    Ok(out) => {
+                        let dims = if out.skipped_dims > 0 {
+                            format!(", {} dimension(s) skipped", out.skipped_dims)
+                        } else { String::new() };
+                        self.history.push(format!("  plot → {} ({} KB, SVG, {} prims{})",
+                            path.display(), (out.bytes + 512) / 1024, out.prim_count, dims));
+                        if !self.plot_suppress_viewer { Self::open_in_viewer(&path); }
+                        Ok(())
+                    }
+                    Err(e) => Err(if locked_msg(&e) {
+                        "  ! plot: the SVG is open in another program — close it, or Browse… to a new file name.".into()
+                    } else {
+                        format!("  ! SVG plot failed: {}", e)
+                    }),
+                }
+            }
+            "png" => {
+                match cad_plot::export_png_meta(&self.doc, table, &cfg, &path, 300.0) {
+                    Ok(out) => {
+                        let dims = if out.skipped_dims > 0 {
+                            format!(", {} dimension(s) skipped", out.skipped_dims)
+                        } else { String::new() };
+                        self.history.push(format!("  plot → {} ({} KB, PNG @300dpi, {} prims{})",
+                            path.display(), (out.bytes + 512) / 1024, out.prim_count, dims));
+                        if !self.plot_suppress_viewer { Self::open_in_viewer(&path); }
+                        Ok(())
+                    }
+                    Err(e) => Err(if locked_msg(&e) {
+                        "  ! plot: the PNG is open in another program — close it, or Browse… to a new file name.".into()
+                    } else {
+                        format!("  ! PNG plot failed: {}", e)
+                    }),
+                }
+            }
+            _ => {
+                match cad_plot::plot(&self.doc, table, &cfg) {
+                    Ok(out) => {
+                        let dims = if out.skipped_dims > 0 {
+                            format!(", {} dimension(s) skipped", out.skipped_dims)
+                        } else { String::new() };
+                        self.history.push(format!("  plot → {} ({} KB, {} prims{})",
+                            out.path.display(), (out.bytes + 512) / 1024, out.prim_count, dims));
+                        // Open the finished PDF in the default viewer.
+                        if !self.plot_suppress_viewer { Self::open_in_viewer(&out.path); }
+                        Ok(())
+                    }
+                    Err(e) => Err(if locked_msg(&e) {
+                        "  ! plot: the PDF is open in another program — close it, or Browse… to a new file name.".into()
+                    } else {
+                        format!("  ! plot failed: {}", e)
+                    }),
+                }
+            }
+        };
+        if let Err(msg) = result {
+            self.history.push(msg);
+        }
+        self.plot_dialog_open = false;
+        self.clear_prompt();
+    }
+
+    /// The Plot dialog (model space) — standalone floating window with
+    /// DIALOG_STANDARD chrome. Builds a `PlotConfig` and calls `cad_plot::plot`.
+    /// Read-only on the doc. Two dialogs coexist: this one and the Plot Style
+    /// Table Editor (which replaces it while open).
+    fn render_plot_dialog(&mut self, ctx: &egui::Context) {
+        if !self.plot_dialog_open { return; }
+        // Parked while picking the Window area on the canvas.
+        if self.plot_win_pick != 0 { return; }
+        self.ensure_layer_glyph_textures(ctx);
+        let gx_close = self.layer_glyph_tex.get("close").map(|t| (t.id(), t.size_vec2()));
+        use crate::theme::color as tc;
+        use cad_kernel::plotstyle::PaperSize;
+
+        let table_name = self.doc.plot_styles.name.clone();
+        let mut close_panel = false;
+        let mut do_ok = false;
+        let mut open_editor = false;
+        let mut pick_window = false;
+        let mut load_pst = false;
+        let mut open_preview = false;
+        let mut edit_anchor: Option<egui::Rect> = None;
+        // Fit readout: model units per paper-mm (1 mm = N units), computed live.
+        let fit_units = self.plot_fit_units_per_mm();
+        // Paper-side unit (mm default / inch) for the scale readout + offset.
+        let unit_mm = if self.plot_unit_inch { 25.4_f64 } else { 1.0 };
+        let unit_name = if self.plot_unit_inch { "inch" } else { "mm" };
+
+        let frame = egui::Frame::none()
+            .fill(tc::SURFACE_1).rounding(egui::Rounding::same(12.0))
+            .stroke(egui::Stroke::new(1.0, tc::BORDER)).inner_margin(egui::Margin::ZERO);
+        // The main Plot dialog opens at the canvas centre, fully INSIDE the
+        // canvas — never over the category bar / rails. If the box is taller than
+        // the canvas, its height is CAPPED to the canvas and the body SCROLLS.
+        let cr = self.canvas_screen_rect.unwrap_or_else(|| ctx.screen_rect());
+        let vmargin = 10.0;
+        let max_h = (cr.height() - 2.0 * vmargin).max(220.0);
+        // Clamp the centre using the CAPPED height so the whole box fits in-canvas.
+        let box_h = self.plot_dialog_rect.map(|r| r.height()).unwrap_or(560.0).min(max_h);
+        let center = Self::clamp_center_in(cr, cr.center(), egui::vec2(724.0, box_h));
+        let win = egui::Window::new("Plot")
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("plot_dialog"))
+            .title_bar(false).frame(frame)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(center)
+            .min_width(724.0).max_width(724.0)
+            .max_height(max_h).vscroll(false)
+            .resizable(false).movable(true);
+        let resp = win.show(ctx, |ui| {
+            let area = ui.max_rect();
+            let full_w = area.width();
+            let hdr_font = egui::TextStyle::Button.resolve(ui.style());
+            let cap = crate::theme::typ::caption();
+
+            // ===== header band (#34414B, "Plot" + Close ×) =====
+            let (hdr, _) = ui.allocate_exact_size(egui::vec2(full_w, 30.0), egui::Sense::hover());
+            {
+                let hp = ui.painter_at(hdr);
+                hp.rect_filled(hdr, egui::Rounding { nw: 12.0, ne: 12.0, sw: 0.0, se: 0.0 }, tc::BORDER);
+                hp.text(egui::pos2(area.left() + 14.0, hdr.center().y), egui::Align2::LEFT_CENTER,
+                    "Plot", hdr_font, tc::TEXT_PRIMARY);
+            }
+            let xr = egui::Rect::from_center_size(egui::pos2(area.right() - 13.0, hdr.center().y), egui::vec2(13.5, 13.5));
+            let xresp = ui.interact(xr, egui::Id::new("plot_close"), egui::Sense::click());
+            {
+                let hp = ui.painter_at(hdr);
+                let xcol = if xresp.hovered() {
+                    hp.rect_filled(xr.expand(3.0), 4.0, egui::Color32::from_rgba_unmultiplied(0xE5, 0x48, 0x4D, 45));
+                    LYR_DANGER
+                } else { LYR_MUTED };
+                blit_layer_glyph(&hp, xr, gx_close, xcol);
+            }
+            if xresp.clicked() { close_panel = true; }
+
+            // ---- SCROLLABLE BODY: the custom header (band + Close ×) and the
+            //      footer stay PINNED — only the middle content scrolls. ----
+            egui::ScrollArea::vertical()
+                .id_salt("plot_dialog_body")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+
+            // ---- reusable painters for a consistent, aligned look ----
+            let body_font = crate::theme::typ::body();
+            let sh = |ui: &mut egui::Ui, t: &str, first: bool| {
+                if first {
+                    ui.add_space(2.0);
+                } else {
+                    ui.add_space(11.0);
+                    let xr = ui.max_rect().x_range();
+                    let y = ui.cursor().top();
+                    ui.painter().hline(xr, y, egui::Stroke::new(1.0, tc::BORDER));
+                    ui.add_space(10.0);
+                }
+                ui.label(egui::RichText::new(t).color(tc::COLUMN_HEADER).size(11.0).strong());
+                ui.add_space(8.0);
+            };
+            // Same primitive the Inspector uses (`pp_box`): 24px tall, radius 4,
+            // surface-0 fill, 1px border, body() 13px text, 8px pad, pp_arrow.
+            let field_box = |ui: &mut egui::Ui, w: f32, text: &str, chevron: bool, enabled: bool| -> egui::Response {
+                let (r, resp) = pp_box(ui, w, enabled);
+                ui.painter().text(egui::pos2(r.left() + crate::theme::space::INPUT_PAD, r.center().y),
+                    egui::Align2::LEFT_CENTER, text, body_font.clone(),
+                    if enabled { PP_TEXT } else { tc::TEXT_DISABLED });
+                if chevron { pp_arrow(&ui.painter_at(r), r); }
+                resp
+            };
+            let lbl = |ui: &mut egui::Ui, t: &str, en: bool| {
+                ui.add_sized([70.0, PP_ROW_H], egui::Label::new(
+                    egui::RichText::new(t).color(if en { tc::TEXT_MUTED } else { tc::TEXT_DISABLED })));
+            };
+            let check = |ui: &mut egui::Ui, w: f32, label: &str, checked: bool, en: bool| -> bool {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::click());
+                let bx = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - 8.0), egui::vec2(16.0, 16.0));
+                if checked {
+                    ui.painter().rect_filled(bx, 4.0, if en { tc::ACCENT } else { tc::SURFACE_3 });
+                    let c = bx.center();
+                    ui.painter().add(egui::Shape::line(
+                        vec![egui::pos2(c.x - 3.5, c.y + 0.5), egui::pos2(c.x - 1.0, c.y + 3.0), egui::pos2(c.x + 4.0, c.y - 3.5)],
+                        egui::Stroke::new(1.9, if en { tc::ON_ACCENT } else { tc::TEXT_DISABLED })));
+                } else {
+                    ui.painter().rect_stroke(bx, 4.0, egui::Stroke::new(1.3, if en { tc::TEXT_MUTED } else { tc::TEXT_DISABLED }));
+                }
+                ui.painter().text(egui::pos2(bx.right() + 8.0, r.center().y), egui::Align2::LEFT_CENTER,
+                    label, body_font.clone(), if en { tc::TEXT_PRIMARY } else { tc::TEXT_DISABLED });
+                resp.clicked() && en
+            };
+            let icon_btn = |ui: &mut egui::Ui, kind: &str, en: bool| -> egui::Response {
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(PP_ROW_H, PP_ROW_H), egui::Sense::click());
+                let brd = if en && resp.hovered() { tc::ACCENT } else { tc::BORDER };
+                ui.painter().rect(r, egui::Rounding::same(crate::theme::radius::SM), tc::SURFACE_1, egui::Stroke::new(1.0, brd));
+                let col = if en { tc::TEXT_MUTED } else { tc::TEXT_DISABLED };
+                let c = r.center();
+                let p = ui.painter();
+                match kind {
+                    "sliders" => {
+                        p.line_segment([egui::pos2(c.x - 6.0, c.y - 4.0), egui::pos2(c.x + 6.0, c.y - 4.0)], egui::Stroke::new(1.4, col));
+                        p.circle_filled(egui::pos2(c.x + 2.5, c.y - 4.0), 2.2, col);
+                        p.line_segment([egui::pos2(c.x - 6.0, c.y + 4.0), egui::pos2(c.x + 6.0, c.y + 4.0)], egui::Stroke::new(1.4, col));
+                        p.circle_filled(egui::pos2(c.x - 2.5, c.y + 4.0), 2.2, col);
+                    }
+                    "save" => {
+                        p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(12.0, 12.0)), 1.0, egui::Stroke::new(1.3, col));
+                        p.rect_filled(egui::Rect::from_min_size(egui::pos2(c.x - 3.0, c.y - 6.0), egui::vec2(6.0, 3.5)), 0.0, col);
+                    }
+                    "pencil" => {
+                        p.line_segment([egui::pos2(c.x - 4.5, c.y + 4.5), egui::pos2(c.x + 3.5, c.y - 3.5)], egui::Stroke::new(1.7, col));
+                        p.line_segment([egui::pos2(c.x - 5.5, c.y + 5.5), egui::pos2(c.x - 3.5, c.y + 3.5)], egui::Stroke::new(1.7, col));
+                    }
+                    _ => {}
+                }
+                resp
+            };
+            // Numeric field identical to the Inspector's (`pp_num_field`).
+            let num_box = |ui: &mut egui::Ui, w: f32, val: &mut f64, en: bool| {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::hover());
+                if en {
+                    pp_num_field(ui, r, val);
+                } else {
+                    ui.painter().rect(r, egui::Rounding::same(crate::theme::radius::SM),
+                        PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
+                    ui.painter().text(egui::pos2(r.left() + crate::theme::space::INPUT_PAD, r.center().y),
+                        egui::Align2::LEFT_CENTER, format!("{:.2}", val),
+                        crate::theme::typ::data_value(), tc::TEXT_DISABLED);
+                }
+            };
+
+            ui.horizontal_top(|ui| {
+                // ===================== LEFT column =====================
+                egui::Frame::none().inner_margin(egui::Margin { left: 18.0, right: 16.0, top: 8.0, bottom: 8.0 }).show(ui, |ui| {
+                  ui.vertical(|ui| {
+                    ui.set_width(392.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+
+                    // ---- DESTINATION ----
+                    sh(ui, "DESTINATION", true);
+                    ui.horizontal(|ui| {
+                        lbl(ui, "Printer", true);
+                        field_box(ui, 244.0, "PDF (cad_plot)", true, true);
+                        ui.add_space(6.0);
+                        icon_btn(ui, "sliders", false).on_hover_text("Printer settings — later phase");
+                    });
+                    ui.horizontal(|ui| {
+                        lbl(ui, "Preset", false);
+                        field_box(ui, 244.0, "<None>", true, false);
+                        ui.add_space(6.0);
+                        icon_btn(ui, "save", false);
+                    });
+                    ui.horizontal(|ui| {
+                        let _ = check(ui, 100.0, "Plot to file", true, true);
+                        ui.label(egui::RichText::new("choose folder + name on Plot")
+                            .color(tc::TEXT_MUTED).small());
+                    });
+
+                    // ---- AREA & SCALE ----
+                    sh(ui, "AREA & SCALE", false);
+                    ui.horizontal(|ui| {
+                        lbl(ui, "What to plot", true);
+                        let r = field_box(ui, 244.0, ["Extents", "Window", "Display"][self.plot_area_kind.min(2) as usize], true, true);
+                        let pid = egui::Id::new("plot_what_pop");
+                        if r.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                        egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.set_min_width(150.0);
+                            if ui.selectable_label(self.plot_area_kind == 0, "Extents").clicked() { self.plot_area_kind = 0; }
+                            if ui.selectable_label(self.plot_area_kind == 1, "Window").clicked() { self.plot_area_kind = 1; }
+                            if ui.selectable_label(self.plot_area_kind == 2, "Display").clicked() { self.plot_area_kind = 2; }
+                        });
+                    });
+                    if self.plot_area_kind == 1 {
+                        ui.horizontal(|ui| {
+                            lbl(ui, "", true);
+                            if ui.button("Pick window <").clicked() { pick_window = true; }
+                            if ui.button("Preview")
+                                .on_hover_text("Full preview of the plotted output, with a Confirm option")
+                                .clicked() { open_preview = true; }
+                            let t = match self.plot_window {
+                                Some((mn, mx)) => format!("({:.0},{:.0})–({:.0},{:.0})", mn.x, mn.y, mx.x, mx.y),
+                                None => "not picked yet".to_string(),
+                            };
+                            ui.label(egui::RichText::new(t).color(tc::TEXT_MUTED).small());
+                        });
+                    } else {
+                        // Extents / Display have no Pick-window row → put Preview on
+                        // the What-to-plot line so it's always reachable.
+                        ui.horizontal(|ui| {
+                            lbl(ui, "", true);
+                            if ui.button("Preview")
+                                .on_hover_text("Full preview of the plotted output, with a Confirm option")
+                                .clicked() { open_preview = true; }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if check(ui, 110.0, "Fit to paper", self.plot_scale_fit, true) { self.plot_scale_fit = !self.plot_scale_fit; }
+                        ui.label(egui::RichText::new("1").color(tc::TEXT_MUTED).small());
+                        // mm / inch unit selector (paper side of the scale; default mm).
+                        let ur = field_box(ui, 58.0, unit_name, true, true);
+                        let uid = egui::Id::new("plot_unit_pop");
+                        if ur.clicked() { ui.memory_mut(|m| m.toggle_popup(uid)); }
+                        egui::popup_below_widget(ui, uid, &ur, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.set_min_width(80.0);
+                            if ui.selectable_label(!self.plot_unit_inch, "mm").clicked() { self.plot_unit_inch = false; }
+                            if ui.selectable_label(self.plot_unit_inch, "inch").clicked() { self.plot_unit_inch = true; }
+                        });
+                        ui.label(egui::RichText::new("=").color(tc::TEXT_MUTED).small());
+                        if self.plot_scale_fit {
+                            let t = fit_units.map(|u| format!("{:.3}", u * unit_mm)).unwrap_or_else(|| "—".into());
+                            field_box(ui, 64.0, &t, false, false);
+                        } else {
+                            let mut n = self.plot_scale_n;
+                            num_box(ui, 64.0, &mut n, true);
+                            self.plot_scale_n = n.max(0.001);
+                        }
+                        ui.label(egui::RichText::new("units").color(tc::TEXT_MUTED).small());
+                    });
+                    ui.horizontal(|ui| {
+                        if check(ui, 110.0, "Center the plot", self.plot_offset_center, true) { self.plot_offset_center = !self.plot_offset_center; }
+                        let en = !self.plot_offset_center;
+                        ui.label(egui::RichText::new("X").color(tc::TEXT_MUTED));
+                        let mut x = self.plot_offset_x as f64;
+                        num_box(ui, 60.0, &mut x, en); self.plot_offset_x = x as f32;
+                        ui.label(egui::RichText::new("Y").color(tc::TEXT_MUTED));
+                        let mut y = self.plot_offset_y as f64;
+                        num_box(ui, 60.0, &mut y, en); self.plot_offset_y = y as f32;
+                    });
+
+                    // ---- PEN & QUALITY ----
+                    sh(ui, "PEN & QUALITY", false);
+                    ui.horizontal(|ui| {
+                        lbl(ui, "Plot style", true);
+                        let r = field_box(ui, 244.0, &table_name, true, true);
+                        let pid = egui::Id::new("plot_table_pop");
+                        if r.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                        egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.set_min_width(180.0);
+                            let _ = ui.selectable_label(true, format!("{} (document)", table_name));
+                            if ui.selectable_label(false, "Load .pst…").clicked() { load_pst = true; }
+                        });
+                        ui.add_space(6.0);
+                        let pencil = icon_btn(ui, "pencil", true).on_hover_text("Edit the plot style table");
+                        edit_anchor = Some(pencil.rect);
+                        if pencil.clicked() { open_editor = true; }
+                    });
+                    ui.horizontal(|ui| {
+                        lbl(ui, "Quality", false);
+                        field_box(ui, 168.0, "Vector (N/A)", true, false);
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("DPI").color(tc::TEXT_DISABLED));
+                        field_box(ui, 44.0, "—", false, false);
+                    });
+                    ui.horizontal(|ui| {
+                        lbl(ui, "Shade plot", false);
+                        field_box(ui, 244.0, "As displayed (N/A)", true, false);
+                    });
+
+                    // ---- OPTIONS ----
+                    sh(ui, "OPTIONS", false);
+                    ui.horizontal(|ui| {
+                        if check(ui, 176.0, "Object lineweights", self.plot_object_lw, true) { self.plot_object_lw = !self.plot_object_lw; }
+                        if check(ui, 150.0, "Plot styles", self.plot_with_styles, true) { self.plot_with_styles = !self.plot_with_styles; }
+                    });
+                    ui.horizontal(|ui| {
+                        let _ = check(ui, 176.0, "Transparency", false, false);
+                        if check(ui, 150.0, "Scale lineweights", self.plot_scale_lw, true) { self.plot_scale_lw = !self.plot_scale_lw; }
+                    });
+                    ui.horizontal(|ui| {
+                        if check(ui, 176.0, "Plot all black", self.plot_mono, true) { self.plot_mono = !self.plot_mono; }
+                        let _ = check(ui, 150.0, "Plot in background", false, false);
+                    });
+                    ui.horizontal(|ui| {
+                        let _ = check(ui, 176.0, "Plot stamp", false, false);
+                    });
+                  });
+                });
+
+                // vertical divider (fixed length to match the columns)
+                let (dv, _) = ui.allocate_exact_size(egui::vec2(1.0, 366.0), egui::Sense::hover());
+                ui.painter().vline(dv.center().x, dv.y_range(), egui::Stroke::new(1.0, tc::BORDER));
+
+                // ===================== RIGHT column =====================
+                egui::Frame::none().inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 8.0, bottom: 8.0 }).show(ui, |ui| {
+                  ui.vertical(|ui| {
+                    ui.set_width(238.0);
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    let (pw, ph) = self.plot_paper.dims_mm();
+                    let (pw, ph) = if self.plot_landscape { (ph, pw) } else { (pw, ph) };
+                    sh(ui, &format!("PREVIEW · {} · {:.0}×{:.0} mm", paper_label(self.plot_paper), pw, ph), true);
+                    let (pv, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 208.0), egui::Sense::hover());
+                    ui.painter().rect(pv, egui::Rounding::same(8.0), tc::SURFACE_2, egui::Stroke::new(1.0, tc::BORDER));
+                    self.plot_preview_paint(&ui.painter_at(pv), pv, cap.clone(), false);
+
+                    // ---- ORIENTATION ----
+                    sh(ui, "ORIENTATION", false);
+                    ui.horizontal(|ui| {
+                        let bw = (ui.available_width() - 8.0) * 0.5;
+                        let mk = |sel: bool, t: &str| egui::Button::new(
+                            egui::RichText::new(t).color(if sel { tc::ON_ACCENT } else { tc::TEXT_PRIMARY }))
+                            .fill(if sel { tc::ACCENT } else { tc::SURFACE_1 })
+                            .stroke(egui::Stroke::new(1.0, tc::BORDER))
+                            .rounding(egui::Rounding::same(6.0));
+                        if ui.add_sized([bw, 34.0], mk(!self.plot_landscape, "Portrait")).clicked() { self.plot_landscape = false; }
+                        if ui.add_sized([bw, 34.0], mk(self.plot_landscape, "Landscape")).clicked() { self.plot_landscape = true; }
+                    });
+                    let _ = check(ui, 130.0, "Upside-down", false, false);
+
+                    // ---- COPIES (greyed) ----
+                    sh(ui, "COPIES", false);
+                    ui.horizontal(|ui| {
+                        icon_btn(ui, "", false);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(46.0, PP_ROW_H), egui::Sense::hover());
+                        ui.painter().rect(r, egui::Rounding::same(crate::theme::radius::SM), PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
+                        ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "1", body_font.clone(), tc::TEXT_DISABLED);
+                        icon_btn(ui, "", false);
+                    });
+
+                    // ---- PAPER SIZE ----
+                    sh(ui, "PAPER SIZE", false);
+                    let w = ui.available_width();
+                    let r = field_box(ui, w, paper_label(self.plot_paper), true, true);
+                    let pid = egui::Id::new("plot_paper_pop");
+                    if r.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                    egui::popup_below_widget(ui, pid, &r, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(200.0);
+                        for p in [PaperSize::A4, PaperSize::A3, PaperSize::A2, PaperSize::A1, PaperSize::A0, PaperSize::Letter] {
+                            let (w, h) = p.dims_mm();
+                            let lab = format!("{}    {:.0} × {:.0} mm", paper_label(p), w, h);
+                            if ui.selectable_label(self.plot_paper == p, lab).clicked() { self.plot_paper = p; }
+                        }
+                    });
+                  });
+                });
+            });
+
+                });
+
+            // ===== OUTPUT FORMAT (PDF / SVG / PNG) =====
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Format:");
+                let fmts = ["PDF", "SVG", "PNG"];
+                let mut fi = match self.plot_format.as_str() { "svg" => 1, "png" => 2, _ => 0 };
+                egui::ComboBox::from_id_salt("plot_fmt2")
+                    .selected_text(fmts[fi]).show_ui(ui, |ui| {
+                        for (i, n) in fmts.iter().enumerate() {
+                            ui.selectable_value(&mut fi, i, *n);
+                        }
+                    });
+                self.plot_format = match fi { 1 => "svg".into(), 2 => "png".into(), _ => "pdf".into() };
+                ui.label(egui::RichText::new("PDF vector · SVG vector · PNG 300 dpi")
+                    .color(tc::TEXT_MUTED).small());
+            });
+
+            // ===== footer: Apply to layout · Cancel · Plot ===== (PINNED)
+            ui.separator();
+            egui::Frame::none().inner_margin(egui::Margin::symmetric(18.0, 10.0)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let _ = ui.add(egui::Label::new(egui::RichText::new("Apply to layout").color(tc::ACCENT)).sense(egui::Sense::click()));
+                    ui.add_space((ui.available_width() - 170.0).max(0.0));
+                    let cancel = egui::Button::new("Cancel").min_size(egui::vec2(74.0, 32.0))
+                        .fill(tc::SURFACE_1).stroke(egui::Stroke::new(1.0, tc::BORDER)).rounding(egui::Rounding::same(6.0));
+                    if ui.add(cancel).clicked() { close_panel = true; }
+                    let plot = egui::Button::new(egui::RichText::new("Plot").color(tc::ON_ACCENT).strong())
+                        .min_size(egui::vec2(80.0, 32.0)).fill(tc::ACCENT).rounding(egui::Rounding::same(6.0));
+                    if ui.add(plot).clicked() { do_ok = true; }
+                });
+            });
+        });
+        self.plotstyle_edit_anchor = edit_anchor;
+        self.plot_dialog_rect = resp.as_ref().map(|r| r.response.rect);
+        self.raise_after_show("PlotDialog", ctx, &resp);
+        let _ = resp;
+
+        if pick_window {
+            self.plot_win_pick = 1;
+            self.plot_win_p1 = None;
+            self.set_prompt("plot: drag a window rectangle on the drawing  [Esc=cancel]");
+        }
+        if load_pst {
+            self.plotstyle_pst_io = Some(false);
+            self.open_file_dialog(FileDialogMode::Open, ".pst");
+        }
+        if open_editor {
+            self.plotstyle_edit_file = None;   // the doc's own table, not a CTB file
+            self.plotstyle_open = true;
+            if self.plotstyle_sel.is_empty() { self.plotstyle_sel = vec![1]; self.plotstyle_anchor = Some(1); }
+            // Replace the Plot dialog with the editor (no menu-on-menu); the Plot
+            // dialog reappears when the editor closes.
+            self.plot_dialog_open = false;
+            self.plotstyle_return_to_plot = true;
+        }
+        if open_preview { self.plot_preview_open = true; }
+        if do_ok {
+            // Owner flow: pressing Plot asks the user for the output folder + file
+            // name (Save dialog), THEN writes the PDF and opens it (see the file-
+            // dialog confirm handler → run_plot). No standalone Browse.
+            self.plot_pdf_browse = true;
+            self.plot_run_after_save = true;
+            let ext = match self.plot_format.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+            self.open_file_dialog(FileDialogMode::Save, &format!(".{}", ext));
+        }
+        if close_panel { self.plot_dialog_open = false; self.clear_prompt(); }
+    }
+
+    /// The full print-preview window (renders the real output + Confirm).
+    fn render_plot_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.plot_preview_open { self.prev_plot_preview_open = false; return; }
+        let pv_just_opened = !self.prev_plot_preview_open;
+        self.prev_plot_preview_open = true;
+        if pv_just_opened { self.plot_preview_open_seq = self.plot_preview_open_seq.wrapping_add(1); }
+        use crate::theme::color as tc;
+        self.ensure_layer_glyph_textures(ctx);
+        let gx_close = self.layer_glyph_tex.get("close").map(|t| (t.id(), t.size_vec2()));
+        let cap = crate::theme::typ::caption();
+        let (pw0, ph0) = self.plot_paper.dims_mm();
+        let (pw, ph) = if self.plot_landscape { (ph0, pw0) } else { (pw0, ph0) };
+        let title = format!("Print preview · {} · {:.0}×{:.0} mm", paper_label(self.plot_paper), pw, ph);
+        let mut close = false;
+        let mut confirm = false;
+        let frame = egui::Frame::none().fill(tc::SURFACE_1).rounding(egui::Rounding::same(12.0))
+            .stroke(egui::Stroke::new(1.0, tc::BORDER)).inner_margin(egui::Margin::ZERO);
+        let pvcr = self.canvas_screen_rect.unwrap_or_else(|| ctx.screen_rect());
+        let win = egui::Window::new("Plot preview")
+            .order(egui::Order::Foreground)
+            .title_bar(false).frame(frame)
+            .default_size(egui::vec2(620.0, 520.0)).resizable(true).movable(true);
+        let win = Self::place_child(win, "plot_preview_win", self.plot_preview_open_seq,
+                                    self.plot_dialog_rect, pvcr);
+        let resp = win.show(ctx, |ui| {
+            let area = ui.max_rect();
+            let full_w = area.width();
+            let hdr_font = egui::TextStyle::Button.resolve(ui.style());
+            let (hdr, _) = ui.allocate_exact_size(egui::vec2(full_w, 30.0), egui::Sense::hover());
+            {
+                let hp = ui.painter_at(hdr);
+                hp.rect_filled(hdr, egui::Rounding { nw: 12.0, ne: 12.0, sw: 0.0, se: 0.0 }, tc::BORDER);
+                hp.text(egui::pos2(area.left() + 14.0, hdr.center().y), egui::Align2::LEFT_CENTER,
+                    &title, hdr_font, tc::TEXT_PRIMARY);
+            }
+            let xr = egui::Rect::from_center_size(egui::pos2(area.right() - 13.0, hdr.center().y), egui::vec2(13.5, 13.5));
+            let xresp = ui.interact(xr, egui::Id::new("plot_preview_close"), egui::Sense::click());
+            {
+                let hp = ui.painter_at(hdr);
+                let xcol = if xresp.hovered() {
+                    hp.rect_filled(xr.expand(3.0), 4.0, egui::Color32::from_rgba_unmultiplied(0xE5, 0x48, 0x4D, 45));
+                    LYR_DANGER
+                } else { LYR_MUTED };
+                blit_layer_glyph(&hp, xr, gx_close, xcol);
+            }
+            if xresp.clicked() { close = true; }
+
+            egui::Frame::none().inner_margin(egui::Margin::same(12.0)).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    let avail = ui.available_size();
+                    let box_h = (avail.y - 46.0).max(160.0);
+                    let (pv, _) = ui.allocate_exact_size(egui::vec2(avail.x, box_h), egui::Sense::hover());
+                    ui.painter().rect(pv, egui::Rounding::same(8.0), tc::SURFACE_2, egui::Stroke::new(1.0, tc::BORDER));
+                    self.plot_preview_paint(&ui.painter_at(pv), pv, cap.clone(), true);
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("This is exactly what will print.").color(tc::TEXT_MUTED).small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let plot = egui::Button::new(egui::RichText::new("Confirm — Plot").color(tc::ON_ACCENT).strong())
+                                .min_size(egui::vec2(122.0, 30.0)).fill(tc::ACCENT).rounding(egui::Rounding::same(6.0));
+                            if ui.add(plot).clicked() { confirm = true; }
+                            let cancel = egui::Button::new("Close").min_size(egui::vec2(74.0, 30.0))
+                                .fill(tc::SURFACE_1).stroke(egui::Stroke::new(1.0, tc::BORDER)).rounding(egui::Rounding::same(6.0));
+                            if ui.add(cancel).clicked() { close = true; }
+                        });
+                    });
+                });
+            });
+        });
+        self.raise_after_show("PlotPreview", ctx, &resp);
+
+        if confirm {
+            self.plot_preview_open = false;
+            // Proceed to the plot flow: choose file → write → open.
+            self.plot_pdf_browse = true;
+            self.plot_run_after_save = true;
+            let ext = match self.plot_format.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+            self.open_file_dialog(FileDialogMode::Save, &format!(".{}", ext));
+        }
+        if close { self.plot_preview_open = false; }
+    }
+
+    /// Dockable Page Setup dialog (model-space plot configuration).
+    fn render_pagesetup_dialog(&mut self, ctx: &egui::Context) {
+        if !self.pagesetup_open { return; }
+        let cfg = crate::dock::DockConfig {
+            id: "pagesetup", title: "Page Setup", badge: None,
+            dock_region: crate::dock::DockRegion::Right,
+            alt_region: Some(crate::dock::DockRegion::Left),
+            dockable: false,
+            rail_header: true, collapsible: true,
+            size: 320.0, min: 300.0, max: 420.0,
+            resizable: false, flush_body: true, float_w: 320.0, float_max_h_frac: 0.9,
+        };
+        let mut state = self.pagesetup_dock_state.clone();
+        let mut open = true;
+        if matches!(state, crate::dock::DockState::Floating(_)) {
+            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 12.0, bottom: 14.0 })
+                    .show(ui, |ui| { self.pagesetup_panel_body(ui); });
+            });
+        }
+        self.pagesetup_dock_state = state;
+        if !open { self.pagesetup_open = false; }
+    }
+
+    fn pagesetup_panel_body(&mut self, ui: &mut egui::Ui) {
+        use cad_kernel::plotstyle::{Orientation, PaperSize};
+        use egui::RichText;
+        let mut saved = false;
+        ui.label(RichText::new("Saved page configuration for model-space plots")
+            .small().color(egui::Color32::from_rgb(150, 165, 185)));
+        ui.add_space(6.0);
+
+        // Paper size.
+        ui.label("Paper size");
+        let papers = ["A4", "A3", "A2", "A1", "A0", "Letter"];
+        let cur = paper_label(self.doc.page_setup.paper).to_string();
+        egui::ComboBox::from_id_salt("ps_paper")
+            .selected_text(&cur)
+            .show_ui(ui, |ui| {
+                for p in papers {
+                    if ui.selectable_label(cur == p, p).clicked() {
+                        self.doc.page_setup.paper = match p {
+                            "A3" => PaperSize::A3, "A2" => PaperSize::A2,
+                            "A1" => PaperSize::A1, "A0" => PaperSize::A0,
+                            "Letter" => PaperSize::Letter,
+                            _ => PaperSize::A4,
+                        };
+                    }
+                }
+            });
+
+        // Orientation.
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.doc.page_setup.orientation, Orientation::Portrait, "Portrait");
+            ui.radio_value(&mut self.doc.page_setup.orientation, Orientation::Landscape, "Landscape");
+        });
+
+        // Margins (mm).
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Margins (mm)");
+            ui.add(egui::DragValue::new(&mut self.doc.page_setup.margins_mm)
+                .range(0.0..=50.0).speed(0.5).update_while_editing(false));
+        });
+
+        // Scale.
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.doc.page_setup.scale_fit, "Fit to paper");
+        if !self.doc.page_setup.scale_fit {
+            ui.horizontal(|ui| {
+                ui.label("1 :");
+                ui.add(egui::DragValue::new(&mut self.doc.page_setup.scale_n)
+                    .range(0.001..=1e6).speed(1.0).update_while_editing(false));
+            });
+        }
+
+        // Unit.
+        ui.add_space(4.0);
+        ui.radio_value(&mut self.doc.page_setup.unit_inch, false, "Millimetres");
+        ui.radio_value(&mut self.doc.page_setup.unit_inch, true, "Inches");
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("Save").strong()).clicked() {
+                saved = true;
+            }
+            if ui.button("Close").clicked() {
+                self.pagesetup_open = false;
+            }
+        });
+        if saved {
+            let (w, h) = self.doc.page_setup.paper.dims_mm();
+            let (pw, ph) = match self.doc.page_setup.orientation {
+                Orientation::Portrait => (w, h),
+                Orientation::Landscape => (h, w),
+            };
+            let scale_txt = if self.doc.page_setup.scale_fit {
+                "fit".to_string()
+            } else {
+                format!("1:{:.3}", self.doc.page_setup.scale_n)
+            };
+            self.set_prompt(format!(
+                "pagesetup: saved {} {:.0}×{:.0} mm  margins {:.1} mm  {}",
+                paper_label(self.doc.page_setup.paper), pw, ph,
+                self.doc.page_setup.margins_mm, scale_txt));
+            self.history.push(format!(
+                "  ✓ pagesetup: {} {:.0}×{:.0} mm  margins {:.1} mm  {}",
+                paper_label(self.doc.page_setup.paper), pw, ph,
+                self.doc.page_setup.margins_mm, scale_txt));
         }
     }
 
@@ -23595,6 +28096,10 @@ impl CadApp {
                 WallColorSlot::Face => "ACI color — wall faces".to_string(),
             },
             AciPickRequest::BlockForm => "ACI color — block instance".to_string(),
+            AciPickRequest::CurrentColor => "ACI color — current color".to_string(),
+            AciPickRequest::PlotStyleColor => {
+                format!("ACI color — plot color ({} styles)", self.plotstyle_sel.len())
+            }
         };
 
         let mut open = true;
@@ -23740,6 +28245,20 @@ impl CadApp {
                 AciPickRequest::BlockForm => {
                     if let Some(d) = self.block_dialog.as_mut() {
                         d.color_aci = Some(aci);
+                    }
+                }
+                AciPickRequest::CurrentColor => {
+                    self.doc.current_color = Color::Aci(aci);
+                    self.touch_view();
+                    self.history.push(format!(
+                        "  color: current → ACI {}", aci));
+                }
+                AciPickRequest::PlotStyleColor => {
+                    // Set plot_color = Aci(picked) for every selected plot style.
+                    let sel = self.plotstyle_sel.clone();
+                    for a in sel {
+                        self.doc.plot_styles.style_mut(a).plot_color =
+                            cad_kernel::plotstyle::PlotColor::Aci(aci);
                     }
                 }
             }
@@ -32000,7 +36519,7 @@ impl CadApp {
         let any = |exts: &[&str]| exts.iter().any(|x| lname.ends_with(x));
         match mode {
             // Open shows every readable drawing type; Save filters to the chosen output extension.
-            FileDialogMode::Open => any(&[".dxf", ".rsm", ".dwg"]),
+            FileDialogMode::Open => any(&[".dxf", ".rsm", ".dwg", ".pst"]),
             FileDialogMode::ImportImage | FileDialogMode::ImportRaster
             | FileDialogMode::ImportTexture =>
                 any(&[".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]),
@@ -32092,6 +36611,10 @@ impl CadApp {
         }
 
         let title = match dlg.mode {
+            FileDialogMode::Open if self.plotstyle_pst_io == Some(false)
+                => "Load Plot Style Table  ·  .pst",
+            FileDialogMode::Save if self.plotstyle_pst_io == Some(true)
+                => "Save Plot Style Table  ·  .pst",
             FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
@@ -32398,6 +36921,8 @@ impl CadApp {
         if !open || do_cancel {
             self.file_dialog_dir = Some(dlg.dir);
             self.file_preview = None;   // drop cached preview doc
+            self.plotstyle_pst_io = None;   // clear any .pst targeting
+            self.plot_pdf_browse = false;   // clear any PDF-path targeting
             // A cancelled Save-As must not leave a pending "close after save" armed.
             self.close_after_save = false;
             self.history.push("  file: cancelled".into());
@@ -32409,6 +36934,69 @@ impl CadApp {
             if name.is_empty() && dlg.mode != FileDialogMode::PickFolder {
                 dlg.error = Some("enter or pick a file name".into());
                 self.file_dialog = Some(dlg);
+                return;
+            }
+            // Plot output path (PDF/SVG/PNG) chosen from the Plot dialog /
+            // preview window — write the file now (and open it in the viewer).
+            if self.plot_pdf_browse {
+                self.plot_pdf_browse = false;
+                // The dialog's own format choice wins (the user can switch
+                // PDF/SVG/PNG right in the dialog); sync plot_format so
+                // run_plot emits the same format the dialog settled on.
+                let dlg_ext = dlg.ext.trim_start_matches('.').to_ascii_lowercase();
+                self.plot_format = match dlg_ext.as_str() {
+                    "svg" => "svg".into(),
+                    "png" => "png".into(),
+                    _ => "pdf".into(),
+                };
+                let ext = match self.plot_format.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+                let l = name.to_ascii_lowercase();
+                let fname = if l.ends_with(&format!(".{}", ext)) {
+                    name.to_string()
+                } else {
+                    format!("{}.{}", name, ext)
+                };
+                self.plot_pdf_path = dlg.dir.join(fname).to_string_lossy().to_string();
+                self.file_preview = None;
+                if self.plot_run_after_save {
+                    self.plot_run_after_save = false;
+                    self.run_plot();   // writes the output, then opens it in the viewer
+                }
+                return;
+            }
+            // Plot-style .pst save/load intercepts the normal drawing I/O.
+            if let Some(save) = self.plotstyle_pst_io.take() {
+                let l = name.to_ascii_lowercase();
+                let fname = if l.ends_with(".pst") { name.to_string() } else { format!("{}.pst", name) };
+                let path = dlg.dir.join(fname);
+                if save {
+                    match cad_io::save_plot_table(&path, &self.doc.plot_styles) {
+                        Ok(()) => {
+                            self.plotstyle_edit_file = Some(path.clone());
+                            self.history.push(format!("  plot table saved → {}", path.display()));
+                        }
+                        Err(e) => self.history.push(format!("  ! plot table save failed: {}", e)),
+                    }
+                } else {
+                    match cad_io::load_plot_table(&path) {
+                        Ok(t) => {
+                            // A LOADED table is not bound to a CTB file — clear the
+                            // binding so "Save changes" can't overwrite the file the
+                            // editor was previously bound to with this table.
+                            self.plotstyle_edit_file = None;
+                            self.doc.plot_styles = t;
+                            self.history.push(format!("  plot table loaded ← {}", path.display()));
+                        }
+                        Err(e) => self.history.push(format!("  ! plot table load failed: {}", e)),
+                    }
+                }
+                self.file_dialog_dir = Some(dlg.dir.clone());
+                self.file_preview = None;
+                // .pst launched from the editor → reopen the editor.
+                if self.plotstyle_return_after_sub {
+                    self.plotstyle_open = true;
+                    self.plotstyle_return_after_sub = false;
+                }
                 return;
             }
             match dlg.mode {
@@ -38820,30 +43408,38 @@ impl CadApp {
                 self.pending.clear();
                 let height = self.env.TxHt;
                 if let Some(string) = self.pending_text.take() {
+                    // Scripted quick path (`text "Hello"`) — commit at the click.
                     self.commit_text_at(pos, &string, height);
                     self.text_draft = TextDraftState::Off;
                     self.tool = Tool::None;
                 } else {
+                    // Interactive path: the dockable Text panel is already open
+                    // (opened when the command started). This click just sets the
+                    // anchor; the user types in the panel and presses Apply/Enter.
                     self.text_draft = TextDraftState::WaitingForString(pos);
-                    // Open the discoverable popup dialog at the anchor.
-                    // Cmd-line capture (set_prompt below) is kept as a
-                    // secondary path for power users who close the
-                    // dialog and type into the cmd line instead.
-                    self.text_input_dialog_open   = true;
-                    self.text_input_dialog_buf.clear();
+                    // Drop any armed-but-unentered Height/Angle so it can't eat
+                    // the next command-line input.
+                    self.text_waiting_height = false;
+                    self.text_waiting_angle = false;
                     self.text_input_dialog_anchor = Some(pos);
-                    self.text_input_dialog_focus  = true;
-                    self.text_input_dialog_height = height;
-                    // Seed style from the last selection (sticky across
-                    // texts); fall back to STANDARD if it's been deleted.
-                    if (self.text_input_dialog_style_id as usize)
-                        >= self.doc.text_styles.len()
-                    {
-                        self.text_input_dialog_style_id =
-                            cad_kernel::TextStyleTable::STANDARD;
+                    self.text_input_dialog_focus  = true;   // focus the content box
+                    if !self.text_input_dialog_open {
+                        // Robustness: if the panel was closed, re-open + seed it.
+                        if self.hatch_dialog_open { self.hatch_dialog_open = false; }
+                        self.text_input_dialog_open = true;
+                        self.text_input_dialog_buf.clear();
+                        self.text_input_dialog_height = height.max(1e-3);
+                        if (self.text_input_dialog_style_id as usize)
+                            >= self.doc.text_styles.len()
+                        {
+                            self.text_input_dialog_style_id =
+                                cad_kernel::TextStyleTable::STANDARD;
+                        }
+                        let sid = self.text_input_dialog_style_id;
+                        self.seed_text_dialog_from_style(sid);
                     }
                     self.set_prompt(
-                        "text: type in popup or cmd line, Enter to commit  [Esc cancels]".to_string());
+                        "text: type in the panel, then Apply".to_string());
                 }
             }
             (Tool::Point, 1) => {
@@ -39649,6 +44245,626 @@ fn polyline_is_effectively_closed(p: &Polyline) -> bool {
         (Some(a), Some(b)) =>
             (a - b).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS,
         _ => false,
+    }
+}
+
+/// True if a spline should be treated as a closed loop for hatch purposes:
+/// ≥3 control points and its first and last control points coincide within
+/// `POLYLINE_EFFECTIVELY_CLOSED_EPS`. (The CAD "Close" appends the first control
+/// point so the curve returns to its start — so closed = first ≈ last cp.)
+fn spline_is_effectively_closed(s: &Spline) -> bool {
+    let n = s.control_points.len();
+    if n < 3 { return false; }
+    (s.control_points[0] - s.control_points[n - 1]).len()
+        < POLYLINE_EFFECTIVELY_CLOSED_EPS
+}
+
+/// Copy a set of dobjects with NEW handles (hatch boundary handles remapped),
+/// applying `xform` to each geometry. Used by the script `copy` op — the
+/// copies must be independent of their sources, which cloned handles would
+/// not be (two dobjects sharing one handle corrupt the spatial index).
+fn duplicate_dobjects(
+    sources: &[DObject],
+    xform: impl Fn(&Geom) -> Geom,
+) -> Vec<DObject> {
+    let mut hmap: HashMap<cad_kernel::Handle, cad_kernel::Handle> =
+        HashMap::with_capacity(sources.len());
+    let mut out: Vec<DObject> = Vec::with_capacity(sources.len());
+    for s in sources {
+        let nh = cad_kernel::next_handle();
+        hmap.insert(s.handle, nh);
+        out.push(DObject { geom: xform(&s.geom), style: s.style, handle: nh });
+    }
+    for d in &mut out {
+        if let Geom::Hatch(h) = &mut d.geom {
+            for bh in &mut h.boundary_handles {
+                if let Some(&nh) = hmap.get(bh) { *bh = nh; }
+            }
+        }
+    }
+    out
+}
+
+/// RESOLVED style of one dobject against a given document — the script-facing
+/// summary: color `"aci N"`/`"bylayer"`/`"byblock"`/`"#RRGGBB"`, linetype NAME
+/// (ByLayer/Continuous → the layer's), lineweight mm, visible.
+fn doc_entity_style_summary(doc: &Document, d: &DObject) -> (String, String, f32, bool) {
+    let layer = doc.layers.get(d.style.layer);
+    let color = match d.style.color {
+        Color::ByLayer => layer
+            .map(|l| CadApp::script_color_string(l.color, doc))
+            .unwrap_or_else(|| "bylayer".into()),
+        Color::ByBlock => "byblock".into(),
+        Color::Aci(n) => format!("aci {}", n),
+        Color::TrueColorRef(idx) => match d.style.color.rgb_bytes(&doc.truecolors) {
+            Some((r, g, b)) => format!("#{:02X}{:02X}{:02X}", r, g, b),
+            None => format!("truecolor {}", idx),
+        },
+    };
+    let linetype = {
+        use cad_kernel::LinetypeTable;
+        let id = match d.style.linetype {
+            LinetypeTable::BYLAYER | LinetypeTable::CONTINUOUS => layer
+                .map(|l| l.linetype)
+                .unwrap_or(LinetypeTable::CONTINUOUS),
+            other => other,
+        };
+        doc.linetypes
+            .get(id)
+            .map(|lt| lt.name.clone())
+            .unwrap_or_else(|| format!("#{}", id))
+    };
+    let lineweight = cad_kernel::lineweight::resolve_lineweight(
+        d.style.lineweight,
+        d.style.layer,
+        &doc.layers,
+    );
+    (color, linetype, lineweight, d.style.visible)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plot-style table helpers (ported from upstream RUST-AutoRASM) — shared by
+// the Plot Style Table Editor's Form View, Table View, and the Plot dialog.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn plotstyle_common<T: PartialEq + Copy>(
+    sel: &[u8],
+    table: &cad_kernel::plotstyle::PlotStyleTable,
+    f: impl Fn(&cad_kernel::plotstyle::PlotStyle) -> T,
+) -> Option<T> {
+    let mut it = sel.iter().map(|&a| f(table.style(a)));
+    let first = it.next()?;
+    if it.all(|v| v == first) { Some(first) } else { None }
+}
+
+/// Pending edits collected while rendering the property panel; applied to every
+/// selected style after the frame (avoids borrow conflicts with the read side).
+#[derive(Default)]
+struct PlotStyleEdit {
+    plot_color:  Option<cad_kernel::plotstyle::PlotColor>,
+    dither:      Option<bool>,
+    grayscale:   Option<bool>,
+    pen:         Option<cad_kernel::plotstyle::PenNum>,
+    vpen:        Option<cad_kernel::plotstyle::PenNum>,
+    screening:   Option<u8>,
+    linetype:    Option<cad_kernel::plotstyle::PlotLinetype>,
+    adaptive:    Option<bool>,
+    lineweight:  Option<cad_kernel::plotstyle::PlotWidth>,
+    end_style:   Option<cad_kernel::plotstyle::EndStyle>,
+    join_style:  Option<cad_kernel::plotstyle::JoinStyle>,
+    fill_style:  Option<cad_kernel::plotstyle::FillStyle>,
+}
+
+/// Label + optional swatch rgb for a plot color.
+fn lbl_plot_color(c: cad_kernel::plotstyle::PlotColor) -> (String, Option<(u8, u8, u8)>) {
+    use cad_kernel::plotstyle::PlotColor as PC;
+    match c {
+        PC::UseObject   => ("Use object color".into(), None),
+        PC::Black       => ("Black".into(), Some((0, 0, 0))),
+        PC::Aci(i)      => (format!("Color {}", i), Some(aci_palette(i))),
+        PC::Rgb(r, g, b) => (format!("RGB {},{},{}", r, g, b), Some((r, g, b))),
+    }
+}
+
+fn lbl_plot_width(w: cad_kernel::plotstyle::PlotWidth) -> String {
+    use cad_kernel::plotstyle::PlotWidth as PW;
+    match w { PW::UseObject => "Use object".into(), PW::Fixed(mm) => format!("{:.2} mm", mm) }
+}
+
+fn lbl_pen(p: cad_kernel::plotstyle::PenNum) -> String {
+    use cad_kernel::plotstyle::PenNum as PN;
+    match p { PN::Automatic => "Automatic".into(), PN::N(n) => format!("{}", n) }
+}
+
+/// Paper-size label for the Plot dialog dropdown.
+fn paper_label(p: cad_kernel::plotstyle::PaperSize) -> &'static str {
+    use cad_kernel::plotstyle::PaperSize as P;
+    match p {
+        P::A4 => "A4", P::A3 => "A3", P::A2 => "A2", P::A1 => "A1",
+        P::A0 => "A0", P::Letter => "Letter", P::Custom { .. } => "Custom",
+    }
+}
+
+fn lbl_end(e: cad_kernel::plotstyle::EndStyle) -> &'static str {
+    use cad_kernel::plotstyle::EndStyle as E;
+    match e { E::UseObject => "Use object", E::Butt => "Butt", E::Square => "Square", E::Round => "Round", E::Diamond => "Diamond" }
+}
+
+fn lbl_join(j: cad_kernel::plotstyle::JoinStyle) -> &'static str {
+    use cad_kernel::plotstyle::JoinStyle as J;
+    match j { J::UseObject => "Use object", J::Miter => "Miter", J::Bevel => "Bevel", J::Round => "Round", J::Diamond => "Diamond" }
+}
+
+fn lbl_fill(f: cad_kernel::plotstyle::FillStyle) -> &'static str {
+    use cad_kernel::plotstyle::FillStyle as F;
+    match f {
+        F::UseObject => "Use object", F::Solid => "Solid", F::Checkerboard => "Checkerboard",
+        F::Crosshatch => "Crosshatch", F::Diamonds => "Diamonds", F::HorizontalBars => "Horizontal bars",
+        F::SlantLeft => "Slant left", F::SlantRight => "Slant right", F::SquareDots => "Square dots",
+        F::VerticalBars => "Vertical bars",
+    }
+}
+
+/// An On/Off dropdown that shows "*Varies*" for a mixed selection and writes the
+/// picked bool to `out` (applied to all selected styles after the frame).
+fn on_off_combo(ui: &mut egui::Ui, id: &str, common: Option<bool>, out: &mut Option<bool>) {
+    let txt = match common { Some(true) => "On", Some(false) => "Off", None => "*Varies*" };
+    egui::ComboBox::from_id_salt(id).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+        if ui.selectable_label(false, "On").clicked() { *out = Some(true); }
+        if ui.selectable_label(false, "Off").clicked() { *out = Some(false); }
+    });
+}
+
+/// A pen-number field: a DragValue where 0 shows as "Auto" (PenNum::Automatic),
+/// 1..=max as the pen number. Writes the picked value to `out` on change.
+fn pen_field(ui: &mut egui::Ui, _id: &str, common: Option<cad_kernel::plotstyle::PenNum>,
+             max: u16, out: &mut Option<cad_kernel::plotstyle::PenNum>) {
+    use cad_kernel::plotstyle::PenNum;
+    let mut v: i32 = match common { Some(PenNum::N(n)) => n as i32, _ => 0 };
+    let r = ui.add(egui::DragValue::new(&mut v).range(0..=max as i32)
+        .update_while_editing(false)
+        .custom_formatter(|n, _| if n <= 0.0 { "Auto".to_string() } else { format!("{}", n as i32) }));
+    if r.changed() {
+        *out = Some(if v <= 0 { PenNum::Automatic } else { PenNum::N(v as u16) });
+    }
+    if common.is_none() { r.on_hover_text("*Varies* — set to override all selected"); }
+}
+
+/// The 12 CTB properties in Form-View order — the single enum both the Form View
+/// and Table View iterate, so the two can never drift.
+#[derive(Clone, Copy, PartialEq)]
+enum PlotProp {
+    Color, Dither, Grayscale, Pen, VPen, Screening,
+    Linetype, Adaptive, Lineweight, EndStyle, JoinStyle, FillStyle,
+}
+
+impl PlotProp {
+    const ALL: [PlotProp; 12] = [
+        PlotProp::Color, PlotProp::Dither, PlotProp::Grayscale, PlotProp::Pen,
+        PlotProp::VPen, PlotProp::Screening, PlotProp::Linetype, PlotProp::Adaptive,
+        PlotProp::Lineweight, PlotProp::EndStyle, PlotProp::JoinStyle, PlotProp::FillStyle,
+    ];
+    fn label(self) -> &'static str {
+        match self {
+            PlotProp::Color => "Color", PlotProp::Dither => "Dither",
+            PlotProp::Grayscale => "Grayscale", PlotProp::Pen => "Pen #",
+            PlotProp::VPen => "Virtual pen #", PlotProp::Screening => "Screening",
+            PlotProp::Linetype => "Linetype", PlotProp::Adaptive => "Adaptive",
+            PlotProp::Lineweight => "Lineweight", PlotProp::EndStyle => "Line end style",
+            PlotProp::JoinStyle => "Line join style", PlotProp::FillStyle => "Fill style",
+        }
+    }
+    /// §1a store-only (round-trips + editable, but no plot effect yet).
+    fn store_only(self) -> bool {
+        matches!(self, PlotProp::Dither | PlotProp::Pen | PlotProp::VPen | PlotProp::Adaptive | PlotProp::FillStyle)
+    }
+}
+
+/// The COMPACT display value of a property for one style — a short label (fits a
+/// narrow grid cell) + optional swatch rgb. Used by every Table View cell.
+fn plotprop_cell(prop: PlotProp, s: &cad_kernel::plotstyle::PlotStyle,
+                 lt_list: &[(u32, String)]) -> (String, Option<(u8, u8, u8)>) {
+    use cad_kernel::plotstyle::{EndStyle as E, FillStyle as F, JoinStyle as J, PenNum, PlotColor as PC, PlotLinetype, PlotWidth};
+    let onoff = |b: bool| if b { "On".to_string() } else { "Off".to_string() };
+    let pen = |p: PenNum| match p { PenNum::Automatic => "Auto".to_string(), PenNum::N(n) => format!("{n}") };
+    match prop {
+        PlotProp::Color      => match s.plot_color {
+            PC::UseObject => ("Obj".to_string(), None),
+            PC::Black => ("Blk".to_string(), Some((0, 0, 0))),
+            PC::Aci(i) => (format!("C{i}"), Some(aci_palette(i))),
+            PC::Rgb(r, g, b) => ("RGB".to_string(), Some((r, g, b))),
+        },
+        PlotProp::Dither     => (onoff(s.dither), None),
+        PlotProp::Grayscale  => (onoff(s.grayscale), None),
+        PlotProp::Pen        => (pen(s.pen_number), None),
+        PlotProp::VPen       => (pen(s.virtual_pen), None),
+        PlotProp::Screening  => (format!("{}%", s.screening), None),
+        PlotProp::Linetype   => (match s.linetype {
+            PlotLinetype::UseObject => "Obj".to_string(),
+            PlotLinetype::Id(id) => lt_list.iter().find(|(i, _)| *i == id)
+                .map(|(_, n)| n.chars().take(6).collect::<String>()).unwrap_or_else(|| format!("LT{id}")),
+        }, None),
+        PlotProp::Adaptive   => (onoff(s.adaptive), None),
+        PlotProp::Lineweight => (match s.lineweight {
+            PlotWidth::UseObject => "Obj".to_string(),
+            PlotWidth::Fixed(mm) => format!("{:.2}", mm),
+        }, None),
+        PlotProp::EndStyle   => (match s.end_style {
+            E::UseObject => "Obj", E::Butt => "Butt", E::Square => "Sqr", E::Round => "Rnd", E::Diamond => "Dmd",
+        }.to_string(), None),
+        PlotProp::JoinStyle  => (match s.join_style {
+            J::UseObject => "Obj", J::Miter => "Mitr", J::Bevel => "Bevl", J::Round => "Rnd", J::Diamond => "Dmd",
+        }.to_string(), None),
+        PlotProp::FillStyle  => (match s.fill_style {
+            F::UseObject => "Obj", F::Solid => "Sld", F::Checkerboard => "Chk", F::Crosshatch => "Xhch",
+            F::Diamonds => "Dmd", F::HorizontalBars => "HBar", F::SlantLeft => "SlL", F::SlantRight => "SlR",
+            F::SquareDots => "SDot", F::VerticalBars => "VBar",
+        }.to_string(), None),
+    }
+}
+
+/// The INTERACTIVE editor control for one property — the single control shared
+/// by the Form View property panel AND the Table View row editor. Computes the
+/// common value across `sel` ("*Varies*" if mixed) and records the picked value
+/// into `edit` (applied to every selected color after the frame). `salt` keeps
+/// egui ids unique between the two views.
+#[allow(clippy::too_many_arguments)]
+fn plotprop_editor(
+    ui: &mut egui::Ui,
+    prop: PlotProp,
+    sel: &[u8],
+    table: &cad_kernel::plotstyle::PlotStyleTable,
+    ladder: &[f32],
+    lt_list: &[(u32, String)],
+    edit: &mut PlotStyleEdit,
+    open_color_picker: &mut bool,
+    salt: &str,
+) {
+    use cad_kernel::plotstyle::{EndStyle, FillStyle, JoinStyle, PlotColor, PlotLinetype, PlotWidth};
+    use crate::theme::color as tc;
+    let varies = "*Varies*";
+    match prop {
+        PlotProp::Color => {
+            let cc = plotstyle_common(sel, table, |s| s.plot_color);
+            ui.horizontal(|ui| {
+                // The swatch itself is clickable → opens the ACI colour picker.
+                let (rect, sresp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                if let Some(c) = cc {
+                    if let (_, Some((r, g, b))) = lbl_plot_color(c) {
+                        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+                    }
+                }
+                let sbrd = if sresp.hovered() { tc::ACCENT } else { tc::BORDER };
+                ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, sbrd));
+                if sresp.clicked() {
+                    *open_color_picker = true;
+                    // Remember the swatch rect so the colour chart opens at its right (§2).
+                    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("plotstyle_color_anchor"), rect));
+                }
+                if sresp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                let txt = cc.map(|c| lbl_plot_color(c).0).unwrap_or_else(|| varies.into());
+                ui.menu_button(txt, |ui| {
+                    if ui.button("Use object color").clicked() { edit.plot_color = Some(PlotColor::UseObject); ui.close_menu(); }
+                    if ui.button("Black").clicked() { edit.plot_color = Some(PlotColor::Black); ui.close_menu(); }
+                    if ui.button("Select Color…").clicked() { *open_color_picker = true; ui.close_menu(); }
+                });
+            });
+        }
+        PlotProp::Dither => { let v = plotstyle_common(sel, table, |s| s.dither); on_off_combo(ui, &format!("{salt}_dith"), v, &mut edit.dither); }
+        PlotProp::Grayscale => { let v = plotstyle_common(sel, table, |s| s.grayscale); on_off_combo(ui, &format!("{salt}_gray"), v, &mut edit.grayscale); }
+        PlotProp::Pen => { let v = plotstyle_common(sel, table, |s| s.pen_number); pen_field(ui, &format!("{salt}_pen"), v, 32, &mut edit.pen); }
+        PlotProp::VPen => { let v = plotstyle_common(sel, table, |s| s.virtual_pen); pen_field(ui, &format!("{salt}_vpen"), v, 255, &mut edit.vpen); }
+        PlotProp::Screening => {
+            let sv = plotstyle_common(sel, table, |s| s.screening);
+            let mut sc = sv.unwrap_or(100) as i32;
+            let r = ui.add(egui::DragValue::new(&mut sc).range(0..=100).suffix(" %").update_while_editing(false));
+            if r.changed() { edit.screening = Some(sc.clamp(0, 100) as u8); }
+            if sv.is_none() { r.on_hover_text(varies); }
+        }
+        PlotProp::Linetype => {
+            let lv = plotstyle_common(sel, table, |s| s.linetype);
+            let txt = match lv {
+                Some(PlotLinetype::UseObject) => "Use object linetype".to_string(),
+                Some(PlotLinetype::Id(id)) => lt_list.iter().find(|(i, _)| *i == id)
+                    .map(|(_, n)| n.clone()).unwrap_or_else(|| format!("Linetype {id}")),
+                None => varies.to_string(),
+            };
+            egui::ComboBox::from_id_salt(format!("{salt}_lt")).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+                if ui.selectable_label(false, "Use object linetype").clicked() { edit.linetype = Some(PlotLinetype::UseObject); }
+                for (id, nm) in lt_list {
+                    if ui.selectable_label(false, nm).clicked() { edit.linetype = Some(PlotLinetype::Id(*id)); }
+                }
+            });
+        }
+        PlotProp::Adaptive => { let v = plotstyle_common(sel, table, |s| s.adaptive); on_off_combo(ui, &format!("{salt}_adap"), v, &mut edit.adaptive); }
+        PlotProp::Lineweight => {
+            let wv = plotstyle_common(sel, table, |s| s.lineweight);
+            let txt = wv.map(lbl_plot_width).unwrap_or_else(|| varies.into());
+            egui::ComboBox::from_id_salt(format!("{salt}_lw")).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+                if ui.selectable_label(false, "Use object lineweight").clicked() { edit.lineweight = Some(PlotWidth::UseObject); }
+                for &mm in ladder {
+                    if ui.selectable_label(false, format!("{:.2} mm", mm)).clicked() { edit.lineweight = Some(PlotWidth::Fixed(mm)); }
+                }
+            });
+        }
+        PlotProp::EndStyle => {
+            let ev = plotstyle_common(sel, table, |s| s.end_style);
+            let txt = ev.map(|e| lbl_end(e).to_string()).unwrap_or_else(|| varies.into());
+            egui::ComboBox::from_id_salt(format!("{salt}_end")).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+                for e in [EndStyle::UseObject, EndStyle::Butt, EndStyle::Square, EndStyle::Round, EndStyle::Diamond] {
+                    if ui.selectable_label(false, lbl_end(e)).clicked() { edit.end_style = Some(e); }
+                }
+            });
+        }
+        PlotProp::JoinStyle => {
+            let jv = plotstyle_common(sel, table, |s| s.join_style);
+            let txt = jv.map(|j| lbl_join(j).to_string()).unwrap_or_else(|| varies.into());
+            egui::ComboBox::from_id_salt(format!("{salt}_join")).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+                for j in [JoinStyle::UseObject, JoinStyle::Miter, JoinStyle::Bevel, JoinStyle::Round, JoinStyle::Diamond] {
+                    if ui.selectable_label(false, lbl_join(j)).clicked() { edit.join_style = Some(j); }
+                }
+            });
+        }
+        PlotProp::FillStyle => {
+            let fv = plotstyle_common(sel, table, |s| s.fill_style);
+            let txt = fv.map(|f| lbl_fill(f).to_string()).unwrap_or_else(|| varies.into());
+            egui::ComboBox::from_id_salt(format!("{salt}_fill")).width(150.0).selected_text(txt).show_ui(ui, |ui| {
+                for f in [FillStyle::UseObject, FillStyle::Solid, FillStyle::Checkerboard,
+                          FillStyle::Crosshatch, FillStyle::Diamonds, FillStyle::HorizontalBars,
+                          FillStyle::SlantLeft, FillStyle::SlantRight, FillStyle::SquareDots,
+                          FillStyle::VerticalBars] {
+                    if ui.selectable_label(false, lbl_fill(f)).clicked() { edit.fill_style = Some(f); }
+                }
+            });
+        }
+    }
+}
+
+/// Apply a collected `PlotStyleEdit` to every selected ACI style.
+fn apply_plot_edit(table: &mut cad_kernel::plotstyle::PlotStyleTable, sel: &[u8], edit: &PlotStyleEdit) {
+    for &a in sel {
+        let st = table.style_mut(a);
+        if let Some(v) = edit.plot_color { st.plot_color = v; }
+        if let Some(v) = edit.dither { st.dither = v; }
+        if let Some(v) = edit.grayscale { st.grayscale = v; }
+        if let Some(v) = edit.pen { st.pen_number = v; }
+        if let Some(v) = edit.vpen { st.virtual_pen = v; }
+        if let Some(v) = edit.screening { st.screening = v; }
+        if let Some(v) = edit.linetype { st.linetype = v; }
+        if let Some(v) = edit.adaptive { st.adaptive = v; }
+        if let Some(v) = edit.lineweight { st.lineweight = v; }
+        if let Some(v) = edit.end_style { st.end_style = v; }
+        if let Some(v) = edit.join_style { st.join_style = v; }
+        if let Some(v) = edit.fill_style { st.fill_style = v; }
+    }
+}
+
+/// The app's CTB folder — `<exe_dir>/ctb`, created on demand. User-defined CTB
+/// tables live here as `.pst` files (AutoCAD's Plot Styles folder analog).
+fn ctb_folder() -> std::path::PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("ctb")
+}
+
+/// All saved CTB tables in the app's CTB folder as (name, path), name-sorted.
+/// The name is the file stem (the table's name — see `load_plot_table`).
+fn ctb_list() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(ctb_folder()) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e.eq_ignore_ascii_case("pst")).unwrap_or(false) {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), p));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// Built-in CTB choices: (display name, canonical stored key). "None" stores
+/// nothing (`None`); the others store their canonical key.
+const CTB_BUILTINS: [(&str, Option<&str>); 4] = [
+    ("None", None),
+    ("Monochrome", Some("monochrome")),
+    ("Grayscale", Some("grayscale")),
+    ("Full Color", Some("fullcolor")),
+];
+
+/// Lowercased names a saved CTB must NOT collide with — the built-in display
+/// names + canonical keys. The pickers dedup against these case-insensitively,
+/// so a colliding file could never be selected/assigned.
+const CTB_RESERVED: [&str; 5] = ["none", "monochrome", "grayscale", "full color", "fullcolor"];
+
+/// The default table for a BUILT-IN CTB — the same semantics the hardcoded
+/// `apply_ctb` transform implements when no saved file exists: monochrome →
+/// every ACI plots black, grayscale → luminance, fullcolor → object colours.
+/// None for names that are not editable built-ins.
+fn ctb_builtin_seed(name: &str) -> Option<cad_kernel::plotstyle::PlotStyleTable> {
+    use cad_kernel::plotstyle::PlotColor;
+    let mut t = cad_kernel::plotstyle::PlotStyleTable::named(name.to_string());
+    match name {
+        "monochrome" => {
+            for a in 0..=255u8 { t.style_mut(a).plot_color = PlotColor::Black; }
+            Some(t)
+        }
+        "grayscale" => {
+            for a in 0..=255u8 { t.style_mut(a).grayscale = true; }
+            Some(t)
+        }
+        "fullcolor" => Some(t),
+        _ => None,
+    }
+}
+
+/// Layer-status glyph ink colours — the owner palette shared by the rasterised
+/// SVG glyphs (`blit_layer_glyph` tints them) and the custom-drawn ones.
+const LYR_MUTED: egui::Color32 = egui::Color32::from_rgb(0x93, 0xA1, 0xAC);
+const LYR_DANGER:egui::Color32 = egui::Color32::from_rgb(0xE5, 0x48, 0x4D);
+
+/// Rasterize an SVG glyph (from `layer_glyphs.rs`) to a white texture at a
+/// generous resolution; `blit_layer_glyph` tints it per state. `key` names the
+/// texture (e.g. "on", "off", "close").
+fn raster_layer_glyph(ctx: &egui::Context, key: &str, svg: &str) -> Option<egui::TextureHandle> {
+    use resvg::{tiny_skia, usvg};
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(svg.as_bytes(), &opt).ok()?;
+    let size = tree.size();
+    // Render so the longest side is ~48 px — sharp at the 13-16 px blit sizes.
+    let target = 48.0;
+    let scale = target / size.width().max(size.height());
+    let pw = (size.width() * scale).ceil().max(1.0) as u32;
+    let ph = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    // Force WHITE so `blit_layer_glyph` can tint by multiplying (the SVG fills
+    // are already white in layer_glyphs.rs, but be defensive about it).
+    let mut data = pixmap.data().to_vec();
+    for px in data.chunks_exact_mut(4) {
+        if px[3] > 0 {
+            px[0] = 255; px[1] = 255; px[2] = 255;
+        }
+    }
+    let color = egui::ColorImage::from_rgba_premultiplied(
+        [pw as usize, ph as usize], &data);
+    Some(ctx.load_texture(format!("layer_glyph_{}", key), color, egui::TextureOptions::LINEAR))
+}
+
+/// Blit a layer-status glyph into `r`, tinted `tint` (a `layer_glyph_tex`
+/// entry). No-op when the texture is missing.
+fn blit_layer_glyph(p: &egui::Painter, r: egui::Rect,
+                    t: Option<(egui::TextureId, egui::Vec2)>, tint: egui::Color32) {
+    if let Some((id, sz)) = t {
+        let a = sz.x / sz.y.max(0.001);
+        let (w, h) = if a >= 1.0 { (r.width(), r.width() / a) }
+                     else { (r.height() * a, r.height()) };
+        let fit = egui::Rect::from_center_size(r.center(), egui::vec2(w, h));
+        p.image(id, fit, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
+    }
+}
+
+/// Screen-space stroke for the plot preview: a polyline drawn as BUTT segments
+/// (each segment its own line), so corner wedges can be painted separately by
+/// `paint_caps_joins_screen`.
+fn paint_butt_polyline(painter: &egui::Painter, spts: &[egui::Pos2], width_px: f32, color: egui::Color32) {
+    if spts.len() < 2 {
+        return;
+    }
+    let stroke = egui::Stroke::new(width_px, color);
+    for w in spts.windows(2) {
+        painter.line_segment([w[0], w[1]], stroke);
+    }
+}
+
+/// Screen-space cap/join emulation for a stroke drawn as butt segments.
+/// - Caps (open strokes): Round/Diamond = filled discs; Square = endpoints
+///   extended by half the width; Butt = nothing.
+/// - Joins at real corners (`corners`): Round/Diamond = discs, Bevel = the
+///   filled gap triangle between the two butt corners, Miter = the wedge to
+///   the edge intersection (4× miter limit, falling back to bevel).
+/// `corners=false` (curve tessellations) skips join wedges — their samples are
+/// dense enough that the butt segments overlap seamlessly. Closed strokes may
+/// or may not duplicate their first point at the end.
+fn paint_caps_joins_screen(
+    painter: &egui::Painter,
+    spts: &[egui::Pos2],
+    closed: bool,
+    width_px: f32,
+    cap: cad_kernel::plotstyle::EndStyle,
+    join: cad_kernel::plotstyle::JoinStyle,
+    color: egui::Color32,
+    corners: bool,
+) {
+    use cad_kernel::plotstyle::{EndStyle, JoinStyle};
+    if spts.len() < 2 {
+        return;
+    }
+    // Unique vertex count: closed strokes may duplicate the first point.
+    let mut m = spts.len();
+    if closed && m > 1 && (spts[m - 1] - spts[0]).length() < 0.5 {
+        m -= 1;
+    }
+    let hw = (width_px * 0.5).max(0.75);
+    // Caps — open strokes only.
+    if !closed {
+        match cap {
+            EndStyle::Round | EndStyle::Diamond => {
+                painter.circle_filled(spts[0], hw, color);
+                painter.circle_filled(spts[m - 1], hw, color);
+            }
+            EndStyle::Square => {
+                let stroke = egui::Stroke::new(width_px, color);
+                let ext = |a: egui::Pos2, b: egui::Pos2| -> egui::Pos2 {
+                    let v = b - a;
+                    let l = v.length();
+                    if l < 1e-3 { return a; }
+                    a - v * (hw / l)
+                };
+                painter.line_segment([ext(spts[0], spts[1]), spts[0]], stroke);
+                painter.line_segment([ext(spts[m - 1], spts[m - 2]), spts[m - 1]], stroke);
+            }
+            EndStyle::Butt | EndStyle::UseObject => {}
+        }
+    }
+    if !corners || m < 3 {
+        return;
+    }
+    // Join wedges at real corners — the geometry comes from the SHARED
+    // `cad_kernel::math::join_wedge` (also used by the PNG rasterizer), so the
+    // preview and the exported raster cannot drift apart.
+    let mut wedge = |v: egui::Pos2, u1: egui::Vec2, u2: egui::Vec2| {
+        let cross = u1.x * u2.y - u1.y * u2.x;
+        if cross.abs() < 0.02 {
+            return; // near-collinear — no visible wedge (cheap cull)
+        }
+        let kv = cad_kernel::math::Vec2::new(v.x as f64, v.y as f64);
+        let kd1 = cad_kernel::math::Vec2::new(u1.x as f64, u1.y as f64);
+        let kd2 = cad_kernel::math::Vec2::new(u2.x as f64, u2.y as f64);
+        let Some(w) = cad_kernel::math::join_wedge(kv, kd1, kd2, hw as f64) else { return };
+        let a = egui::pos2(w.a.x as f32, w.a.y as f32);
+        let b = egui::pos2(w.b.x as f32, w.b.y as f32);
+        match join {
+            JoinStyle::Round | JoinStyle::Diamond => {
+                painter.circle_filled(v, hw, color);
+            }
+            JoinStyle::Bevel => {
+                painter.add(egui::Shape::convex_polygon(vec![v, a, b], color, egui::Stroke::NONE));
+            }
+            JoinStyle::Miter => {
+                let poly = match w.apex {
+                    Some(apex) => vec![v, a, egui::pos2(apex.x as f32, apex.y as f32), b],
+                    None => vec![v, a, b],
+                };
+                painter.add(egui::Shape::convex_polygon(poly, color, egui::Stroke::NONE));
+            }
+            JoinStyle::UseObject => {}
+        }
+    };
+    if closed {
+        for i in 0..m {
+            let prev = (i + m - 1) % m;
+            let next = (i + 1) % m;
+            let d1 = spts[i] - spts[prev];
+            let d2 = spts[next] - spts[i];
+            if d1.length() < 1e-3 || d2.length() < 1e-3 {
+                continue;
+            }
+            wedge(spts[i], d1 / d1.length(), d2 / d2.length());
+        }
+    } else {
+        for i in 1..m - 1 {
+            let d1 = spts[i] - spts[i - 1];
+            let d2 = spts[i + 1] - spts[i];
+            if d1.length() < 1e-3 || d2.length() < 1e-3 {
+                continue;
+            }
+            wedge(spts[i], d1 / d1.length(), d2 / d2.length());
+        }
     }
 }
 
@@ -40598,6 +45814,7 @@ enum FlyMenu {
     Method(String),   // arc/circle/fillet method list
     Insert,           // block names → `insert <name>`
     Import,           // File → Import (raster / vector)
+    PlotStyleTables,  // File → Plot Style Tables (CTB manager)
     Dimension,        // Formative → Dimension
     Styles,           // Formative → Styles
     DimStylePick,     // Styles → current dim-style picker
@@ -40678,6 +45895,9 @@ enum FlyAct {
     Method(String, String),
     Insert(String),
     Import(bool),                 // true = raster underlay, false = vector trace
+    NewCtb,                       // File → Plot Style Tables → New CTB…
+    OpenCtb(String),              // File → Plot Style Tables → a built-in CTB
+    OpenCtbFile(std::path::PathBuf), // File → Plot Style Tables → a saved .pst
     SetDimStyle(u32),
     SetWallStyle(u32),
     ToggleBool(BoolField),
@@ -41040,6 +46260,34 @@ impl CadApp {
                 FlyItem::act(FlyIcon::None, "Image as raster (underlay)…", FlyAct::Import(true)),
                 FlyItem::act(FlyIcon::None, "Image → vector (trace editor)…", FlyAct::Import(false)),
             ],
+            FlyMenu::PlotStyleTables => {
+                // CTB manager: New / built-ins / saved .pst tables + Plot Style
+                // Table Editor. The saved list is rebuilt every frame from the
+                // app's ctb folder (see `ctb_list`).
+                let saved = ctb_list();
+                let mut items = vec![
+                    FlyItem::Heading("Plot Style Tables".into()),
+                    FlyItem::act(FlyIcon::None, "New CTB…", FlyAct::NewCtb),
+                    FlyItem::act(FlyIcon::None, "Edit current table…", FlyAct::Run("plotstyle".into())),
+                    FlyItem::Divider,
+                ];
+                for (builtin, key) in CTB_BUILTINS.iter().filter_map(|(d, k)| {
+                    k.map(|k| (d, k))
+                }) {
+                    items.push(FlyItem::act(FlyIcon::None, builtin,
+                        FlyAct::OpenCtb(key.to_string())));
+                }
+                if !saved.is_empty() {
+                    items.push(FlyItem::Divider);
+                    for (name, path) in &saved {
+                        items.push(FlyItem::act(FlyIcon::None, name,
+                            FlyAct::OpenCtbFile(path.clone())));
+                    }
+                }
+                items.push(FlyItem::Divider);
+                items.push(FlyItem::Disabled("Delete CTB…  (select a table first)".into()));
+                items
+            }
             FlyMenu::Dimension => vec![
                 FlyItem::act(FlyIcon::Key("formative.dimension"),
                     "Dimension  (smart: linear · radius · diameter)", FlyAct::Run("dim".into())),
@@ -41113,6 +46361,13 @@ impl CadApp {
             FlyAct::Insert(n) => self.run_command(&format!("insert {}", n)),
             FlyAct::Import(raster) => self.open_file_dialog(
                 if raster { FileDialogMode::ImportRaster } else { FileDialogMode::ImportImage }, ""),
+            FlyAct::NewCtb => {
+                let saved = ctb_list();
+                self.new_ctb_name = format!("CTB {}", saved.len() + 1);
+                self.new_ctb_open = true;
+            }
+            FlyAct::OpenCtb(name) => self.ctb_open_builtin(&name),
+            FlyAct::OpenCtbFile(path) => self.ctb_open_editor(&path),
             FlyAct::SetDimStyle(id) => {
                 let name = self.doc.dim_styles.styles.get(id as usize).map(|s| s.name.clone());
                 self.current_dim_style = id;
@@ -42521,6 +47776,8 @@ impl eframe::App for CadApp {
         // no worker is running. Runs FIRST so the rest of the frame
         // sees the updated doc state.
         self.poll_hatch_worker();
+        // WP-SCRIPT: drain the Python worker's output into the command history.
+        self.poll_script_engine(ctx);
 
         // FPS — exponential moving average so the number doesn't jitter
         let dt = ctx.input(|i| i.stable_dt);
@@ -43424,6 +48681,7 @@ impl eframe::App for CadApp {
                         (save_label.as_str(), RowT::Plain),
                         ("Save As .dxf…", RowT::Plain), ("Save As .rsm…", RowT::Plain),
                         ("Import", RowT::Arrow),
+                        ("Plot Style Tables", RowT::Arrow),
                         ("New parametric sketch", RowT::Plain), ("Exit", RowT::Plain),
                     ]);
                     ui.set_width(w);
@@ -43441,6 +48699,13 @@ impl eframe::App for CadApp {
                     // Import ▸ — generalized flyout (raster / vector).
                     let (_ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Import", nc, RowT::Arrow);
                     if ia { self.open_flyout(FlyMenu::Import, irect); }
+                    menu_divider(ui, w);
+                    // Plot Style Tables ▸ — CTB manager: New / built-ins / saved
+                    // tables (defined in the app's <exe_dir>/ctb as .pst files).
+                    let (ptb, pta, ptrect) = paint_menu_row(
+                        ui, w, arrow_x, MenuIcon::None, "Plot Style Tables", nc, RowT::Arrow);
+                    if pta { self.open_flyout(FlyMenu::PlotStyleTables, ptrect); }
+                    let _ = ptb;
                     menu_divider(ui, w);
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "New parametric sketch", nc, RowT::Plain).0 {
                         self.run_command("clear");
@@ -44388,6 +49653,21 @@ impl eframe::App for CadApp {
         self.render_param_panel(ctx);   // parametric MODE constraint panel
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
+        self.render_py_console(ctx);
+        // PLOT: dockable Page Setup + floating Plot dialog + preview + Plot
+        // Style Table Editor + its sub-dialogs (ladder, New-CTB). The CTB table
+        // cache is refreshed each frame (cheap fingerprint check).
+        self.refresh_ctb_tables();
+        self.render_new_ctb_dialog(ctx);
+        if self.plot_dialog_open {
+            self.render_plot_dialog(ctx);
+        }
+        if self.plot_preview_open {
+            self.render_plot_preview_window(ctx);
+        }
+        self.render_plot_style_editor(ctx);
+        self.render_plot_ladder_dialog(ctx);
+        self.render_pagesetup_dialog(ctx);
         self.render_dbg_recorder_window(ctx); self.mark("dialogs");
         // FRAME-END STATE POLL — capture every transition that wasn't
         // explicitly wired. Tools, state machines, window open/close,
@@ -44854,7 +50134,9 @@ impl eframe::App for CadApp {
             // not react to ANY pointer gesture (pan/zoom/select/grip/draw) —
             // all block editing happens inside that window. Every interaction
             // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
-            let canvas_locked = self.block_editor.is_some();
+            // Also parked while the Plot dialog's "Window" area is being
+            // picked — the drag defines the plot region, it must NOT select.
+            let canvas_locked = self.block_editor.is_some() || self.plot_win_pick != 0;
             // SIMLUX: placing / moving light points on the plan. Gates the primary click+drag
             // handlers only (see `simlux_pointer_2d`) — pan, zoom and the right-click menu stay
             // live, because laying out a lighting grid means moving around the drawing.
@@ -44864,6 +50146,43 @@ impl eframe::App for CadApp {
             // place the user can click on the 3d or 2d window". Gated in alongside `light_grab` so
             // the placing click never also selects or starts drawing something.
             let place_grab = !canvas_locked && self.factory_placing_pointer_2d(&resp, rect);
+
+            // ---- Plot "Window" area pick — rubber-band, no selection ----
+            if self.plot_win_pick != 0 {
+                if resp.drag_started() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if rect.contains(pos) { self.plot_win_p1 = Some(self.s2w(pos, rect)); }
+                    }
+                }
+                // Live preview: red rubber-band from the first corner to the cursor.
+                if let (Some(p1), Some(cur)) = (self.plot_win_p1, resp.hover_pos().or_else(|| resp.interact_pointer_pos())) {
+                    let a = self.w2s(p1, rect);
+                    let rb = egui::Rect::from_two_pos(a, cur);
+                    let lp = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground, egui::Id::new("plot_win_rubber")));
+                    lp.rect_filled(rb, 0.0, egui::Color32::from_rgba_unmultiplied(0xE5, 0x48, 0x4D, 26));
+                    lp.rect_stroke(rb, 0.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(0xE5, 0x48, 0x4D)));
+                }
+                if resp.drag_stopped() {
+                    if let (Some(p1), Some(pos)) = (self.plot_win_p1, resp.interact_pointer_pos()) {
+                        let p2 = self.s2w(pos, rect);
+                        let mn = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
+                        let mx = Vec2::new(p1.x.max(p2.x), p1.y.max(p2.y));
+                        if (mx.x - mn.x) > 1e-3 && (mx.y - mn.y) > 1e-3 {
+                            self.plot_window = Some((mn, mx));
+                            self.plot_area_kind = 1;   // Window is the active area
+                            self.history.push(format!(
+                                "  plot: window ({:.2},{:.2})–({:.2},{:.2})", mn.x, mn.y, mx.x, mx.y));
+                        }
+                    }
+                    // Done (or a zero-size drag) → unpark the dialog.
+                    self.plot_win_pick = 0;
+                    self.plot_win_p1 = None;
+                    self.clear_prompt();
+                    self.set_prompt("plot — set paper / area / scale in the dialog, then Plot");
+                }
+                return;
+            }
             // ---- right-click shortcut (context) menu --------------------
             // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
             // when there's a selection or something on the clipboard.
