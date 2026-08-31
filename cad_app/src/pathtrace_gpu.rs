@@ -47,12 +47,12 @@ const FS: &str = r#"
     uniform uint u_pass;
 
     // The HDR environment, when one is loaded — the same equirectangular map the viewport draws,
-    // read through the same formula (ENV_UV_GLSL comes straight out of `crate::env`).
+    // read through the same formula (the ENV_UV_GLSL block comes straight out of `crate::env`).
     uniform sampler2D u_env;
     uniform int u_env_on;
     uniform float u_env_rot;
     uniform float u_env_strength;
-    ENV_UV_GLSL
+    @@ENV_UV_GLSL@@
 
     // ---- RNG (pcg-ish) ----
     uint g_state;
@@ -114,7 +114,7 @@ const FS: &str = r#"
                 int start = int(n0.w);
                 for (int k = start; k < start + count; k++) {
                     int ti = int(fetchT(u_order, k).x);
-                    int b = ti * TRI_TEXELS;
+                    int b = ti * @@TRI_TEXELS@@;
                     float t = rayTri(ro, rd, fetchT(u_tris, b).xyz, fetchT(u_tris, b + 1).xyz, fetchT(u_tris, b + 2).xyz);
                     if (t > 0.0 && t < tmax) { tmax = t; best = ti; }
                 }
@@ -134,7 +134,7 @@ const FS: &str = r#"
             float t;
             int ti = intersect(ro, rd, t);
             if (ti < 0) return tr;
-            int b = ti * TRI_TEXELS;
+            int b = ti * @@TRI_TEXELS@@;
             float opacity = fetchT(u_tris, b + 2).w;
             if (opacity >= 0.99) return vec3(0.0);
             vec3 alb = fetchT(u_tris, b + 3).xyz;
@@ -178,7 +178,7 @@ const FS: &str = r#"
             float t;
             int ti = intersect(ro, rd, t);
             if (ti < 0) { radiance += through * skyRadiance(rd, primary); break; }
-            int b = ti * TRI_TEXELS;
+            int b = ti * @@TRI_TEXELS@@;
             vec4 t0 = fetchT(u_tris, b);
             vec4 t1 = fetchT(u_tris, b + 1);
             vec4 t2 = fetchT(u_tris, b + 2);
@@ -388,8 +388,8 @@ impl GpuTracer {
             let program = gl.create_program()?;
             let mut compiled = Vec::new();
             let fs = FS
-                .replace("ENV_UV_GLSL", crate::env::ENV_UV_GLSL)
-                .replace("TRI_TEXELS", &crate::pathtrace::TRI_TEXELS.to_string());
+                .replace("@@ENV_UV_GLSL@@", crate::env::ENV_UV_GLSL)
+                .replace("@@TRI_TEXELS@@", &crate::pathtrace::TRI_TEXELS.to_string());
             for (ty, src) in [(glow::VERTEX_SHADER, VS), (glow::FRAGMENT_SHADER, fs.as_str())] {
                 let sh = gl.create_shader(ty)?;
                 gl.shader_source(sh, src);
@@ -620,12 +620,15 @@ mod tests {
     /// wrong: two transcriptions of an equirect lookup drifting apart. It is substituted from
     /// `crate::env`, not copied — this asserts the substitution really happens, because a
     /// misspelled token would leave the literal word in the source and fail to compile only on a
-    /// machine with a GPU.
+    /// machine with a GPU. The `@@…@@` placeholders are collision-proof: a comment in the shader
+    /// may mention `ENV_UV_GLSL` freely without being spliced over.
     #[test]
     fn the_tracer_and_the_viewport_read_the_environment_the_same_way() {
-        assert!(FS.contains("ENV_UV_GLSL"), "the tracer includes the shared lookup by token");
-        let fs = FS.replace("ENV_UV_GLSL", crate::env::ENV_UV_GLSL);
-        assert!(!fs.contains("ENV_UV_GLSL"), "…and the token is fully substituted");
+        assert_eq!(FS.matches("@@ENV_UV_GLSL@@").count(), 1,
+            "the placeholder must appear EXACTLY once — a comment mentioning it would be \
+             spliced over by the substitution");
+        let fs = FS.replace("@@ENV_UV_GLSL@@", crate::env::ENV_UV_GLSL);
+        assert!(!fs.contains("@@ENV_UV_GLSL@@"), "…and the token is fully substituted");
         assert!(fs.contains("vec2 env_uv(vec3 d)"), "…leaving a real env_uv behind");
         assert!(fs.contains("uniform float u_env_rot;"), "…with the rotation it reads in scope");
         // The viewport's copy has to stay word for word the same as the shared one, or the render
@@ -657,9 +660,11 @@ mod tests {
     /// the render comes back with every surface wearing its neighbour's material.
     #[test]
     fn the_shader_strides_by_the_packed_texel_count() {
-        assert!(FS.contains("ti * TRI_TEXELS"), "the shader strides by the shared constant");
-        let fs = FS.replace("TRI_TEXELS", &crate::pathtrace::TRI_TEXELS.to_string());
-        assert!(!fs.contains("TRI_TEXELS"), "…and every occurrence is substituted");
+        assert_eq!(FS.matches("ti * @@TRI_TEXELS@@").count(), 3,
+            "the stride placeholder appears at every texel-fetch site — a comment mentioning \
+             it would be spliced over");
+        let fs = FS.replace("@@TRI_TEXELS@@", &crate::pathtrace::TRI_TEXELS.to_string());
+        assert!(!fs.contains("@@TRI_TEXELS@@"), "…and every occurrence is substituted");
         // The highest texel the shader reads must exist in the packed stride.
         let last = (0..16)
             .filter(|i| fs.contains(&format!("fetchT(u_tris, b + {i})")))
@@ -688,3 +693,5 @@ mod tests {
         assert!(big.w <= ENV_MAX_W, "a small map is left alone");
     }
 }
+
+
