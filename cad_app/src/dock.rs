@@ -16,7 +16,7 @@ use egui::{Align2, Color32, Context, CursorIcon, FontId, Id, Pos2, Rect, Sense,
 
 /// Which edge a panel is docked against.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum DockRegion { Left, Right, Bottom }
+pub enum DockRegion { Left, Right, Bottom, Top }
 
 /// Whether a panel is docked (to a region) or floating (at a screen position).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -38,6 +38,16 @@ pub struct DockConfig<'a> {
     /// Inspector docks Right *or* Left). `None` = single-edge (the historical
     /// behaviour). The stored `DockState::Docked(region)` picks between them.
     pub alt_region: Option<DockRegion>,
+    /// When TRUE the panel may dock to ANY edge (the toolbars): the header gets a
+    /// right-click dock menu (Left / Right / Top / Bottom / Float) and drag-to-dock
+    /// accepts all four edges. `dock_region` / `alt_region` are ignored while set,
+    /// and a stored `Docked(region)` is honoured as-is rather than re-homed to the
+    /// one allowed edge.
+    pub any_edge: bool,
+    /// Height of the panel when docked to the TOP edge — the strip thickness.
+    /// (`size` is the width for L/R; a Bottom dock already reuses `size` as its
+    /// height.) Meaningless for panels that cannot dock Top.
+    pub strip_h: f32,
     /// When FALSE the panel is FLOATING-ONLY: it can never dock, and a stale
     /// `Docked` state is migrated to `Floating` on show. Only the Inspector is
     /// dockable (owner: the right column must not grab other dialogs).
@@ -327,22 +337,71 @@ fn paint_close_flyout(ctx: &Context, id: Id, anchor: Pos2) -> Rect {
 }
 
 /// Docked-panel header — drag the band out to undock. Returns
-/// `(close_clicked, undock_to)`.
-fn docked_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Option<Pos2>) {
+/// `(close_clicked, undock_to, band)`; the band also carries the right-click
+/// dock menu when the panel is `any_edge`.
+fn docked_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Option<Pos2>, egui::Response) {
     let h = header_band(ui, cfg.title, cfg.badge, true);
     let undock = if h.band.drag_started() {
         h.band.interact_pointer_pos()
             .map(|p| egui::pos2((p.x - 130.0).max(0.0), (p.y - 12.0).max(48.0)))
     } else { None };
-    (h.close_clicked, undock)
+    (h.close_clicked, undock, h.band)
 }
 
 /// Floating-panel header — the band drags the window. Returns
-/// `(close_clicked, drag_delta, drag_released)`; the host docks only on release.
-fn float_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Vec2, bool) {
+/// `(close_clicked, drag_delta, drag_released, band)`; the band also carries
+/// the right-click dock menu when the panel is `any_edge`.
+fn float_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Vec2, bool, egui::Response) {
     let h = header_band(ui, cfg.title, cfg.badge, true);
     let delta = if h.band.dragged() { h.band.drag_delta() } else { Vec2::ZERO };
-    (h.close_clicked, delta, h.band.drag_stopped())
+    (h.close_clicked, delta, h.band.drag_stopped(), h.band)
+}
+
+/// Where a panel floats after leaving a docked edge — clear of the edge it left
+/// so it doesn't sit inside the re-dock zone. Shared by the floating-only
+/// migration, undock, and the dock menu's "Float" row.
+fn float_pos_for(cfg: &DockConfig, sr: egui::Rect, r: DockRegion) -> Pos2 {
+    match r {
+        DockRegion::Left   => egui::pos2(sr.left() + 60.0, sr.center().y - 120.0),
+        DockRegion::Right  => egui::pos2((sr.right() - cfg.float_w - 60.0).max(20.0), sr.center().y - 120.0),
+        DockRegion::Bottom => egui::pos2(sr.center().x - cfg.float_w * 0.5, (sr.bottom() - 240.0).max(sr.top() + 60.0)),
+        DockRegion::Top    => egui::pos2(sr.center().x - cfg.float_w * 0.5, (sr.top() + 44.0).max(44.0)),
+    }
+}
+
+/// The header right-click dock menu for `any_edge` panels (the toolbars): dock
+/// to any of the four edges, or float. The current state is checkmarked.
+/// Returns whether the state was changed — the caller uses that to skip its own
+/// trailing drag-release state write in the same frame (a menu click is not a
+/// drag, so an unguarded write would immediately undo the menu's choice).
+fn dock_menu(ui: &mut Ui, cfg: &DockConfig, state: &mut DockState) -> bool {
+    ui.set_min_width(140.0);
+    for (r, label) in [
+        (DockRegion::Left, "Dock left"),
+        (DockRegion::Right, "Dock right"),
+        (DockRegion::Top, "Dock top"),
+        (DockRegion::Bottom, "Dock bottom"),
+    ] {
+        let active = matches!(*state, DockState::Docked(x) if x == r);
+        if ui.selectable_label(active, label).clicked() {
+            *state = DockState::Docked(r);
+            ui.close_menu();
+            return true;
+        }
+    }
+    ui.separator();
+    let floating = matches!(*state, DockState::Floating(_));
+    if ui.selectable_label(floating, "Float").clicked() {
+        let sr = ui.ctx().screen_rect();
+        let pos = match *state {
+            DockState::Floating(p) => p,
+            DockState::Docked(r) => float_pos_for(cfg, sr, r),
+        };
+        *state = DockState::Floating(pos);
+        ui.close_menu();
+        return true;
+    }
+    false
 }
 
 /// The hand-rolled egui docking engine.
@@ -358,12 +417,7 @@ impl DockHost for EguiDockHost {
         if !cfg.dockable {
             if let DockState::Docked(r) = *state {
                 let sr = ctx.screen_rect();
-                let pos = match r {
-                    DockRegion::Left   => egui::pos2(sr.left() + 60.0, sr.center().y - 120.0),
-                    DockRegion::Right  => egui::pos2((sr.right() - cfg.float_w - 60.0).max(20.0), sr.center().y - 120.0),
-                    DockRegion::Bottom => egui::pos2(sr.center().x - cfg.float_w * 0.5, (sr.bottom() - 240.0).max(sr.top() + 60.0)),
-                };
-                *state = DockState::Floating(pos);
+                *state = DockState::Floating(float_pos_for(cfg, sr, r));
             }
         }
         // Collapsed (minimised to header) — the rail header's chevron sets this;
@@ -374,10 +428,11 @@ impl DockHost for EguiDockHost {
             .inner_margin(egui::Margin::ZERO);
 
         match *state {
-            DockState::Docked(_) => {
-                // Always dock to the panel's one allowed edge, regardless of what
-                // the stored state says — a panel can't be docked anywhere else.
-                let region = cfg.dock_region;
+            DockState::Docked(stored) => {
+                // An `any_edge` panel keeps whichever edge its state names; a
+                // single-edge panel always docks to its one allowed edge, no
+                // matter what the stored state says.
+                let region = if cfg.any_edge { stored } else { cfg.dock_region };
                 let mut close = false;
                 let mut undock: Option<Pos2> = None;
                 let rect = match region {
@@ -391,8 +446,9 @@ impl DockHost for EguiDockHost {
                             .default_width(cfg.size).min_width(cfg.min).max_width(cfg.max)
                             .frame(frame)
                             .show(ctx, |ui| {
-                                let (c, u) = docked_header(ui, cfg);
+                                let (c, u, band) = docked_header(ui, cfg);
                                 close = c; undock = u;
+                                if cfg.any_edge { band.context_menu(|ui| { dock_menu(ui, cfg, state); }); }
                                 if cfg.flush_body {
                                     body(ui, None);
                                 } else {
@@ -405,11 +461,32 @@ impl DockHost for EguiDockHost {
                     DockRegion::Bottom => {
                         egui::TopBottomPanel::bottom(Id::new((cfg.id, "dock")))
                             .resizable(cfg.resizable)
-                            .default_height(cfg.size).min_height(cfg.min).max_height(cfg.max)
+                            .default_height(if cfg.any_edge { cfg.strip_h.max(1.0) } else { cfg.size })
+                            .min_height(cfg.min).max_height(cfg.max)
                             .frame(frame)
                             .show(ctx, |ui| {
-                                let (c, u) = docked_header(ui, cfg);
+                                let (c, u, band) = docked_header(ui, cfg);
                                 close = c; undock = u;
+                                if cfg.any_edge { band.context_menu(|ui| { dock_menu(ui, cfg, state); }); }
+                                if cfg.flush_body {
+                                    body(ui, None);
+                                } else {
+                                    egui::Frame::none()
+                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| body(ui, None));
+                                }
+                            }).response.rect
+                    }
+                    DockRegion::Top => {
+                        egui::TopBottomPanel::top(Id::new((cfg.id, "dock")))
+                            .resizable(cfg.resizable)
+                            .default_height(cfg.strip_h.max(1.0))
+                            .min_height(cfg.min).max_height(cfg.max)
+                            .frame(frame)
+                            .show(ctx, |ui| {
+                                let (c, u, band) = docked_header(ui, cfg);
+                                close = c; undock = u;
+                                if cfg.any_edge { band.context_menu(|ui| { dock_menu(ui, cfg, state); }); }
                                 if cfg.flush_body {
                                     body(ui, None);
                                 } else {
@@ -432,8 +509,8 @@ impl DockHost for EguiDockHost {
                         // centred on the window; it may overlay the right bar
                         // (the float draws on top of the side panels). It won't
                         // re-dock on its own — docking only happens on an actual
-                        // drag-release near the bottom edge.
-                        DockRegion::Bottom =>
+                        // drag-release near the edge.
+                        DockRegion::Bottom | DockRegion::Top =>
                             egui::pos2(sr.center().x - cfg.float_w * 0.5,
                                        (sr.bottom() - 220.0).max(sr.top() + 56.0)),
                         // Centre horizontally on undock (like Bottom) so the
@@ -455,6 +532,7 @@ impl DockHost for EguiDockHost {
                 let mut close = false;
                 let mut delta = Vec2::ZERO;
                 let mut released = false;
+                let mut menu_mutated = false;
                 let area = egui::Area::new(Id::new((cfg.id, "float")))
                     // Foreground: a float must stay ABOVE the Middle painter-layer
                     // rail/panel shadows (the "shadows over undocked toolbars /
@@ -470,8 +548,13 @@ impl DockHost for EguiDockHost {
                             .show(ui, |ui| {
                                 ui.set_width(cfg.float_w);
                                 ui.set_max_width(cfg.float_w);
-                                let (c, d, r) = float_header(ui, cfg);
+                                let (c, d, r, band) = float_header(ui, cfg);
                                 close = c; delta = d; released = r;
+                                if cfg.any_edge {
+                                    band.context_menu(|ui| {
+                                        menu_mutated = dock_menu(ui, cfg, state);
+                                    });
+                                }
                                 if cfg.flush_body {
                                     body(ui, Some(cap));
                                 } else {
@@ -484,31 +567,46 @@ impl DockHost for EguiDockHost {
                 let wr = area.response.rect;
                 if close { *open = false; }
                 // Follow the pointer while dragging; dock ONLY when the drag is
-                // released with the panel's own edge inside the snap zone. A
-                // panel can dock to its `dock_region` and nowhere else, so it
-                // never grabs the wrong side and never re-docks mid-move.
+                // released with the panel's own edge inside the snap zone.
                 let np = egui::pos2((pos.x + delta.x).max(0.0), (pos.y + delta.y).max(44.0));
                 let sr = ctx.screen_rect();
-                let edge_near = |r: DockRegion| match r {
-                    DockRegion::Right  => wr.right()  >= sr.right()  - 48.0,
-                    DockRegion::Left   => wr.left()   <= sr.left()   + 48.0,
-                    DockRegion::Bottom => wr.bottom() >= sr.bottom() - 48.0,
+                // Gap between the panel's edge and the screen edge it faces;
+                // `None` when the panel is further than 48 px away (in OR out).
+                let edge_gap = |r: DockRegion| -> Option<f32> {
+                    let g = match r {
+                        DockRegion::Right  => wr.right()  - sr.right(),
+                        DockRegion::Left   => sr.left()   - wr.left(),
+                        DockRegion::Bottom => wr.bottom() - sr.bottom(),
+                        DockRegion::Top    => sr.top()    - wr.top(),
+                    };
+                    (g >= -48.0 && g <= 48.0).then_some(g)
                 };
-                // Dock to whichever allowed edge the panel's own edge is inside;
-                // the primary wins if both are somehow near. A panel docks to its
-                // `dock_region`/`alt_region` and nowhere else — and only when it
-                // is dockable at all (floating-only dialogs stay floating).
-                let dock_to = if cfg.dockable {
-                    if edge_near(cfg.dock_region) {
+                // An `any_edge` panel docks to whichever allowed edge is nearest
+                // (smallest absolute gap); every other panel docks to its
+                // `dock_region`/`alt_region` and nowhere else — so it never grabs
+                // the wrong side and never re-docks mid-move.
+                let dock_to = if cfg.any_edge {
+                    [DockRegion::Left, DockRegion::Right, DockRegion::Top, DockRegion::Bottom]
+                        .into_iter()
+                        .filter_map(|r| edge_gap(r).map(|g| (r, g)))
+                        .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                        .map(|(r, _)| r)
+                } else if cfg.dockable {
+                    if edge_gap(cfg.dock_region).is_some() {
                         Some(cfg.dock_region)
-                    } else if cfg.alt_region.is_some_and(edge_near) {
+                    } else if cfg.alt_region.is_some_and(|r| edge_gap(r).is_some()) {
                         cfg.alt_region
                     } else { None }
                 } else { None };
-                *state = match (released, dock_to) {
-                    (true, Some(r)) => DockState::Docked(r),
-                    _ => DockState::Floating(np),
-                };
+                // A dock-menu choice made THIS frame wins over the drag-release
+                // bookkeeping — a menu click is not a drag, and the write below
+                // would otherwise undo it immediately.
+                if !menu_mutated {
+                    *state = match (released, dock_to) {
+                        (true, Some(r)) => DockState::Docked(r),
+                        _ => DockState::Floating(np),
+                    };
+                }
                 wr
             }
         }

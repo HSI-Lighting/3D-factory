@@ -23248,6 +23248,7 @@ impl CadApp {
             id: "text", title: "Text", badge: None,
             dock_region: crate::dock::DockRegion::Right,
             alt_region: Some(crate::dock::DockRegion::Left),
+            any_edge: false, strip_h: 0.0,
             dockable: false,             // floating-only (owner: Inspector docks)
             rail_header: true,
             collapsible: true,
@@ -25029,6 +25030,7 @@ impl CadApp {
             badge: None,
             dock_region: crate::dock::DockRegion::Bottom,
             alt_region: None,
+            any_edge: false, strip_h: 0.0,
             dockable: true,
             rail_header: false,
             collapsible: false,
@@ -27120,6 +27122,7 @@ impl CadApp {
             id: "pagesetup", title: "Page Setup", badge: None,
             dock_region: crate::dock::DockRegion::Right,
             alt_region: Some(crate::dock::DockRegion::Left),
+            any_edge: false, strip_h: 0.0,
             dockable: false,
             rail_header: true, collapsible: true,
             size: 320.0, min: 300.0, max: 420.0,
@@ -28436,7 +28439,8 @@ impl CadApp {
             // flush_body: the Inspector paints its own padding (panel-edge 16,
             // panel-header→content 24) per INSPECTOR_DESIGN §2.
             resizable: true, flush_body: true, float_w: 264.0, float_max_h_frac: 0.5,
-            alt_region: None, dockable: true, rail_header: false, collapsible: false,
+            alt_region: None, any_edge: false, strip_h: 0.0,
+            dockable: true, rail_header: false, collapsible: false,
         };
         let mut state = self.inspector_dock_state;
         let mut open = self.info_window_open;
@@ -28974,7 +28978,9 @@ impl CadApp {
     /// The scrolling icon list + pinned footer (+ / reset) for one rail.
     /// Right-click an icon to remove it. `ui.available_height()` must be
     /// bounded (docked panel height, or the floating rail's set_height).
-    fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize) {
+    /// `horizontal` (docked Top/Bottom) flows the icons into ONE row and puts
+    /// the + / reset buttons inline at the end of it.
+    fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize, horizontal: bool) {
         let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
         // Phase 6b: one read-only Ctx snapshot; each rail item filters/greys
         // against its predicates (all-default now → nothing hidden/greyed).
@@ -28985,6 +28991,7 @@ impl CadApp {
         // Icons flow top-to-bottom in `cols` columns (1 or 2) — NO scrollbar; the
         // rail widens to a second column when they won't fit the height. Small
         // inset (the body is edge-to-edge so the footer below can be full-width).
+        // Horizontal mode: `cols` = item count → a single left→right row.
         egui::Frame::none()
             .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 4.0, bottom: 0.0 })
             .show(ui, |ui| {
@@ -29172,7 +29179,8 @@ impl CadApp {
                         pp_cap_ui(ui, &format!("rail remove menu · {}", short));
                     });
                     // Break to the next grid row after every `cols` icons.
-                    if (pos + 1) % cols == 0 { ui.end_row(); }
+                    // Horizontal mode: NO breaks — every icon shares the one row.
+                    if !horizontal && (pos + 1) % cols == 0 { ui.end_row(); }
                 }
             });
             });
@@ -29189,16 +29197,31 @@ impl CadApp {
         }
         // ---- footer band (same chrome look as the header) PINNED to the bottom
         // so both rails' footers line up; the gap above it varies with each
-        // rail's icon count. Two lines: "+" (add) then "reset". ----
+        // rail's icon count. Two lines: "+" (add) then "reset". In HORIZONTAL
+        // mode (docked top/bottom) the buttons sit INLINE at the end of the
+        // icon row instead — the strip is one thin band, not a column.
         let footer_h = 58.0;
-        let pad = (ui.available_height() - footer_h).max(0.0);
+        let pad = if horizontal { 0.0 } else { (ui.available_height() - footer_h).max(0.0) };
         ui.add_space(pad);
         let mut add: Option<crate::command::CommandId> = None;
-        let fr = egui::Frame::none()
-            .fill(crate::theme::color::CHROME)
-            .inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 10.0 })
-            .show(ui, |ui| {
-        ui.vertical_centered(|ui| {
+        let cat = if is_draw { crate::command::CommandCategory::Draw }
+                  else { crate::command::CommandCategory::Modify };
+        let present: std::collections::HashSet<&str> =
+            items.iter().map(|s| s.as_str()).collect();
+        // Precompute (id, short-name, icon) so the popup closure needs no
+        // registry borrow. "Available tools" = by_category (canonical order),
+        // defensively filtered.
+        let available: Vec<(crate::command::CommandId, String, crate::command::IconId)> =
+            self.command_registry.by_category(cat).into_iter()
+                .filter_map(|aid| self.command_registry.get(&aid).map(|info| {
+                    let short = info.tooltip.split("  ").next()
+                        .unwrap_or(&info.tooltip).to_string();
+                    (aid, short, info.icon)
+                }))
+                .collect();
+        // The + / reset controls (and the add-commands popup they open). Shared
+        // by both layouts — only the arrangement differs.
+        let mut footer_controls = |ui: &mut egui::Ui| {
             let plus = text_button(ui, "+", 20.0).on_hover_text("Add commands");
             let popup_id = ui.make_persistent_id(
                 if is_draw { "rail_add_draw" } else { "rail_add_modify" });
@@ -29211,23 +29234,10 @@ impl CadApp {
                 v.window_fill = PP_BG_LO;
                 v.window_stroke = egui::Stroke::new(1.0, PP_BORDER);
             }
-            let present: std::collections::HashSet<&str> =
-                items.iter().map(|s| s.as_str()).collect();
-            let cat = if is_draw { crate::command::CommandCategory::Draw }
-                      else { crate::command::CommandCategory::Modify };
-            // Precompute (id, short-name, icon) so the popup closure needs no
-            // registry borrow. "Available tools" = by_category (canonical order),
-            // defensively filtered.
-            let available: Vec<(crate::command::CommandId, String, crate::command::IconId)> =
-                self.command_registry.by_category(cat).into_iter()
-                    .filter_map(|aid| self.command_registry.get(&aid).map(|info| {
-                        let short = info.tooltip.split("  ").next()
-                            .unwrap_or(&info.tooltip).to_string();
-                        (aid, short, info.icon)
-                    }))
-                    .collect();
             egui::popup_above_or_below_widget(ui, popup_id, &plus,
-                egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                if horizontal { egui::AboveOrBelow::Below }
+                else { egui::AboveOrBelow::Above },
+                egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                     ui.set_min_width(252.0);
                     ui.label(egui::RichText::new("Highlighted = add · dimmed = already on rail")
                         .small().color(PP_LABEL));
@@ -29279,11 +29289,30 @@ impl CadApp {
                 let ids = self.command_registry.by_category(cat);
                 if is_draw { self.draw_items = ids; } else { self.modify_items = ids; }
             }
-        });
+        };
+        let fr = egui::Frame::none()
+            .fill(if horizontal { egui::Color32::TRANSPARENT }
+                  else { crate::theme::color::CHROME })
+            .inner_margin(if horizontal {
+                egui::Margin { left: 6.0, right: 6.0, top: 4.0, bottom: 2.0 }
+            } else {
+                egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 10.0 }
+            })
+            .show(ui, |ui| {
+                if horizontal {
+                    ui.horizontal(|ui| {
+                        ui.separator();
+                        footer_controls(ui);
+                    });
+                } else {
+                    ui.vertical_centered(|ui| footer_controls(ui));
+                }
             });
-        // Top hairline — mirrors the header's bottom border.
-        ui.painter().hline(fr.response.rect.x_range(), fr.response.rect.top(),
-            egui::Stroke::new(1.0, crate::theme::color::BORDER));
+        if !horizontal {
+            // Top hairline — mirrors the header's bottom border.
+            ui.painter().hline(fr.response.rect.x_range(), fr.response.rect.top(),
+                egui::Stroke::new(1.0, crate::theme::color::BORDER));
+        }
         if let Some(aid) = add {
             if is_draw { if !self.draw_items.contains(&aid) { self.draw_items.push(aid); } }
             else if !self.modify_items.contains(&aid) { self.modify_items.push(aid); }
@@ -29398,10 +29427,13 @@ impl CadApp {
         });
     }
 
-    /// Left command rails (Draw + Modify), rendered through the UNIFIED dock host
+    /// Left command rails (Draw + Modify), rendered through the unified dock host
     /// (dock.rs) — the SAME swappable engine as the Inspector and command bar.
-    /// Rails dock only to the LEFT edge and carry NO title in their header. Icons
-    /// flow into 1 or 2 columns so they always fit the height WITHOUT a scrollbar.
+    /// The rails are `any_edge`: right-click their header → dock left / right /
+    /// top / bottom (or float), and drag-to-dock accepts all four edges. Docked
+    /// to the TOP or BOTTOM edge the icons flow into ONE horizontal row; docked
+    /// left/right they flow into 1 or 2 columns so they always fit the height
+    /// WITHOUT a scrollbar. Icons carry NO title in their header.
     fn render_command_rails(&mut self, ctx: &egui::Context) {
         // Rows that fit in the rail body (rail height minus header + footer)
         // decide 1 vs 2 columns — never a scrollbar. Uses the rail's OWN height
@@ -29410,47 +29442,73 @@ impl CadApp {
         let rows_fit = (((self.rail_panel_h - 88.0) / 36.0).floor() as usize).max(3);
         let cols_for = |n: usize| if n <= rows_fit { 1usize } else { 2usize };
         let width_for = |cols: usize| if cols == 1 { 50.0 } else { 92.0 };
+        // Height of the strip when docked to the TOP/BOTTOM edge: header band
+        // (32) + body margin (4) + one icon row (32) + inline footer (~36).
+        const STRIP_H: f32 = 108.0;
+        // `horizontal` decides the ICON LAYOUT before the host renders: docked
+        // top/bottom = one row (tools laid out left→right); everything else =
+        // the vertical 1-2 column flow.
 
         // DRAW
         if self.draw_rail_open {
-            let cols = cols_for(self.draw_items.len());
+            let mut state = self.draw_rail_dock_state;
+            let horizontal = matches!(state, crate::dock::DockState::Docked(
+                crate::dock::DockRegion::Top | crate::dock::DockRegion::Bottom));
+            // Horizontal (top/bottom) → ONE row of icons; vertical → 1-2 columns
+            // sized by the rail's own height, never a scrollbar.
+            let cols = if horizontal { self.draw_items.len().max(1) }
+                       else { cols_for(self.draw_items.len()) };
             let w = width_for(cols);
+            // Size lock is on the VARIABLE axis of the dock: width for L/R,
+            // height for T/B.
+            let (min, max) = if horizontal { (STRIP_H, STRIP_H) } else { (w, w) };
             let cfg = crate::dock::DockConfig {
                 id: "rail_draw", title: "", badge: None,
                 dock_region: crate::dock::DockRegion::Left,
-                size: w, min: w, max: w, resizable: false,
-                flush_body: true, float_w: w, float_max_h_frac: 0.92,
-                alt_region: None, dockable: false, rail_header: false, collapsible: false,
+                size: w, min, max, resizable: false,
+                strip_h: STRIP_H, any_edge: true, dockable: true,
+                flush_body: true, float_w: if horizontal { 92.0 } else { w },
+                float_max_h_frac: 0.92,
+                alt_region: None, rail_header: false, collapsible: false,
             };
-            let mut state = self.draw_rail_dock_state;
             let mut open = self.draw_rail_open;
             let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
-                self.rail_inner(ui, true, cols);
+                self.rail_inner(ui, true, cols, horizontal);
                 pp_cap_ui(ui, "DRAW rail");
             });
             self.draw_rail_dock_state = state;
             self.draw_rail_open = open;
             // Capture the DOCKED rail height (full menu→status) to drive the
-            // column decision from a height that doesn't move with the command bar.
-            if matches!(state, crate::dock::DockState::Docked(_)) && rect.is_finite() {
+            // column decision from a height that doesn't move with the command
+            // bar. A top/bottom strip is only its own thickness, useless here.
+            if matches!(state, crate::dock::DockState::Docked(
+                crate::dock::DockRegion::Left | crate::dock::DockRegion::Right))
+                && rect.is_finite()
+            {
                 self.rail_panel_h = rect.height();
             }
         }
         // MODIFY
         if self.modify_rail_open {
-            let cols = cols_for(self.modify_items.len());
+            let mut state = self.modify_rail_dock_state;
+            let horizontal = matches!(state, crate::dock::DockState::Docked(
+                crate::dock::DockRegion::Top | crate::dock::DockRegion::Bottom));
+            let cols = if horizontal { self.modify_items.len().max(1) }
+                       else { cols_for(self.modify_items.len()) };
             let w = width_for(cols);
+            let (min, max) = if horizontal { (STRIP_H, STRIP_H) } else { (w, w) };
             let cfg = crate::dock::DockConfig {
                 id: "rail_modify", title: "", badge: None,
                 dock_region: crate::dock::DockRegion::Left,
-                size: w, min: w, max: w, resizable: false,
-                flush_body: true, float_w: w, float_max_h_frac: 0.92,
-                alt_region: None, dockable: false, rail_header: false, collapsible: false,
+                size: w, min, max, resizable: false,
+                strip_h: STRIP_H, any_edge: true, dockable: true,
+                flush_body: true, float_w: if horizontal { 92.0 } else { w },
+                float_max_h_frac: 0.92,
+                alt_region: None, rail_header: false, collapsible: false,
             };
-            let mut state = self.modify_rail_dock_state;
             let mut open = self.modify_rail_open;
             crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
-                self.rail_inner(ui, false, cols);
+                self.rail_inner(ui, false, cols, horizontal);
                 pp_cap_ui(ui, "MODIFY rail");
             });
             self.modify_rail_dock_state = state;
@@ -49008,7 +49066,7 @@ impl eframe::App for CadApp {
                         ("Layers", RowT::Plain), ("Pens", RowT::Plain),
                         ("Inspector", RowT::Plain), ("DObjects list", RowT::Plain),
                         ("Command rails", RowT::Plain),
-                        ("Draw rail (left)", RowT::Plain), ("Modify rail (left)", RowT::Plain),
+                        ("Draw rail", RowT::Plain), ("Modify rail", RowT::Plain),
                         ("Snap window", RowT::Plain), ("Toggle Grips", RowT::Plain),
                         ("Session Recorder", RowT::Plain),
                         ("Inquiry", RowT::Plain),
@@ -49049,8 +49107,8 @@ impl eframe::App for CadApp {
                     panel_row!("DObjects list", self.dobjects_window_open, "DObjects");
                     menu_divider(ui, w);
                     menu_heading_row(ui, w, "Command rails");
-                    check_row!("Draw rail (left)", self.draw_rail_open);
-                    check_row!("Modify rail (left)", self.modify_rail_open);
+                    check_row!("Draw rail", self.draw_rail_open);
+                    check_row!("Modify rail", self.modify_rail_open);
                     menu_divider(ui, w);
                     check_row!("Snap window", self.snap_window_open);
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Toggle Grips", nc, RowT::Plain).0 {
@@ -50095,7 +50153,8 @@ impl eframe::App for CadApp {
                 dock_region: crate::dock::DockRegion::Bottom,
                 size: 150.0, min: 96.0, max: 320.0,
                 resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
-                alt_region: None, dockable: true, rail_header: false, collapsible: false,
+                alt_region: None, any_edge: false, strip_h: 0.0,
+                dockable: true, rail_header: false, collapsible: false,
             };
             let mut state = self.cmd_dock_state;
             let mut open = self.cmd_window_open;
