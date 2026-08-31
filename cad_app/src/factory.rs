@@ -1138,6 +1138,11 @@ pub struct FactoryState {
     /// warning anybody.
     /// Draw the ground grid in the 3D view. Toggled by the GRID badge on the drafting bar.
     pub show_grid: bool,
+    /// Draw a flat ground surface at z = 0 under the model — "terrain" — so rooms and buildings
+    /// sit on something instead of floating in the void. Toggled by the GND badge. Like the grid
+    /// it FOLLOWS THE CAMERA, so it always reaches the edges of the view at any zoom and never
+    /// shows its own rim.
+    pub show_ground: bool,
     /// Draw the three-axis gizmo at the world origin. OFF by default — see `origin_gizmo_lines`.
     pub show_origin: bool,
     /// 3D object snap: a click in the 3D view lands on the nearest solid VERTEX within the
@@ -3465,6 +3470,7 @@ impl Default for FactoryState {
             // in it; the fix is not a better default position, it is being ASKED. Switch it to
             // "Model centre" on the Factory toolbar to get the old drop-and-go behaviour back.
             show_grid: true,
+            show_ground: true,
             show_origin: false,
             snap_3d: true,
             unit_asked: false,
@@ -9293,6 +9299,46 @@ impl FactoryState {
             seg(&mut out, Vec3::new(cx - half, y, 0.0), Vec3::new(cx + half, y, 0.0), cyl);
         }
         out
+    }
+
+    /// The flat ground surface — one camera-following quad, normal +Z, in the same colour family
+    /// as the grid so the two read as one ground plane.
+    ///
+    /// Rests 2 cm BELOW z = 0: the ground-floor slab's bottom face sits exactly on z = 0, and a
+    /// quad sharing that plane z-fights with it (the visible flicker is the two surfaces
+    /// alternating by depth precision). Two centimetres is invisible and ends the fight.
+    ///
+    /// Sized by the SAME reach rule as [`Self::grid_lines`] (1.6× camera distance overhead; the
+    /// 1/sin(pitch) stretch when looking along the ground, capped at 10×) so the quad always
+    /// covers the whole view and its edges stay off screen — a fixed pad around the model would
+    /// show its rim the moment you orbit past it, which reads as the world ending.
+    ///
+    /// Drawn through the renderer's `dyn_verts` slot (opaque, depth-tested, sun-shaded, receives
+    /// the model's shadows) — NOT through `opaque_verts`, whose cache is keyed on the MODEL and
+    /// would rebuild the whole heavy buffer every time the camera moved.
+    pub fn ground_plane_verts(&self) -> Vec<V3> {
+        if !self.show_ground {
+            return Vec::new();
+        }
+        let spread = if self.ortho {
+            1.6
+        } else {
+            (1.6 / self.cam_pitch.abs().sin().max(0.16)).min(10.0)
+        };
+        let reach = (self.cam_dist * spread).clamp(1.0, 1.0e6);
+        let (cx, cy) = (self.cam_target[0], self.cam_target[1]);
+        let h = reach;
+        const GROUND_Z: f32 = -0.02;
+        const GROUND: [f32; 3] = [0.33, 0.31, 0.26]; // dry earth — under the rooms, not in them
+        let v = |x: f32, y: f32| V3 {
+            x, y, z: GROUND_Z,
+            r: GROUND[0], g: GROUND[1], b: GROUND[2],
+            nx: 0.0, ny: 0.0, nz: 1.0,
+            mode: SHADE_SCENE,
+        };
+        // Two triangles, wound CCW from above so the +Z normal is outward.
+        let (a, b, cc, d) = (v(cx - h, cy - h), v(cx + h, cy - h), v(cx + h, cy + h), v(cx - h, cy + h));
+        vec![a, b, cc, a, cc, d]
     }
 
     /// THE ORIGIN — three axes standing at (0, 0, 0), so world zero is a place you can see.
@@ -15408,6 +15454,57 @@ mod ground_grid {
         let (reach, segs) = extent(&st);
         assert!(reach >= st.cam_dist, "the grid stops short at full zoom-out");
         assert!(segs < 300, "…and does not explode getting there: {segs} segments");
+    }
+}
+
+mod ground_plane {
+    use super::*;
+
+    /// OFF means OFF — the GND badge toggle must produce nothing at all.
+    #[test]
+    fn off_is_empty() {
+        let mut st = FactoryState::default();
+        st.show_ground = false;
+        assert!(st.ground_plane_verts().is_empty(), "the ground is empty when off");
+    }
+
+    /// The quad is two triangles (6 verts), rests a hair below z = 0 (so the ground-floor
+    /// slab's bottom face at z = 0 cannot z-fight with it), faces up, and is sun-lit like
+    /// the model rather than passed through as a UI swatch.
+    #[test]
+    fn the_quad_is_below_zero_facing_up_and_scene_shaded() {
+        let mut st = FactoryState::default();
+        st.show_ground = true;
+        st.cam_target = [-232.0, -58.0, 0.0];
+        st.cam_dist = 50.0;
+        let v = st.ground_plane_verts();
+        assert_eq!(v.len(), 6, "two triangles");
+        for p in &v {
+            assert_eq!(p.z, -0.02, "a hair below z = 0, not on it");
+            assert_eq!((p.nx, p.ny, p.nz), (0.0, 0.0, 1.0), "facing up");
+            assert_eq!(p.mode, SHADE_SCENE, "sun-lit like the model");
+        }
+    }
+
+    /// THE WHOLE POINT — the quad follows the camera and covers the view at any zoom, so it
+    /// never shows its own rim. Same reach rule as the grid.
+    #[test]
+    fn the_ground_covers_the_view_at_any_zoom() {
+        let mut st = FactoryState::default();
+        st.show_ground = true;
+        for dist in [2.0_f32, 20.0, 200.0, 2000.0, 50_000.0] {
+            st.cam_dist = dist;
+            let v = st.ground_plane_verts();
+            assert_eq!(v.len(), 6, "still one quad at {dist} m");
+            let xs: Vec<f32> = v.iter().map(|p| p.x).collect();
+            let reach = xs.iter().copied().fold(f32::MIN, f32::max)
+                - xs.iter().copied().fold(f32::MAX, f32::min);
+            assert!(
+                reach / 2.0 >= dist,
+                "at cam_dist {dist} the ground reaches only {:.1} m",
+                reach / 2.0
+            );
+        }
     }
 }
 

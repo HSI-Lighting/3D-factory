@@ -15335,6 +15335,11 @@ impl CadApp {
                 let t_build = std::time::Instant::now();
                 let verts = self.factory.opaque_verts();
                 let build_us = t_build.elapsed().as_micros() as u64;
+                // The flat ground surface, if the GND badge is on: one camera-following quad
+                // through the per-frame opaque slot (`dyn_verts`) — it must NOT ride in the
+                // model-keyed cache, because it moves with the camera and would rebuild the
+                // whole heavy buffer every frame.
+                let ground = self.factory.ground_plane_verts();
 
                 // FURNITURE: one GPU-instanced draw per piece. Each mesh is baked to LOCAL space
                 // ONCE (cached by asset+colour) and uploaded to its own GPU buffer once by the
@@ -15758,10 +15763,12 @@ impl CadApp {
                         ants = Some((to_s(base), to_s(cw), accent));
                     }
                 }
-                if verts.is_empty() && lines.is_empty() && furn_draws.is_empty()
-                    && transp_draws_owned.is_empty() && tex_transp_draws_owned.is_empty()
-                    && tex_draws_owned.is_empty() && tex_feat_owned.is_empty()
-                    && tex_feat_transp_owned.is_empty()
+                // The ground counts as a scene: with the GND badge on, an empty model still has
+                // something to look at, so the placeholder must not replace the render.
+                if verts.is_empty() && lines.is_empty() && ground.is_empty()
+                    && furn_draws.is_empty() && transp_draws_owned.is_empty()
+                    && tex_transp_draws_owned.is_empty() && tex_draws_owned.is_empty()
+                    && tex_feat_owned.is_empty() && tex_feat_transp_owned.is_empty()
                 {
                     painter.text(
                         rect.center(),
@@ -15832,7 +15839,7 @@ impl CadApp {
                                 r.render(
                                     // The 3D Factory already keeps its whole scene in the versioned
                                     // buffer, so it has no per-frame opaque geometry to add.
-                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver), 0, &[],
+                                    gl, &verts, &overlay, &lines, &mvp, Some(scene_ver), 0, &ground,
                                     &furn, &transp, &tex_assets, &tex_draws, &tex_transp, &tex_feat,
                                     &tex_feat_transp, cam_pos, &tex_reflect_owned, &tex_proc_owned,
                                     &tex_pbr_owned, sun_uniform, &shadow_mvp, clay, mf_highlight, color_pipeline, env_render, true,
@@ -50035,6 +50042,17 @@ impl eframe::App for CadApp {
                                  spacing with the zoom, so it covers the whole view at any scale.")
                         {
                             self.factory.show_grid = !self.factory.show_grid;
+                        }
+                        // The flat ground surface under the model — the rooms sit on something
+                        // instead of floating in the void. Drawn with the grid, in the same
+                        // colour family, so the two read as one ground plane.
+                        if self.factory.open
+                            && drafting_badge(ui, "GND", self.factory.show_ground,
+                                "Flat ground surface at z = 0 under the model. Follows the \
+                                 camera like the grid, catches the model's shadows, and turns \
+                                 off with this badge.")
+                        {
+                            self.factory.show_ground = !self.factory.show_ground;
                         }
                         // The world-origin axes. Off by default and separate from the grid: one is
                         // a working surface, the other a reference point.
