@@ -4794,8 +4794,12 @@ Type \n                     `straylights` to list them, `straylights purge` to r
                 // written in, and for a diffuse surface it is ρE/π — so a bright ceiling and a
                 // dark floor can receive the same light and look nothing alike.
                 if !self.surfaces.is_empty() {
-                    ui.add_space(4.0);
+                    // egui forbids `add_space` inside a Grid ("You cannot advance
+                    // the cursor when in a grid layout") — the section heading is
+                    // a two-cell row with an empty second cell instead.
                     ui.label(egui::RichText::new("room surfaces").small().weak());
+                    ui.label("");
+                    ui.end_row();
                     for s in &self.surfaces {
                         row(
                             ui,
