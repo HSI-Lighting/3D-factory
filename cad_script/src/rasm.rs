@@ -348,7 +348,7 @@ fn doc_active_layer(py: Python<'_>) -> PyResult<u32> {
 }
 
 /// Names of all block definitions.
-#[pyfunction]
+#[pyfunction(name = "blocks")]
 fn doc_blocks(py: Python<'_>) -> PyResult<Vec<String>> {
     let rep = round_trip(py, ScriptOp::BlocksGet)?;
     match rep {
@@ -645,6 +645,12 @@ fn scale_entities(
     center: (f64, f64),
     factor: f64,
 ) -> PyResult<usize> {
+    // docs §4.2: "factor must be > 0"
+    if !(factor > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "scale factor must be > 0",
+        ));
+    }
     let rep = round_trip(py, ScriptOp::ModifyScale {
         indices,
         pivot: Vec2::new(center.0, center.1),

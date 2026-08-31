@@ -25,3 +25,9 @@ Desktop.ini
 # Build output of packaging/build-package.ps1 — a packaged copy of what is already
 # in the tree, so committing it would double every asset for no gain.
 /dist
+
+# Python test suite artifacts
+.venv/
+tests/__pycache__/
+tests/report/
+test-results.xml

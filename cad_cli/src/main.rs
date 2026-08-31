@@ -146,7 +146,9 @@ fn apply_line(doc: &mut Document, cmd: Command) -> String {
     let mut out = String::new();
     match cmd {
         Command::Add(geom) => {
-            let i = doc.push(DObject::new(geom));
+            let mut d = DObject::new(geom);
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             out.push_str(&format!("+ #{} {}\n", i, describe(&doc.dobjects[i].geom)));
         }
         Command::Delete(i) => {
@@ -444,6 +446,38 @@ fn run_python(doc: &mut Document, job: PythonJob) {
     }
 }
 
+/// Stamp the document's CURRENT style (color / linetype / lineweight) and
+/// ACTIVE layer onto a fresh entity — the headless twin of the GUI's
+/// `stamp_fresh_style` (cad_app/src/app.rs). Script adds (`rasm.add_*`) and
+/// parser adds are "fresh draws": the docs promise new entities land on the
+/// active layer with the current style.
+fn stamp_fresh_style(doc: &Document, style: &mut Style) {
+    let fresh_default = style.layer == LayerTable::LAYER_ZERO
+        && style.color == Color::ByLayer
+        && style.linetype == LinetypeTable::CONTINUOUS
+        && style.linetype_scale == 1.0
+        && style.lineweight == Lineweight::ByLayer
+        && style.visible;
+    if fresh_default {
+        style.color = doc.current_color;
+        // BYLAYER (u32::MAX) → follow the active layer's linetype at draw
+        // time (linetype has no ByLayer variant); else the current linetype.
+        style.linetype = if doc.current_linetype == LinetypeTable::BYLAYER {
+            doc.layers.get(doc.layers.active)
+                .map(|l| l.linetype)
+                .unwrap_or(LinetypeTable::CONTINUOUS)
+        } else {
+            doc.current_linetype
+        };
+        style.lineweight = doc.current_lineweight;
+    }
+    if style.layer == LayerTable::LAYER_ZERO
+        && doc.layers.active != LayerTable::LAYER_ZERO
+    {
+        style.layer = doc.layers.active;
+    }
+}
+
 /// Apply one script op against the headless document. Reads + geometry adds
 /// + layers + entity modification work; UI-only surfaces (selection, view,
 /// sysvars, blocks, files) answer loudly instead of pretending (rule 10).
@@ -532,44 +566,56 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
 
         ScriptOp::SelectionSet { .. } => ScriptOpReply::Indices(Vec::new()),
         ScriptOp::AddLine { a, b } => {
-            let i = doc.push(DObject::new(Geom::Line(Line { a: *a, b: *b })));
+            let mut d = DObject::new(Geom::Line(Line { a: *a, b: *b }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddCircle { center, radius } => {
             if !(*radius > 0.0) { return ScriptOpReply::Error("circle radius must be > 0".into()); }
-            let i = doc.push(DObject::new(Geom::Circle(Circle { center: *center, radius: *radius })));
+            let mut d = DObject::new(Geom::Circle(Circle { center: *center, radius: *radius }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddArc { center, radius, start_deg, sweep_deg } => {
             if !(*radius > 0.0) { return ScriptOpReply::Error("arc radius must be > 0".into()); }
-            let i = doc.push(DObject::new(Geom::Arc(Arc {
+            let mut d = DObject::new(Geom::Arc(Arc {
                 center: *center,
                 radius: *radius,
                 start_angle: start_deg.to_radians(),
                 sweep_angle: sweep_deg.to_radians(),
-            })));
+            }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddEllipse { center, major, ratio } => {
-            let i = doc.push(DObject::new(Geom::Ellipse(Ellipse {
+            let mut d = DObject::new(Geom::Ellipse(Ellipse {
                 center: *center, major: *major, ratio: *ratio,
-            })));
+            }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddPolyline { vertices, closed } => {
             if vertices.len() < 2 {
                 return ScriptOpReply::Error("a polyline needs at least 2 points".into());
             }
-            let i = doc.push(DObject::new(Geom::Polyline(Polyline {
+            let mut d = DObject::new(Geom::Polyline(Polyline {
                 vertices: vertices.iter()
                     .map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
                 closed: *closed,
                 widths: Vec::new(),
-            })));
+            }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddPoint { at } => {
-            let i = doc.push(DObject::new(Geom::Point(Point { location: *at, style: 0, size: 0.0 })));
+            let mut d = DObject::new(Geom::Point(Point { location: *at, style: 0, size: 0.0 }));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::AddText { text, at, height, angle_deg } => {
@@ -578,7 +624,9 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
             t.height = *height;
             t.angle = angle_deg.to_radians();
             t.text = text.clone();
-            let i = doc.push(DObject::new(Geom::Text(t)));
+            let mut d = DObject::new(Geom::Text(t));
+            stamp_fresh_style(doc, &mut d.style);
+            let i = doc.push(d);
             ScriptOpReply::Ok(i)
         }
         ScriptOp::Delete { indices } => {
@@ -672,6 +720,11 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
             Err(e) => ScriptOpReply::Error(e),
         },
         ScriptOp::ModifyCopy { indices, delta } => {
+            // Validated loudly, like the other transforms (docs §4.2: "if
+            // none of them exist the call raises").
+            if indices.iter().all(|&i| i >= doc.dobjects.len()) {
+                return ScriptOpReply::Error("none of the given entity indices exist".into());
+            }
             let n0 = doc.dobjects.len();
             for &i in indices {
                 if let Some(src) = doc.dobjects.get(i).cloned() {
@@ -899,7 +952,8 @@ fn cli_apply_op(doc: &mut Document, op: &ScriptOp) -> ScriptOpReply {
                     "add_hatch: none of the given indices is a closed boundary".into(),
                 );
             }
-            let hd: DObject = Hatch { boundary_handles: handles, pattern: pat }.into();
+            let mut hd: DObject = Hatch { boundary_handles: handles, pattern: pat }.into();
+            stamp_fresh_style(doc, &mut hd.style);
             let i = doc.push(hd);
             ScriptOpReply::Ok(i)
         }
