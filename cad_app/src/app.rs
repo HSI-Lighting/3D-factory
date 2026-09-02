@@ -1146,6 +1146,22 @@ fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     crate::simlux_io::replace_file(std::path::Path::new(&tmp), std::path::Path::new(path))
 }
 
+/// Normalize a document for serialization. At RUNTIME the layer tables live
+/// in the SWAPPED arrangement while a layout tab is active (doc.layers = that
+/// layout's paper table, the model table sits inside `layouts[i].layers`).
+/// Files always store doc.layers = MODEL table + each layout's OWN paper table,
+/// so swap back and clear `active_layout` before any writer sees the doc —
+/// otherwise saving from a layout tab silently persists the swapped pair
+/// (paper table as the model table) and the file corrupts or refuses to load.
+fn normalize_layers_for_save(doc: &mut Document) {
+    if let Some(li) = doc.active_layout {
+        if let Some(layout) = doc.layouts.get_mut(li) {
+            std::mem::swap(&mut doc.layers, &mut layout.layers);
+        }
+        doc.active_layout = None;
+    }
+}
+
 fn save_file_worker(
     path: &str,
     doc: Document,
@@ -1161,6 +1177,10 @@ fn save_file_worker(
         rec.uv_b64 = if g.uv.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.uv) };
         rec.alpha_b64 = if g.alpha.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.alpha) };
     }
+    // CRITICAL: never serialize the swapped (active-tab) table arrangement —
+    // the RSM/DXF writers expect doc.layers = model table.
+    let mut doc = doc;
+    normalize_layers_for_save(&mut doc);
     let lower = path.to_ascii_lowercase();
     let bytes: Vec<u8> = if lower.ends_with(".dxf") || lower.ends_with(".dwg") {
         // A DWG GOES OUT AS DXF FIRST. Nothing here writes DWG — it is closed, versioned and
@@ -1996,7 +2016,6 @@ pub struct CadApp {
     /// unified dock host (see dock.rs) — the same engine the Inspector uses.
     /// Defaults to floating lower-left; drag its header to an edge to dock
     /// (Bottom = the AutoCAD-style command strip), drag out to float again.
-    cmd_dock_state:      crate::dock::DockState,
     layers_window_open:  bool,
     pens_window_open:    bool,
     info_window_open:    bool,
@@ -3114,6 +3133,53 @@ pub struct CadApp {
     /// Page Setup (dockable) dialog — model-space plot configuration.
     pagesetup_open: bool,
     pagesetup_dock_state: crate::dock::DockState,
+    // ---- Model/Layout tabs (upstream parity) ----
+    /// Paper-space selection (indices into the ACTIVE layout's `entities`).
+    /// Model selections live in `self.selection`; cleared on every tab switch.
+    layout_selection: Vec<usize>,
+    /// Drag state for paper-space MOVE (world pos of the last drag frame).
+    layout_move_last: Option<Vec2>,
+    /// In-progress paper grip drag: (entity index, role, origin).
+    layout_grip_drag: Option<(usize, cad_kernel::GripRole, Vec2)>,
+    /// Model-space camera saved when the user switches INTO a layout and
+    /// restored when they come back (each layout keeps its own camera in
+    /// `Layout.camera`).
+    saved_model_scale: Option<f32>,
+    saved_model_offset: Option<egui::Vec2>,
+    /// "New Layout" dialog state.
+    show_new_layout_dialog: bool,
+    new_layout_name: String,
+    new_layout_paper: cad_kernel::plotstyle::PaperSize,
+    new_layout_landscape: bool,
+    new_layout_ctb: String,
+    /// Layout PRINT-PREVIEW toggle. OFF (default) = viewports show the model in
+    /// its true colors (identical to the model render). ON = apply the plot pen
+    /// / CTB colors so the layout previews what will print.
+    layout_print_preview: bool,
+    /// A viewport-drawing flow is mid-flight (0 = none; 1 = first corner
+    /// placed, waiting for the second).
+    viewport_draw_state: u8,
+    /// The layout the in-flight viewport-create flow belongs to (corners are
+    /// paper mm of THAT layout; the scale dialog must not redirect the create
+    /// onto whatever tab is active when "Create Viewport" is clicked).
+    viewport_draw_li: Option<usize>,
+    viewport_draw_p1: Option<Vec2>,
+    viewport_draw_p2: Option<Vec2>,
+    /// Selected viewport's scale dialog.
+    viewport_scale_dialog_open: bool,
+    viewport_scale_text: String,
+    viewport_custom_n:    String,
+    viewport_custom_m:    String,
+    viewport_custom_unit: String,
+    viewport_ctb_name: String,
+    /// Double-clicked viewport → its edit dialog (layout index, viewport
+    /// index) — bound to the LAYOUT it was opened from, so switching tabs can
+    /// never redirect Apply onto a different space.
+    vp_edit_dialog: Option<(usize, usize)>,
+    /// Edit-dialog seed buffers (per-open init tracked by `vp_edit_init_for`).
+    vp_edit_scale_text: String,
+    vp_edit_ctb: String,
+    vp_edit_init_for: Option<(usize, usize)>,
     /// Session Recorder — captures every user action / state transition
     /// / doc mutation when armed. OFF by default; user pushes Start in
     /// the Recorder window before a debug session. See
@@ -3280,6 +3346,11 @@ pub struct ScriptPreview {
 }
 
 const UNDO_STACK_CAP: usize = 64;
+/// Command bar geometry (§7 height computation — COMMAND_BAR_MENTOR).
+const CMD_PILL_H:    f32   = 25.0;   // input pill height
+const CMD_PAD_TOP:   f32   = 8.0;    // history top margin + gap above the pill
+const CMD_PAD_BELOW: f32   = 16.0;   // gap from the pill bottom to the bar bottom
+const CMD_HIST_LINES: usize = 3;     // default fully-visible history lines
 
 /// HOW MUCH MEMORY THE UNDO HISTORY MAY HOLD, in bytes.
 ///
@@ -4670,7 +4741,6 @@ impl Default for CadApp {
             cmd_window_open:     true,
             factory_was_open:    false,
             menubar_rect:        egui::Rect::NOTHING,
-            cmd_dock_state:      crate::dock::DockState::Floating(egui::pos2(360.0, 560.0)),
             layers_window_open:  false,
             pens_window_open:    false,
             info_window_open:    false,
@@ -5056,6 +5126,31 @@ impl Default for CadApp {
             plot_unit_inch:   false,
             plot_run_after_save: false,
             plot_preview_open: false,
+            layout_selection: Vec::new(),
+            layout_move_last: None,
+            layout_grip_drag: None,
+            saved_model_scale: None,
+            saved_model_offset: None,
+            show_new_layout_dialog: false,
+            new_layout_name: String::new(),
+            new_layout_paper: cad_kernel::plotstyle::PaperSize::A4,
+            new_layout_landscape: false,
+            new_layout_ctb: String::new(),
+            layout_print_preview: true,
+            viewport_draw_state: 0,
+            viewport_draw_li: None,
+            viewport_draw_p1: None,
+            viewport_draw_p2: None,
+            viewport_scale_dialog_open: false,
+            viewport_scale_text: String::new(),
+            viewport_custom_n: String::new(),
+            viewport_custom_m: String::new(),
+            viewport_custom_unit: "mm".into(),
+            viewport_ctb_name: String::new(),
+            vp_edit_dialog: None,
+            vp_edit_scale_text: String::new(),
+            vp_edit_ctb: String::new(),
+            vp_edit_init_for: None,
             pagesetup_open: false,
             pagesetup_dock_state: crate::dock::DockState::Floating(egui::pos2(1240.0, 420.0)),
             dbg: crate::dbg_recorder::DbgRecorder::default(),
@@ -27763,6 +27858,886 @@ impl CadApp {
         }
     }
 
+    fn render_layout_tabs(&mut self, ctx: &egui::Context) {
+        use cad_kernel::plotstyle::PaperSize;
+        use crate::theme::color as tc;
+        let active = self.doc.active_layout;
+        let n_layouts = self.doc.layouts.len();
+        let nt: Vec<String> = self.doc.layouts.iter().map(|l| l.name.clone()).collect();
+        let pt: Vec<(PaperSize, cad_kernel::plotstyle::Orientation)> = self.doc.layouts.iter().map(|l| (l.paper, l.orientation)).collect();
+        let sk = egui::Id::new("lsi"); let ck = egui::Id::new("lci"); let nk = egui::Id::new("lnd");
+        egui::TopBottomPanel::top("layout_tabs").min_height(26.0).show(ctx, |ui| { ui.horizontal(|ui| {
+            ui.add_space(11.0); let im = active.is_none();
+            if ui.add(egui::Button::new(egui::RichText::new("Model").color(if im{tc::ACCENT}else{tc::TEXT_MUTED}).size(12.0)).fill(if im{tc::SURFACE_2}else{egui::Color32::TRANSPARENT}).min_size(egui::vec2(54.0,22.0)).rounding(egui::Rounding::same(4.0))).clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp::<Option<usize>>(sk, None)); }
+            ui.add_space(2.0);
+            for (i, name) in nt.iter().enumerate() { let is = active == Some(i); let r = ui.add(egui::Button::new(egui::RichText::new(name).color(if is{tc::ACCENT}else{tc::TEXT_MUTED}).size(12.0)).fill(if is{tc::SURFACE_2}else{egui::Color32::TRANSPARENT}).min_size(egui::vec2(80.0,22.0)).rounding(egui::Rounding::same(4.0)));
+                if r.clicked() { ui.ctx().data_mut(|d| d.insert_temp::<Option<usize>>(sk, Some(i))); }
+                r.context_menu(|ui| { if ui.button("Close Layout").clicked() { ui.ctx().data_mut(|d| d.insert_temp::<usize>(ck, i)); ui.close_menu(); } }); }
+            ui.add_space(2.0);
+            if ui.add(egui::Button::new(egui::RichText::new("+").color(tc::TEXT_MUTED).size(14.0)).fill(egui::Color32::TRANSPARENT).min_size(egui::vec2(22.0,22.0)).rounding(egui::Rounding::same(4.0))).clicked() {
+                ui.ctx().data_mut(|d| d.insert_temp::<bool>(nk, true)); }
+            ui.add_space(6.0);
+            if let Some(i) = active { if let Some((p, o)) = pt.get(i) { ui.label(egui::RichText::new(format!("{} {}", match p{PaperSize::A4=>"A4",PaperSize::A3=>"A3",PaperSize::A2=>"A2",PaperSize::A1=>"A1",PaperSize::A0=>"A0",PaperSize::Letter=>"Let",_=>"?"}, if matches!(o,cad_kernel::plotstyle::Orientation::Landscape){"L"}else{"P"})).color(tc::TEXT_MUTED).size(10.0)); } }
+            // Print-preview toggle (only in a layout): model true colours vs plot pen/CTB.
+            if active.is_some() {
+                ui.add_space(12.0);
+                let on = self.layout_print_preview;
+                let txt = if on { "◉ Print colors" } else { "○ Model colors" };
+                if ui.add(egui::Button::new(egui::RichText::new(txt).size(11.0)
+                        .color(if on { tc::ACCENT } else { tc::TEXT_MUTED }))
+                        .fill(if on { tc::SURFACE_2 } else { egui::Color32::TRANSPARENT })
+                        .rounding(egui::Rounding::same(4.0)))
+                    .on_hover_text("Viewport render: OFF = model's true colours; ON = plot pen / CTB colours")
+                    .clicked()
+                {
+                    self.layout_print_preview = !self.layout_print_preview;
+                }
+            }
+        }); });
+        if let Some(t) = ctx.data_mut(|d| d.remove_temp::<Option<usize>>(sk)) { self.switch_to_tab(t); }
+        if let Some(i) = ctx.data_mut(|d| d.remove_temp::<usize>(ck)) { if i < self.doc.layouts.len() { if self.doc.active_layout == Some(i) { self.switch_to_tab(None); } self.doc.layouts.remove(i); self.doc.active_layout = match self.doc.active_layout { Some(a) if a > i => Some(a-1), o => o }; } }
+        if ctx.data_mut(|d| d.remove_temp::<bool>(nk)).unwrap_or(false) { self.show_new_layout_dialog = true; self.new_layout_name = format!("Layout {}", n_layouts + 1); self.new_layout_paper = PaperSize::A4; self.new_layout_landscape = true; }
+    }
+
+    /// LAYOUT TAB paper render: the white page (outline + name), every paper
+    /// entity (print-preview applies the layout CTB), then each viewport's
+    /// window into the model (true colours, or per-viewport CTB under the
+    /// print-preview toggle), selection grips and viewport lock badges.
+    fn paper_space_render(&mut self, ui: &egui::Ui, rect: egui::Rect,
+                          painter: &egui::Painter, resp: &egui::Response) {
+        let _ = ui;
+            // ---- paper-space layout rendering ----------------------------
+            if let Some(li) = self.doc.active_layout { if let Some(l) = self.doc.layouts.get(li) {
+                let p0 = self.w2s(Vec2::new(0.0, 0.0), rect);
+                let p1 = self.w2s(Vec2::new(l.page_w_mm, l.page_h_mm), rect);
+                let pmn = egui::pos2(p0.x.min(p1.x), p0.y.min(p1.y));
+                let pmx = egui::pos2(p0.x.max(p1.x), p0.y.max(p1.y));
+                let pr = egui::Rect::from_min_max(pmn, pmx);
+                painter.rect_filled(pr, egui::Rounding::ZERO, egui::Color32::from_rgb(252,252,252));
+                painter.rect_stroke(pr, egui::Rounding::ZERO, egui::Stroke::new(1.5, egui::Color32::from_rgb(80,80,80)));
+                painter.text(egui::pos2(pmn.x+4.,pmx.y-14.), egui::Align2::LEFT_BOTTOM, &l.name, egui::FontId::proportional(11.), egui::Color32::from_rgb(120,120,120));
+                let ents = l.entities.clone();
+                // The layout's CTB table (saved CTBs only — built-ins resolve by
+                // name in apply_vp_ctb). The editor's live table wins while open.
+                let layout_ctb_table = if self.layout_print_preview {
+                    let name = l.ctb_name.as_deref().unwrap_or("");
+                    if self.plotstyle_open && self.doc.plot_styles.name.eq_ignore_ascii_case(name) {
+                        Some(&self.doc.plot_styles)
+                    } else {
+                        self.ctb_table_cache.get(name)
+                    }
+                } else { None };
+                for d in &ents { if !d.style.visible { continue; }
+                    let ego = if matches!(&d.geom, cad_kernel::Geom::Viewport(_)) { egui::Color32::from_rgb(60,60,80) }
+                    else { let (r,g,b) = cad_kernel::resolve_color(d.style.color, d.style.layer, &self.doc.layers, &self.doc.truecolors); egui::Color32::from_rgb(r,g,b) };
+                    let ego = if self.layout_print_preview {
+                        Self::apply_vp_ctb((ego.r(), ego.g(), ego.b()),
+                            style_effective_aci(d.style.color, d.style.layer, &self.doc.layers),
+                            l.ctb_name.as_deref().unwrap_or(""), layout_ctb_table)
+                    } else { ego };
+                    // Hatches: `draw_dobject` / `paint_dobject_ctb` stub Hatch as
+                    // a no-op — short-circuit to the boundary-resolving fill
+                    // renderer with the CTB-applied colour.
+                    if let cad_kernel::Geom::Hatch(h) = &d.geom {
+                        self.render_hatch_fill(&painter, rect, h, ego);
+                        continue;
+                    }
+                    if self.layout_print_preview {
+                        // Print-preview: the effective CTB's pen width + linetype.
+                        paint_dobject_ctb(&painter, rect, self, d, ego, self.scale,
+                            layout_ctb_table, &self.doc.layers);
+                    } else {
+                        draw_dobject(&painter, rect, self, &d.geom, ego);
+                    } }
+                let vps = &l.viewports;
+                let ssc = self.scale; let sof = self.world_offset;
+                let page_white = egui::Color32::from_rgb(252, 252, 252);
+                let mut hatch_pending: Vec<(u64, HatchCacheEntry)> = Vec::new();
+                for vp in vps {
+                    // Restore paper camera for screen-coordinate math
+                    self.scale = ssc; self.world_offset = sof;
+                    let Some(h) = vp.shape_handle else { continue; };
+                    let Some(e) = ents.iter().find(|e| e.handle == h) else { continue; };
+                    let cad_kernel::Geom::Viewport(vg) = &e.geom else { continue; };
+                    let a = self.w2s(Vec2::new(vg.center.x-vg.width*0.5, vg.center.y-vg.height*0.5), rect);
+                    let b = self.w2s(Vec2::new(vg.center.x+vg.width*0.5, vg.center.y+vg.height*0.5), rect);
+                    let vp_sr = egui::Rect::from_min_max(egui::pos2(a.x.min(b.x),a.y.min(b.y)), egui::pos2(a.x.max(b.x),a.y.max(b.y)));
+                    let clip_painter = painter.with_clip_rect(vp_sr);
+                    let vc = egui::pos2((a.x+b.x)*0.5, (a.y+b.y)*0.5);
+                    let ms = (vp.model_zoom * vp.model_scale * ssc as f64) as f32;
+                    let cx = rect.center().x; let cy = rect.center().y;
+                    self.scale = ms; self.world_offset = egui::vec2((vc.x-cx)/ms - vp.model_center.0 as f32, (cy-vc.y)/ms - vp.model_center.1 as f32);
+                    // Per-viewport CTB, inheriting the LAYOUT's CTB when the
+                    // viewport has none (matches the plot scene); empty = full
+                    // colour.
+                    let vp_ctb: &str = vp.ctb_name.as_deref()
+                        .or(l.ctb_name.as_deref()).unwrap_or("");
+                    // Its saved table (built-ins resolve by name in apply_vp_ctb).
+                    // The editor's live table wins while open.
+                    let vp_ctb_table = if self.layout_print_preview {
+                        if self.plotstyle_open
+                            && self.doc.plot_styles.name.eq_ignore_ascii_case(vp_ctb)
+                        {
+                            Some(&self.doc.plot_styles)
+                        } else {
+                            self.ctb_table_cache.get(vp_ctb)
+                        }
+                    } else { None };
+                    // Model-space window covered by this viewport — culls the
+                    // per-frame model walk (hatches always draw: their bbox is
+                    // a placeholder).
+                    let k = (vp.model_zoom * vp.model_scale).max(1e-9);
+                    let wmn = Vec2::new(
+                        vp.model_center.0 - vg.width * 0.5 / k,
+                        vp.model_center.1 - vg.height * 0.5 / k);
+                    let wmx = Vec2::new(
+                        vp.model_center.0 + vg.width * 0.5 / k,
+                        vp.model_center.1 + vg.height * 0.5 / k);
+                    // Hatch cache warm-up budget for the viewport loops (the
+                    // model-space builder is skipped while a layout is active —
+                    // its candidates are empty). Bound per frame like the model
+                    // path so a dense batch of hatches can't spike one frame.
+                    let mut hatch_work = 0usize;
+                    for (d_idx, d) in self.doc.dobjects.iter().enumerate() {
+                        if !d.style.visible { continue; }
+                        if !l.layers.renders(d.style.layer) { continue; }
+                        let is_hatch = matches!(&d.geom, cad_kernel::Geom::Hatch(_));
+                        if !is_hatch {
+                            let (bmin, bmax) = d.bbox();
+                            if bmax.x < wmn.x || bmin.x > wmx.x
+                                || bmax.y < wmn.y || bmin.y > wmx.y { continue; }
+                        }
+                        // Model content resolves against the MODEL layer table
+                        // (held in `l.layers` while this layout is active — layers
+                        // are swapped on tab change), NOT the paper layers, so
+                        // ByLayer colours match the model exactly.
+                        let (r,g,b) = cad_kernel::resolve_color(d.style.color, d.style.layer, &l.layers, &self.doc.truecolors);
+                        // Default = true model colours (identical render). Only the
+                        // print-preview toggle applies the plot pen / CTB.
+                        let ego = if self.layout_print_preview {
+                            Self::apply_vp_ctb((r,g,b),
+                                style_effective_aci(d.style.color, d.style.layer, &l.layers),
+                                vp_ctb, vp_ctb_table)
+                        } else {
+                            egui::Color32::from_rgb(r,g,b)
+                        };
+                        if let cad_kernel::Geom::Hatch(h) = &d.geom {
+                            // Render the cached geometry (shared painter — the
+                            // page's white is the hole over-draw colour), or
+                            // warm the cache (budgeted + once per frame) and
+                            // fall back to the boundary fill until built.
+                            let mut painted = false;
+                            if let Some(entry) = self.hatch_cache.get(&d.handle) {
+                                paint_cached_hatch(&clip_painter, rect, self,
+                                    entry, ego, page_white);
+                                painted = true;
+                            }
+                            if !painted {
+                                if hatch_work < HATCH_GEN_WORK_BUDGET
+                                    && !hatch_pending.iter().any(|(hh, _)| *hh == d.handle)
+                                {
+                                    let entry = self.build_hatch_cache_entry(d_idx);
+                                    hatch_work += entry.segs.len() + entry.circs.len()
+                                        + entry.solid.iter().map(|(_, t)| t.len()).sum::<usize>();
+                                    paint_cached_hatch(&clip_painter, rect, self,
+                                        &entry, ego, page_white);
+                                    hatch_pending.push((d.handle, entry));
+                                } else {
+                                    self.render_hatch_fill(&clip_painter, rect, h, ego);
+                                }
+                            }
+                            continue;
+                        }
+                        if self.layout_print_preview {
+                            // Print-preview: the effective CTB's pen width +
+                            // linetype (paper scale = the layout tab's camera).
+                            paint_dobject_ctb(&clip_painter, rect, self, d, ego, ssc,
+                                vp_ctb_table, &l.layers);
+                        } else {
+                            draw_dobject(&clip_painter, rect, self, &d.geom, ego);
+                        }
+                    }
+                    // Cache warm-ups land after the borrow of `self.doc` ends.
+                    for (hh, entry) in hatch_pending.drain(..) {
+                        self.hatch_cache.insert(hh, entry);
+                    }
+                }
+                self.scale = ssc; self.world_offset = sof;
+                // Rubber-band for viewport creation
+                if self.viewport_draw_state == 2 { if let (Some(p1), Some(cs)) = (self.viewport_draw_p1, resp.hover_pos()) { let a = self.w2s(p1, rect); let rb = egui::Rect::from_two_pos(a, cs); painter.rect_stroke(rb, 0.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(0, 200, 255))); } }
+            } }
+
+
+    }
+
+    /// LAYOUT TAB paper input lane: viewport-frame selection / MOVE / grip
+    /// RESIZE (overlap-guarded), viewport-draw corner picking, right-click
+    /// context menu (Scale / Lock / Copy / Set CTB / Delete / Create
+    /// viewport), and Delete-key removal of paper entities.
+    fn paper_space_input(&mut self, ctx: &egui::Context, ui: &egui::Ui,
+                         rect: egui::Rect, painter: &egui::Painter,
+                         resp: &egui::Response) {
+        let _ = ctx;
+        let _ = painter;
+        let canvas_locked = self.block_editor.is_some() || self.plot_win_pick != 0;
+            // ---- Layout entity selection + grip resize + MOVE (paper space) ----
+            // Viewport frames behave like 2D dobjects: click INSIDE (or on the
+            // frame) to select, drag the body to MOVE, drag a grip to RESIZE.
+            // Overlap between viewports is prevented. (Paper is a sheet; the
+            // model inside is a view, handled separately.)
+            if self.doc.active_layout.is_some() && !canvas_locked && self.viewport_draw_state == 0 { let Some(li) = self.doc.active_layout else { return; }; let Some(l) = self.doc.layouts.get(li) else { return; }; let ents = l.entities.clone();
+                let tol = 10.0 / self.scale.max(0.01) as f64;
+                // Entity index under a world point: INSIDE a viewport rect, or
+                // within `tol` of any entity's frame.
+                let hit_at = |w: Vec2| -> Option<usize> {
+                    let mut best: Option<(usize, f64)> = None;
+                    for (i, d) in ents.iter().enumerate() {
+                        let (inside, dist) = if let cad_kernel::Geom::Viewport(vg) = &d.geom {
+                            let (mn, mx) = vg.bbox_world();
+                            let ins = w.x >= mn.x && w.x <= mx.x && w.y >= mn.y && w.y <= mx.y;
+                            (ins, if ins { 0.0 } else { d.geom.distance_to_point(w) })
+                        } else { (false, d.geom.distance_to_point(w)) };
+                        if inside || dist < tol { if best.map_or(true, |(_, bd)| dist < bd) { best = Some((i, dist)); } }
+                    }
+                    best.map(|(i, _)| i)
+                };
+                // Clear a stale move-anchor on any non-dragging frame (keeps it
+                // set through the stop frame so the window-select handler skips).
+                if !resp.dragged_by(egui::PointerButton::Primary) && !resp.drag_stopped() {
+                    self.layout_move_last = None;
+                }
+                // Grip hover (selected entities only).
+                let mut near_grip: Option<(usize, GripRole)> = None;
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    for &si in &self.layout_selection { if let Some(e) = ents.get(si) {
+                        for (gp, role) in e.geom.grip_points() { let gs = self.w2s(gp, rect); if pos.distance(gs) < 12.0 { near_grip = Some((si, role)); break; } }
+                        if near_grip.is_some() { break; }
+                    } }
+                }
+                // Start grip drag (resize).
+                if let Some((si, role)) = near_grip { if resp.drag_started() { if let Some(e) = ents.get(si) { if let Some(gp) = e.geom.grip_points().iter().find(|(_,r)| *r == role).map(|(p,_)|*p) { self.layout_grip_drag = Some((si, role, gp)); } } } }
+                // Start MOVE drag: press on a viewport body (not a grip). Auto-select.
+                if near_grip.is_none() && self.layout_grip_drag.is_none() && resp.drag_started() {
+                    if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
+                        if let Some(i) = hit_at(w) {
+                            if !self.layout_selection.contains(&i) {
+                                if !ui.input(|inp| inp.modifiers.shift) { self.layout_selection.clear(); }
+                                self.layout_selection.push(i);
+                            }
+                            self.layout_move_last = Some(w);
+                        }
+                    }
+                }
+                // Process grip RESIZE (with overlap guard).
+                if let Some((si, role, origin)) = self.layout_grip_drag { if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
+                    if resp.dragged_by(egui::PointerButton::Primary) {
+                        // Bounds-guarded: the entity may have been deleted (or
+                        // the tab switched) mid-drag; abort the resize instead
+                        // of indexing out of range or mutating a stranger.
+                        let Some(entity) = ents.get(si) else {
+                            self.layout_grip_drag = None;
+                            self.layout_move_last = None;
+                            return;
+                        };
+                        let new_geom = entity.geom.with_grip_moved(role, origin + (w - origin));
+                        let ok = if let cad_kernel::Geom::Viewport(nvg) = &new_geom {
+                            let (nmn, nmx) = nvg.bbox_world();
+                            !Self::layout_rect_overlaps(&ents, si, (nmn.x,nmn.y), (nmx.x,nmx.y))
+                        } else { true };
+                        if ok { if let Some(layout) = self.doc.layouts.get_mut(li) { if let Some(entity) = layout.entities.get_mut(si) {
+                            entity.geom = new_geom;
+                            if let cad_kernel::Geom::Viewport(vg) = &entity.geom { if let Some(vi) = layout.viewports.iter().position(|v| v.shape_handle == Some(entity.handle)) {
+                                let vd = &mut layout.viewports[vi]; vd.rect_min = (vg.center.x-vg.width*0.5, vg.center.y-vg.height*0.5); vd.rect_max = (vg.center.x+vg.width*0.5, vg.center.y+vg.height*0.5);
+                                // P0: a mid-grip pans the model in the entity (authoritative);
+                                // mirror it back so the sidecar the renderer reads stays in sync.
+                                vd.model_center = (vg.model_center.x, vg.model_center.y); vd.model_zoom = vg.model_zoom; vd.model_scale = vg.model_scale; } }
+                        } } }
+                    }
+                } }
+                // Process MOVE drag (selected viewports, overlap-guarded per entity).
+                else if let Some(last) = self.layout_move_last { if resp.dragged_by(egui::PointerButton::Primary) { if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
+                    let dv = w - last;
+                    let sel = self.layout_selection.clone();
+                    if let Some(layout) = self.doc.layouts.get_mut(li) {
+                        for &si in &sel {
+                            let (nc, nmn, nmx, h) = {
+                                let Some(entity) = layout.entities.get(si) else { continue };
+                                let cad_kernel::Geom::Viewport(vg) = &entity.geom else { continue };
+                                let nc = vg.center + dv;
+                                ((nc), (nc.x-vg.width*0.5, nc.y-vg.height*0.5), (nc.x+vg.width*0.5, nc.y+vg.height*0.5), entity.handle)
+                            };
+                            if Self::layout_rect_overlaps(&ents, si, nmn, nmx) { continue; }
+                            if let Some(entity) = layout.entities.get_mut(si) {
+                                if let cad_kernel::Geom::Viewport(vg) = &mut entity.geom { vg.center = nc; }
+                            }
+                            if let Some(vd) = layout.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) {
+                                vd.rect_min = nmn; vd.rect_max = nmx;
+                            }
+                        }
+                    }
+                    self.layout_move_last = Some(w);
+                } } }
+                // End drags on stop.
+                if resp.drag_stopped() { self.layout_grip_drag = None; }
+                // Right-click on a viewport → select it, so the context menu
+                // always offers Scale / Lock / Copy for the one under the cursor.
+                if resp.secondary_clicked() { if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
+                    if let Some(i) = hit_at(w) { if !self.layout_selection.contains(&i) { self.layout_selection = vec![i]; } }
+                } }
+                // Click for selection (inside rect or on frame). A click on a
+                // corner LOCK BADGE toggles that viewport's scale lock instead.
+                if resp.clicked() && self.layout_grip_drag.is_none() && self.layout_move_last.is_none() && near_grip.is_none() { if let Some(pos) = resp.interact_pointer_pos() {
+                    // Lock badge hit?
+                    let mut badge_handle: Option<u64> = None;
+                    for e in &ents { if let cad_kernel::Geom::Viewport(vg) = &e.geom {
+                        let (_mn, mx) = vg.bbox_world();
+                        let tr = self.w2s(Vec2::new(mx.x, mx.y), rect);
+                        if pos.distance(egui::pos2(tr.x - 12.0, tr.y + 12.0)) < 11.0 { badge_handle = Some(e.handle); break; }
+                    } }
+                    if let Some(h) = badge_handle {
+                        if let Some(layout) = self.doc.layouts.get_mut(li) { if let Some(v) = layout.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) { v.locked = !v.locked; } }
+                    } else {
+                        let w = self.s2w(pos, rect);
+                        let best = hit_at(w);
+                        if !ui.input(|inp| inp.modifiers.shift) && !ui.input(|inp| inp.modifiers.ctrl) { self.layout_selection.clear(); }
+                        if let Some(i) = best {
+                            let was_selected = self.layout_selection.contains(&i);
+                            if resp.double_clicked() {
+                                // Double-click opens the viewport's Properties
+                                // dialog — checked BEFORE the toggle so a
+                                // double-click on an UNSELECTED viewport works
+                                // (the second click must not deselect it first).
+                                if !was_selected { self.layout_selection.push(i); }
+                                if let Some(layout) = self.doc.layouts.get(li) {
+                                    if let Some(e) = ents.get(i) {
+                                        if let Some(vi) = layout.viewports.iter().position(|v| v.shape_handle == Some(e.handle)) {
+                                            self.vp_edit_dialog = Some((li, vi));
+                                        }
+                                    }
+                                }
+                            } else if was_selected {
+                                self.layout_selection.retain(|&x| x != i);
+                            } else {
+                                self.layout_selection.push(i);
+                            }
+                        }
+                    }
+                } }
+            }
+
+            // ---- Viewport rectangle pick (paper space) -------------------
+            if self.viewport_draw_state != 0 && !canvas_locked {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) { self.viewport_draw_state = 0; self.viewport_draw_p1 = None; self.viewport_draw_li = None; self.clear_prompt(); }
+                if resp.clicked() { if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
+                    if self.viewport_draw_state == 1 {
+                        // First corner — advance to the second, DO NOT reset here.
+                        self.viewport_draw_p1 = Some(w);
+                        self.viewport_draw_state = 2;
+                        self.set_prompt("Click second corner of viewport (Esc to cancel)");
+                    } else if self.viewport_draw_state == 2 {
+                        if let Some(p1) = self.viewport_draw_p1 {
+                            let mn = Vec2::new(p1.x.min(w.x), p1.y.min(w.y));
+                            let mx = Vec2::new(p1.x.max(w.x), p1.y.max(w.y));
+                            if (mx.x-mn.x) > 1.0 && (mx.y-mn.y) > 1.0 {
+                                // Valid box — open the scale dialog and finish the tool.
+                                self.viewport_draw_p1 = Some(mn);
+                                self.viewport_draw_p2 = Some(mx);
+                                self.viewport_scale_text = String::from("1:100");
+                                self.viewport_ctb_name = String::new();  // default = full color (model render)
+                                self.viewport_scale_dialog_open = true;
+                                self.viewport_draw_state = 0;
+                                self.clear_prompt();
+                            } else {
+                                // Degenerate (zero-size) box — restart from corner 1.
+                                self.viewport_draw_p1 = None;
+                                self.viewport_draw_state = 1;
+                                self.set_prompt("Viewport too small — click first corner again (Esc to cancel)");
+                            }
+                        } else {
+                            // No stored first corner — bail cleanly.
+                            self.viewport_draw_state = 0;
+                            self.clear_prompt();
+                        }
+                    }
+                } }
+            }
+
+            // ---- right-click shortcut (context) menu --------------------
+            // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
+            // when there's a selection or something on the clipboard.
+            if !canvas_locked
+                && (!self.selection.is_empty() || !self.clipboard_dobjects.is_empty() || self.doc.active_layout.is_some())
+            {
+                resp.context_menu(|ui| {
+                    ui.set_min_width(150.0);
+                    // Group ▸ (flyout submenu)
+                    ui.menu_button("Group", |ui| {
+                        if ui.button("Group     Ctrl+G").clicked() {
+                            self.group_selection();
+                            ui.close_menu();
+                        }
+                        if ui.button("Add to Group").clicked() {
+                            self.add_to_group();
+                            ui.close_menu();
+                        }
+                        if ui.button("Ungroup").clicked() {
+                            self.ungroup_selection();
+                            ui.close_menu();
+                        }
+                    });
+                    // Clipboard ▸ (flyout submenu)
+                    ui.menu_button("Clipboard", |ui| {
+                        if ui.button("Copy      Ctrl+C").clicked() {
+                            self.copy_selection();
+                            let n = self.clipboard_dobjects.len();
+                            ui.ctx().copy_text(format!(
+                                "RUST-AutoRASM: {} object(s) on clipboard", n));
+                            ui.close_menu();
+                        }
+                        if ui.button("Paste     Ctrl+V").clicked() {
+                            self.start_paste();
+                            ui.close_menu();
+                        }
+                    });
+                    // DObject Snap ▸ (running-osnap toggles, same set as DSNAP)
+                    ui.menu_button("DObject Snap", |ui| {
+                        for k in SnapKind::ALL {
+                            let mut on = self.snap_enabled.is_enabled(k);
+                            let label = format!("{:<5}  {}", k.name(), snap_blurb(k));
+                            if ui.checkbox(&mut on, label).changed() {
+                                self.snap_enabled.set(k, on);
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("All on").clicked() {
+                                for k in SnapKind::ALL { self.snap_enabled.set(k, true); }
+                            }
+                            if ui.button("All off").clicked() {
+                                self.snap_enabled = SnapSet::default();
+                            }
+                            if ui.button("Defaults").clicked() {
+                                self.snap_enabled = SnapSet::defaults();
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if ui.button("Inspector").clicked() {
+                        self.info_window_open = true;
+                        ui.close_menu();
+                    }
+                    if self.doc.active_layout.is_some() {
+                        if !self.layout_selection.is_empty() {
+                            ui.separator();
+                            if ui.button("Viewport Scale / Properties…").clicked() {
+                                let ent_idx = self.layout_selection[0];
+                                if let Some(li) = self.doc.active_layout {
+                                    if let Some(layout) = self.doc.layouts.get(li) {
+                                        if let Some(e) = layout.entities.get(ent_idx) {
+                                            if let Some(vi) = layout.viewports.iter().position(|v| v.shape_handle == Some(e.handle)) {
+                                                self.vp_edit_dialog = Some((li, vi));
+                                            }
+                                        }
+                                    }
+                                }
+                                ui.close_menu();
+                            }
+                            // Lock / Unlock the scale (freezes the model view).
+                            {
+                                let li = self.doc.active_layout.unwrap_or(0);
+                                let ent_idx = self.layout_selection[0];
+                                let cur_locked = self.doc.layouts.get(li).and_then(|l| l.entities.get(ent_idx)).and_then(|e| self.doc.layouts.get(li).and_then(|l| l.viewports.iter().find(|v| v.shape_handle == Some(e.handle))).map(|v| v.locked)).unwrap_or(false);
+                                if ui.button(if cur_locked { "🔓 Unlock scale" } else { "🔒 Lock scale" }).clicked() {
+                                    let sel = self.layout_selection.clone();
+                                    if let Some(layout) = self.doc.layouts.get_mut(li) {
+                                        for &si in &sel { if let Some(e) = layout.entities.get(si) { let h = e.handle; if let Some(v) = layout.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) { v.locked = !cur_locked; } } }
+                                    }
+                                    ui.close_menu();
+                                }
+                                if ui.button("Copy Viewport").clicked() { self.copy_selected_viewports(); ui.close_menu(); }
+                            }
+                            ui.menu_button("Set CTB", |ui| {
+                                let ent_idx = self.layout_selection.first().copied().unwrap_or(0);
+                                if ui.button("None").clicked() { self.set_viewport_ctb(ent_idx, None); ui.close_menu(); }
+                                if ui.button("Monochrome").clicked() { self.set_viewport_ctb(ent_idx, Some("monochrome".into())); ui.close_menu(); }
+                                if ui.button("Grayscale").clicked() { self.set_viewport_ctb(ent_idx, Some("grayscale".into())); ui.close_menu(); }
+                                if ui.button("Full Color").clicked() { self.set_viewport_ctb(ent_idx, Some("fullcolor".into())); ui.close_menu(); }
+                                // The user's own CTBs (saved in the app's CTB folder).
+                                let saved = ctb_list();
+                                if !saved.is_empty() {
+                                    ui.separator();
+                                    for (name, _) in saved {
+                                        if CTB_RESERVED.contains(&name.to_ascii_lowercase().as_str()) { continue; }
+                                        if ui.button(&name).clicked() { self.set_viewport_ctb(ent_idx, Some(name.clone())); ui.close_menu(); }
+                                    }
+                                }
+                            });
+                            if ui.button("Delete Viewport").clicked() { self.delete_selected_viewports(); ui.close_menu(); }
+                        }
+                        ui.separator();
+                        if ui.button("Create Viewport").clicked() {
+                            self.viewport_draw_state = 1;
+                            self.viewport_draw_p1 = None;
+                            self.viewport_draw_li = self.doc.active_layout;
+                            self.set_prompt("Click first corner of viewport (Esc to cancel)");
+                            ui.close_menu();
+                        }
+                    }
+                    pp_cap_ui(ui, "canvas right-click menu");
+                });
+            }
+
+
+        // Delete / Backspace: remove the selected paper entities (undo-aware;
+        // viewport sidecars follow their frame entity).
+        if !self.layout_selection.is_empty()
+            && ui.input(|i| i.key_pressed(egui::Key::Delete)
+                            || i.key_pressed(egui::Key::Backspace))
+        {
+            // One undoable, shared removal (same path as the context menu).
+            self.delete_selected_viewports();
+        }
+        // Esc clears the paper selection (the global Esc handler also clears
+        // it, but this catches the lane's own frames).
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.layout_selection.clear();
+        }
+    }
+
+    /// Switch the active tab (None = Model). Saves the outgoing space's
+    /// camera (model → saved_model_*, layout → its Layout.camera), swaps the
+    /// per-space layer tables (kernel tables are swapped, so all doc.layers
+    /// consumers read the ACTIVE space's layers), clears both selections, and
+    /// restores the incoming space's camera.
+    fn switch_to_tab(&mut self, target: Option<usize>) {
+        if self.doc.active_layout == target { return; }
+        self.layout_selection.clear();
+        self.layout_grip_drag = None;
+        self.layout_move_last = None;
+        // Cancel any in-flight viewport-create flow and close the layout-bound
+        // viewport dialogs — their state refers to the outgoing space.
+        self.viewport_draw_state = 0;
+        self.viewport_draw_p1 = None;
+        self.viewport_draw_p2 = None;
+        self.viewport_draw_li = None;
+        self.viewport_scale_dialog_open = false;
+        self.vp_edit_dialog = None;
+        self.vp_edit_init_for = None;
+        // Selection indices are space-specific: a model selection is meaningless
+        // in paper space (and vice-versa). Clear on every switch so a selection
+        // made in Model space can't be moved/edited from a layout, and grips
+        // don't linger across the boundary.
+        self.selection.clear();
+        self.selected = None;
+        let old = self.doc.active_layout;
+        if let Some(oi) = old { if let Some(l) = self.doc.layouts.get_mut(oi) { l.camera.zoom = self.scale; l.camera.pan_x = self.world_offset.x; l.camera.pan_y = self.world_offset.y; std::mem::swap(&mut self.doc.layers, &mut l.layers); } }
+        else { self.saved_model_scale = Some(self.scale); self.saved_model_offset = Some(self.world_offset); }
+        self.doc.active_layout = target;
+        if let Some(ni) = target { if let Some(l) = self.doc.layouts.get_mut(ni) { std::mem::swap(&mut self.doc.layers, &mut l.layers); self.scale = l.camera.zoom; self.world_offset = egui::vec2(l.camera.pan_x, l.camera.pan_y); } }
+        else { if let (Some(s), Some(o)) = (self.saved_model_scale, self.saved_model_offset) { self.scale = s; self.world_offset = o; self.saved_model_scale = None; self.saved_model_offset = None; } }
+        self.touch_view();
+        self.index_dirty = true;
+    }
+
+    fn render_new_layout_dialog(&mut self, ctx: &egui::Context) {
+        use cad_kernel::plotstyle::PaperSize;
+        let mut cl = false; let mut cr = false;
+        egui::Window::new("New Layout").id(egui::Id::new("nld")).order(egui::Order::Foreground).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.,0.)).show(ctx, |ui| {
+            ui.horizontal(|ui| { ui.label("Name:"); ui.text_edit_singleline(&mut self.new_layout_name); }); ui.add_space(6.);
+            ui.horizontal(|ui| { ui.label("Paper:"); let ps=["A4","A3","A2","A1","A0","Letter"]; let cur = match self.new_layout_paper{PaperSize::A4=>0,PaperSize::A3=>1,PaperSize::A2=>2,PaperSize::A1=>3,PaperSize::A0=>4,_=>5}; let mut s=cur;
+            egui::ComboBox::from_id_salt("nlpp").selected_text(ps[s]).show_ui(ui,|ui|{for(i,n)in ps.iter().enumerate(){ui.selectable_value(&mut s,i,*n);}});
+            if s!=cur{self.new_layout_paper=match s{0=>PaperSize::A4,1=>PaperSize::A3,2=>PaperSize::A2,3=>PaperSize::A1,4=>PaperSize::A0,_=>PaperSize::Letter};}}); ui.add_space(4.); ui.checkbox(&mut self.new_layout_landscape,"Landscape"); ui.add_space(4.);
+            ui.horizontal(|ui|{ui.label("CTB:"); let key=self.new_layout_ctb.clone(); let (ctbs,mut ci)=self.ctb_picker_state(&key);
+            egui::ComboBox::from_id_salt("nl_ctb").selected_text(ctbs[ci].0.clone()).show_ui(ui,|ui|{for(i,(disp,_))in ctbs.iter().enumerate(){ui.selectable_value(&mut ci,i,disp);}});
+            self.new_layout_ctb=ctbs[ci].1.clone().unwrap_or_default();}); ui.add_space(8.);
+            ui.horizontal(|ui|{if ui.button("Cancel").clicked(){cl=true;}if ui.button("Create").clicked(){cr=true;}});
+        });
+        if cr { let n = if self.new_layout_name.trim().is_empty(){format!("Layout {}",self.doc.layouts.len()+1)}else{self.new_layout_name.trim().to_string()};
+            let o = if self.new_layout_landscape{cad_kernel::plotstyle::Orientation::Landscape}else{cad_kernel::plotstyle::Orientation::Portrait};
+            let mut l = cad_kernel::Layout::new(&n,self.new_layout_paper,o);
+            l.ctb_name = if self.new_layout_ctb.is_empty() { None } else { Some(self.new_layout_ctb.clone()) };
+            self.doc.layouts.push(l); self.switch_to_tab(Some(self.doc.layouts.len()-1)); self.show_new_layout_dialog=false; }
+        if cl { self.show_new_layout_dialog=false; }
+    }
+
+    fn set_viewport_camera(&mut self, li: usize, vi: usize,
+                           center: (f64, f64), zoom: f64, scale: f64) {
+        let Some(layout) = self.doc.layouts.get_mut(li) else { return };
+        let handle = match layout.viewports.get(vi) { Some(v) => v.shape_handle, None => return };
+        // authoritative: the paper entity
+        if let Some(h) = handle {
+            if let Some(e) = layout.entities.iter_mut().find(|e| e.handle == h) {
+                if let cad_kernel::Geom::Viewport(ref mut vg) = e.geom {
+                    vg.model_center.x = center.0; vg.model_center.y = center.1;
+                    vg.model_zoom = zoom; vg.model_scale = scale;
+                }
+            }
+        }
+        // mirror: the sidecar the render loop + RSM read
+        if let Some(vd) = layout.viewports.get_mut(vi) {
+            vd.model_center = center; vd.model_zoom = zoom; vd.model_scale = scale;
+        }
+    }
+
+    fn set_viewport_ctb(&mut self, ent_idx: usize, new: Option<String>) {
+        let Some(li) = self.doc.active_layout else { return };
+        let Some(layout) = self.doc.layouts.get(li) else { return };
+        let Some(e) = layout.entities.get(ent_idx) else { return };
+        let Some(vi) = layout.viewports.iter().position(|v| v.shape_handle == Some(e.handle)) else { return };
+        if layout.viewports[vi].ctb_name.as_deref() == new.as_deref() { return; }
+        self.snapshot_doc();
+        if let Some(layout) = self.doc.layouts.get_mut(li) {
+            layout.viewports[vi].ctb_name = new;
+        }
+        // CTB lives only in ViewportData (no geom counterpart) and the camera is
+        // unchanged here — no camera sync needed (P0: camera routes through
+        // set_viewport_camera only).
+    }
+
+    fn layout_rect_overlaps(ents: &[cad_kernel::DObject], skip_idx: usize,
+        nmn: (f64, f64), nmx: (f64, f64)) -> bool
+    {
+        for (j, oe) in ents.iter().enumerate() {
+            if j == skip_idx { continue; }
+            if let cad_kernel::Geom::Viewport(ov) = &oe.geom {
+                let (omn, omx) = ov.bbox_world();
+                if nmn.0 < omx.x && nmx.0 > omn.x && nmn.1 < omx.y && nmx.1 > omn.y {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn paint_lock_badge(p: &egui::Painter, c: egui::Pos2, locked: bool) -> egui::Rect {
+        let col = if locked { egui::Color32::from_rgb(255, 200, 80) } else { egui::Color32::from_rgb(130, 140, 155) };
+        // body
+        let body = egui::Rect::from_center_size(c + egui::vec2(0.0, 2.5), egui::vec2(10.0, 8.0));
+        p.rect_filled(body, 1.5, col);
+        // shackle (half-circle above the body); open lock shifts it aside
+        let sh_c = if locked { egui::pos2(c.x, c.y - 2.0) } else { egui::pos2(c.x + 2.0, c.y - 2.0) };
+        let r = 3.2_f32;
+        let pts: Vec<egui::Pos2> = (0..=10).map(|i| { let a = std::f32::consts::PI * (i as f32 / 10.0); egui::pos2(sh_c.x - r*a.cos(), sh_c.y - r*a.sin()) }).collect();
+        p.add(egui::Shape::line(pts, egui::Stroke::new(1.6, col)));
+        if locked { p.circle_filled(c + egui::vec2(0.0, 2.5), 1.3, egui::Color32::from_rgb(30, 30, 30)); }
+        egui::Rect::from_center_size(c, egui::vec2(16.0, 16.0))
+    }
+
+    fn apply_vp_ctb(rgb: (u8, u8, u8), aci: Option<u8>, ctb: &str,
+                    table: Option<&cad_kernel::plotstyle::PlotStyleTable>) -> egui::Color32 {
+        // Same semantics as the plot scene's `apply_ctb` (e0fddd1 / aa95957):
+        // empty → monochrome, so the "Print colors" canvas view always matches
+        // the plot output. A resolved table (a saved CTB — including an edited
+        // built-in) applies its per-ACI colour rules; without one the built-in
+        // names keep the hardcoded transform.
+        let ctb = if ctb.is_empty() { "monochrome" } else { ctb };
+        if let Some(t) = table {
+            let (r, g, b) = t.apply_color(aci, rgb);
+            return egui::Color32::from_rgb(r, g, b);
+        }
+        match ctb {
+            "monochrome" => egui::Color32::from_rgb(0,0,0),
+            // Rec.601 luminance — matches PlotStyleTable::apply_color.
+            "grayscale" => { let g = (0.299*rgb.0 as f32+0.587*rgb.1 as f32+0.114*rgb.2 as f32).round().clamp(0.0,255.0) as u8; egui::Color32::from_rgb(g,g,g) },
+            _ => egui::Color32::from_rgb(rgb.0,rgb.1,rgb.2),
+        }
+    }
+
+    /// Remove the selected paper entities (viewport sidecars follow their
+    /// frame entity). UNDO-AWARE: one snapshot covers the whole deletion, so
+    /// both the context-menu "Delete Viewport" and the Delete-key path share
+    /// one undoable implementation.
+    fn delete_selected_viewports(&mut self) {
+        if self.layout_selection.is_empty() { return; }
+        let li = match self.doc.active_layout { Some(i) => i, None => return };
+        let sel = self.layout_selection.clone();
+        self.snapshot_doc();
+        if let Some(layout) = self.doc.layouts.get_mut(li) {
+            let mut indices = sel.clone();
+            indices.sort_unstable_by(|a,b| b.cmp(a));
+            for &i in &indices {
+                if i < layout.entities.len() {
+                    let h = layout.entities[i].handle;
+                    layout.viewports.retain(|v| v.shape_handle != Some(h));
+                    layout.entities.remove(i);
+                }
+            }
+        }
+        self.layout_selection.clear();
+        self.layout_grip_drag = None;
+        self.layout_move_last = None;
+        self.history.push(format!("  deleted {} paper entit(y/ies)", sel.len()));
+    }
+
+    fn copy_selected_viewports(&mut self) {
+        if self.layout_selection.is_empty() { return; }
+        let li = match self.doc.active_layout { Some(i) => i, None => return };
+        let sel = self.layout_selection.clone();
+        let mut new_sel: Vec<usize> = Vec::new();
+        let Some(layout) = self.doc.layouts.get_mut(li) else { return };
+        for &si in &sel {
+            let Some(src_e) = layout.entities.get(si).cloned() else { continue };
+            let cad_kernel::Geom::Viewport(svg) = &src_e.geom else { continue };
+            // Find a non-overlapping offset (step by the width until clear).
+            let mut vg = svg.clone();
+            let step = svg.width.max(10.0) * 0.25 + 8.0;
+            let mut off = step;
+            let mut placed = false;
+            for _ in 0..64 {
+                let nc = Vec2::new(svg.center.x + off, svg.center.y + off);
+                let nmn = (nc.x - svg.width*0.5, nc.y - svg.height*0.5);
+                let nmx = (nc.x + svg.width*0.5, nc.y + svg.height*0.5);
+                if !Self::layout_rect_overlaps(&layout.entities, usize::MAX, nmn, nmx) {
+                    vg.center = nc; placed = true; break;
+                }
+                off += step;
+            }
+            if !placed { vg.center = Vec2::new(svg.center.x + off, svg.center.y + off); }
+            let src_vd = layout.viewports.iter().find(|v| v.shape_handle == Some(src_e.handle)).cloned();
+            let d = cad_kernel::DObject::new(cad_kernel::Geom::Viewport(vg.clone()));
+            let h = d.handle;
+            layout.entities.push(d);
+            new_sel.push(layout.entities.len() - 1);
+            let mut vd = src_vd.unwrap_or_else(|| cad_kernel::ViewportData::new(
+                (0.,0.),(0.,0.),(0.,0.), vg.model_zoom, vg.model_scale));
+            vd.shape_handle = Some(h);
+            vd.rect_min = (vg.center.x - vg.width*0.5, vg.center.y - vg.height*0.5);
+            vd.rect_max = (vg.center.x + vg.width*0.5, vg.center.y + vg.height*0.5);
+            layout.viewports.push(vd);
+        }
+        if !new_sel.is_empty() {
+            self.layout_selection = new_sel;
+            self.history.push("  ✔ viewport copied".into());
+        }
+    }
+
+    fn render_viewport_scale_dialog(&mut self, ctx: &egui::Context) {
+        let mut cl = false; let mut cr = false;
+        egui::Window::new("New Viewport — Scale").id(egui::Id::new("vsd")).order(egui::Order::Foreground).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.,0.)).show(ctx, |ui| {
+            ui.label("Viewport scale (e.g. 1:100, 1:50):"); ui.add_space(4.);
+            ui.horizontal(|ui|{ui.label("Scale:  1:"); ui.add(egui::TextEdit::singleline(&mut self.viewport_scale_text).desired_width(60.));});
+            ui.add_space(4.); ui.horizontal(|ui|{for &s in &[1.,2.,5.,10.,20.,50.,100.,200.,500.]{if ui.button(format!("1:{:.0}",s)).clicked(){self.viewport_scale_text=format!("1:{:.0}",s); self.viewport_custom_n.clear(); self.viewport_custom_m.clear();}}});
+            ui.add_space(4.);
+            // Custom paper scale: N <unit> = M units (both editable; the unit is
+            // the PAPER unit of N — mm/cm/m). Overrides the 1:N field.
+            ui.horizontal(|ui|{
+                ui.label("Custom:");
+                let mut unit = self.viewport_custom_unit.clone();
+                egui::ComboBox::from_id_salt("vp_cu").selected_text(unit.clone()).width(56.0)
+                    .show_ui(ui, |ui| {
+                        for u in ["mm", "cm", "m"] {
+                            if ui.selectable_label(unit == u, u).clicked() { unit = u.to_string(); }
+                        }
+                    });
+                self.viewport_custom_unit = unit;
+                ui.add(egui::TextEdit::singleline(&mut self.viewport_custom_n).desired_width(52.).hint_text("N"));
+                ui.label("=");
+                ui.add(egui::TextEdit::singleline(&mut self.viewport_custom_m).desired_width(52.).hint_text("M"));
+                ui.label("unit(s) on paper");
+            });
+            ui.label(egui::RichText::new("(custom overrides the 1:N field — e.g. 2 cm = 5 units)").small().weak());
+            ui.add_space(6.); ui.horizontal(|ui|{ui.label("CTB:"); let key=self.viewport_ctb_name.clone(); let (ctbs,mut ci)=self.ctb_picker_state(&key);
+            egui::ComboBox::from_id_salt("vp_ctb").selected_text(ctbs[ci].0.clone()).show_ui(ui,|ui|{for(i,(disp,_))in ctbs.iter().enumerate(){ui.selectable_value(&mut ci,i,disp);}});
+            self.viewport_ctb_name=ctbs[ci].1.clone().unwrap_or_default();}); ui.add_space(8.);
+            ui.horizontal(|ui|{if ui.button("Cancel").clicked(){cl=true;}if ui.button("Create Viewport").clicked(){cr=true;}});
+        });
+        if cr { if let (Some(mn), Some(mx)) = (self.viewport_draw_p1, self.viewport_draw_p2) {
+            let sc: f64 = self.viewport_scale_text.trim().trim_start_matches("1:").trim().parse().unwrap_or(100.);
+            // Units-correct scale (plotting spec Part 5): store paper-mm-per-scene
+            // in model_scale so a physical length prints at length×(1:N) regardless
+            // of the document unit. For the default doc (1 unit = 1 mm) this equals
+            // 1/N — identical to the old behaviour. model_zoom stays the free-zoom.
+            // Custom "N <unit> = M units" overrides the 1:N ratio: paper-mm-per-
+            // scene = N×mm_per_named(unit)/M, applied directly as model_scale.
+            let ms = match (self.eval_field(&self.viewport_custom_n),
+                            self.eval_field(&self.viewport_custom_m)) {
+                (Ok(n), Ok(m)) if n > 0.0 && m > 0.0 =>
+                    n * cad_kernel::Units::mm_per_named(&self.viewport_custom_unit) / m,
+                _ => { let desired = if sc > 0. { 1./sc } else { 1. }; self.doc.units.viewport_paper_mm_per_scene(desired) }
+            };
+            // New-viewport camera: centre on the MODEL EXTENTS and zoom to FIT
+            // them into the viewport, so a fresh layout actually shows the
+            // drawing. A plain 1:100-at-origin default renders the shapes as a
+            // ~1px dot on screen and an empty sheet in the plot — "nothing
+            // visible in the layout" (only fixed-screen-size points show).
+            // `model_scale` keeps the chosen plot scale; the fit lives in
+            // `model_zoom` (the free zoom), so the canvas view and the plot
+            // always match.
+            let (mut mc_x, mut mc_y, mut mz) = (0.0f64, 0.0f64, 1.0f64);
+            if let Some((emin, emax)) = self.doc_extents() {
+                let bw = (emax.x - emin.x).max(1e-9);
+                let bh = (emax.y - emin.y).max(1e-9);
+                let vw = (mx.x - mn.x).max(1e-9);
+                let vh = (mx.y - mn.y).max(1e-9);
+                let fit = (vw / bw).min(vh / bh);
+                if fit.is_finite() && fit > 0.0 && ms > 0.0 {
+                    mz = (fit / ms).clamp(0.001, 100.0);
+                    mc_x = (emin.x + emax.x) * 0.5;
+                    mc_y = (emin.y + emax.y) * 0.5;
+                }
+            }
+            let vg = cad_kernel::ViewportGeom { center: Vec2::new((mn.x+mx.x)*0.5,(mn.y+mx.y)*0.5), width: mx.x-mn.x, height: mx.y-mn.y, model_center: Vec2::new(mc_x, mc_y), model_zoom: mz, model_scale: ms, frame_visible: true };
+            let vw = vg.width; let vh = vg.height;
+            let d = cad_kernel::DObject::new(cad_kernel::Geom::Viewport(vg)); let h = d.handle;
+            let vd = cad_kernel::ViewportData { shape_handle: Some(h), rect_min:(mn.x,mn.y), rect_max:(mx.x,mx.y), model_center:(mc_x,mc_y), model_zoom:mz, model_scale:ms, frozen_layers:Vec::new(), ctb_name: if self.viewport_ctb_name.trim().is_empty() { None } else { Some(self.viewport_ctb_name.trim().to_string()) }, locked: false };
+            let li = self.viewport_draw_li
+                .or_else(|| self.doc.active_layout)
+                .unwrap_or(0);
+            if let Some(l) = self.doc.layouts.get_mut(li) { l.entities.push(d); l.viewports.push(vd); self.history.push(format!("  Created viewport {}x{}mm", vw, vh)); }
+                    } self.viewport_scale_dialog_open=false; self.viewport_draw_p1=None; self.viewport_draw_p2=None; self.viewport_draw_li=None; self.viewport_custom_n.clear(); self.viewport_custom_m.clear(); }
+        if cl { self.viewport_scale_dialog_open=false; self.viewport_draw_p1=None; self.viewport_draw_p2=None; self.viewport_draw_li=None; }
+    }
+
+    fn render_vp_edit_dialog(&mut self, ctx: &egui::Context) {
+        // Bound to the layout it was opened from — tab switches close the
+        // dialog (switch_to_tab), so `li` can never point at another space.
+        let Some((li, vp_idx)) = self.vp_edit_dialog else { return };
+        let Some(layout) = self.doc.layouts.get(li) else { self.vp_edit_dialog = None; return; };
+        if vp_idx >= layout.viewports.len() { self.vp_edit_dialog = None; return; }
+        let vp = layout.viewports[vp_idx].clone();
+        let mut cl = false;
+        // SEED the persistent buffers ONCE per open (nominal 1:N from model_scale,
+        // inverted through the doc units). Recomputing every frame is what froze
+        // the field. Thereafter the user edits the buffers freely.
+        if self.vp_edit_init_for != Some((li, vp_idx)) {
+            let desired = self.doc.units.viewport_nominal_scale(vp.model_scale);
+            self.vp_edit_scale_text = if desired > 0. { format!("1:{:.0}", 1.0/desired) } else { String::from("1:100") };
+            self.vp_edit_ctb = vp.ctb_name.clone().unwrap_or_default();
+            self.vp_edit_init_for = Some((li, vp_idx));
+        }
+        // Edit copies (written back after the closure so the closure doesn't hold
+        // a `self` field borrow across the whole UI).
+        let mut sc_text = self.vp_edit_scale_text.clone();
+        let mut ctb_name = self.vp_edit_ctb.clone();
+        egui::Window::new("Viewport Properties").id(egui::Id::new("vpe")).order(egui::Order::Foreground).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.,0.)).show(ctx, |ui| {
+            ui.horizontal(|ui|{ui.label("Scale:"); ui.add(egui::TextEdit::singleline(&mut sc_text).desired_width(60.));});
+            ui.horizontal(|ui|{for &s in &[1.,2.,5.,10.,20.,50.,100.,200.,500.]{if ui.button(format!("1:{:.0}",s)).clicked(){sc_text=format!("1:{:.0}",s);}}});
+            ui.add_space(6.);
+            ui.horizontal(|ui|{ui.label("CTB:"); let (ctbs,mut ci)=self.ctb_picker_state(&ctb_name);
+            egui::ComboBox::from_id_salt("vpe_ctb").selected_text(ctbs[ci].0.clone()).show_ui(ui,|ui|{for(i,(disp,_))in ctbs.iter().enumerate(){ui.selectable_value(&mut ci,i,disp);}});
+            ctb_name=ctbs[ci].1.clone().unwrap_or_default();});
+            ui.add_space(8.);
+            ui.horizontal(|ui|{if ui.button("Cancel").clicked(){cl=true;}if ui.button("Apply").clicked(){
+                let sc: f64 = sc_text.trim().trim_start_matches("1:").trim().parse().unwrap_or(100.);
+                // Snap to the EXACT units-correct scale: model_scale = paper-mm-per-
+                // scene for 1:N; reset the free-zoom to 1 so effective == nominal.
+                let desired = if sc > 0. { 1./sc } else { 1. };
+                let ms = self.doc.units.viewport_paper_mm_per_scene(desired);
+                let ctb = ctb_name.clone();
+                self.snapshot_doc();
+                let cur_c = self.doc.layouts.get(li).and_then(|l| l.viewports.get(vp_idx)).map(|v| v.model_center).unwrap_or((0.0, 0.0));
+                if let Some(l) = self.doc.layouts.get_mut(li) { if let Some(vd) = l.viewports.get_mut(vp_idx) { vd.ctb_name = if ctb.is_empty(){None}else{Some(ctb)}; } }
+                self.set_viewport_camera(li, vp_idx, cur_c, 1.0, ms);
+                                cl = true;
+            }});
+        });
+        // Persist edits across frames (this is what un-freezes the field).
+        self.vp_edit_scale_text = sc_text;
+        self.vp_edit_ctb = ctb_name;
+        if cl { self.vp_edit_dialog = None; self.vp_edit_init_for = None; }
+    }
+
     // ===================================================================
     // PLOT — dockable Page Setup, Plot dialog (model space), Plot Style
     // Table Editor (CTB), preview window, and the run_plot pipeline.
@@ -31834,6 +32809,12 @@ impl CadApp {
         egui::ScrollArea::vertical()
             .id_salt("hist_scroll")
             .stick_to_bottom(true)
+            // Full panel width: the log must span the strip edge-to-edge, so
+            // the vertical scrollbar hugs the panel's right edge. auto_shrink
+            // [horizontal, vertical] — false here means "do not shrink to the
+            // content width" (short log lines would otherwise pull the
+            // scrollbar into the middle of the bar).
+            .auto_shrink([false, true])
             .max_height((avail_h - bottom_reserve).max(24.0))
             .show(ui, |ui| {
                 for h in &self.history {
@@ -38131,6 +39112,13 @@ impl CadApp {
                 self.selected = None;
                 self.intersections.clear();
                 self.index_dirty = true;
+                // Tabs: open on MODEL. The file's own `active_layout` may point
+                // at a saved layout; the tab strip honours it once the user
+                // clicks through (Model-first matches the source repo).
+                self.doc.active_layout = None;
+                self.layout_selection.clear();
+                self.layout_move_last = None;
+                self.layout_grip_drag = None;
                 self.touch_view();
                 self.stage_evt("install doc", n, t.elapsed(), &format!("{l} layer(s)"));
                 // ---- Stage 4: frame the drawing (bbox sweep). ----------------------
@@ -38454,11 +39442,12 @@ impl CadApp {
     #[allow(dead_code)] // retained for reference; the live path is the threaded worker.
     fn do_save_now(&mut self, path: &str) {
         let lower = path.to_ascii_lowercase();
-        let plan = self.plan_doc();
+        let mut plan = self.plan_doc().clone();
+        normalize_layers_for_save(&mut plan);
         let bytes: Vec<u8> = if lower.ends_with(".dxf") {
-            cad_io::dxf::write_dxf(plan).into_bytes()
+            cad_io::dxf::write_dxf(&plan).into_bytes()
         } else if lower.ends_with(".rsm") {
-            cad_io::rsm::write_rsm(plan)
+            cad_io::rsm::write_rsm(&plan)
         } else {
             self.history.push(format!(
                 "  ! save '{}': unknown extension (expected .dxf, .dwg or .rsm)", path
@@ -45555,8 +46544,28 @@ impl CadApp {
         let kind = dobject_kind_name(&geom).to_string();
         let mut dobj = DObject::new(geom);
         self.stamp_fresh_style(&mut dobj.style);   // §5/WP6.1 fresh-draw stamp
-        let i = self.doc.push(dobj);
-        let handle = self.doc.dobjects[i].handle;
+        // Layout tabs (upstream parity): while a layout is active, fresh
+        // geometry lands in that layout's PAPER-SPACE entity list (mm coords),
+        // not the model. All save/load, undo snapshots and the tab's paper
+        // render read the same per-layout store.
+        let (i, handle, went_paper) = if let Some(li) = self.doc.active_layout {
+            if let Some(layout) = self.doc.layouts.get_mut(li) {
+                let handle = dobj.handle;
+                layout.entities.push(dobj);
+                (layout.entities.len() - 1, handle, true)
+            } else {
+                let i = self.doc.push(dobj);
+                let h = self.doc.dobjects[i].handle;
+                (i, h, false)
+            }
+        } else {
+            let i = self.doc.push(dobj);
+            let h = self.doc.dobjects[i].handle;
+            (i, h, false)
+        };
+        if went_paper {
+            self.touch_view();
+        }
         crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::DocPush {
             index:     i,
             geom_kind: kind,
@@ -45570,6 +46579,11 @@ impl CadApp {
         // presses an ∩ button — otherwise modifying dobjects silently
         // invalidates them.
         self.intersections.clear();
+        // Paper-space appends don't touch the model index (they live in the
+        // layout's entity list; the paper lane draws them directly).
+        if self.doc.active_layout.is_some() {
+            return;
+        }
         // THE INDEX ABSORBS THE ONE NEW OBJECT INSTEAD OF BEING REBUILT FROM SCRATCH.
         //
         // This used to set `index_dirty`, which costs a full O(n) rebuild on the next query:
@@ -48162,6 +49176,21 @@ fn dedupe_hits(hits: &mut Vec<f64>) {
     hits.truncate(w);
 }
 
+/// Soft drop shadow above a panel's top edge (the command bar's
+/// canvas-facing edge). `steps` bands of fading black alpha.
+fn paint_top_shadow(p: &egui::Painter, rect: egui::Rect, steps: i32) {
+    for i in 0..steps {
+        let t = 1.0 - i as f32 / steps as f32;
+        let a = (118.0 * t).max(14.0) as u8;
+        let d = i as f32;
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(),  rect.top() - d - 1.0),
+                egui::pos2(rect.right(), rect.top() - d)),
+            egui::Rounding::ZERO, egui::Color32::from_black_alpha(a));
+    }
+}
+
 fn line_segment_intersect_t(o: Vec2, u: Vec2, a: Vec2, b: Vec2) -> Option<f64> {
     let d = b - a;
     // Parametric line: o + t*u; segment: a + s*d. Solve for (t, s).
@@ -49056,6 +50085,7 @@ enum FlyMenu {
     WallStylePick,    // Styles → current wall-style picker
     Debug,            // Tools → Debug tools
     Scripts,          // Tools → Scripts (scripts/*.py → `run <name>`)
+    CommandBar,       // command-bar grip right-click (Close)
 }
 
 /// One open flyout in the stack (`menu_flyouts`): which menu + the row rect it hangs
@@ -49146,6 +50176,7 @@ enum FlyAct {
     RescanScripts,       // Scripts → rescan scripts/*.py into the list
     OpenScriptEditor,    // Scripts → open the in-app script editor panel
     OpenScriptingDoc,    // Scripts → open the full API reference window
+    CloseCommandBar,     // command-bar grip → hide the bar (reopen via Tools)
 }
 
 /// A `&mut self` bool a flyout toggle flips (Tools→Debug), named so `FlyAct` stays
@@ -49617,6 +50648,11 @@ impl CadApp {
                     items
                 }
             }
+            // Command-bar grip right-click: docked strip, so just Close (reopen
+            // via Tools → Command line).
+            FlyMenu::CommandBar => vec![
+                FlyItem::act(FlyIcon::None, "Close command bar", FlyAct::CloseCommandBar),
+            ],
         }
     }
 
@@ -49674,6 +50710,7 @@ impl CadApp {
             FlyAct::RescanScripts   => self.scan_py_examples(),
             FlyAct::OpenScriptEditor => self.py_editor_open_panel(),
             FlyAct::OpenScriptingDoc => self.open_scripting_doc(),
+            FlyAct::CloseCommandBar => self.cmd_window_open = false,
         }
     }
 
@@ -51207,6 +52244,7 @@ impl eframe::App for CadApp {
                 self.script_param_pick = None;
                 self.history.push("  python: pick cancelled".into());
             }
+            self.layout_selection.clear();
             self.hatch_pick_point_armed = false;
             self.hatch_pick_point_session = None;
             self.pending_hatch_pattern = (None, 1.0, 0.0);
@@ -53385,40 +54423,116 @@ impl eframe::App for CadApp {
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
+        // Model/Layout tab strip (upstream parity) + the New Layout dialog.
+        self.render_layout_tabs(ctx);
+        if self.show_new_layout_dialog {
+            self.render_new_layout_dialog(ctx);
+        }
+        // Viewport creation/scale + properties dialogs (paper space).
+        if self.viewport_scale_dialog_open {
+            self.render_viewport_scale_dialog(ctx);
+        }
+        self.render_vp_edit_dialog(ctx);
 
-        // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
-        // the same swappable engine the Inspector uses. Floats by default
-        // (lower-left); drag its header to the bottom edge to dock it as the
-        // AutoCAD-style command strip above the status bar. Because it renders
-        // after the left rails + right Inspector, the docked strip is confined
-        // to the CENTER column (WORKSPACE_SYSTEM). The history/prompt/input body
-        // is `command_bar_body` — one implementation for both docking modes.
-        {
-            // THE TITLE SAYS WHICH WINDOW IT IS TALKING TO. Asked for as: "when the user is using
-            // the 3d factory the command window's name will change to 3d command. and when the user
-            // clicks on the 2d window it changes back to just command".
-            //
-            // It reads `active_view` — the viewport last interacted with — which is the same gate
-            // the shared `move`/`copy`/`rotate` commands already dispatch on. So the title is not a
-            // second opinion about where a command will go; it is a readout of the one that decides.
-            let three_d = self.command_target() == ActiveView::ThreeD;
-            let cfg = crate::dock::DockConfig {
-                id: "command", title: if three_d { "3D Command" } else { "Command" }, badge: None,
-                dock_region: crate::dock::DockRegion::Bottom,
-                size: 150.0, min: 96.0, max: 320.0,
-                resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
-                alt_region: None, any_edge: false, strip_h: 0.0,
-                dockable: true, rail_header: false, collapsible: false,
+        // ---- Command bar — a bottom strip docked directly above the status bar
+        // (which is bottommost). No float / drag / dock host (upstream parity):
+        // user-resizable height by dragging the top edge; remembered across runs
+        // (`env.CmdBarH`). A visual left grip (§2, no move handle) whose
+        // right-click opens the sticky "Close command bar" flyout.
+        if self.cmd_window_open {
+            use crate::theme::color as tc;
+            // §7 height computed from the mono line height so CMD_HIST_LINES
+            // whole lines fit; the bar is USER-RESIZABLE by dragging its top
+            // edge, and a remembered height is restored on launch.
+            let line_h = {
+                let fid = ctx.style().text_styles
+                    .get(&egui::TextStyle::Monospace).cloned()
+                    .unwrap_or_else(|| egui::FontId::monospace(13.0));
+                ctx.fonts(|f| f.row_height(&fid))
             };
-            let mut state = self.cmd_dock_state;
-            let mut open = self.cmd_window_open;
-            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
-                self.command_bar_body(ui, cap);
-            });
-            self.raise_dock_after_show("Command line", "command",
-                matches!(state, crate::dock::DockState::Floating(_)), ctx);
-            self.cmd_dock_state = state;
-            self.cmd_window_open = open;
+            let default_h = CMD_PAD_TOP + CMD_HIST_LINES as f32 * line_h
+                + CMD_PAD_TOP + CMD_PILL_H + CMD_PAD_BELOW;
+            // Min height = the pill + CMD_HIST_LINES whole history lines, so the
+            // log can never shrink to a one-line sliver (the scroll area fills
+            // whatever remains).
+            let min_h = CMD_PAD_BELOW + CMD_PILL_H + CMD_PAD_TOP
+                + CMD_HIST_LINES as f32 * line_h;
+            // No upper cap: the bar can grow to any height the window allows.
+            let bar_h = if self.env.CmdBarH > 0.0 {
+                self.env.CmdBarH.max(min_h)
+            } else { default_h };
+            let cmd_panel = egui::TopBottomPanel::bottom("command")
+                // §7 resize: a drag handle on the top edge; the panel keeps its
+                // size for the session, and the final height is persisted below.
+                .resizable(true)
+                .default_height(bar_h)
+                .min_height(min_h)
+                // No egui separator line — the top edge gets a soft drop shadow
+                // + our own painted resize handle instead.
+                .show_separator_line(false)
+                .frame(egui::Frame::none().fill(tc::SURFACE_1))
+                .show(ctx, |ui| {
+                    let h = ui.available_height();   // known panel height for the body
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        // §2 visual grip strip (no drag / no move cursor).
+                        let (grip_rect, gresp) = ui.allocate_exact_size(
+                            egui::vec2(16.0, h), egui::Sense::click());
+                        let p = ui.painter_at(grip_rect);
+                        p.rect_filled(grip_rect, 0.0, tc::BORDER);   // #34414B strip
+                        let ppp = ui.ctx().pixels_per_point();
+                        let snap = |v: f32| (v * ppp).round() / ppp;
+                        let (ln_w, ln_h, pitch) = (5.0_f32, 1.5_f32, 3.0_f32);
+                        let lx = snap(grip_rect.center().x - ln_w * 0.5);
+                        let ty = snap(grip_rect.top() + 6.0);        // pinned to TOP
+                        for i in 0..5 {
+                            let y = snap(ty + i as f32 * pitch);
+                            p.rect_filled(egui::Rect::from_min_size(
+                                egui::pos2(lx, y), egui::vec2(ln_w, ln_h)), 0.0, tc::SURFACE_1);
+                        }
+                        if gresp.secondary_clicked() {
+                            self.open_flyout(FlyMenu::CommandBar, grip_rect);
+                        }
+                        // Body fills the rest at the full (known) height and
+                        // the FULL remaining width — the log scrollbar must
+                        // sit at the panel's right edge, not mid-bar.
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            self.command_bar_body(ui, None);
+                        });
+                    });
+                });
+            // §7 resize: persist the new height when the user finishes dragging
+            // the top handle (`__resize` is the panel's own resize-interaction
+            // id, the same one egui reads inside `TopBottomPanel`).
+            let resize_id = egui::Id::new("command").with("__resize");
+            if let Some(r) = ctx.read_response(resize_id) {
+                if r.drag_stopped() {
+                    self.env.CmdBarH = cmd_panel.response.rect.height();
+                    let _ = self.env.save();
+                }
+            }
+            // Soft drop shadow on the command bar's canvas-facing (top) edge,
+            // full width, on a Middle-order painter so the bands fall onto the
+            // canvas above the bar.
+            let cmd_p = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle, egui::Id::new("command_bar_shadow")));
+            paint_top_shadow(&cmd_p, cmd_panel.response.rect, 6);
+            // §7 resize affordance: a painted handle ON the bar's top edge, ABOVE
+            // the shadow. Dim 2px by default; a thicker ACCENT bar while
+            // hovered/dragging.
+            let edge = cmd_panel.response.rect;
+            let resizing = ctx.read_response(resize_id)
+                .map(|r| r.hovered() || r.dragged()).unwrap_or(false);
+            let (hcol, hh) = if resizing {
+                (tc::ACCENT, 3.0_f32)
+            } else {
+                (egui::Color32::from_rgb(0x46, 0x52, 0x5E), 2.0_f32)
+            };
+            cmd_p.rect_filled(egui::Rect::from_min_max(
+                egui::pos2(edge.left() + 1.0, edge.top() - 1.0),
+                egui::pos2(edge.right() - 1.0, edge.top() - 1.0 + hh)),
+                egui::Rounding::ZERO, hcol);
         }
 
         // ---- central panel: canvas --------------------------------------
@@ -53450,6 +54564,8 @@ impl eframe::App for CadApp {
             // Also parked while the Plot dialog's "Window" area is being
             // picked — the drag defines the plot region, it must NOT select.
             let canvas_locked = self.block_editor.is_some() || self.plot_win_pick != 0;
+            // LAYOUT TAB: true while a layout (paper space) tab is active.
+            let in_layout = self.doc.active_layout.is_some();
             // SIMLUX: placing / moving light points on the plan. Gates the primary click+drag
             // handlers only (see `simlux_pointer_2d`) — pan, zoom and the right-click menu stay
             // live, because laying out a lighting grid means moving around the drawing.
@@ -53500,6 +54616,7 @@ impl eframe::App for CadApp {
             // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
             // when there's a selection or something on the clipboard.
             if !canvas_locked
+                && !in_layout
                 && (!self.selection.is_empty() || !self.clipboard_dobjects.is_empty())
             {
                 resp.context_menu(|ui| {
@@ -53638,6 +54755,12 @@ impl eframe::App for CadApp {
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
 
+            // LAYOUT TAB: paper-space render (page outline + paper entities +
+            // viewport windows of the model) replaces the model canvas below.
+            if in_layout && !canvas_locked {
+                self.paper_space_render(ui, rect, &painter, &resp);
+            }
+            if !in_layout {
             // ---- Reference raster underlays (behind everything) -----------
             self.sync_underlay_textures(ctx);
             self.draw_raster_underlays(&painter, rect);
@@ -53656,6 +54779,7 @@ impl eframe::App for CadApp {
             // being computed will cover.
             self.paint_calculating_zone(&painter, rect);
             self.paint_luminaires_2d(&painter, rect);
+            }
 
             // ---- Background grid (GrdEnb) ---------------------------------
             //
@@ -53724,6 +54848,42 @@ impl eframe::App for CadApp {
                     let factor = (-dy as f64 * 0.005).exp();
                     self.scale = ((self.scale as f64 * factor) as f32).clamp(0.01, 5000.0);
                 }
+            }
+
+            // LAYOUT TAB — PAPER-SPACE INPUT LANE. When no modal draw/edit
+            // flow is active, paper interactions (select / move / grip-resize /
+            // viewport pick + the layout context menu) replace the model
+            // canvas's click handling entirely. Modal flows (draw tools, move /
+            // copy / … ) keep the model monolith below — their clicks commit
+            // through `add_dobject`, which routes into the active layout's
+            // paper entities.
+            if in_layout && !canvas_locked && self.hatch_pick_point_armed {
+                // Hatch pick-point clicks resolve against MODEL boundaries;
+                // hatches are a model-space operation (upstream parity).
+                self.hatch_pick_point_armed = false;
+                self.hatch_pick_point_session = None;
+                self.hatch_confirm_open = false;
+                self.hatch_dialog_open = false;
+                self.history.push("  hatch: cancelled — hatching works in Model space".into());
+            }
+            let layout_modal_flow =
+                   self.tool                != Tool::None
+                || self.move_state          != MoveState::Off
+                || self.copy_state          != CopyState::Off
+                || self.paste_state         != PasteState::Off
+                || self.rotate_state        != RotateState::Off
+                || self.scale_state         != ScaleState::Off
+                || self.mirror_state        != MirrorState::Off
+                || self.align_state         != AlignState::Off
+                || self.stretch_state       != StretchState::Off
+                || self.break_state         != BreakState::Off
+                || self.dist_state          != DistState::Off
+                || self.insert_state        != InsertState::Off
+                || self.cmd_flow.is_some()
+                || self.block_def_state     != BlockDefState::Off;
+            if in_layout && !canvas_locked && !layout_modal_flow && !rt_zoom {
+                self.paper_space_input(ctx, ui, rect, &painter, &resp);
+                return;
             }
 
             // ---- snap candidates + Tab-cycling -----------------------------
@@ -55429,7 +56589,10 @@ impl eframe::App for CadApp {
                 }
             }
 
-            // axes
+            // axes — model-space decoration; on a layout tab the paper render
+            // already painted the page (modal flows keep the canvas lanes, so
+            // the model geometry must not re-draw OVER the paper below).
+            if !in_layout {
             let origin = self.w2s(Vec2::ZERO, rect);
             let axis_col = egui::Color32::from_rgb(46, 56, 70);
             painter.line_segment(
@@ -55446,6 +56609,7 @@ impl eframe::App for CadApp {
                 origin, 5.0,
                 egui::Stroke::new(1.5, egui::Color32::from_rgb(240, 210, 70)),
             );
+            }
 
             // dobjects — viewport-culled. We compute the visible world rect once
             // and skip any dobject whose bbox doesn't overlap it. Still O(N) per
@@ -55483,12 +56647,16 @@ impl eframe::App for CadApp {
             // was otherwise unfalsifiable from a dump.
             let t_frame = std::time::Instant::now();
             let t_query = std::time::Instant::now();
-            let candidates: Vec<usize> =
-                if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
-                    g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize).collect()
-                } else {
-                    (0..self.doc.dobjects.len()).collect()
-                };
+            let candidates: Vec<usize> = if in_layout {
+                // Paper space: the model was already drawn inside the layout's
+                // viewports by `paper_space_render`; the modal lanes must not
+                // re-draw it over the page.
+                Vec::new()
+            } else if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
+                g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize).collect()
+            } else {
+                (0..self.doc.dobjects.len()).collect()
+            };
             let query_us = t_query.elapsed().as_micros() as u64;
             let in_viewport = candidates.len();
 
@@ -55740,36 +56908,10 @@ impl eframe::App for CadApp {
                             // → line/circle strokes; solid → a triangle mesh
                             // (even loops = color, odd = bg over-draw for holes).
                             if let Some(entry) = self.hatch_cache.get(&e.handle) {
-                                let stroke = egui::Stroke::new(0.9, color);
-                                for (a, b) in &entry.segs {
-                                    painter.line_segment(
-                                        [self.w2s(*a, rect), self.w2s(*b, rect)], stroke);
-                                }
-                                for (c, r) in &entry.circs {
-                                    let rpx = (*r as f32) * self.scale;
-                                    if rpx >= 0.5 {
-                                        painter.circle_stroke(self.w2s(*c, rect), rpx, stroke);
-                                    }
-                                }
-                                if !entry.solid.is_empty() {
-                                    let bg = egui::Color32::from_rgb(18, 22, 28);
-                                    // Depth-ascending batches — one mesh per
-                                    // loop so nested islands (even depth)
-                                    // paint after the hole (odd depth) that
-                                    // contains them.
-                                    for (is_fill, tris) in &entry.solid {
-                                        let col = if *is_fill { color } else { bg };
-                                        let mut mesh = egui::Mesh::default();
-                                        for tri in tris {
-                                            let base = mesh.vertices.len() as u32;
-                                            for v in tri {
-                                                mesh.colored_vertex(self.w2s(*v, rect), col);
-                                            }
-                                            mesh.add_triangle(base, base + 1, base + 2);
-                                        }
-                                        painter.add(egui::Shape::mesh(mesh));
-                                    }
-                                }
+                                // Shared painter (also used by the layout
+                                // viewport path) — one depth-ordered mesh.
+                                paint_cached_hatch(&painter, rect, self, entry, color,
+                                    egui::Color32::from_rgb(18, 22, 28));
                             }
                             drawn += 1;
                             continue;
@@ -58759,6 +59901,179 @@ fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
             egui::FontId::monospace(9.0),
             egui::Color32::from_rgb(150, 160, 175),
         );
+    }
+}
+
+fn style_effective_aci(color: cad_kernel::Color, layer: u32,
+                       layers: &cad_kernel::layer::LayerTable) -> Option<u8> {
+    match color {
+        cad_kernel::Color::Aci(i) => Some(i),
+        cad_kernel::Color::ByLayer | cad_kernel::Color::ByBlock => {
+            match layers.get(layer).map(|l| l.color) {
+                Some(cad_kernel::Color::Aci(i)) => Some(i),
+                _ => None,
+            }
+        }
+        cad_kernel::Color::TrueColorRef(_) => None,
+    }
+}
+fn paint_ctb_caps_joins(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    pts: &[Vec2],
+    closed: bool,
+    width_px: f32,
+    cap: cad_kernel::plotstyle::EndStyle,
+    join: cad_kernel::plotstyle::JoinStyle,
+    color: egui::Color32,
+    corners: bool,
+) {
+    let spts: Vec<egui::Pos2> = pts.iter().map(|p| app.w2s(*p, rect)).collect();
+    paint_caps_joins_screen(painter, &spts, closed, width_px, cap, join, color, corners);
+}
+/// Paint ONE cached hatch entry with the egui painter: pattern segs/circs as
+/// 0.9 px strokes in `color`, solid batches in DEPTH order (even = `color`,
+/// odd = `hole_bg` over-draw). Batches are appended to a single mesh in
+/// order, so nested islands still repaint over their holes. `hole_bg` is the
+/// canvas colour in model space but the PAGE WHITE inside a layout viewport.
+fn paint_cached_hatch(painter: &egui::Painter, rect: egui::Rect, app: &CadApp,
+                      entry: &HatchCacheEntry, color: egui::Color32,
+                      hole_bg: egui::Color32) {
+    let stroke = egui::Stroke::new(0.9, color);
+    for (a, b) in &entry.segs {
+        painter.line_segment([app.w2s(*a, rect), app.w2s(*b, rect)], stroke);
+    }
+    for (c, r) in &entry.circs {
+        let rpx = (*r as f32) * app.scale;
+        if rpx >= 0.5 {
+            painter.circle_stroke(app.w2s(*c, rect), rpx, stroke);
+        }
+    }
+    if !entry.solid.is_empty() {
+        let mut mesh = egui::Mesh::default();
+        let mut push_tri = |tri: &[Vec2; 3], col: egui::Color32| {
+            let base = mesh.vertices.len() as u32;
+            for v in tri { mesh.colored_vertex(app.w2s(*v, rect), col); }
+            mesh.add_triangle(base, base + 1, base + 2);
+        };
+        for (is_fill, tris) in &entry.solid {
+            let col = if *is_fill { color } else { hole_bg };
+            for tri in tris { push_tri(tri, col); }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+fn paint_dobject_ctb(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    d: &cad_kernel::DObject,
+    color: egui::Color32,
+    paper_scale: f32,
+    pen: Option<&cad_kernel::plotstyle::PlotStyleTable>,
+    layers: &cad_kernel::layer::LayerTable,
+) {
+    use cad_kernel::plotstyle::{EndStyle, JoinStyle};
+    let aci = style_effective_aci(d.style.color, d.style.layer, layers);
+    // Pen width: CTB Fixed wins; UseObject → the object's own lineweight.
+    let width_mm: f32 = match pen.and_then(|t| aci.map(|a| t.style(a).lineweight)) {
+        Some(cad_kernel::plotstyle::PlotWidth::Fixed(w)) => w,
+        _ => cad_kernel::lineweight::resolve_lineweight(d.style.lineweight, d.style.layer, layers),
+    };
+    let width = (width_mm * paper_scale).clamp(1.0, 64.0);
+    // Pen cap/join (canvas emulation — egui has no per-stroke styles). Same
+    // resolution as the plot scene: UseObject → Round defaults.
+    let cap = match pen.and_then(|t| aci.map(|a| t.style(a).end_style)) {
+        Some(EndStyle::UseObject) | None => EndStyle::Round,
+        Some(other) => other,
+    };
+    let join = match pen.and_then(|t| aci.map(|a| t.style(a).join_style)) {
+        Some(JoinStyle::UseObject) | None => JoinStyle::Round,
+        Some(other) => other,
+    };
+    // Linetype: CTB Id wins; UseObject → the entity's own chain (style, layer).
+    let override_lt = pen
+        .and_then(|t| aci.map(|a| t.style(a).linetype))
+        .and_then(|lt| match lt {
+            cad_kernel::plotstyle::PlotLinetype::UseObject => None,
+            cad_kernel::plotstyle::PlotLinetype::Id(id) => Some(id),
+        });
+    let lt_id = override_lt.unwrap_or_else(|| d.style.linetype);
+    let pattern = match app.doc.linetypes.get(lt_id).or_else(|| {
+        if override_lt.is_some() { None } else {
+            layers.get(d.style.layer).and_then(|l| app.doc.linetypes.get(l.linetype))
+        }
+    }) {
+        Some(lt) if !lt.is_continuous() => lt.pattern.clone(),
+        _ => {
+            // Continuous stroke: cap/join emulation (dashed strokes keep the
+            // plain dash rendering — per-dash caps are skipped as an
+            // approximation; the exports apply the real styles per segment).
+            if matches!(&d.geom,
+                Geom::Line(_) | Geom::Polyline(_) | Geom::Circle(_) | Geom::Arc(_)
+                | Geom::Ellipse(_) | Geom::EllipseArc(_) | Geom::Spline(_))
+            {
+                let closed = match &d.geom {
+                    Geom::Circle(_) | Geom::Ellipse(_) => true,
+                    Geom::Polyline(p) => p.closed,
+                    // Spline has no closed flag — first ≈ last control point
+                    // is the "Close" convention.
+                    Geom::Spline(s) => {
+                        let n = s.control_points.len();
+                        n > 2 && (s.control_points[0] - s.control_points[n - 1]).len() < 1e-6
+                    }
+                    _ => false,
+                };
+                let corners = matches!(&d.geom, Geom::Polyline(_));
+                // A Bevel pen needs butt SEGMENTS (egui `Shape::line` miters by
+                // itself and a bevel can't un-draw its spike). Round/Miter keep
+                // the single-strip render (one shape per polyline, not one per
+                // segment) with the cap/join emulation layered on top.
+                if let Geom::Polyline(p) = &d.geom {
+                    if p.widths.is_empty() {
+                        if join == JoinStyle::Bevel {
+                            for pl in app.preview_world_polylines(&d.geom) {
+                                let spts: Vec<egui::Pos2> =
+                                    pl.iter().map(|p| app.w2s(*p, rect)).collect();
+                                paint_butt_polyline(painter, &spts, width, color);
+                                paint_caps_joins_screen(painter, &spts, closed, width,
+                                    cap, join, color, corners);
+                            }
+                            return;
+                        }
+                        draw_dobject_thick(painter, rect, app, &d.geom, color, width);
+                        for pl in app.preview_world_polylines(&d.geom) {
+                            paint_ctb_caps_joins(painter, rect, app, &pl, closed, width,
+                                cap, join, color, corners);
+                        }
+                        return;
+                    }
+                }
+                draw_dobject_thick(painter, rect, app, &d.geom, color, width);
+                for pl in app.preview_world_polylines(&d.geom) {
+                    paint_ctb_caps_joins(painter, rect, app, &pl, closed, width, cap, join, color, corners);
+                }
+            } else {
+                draw_dobject_thick(painter, rect, app, &d.geom, color, width);
+            }
+            return;
+        }
+    };
+    let lt_scale = if d.style.linetype_scale > 1e-6 { d.style.linetype_scale } else { 1.0 };
+    let scale_px = app.scale * lt_scale;
+    let stroke = egui::Stroke::new(width, color);
+    match &d.geom {
+        Geom::Line(_) | Geom::Polyline(_) | Geom::Circle(_) | Geom::Arc(_)
+        | Geom::Ellipse(_) | Geom::EllipseArc(_) | Geom::Spline(_) => {
+            for pl in app.preview_world_polylines(&d.geom) {
+                let pts: Vec<egui::Pos2> =
+                    pl.iter().map(|p| app.w2s(*p, rect)).collect();
+                paint_pattern_polyline(painter, &pts, &pattern, scale_px, stroke);
+            }
+        }
+        _ => draw_dobject_thick(painter, rect, app, &d.geom, color, width),
     }
 }
 
