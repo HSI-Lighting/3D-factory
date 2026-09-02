@@ -2970,6 +2970,42 @@ pub struct CadApp {
     py_examples: Vec<(String, std::path::PathBuf)>,
     /// Selected example index in the console's combo.
     py_example_sel: usize,
+    /// WP-SCRIPT slice 5 — in-app script editor (create/edit/save/run
+    /// scripts/*.py). The buffer lives in the app so closing the panel loses
+    /// nothing; only Save writes to disk.
+    py_editor_open: bool,
+    /// Editor text buffer (the script being edited).
+    py_editor_text: String,
+    /// The file the buffer was loaded from / saved to (None = untitled).
+    py_editor_path: Option<std::path::PathBuf>,
+    /// Script name field (file stem, without .py).
+    py_editor_name: String,
+    /// Buffer differs from the on-disk file.
+    py_editor_dirty: bool,
+    /// Pending "discard unsaved changes?" target when the user picks a
+    /// different file (or New) while dirty.
+    py_editor_confirm: Option<PyEditorConfirm>,
+    /// Run-script parameter dialog (slice 5): `run <name>` bare or a menu
+    /// pick opens it; named `run <name> k=v …` skips it.
+    script_param_dialog: Option<ScriptParamDialog>,
+    /// Armed pick for a script parameter (slice 5): `Some((name, kind))` —
+    /// the next canvas click fills that parameter's value and clears this.
+    script_param_pick: Option<(String, ScriptPickKind)>,
+    /// Live ghost preview while the parameter dialog is open (slice 5).
+    script_preview: Option<ScriptPreview>,
+    /// A `run <name> k=v …` invocation waiting on its meta reply (slice 5 —
+    /// length conversion needs the declaration).
+    script_pending_run: Option<PendingScriptRun>,
+    /// The `pyhelp` reference window (slice 5): shows the full scripting
+    /// API document (docs/scripting_api.md — the AI-agent reference).
+    scripting_doc_open: bool,
+    /// The document text, lazy-loaded once on first open.
+    scripting_doc_text: Option<String>,
+    /// A Meta reply arrived and its job's `Finished` is next in the poll
+    /// stream — that finish must NOT finalize a preview the Meta reply just
+    /// started (both arrive in one poll batch). Consumed by
+    /// `on_script_finished`.
+    script_meta_finish_pending: bool,
     /// WP-SCRIPT D5 (one run = one undo unit): undo depth captured when the
     /// running script made its FIRST write. On `Finished` the per-op
     /// snapshots collapse back to `base + 1` — the single pre-run state —
@@ -3170,6 +3206,77 @@ pub struct CadApp {
     /// Frame counter for log timestamping — gives ordering even when
     /// multiple clicks happen close in wall-clock time.
     trim_debug_frame: u64,
+}
+
+/// What the script editor wants to switch to, once the user confirms
+/// discarding unsaved changes (slice 5).
+#[derive(Clone, Debug)]
+pub enum PyEditorConfirm {
+    /// Load an existing scripts/*.py file.
+    File(std::path::PathBuf),
+    /// Start a fresh untitled buffer.
+    New,
+}
+
+/// What an armed script-parameter pick returns on the next canvas click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScriptPickKind {
+    /// `'point'` param — the world coordinate fills the value.
+    Point,
+    /// `'entity'` param — the nearest entity's index fills the value.
+    Entity,
+}
+
+/// The run-script parameter dialog: one typed, named field per declared
+/// input, prefilled from the script's defaults (slice 5).
+pub struct ScriptParamDialog {
+    /// Script stem (for history + the run).
+    pub name: String,
+    /// Resolved scripts/<name>.py path.
+    pub path: std::path::PathBuf,
+    /// The declaration (filled when the Meta reply arrives).
+    pub params: Vec<cad_script::ScriptParamMeta>,
+    /// Editable values, parallel to `params`.
+    pub values: Vec<String>,
+    /// True until the engine's Meta reply lands.
+    pub waiting_meta: bool,
+    /// Floating position (the header band drags the dialog, palette-style).
+    pub pos: egui::Pos2,
+}
+
+/// A `run <name> k=v …` / positional invocation waiting on the script's
+/// metadata — needed so LENGTH inputs convert through the document's
+/// display unit before the run (slice 5).
+pub struct PendingScriptRun {
+    pub name: String,
+    pub path: std::path::PathBuf,
+    /// Named inputs (raw user strings) — `Some` = the k=v form.
+    pub named: Option<Vec<(String, String)>>,
+    /// Positional inputs (raw) — `Some` = the legacy form.
+    pub positional: Option<Vec<String>>,
+}
+
+/// WP-SCRIPT slice 5 — the live script preview: a GHOST pass runs the script
+/// on the worker while the parameter dialog is open; its ops land in a
+/// shadow `Document` (never the real one — no undo, no history, no GPU
+/// invalidation) and the net additions render as a dashed overlay.
+pub struct ScriptPreview {
+    /// Shadow document: a clone of the real doc taken at pass start.
+    doc: Document,
+    /// Real-document handles at pass start — a shadow dobject whose handle
+    /// is NOT here is a script addition (robust to script deletes).
+    base_handles: std::collections::HashSet<u64>,
+    /// True while a ghost pass executes on the worker.
+    running: bool,
+    /// The user ran / closed the dialog mid-pass — drop on finish instead
+    /// of finalizing ghosts.
+    cancelled: bool,
+    /// The dialog values changed since the pass started (restart pending).
+    dirty: bool,
+    /// Restart throttle.
+    last_restart: std::time::Instant,
+    /// Net additions of the last completed pass (rendered dashed).
+    ghosts: Vec<Geom>,
 }
 
 const UNDO_STACK_CAP: usize = 64;
@@ -4450,6 +4557,9 @@ pub enum AciPickRequest {
     WallStyleForm(WallColorSlot),
     /// Picker is editing the Block dialog's instance color.
     BlockForm,
+    /// Picker is editing one field of the run-script parameter dialog. The
+    /// index is into `ScriptParamDialog.params`, so the enum stays `Copy`).
+    ScriptParam(usize),
     /// Picker is editing the drawing's CURRENT color (text dialog parameter
     /// section — the color new dobjects are born with).
     CurrentColor,
@@ -4881,6 +4991,19 @@ impl Default for CadApp {
             py_console_dock: crate::dock::DockState::Docked(crate::dock::DockRegion::Bottom),
             py_examples: Vec::new(),
             py_example_sel: 0,
+            py_editor_open: false,
+            py_editor_text: String::new(),
+            py_editor_path: None,
+            py_editor_name: String::new(),
+            py_editor_dirty: false,
+            py_editor_confirm: None,
+            script_param_dialog: None,
+            script_param_pick: None,
+            script_preview: None,
+            script_pending_run: None,
+            scripting_doc_open: false,
+            scripting_doc_text: None,
+            script_meta_finish_pending: false,
             script_undo_base: None,
             script_group_snapshots: Vec::new(),
             plotstyle_open: false,
@@ -19173,6 +19296,7 @@ impl CadApp {
                 self.history.push(format!("  py> {}", code));
                 self.script.get_or_insert_with(cad_script::ScriptEngine::new)
                     .submit_text(code);
+                self.refocus_cmd = true;
             }
             Ok(Command::Python(None)) => {
                 // Bare `py` toggles the docked Python console.
@@ -19184,53 +19308,24 @@ impl CadApp {
                 }
             }
             Ok(Command::PythonFile(path)) => {
+                self.clear_script_preview();
                 self.history.push(format!("  pyfile> {}", path));
                 self.script.get_or_insert_with(cad_script::ScriptEngine::new)
                     .submit_file(std::path::PathBuf::from(path));
+                self.refocus_cmd = true;
             }
             // WP-SCRIPT: `run <name>` executes scripts/<name>.py; bare `run`
             // opens the console and lists what's available.
-            Ok(Command::Script(name, _args)) => {
-                match name {
-                    None => {
-                        self.py_console_open = true;
-                        self.scan_py_examples();
-                        let list: Vec<String> =
-                            self.py_examples.iter().map(|(n, _)| n.clone()).collect();
-                        self.history.push(format!(
-                            "  run — scripts: {}  (type `run <name>` to execute)",
-                            if list.is_empty() { "none".into() } else { list.join(", ") },
-                        ));
-                    }
-                    Some(name) => {
-                        self.scan_py_examples();
-                        let resolved = Self::resolve_script(&name);
-                        match resolved {
-                            Some((stem, path)) => {
-                                self.history.push(format!("  run> {}", stem));
-                                self.script
-                                    .get_or_insert_with(cad_script::ScriptEngine::new)
-                                    .submit_file(path);
-                            }
-                            None => {
-                                let list: Vec<String> =
-                                    self.py_examples.iter().map(|(n, _)| n.clone()).collect();
-                                self.history.push(format!(
-                                    "  ! no script '{}' — available: {}",
-                                    name,
-                                    if list.is_empty() { "none".into() } else { list.join(", ") },
-                                ));
-                            }
-                        }
-                    }
-                }
+            // WP-SCRIPT slice 5: `run <name> [args…]` executes scripts/<name>.py
+            // with the args passed to the script; bare `run` opens the console
+            // and lists what's available.
+            Ok(Command::Script(name, args)) => {
+                self.run_script_command(name, args);
             }
+            // WP-SCRIPT slice 5: `pyhelp` shows the full scripting API
+            // reference (the AI-agent document).
             Ok(Command::PyApiDoc) => {
-                // The full API reference document is not bundled in this build;
-                // the console's `help(rasm)` covers the scripting surface.
-                self.py_console_open = true;
-                self.history.push(
-                    "  python: console opened — `help(rasm)` lists the scripting surface".into());
+                self.open_scripting_doc();
             }
             Ok(Command::PlotStyle) => {
                 // Open the Plot Style Table Editor (CTB color->pen editor). App
@@ -24856,10 +24951,21 @@ impl CadApp {
                 cad_script::ScriptReply::Finished { ok } => {
                     self.on_script_finished(*ok);
                 }
-                cad_script::ScriptReply::Meta(_) => {
-                    // The parameter-declaration machinery (slice 5 param
-                    // dialog) is not ported to this build — a Meta reply has
-                    // no consumer, so it is dropped.
+                cad_script::ScriptReply::Meta(meta) => {
+                    // Slice 5 — the script's parameter declaration arrived
+                    // (answer to the dialog's request_meta). Its Finished is
+                    // next in the stream — mark it so `on_script_finished`
+                    // doesn't mistake it for the preview's own finish (they
+                    // share a poll batch: Meta starts the preview, and the
+                    // META job's Finished must not finalize it).
+                    self.script_meta_finish_pending = true;
+                    // A pending k=v / positional run consumes the spec first
+                    // (length conversion); otherwise it feeds the dialog.
+                    if self.script_pending_run.is_some() {
+                        self.run_pending_script(meta.clone());
+                    } else {
+                        self.on_script_meta(meta.clone());
+                    }
                 }
             }
         }
@@ -24891,6 +24997,12 @@ impl CadApp {
         op: cad_script::ScriptOp,
     ) -> cad_script::ScriptOpReply {
         use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+        // Slice 5 preview: while a ghost pass runs, every op lands in the
+        // shadow document — the real doc is never touched (no undo, no
+        // history, no GPU invalidation).
+        if self.script_preview.as_ref().is_some_and(|p| p.running) {
+            return self.apply_preview_op(&op);
+        }
         // D5 — lazy undo baseline: the first write of a run captures the
         // pre-run depth; Finished collapses everything above it (see
         // poll_script_engine). The group-boundary list belongs to the same
@@ -25541,44 +25653,480 @@ impl CadApp {
         }
     }
 
-    /// End-of-run handling: collapse the per-op undo entries back to the
-    /// pre-run snapshot (D5 — one run = one undo unit; P3 — grouped runs
-    /// keep one entry per `rasm.undo_group()` boundary).
+    /// End-of-run handling. Three kinds:
+    /// - a METADATA pass finish (marked by `script_meta_finish_pending`):
+    ///   ignored entirely — its `Meta` reply already handled the outcome;
+    /// - a ghost preview finish: finalizes the shadow's net additions into
+    ///   the dashed overlay (or drops a cancelled/zombie pass) and stays out
+    ///   of history / console / undo;
+    /// - a real run finish: history + console + the one-run-one-undo
+    ///   collapse (D5 — one run = one undo unit; P3 — grouped runs keep one
+    ///   entry per `rasm.undo_group()` boundary).
     fn on_script_finished(&mut self, ok: bool) {
-        if ok {
-            self.history.push("  ✔ python: done".into());
+        if self.script_meta_finish_pending {
+            self.script_meta_finish_pending = false;
+            return;
         }
-        self.py_log(format!("— run {}", if ok { "done" } else { "failed" }));
-        if let Some(base) = self.script_undo_base.take() {
-            if self.script_group_snapshots.is_empty() {
-                // D5 — one run = one undo unit.
-                let keep = (base + 1).min(self.undo_stack.len());
-                if self.undo_stack.len() > keep {
-                    self.undo_stack.truncate(keep);
+        let was_preview = self.script_preview.as_ref().is_some_and(|p| p.running);
+        if !was_preview {
+            if ok {
+                self.history.push("  ✔ python: done".into());
+            }
+            self.py_log(format!("— run {}", if ok { "done" } else { "failed" }));
+            if let Some(base) = self.script_undo_base.take() {
+                if self.script_group_snapshots.is_empty() {
+                    // D5 — one run = one undo unit.
+                    let keep = (base + 1).min(self.undo_stack.len());
+                    if self.undo_stack.len() > keep {
+                        self.undo_stack.truncate(keep);
+                    }
+                } else {
+                    // P3 — grouped run: keep the pre-run snapshot plus ONE
+                    // entry per `rasm.undo_group()` boundary; each group is
+                    // its own undo unit. Boundary indices are stack indices
+                    // recorded at boundary time (the stack only appends
+                    // during a run, so they stay valid).
+                    let mut kept = Vec::with_capacity(self.script_group_snapshots.len() + 1);
+                    kept.push(base);
+                    kept.extend(self.script_group_snapshots.iter().copied());
+                    let mut out = Vec::with_capacity(kept.len());
+                    let mut last = base;
+                    for &ix in &kept {
+                        if ix >= self.undo_stack.len() || ix < base {
+                            continue;
+                        }
+                        out.push(self.undo_stack[ix].clone());
+                        last = ix;
+                    }
+                    if out.is_empty() {
+                        out.push(self.undo_stack[base.min(self.undo_stack.len().saturating_sub(1))].clone());
+                    }
+                    let _ = last;
+                    self.undo_stack.truncate(base);
+                    self.undo_stack.extend(out);
                 }
-            } else {
-                // P3 — grouped run: keep the pre-run snapshot plus ONE
-                // entry per `rasm.undo_group()` boundary; each group is
-                // its own undo unit. Boundary indices are stack indices
-                // recorded at boundary time (the stack only appends
-                // during a run, so they stay valid).
-                let mut kept = Vec::with_capacity(self.script_group_snapshots.len() + 1);
-                kept.push(base);
-                kept.extend(self.script_group_snapshots.iter().copied());
-                let mut out = Vec::with_capacity(kept.len());
-                for &ix in &kept {
-                    if ix >= self.undo_stack.len() || ix < base {
+                self.script_group_snapshots.clear();
+            }
+        }
+        if let Some(p) = &mut self.script_preview {
+            if p.running {
+                p.running = false;
+                if p.cancelled {
+                    self.script_preview = None;
+                } else if ok {
+                    p.ghosts = p
+                        .doc
+                        .dobjects
+                        .iter()
+                        .filter(|d| !p.base_handles.contains(&d.handle))
+                        .map(|d| d.geom.clone())
+                        .collect();
+                }
+                // A failed pass keeps the previous ghosts.
+            }
+        }
+    }
+
+    // ---- slice 5 preview: the shadow-document ghost pass ------------------
+
+    /// Start a ghost pass: clone the real doc, snapshot its handles, and
+    /// submit the script with the CURRENT dialog values. Ops land in the
+    /// shadow; on `Finished` the net additions become the dashed overlay.
+    fn script_preview_start(
+        &mut self,
+        name: String,
+        path: std::path::PathBuf,
+        params: Vec<(String, String)>,
+    ) {
+        self.script_preview = Some(ScriptPreview {
+            base_handles: self.doc.dobjects.iter().map(|d| d.handle).collect(),
+            doc: self.doc.clone(),
+            running: true,
+            cancelled: false,
+            dirty: false,
+            last_restart: std::time::Instant::now(),
+            ghosts: Vec::new(),
+        });
+        self.script
+            .get_or_insert_with(cad_script::ScriptEngine::new)
+            .submit_script_preview(path, name, params);
+    }
+
+    /// The dialog values changed — mark the preview stale (the restart is
+    /// throttled in `render_script_param_dialog`).
+    fn script_preview_dirty(&mut self) {
+        if let Some(p) = &mut self.script_preview {
+            if !p.cancelled {
+                p.dirty = true;
+            }
+        }
+    }
+
+    /// Drop the preview state. A pass still in flight becomes a zombie —
+    /// its ops keep landing in the shadow until `Finished` drops the struct,
+    /// so they can never leak into the real document.
+    fn clear_script_preview(&mut self) {
+        match &mut self.script_preview {
+            Some(p) if p.running => {
+                p.cancelled = true;
+                p.dirty = false;
+            }
+            Some(_) => {
+                self.script_preview = None;
+            }
+            None => {}
+        }
+    }
+
+/// One op of a ghost pass: reads see the shadow snapshot (so a script
+    /// counts/looks up what IT has drawn so far), writes land in the shadow
+    /// only. UI-only surfaces answer as inert no-ops — the preview is
+    /// best-effort and the REAL run is what commits (rule 10: the answer
+    /// says so).
+    fn apply_preview_op(&mut self, op: &cad_script::ScriptOp) -> cad_script::ScriptOpReply {
+        use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+        let p = self.script_preview.as_mut().expect("preview op without preview");
+        let doc = &mut p.doc;
+        let entity = |d: &DObject| {
+            let (color, linetype, lineweight, visible) = doc_entity_style_summary(doc, d);
+            cad_script::Entity {
+                handle: d.handle,
+                layer: doc
+                    .layers
+                    .get(d.style.layer)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_default(),
+                color,
+                linetype,
+                lineweight,
+                visible,
+                geom: d.geom.clone(),
+                style: d.style,
+            }
+        };
+        match op {
+            Op::DocCount => R::Count(doc.dobjects.len()),
+            Op::DocGet { index } => match doc.dobjects.get(*index) {
+                Some(d) => R::Entity(entity(d)),
+                None => R::Error(format!("no dobject #{} ({} total)", index, doc.dobjects.len())),
+            },
+            Op::DocAll => R::Entities(doc.dobjects.iter().map(entity).collect()),
+            Op::SelectionGet => R::Indices(Vec::new()),
+            Op::LayersGet => R::Layers(
+                doc.layers.layers.iter().enumerate().map(|(i, l)| cad_script::LayerInfo {
+                    id: i as u32,
+                    name: l.name.clone(),
+                    visible: l.visible,
+                    locked: l.locked,
+                    frozen: l.frozen,
+                    plottable: l.plottable,
+                    color: format!("{:?}", l.color),
+                }).collect(),
+            ),
+            Op::LayerActive => R::LayerActive(doc.layers.active),
+            Op::BlocksGet => R::Blocks(doc.blocks.blocks.iter().map(|b| b.name.clone()).collect()),
+            Op::SysVarGet { name } => R::SysVar(crate::varreg::env_get(&self.env, name)),
+            Op::ViewGet => R::View(cad_script::ViewInfo {
+                center: Vec2::new(-self.world_offset.x as f64, -self.world_offset.y as f64),
+                scale: self.scale as f64,
+            }),
+
+            Op::AddLine { a, b } => {
+                let i = doc.push(DObject::new(Geom::Line(Line { a: *a, b: *b })));
+                R::Ok(i)
+            }
+            Op::AddCircle { center, radius } => {
+                if !(*radius > 0.0) {
+                    return R::Error("circle radius must be > 0".into());
+                }
+                let i = doc.push(DObject::new(Geom::Circle(Circle { center: *center, radius: *radius })));
+                R::Ok(i)
+            }
+            Op::AddArc { center, radius, start_deg, sweep_deg } => {
+                if !(*radius > 0.0) {
+                    return R::Error("arc radius must be > 0".into());
+                }
+                let i = doc.push(DObject::new(Geom::Arc(Arc {
+                    center: *center,
+                    radius: *radius,
+                    start_angle: start_deg.to_radians(),
+                    sweep_angle: sweep_deg.to_radians(),
+                })));
+                R::Ok(i)
+            }
+            Op::AddEllipse { center, major, ratio } => {
+                let i = doc.push(DObject::new(Geom::Ellipse(Ellipse {
+                    center: *center, major: *major, ratio: *ratio,
+                })));
+                R::Ok(i)
+            }
+            Op::AddPolyline { vertices, closed } => {
+                if vertices.len() < 2 {
+                    return R::Error("a polyline needs at least 2 points".into());
+                }
+                let i = doc.push(DObject::new(Geom::Polyline(Polyline {
+                    vertices: vertices.iter()
+                        .map(|v| PolyVertex { pos: *v, bulge: 0.0 }).collect(),
+                    closed: *closed,
+                    widths: Vec::new(),
+                })));
+                R::Ok(i)
+            }
+            Op::AddPoint { at } => {
+                let i = doc.push(DObject::new(Geom::Point(Point { location: *at, style: 0, size: 0.0 })));
+                R::Ok(i)
+            }
+            Op::AddText { text, at, height, angle_deg } => {
+                let mut t = Text::empty();
+                t.position = *at;
+                t.height = *height;
+                t.angle = angle_deg.to_radians();
+                t.text = text.clone();
+                let i = doc.push(DObject::new(Geom::Text(t)));
+                R::Ok(i)
+            }
+            Op::Delete { indices } => {
+                let mut sorted = indices.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                let n = sorted.len();
+                for &i in sorted.iter().rev() {
+                    if i < doc.dobjects.len() {
+                        doc.dobjects.remove(i);
+                    }
+                }
+                R::Ok(n)
+            }
+            Op::LayerAdd { name } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return R::Error("layer name cannot be empty".into());
+                }
+                if doc.layers.find(&name).is_some() {
+                    return R::Error(format!("layer '{}' already exists", name));
+                }
+                let id = doc.layers.add(Layer {
+                    name,
+                    color: Color::Aci(7),
+                    linetype: 0,
+                    lineweight: Lineweight::Custom(0.0),
+                    visible: true, locked: false, frozen: false, plottable: true,
+                    order: 0,
+                });
+                R::Ok(id as usize)
+            }
+            Op::LayerSetActive { name } => match doc.layers.find(name) {
+                Some(id) => { doc.layers.active = id; R::OkUnit }
+                None => R::Error(format!("no layer named '{}'", name)),
+            },
+            Op::LayerSet { name, visible, locked, frozen, plottable, color_aci } => {
+                match doc.layers.find(name) {
+                    None => R::Error(format!("no layer named '{}'", name)),
+                    Some(id) => {
+                        if let Some(l) = doc.layers.get_mut(id) {
+                            if let Some(v) = visible { l.visible = *v; }
+                            if let Some(v) = locked { l.locked = *v; }
+                            if let Some(v) = frozen { l.frozen = *v; }
+                            if let Some(v) = plottable { l.plottable = *v; }
+                            if let Some(a) = color_aci { l.color = Color::Aci(*a); }
+                        }
+                        R::OkUnit
+                    }
+                }
+            }
+            Op::SelectionSet { .. } => R::Indices(Vec::new()),
+            Op::BlockCreate { .. } | Op::BlockInsert { .. } =>
+                R::Error("preview does not simulate blocks — the real run applies them".into()),
+            Op::Command { raw } => match parse(raw) {
+                Ok(Command::Add(g)) => {
+                    let i = doc.push(DObject::new(g));
+                    R::CommandOutput(vec![format!("+ #{} (preview)", i)])
+                }
+                Ok(_) => R::CommandOutput(vec!["(preview: command not simulated)".into()]),
+                Err(e) => R::CommandOutput(vec![format!("(preview: {})", e)]),
+            },
+            Op::SysVarSet { .. } => R::OkUnit,
+            Op::ViewSet { .. } => R::OkUnit,
+            Op::Save { .. } | Op::Open { .. } =>
+                R::CommandOutput(vec!["(preview: file operations not simulated)".into()]),
+
+            // P1 — transforms/style/geometry apply to the shadow so the
+            // ghost preview shows their effect.
+            Op::ModifyMove { indices, delta } => {
+                let n = preview_transform(doc, indices, |g| g.translated(*delta));
+                R::Ok(n)
+            }
+            Op::ModifyCopy { indices, delta } => {
+                let sources: Vec<DObject> = indices
+                    .iter()
+                    .filter_map(|&i| doc.dobjects.get(i).cloned())
+                    .collect();
+                let n0 = doc.dobjects.len();
+                let copies = duplicate_dobjects(&sources, |g| g.translated(*delta));
+                for c in copies {
+                    doc.push(c);
+                }
+                R::Indices((n0..doc.dobjects.len()).collect())
+            }
+            Op::ModifyRotate { indices, pivot, angle_deg } => {
+                let a = angle_deg.to_radians();
+                let n = preview_transform(doc, indices, |g| g.rotated(*pivot, a));
+                R::Ok(n)
+            }
+            Op::ModifyScale { indices, pivot, factor } => {
+                let n = preview_transform(doc, indices, |g| g.scaled(*pivot, *factor));
+                R::Ok(n)
+            }
+            Op::ModifyMirror { indices, a, b } => {
+                let n = preview_transform(doc, indices, |g| g.mirrored(*a, *b));
+                R::Ok(n)
+            }
+            Op::SetEntityColor { indices, color } => {
+                let c = match color {
+                    -1 => Color::ByLayer,
+                    -2 => Color::ByBlock,
+                    n if (0..=255).contains(n) => Color::Aci(*n as u8),
+                    _ => return R::Error("bad color".into()),
+                };
+                let n = preview_style(doc, indices, |d| d.style.color = c);
+                R::Ok(n)
+            }
+            Op::SetEntityLinetype { indices, name } => {
+                use cad_kernel::LinetypeTable;
+                let id = if name.is_empty() || name.eq_ignore_ascii_case("bylayer") {
+                    LinetypeTable::BYLAYER
+                } else {
+                    match doc.linetypes.find(name) {
+                        Some(id) => id,
+                        None => return R::Error(format!("no linetype named '{}'", name)),
+                    }
+                };
+                let n = preview_style(doc, indices, |d| d.style.linetype = id);
+                R::Ok(n)
+            }
+            Op::SetEntityLayer { indices, name } => match doc.layers.find(name) {
+                None => R::Error(format!("no layer named '{}'", name)),
+                Some(id) => {
+                    let n = preview_style(doc, indices, |d| d.style.layer = id);
+                    R::Ok(n)
+                }
+            },
+            Op::SetEntityLineweight { indices, mm } => {
+                let lw = if *mm < 0.0 {
+                    Lineweight::ByLayer
+                } else {
+                    Lineweight::Custom(*mm as f32)
+                };
+                let n = preview_style(doc, indices, |d| d.style.lineweight = lw);
+                R::Ok(n)
+            }
+            Op::SetEntityVisible { indices, visible } => {
+                let n = preview_style(doc, indices, |d| d.style.visible = *visible);
+                R::Ok(n)
+            }
+            Op::SetEntityGeom { index, geom } => {
+                match doc.dobjects.get_mut(*index) {
+                    Some(d) => {
+                        d.geom = geom.clone();
+                        R::OkUnit
+                    }
+                    None => R::Error(format!("no dobject #{}", index)),
+                }
+            }
+            Op::DocUnits => R::Units(cad_script::UnitsInfo {
+                name: self.doc.units.name.clone(),
+                scene_per_unit: self.doc.units.scene_per_unit,
+            }),
+            Op::DocBounds => {
+                let mut min: Option<Vec2> = None;
+                let mut max: Option<Vec2> = None;
+                for d in &doc.dobjects {
+                    if matches!(d.geom, Geom::Hatch(_)) {
                         continue;
                     }
-                    out.push(self.undo_stack[ix].clone());
+                    let (lo, hi) = d.bbox();
+                    min = Some(match min {
+                        None => lo,
+                        Some(m) => Vec2::new(m.x.min(lo.x), m.y.min(lo.y)),
+                    });
+                    max = Some(match max {
+                        None => hi,
+                        Some(m) => Vec2::new(m.x.max(hi.x), m.y.max(hi.y)),
+                    });
                 }
-                if out.is_empty() {
-                    out.push(self.undo_stack[base.min(self.undo_stack.len().saturating_sub(1))].clone());
-                }
-                self.undo_stack.truncate(base);
-                self.undo_stack.extend(out);
+                R::Bounds(min.zip(max))
             }
-            self.script_group_snapshots.clear();
+            Op::LayoutsGet => R::Layouts(
+                doc.layouts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| cad_script::LayoutInfo {
+                        id: i as u32,
+                        name: l.name.clone(),
+                        active: doc.active_layout == Some(i),
+                    })
+                    .collect(),
+            ),
+            Op::LayoutSetActive { .. } =>
+                R::Error("preview does not switch layouts".into()),
+            Op::LinetypesGet => R::Linetypes(
+                doc.linetypes.linetypes.iter().map(|l| l.name.clone()).collect(),
+            ),
+            Op::UndoGroup => R::OkUnit,
+            Op::SetCurrentColor { .. }
+            | Op::SetCurrentLinetype { .. }
+            | Op::SetCurrentLineweight { .. }
+            | Op::ZoomExtents => R::OkUnit,
+            // Hatching: AddHatch lands in the shadow (the ghost overlay
+            // skips hatch fills — the real run is what shows them);
+            // HatchAt tracing is app-native and returns "no region".
+            Op::AddHatch { boundary_indices, pattern } => {
+                let pattern = pattern.trim();
+                let pat = if pattern.eq_ignore_ascii_case("solid") {
+                    HatchPattern::Solid
+                } else {
+                    let canonical = cad_kernel::patterns::PATTERN_NAMES
+                        .iter()
+                        .find(|n| n.eq_ignore_ascii_case(pattern))
+                        .map(|s| s.to_string());
+                    match canonical {
+                        Some(name) => HatchPattern::Pattern { name, scale: 1.0, angle_deg: 0.0 },
+                        None => {
+                            return R::Error(format!(
+                                "no hatch pattern '{}' — available: {}",
+                                pattern,
+                                cad_kernel::patterns::PATTERN_NAMES.join(", ")
+                            ))
+                        }
+                    }
+                };
+                let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+                for &i in boundary_indices {
+                    if let Some(d) = doc.dobjects.get(i) {
+                        let ok = match &d.geom {
+                            Geom::Polyline(p) => polyline_is_effectively_closed(p),
+                            Geom::Circle(_) | Geom::Ellipse(_) => true,
+                            Geom::Spline(s) => spline_is_effectively_closed(s),
+                            _ => false,
+                        };
+                        if ok {
+                            handles.push(d.handle);
+                        }
+                    }
+                }
+                if handles.is_empty() {
+                    return R::Error(
+                        "add_hatch: none of the given indices is a closed boundary".into(),
+                    );
+                }
+                let hd: DObject = cad_kernel::Hatch { boundary_handles: handles, pattern: pat }.into();
+                let i = doc.push(hd);
+                R::Ok(i)
+            }
+            Op::HatchAt { .. } => R::Indices(Vec::new()),
+            Op::HatchPatternsGet => R::Patterns(
+                cad_kernel::patterns::PATTERN_NAMES.iter().map(|s| s.to_string()).collect(),
+            ),
         }
     }
 
@@ -25875,6 +26423,12 @@ impl CadApp {
             );
             let save_btn = ui.button("Save as script")
                 .on_hover_text("saves the input above to scripts/<name>.py");
+            if ui.button("Editor").on_hover_text("open the full script editor").clicked() {
+                self.py_editor_open_panel();
+            }
+            if ui.button("Guide").on_hover_text("full scripting API reference (pyhelp)").clicked() {
+                self.open_scripting_doc();
+            }
             let entered = name_te.lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if save_btn.clicked() || entered {
@@ -25958,6 +26512,7 @@ impl CadApp {
         }
         self.py_console_hist_idx = None;
         self.py_log(format!(">>> {}", code));
+        self.clear_script_preview();
         self.script
             .get_or_insert_with(cad_script::ScriptEngine::new)
             .submit_text(code);
@@ -25974,6 +26529,7 @@ impl CadApp {
             return;
         };
         self.py_log(format!(">>> pyfile {} ({})", name, path.display()));
+        self.clear_script_preview();
         self.script
             .get_or_insert_with(cad_script::ScriptEngine::new)
             .submit_file(path);
@@ -26056,7 +26612,869 @@ impl CadApp {
         None
     }
 
-    /// Save the console input as scripts/<name>.py.
+    /// A failed operation (fork-local): appends the `! ` marker to the
+    /// history transcript. (Upstream also surfaces it in a status bar this
+    /// build does not have.)
+    fn fail_op(&mut self, msg: impl Into<String>) {
+        self.history.push(format!("  ! {}", msg.into()));
+    }
+
+    fn run_script_command(&mut self, name: Option<String>, args: Vec<String>) {
+        let Some(name) = name else {
+            self.py_console_open = true;
+            self.scan_py_examples();
+            let list: Vec<String> = self.py_examples.iter().map(|(n, _)| n.clone()).collect();
+            self.history.push(format!(
+                "  run — scripts: {}  (type `run <name> [k=v …]`, or pick from Tools → Scripts)",
+                if list.is_empty() { "none".into() } else { list.join(", ") },
+            ));
+            return;
+        };
+        self.scan_py_examples();
+        self.clear_script_preview();
+        match Self::resolve_script(&name) {
+            Some((stem, path)) => {
+                if args.is_empty() {
+                    // No inputs → dialog: ask the engine for the declaration
+                    // (metadata pass) and open the panel; the Meta reply
+                    // fills the fields (or runs immediately when the script
+                    // declares nothing).
+                    self.script_param_dialog = Some(ScriptParamDialog {
+                        name: stem.clone(),
+                        path: path.clone(),
+                        params: Vec::new(),
+                        values: Vec::new(),
+                        waiting_meta: true,
+                        pos: egui::pos2(520.0, 160.0),
+                    });
+                    self.history.push(format!("  run> {}", stem));
+                    self.script
+                        .get_or_insert_with(cad_script::ScriptEngine::new)
+                        .request_meta(path);
+                } else if let Some(params) = Self::parse_named_script_args(&args) {
+                    // Named inputs → run now. The meta reply is fetched
+                    // first (invisibly — no dialog) so LENGTH values convert
+                    // through the document's display unit.
+                    let shown: Vec<String> =
+                        params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    self.history.push(format!("  run> {} {}", stem, shown.join(" ")));
+                    self.script_pending_run = Some(PendingScriptRun {
+                        name: stem.clone(),
+                        path: path.clone(),
+                        named: Some(params),
+                        positional: None,
+                    });
+                    self.script
+                        .get_or_insert_with(cad_script::ScriptEngine::new)
+                        .request_meta(path);
+                } else {
+                    // Legacy positional inputs — same meta-first treatment
+                    // for declared-order length conversion.
+                    self.history.push(format!("  run> {} {}", stem, args.join(" ")));
+                    self.script_pending_run = Some(PendingScriptRun {
+                        name: stem.clone(),
+                        path: path.clone(),
+                        named: None,
+                        positional: Some(args),
+                    });
+                    self.script
+                        .get_or_insert_with(cad_script::ScriptEngine::new)
+                        .request_meta(path);
+                }
+                self.refocus_cmd = true;
+            }
+            None => {
+                let list: Vec<String> = self.py_examples.iter().map(|(n, _)| n.clone()).collect();
+                self.fail_op(format!(
+                    "run: no script '{}' in scripts/{}",
+                    name,
+                    if list.is_empty() {
+                        " (folder is empty — save one from the Python console)".into()
+                    } else {
+                        format!(" (available: {})", list.join(", "))
+                    },
+                ));
+            }
+        }
+    }
+
+    /// `run <name> k=v k2=v2 …` → the named inputs. `Some(_)` only when
+    /// EVERY arg is a `k=v` pair (mixed forms are rejected loudly by the
+    /// caller treating them as positional).
+    fn parse_named_script_args(args: &[String]) -> Option<Vec<(String, String)>> {
+        if args.is_empty() || !args.iter().all(|a| a.contains('=')) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            let (k, v) = a.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            out.push((k.to_string(), v.to_string()));
+        }
+        Some(out)
+    }
+
+    /// Fill the catalog-backed dropdown choices (linetype / layer / block /
+    /// hatch pattern) from the LIVE document. Called when the dialog opens
+    /// AND before a k=v / positional run converts its inputs, so both paths
+    /// validate against the same catalogs.
+    fn fill_catalog_choices(&self, params: &mut [cad_script::ScriptParamMeta]) {
+        for p in params {
+            match p.ptype {
+                cad_script::ParamType::Linetype => {
+                    p.choices = self
+                        .doc
+                        .linetypes
+                        .linetypes
+                        .iter()
+                        .map(|l| l.name.clone())
+                        .collect();
+                }
+                cad_script::ParamType::Layer => {
+                    p.choices = self
+                        .doc
+                        .layers
+                        .layers
+                        .iter()
+                        .map(|l| l.name.clone())
+                        .collect();
+                }
+                cad_script::ParamType::Block => {
+                    p.choices = self
+                        .doc
+                        .blocks
+                        .blocks
+                        .iter()
+                        .map(|b| b.name.clone())
+                        .collect();
+                }
+                cad_script::ParamType::HatchPattern => {
+                    p.choices = cad_kernel::patterns::PATTERN_NAMES
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Execute a pending `run <name> k=v …` / positional invocation now
+    /// that its declaration arrived: LENGTH inputs convert display → scene
+    /// units first (a bad length fails loudly and skips the run).
+    fn run_pending_script(&mut self, meta: Option<cad_script::ScriptMeta>) {
+        let Some(pend) = self.script_pending_run.take() else {
+            return;
+        };
+        match meta {
+            Some(mut m) => {
+                // Catalog dropdowns validate against the live document —
+                // fill their choices before converting any input.
+                self.fill_catalog_choices(&mut m.params);
+                // Build (name, raw) pairs: named as typed, positional
+                // mapped onto the declared order.
+                let named: Option<Vec<(String, String)>> = pend.named;
+                let raw: Vec<(String, String)> = match named {
+                    Some(n) => n,
+                    None => {
+                        let args = pend.positional.unwrap_or_default();
+                        m.params
+                            .iter()
+                            .zip(args.iter())
+                            .map(|(p, a)| (p.name.clone(), a.clone()))
+                            .collect()
+                    }
+                };
+                // Convert lengths; abort loudly on the first bad value.
+                let mut params = Vec::with_capacity(raw.len());
+                for (k, v) in &raw {
+                    match self.param_value_scene(&m.params, k, v) {
+                        Ok(s) => params.push((k.clone(), s)),
+                        Err(e) => {
+                            self.fail_op(format!("run {}: {}", pend.name, e));
+                            return;
+                        }
+                    }
+                }
+                let shown: Vec<String> =
+                    raw.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                self.py_log(format!(">>> run {} {}", pend.name, shown.join(" ")));
+                self.clear_script_preview();
+                self.script
+                    .get_or_insert_with(cad_script::ScriptEngine::new)
+                    .submit_script_with_params(pend.path, pend.name, Vec::new(), params);
+            }
+            None => {
+                // No declaration (plain script) — pass the inputs through
+                // untouched (legacy rasm.args semantics).
+                self.py_log(format!(">>> run {}", pend.name));
+                self.clear_script_preview();
+                match (pend.named, pend.positional) {
+                    (Some(named), _) => {
+                        self.script
+                            .get_or_insert_with(cad_script::ScriptEngine::new)
+                            .submit_script_with_params(pend.path, pend.name, Vec::new(), named);
+                    }
+                    (None, Some(args)) => {
+                        self.script
+                            .get_or_insert_with(cad_script::ScriptEngine::new)
+                            .submit_script(pend.path, pend.name, args);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        self.refocus_cmd = true;
+    }
+
+    fn on_script_meta(&mut self, meta: Option<cad_script::ScriptMeta>) {
+        let Some(mut dlg) = self.script_param_dialog.take() else {
+            return;
+        };
+        if !dlg.waiting_meta {
+            self.script_param_dialog = Some(dlg);
+            return;
+        }
+        dlg.waiting_meta = false;
+        match meta {
+            Some(m) => {
+                dlg.params = m.params;
+                dlg.values = dlg
+                    .params
+                    .iter()
+                    .map(|p| self.param_display_default(p))
+                    .collect();
+                if dlg.params.is_empty() {
+                    let (name, path) = (dlg.name.clone(), dlg.path.clone());
+                    self.history
+                        .push(format!("  run> {} (no parameters — running)", name));
+                    self.py_log(format!(">>> run {}", name));
+                    self.script
+                        .get_or_insert_with(cad_script::ScriptEngine::new)
+                        .submit_script_with_params(path, name, Vec::new(), Vec::new());
+                } else {
+                    // Catalog-backed dropdowns (linetype / layer / block /
+                    // hatch pattern) get their choices from the LIVE
+                    // document at dialog time.
+                    self.fill_catalog_choices(&mut dlg.params);
+                    // Slice 5 preview: with declared inputs, start a ghost
+                    // pass immediately so the DEFAULT result is visible while
+                    // the user decides.
+                    let params = match self.dialog_params_scene(&dlg) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.fail_op(format!("run {}: {}", dlg.name, e));
+                            self.script_param_dialog = Some(dlg);
+                            return;
+                        }
+                    };
+                    let dname = dlg.name.clone();
+                    let dpath = dlg.path.clone();
+                    self.script_preview_start(dname, dpath, params);
+                    self.script_param_dialog = Some(dlg);
+                }
+            }
+            None => {
+                // No rasm.main → a plain script: run it straight away.
+                let (name, path) = (dlg.name.clone(), dlg.path.clone());
+                self.history.push(format!(
+                    "  run> {} (no declared parameters — running)",
+                    name
+                ));
+                self.py_log(format!(">>> run {}", name));
+                self.script
+                    .get_or_insert_with(cad_script::ScriptEngine::new)
+                    .submit_script(path, name, Vec::new());
+            }
+        }
+    }
+
+    /// The run-script parameter dialog (slice 5): one labeled, typed field
+    /// per declared input, prefilled with the script's defaults. Run
+    /// submits the values as `rasm.params`; X/Cancel just closes.
+    fn render_script_param_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.script_param_dialog.take() else {
+            return;
+        };
+        // Slice 5 preview: restart the ghost pass when the values changed
+        // (throttled; never while another job runs on the engine).
+        if let Some(p) = &mut self.script_preview {
+            let busy = self.script.as_ref().is_some_and(|s| s.is_busy());
+            if p.dirty
+                && !p.running
+                && !p.cancelled
+                && !busy
+                && p.last_restart.elapsed() >= std::time::Duration::from_millis(300)
+            {
+                let params = match self.dialog_params_scene(&dlg) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.fail_op(format!("run {}: {}", dlg.name, e));
+                        Vec::new()
+                    }
+                };
+                if !params.is_empty() {
+                    let dname = dlg.name.clone();
+                    let dpath = dlg.path.clone();
+                    self.script_preview_start(dname, dpath, params);
+                }
+            }
+        }
+        let mut do_run = false;
+        let mut do_cancel = false;
+        let mut keep = true;
+        let mut drag_delta = egui::Vec2::ZERO;
+        let title = format!("Run script — {}", dlg.name);
+        egui::Window::new(title)
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("script_param_dialog"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .current_pos(dlg.pos)
+            .frame(egui::Frame::none()
+                .fill(crate::theme::color::SURFACE_1)
+                .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER)))
+            .show(ctx, |ui| {
+                let hb = crate::dock::header_band(
+                    ui, &format!("Run script — {}", dlg.name), None, true);
+                if hb.close_clicked {
+                    keep = false;
+                }
+                // Drag handle — the shared band, palette-style.
+                if hb.band.dragged() {
+                    drag_delta = hb.band.drag_delta();
+                }
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        if dlg.waiting_meta {
+                            ui.weak("reading the script's parameters…");
+                        } else {
+                            ui.set_min_width(340.0);
+                            for i in 0..dlg.params.len() {
+                                let p = &dlg.params[i];
+                                let label = if p.help.is_empty() {
+                                    p.name.clone()
+                                } else {
+                                    format!("{} — {}", p.name, p.help)
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [220.0, 20.0],
+                                        egui::Label::new(&label).truncate(),
+                                    );
+                                    match p.ptype {
+                                        cad_script::ParamType::Float => {
+                                            let fallback =
+                                                p.default.parse().unwrap_or(0.0);
+                                            let mut v: f64 = dlg.values[i]
+                                                .parse()
+                                                .unwrap_or(fallback);
+                                            let mut dv = egui::DragValue::new(&mut v)
+                                                .update_while_editing(false)
+                                                .speed(0.5);
+                                            if let (Some(lo), Some(hi)) = (p.min, p.max) {
+                                                dv = dv.range(lo..=hi);
+                                            }
+                                            if ui.add(dv).changed() {
+                                                dlg.values[i] = format!("{}", v);
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Length => {
+                                            // Display units: the field shows
+                                            // the value in the document's
+                                            // unit; the submit paths convert
+                                            // back to scene units.
+                                            let fallback = self
+                                                .param_display_default(p)
+                                                .parse()
+                                                .unwrap_or(0.0);
+                                            let mut v: f64 = dlg.values[i]
+                                                .parse()
+                                                .unwrap_or(fallback);
+                                            let unit = self.doc.units.name.clone();
+                                            let mut dv = egui::DragValue::new(&mut v)
+                                                .update_while_editing(false)
+                                                .speed(0.5)
+                                                .suffix(format!(" {}", unit));
+                                            if let (Some(lo), Some(hi)) = (p.min, p.max) {
+                                                let lo = self.doc.units.to_display(lo);
+                                                let hi = self.doc.units.to_display(hi);
+                                                dv = dv.range(lo..=hi);
+                                            }
+                                            if ui.add(dv).changed() {
+                                                dlg.values[i] = format!("{}", v);
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Int => {
+                                            let fallback =
+                                                p.default.parse().unwrap_or(0);
+                                            let mut v: i64 = dlg.values[i]
+                                                .parse()
+                                                .unwrap_or(fallback);
+                                            let mut dv = egui::DragValue::new(&mut v)
+                                                .update_while_editing(false)
+                                                .speed(1);
+                                            if let (Some(lo), Some(hi)) = (p.min, p.max) {
+                                                dv = dv.range((lo as i64)..=(hi as i64));
+                                            }
+                                            if ui.add(dv).changed() {
+                                                dlg.values[i] = format!("{}", v);
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Bool => {
+                                            let mut v = matches!(
+                                                dlg.values[i].to_ascii_lowercase().as_str(),
+                                                "true" | "1" | "yes" | "on"
+                                            );
+                                            if ui.checkbox(&mut v, "").changed() {
+                                                dlg.values[i] =
+                                                    if v { "true" } else { "false" }.into();
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Str => {
+                                            if ui.add_sized(
+                                                [120.0, 20.0],
+                                                egui::TextEdit::singleline(
+                                                    &mut dlg.values[i],
+                                                ),
+                                            ).changed()
+                                            {
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Choice
+                                        | cad_script::ParamType::Linetype
+                                        | cad_script::ParamType::Layer
+                                        | cad_script::ParamType::Block
+                                        | cad_script::ParamType::HatchPattern => {
+                                            // A dropdown: declared choices
+                                            // (`name: help [a, b, c]`) or a
+                                            // LIVE catalog (linetypes /
+                                            // layers / blocks / patterns —
+                                            // filled when the dialog opens).
+                                            let current = dlg.values[i].clone();
+                                            let choices = p.choices.clone();
+                                            let selected = if choices.contains(&current) {
+                                                current.clone()
+                                            } else if let Some(first) = choices.first() {
+                                                first.clone()
+                                            } else {
+                                                current.clone()
+                                            };
+                                            let mut label = selected.clone();
+                                            egui::ComboBox::from_id_salt(
+                                                egui::Id::new(("py_param_choice", i)),
+                                            )
+                                            .selected_text(&label)
+                                            .width(150.0)
+                                            .show_ui(ui, |ui| {
+                                                for c in &choices {
+                                                    if ui.selectable_label(&label == c, c).clicked() {
+                                                        label = c.clone();
+                                                    }
+                                                }
+                                            });
+                                            if label != dlg.values[i] {
+                                                dlg.values[i] = label;
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::FloatList
+                                        | cad_script::ParamType::IntList
+                                        | cad_script::ParamType::StrList
+                                        | cad_script::ParamType::PointList => {
+                                            let hint = match p.ptype {
+                                                cad_script::ParamType::PointList => {
+                                                    "x,y; x,y; …"
+                                                }
+                                                _ => "1, 2, 3, …",
+                                            };
+                                            if ui.add_sized(
+                                                [220.0, 20.0],
+                                                egui::TextEdit::singleline(&mut dlg.values[i])
+                                                    .hint_text(hint),
+                                            ).changed()
+                                            {
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Point => {
+                                            let (mut x, mut y) =
+                                                CadApp::parse_point_param_value(
+                                                    &dlg.values[i],
+                                                )
+                                                .unwrap_or((0.0, 0.0));
+                                            let rx = ui.add_sized(
+                                                [76.0, 20.0],
+                                                egui::DragValue::new(&mut x).update_while_editing(false).speed(1.0),
+                                            );
+                                            let ry = ui.add_sized(
+                                                [76.0, 20.0],
+                                                egui::DragValue::new(&mut y).update_while_editing(false).speed(1.0),
+                                            );
+                                            let picking = self
+                                                .script_param_pick
+                                                .as_ref()
+                                                .map(|(n, _)| n == &p.name)
+                                                .unwrap_or(false);
+                                            if ui
+                                                .add(egui::Button::new(if picking {
+                                                    "click canvas…"
+                                                } else {
+                                                    "Pick"
+                                                }))
+                                                .on_hover_text(
+                                                    "pick the position with a click on the canvas",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.script_param_pick =
+                                                    Some((p.name.clone(), ScriptPickKind::Point));
+                                                self.set_prompt(format!(
+                                                    "script: click the position for '{}' — Esc cancels",
+                                                    p.name
+                                                ));
+                                            }
+                                            if rx.changed() || ry.changed() {
+                                                dlg.values[i] = format!("{},{}", x, y);
+                                                // A manual edit supersedes an armed pick.
+                                                self.script_param_pick = None;
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Entity => {
+                                            let idx: i64 =
+                                                dlg.values[i].parse().unwrap_or(-1);
+                                            let label = if idx >= 0 {
+                                                format!("entity #{}", idx)
+                                            } else {
+                                                "unpicked".into()
+                                            };
+                                            ui.add_sized(
+                                                [80.0, 20.0],
+                                                egui::Label::new(&label),
+                                            );
+                                            let picking = self
+                                                .script_param_pick
+                                                .as_ref()
+                                                .map(|(n, _)| n == &p.name)
+                                                .unwrap_or(false);
+                                            if ui
+                                                .add(egui::Button::new(if picking {
+                                                    "click entity…"
+                                                } else {
+                                                    "Pick"
+                                                }))
+                                                .on_hover_text(
+                                                    "click the shape on the canvas to pick it",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.script_param_pick = Some((
+                                                    p.name.clone(),
+                                                    ScriptPickKind::Entity,
+                                                ));
+                                                self.set_prompt(format!(
+                                                    "script: click the shape for '{}' — Esc cancels",
+                                                    p.name
+                                                ));
+                                            }
+                                            if ui.button("clear").clicked() {
+                                                dlg.values[i] = "-1".into();
+                                                self.script_param_pick = None;
+                                                self.script_preview_dirty();
+                                            }
+                                        }
+                                        cad_script::ParamType::Color => {
+                                            let aci: u8 =
+                                                dlg.values[i].parse().unwrap_or(0);
+                                            let (r, g, b) = cad_kernel::aci_palette(aci);
+                                            let (sw, _) = ui.allocate_exact_size(
+                                                egui::vec2(22.0, 20.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            ui.painter().rect_filled(
+                                                sw,
+                                                3.0,
+                                                egui::Color32::from_rgb(r, g, b),
+                                            );
+                                            ui.painter().rect_stroke(
+                                                sw,
+                                                3.0,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(90),
+                                                ),
+                                            );
+                                            ui.label(format!("ACI {}", aci));
+                                            if ui
+                                                .button("color…")
+                                                .on_hover_text(
+                                                    "open the ACI color wheel",
+                                                )
+                                                .clicked()
+                                            {
+                                                self.aci_pick_request =
+                                                    Some(AciPickRequest::ScriptParam(i));
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Run").clicked() {
+                                    do_run = true;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    do_cancel = true;
+                                }
+                                ui.weak("values reach the script as rasm.params");
+                            });
+                        }
+                    });
+            });
+        // Resolve the outcome outside the window closure.
+        dlg.pos += drag_delta;
+        if !keep || do_cancel || dlg.waiting_meta {
+            self.script_param_pick = None; // no orphaned armed pick
+            self.clear_script_preview();   // ghosts vanish with the dialog
+            if dlg.waiting_meta {
+                self.script_param_dialog = Some(dlg); // still waiting for Meta
+            }
+            return;
+        }
+        if do_run {
+            self.script_param_pick = None;
+            self.clear_script_preview();
+            let params = match self.dialog_params_scene(&dlg) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.fail_op(format!("run {}: {}", dlg.name, e));
+                    return;
+                }
+            };
+            let (name, path) = (dlg.name.clone(), dlg.path.clone());
+            let shown: Vec<String> =
+                params.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+            self.history.push(format!("  run> {} {}", name, shown.join(" ")));
+            self.py_log(format!(">>> run {} {}", name, shown.join(" ")));
+            self.script
+                .get_or_insert_with(cad_script::ScriptEngine::new)
+                .submit_script_with_params(path, name, Vec::new(), params);
+        } else {
+            self.script_param_dialog = Some(dlg); // still open
+        }
+    }
+
+    fn parse_point_param_value(s: &str) -> Option<(f64, f64)> {
+        let s = s.trim().trim_start_matches('(').trim_end_matches(')');
+        let (a, b) = s.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }
+
+    /// The dialog's initial value for a param: `Length` defaults are SCENE
+    /// units (the script's own default) — the field edits DISPLAY units, so
+    /// convert once when filling the dialog.
+    fn param_display_default(&self, p: &cad_script::ScriptParamMeta) -> String {
+        if p.ptype == cad_script::ParamType::Length {
+            if let Ok(s) = p.default.parse::<f64>() {
+                return format!("{}", self.doc.units.to_display(s));
+            }
+        }
+        p.default.clone()
+    }
+
+    /// Convert ONE raw value to the string the script should receive.
+    /// `Length` values are display units (with optional suffixes — `25`,
+    /// `25cm`, `6'`) → scene units via `Units::parse_distance`; everything
+    /// else passes through unchanged. Fails loudly on a bad length
+    /// (rule 10 — the run must not proceed with a wrong distance).
+    fn param_value_scene(
+        &self,
+        spec: &[cad_script::ScriptParamMeta],
+        name: &str,
+        raw: &str,
+    ) -> Result<String, String> {
+        let Some(p) = spec.iter().find(|p| p.name == name) else {
+            return Ok(raw.to_string());
+        };
+        match p.ptype {
+            cad_script::ParamType::Length => {
+                match self.doc.units.parse_distance(raw) {
+                    Some(s) if s.is_finite() => Ok(format!("{}", s)),
+                    _ => Err(format!("{}: '{}' is not a valid length", name, raw)),
+                }
+            }
+            // Catalog-backed dropdowns validate against the LIVE catalogs —
+            // a value outside the list fails loudly instead of running.
+            // Stale dialog values may carry Python repr quotes
+            // ("'ANSI31'") — strip them before comparing.
+            cad_script::ParamType::Linetype
+            | cad_script::ParamType::Layer
+            | cad_script::ParamType::Block
+            | cad_script::ParamType::HatchPattern
+            | cad_script::ParamType::Choice => {
+                let cmp = raw.trim().trim_matches(|c| c == '\'' || c == '"');
+                let valid = !p.choices.is_empty()
+                    && p.choices.iter().any(|c| c.eq_ignore_ascii_case(cmp));
+                if valid {
+                    // Canonicalize to the catalog/declared spelling.
+                    let canonical = p
+                        .choices
+                        .iter()
+                        .find(|c| c.eq_ignore_ascii_case(cmp))
+                        .cloned()
+                        .unwrap_or_else(|| cmp.to_string());
+                    Ok(canonical)
+                } else {
+                    Err(format!(
+                        "{}: '{}' is not one of [{}]",
+                        name,
+                        raw,
+                        p.choices.join(", ")
+                    ))
+                }
+            }
+            _ => Ok(raw.to_string()),
+        }
+    }
+
+    /// The whole dialog's values → (name, scene-value) pairs, converting
+    /// `Length` fields through the document's display unit.
+    fn dialog_params_scene(
+        &self,
+        dlg: &ScriptParamDialog,
+    ) -> Result<Vec<(String, String)>, String> {
+        dlg.params
+            .iter()
+            .zip(dlg.values.iter())
+            .map(|(p, v)| {
+                self.param_value_scene(&dlg.params, &p.name, v)
+                    .map(|s| (p.name.clone(), s))
+            })
+            .collect()
+    }
+
+    /// Open the scripting API reference window (`pyhelp`), loading the
+    /// document once from `docs/scripting_api.md` (cwd, then exe dir).
+    fn open_scripting_doc(&mut self) {
+        if self.scripting_doc_text.is_none() {
+            let mut dirs = vec![std::path::PathBuf::from("docs")];
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(d) = exe.parent() {
+                    dirs.push(d.join("docs"));
+                }
+            }
+            for dir in dirs {
+                let p = dir.join("scripting_api.md");
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    self.scripting_doc_text = Some(t);
+                    break;
+                }
+            }
+            if self.scripting_doc_text.is_none() {
+                self.scripting_doc_text = Some(
+                    "! cannot find docs/scripting_api.md (looked in ./docs and <exe dir>/docs)"
+                        .into(),
+                );
+            }
+        }
+        self.scripting_doc_open = true;
+    }
+
+    /// The `pyhelp` reference window — the full scripting API document in a
+    /// resizable, scrollable floating window.
+    fn render_scripting_doc(&mut self, ctx: &egui::Context) {
+        if !self.scripting_doc_open {
+            return;
+        }
+        let mut keep = true;
+        egui::Window::new("Python scripting — API reference")
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("scripting_doc_dialog"))
+            .title_bar(false)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(egui::vec2(920.0, 680.0))
+            .min_size(egui::vec2(480.0, 300.0))
+            .frame(egui::Frame::none()
+                .fill(crate::theme::color::SURFACE_1)
+                .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER)))
+            .show(ctx, |ui| {
+                let hb = crate::dock::header_band(
+                    ui,
+                    "Python scripting — API reference",
+                    Some("AI-agent reference"),
+                    true,
+                );
+                if hb.close_clicked {
+                    keep = false;
+                }
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for line in self
+                                    .scripting_doc_text
+                                    .as_deref()
+                                    .unwrap_or("(loading…)")
+                                    .split('\n')
+                                {
+                                    if line.starts_with("## ") {
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(line)
+                                                .size(16.0)
+                                                .strong()
+                                                .color(PP_ACCENT),
+                                        );
+                                        ui.add_space(2.0);
+                                    } else if line.starts_with("# ") {
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new(line).size(19.0).strong(),
+                                        );
+                                        ui.add_space(4.0);
+                                    } else if line.trim_start().starts_with("```")
+                                        || line.trim_start().starts_with('|')
+                                    {
+                                        ui.monospace(line);
+                                    } else if let Some(rest) =
+                                        line.strip_prefix("### ")
+                                    {
+                                        ui.add_space(6.0);
+                                        ui.label(egui::RichText::new(rest).strong());
+                                    } else if let Some(rest) = line.strip_prefix("- ") {
+                                        ui.monospace(rest);
+                                    } else if line.is_empty() {
+                                        ui.add_space(2.0);
+                                    } else {
+                                        ui.monospace(line);
+                                    }
+                                }
+                            });
+                    });
+            });
+        if !keep {
+            self.scripting_doc_open = false;
+        }
+    }
+
+    /// Save the console's input buffer as scripts/<name>.py (slice 5 — the
+    /// scripts folder is the home of named scripts). Rescans so the menu and
+    /// the example list pick the new file up immediately.
     fn save_py_script(&mut self) {
         let name = self.py_console_name.trim().to_string();
         let code = self.py_console_input.trim().to_string();
@@ -26078,10 +27496,270 @@ impl CadApp {
         }
         match std::fs::write(&p, format!("{}\n", code)) {
             Ok(()) => {
-                self.py_log(format!("saved → {}", p.display()));
+                self.scan_py_examples();
+                let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.py_log(format!("saved script → {}  (run with: run {})", p.display(), stem));
+                self.history.push(format!("  python: script saved → {}", p.display()));
+            }
+            Err(e) => {
+                self.py_log(format!("! save failed: {}", e));
+            }
+        }
+    }
+
+    // ---- in-app script editor (slice 5) -----------------------------------
+
+    /// Open the script editor panel (with a fresh script list).
+    fn py_editor_open_panel(&mut self) {
+        self.scan_py_examples();
+        self.py_editor_open = true;
+    }
+
+    /// Save the editor buffer to scripts/<name>.py. Returns true on success.
+    fn py_editor_save(&mut self) -> bool {
+        let name = self.py_editor_name.trim().to_string();
+        if name.is_empty() {
+            self.py_log("! editor: give the script a name first (scripts/<name>.py)".into());
+            return false;
+        }
+        if let Err(e) = std::fs::create_dir_all(Self::script_dir()) {
+            self.py_log(format!("! editor: cannot create the scripts folder: {}", e));
+            return false;
+        }
+        let mut p = Self::script_dir().join(&name);
+        if p.extension().is_none() {
+            p.set_extension("py");
+        }
+        match std::fs::write(&p, format!("{}\n", self.py_editor_text)) {
+            Ok(()) => {
+                self.py_editor_path = Some(p.clone());
+                self.py_editor_name = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or(name);
+                self.py_editor_dirty = false;
+                self.scan_py_examples();
+                self.py_log(format!("saved script → {}", p.display()));
+                true
+            }
+            Err(e) => {
+                self.py_log(format!("! editor: save failed: {}", e));
+                false
+            }
+        }
+    }
+
+    /// Load a script file into the editor buffer.
+    fn py_editor_load(&mut self, path: std::path::PathBuf) {
+        match std::fs::read_to_string(&path) {
+            Ok(src) => {
+                self.py_editor_text = src;
+                self.py_editor_path = Some(path.clone());
+                self.py_editor_name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.py_editor_dirty = false;
+                self.py_editor_confirm = None;
+            }
+            Err(e) => self.py_log(format!("! editor: cannot read {}: {}", path.display(), e)),
+        }
+    }
+
+    /// Ask to load `target` — immediately when the buffer is clean, else
+    /// arm the discard-confirm row.
+    fn py_editor_request_open(&mut self, target: Option<std::path::PathBuf>) {
+        if self.py_editor_dirty {
+            self.py_editor_confirm = Some(match target {
+                Some(p) => PyEditorConfirm::File(p),
+                None => PyEditorConfirm::New,
+            });
+        } else {
+            match target {
+                Some(p) => self.py_editor_load(p),
+                None => self.py_editor_new(),
+            }
+        }
+    }
+
+    /// Start a fresh, untitled script.
+    fn py_editor_new(&mut self) {
+        self.py_editor_text.clear();
+        self.py_editor_path = None;
+        self.py_editor_name.clear();
+        self.py_editor_dirty = false;
+        self.py_editor_confirm = None;
+    }
+
+    /// Run the editor's script: save (when dirty/untitled) then run it as a
+    /// named script — same semantics as `run <name>`.
+    fn py_editor_run(&mut self) {
+        if self.py_editor_name.trim().is_empty() {
+            self.py_log("! editor: give the script a name first, then Run".into());
+            return;
+        }
+        if self.py_editor_dirty || self.py_editor_path.is_none() {
+            if !self.py_editor_save() {
+                return;
+            }
+        }
+        let Some(path) = self.py_editor_path.clone() else {
+            return;
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.py_log(format!(">>> run {}", stem));
+        self.clear_script_preview();
+        self.script
+            .get_or_insert_with(cad_script::ScriptEngine::new)
+            .submit_script(path, stem.clone(), Vec::new());
+    }
+
+    /// The script editor panel: open/save/run toolbar over a monospace
+    /// multi-line buffer. Unsaved changes persist in the app even when the
+    /// panel is closed; only Save writes to scripts/.
+    fn render_py_editor(&mut self, ctx: &egui::Context) {
+        if !self.py_editor_open {
+            return;
+        }
+        let badge = match (&self.py_editor_path, self.py_editor_dirty) {
+            (Some(p), true) => Some(format!("{} *", p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default())),
+            (Some(p), false) => Some(p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()),
+            (None, true) => Some("untitled *".into()),
+            (None, false) => None,
+        };
+        let mut keep = true;
+        egui::Window::new("Script editor")
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("py_editor_dialog"))
+            .title_bar(false)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(egui::vec2(760.0, 540.0))
+            .min_size(egui::vec2(420.0, 260.0))
+            .frame(egui::Frame::none()
+                .fill(crate::theme::color::SURFACE_1)
+                .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER)))
+            .show(ctx, |ui| {
+                let hb = crate::dock::header_band(
+                    ui, "Script editor", badge.as_deref(), true);
+                if hb.close_clicked { keep = false; }
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        self.py_editor_toolbar(ui);
+                        if let Some(target) = self.py_editor_confirm.clone() {
+                            let what = match &target {
+                                PyEditorConfirm::File(p) => p.display().to_string(),
+                                PyEditorConfirm::New => "a new script".into(),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(format!("Discard unsaved changes and open {}?", what));
+                                if ui.button("Discard & open").clicked() {
+                                    match target {
+                                        PyEditorConfirm::File(p) => self.py_editor_load(p),
+                                        PyEditorConfirm::New => self.py_editor_new(),
+                                    }
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    self.py_editor_confirm = None;
+                                }
+                            });
+                        }
+                        ui.add_space(4.0);
+                        let resp = ui.add_sized(
+                            ui.available_size(),
+                            egui::TextEdit::multiline(&mut self.py_editor_text)
+                                .id(egui::Id::new("py_editor_code"))
+                                .code_editor()
+                                .desired_rows(24)
+                                .hint_text("python — uses the rasm surface (help(rasm)); Ctrl+S saves, Esc stops a run"),
+                        );
+                        if resp.changed() {
+                            self.py_editor_dirty = true;
+                        }
+                        // Ctrl+S — save the buffer while the editor has focus.
+                        if resp.has_focus()
+                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S))
+                        {
+                            self.py_editor_save();
+                        }
+                    });
+            });
+        if !keep {
+            self.py_editor_open = false;
+        }
+    }
+
+    /// Editor toolbar: open/New on the left, name + Save + Run on the right.
+    fn py_editor_toolbar(&mut self, ui: &mut egui::Ui) {
+        let mut open_target: Option<std::path::PathBuf> = None;
+        let mut do_new = false;
+        let mut do_save = false;
+        let mut do_run = false;
+        ui.horizontal(|ui| {
+            let current_label = match &self.py_editor_path {
+                Some(p) => p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                None => if self.py_editor_dirty { "untitled *".into() } else { "open…".into() },
+            };
+            egui::ComboBox::from_id_salt("py_editor_open")
+                .selected_text(current_label)
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    if self.py_examples.is_empty() {
+                        ui.label("(no scripts yet)");
+                    }
+                    for (name, path) in &self.py_examples {
+                        if ui.selectable_label(false, name).clicked() {
+                            open_target = Some(path.clone());
+                        }
+                    }
+                });
+            if ui.button("New").clicked() {
+                do_new = true;
+            }
+            if ui.button("Refresh").on_hover_text("rescan scripts/").clicked() {
                 self.scan_py_examples();
             }
-            Err(e) => self.py_log(format!("! save failed: {}", e)),
+            ui.separator();
+            ui.label("name:");
+            ui.add_sized(
+                [120.0, 20.0],
+                egui::TextEdit::singleline(&mut self.py_editor_name)
+                    .id(egui::Id::new("py_editor_name"))
+                    .hint_text("script_name"),
+            );
+            if ui.add_enabled(!self.py_editor_name.trim().is_empty(), egui::Button::new("Save"))
+                .on_hover_text("saves to scripts/<name>.py  (Ctrl+S)")
+                .clicked()
+            {
+                do_save = true;
+            }
+            let busy = self.script.as_ref().is_some_and(|s| s.is_busy());
+            if ui.add_enabled(!busy, egui::Button::new(if busy { "busy" } else { "Run" }))
+                .on_hover_text("saves (if changed) then runs as `run <name>`")
+                .clicked()
+            {
+                do_run = true;
+            }
+        });
+        // Commit after the borrow-heavy row loop.
+        if let Some(target) = open_target {
+            let same = self.py_editor_path.as_ref() == Some(&target);
+            if !same {
+                self.py_editor_request_open(Some(target));
+            }
+        }
+        if do_new {
+            self.py_editor_request_open(None);
+        }
+        if do_save {
+            self.py_editor_save();
+        }
+        if do_run {
+            self.py_editor_run();
         }
     }
 
@@ -28904,6 +30582,15 @@ impl CadApp {
                 WallColorSlot::Face => "ACI color — wall faces".to_string(),
             },
             AciPickRequest::BlockForm => "ACI color — block instance".to_string(),
+            AciPickRequest::ScriptParam(ix) => {
+                let name = self
+                    .script_param_dialog
+                    .as_ref()
+                    .and_then(|d| d.params.get(ix))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("script parameter #{}", ix));
+                format!("ACI color — {}", name)
+            }
             AciPickRequest::CurrentColor => "ACI color — current color".to_string(),
             AciPickRequest::PlotStyleColor => {
                 format!("ACI color — plot color ({} styles)", self.plotstyle_sel.len())
@@ -29068,6 +30755,16 @@ impl CadApp {
                         self.doc.plot_styles.style_mut(a).plot_color =
                             cad_kernel::plotstyle::PlotColor::Aci(aci);
                     }
+                }
+                AciPickRequest::ScriptParam(ix) => {
+                    // The chosen color lands in the open parameter dialog and
+                    // restarts the ghost preview.
+                    if let Some(d) = self.script_param_dialog.as_mut() {
+                        if let Some(v) = d.values.get_mut(ix) {
+                            *v = aci.to_string();
+                        }
+                    }
+                    self.script_preview_dirty();
                 }
             }
             self.aci_pick_request = None;
@@ -45784,6 +47481,57 @@ fn doc_entity_style_summary(doc: &Document, d: &DObject) -> (String, String, f32
     (color, linetype, lineweight, d.style.visible)
 }
 
+fn preview_transform(
+    doc: &mut Document,
+    indices: &[usize],
+    f: impl Fn(&Geom) -> Geom,
+) -> usize {
+    let mut targets: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &i in indices {
+        if i < doc.dobjects.len() && seen.insert(i) {
+            targets.push(i);
+        }
+    }
+    let mut extra: Vec<cad_kernel::Handle> = Vec::new();
+    for &i in &targets {
+        if let Some(d) = doc.dobjects.get(i) {
+            if let Geom::Hatch(h) = &d.geom {
+                extra.extend(h.boundary_handles.iter().copied());
+            }
+        }
+    }
+    for handle in extra {
+        if let Some(bi) = doc.index_of_handle(handle) {
+            if seen.insert(bi) {
+                targets.push(bi);
+            }
+        }
+    }
+    for &i in &targets {
+        if let Some(d) = doc.dobjects.get_mut(i) {
+            d.geom = f(&d.geom);
+        }
+    }
+    targets.len()
+}
+
+/// P1 preview helper — per-entity style change against the shadow document.
+fn preview_style(
+    doc: &mut Document,
+    indices: &[usize],
+    mut f: impl FnMut(&mut DObject),
+) -> usize {
+    let mut n = 0;
+    for &i in indices {
+        if let Some(d) = doc.dobjects.get_mut(i) {
+            f(d);
+            n += 1;
+        }
+    }
+    n
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Plot-style table helpers (ported from upstream RUST-AutoRASM) — shared by
 // the Plot Style Table Editor's Form View, Table View, and the Plot dialog.
@@ -47307,6 +49055,7 @@ enum FlyMenu {
     DimStylePick,     // Styles → current dim-style picker
     WallStylePick,    // Styles → current wall-style picker
     Debug,            // Tools → Debug tools
+    Scripts,          // Tools → Scripts (scripts/*.py → `run <name>`)
 }
 
 /// One open flyout in the stack (`menu_flyouts`): which menu + the row rect it hangs
@@ -47393,6 +49142,10 @@ enum FlyAct {
     IntersectArm,
     IntersectClear,
     ClearAll,
+    RunScript(String),   // Scripts → run scripts/<name>.py (no args)
+    RescanScripts,       // Scripts → rescan scripts/*.py into the list
+    OpenScriptEditor,    // Scripts → open the in-app script editor panel
+    OpenScriptingDoc,    // Scripts → open the full API reference window
 }
 
 /// A `&mut self` bool a flyout toggle flips (Tools→Debug), named so `FlyAct` stays
@@ -47836,6 +49589,34 @@ impl CadApp {
                     FlyItem::act(FlyIcon::None, "Clear all dobjects (DESTRUCTIVE)", FlyAct::ClearAll),
                 ]
             }
+            FlyMenu::Scripts => {
+                // WP-SCRIPT: one row per scripts/*.py (menu access runs without
+                // args — `run <name> [args…]` on the command line passes inputs).
+                if self.py_examples.is_empty() {
+                    vec![
+                        FlyItem::Disabled(
+                            "(no scripts in scripts/ — save one from the Python console)"
+                                .into()),
+                        FlyItem::Divider,
+                        FlyItem::act(FlyIcon::None, "Script editor…", FlyAct::OpenScriptEditor),
+                        FlyItem::act(FlyIcon::None, "Scripting guide…", FlyAct::OpenScriptingDoc),
+                        FlyItem::act(FlyIcon::None, "Python console", FlyAct::Run("py".into())),
+                        FlyItem::act(FlyIcon::None, "Reload script list", FlyAct::RescanScripts),
+                    ]
+                } else {
+                    let mut items: Vec<FlyItem> = self.py_examples.iter()
+                        .map(|(n, _)| {
+                            FlyItem::act(FlyIcon::None, n, FlyAct::RunScript(n.clone()))
+                        })
+                        .collect();
+                    items.push(FlyItem::Divider);
+                    items.push(FlyItem::act(FlyIcon::None, "Script editor…", FlyAct::OpenScriptEditor));
+                    items.push(FlyItem::act(FlyIcon::None, "Scripting guide…", FlyAct::OpenScriptingDoc));
+                    items.push(FlyItem::act(FlyIcon::None, "Python console", FlyAct::Run("py".into())));
+                    items.push(FlyItem::act(FlyIcon::None, "Reload script list", FlyAct::RescanScripts));
+                    items
+                }
+            }
         }
     }
 
@@ -47889,6 +49670,10 @@ impl CadApp {
             FlyAct::IntersectArm  => self.intersect_pending_click = !self.intersect_pending_click,
             FlyAct::IntersectClear=> { self.intersections.clear(); self.last_intersect_label.clear(); }
             FlyAct::ClearAll      => { self.clear_all(); self.history.push("  cleared".into()); }
+            FlyAct::RunScript(name) => self.run_script_command(Some(name), Vec::new()),
+            FlyAct::RescanScripts   => self.scan_py_examples(),
+            FlyAct::OpenScriptEditor => self.py_editor_open_panel(),
+            FlyAct::OpenScriptingDoc => self.open_scripting_doc(),
         }
     }
 
@@ -49408,6 +51193,20 @@ impl eframe::App for CadApp {
             // worker's exit; dropping the receiver is what makes the cancel
             // correct.
             self.cancel_hatch_worker();
+            // WP-SCRIPT: Esc interrupts a running Python script (Background-Ops
+            // I-3). Cooperative — raises KeyboardInterrupt into the worker.
+            if let Some(s) = &self.script {
+                if s.is_busy() {
+                    s.cancel();
+                    self.history.push("  python: cancel requested".into());
+                }
+            }
+            // WP-SCRIPT: Esc disarms an armed script-parameter pick
+            // (the dialog's "pick on canvas").
+            if self.script_param_pick.is_some() {
+                self.script_param_pick = None;
+                self.history.push("  python: pick cancelled".into());
+            }
             self.hatch_pick_point_armed = false;
             self.hatch_pick_point_session = None;
             self.pending_hatch_pattern = (None, 1.0, 0.0);
@@ -50572,8 +52371,12 @@ impl eframe::App for CadApp {
                         { self.run_command("list"); ui.close_menu(); }
                     menu_divider(ui, w);
                     // Debug tools ▸ — generalized flyout (§9): toggles, index, ∩, clear.
+                    // Debug tools ▸ — generalized flyout (§9): toggles, index, ∩, clear.
                     let (_gb, ga, grect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Debug tools", nc, RowT::Arrow);
                     if ga { self.open_flyout(FlyMenu::Debug, grect); }
+                    // Scripts ▸ — WP-SCRIPT: scripts/*.py → run, editor, guide, console.
+                    let (_sb, sa, srect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Scripts", nc, RowT::Arrow);
+                    if sa { self.scan_py_examples(); self.open_flyout(FlyMenu::Scripts, srect); }
                     pp_cap_ui(ui, "menu: Tools");
                 });
                 // Help — custom rows (MENU_DROPDOWN). Neither command has a glyph
@@ -51147,6 +52950,11 @@ impl eframe::App for CadApp {
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
         self.render_py_console(ctx);
+        // WP-SCRIPT slice 5 — in-app script editor + run-parameters dialog +
+        // the scripting API reference window.
+        self.render_py_editor(ctx);
+        self.render_script_param_dialog(ctx);
+        self.render_scripting_doc(ctx);
         // PLOT: dockable Page Setup + floating Plot dialog + preview + Plot
         // Style Table Editor + its sub-dialogs (ladder, New-CTB). The CTB table
         // cache is refreshed each frame (cheap fingerprint check).
@@ -52617,6 +54425,56 @@ impl eframe::App for CadApp {
                                 active_state,
                             });
                     }
+
+                    // WP-SCRIPT slice 5: an armed script-parameter pick
+                    // consumes the click (highest priority: it must beat
+                    // every command/tool click handler). `point` fills the
+                    // world coordinate; `entity` hit-tests the nearest
+                    // shape and fills its index.
+                    if let Some((pname, kind)) = self.script_param_pick.clone() {
+                        let value = match kind {
+                            ScriptPickKind::Point => Some(format!(
+                                "{:.4},{:.4}",
+                                click_world.x, click_world.y
+                            )),
+                            ScriptPickKind::Entity => {
+                                let tol = 10.0 / self.scale as f64;
+                                self.nearest_entity_under(click_world, tol)
+                                    .map(|i| i.to_string())
+                            }
+                        };
+                        match value {
+                            Some(v) => {
+                                self.script_param_pick = None;
+                                if let Some(dlg) = self.script_param_dialog.as_mut() {
+                                    if let Some(ix) = dlg
+                                        .params
+                                        .iter()
+                                        .position(|p| p.name == pname)
+                                    {
+                                        dlg.values[ix] = v.clone();
+                                    }
+                                }
+                                self.script_preview_dirty();
+                                self.history.push(format!(
+                                    "  python: {} = {}",
+                                    pname, v
+                                ));
+                                self.clear_prompt();
+                                self.refocus_cmd = true;
+                                return;
+                            }
+                            None => {
+                                // Missed — stay armed, tell the user (rule 10).
+                                self.fail_op(format!(
+                                    "script: no shape at that point — click a dobject for '{}' (Esc cancels)",
+                                    pname
+                                ));
+                                return;
+                            }
+                        }
+                    }
+
 
                     // ZOOM point pick (center / window corners). Consumes the
                     // click before any selection/tool handler. ObjectSel is NOT
@@ -54359,6 +56217,21 @@ impl eframe::App for CadApp {
                 }
                 RenderMode::Apx => {}   // handled by the APX branch above (keeps the match exhaustive)
             } } // close `match self.render_mode` and outer `else` from APX branch
+            // WP-SCRIPT slice 5 — script preview ghosts: the net additions of
+            // the last ghost pass, dashed + translucent over the real drawing
+            // (best-effort: hatches are skipped — their fills need the real
+            // doc's boundary resolution).
+            if let Some(p) = &self.script_preview {
+                if !p.ghosts.is_empty() {
+                    let ghost = egui::Color32::from_rgba_unmultiplied(90, 220, 255, 170);
+                    for g in &p.ghosts {
+                        if matches!(g, Geom::Hatch(_)) {
+                            continue;
+                        }
+                        draw_dobject_dashed(&painter, rect, self, g, ghost, 7.0, 4.0);
+                    }
+                }
+            }
             // Parametric DOF overlay: tint under-defined geometry blue and
             // fully-defined geometry black-ish, SolidWorks style. Reads the
             // per-handle map cached by render_param_panel earlier this frame.
@@ -76291,5 +78164,813 @@ mod calc_command_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("calc sidecar patch did not finish");
+    }
+}
+
+#[cfg(test)]
+mod script_op_tests {
+    use super::*;
+    use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+
+    fn ok(reply: cad_script::ScriptOpReply) -> usize {
+        match reply {
+            R::Ok(i) => i,
+            other => panic!("expected Ok(index), got {other:?}"),
+        }
+    }
+
+    // Adds via rasm land as ordinary dobjects and report their index.
+    #[test]
+    fn script_adds_create_dobjects() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        let r = app.apply_script_op(Op::AddCircle {
+            center: Vec2::new(1.0, 2.0), radius: 3.0,
+        });
+        assert_eq!(ok(r), n0);
+        let r = app.apply_script_op(Op::AddLine {
+            a: Vec2::ZERO, b: Vec2::new(5.0, 0.0),
+        });
+        assert_eq!(ok(r), n0 + 1);
+        assert_eq!(app.doc.dobjects.len(), n0 + 2);
+    }
+
+    // Reads return owned snapshots (D7) — never borrows into the doc.
+    #[test]
+    fn script_reads_return_owned_data() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        app.apply_script_op(Op::AddCircle {
+            center: Vec2::new(4.0, 0.0), radius: 2.0,
+        });
+        match app.apply_script_op(Op::DocCount) {
+            R::Count(n) => assert_eq!(n, n0 + 1),
+            other => panic!("expected Count, got {other:?}"),
+        }
+        match app.apply_script_op(Op::DocGet { index: n0 }) {
+            R::Entity(e) => {
+                assert_eq!(e.handle, app.doc.dobjects[n0].handle);
+                assert!(!e.layer.is_empty(), "layer name must resolve");
+            }
+            other => panic!("expected Entity, got {other:?}"),
+        }
+    }
+
+    // Delete removes highest-first and prunes the selection.
+    #[test]
+    fn script_delete_removes_and_prunes_selection() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        for i in 0..4 {
+            app.apply_script_op(Op::AddLine {
+                a: Vec2::new(i as f64, 0.0), b: Vec2::new(i as f64, 1.0),
+            });
+        }
+        app.apply_script_op(Op::SelectionSet { indices: vec![n0, n0 + 2, n0 + 3] });
+        match app.apply_script_op(Op::Delete { indices: vec![n0 + 3, n0 + 1] }) {
+            R::Ok(n) => assert_eq!(n, 2),
+            other => panic!("expected Ok(2), got {other:?}"),
+        }
+        assert_eq!(app.doc.dobjects.len(), n0 + 2);
+        assert_eq!(app.selection, vec![n0, n0 + 2], "selection must drop deleted #3");
+    }
+
+    // D5 — one run = one undo unit: a script run's snapshots collapse to a
+    // single pre-run state on Finished.
+    #[test]
+    fn script_run_collapses_to_one_undo_unit() {
+        let mut app = CadApp::default();
+        let base = app.undo_stack.len();
+        // First write of the run captures the baseline.
+        app.apply_script_op(Op::AddCircle {
+            center: Vec2::ZERO, radius: 1.0,
+        });
+        assert!(app.script_undo_base.is_some(), "first write must capture the baseline");
+        app.apply_script_op(Op::AddLine {
+            a: Vec2::ZERO, b: Vec2::new(1.0, 0.0),
+        });
+        app.apply_script_op(Op::LayerAdd { name: "SCRIPTLYR".into() });
+        assert!(app.undo_stack.len() > base + 1,
+            "each op snapshots — the run holds several entries");
+        // Finished collapses them all back to the single pre-run snapshot.
+        let keep = (app.script_undo_base.unwrap() + 1).min(app.undo_stack.len());
+        if app.undo_stack.len() > keep { app.undo_stack.truncate(keep); }
+        app.script_undo_base = None;
+        assert_eq!(app.undo_stack.len(), base + 1, "one run = one undo unit");
+        let n0 = app.doc.dobjects.len();
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), n0 - 2, "undo must revert the whole run");
+        assert_eq!(app.doc.layers.find("SCRIPTLYR"), None, "layer add must revert too");
+    }
+
+    // A run with no writes leaves the undo stack untouched.
+    #[test]
+    fn script_read_only_run_leaves_undo_alone() {
+        let mut app = CadApp::default();
+        let base = app.undo_stack.len();
+        app.apply_script_op(Op::DocCount);
+        app.apply_script_op(Op::ViewGet);
+        app.apply_script_op(Op::LayersGet);
+        assert_eq!(app.undo_stack.len(), base, "reads must never snapshot");
+        assert!(app.script_undo_base.is_none(), "no write → no baseline");
+    }
+
+    // Bad requests fail loudly (rule 10), never silently.
+    #[test]
+    fn script_bad_requests_fail_loudly() {
+        let mut app = CadApp::default();
+        match app.apply_script_op(Op::AddCircle { center: Vec2::ZERO, radius: -1.0 }) {
+            R::Error(_) => {}
+            other => panic!("negative radius must fail, got {other:?}"),
+        }
+        match app.apply_script_op(Op::LayerSetActive { name: "NOPE".into() }) {
+            R::Error(_) => {}
+            other => panic!("unknown layer must fail, got {other:?}"),
+        }
+        let n0 = app.doc.dobjects.len();
+        assert_eq!(app.doc.dobjects.len(), n0, "failed ops must not mutate");
+    }
+
+    // Layer ops mirror the panel's rules: unique names, set-active by name.
+    #[test]
+    fn script_layer_ops() {
+        let mut app = CadApp::default();
+        match app.apply_script_op(Op::LayerAdd { name: "SCRIPTWALLS".into() }) {
+            R::Ok(id) => assert_eq!(app.doc.layers.find("SCRIPTWALLS"), Some(id as u32)),
+            other => panic!("expected Ok(id), got {other:?}"),
+        }
+        match app.apply_script_op(Op::LayerAdd { name: "SCRIPTWALLS".into() }) {
+            R::Error(_) => {}
+            other => panic!("duplicate layer must fail, got {other:?}"),
+        }
+        app.apply_script_op(Op::LayerSetActive { name: "SCRIPTWALLS".into() });
+        assert_eq!(app.doc.layers.active, app.doc.layers.find("SCRIPTWALLS").unwrap());
+    }
+}
+#[cfg(test)]
+mod script_cmd_tests {
+    use super::*;
+
+    // `run <unknown>` fails loudly with the available list (rule 10) and
+    // never submits to the engine.
+    #[test]
+    fn run_unknown_script_fails_loudly() {
+        let mut app = CadApp::default();
+        let h0 = app.history.len();
+        app.run_script_command(Some("definitely_not_a_script".into()), vec!["x".into()]);
+        assert_eq!(app.script.is_none(), true, "no engine must be created");
+        assert!(
+            app.history[h0..].iter().any(|l| l.contains("! run: no script")),
+            "the failure must be surfaced: {:?}",
+            &app.history[h0..]
+        );
+    }
+
+    // `resolve_script` accepts the bare name and `name.py`, case-insensitively.
+    // (Pointed at the repo's own scripts/ — the test cwd is the package dir,
+    // so a missing folder simply resolves to None; the shape is what's pinned.)
+    #[test]
+    fn resolve_script_handles_names() {
+        assert!(CadApp::resolve_script("").is_none(), "empty name resolves to nothing");
+        let r = CadApp::resolve_script("definitely_not_a_script");
+        assert!(r.is_none(), "unknown names must not resolve");
+    }
+
+    // The editor save→run path requires a name and refuses a nameless run.
+    #[test]
+    fn editor_run_requires_a_name() {
+        let mut app = CadApp::default();
+        app.py_editor_text = "rasm.add_circle((0, 0), 1.0)".into();
+        app.py_editor_name.clear();
+        let l0 = app.py_console_log.len();
+        app.py_editor_run();
+        assert_eq!(app.script.is_none(), true, "no engine without a name");
+        assert!(
+            app.py_console_log[l0..].iter().any(|l| l.contains("give the script a name")),
+            "the refusal must be visible in the console log"
+        );
+    }
+}
+#[cfg(test)]
+mod script_params_tests {
+    use super::*;
+    use cad_script::{ParamType, ScriptMeta, ScriptParamMeta};
+
+    #[test]
+    fn named_args_parse_as_pairs() {
+        let args: Vec<String> = vec!["outer_d=150".into(), "bolts=10".into()];
+        let got = CadApp::parse_named_script_args(&args).expect("all k=v parse");
+        assert_eq!(got, vec![
+            ("outer_d".to_string(), "150".to_string()),
+            ("bolts".to_string(), "10".to_string()),
+        ]);
+        assert!(CadApp::parse_named_script_args(&["100".into()]).is_none(),
+            "positional forms must not parse as named");
+        assert!(CadApp::parse_named_script_args(&["=5".into()]).is_none(),
+            "an empty name must not parse");
+        assert!(CadApp::parse_named_script_args(&[]).is_none());
+    }
+
+    fn param(name: &str, ty: ParamType, default: &str) -> ScriptParamMeta {
+        ScriptParamMeta {
+            name: name.into(), ptype: ty, default: default.into(),
+            min: None, max: None, help: String::new(),
+            choices: Vec::new(),
+        }
+    }
+
+    // A script WITH parameters → the dialog fills from the declaration.
+    #[test]
+    fn meta_reply_fills_the_dialog() {
+        let mut app = CadApp::default();
+        app.script_param_dialog = Some(ScriptParamDialog {
+            name: "flange".into(),
+            path: std::path::PathBuf::from("flange.py"),
+            params: Vec::new(),
+            values: Vec::new(),
+            waiting_meta: true,
+            pos: egui::pos2(0.0, 0.0),
+        });
+        let meta = ScriptMeta {
+            name: "flange".into(),
+            params: vec![param("outer_d", ParamType::Float, "120.0"),
+                         param("bolts", ParamType::Int, "6")],
+        };
+        app.on_script_meta(Some(meta));
+        let dlg = app.script_param_dialog.as_ref().expect("dialog stays open");
+        assert!(!dlg.waiting_meta);
+        assert_eq!(dlg.params.len(), 2);
+        assert_eq!(dlg.values, vec!["120.0".to_string(), "6".to_string()]);
+        // The default values go straight into a ghost preview pass.
+        assert!(app.script.is_some(), "the preview pass is submitted");
+        let p = app.script_preview.as_ref().expect("preview active");
+        assert!(p.running, "the ghost pass is running");
+        assert!(!p.cancelled);
+    }
+
+    // A script with NOTHING to declare → run immediately, no empty dialog.
+    #[test]
+    fn meta_reply_without_params_runs_immediately() {
+        let mut app = CadApp::default();
+        app.script_param_dialog = Some(ScriptParamDialog {
+            name: "hello".into(),
+            path: std::path::PathBuf::from("hello.py"),
+            params: Vec::new(),
+            values: Vec::new(),
+            waiting_meta: true,
+            pos: egui::pos2(0.0, 0.0),
+        });
+        app.on_script_meta(None);
+        assert!(app.script_param_dialog.is_none(), "no dialog for plain scripts");
+        assert!(app.script.is_some(), "the script was submitted");
+    }
+}
+#[cfg(test)]
+mod script_point_pick_tests {
+    use super::*;
+
+    #[test]
+    fn point_values_parse_from_dialog_and_defaults() {
+        assert_eq!(
+            CadApp::parse_point_param_value("12.5, -3"),
+            Some((12.5, -3.0)),
+            "plain x,y must parse"
+        );
+        assert_eq!(
+            CadApp::parse_point_param_value("(0.0, 0.0)"),
+            Some((0.0, 0.0)),
+            "python-tuple defaults must parse"
+        );
+        assert_eq!(CadApp::parse_point_param_value(""), None);
+        assert_eq!(CadApp::parse_point_param_value("12.5"), None);
+        assert_eq!(CadApp::parse_point_param_value("a,b"), None);
+    }
+
+    // A canvas click while a pick is armed fills the right dialog field and
+    // consumes the pick (simulated by calling the same path logic directly).
+    #[test]
+    fn armed_pick_fills_the_dialog_field() {
+        let mut app = CadApp::default();
+        app.script_param_dialog = Some(ScriptParamDialog {
+            name: "flange".into(),
+            path: std::path::PathBuf::from("flange.py"),
+            params: vec![
+                cad_script::ScriptParamMeta {
+                    name: "pos".into(),
+                    ptype: cad_script::ParamType::Point,
+                    default: "(0.0, 0.0)".into(),
+                    min: None, max: None, help: String::new(),
+                    choices: Vec::new(),
+                },
+            ],
+            values: vec!["(0.0, 0.0)".into()],
+            waiting_meta: false,
+            pos: egui::pos2(0.0, 0.0),
+        });
+        app.script_param_pick = Some(("pos".into(), ScriptPickKind::Point));
+        // The click intercept's body (applied on the main canvas click).
+        app.script_param_pick = None;
+        let v = "77.5,-12.25".to_string();
+        if let Some(dlg) = app.script_param_dialog.as_mut() {
+            if let Some(ix) = dlg.params.iter().position(|p| p.name == "pos") {
+                dlg.values[ix] = v;
+            }
+        }
+        let dlg = app.script_param_dialog.as_ref().unwrap();
+        assert_eq!(dlg.values[0], "77.5,-12.25");
+        assert_eq!(
+            CadApp::parse_point_param_value(&dlg.values[0]),
+            Some((77.5, -12.25))
+        );
+    }
+}
+#[cfg(test)]
+mod script_preview_tests {
+    use super::*;
+    use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+
+    fn finalize(app: &mut CadApp) {
+        if let Some(p) = &mut app.script_preview {
+            p.running = false;
+            p.ghosts = p
+                .doc
+                .dobjects
+                .iter()
+                .filter(|d| !p.base_handles.contains(&d.handle))
+                .map(|d| d.geom.clone())
+                .collect();
+        }
+    }
+
+    #[test]
+    fn preview_ops_stay_in_the_shadow() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        app.script_preview_start(
+            "flange".into(),
+            std::path::PathBuf::from("flange.py"),
+            Vec::new(),
+        );
+        // A write lands in the shadow, not the real doc.
+        assert!(matches!(
+            app.apply_script_op(Op::AddCircle { center: Vec2::ZERO, radius: 5.0 }),
+            R::Ok(_)
+        ));
+        assert_eq!(app.doc.dobjects.len(), n0, "the real doc must stay untouched");
+        assert_eq!(
+            app.script_preview.as_ref().unwrap().doc.dobjects.len(),
+            n0 + 1,
+            "the shadow gets the addition"
+        );
+        // Reads see the shadow snapshot (the script's own additions).
+        match app.apply_script_op(Op::DocCount) {
+            R::Count(c) => assert_eq!(c, n0 + 1),
+            other => panic!("expected Count, got {other:?}"),
+        }
+        // No undo baseline for preview writes.
+        assert!(app.script_undo_base.is_none());
+        // Finalize → exactly the net additions become ghosts.
+        finalize(&mut app);
+        let p = app.script_preview.as_ref().unwrap();
+        assert_eq!(p.ghosts.len(), 1, "one ghost extracted");
+        assert!(
+            matches!(&p.ghosts[0], Geom::Circle(c)
+                if c.center == Vec2::ZERO && (c.radius - 5.0).abs() < 1e-9),
+            "the ghost is the preview's circle"
+        );
+    }
+
+    #[test]
+    fn preview_deletes_dont_leak_into_ghosts() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        app.script_preview_start("x".into(), std::path::PathBuf::from("x.py"), Vec::new());
+        // Add one, delete it again — the net additions must be EMPTY.
+        app.apply_script_op(Op::AddLine { a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) });
+        app.apply_script_op(Op::Delete { indices: vec![n0] });
+        finalize(&mut app);
+        assert!(
+            app.script_preview.as_ref().unwrap().ghosts.is_empty(),
+            "a deleted preview addition must not ghost"
+        );
+        assert_eq!(app.doc.dobjects.len(), n0, "real doc untouched by the delete");
+    }
+
+    #[test]
+    fn zombie_preview_keeps_ops_out_of_the_real_doc() {
+        let mut app = CadApp::default();
+        let n0 = app.doc.dobjects.len();
+        app.script_preview_start("x".into(), std::path::PathBuf::from("x.py"), Vec::new());
+        // The user runs/commits while the pass is in flight → zombie.
+        app.clear_script_preview();
+        assert!(app.script_preview.is_some(), "zombie survives until Finished");
+        assert!(
+            app.script_preview.as_ref().unwrap().cancelled,
+            "the pass is cancelled, not dropped"
+        );
+        app.apply_script_op(Op::AddLine { a: Vec2::ZERO, b: Vec2::new(2.0, 0.0) });
+        assert_eq!(app.doc.dobjects.len(), n0, "zombie ops must still avoid the real doc");
+        // Finished drops the zombie.
+        if let Some(p) = &mut app.script_preview {
+            if p.running {
+                p.running = false;
+                if p.cancelled {
+                    app.script_preview = None;
+                }
+            }
+        }
+        assert!(app.script_preview.is_none(), "the zombie drops on finish");
+        // The next write goes to the real doc again.
+        app.apply_script_op(Op::AddLine { a: Vec2::ZERO, b: Vec2::new(3.0, 0.0) });
+        assert_eq!(app.doc.dobjects.len(), n0 + 1, "real ops resume after the zombie");
+    }
+}
+#[cfg(test)]
+mod script_meta_finish_tests {
+    use super::*;
+    use cad_script::{ParamType, ScriptMeta, ScriptParamMeta};
+
+    fn dialog() -> ScriptParamDialog {
+        ScriptParamDialog {
+            name: "flange".into(),
+            path: std::path::PathBuf::from("flange.py"),
+            params: Vec::new(),
+            values: Vec::new(),
+            waiting_meta: true,
+            pos: egui::pos2(0.0, 0.0),
+        }
+    }
+
+    fn meta() -> ScriptMeta {
+        ScriptMeta {
+            name: "flange".into(),
+            params: vec![ScriptParamMeta {
+                name: "outer_d".into(),
+                ptype: ParamType::Float,
+                default: "120.0".into(),
+                min: None, max: None, help: String::new(),
+                choices: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn meta_finished_must_not_finalize_the_just_started_preview() {
+        let mut app = CadApp::default();
+        app.script_param_dialog = Some(dialog());
+        // The Meta reply arrives first: it fills the dialog and starts the
+        // ghost pass (running = true).
+        app.script_meta_finish_pending = true;
+        app.on_script_meta(Some(meta()));
+        assert!(app.script_preview.as_ref().unwrap().running, "preview started");
+        let h0 = app.history.len();
+        // The META job's Finished lands in the same poll batch — it must not
+        // finalize the preview (that was the leak: preview ops then hit the
+        // real document).
+        app.on_script_finished(true);
+        assert!(
+            app.script_preview.as_ref().unwrap().running,
+            "the preview must survive the meta job's finish"
+        );
+        assert_eq!(app.history.len(), h0, "meta finish stays out of the history");
+        // A real run's ops still route to the shadow while it survives.
+        app.apply_script_op(cad_script::ScriptOp::AddCircle {
+            center: Vec2::ZERO, radius: 2.0,
+        });
+        assert!(
+            app.doc.dobjects.iter().all(|d| !matches!(&d.geom, Geom::Circle(c) if c.radius == 2.0)),
+            "preview ops must stay in the shadow after the meta finish"
+        );
+        // The PREVIEW's own finish (later) finalizes normally.
+        app.on_script_finished(true);
+        assert!(!app.script_preview.as_ref().unwrap().running, "preview finalized");
+    }
+}
+#[cfg(test)]
+mod script_length_tests {
+    use super::*;
+    use cad_script::{ParamType, ScriptParamMeta};
+
+    fn len_param(default: &str) -> ScriptParamMeta {
+        ScriptParamMeta {
+            name: "outer_d".into(),
+            ptype: ParamType::Length,
+            default: default.into(),
+            min: None, max: None, help: String::new(),
+            choices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn length_defaults_show_in_display_units() {
+        let mut app = CadApp::default();
+        app.doc.units.name = "mm".into();
+        app.doc.units.scene_per_unit = 10.0;   // calibrated: 10 scene per mm
+        let p = len_param("120.0");
+        assert_eq!(app.param_display_default(&p), "12",
+            "a 120-scene default must display as 12 in a 10:1 doc");
+        // Display → scene round trip.
+        assert_eq!(
+            app.param_value_scene(&[p.clone()], "outer_d", "12").unwrap(),
+            "120"
+        );
+    }
+
+    #[test]
+    fn length_inputs_convert_suffixes_through_the_document_units() {
+        let mut app = CadApp::default();
+        app.doc.units.name = "mm".into();
+        app.doc.units.scene_per_unit = 1.0;
+        let spec = [len_param("120.0")];
+        assert_eq!(app.param_value_scene(&spec, "outer_d", "25").unwrap(), "25",
+            "a bare number is in the display unit (mm doc → scene)");
+        assert_eq!(app.param_value_scene(&spec, "outer_d", "25cm").unwrap(), "250",
+            "an explicit suffix converts physically (25cm = 250mm scene)");
+        assert_eq!(app.param_value_scene(&spec, "outer_d", "1in").unwrap(), "25.4",
+            "1in = 25.4mm scene");
+        assert!(app.param_value_scene(&spec, "outer_d", "abc").is_err(),
+            "a bad length fails loudly");
+    }
+
+    #[test]
+    fn pending_run_converts_lengths_before_submitting() {
+        let mut app = CadApp::default();
+        app.doc.units.name = "mm".into();
+        app.doc.units.scene_per_unit = 10.0;   // 1 mm = 10 scene
+        app.script_pending_run = Some(PendingScriptRun {
+            name: "flange".into(),
+            path: std::path::PathBuf::from("flange.py"),
+            named: Some(vec![("outer_d".into(), "15".into()),
+                             ("bolts".into(), "8".into())]),
+            positional: None,
+        });
+        app.run_pending_script(Some(cad_script::ScriptMeta {
+            name: "flange".into(),
+            params: vec![len_param("120.0"), ScriptParamMeta {
+                name: "bolts".into(),
+                ptype: ParamType::Int,
+                default: "6".into(),
+                min: None, max: None, help: String::new(),
+                choices: Vec::new(),
+            }],
+        }));
+        assert!(app.script_pending_run.is_none(), "pending run consumed");
+        assert!(app.script.is_some(), "the run was submitted");
+    }
+
+    #[test]
+    fn non_length_params_pass_through_untouched() {
+        let mut app = CadApp::default();
+        app.doc.units.scene_per_unit = 100.0;   // must NOT scale counts
+        let p = ScriptParamMeta {
+            name: "bolts".into(),
+            ptype: ParamType::Int,
+            default: "6".into(),
+            min: None, max: None, help: String::new(),
+            choices: Vec::new(),
+        };
+        assert_eq!(app.param_value_scene(&[p], "bolts", "8").unwrap(), "8");
+    }
+}
+#[cfg(test)]
+mod script_modify_tests {
+    use super::*;
+    use cad_script::{ScriptOp as Op, ScriptOpReply as R};
+
+    fn n_adds(app: &mut CadApp, n: usize) -> usize {
+        let base = app.doc.dobjects.len();
+        for i in 0..n {
+            app.apply_script_op(Op::AddLine {
+                a: Vec2::new(i as f64 * 10.0, 0.0),
+                b: Vec2::new(i as f64 * 10.0 + 5.0, 0.0),
+            });
+        }
+        base
+    }
+
+    #[test]
+    fn modify_move_transforms_in_place() {
+        let mut app = CadApp::default();
+        let b = n_adds(&mut app, 2);
+        app.apply_script_op(Op::ModifyMove { indices: vec![b, b + 1], delta: Vec2::new(0.0, 7.0) });
+        let d = &app.doc.dobjects[b];
+        match &d.geom {
+            Geom::Line(l) => assert!((l.a.y - 7.0).abs() < 1e-9, "line moved up"),
+            other => panic!("expected line, got {:?}", other),
+        }
+        app.do_undo();
+        let d = &app.doc.dobjects[b];
+        match &d.geom {
+            Geom::Line(l) => assert!((l.a.y).abs() < 1e-9, "undo restores the line"),
+            other => panic!("expected line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn modify_copy_returns_new_indices() {
+        let mut app = CadApp::default();
+        let b = n_adds(&mut app, 1);
+        let n0 = app.doc.dobjects.len();
+        match app.apply_script_op(Op::ModifyCopy {
+            indices: vec![b],
+            delta: Vec2::new(50.0, 0.0),
+        }) {
+            R::Indices(v) => {
+                assert_eq!(v, vec![n0], "one new index");
+                assert_eq!(app.doc.dobjects.len(), n0 + 1);
+                match &app.doc.dobjects[v[0]].geom {
+                    Geom::Line(l) => assert!((l.a.x - 50.0).abs() < 1e-9, "copy offset"),
+                    other => panic!("expected line, got {:?}", other),
+                }
+            }
+            other => panic!("expected Indices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_entity_geom_replaces_shape_properties() {
+        let mut app = CadApp::default();
+        let b = n_adds(&mut app, 1);
+        // Line → Circle (shape-specific properties replaced; index kept).
+        app.apply_script_op(Op::SetEntityGeom {
+            index: b,
+            geom: Geom::Circle(Circle { center: Vec2::new(3.0, 4.0), radius: 2.0 }),
+        });
+        match &app.doc.dobjects[b].geom {
+            Geom::Circle(c) => {
+                assert_eq!(c.center, Vec2::new(3.0, 4.0));
+                assert!((c.radius - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected circle, got {:?}", other),
+        }
+        assert!(app.doc.dobjects.len() == b + 1, "no extra entity was created");
+    }
+
+    #[test]
+    fn style_setters_and_resolved_summary() {
+        let mut app = CadApp::default();
+        let b = n_adds(&mut app, 1);
+        app.apply_script_op(Op::SetEntityColor { indices: vec![b], color: 3 });
+        let d = &app.doc.dobjects[b];
+        assert_eq!(d.style.color, Color::Aci(3));
+        // The snapshot exposes the resolved style.
+        let e = app.entity_snapshot(d);
+        assert_eq!(e.color, "aci 3");
+        assert!(!e.linetype.is_empty());
+        assert!(e.visible);
+        // Layer move resolves the layer name in the snapshot.
+        app.apply_script_op(Op::LayerAdd { name: "SCRIPT_LW".into() });
+        app.apply_script_op(Op::SetEntityLayer { indices: vec![b], name: "SCRIPT_LW".into() });
+        let e = app.entity_snapshot(&app.doc.dobjects[b]);
+        assert_eq!(e.layer, "SCRIPT_LW");
+        // Visibility toggle.
+        app.apply_script_op(Op::SetEntityVisible { indices: vec![b], visible: false });
+        assert!(!app.doc.dobjects[b].style.visible);
+        let e = app.entity_snapshot(&app.doc.dobjects[b]);
+        assert!(!e.visible);
+    }
+
+    #[test]
+    fn doc_bounds_cover_all_entities() {
+        let mut app = CadApp::default();
+        let b = n_adds(&mut app, 1);
+        app.apply_script_op(Op::ModifyMove { indices: vec![b], delta: Vec2::new(-5.0, 3.0) });
+        match app.apply_script_op(Op::DocBounds) {
+            R::Bounds(Some((min, max))) => {
+                assert!(min.x <= -5.0 && max.x >= 0.0);
+                assert!(min.y <= 0.0 && max.y >= 3.0);
+            }
+            other => panic!("expected Bounds, got {other:?}"),
+        }
+        match app.apply_script_op(Op::DocUnits) {
+            R::Units(u) => assert_eq!(u.name, app.doc.units.name),
+            other => panic!("expected Units, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_group_splits_a_run_into_units() {
+        let mut app = CadApp::default();
+        let depth0 = app.undo_stack.len();
+        let b = n_adds(&mut app, 1);          // first write → baseline
+        app.apply_script_op(Op::UndoGroup);   // boundary after entity #b
+        let b2 = n_adds(&mut app, 1);         // second group
+        assert_eq!(b2, b + 1);
+        // Simulate the Finished collapse (grouped).
+        let base = app.script_undo_base.unwrap();
+        let mut kept = vec![base];
+        kept.extend(app.script_group_snapshots.iter().copied());
+        let mut out = Vec::new();
+        for &ix in &kept {
+            if ix >= app.undo_stack.len() { continue; }
+            out.push(app.undo_stack[ix].clone());
+        }
+        app.undo_stack.truncate(base);
+        app.undo_stack.extend(out);
+        app.script_undo_base = None;
+        app.script_group_snapshots.clear();
+        assert_eq!(app.undo_stack.len(), depth0 + 2, "pre-run + one boundary = 2 units");
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), b2, "first undo reverts only the 2nd group");
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), b, "second undo reverts the 1st group");
+    }
+
+    #[test]
+    fn current_style_setters_apply_to_next_adds() {
+        let mut app = CadApp::default();
+        app.apply_script_op(Op::SetCurrentColor { color: 1 });
+        assert_eq!(app.doc.current_color, Color::Aci(1));
+        match app.apply_script_op(Op::SetCurrentLinetype { name: "Continuous".into() }) {
+            R::OkUnit => {}
+            other => panic!("expected OkUnit, got {other:?}"),
+        }
+        app.apply_script_op(Op::SetCurrentLineweight { mm: 0.5 });
+        assert_eq!(app.doc.current_lineweight, Lineweight::Custom(0.5));
+        match app.apply_script_op(Op::SetCurrentColor { color: 999 }) {
+            R::Error(_) => {}
+            other => panic!("bad color must fail loudly, got {other:?}"),
+        }
+    }
+}
+#[cfg(test)]
+mod script_catalog_types_tests {
+    use super::*;
+    use cad_script::{ParamType, ScriptParamMeta};
+
+    fn cat_param(name: &str, ty: ParamType) -> ScriptParamMeta {
+        ScriptParamMeta {
+            name: name.into(),
+            ptype: ty,
+            default: String::new(),
+            min: None, max: None, help: String::new(),
+            choices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn catalog_choices_fill_from_the_live_document() {
+        let mut app = CadApp::default();
+        let mut params = vec![
+            cat_param("lt", ParamType::Linetype),
+            cat_param("ly", ParamType::Layer),
+            cat_param("bl", ParamType::Block),
+            cat_param("hp", ParamType::HatchPattern),
+            cat_param("plain", ParamType::Str),
+        ];
+        app.fill_catalog_choices(&mut params);
+        assert!(params[0].choices.iter().any(|c| c == "Continuous"),
+            "linetype catalog filled: {:?}", params[0].choices);
+        assert!(!params[1].choices.is_empty(), "layer list filled");
+        assert!(params[2].choices.is_empty(), "no blocks in the default doc");
+        assert!(params[3].choices.iter().any(|c| c == "SOLID"), "pattern catalog filled");
+        assert!(params[4].choices.is_empty(), "plain types keep no choices");
+    }
+
+    #[test]
+    fn quoted_defaults_validate_after_quote_stripping() {
+        // The exact reported bug: a stale dialog value carrying Python repr
+        // quotes ("'ANSI31'") must still validate + canonicalize.
+        let mut app = CadApp::default();
+        let mut spec = vec![cat_param("hp", ParamType::HatchPattern)];
+        app.fill_catalog_choices(&mut spec);
+        assert_eq!(
+            app.param_value_scene(&spec, "hp", "'ANSI31'").unwrap(),
+            "ANSI31"
+        );
+        assert_eq!(
+            app.param_value_scene(&spec, "hp", "'solid'").unwrap(),
+            "SOLID"
+        );
+    }
+
+    #[test]
+    fn catalog_values_validate_and_canonicalize() {
+        let mut app = CadApp::default();
+        let mut spec = vec![
+            cat_param("lt", ParamType::Linetype),
+            cat_param("hp", ParamType::HatchPattern),
+        ];
+        app.fill_catalog_choices(&mut spec);
+        // Case-insensitive canonicalization to the catalog spelling.
+        assert_eq!(
+            app.param_value_scene(&spec, "lt", "continuous").unwrap(),
+            "Continuous"
+        );
+        assert_eq!(
+            app.param_value_scene(&spec, "hp", "solid").unwrap(),
+            "SOLID"
+        );
+        // Unknown values fail loudly with the available list.
+        let err = app.param_value_scene(&spec, "lt", "NOPE").unwrap_err();
+        assert!(err.contains("not one of"), "{err}");
+        let err = app.param_value_scene(&spec, "hp", "NOPE").unwrap_err();
+        assert!(err.contains("SOLID"), "{err}");
+        // Non-catalog params still pass through untouched.
+        let plain = cat_param("s", ParamType::Str);
+        assert_eq!(
+            app.param_value_scene(&[plain], "s", "free text").unwrap(),
+            "free text"
+        );
     }
 }

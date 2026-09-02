@@ -303,3 +303,41 @@ Tests: kernel 416 (snap text anchor + one more); app 1413 passed / 10
 pre-existing failures; hatch suites 37 + hatch_trace 22; cad_text 29; cad_io
 93; pytest 1473/1473; `cargo test --workspace --no-fail-fast` green except the
 10 known. Changes uncommitted.
+
+### Fourth continuation (2026-09-02) — python scripting / plot parity + commit
+
+9446058 committed + pushed to origin/farzad-dev (all hatch/text/audit work).
+
+Then full python-scripting parity port from upstream (9122825-era UI slices
+the fork's merge had dropped):
+- state: 13 fields (py_editor_*, script_param_dialog/pick, script_preview,
+  script_pending_run, scripting_doc_open/text, script_meta_finish_pending) +
+  5 module types (PyEditorConfirm, ScriptPickKind, ScriptParamDialog,
+  PendingScriptRun, ScriptPreview) + inits.
+- fns: run_script_command/parse_named_script_args/fill_catalog_choices/
+  run_pending_script, on_script_meta, render_script_param_dialog (typed
+  fields incl length/point-pick/entity/color/choice catalogs),
+  param helpers (parse_point_param_value, param_display_default,
+  param_value_scene, dialog_params_scene), open/render_scripting_doc,
+  save_py_script (upstream), py_editor_* + render_py_editor +
+  py_editor_toolbar, preview trio (script_preview_start/dirty/
+  clear_script_preview), apply_preview_op + preview_transform/preview_style
+  (shadow-document ghost pass; module-level in fork → direct calls, no
+  Self::), on_script_finished rewritten (meta-finish guard + preview
+  finalize), poll_script_engine Meta arm, apply_script_op preview guard.
+- wiring: console Editor/Guide buttons; clear_script_preview on pyfile/
+  submit/example-run/run paths; dispatch → run_script_command /
+  open_scripting_doc / refocus_cmd; Esc interrupts script + disarms param
+  pick; canvas-click fills point/entity param pick; ghost dashed overlay in
+  draw path; AciPickRequest::ScriptParam + title/apply arms;
+  Tools→Scripts flyout (FlyMenu::Scripts, 4 FlyAct variants + handlers +
+  activate arms); update() renders py editor + param dialog + scripting
+  doc. Tests: 10 upstream script test modules ported (script_hatch_tests
+  dropped — tests fork-absent hover/designate machinery); new DragValues
+  carry update_while_editing(false) (fork's numeric-field regression test).
+- Plotting: verified byte-identical shared plot UI (dialog/preview/CTB/
+  ladder/plot_config) — cad_plot scene.rs diff belongs to the deferred
+  kernel Spline.width feature; layout_print_preview belongs to the
+  not-ported layout-tabs feature. Nothing to port.
+Verification: app 1446 passed / 10 pre-existing failures; kernel 416;
+pytest 1473/1473. Changes committed + pushed.
