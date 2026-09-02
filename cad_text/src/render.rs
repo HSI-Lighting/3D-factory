@@ -18,12 +18,22 @@ use lyon::tessellation::{
 use crate::font::rtl_fallback_bytes;
 use crate::{FillMode, RenderedGlyphs, TextRequest};
 
+/// Hard cap on per-glyph contour classification — the contour count comes
+/// from the (untrusted) font file, and containment is quadratic in it. Real
+/// glyphs stay far below this; beyond it TXTEXP simply gets no polygons.
+const MAX_CLASSIFY_CONTOURS: usize = 1024;
+
 /// Tessellated geometry for ONE glyph, in font units, glyph-local (origin at the
 /// glyph's baseline pen point). Cached so each glyph is tessellated once ever.
 struct GlyphGeom {
     fills: Vec<[Vec2; 3]>,
     /// Closed perimeter contours (font units, glyph-local).
     outlines: Vec<Vec<Vec2>>,
+    /// Contours classified by containment: `(outer, holes)` per island —
+    /// glyph-local font units. Even containment depth → outer, odd → hole;
+    /// each hole assigned to the smallest containing outer. This mirrors the
+    /// flatten-then-classify pipeline of auto_rasm's TXTEXP.
+    polygons: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)>,
 }
 
 /// One font in the renderer's face chain: `[0]` is the requested font, `[1..]`
@@ -44,10 +54,10 @@ struct FaceData {
 }
 
 impl FaceData {
-    fn new(bytes: Vec<u8>) -> Option<Self> {
+    fn new(bytes: Vec<u8>, index: u32) -> Option<Self> {
         let data: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        let shaper = rustybuzz::Face::from_slice(data, 0)?;
-        let face = ttf_parser::Face::parse(data, 0).ok()?;
+        let shaper = rustybuzz::Face::from_slice(data, index)?;
+        let face = ttf_parser::Face::parse(data, index).ok()?;
         let upm = face.units_per_em() as f64;
         if upm <= 0.0 {
             return None;
@@ -95,10 +105,21 @@ impl TextRenderer {
         primary: Vec<u8>,
         fallback: Option<Vec<u8>>,
     ) -> Option<Self> {
-        let mut faces = vec![FaceData::new(primary)?];
+        Self::from_face(primary, 0, fallback)
+    }
+
+    /// Parse face `index` of `primary` (font collections carry one face per
+    /// index; regular fonts are index 0), with the embedded RTL font as the
+    /// script fallback.
+    pub(crate) fn from_bytes_with_index(primary: Vec<u8>, index: u32) -> Option<Self> {
+        Self::from_face(primary, index, Some(rtl_fallback_bytes().to_vec()))
+    }
+
+    fn from_face(primary: Vec<u8>, index: u32, fallback: Option<Vec<u8>>) -> Option<Self> {
+        let mut faces = vec![FaceData::new(primary, index)?];
         if let Some(fb) = fallback {
             if faces[0]._data != fb.as_slice() {
-                if let Some(f) = FaceData::new(fb) {
+                if let Some(f) = FaceData::new(fb, 0) {
                     faces.push(f);
                 }
             }
@@ -107,7 +128,20 @@ impl TextRenderer {
     }
 
     /// Render a request to world-space geometry. Empty result for empty text.
+    /// The per-frame text path — polygon classification is NOT emitted here
+    /// (see `render_with_polygons`).
     pub fn render(&mut self, req: &TextRequest<'_>) -> RenderedGlyphs {
+        self.render_with_polygons(req, false)
+    }
+
+    /// `render` plus the classified `(outer, holes)` glyph polygons in world
+    /// space — the one-shot TXTEXP path. The per-frame renderer skips the
+    /// extra transform/alloc work.
+    pub(crate) fn render_with_polygons(
+        &mut self,
+        req: &TextRequest<'_>,
+        want_polygons: bool,
+    ) -> RenderedGlyphs {
         let mut out = RenderedGlyphs::default();
         if req.text.is_empty() {
             return out;
@@ -229,6 +263,19 @@ impl TextRenderer {
                     wc.push(w);
                 }
                 out.outlines.push(wc);
+            }
+            // Classified polygons (outer + holes) in world space — TXTEXP
+            // input only; the per-frame path never pays this transform.
+            if want_polygons {
+                for (outer, holes) in &geom.polygons {
+                    let wo: Vec<Vec2> =
+                        outer.iter().map(|p| to_glyph(base, p.x, p.y, fs)).collect();
+                    let wh: Vec<Vec<Vec2>> = holes
+                        .iter()
+                        .map(|h| h.iter().map(|p| to_glyph(base, p.x, p.y, fs)).collect())
+                        .collect();
+                    out.glyph_polygons.push((wo, wh));
+                }
             }
         }
 
@@ -411,8 +458,113 @@ impl TextRenderer {
             }
         }
 
-        GlyphGeom { fills, outlines }
+        // 3) Containment classification → (outer, holes) islands for TXTEXP.
+        let polygons = classify_contours(&outlines);
+
+        GlyphGeom { fills, outlines, polygons }
     }
+}
+
+/// Split closed contours into `(outer, holes)` islands. A contour whose first
+/// point is contained by an EVEN number of other contours is an outer; odd →
+/// hole. Each hole joins the smallest-area outer that contains it (nested
+/// islands keep their holes separate). Degenerate contours with < 3 points
+/// were already dropped upstream.
+///
+/// Adversarial-font guard: containment is O(n²·m) in the contour count (which
+/// the FONT controls). Contours beyond `MAX_CLASSIFY_CONTOURS` skip polygon
+/// classification entirely (fills/outlines still render), and a bounding-box
+/// pre-filter rejects most non-containing pairs before the ray-cast.
+fn classify_contours(contours: &[Vec<Vec2>]) -> Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)> {
+    let n = contours.len();
+    if n > MAX_CLASSIFY_CONTOURS {
+        return Vec::new();
+    }
+    // containment[i] = indices of every contour containing contour i.
+    let bboxes: Vec<(Vec2, Vec2)> = contours.iter().map(|c| contour_bbox(c)).collect();
+    let mut containment: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        let p = contours[i][0];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // Cheap rejection: containment implies the point lies inside the
+            // contour's bounding box (inclusive, matching point_in_polygon's
+            // boundary-inside semantics).
+            let (mn, mx) = bboxes[j];
+            if p.x < mn.x || p.x > mx.x || p.y < mn.y || p.y > mx.y {
+                continue;
+            }
+            if cad_kernel::point_in_polygon(p, &contours[j]) {
+                containment[i].push(j);
+            }
+        }
+    }
+
+    let area = |c: &Vec<Vec2>| -> f64 {
+        let mut a = 0.0;
+        let m = c.len();
+        for i in 0..m {
+            let p = c[i];
+            let q = c[(i + 1) % m];
+            a += p.x * q.y - q.x * p.y;
+        }
+        a.abs() * 0.5
+    };
+
+    // Outers (even depth), then attach each hole (odd depth) to the smallest
+    // containing outer. A hole contained by NO outer (malformed glyph) is
+    // promoted to an outer so its outline is never lost.
+    let outer_idx: Vec<usize> = (0..n)
+        .filter(|&i| containment[i].len() % 2 == 0)
+        .collect();
+    let mut islands: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)> = outer_idx
+        .iter()
+        .map(|&i| (contours[i].clone(), Vec::new()))
+        .collect();
+    let mut orphan_holes: Vec<Vec<Vec2>> = Vec::new();
+    for (i, c) in contours.iter().enumerate() {
+        if containment[i].len() % 2 != 1 {
+            continue;
+        }
+        // Smallest-area OUTER among the containing contours.
+        let parent = containment[i]
+            .iter()
+            .filter(|&&j| containment[j].len() % 2 == 0)
+            .min_by(|&&a, &&b| {
+                area(&contours[a])
+                    .partial_cmp(&area(&contours[b]))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        match parent {
+            Some(&j) => {
+                // `j` is even-depth, and `outer_idx` holds exactly those —
+                // the position always exists.
+                let pos = outer_idx
+                    .iter()
+                    .position(|&o| o == j)
+                    .expect("hole parent must be a classified outer");
+                islands[pos].1.push(c.clone());
+            }
+            None => orphan_holes.push(c.clone()),
+        }
+    }
+    for h in orphan_holes {
+        islands.push((h, Vec::new()));
+    }
+    islands
+}
+
+/// Axis-aligned bounding box of a contour (inclusive).
+fn contour_bbox(c: &[Vec2]) -> (Vec2, Vec2) {
+    let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+    let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in c {
+        mn = Vec2::new(mn.x.min(p.x), mn.y.min(p.y));
+        mx = Vec2::new(mx.x.max(p.x), mx.y.max(p.y));
+    }
+    (mn, mx)
 }
 
 /// Feeds a glyph outline into a lyon path (fill + flattening both derive from
@@ -578,5 +730,96 @@ mod tests {
         assert!(g.advance > 0.0);
         let (min, max) = g.bbox;
         assert!(max.x > min.x && max.y > min.y);
+    }
+
+    fn fill_req(text: &'static str, pos: Vec2) -> TextRequest<'static> {
+        TextRequest {
+            text,
+            font_name: "liberation sans",
+            position: pos,
+            height: 10.0,
+            angle: 0.0,
+            h_align: HAlign::Left,
+            v_align: VAlign::Baseline,
+            fill_mode: FillMode::Fill,
+            slant: 0.0,
+            x_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn o_has_one_outer_and_one_hole() {
+        let mut r = liberation_with_dejavu_fallback();
+        let g = r.render_with_polygons(&fill_req("O", Vec2::ZERO), true);
+        assert_eq!(
+            g.glyph_polygons.len(),
+            1,
+            "'O' is ONE glyph with one outer + one hole"
+        );
+        let (outer, holes) = &g.glyph_polygons[0];
+        assert!(outer.len() >= 3, "outer contour must be a closed loop");
+        assert_eq!(holes.len(), 1, "'O' must have exactly one counter (hole)");
+        assert!(holes[0].len() >= 3);
+        // The hole must be strictly inside the outer (every hole point
+        // contained by the outer loop).
+        for p in &holes[0] {
+            assert!(cad_kernel::point_in_polygon(*p, outer));
+        }
+    }
+
+    #[test]
+    fn ab_yields_two_glyph_polygons() {
+        let mut r = liberation_with_dejavu_fallback();
+        let g = r.render_with_polygons(&fill_req("AB", Vec2::ZERO), true);
+        assert_eq!(
+            g.glyph_polygons.len(),
+            2,
+            "'AB' is two glyphs → two (outer, holes) entries"
+        );
+        // 'B' carries two counters; between the two glyphs there are holes.
+        let total_holes: usize = g.glyph_polygons.iter().map(|(_, h)| h.len()).sum();
+        assert!(total_holes >= 2, "A (1 hole) + B (2 holes) = 3 holes total");
+    }
+
+    #[test]
+    fn arabic_sample_produces_polygons() {
+        let mut r = liberation_with_dejavu_fallback();
+        let g = r.render_with_polygons(
+            &fill_req("\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629}", Vec2::ZERO),
+            true,
+        );
+        assert!(!g.glyph_polygons.is_empty(), "Arabic must produce glyph polygons");
+        assert!(g.glyph_polygons.iter().any(|(o, _)| o.len() >= 3));
+    }
+
+    #[test]
+    fn polygons_transform_to_world_space() {
+        let mut r = liberation_with_dejavu_fallback();
+        let at_origin = r.render_with_polygons(&fill_req("O", Vec2::ZERO), true);
+        let shifted = r.render_with_polygons(&fill_req("O", Vec2::new(30.0, 40.0)), true);
+        assert_eq!(at_origin.glyph_polygons.len(), shifted.glyph_polygons.len());
+        let d = Vec2::new(30.0, 40.0);
+        for ((o1, _), (o2, _)) in at_origin
+            .glyph_polygons
+            .iter()
+            .zip(shifted.glyph_polygons.iter())
+        {
+            for (a, b) in o1.iter().zip(o2.iter()) {
+                assert!(
+                    (*b - (*a + d)).len() < 1e-6,
+                    "polygon point must translate with the anchor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn per_frame_render_skips_polygon_work() {
+        // The per-frame path must NOT pay the polygon classification/transform
+        // cost — only the explode path wants it.
+        let mut r = liberation_with_dejavu_fallback();
+        let g = r.render(&fill_req("O", Vec2::ZERO));
+        assert!(g.glyph_polygons.is_empty());
+        assert!(!g.fills.is_empty(), "fills still render");
     }
 }

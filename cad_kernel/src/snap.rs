@@ -233,11 +233,15 @@ pub fn find_all_snaps(
         } else {
             world_radius
         };
-        let cand_ents: Vec<usize> = match grid {
+        let mut cand_ents: Vec<usize> = match grid {
             Some(g) => g.query_near(cursor, dobject_search_r)
                         .into_iter().map(|u| u as usize).collect(),
             None    => (0..dobjects.len()).collect(),
         };
+        // P2: the grid's indices are from its BUILD-time count. If the doc shrank
+        // (delete-then-hover) the grid is stale, so drop any index past the
+        // current slice — else `dobjects[..]` panics in the INT + main loops below.
+        cand_ents.retain(|&i| i < dobjects.len());
         if cand_ents.is_empty() { continue; }
 
         if k == SnapKind::Int {
@@ -1318,9 +1322,28 @@ mod tests {
         approx_eq(p.x, x) && approx_eq(p.y, y)
     }
 
+    // P2: a STALE spatial grid (built before the doc shrank — delete-then-hover)
+    // yields candidate indices past the current slice. `find_all_snaps`/`find_snap`
+    // must filter them, not index OOB and panic.
     #[test]
-    fn per_to_horizontal_line_in_segment() {
-        let l = Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) };
+    fn stale_grid_indices_do_not_panic() {
+        let mut dobjects: Vec<DObject> = Vec::new();
+        for i in 0..6 {
+            dobjects.push(DObject::new(Geom::Circle(Circle {
+                center: Vec2::new(i as f64 * 0.1, 0.0), radius: 1.0,
+            })));
+        }
+        let grid = UniformGrid::build(&dobjects, 1.0);   // knows all 6
+        let shorter = &dobjects[..dobjects.len() - 2];   // doc "shrank" by 2
+        let all = SnapSet { end: true, mid: true, cen: true, qua: true,
+                            int: true, per: true, tan: true, nea: true };
+        // No panic on the OOB indices the stale grid returns.
+        let _ = find_all_snaps(Vec2::ZERO, 5.0, all, None, None, shorter, Some(&grid));
+        let _ = find_snap(Vec2::ZERO, 5.0, all, None, None, shorter, Some(&grid));
+    }
+
+    #[test]
+    fn per_to_horizontal_line_in_segment() {        let l = Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) };
         let (p, anchor) = per_to_line(Vec2::new(3.0, 4.0), &l).unwrap();
         assert!(close(p, 3.0, 0.0));
         assert!(anchor.is_none(), "foot is inside the segment, no extension");
@@ -1708,6 +1731,30 @@ mod tests {
         assert!(candidate_points(SnapKind::Qua, &g, Vec2::ZERO, None).is_empty());
         assert_eq!(nearest_point_on(&g, Vec2::new(3.2, 3.1)),
             Some(Vec2::new(3.0, 3.0)));
+    }
+
+    #[test]
+    fn text_snaps_at_anchor() {
+        // Text has no curve geometry — its ANCHOR is the END/CEN candidate,
+        // the NEA hit, and the PER foot.
+        let t = crate::text::Text {
+            position: Vec2::new(4.0, 5.0),
+            ..crate::text::Text::empty()
+        };
+        let g = Geom::Text(t);
+        let ends = candidate_points(SnapKind::End, &g, Vec2::ZERO, None);
+        assert_eq!(ends.len(), 1);
+        assert!(close(ends[0].0, 4.0, 5.0));
+        let cens = candidate_points(SnapKind::Cen, &g, Vec2::ZERO, None);
+        assert_eq!(cens.len(), 1);
+        assert!(close(cens[0].0, 4.0, 5.0));
+        assert_eq!(nearest_point_on(&g, Vec2::new(4.2, 5.1)),
+            Some(Vec2::new(4.0, 5.0)));
+        let pers = candidate_points(SnapKind::Per, &g, Vec2::new(0.0, 0.0), Some(Vec2::ZERO));
+        assert_eq!(pers.len(), 1);
+        assert!(close(pers[0].0, 4.0, 5.0));
+        assert!(candidate_points(SnapKind::Mid, &g, Vec2::ZERO, None).is_empty());
+        assert!(candidate_points(SnapKind::Qua, &g, Vec2::ZERO, None).is_empty());
     }
 }
 

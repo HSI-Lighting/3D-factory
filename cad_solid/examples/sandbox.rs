@@ -919,7 +919,9 @@ impl Sandbox {
                 Ok(out) => {
                     doc.dobjects[i1].geom = out.g1_new;
                     doc.dobjects[i2].geom = out.g2_new;
-                    doc.push(DObject::new(out.bridge));
+                    if let Some(bridge_geom) = out.bridge {
+                        doc.push(DObject::new(bridge_geom));
+                    }
                     self.note("flat chamfer ✓".into());
                 }
                 Err(e) => self.status = format!("chamfer: {e}"),

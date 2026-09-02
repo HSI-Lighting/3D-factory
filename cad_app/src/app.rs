@@ -187,6 +187,9 @@ const PP_ROW_GAP: f32 = crate::theme::space::ROW_GAP;    // vertical gap between
 /// linetype dash / lineweight bar preview, so both previews share one length.
 /// Wide enough for a 10-letter linetype name + variant (e.g. "Continuous").
 const PP_PREVIEW_TRAIL: f32 = 96.0;
+/// Standard synthetic-italic shear angle (~12°) — the value the text dialog's
+/// Row-4 Italic toggle writes to `TextStyle.oblique` / `Text.oblique`.
+const ITALIC_RAD: f64 = 0.209_439_5;
 
 /// A labelled property row: muted fixed-width label on the left, a value
 /// area that fills the rest. `add` receives the value-cell width so every
@@ -2482,7 +2485,12 @@ pub struct CadApp {
     /// caching it means it runs once per doc change instead of every frame,
     /// which is what makes many/dense hatches usable. Colour is applied at
     /// draw time (not baked in), so selection/snap highlight still work.
-    /// Invalidated wholesale whenever `gpu_dirty` is observed (doc mutated).
+    /// Invalidated wholesale ONLY on a GEOMETRY change — cleared in
+    /// `ensure_index` when the spatial index rebuilds (`index_dirty`). It must
+    /// NOT clear on a pure selection/highlight/camera change (`gpu_dirty`
+    /// alone), or clicking/box-selecting a dense-hatch drawing re-generates
+    /// every hatch and stutters (B24 / GP1). Hatch fill depends only on
+    /// boundary-dobject geometry, which always sets `index_dirty`.
     hatch_cache: HashMap<cad_kernel::Handle, HatchCacheEntry>,
 
     // ---- Layer panel (Slice B) ----
@@ -3420,6 +3428,9 @@ pub enum QueuedOp {
     /// Explode — on Enter every selected BlockRef is replaced by
     /// transformed copies of its contents (one level).
     Explode,
+    /// Overkill — on Enter the finalised selection is deduped; an empty
+    /// basket means the WHOLE drawing (AutoCAD semantics).
+    Overkill,
     /// Erase — applied on Enter. The finalised selection is deleted
     /// in one batch. AutoCAD's ERASE: type `erase`, pick targets,
     /// Enter to commit.
@@ -4972,27 +4983,38 @@ impl Default for CadApp {
         s.doc.layers.active = walls;
 
         // Demo dobjects so the canvas is never empty on first launch.
-        s.doc.push(Line {
+        // (push is a pure append now — stamp the fresh-draw style so the
+        // demos land on the active WALLS layer as before.)
+        let mut demo_line: DObject = Line {
             a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0),
-        }.into());
-        s.doc.push(Circle {
+        }.into();
+        s.stamp_fresh_style(&mut demo_line.style);
+        s.doc.push(demo_line);
+        let mut demo_circle: DObject = Circle {
             center: Vec2::new(0.0, 0.0), radius: 30.0,
-        }.into());
-        s.doc.push(Arc {
+        }.into();
+        s.stamp_fresh_style(&mut demo_circle.style);
+        s.doc.push(demo_circle);
+        let mut demo_arc: DObject = Arc {
             center: Vec2::new(0.0, 0.0), radius: 45.0,
             start_angle: 0.0, sweep_angle: std::f64::consts::PI,
-        }.into());
-        // Demo ellipse — tilted so its rotated QUA points are visible
-        s.doc.push(Ellipse {
+        }.into();
+        s.stamp_fresh_style(&mut demo_arc.style);
+        s.doc.push(demo_arc);
+        let mut demo_ellipse: DObject = Ellipse {
             center: Vec2::new(-60.0, -30.0),
             major:  Vec2::new(25.0, 12.0),    // semi-major ≈ 27.7, rotation ≈ 25.6°
             ratio:  0.55,                     // semi-minor ≈ 15.2
-        }.into());
+        }.into();
+        s.stamp_fresh_style(&mut demo_ellipse.style);
+        s.doc.push(demo_ellipse);
         // Demo point + polyline (Slice E preview).
-        s.doc.push(Point {
+        let mut demo_point: DObject = Point {
             location: Vec2::new(60.0, -40.0), style: 0, size: 0.0,
-        }.into());
-        s.doc.push(Polyline {
+        }.into();
+        s.stamp_fresh_style(&mut demo_point.style);
+        s.doc.push(demo_point);
+        let mut demo_pl: DObject = Polyline {
             vertices: vec![
                 PolyVertex { pos: Vec2::new(50.0,  40.0), bulge: 0.0 },
                 PolyVertex { pos: Vec2::new(70.0,  60.0), bulge: 0.0 },
@@ -5002,7 +5024,9 @@ impl Default for CadApp {
             ],
             closed: true,
             widths: Vec::new(),
-        }.into());
+        }.into();
+        s.stamp_fresh_style(&mut demo_pl.style);
+        s.doc.push(demo_pl);
         s.recompute();
         s.history.push("RUST_CAD math workbench — three demo dobjects loaded.".into());
         s.history.push("Pick a tool from the top toolbar, or type 'help'.".into());
@@ -16592,6 +16616,12 @@ impl CadApp {
         let trimmed = raw.trim();
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
+        // A2: a NEW command must cancel any in-flight hatch-trace worker and
+        // drop its result (Background-Ops I-3) — else a trace that finishes
+        // after the switch drops invisible boundary polylines into the doc.
+        // A hatch-trace worker leaves `tool == None` and every `*_state` Off,
+        // so a guarded cancel would skip it — cancel unconditionally here.
+        self.cancel_hatch_worker();
         // SESSION RECORDER — capture every cmd-line invocation BEFORE
         // the intercepts run. The parsed result is recorded only after
         // parsing succeeds; pre-parser intercepts (text body, fillet
@@ -18072,6 +18102,14 @@ impl CadApp {
                 self.history.push(format!("  command: {}", canon));
             }
         }
+        // Phase-10 instrumentation: record any command that runs while a hatch
+        // (or a hatch's boundary) is in the basket, with the doc size before
+        // and after. `move`, `erase`, `copy` and friends acting on a fill are
+        // where the confusing behaviour shows up, and the log used to stop at
+        // creation — so the interesting half was invisible.
+        if let Ok(ref c) = parsed {
+            self.hatch_dbg_command_on_selection(&c.canonical_name(), trimmed);
+        }
         match parsed {
             Ok(Command::Add(e))   => self.add_dobject(e, "command"),
             Ok(Command::Delete(i)) => {
@@ -19227,6 +19265,29 @@ impl CadApp {
                 self.tool = Tool::None;
                 self.pagesetup_open = true;
             }
+            Ok(Command::Purge) => {
+                self.tool = Tool::None;
+                self.commit_purge();
+            }
+            Ok(Command::LayerState(args)) => {
+                self.tool = Tool::None;
+                self.apply_layerstate(&args);
+            }
+            Ok(Command::Ucs(args)) => {
+                self.tool = Tool::None;
+                self.apply_ucs(&args);
+            }
+            Ok(Command::Overkill) => {
+                self.tool = Tool::None;
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Overkill;
+                    self.set_prompt(
+                        "overkill: select dobjects  [Enter = whole drawing]");
+                } else {
+                    self.commit_overkill(Some(self.selection.clone()));
+                }
+            }
             Err(e) => {
                 // ---- Command-line calculator & user variables ------------
                 // The parser-Err path is the ONLY calc entry point, so
@@ -19583,9 +19644,11 @@ impl CadApp {
         // straight to base-point capture).
         let queued = std::mem::replace(&mut self.queued_op, QueuedOp::None);
         // BlockReopen always restores its dialog (even with an empty
-        // basket — the user can just select again from there).
+        // basket — the user can just select again from there). Overkill
+        // with an empty basket means the WHOLE drawing (AutoCAD).
         if queued != QueuedOp::None
             && queued != QueuedOp::BlockReopen
+            && queued != QueuedOp::Overkill
             && self.selection.is_empty()
         {
             self.history.push(format!(
@@ -19689,6 +19752,12 @@ impl CadApp {
                 // Replay the same path Command::DeleteSelected uses.
                 self.run_command("erase");
             }
+            QueuedOp::Overkill => {
+                // Empty selection (Enter with nothing picked) → whole drawing.
+                let subset = if self.selection.is_empty() { None } else { Some(self.selection.clone()) };
+                self.commit_overkill(subset);
+                self.clear_prompt();
+            }
             QueuedOp::ChProp(prop, val) => {
                 self.apply_chprop(&prop, &val);
             }
@@ -19717,30 +19786,15 @@ impl CadApp {
     /// user deleted a boundary) are silently skipped, so the hatch
     /// just shrinks rather than crashing.
     fn resolve_hatch_loops(&self, h: &cad_kernel::Hatch) -> Vec<Vec<Vec2>> {
-        let mut loops: Vec<Vec<Vec2>> = Vec::with_capacity(h.boundary_handles.len());
-        for handle in &h.boundary_handles {
-            let Some(d) = self.doc.find_by_handle(*handle) else { continue; };
-            // Any closed boundary dobject is fair game now —
-            // Polyline (closed), Circle, Ellipse. Open dobjects and
-            // arcs would need boundary-traversal (chain into a loop);
-            // queued for the pick-point slice.
-            let loop_verts: Option<Vec<Vec2>> = match &d.geom {
-                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
-                    Some(closed_dobject_polygon(&d.geom))
-                }
-                Geom::Circle(c) => {
-                    Some(tessellate_circle_loop(c.center, c.radius, 64))
-                }
-                Geom::Ellipse(e) => {
-                    Some(tessellate_ellipse_loop(e, 64))
-                }
-                _ => None,
-            };
-            if let Some(v) = loop_verts {
-                loops.push(v);
-            }
-        }
-        loops
+        // Delegates to the SHARED kernel resolver (cad_kernel::resolve_hatch_loops)
+        // so on-screen RENDER and DXF EXPORT compute hatch fill loops from the
+        // exact same code — the whole point of promoting it to the kernel.
+        //
+        // The kernel resolver adds what the inline copy below didn't have:
+        // spline boundaries, invisible/frozen-layer gating (issue #17, with the
+        // `hatch_aux` synthetic-boundary exception) and the shared tessellation
+        // helpers.
+        cad_kernel::resolve_hatch_loops(h, &self.doc)
     }
 
     /// Paint a hatch — solid fill of its resolved boundary loops with
@@ -19768,9 +19822,13 @@ impl CadApp {
         }
     }
 
-    /// Solid fill path — outer loop fills, alternating loops "subtract"
-    /// by overdrawing in the canvas background color (poor man's even-
-    /// odd; real tessellator pass is a follow-up).
+    /// Solid fill path — geometric even-odd by containment DEPTH: a loop at
+    /// even depth (outer, hole-in-hole, …) fills in the hatch colour, odd
+    /// depth subtracts via canvas-background overdraw. Loops are painted in
+    /// depth order so a nested island re-fills its parent hole's interior
+    /// (letter counters inside punched-out letters hatch again — AutoCAD
+    /// even-odd semantics). The old index-based alternation broke as soon
+    /// as two sibling islands appeared (the second got re-filled).
     fn render_hatch_solid(
         &self,
         painter: &egui::Painter,
@@ -19778,6 +19836,7 @@ impl CadApp {
         loops: &[Vec<Vec2>],
         color: egui::Color32,
     ) {
+        if loops.is_empty() { return; }
         if loops.len() == 1 {
             let pts: Vec<egui::Pos2> = loops[0].iter()
                 .map(|w| self.w2s(*w, rect)).collect();
@@ -19789,11 +19848,18 @@ impl CadApp {
             return;
         }
         let bg = egui::Color32::from_rgb(18, 22, 28);
-        for (i, l) in loops.iter().enumerate() {
-            let pts: Vec<egui::Pos2> = l.iter()
+        // Containment depth per loop, computed ONCE (see `loop_depths`) —
+        // recomputing inside a sort key or per paint is O(n²·verts) per
+        // frame for island-heavy fills. Loops paint in depth order so a
+        // nested island re-fills its parent hole's interior.
+        let depths = loop_depths(loops);
+        let mut order: Vec<usize> = (0..loops.len()).collect();
+        order.sort_by_cached_key(|&i| depths[i]);
+        for i in order {
+            let pts: Vec<egui::Pos2> = loops[i].iter()
                 .map(|w| self.w2s(*w, rect)).collect();
             if pts.len() < 3 { continue; }
-            let fill = if i % 2 == 0 { color } else { bg };
+            let fill = if depths[i] % 2 == 0 { color } else { bg };
             painter.add(egui::Shape::Path(egui::epaint::PathShape {
                 points: pts, closed: true, fill,
                 stroke: egui::epaint::PathStroke::NONE,
@@ -19875,37 +19941,17 @@ impl CadApp {
             if line_count_estimate > 10_000.0 { continue; }
             while s <= s_max + 1e-9 {
                 let line_origin = base + n * s;
-                // Clip this infinite line against the loops — gather
-                // every (t-value, edge-orientation) intersection, sort,
-                // emit segments via even-odd.
-                let mut hits: Vec<f64> = Vec::new();
-                for l in loops {
-                    let m = l.len();
-                    if m < 2 { continue; }
-                    for i in 0..m {
-                        let a = l[i];
-                        let b = l[(i + 1) % m];
-                        if let Some(t) = line_segment_intersect_t(line_origin, u, a, b) {
-                            hits.push(t);
-                        }
-                    }
-                }
-                if hits.len() >= 2 {
-                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-                    // Pair consecutive hits — even-odd inside/outside.
-                    let mut i = 0;
-                    while i + 1 < hits.len() {
-                        let t0 = hits[i];
-                        let t1 = hits[i + 1];
-                        if (t1 - t0).abs() > 1e-6 {
-                            let p0 = line_origin + u * t0;
-                            let p1 = line_origin + u * t1;
-                            painter.line_segment(
-                                [self.w2s(p0, rect), self.w2s(p1, rect)],
-                                stroke);
-                        }
-                        i += 2;
-                    }
+                // Clip this infinite line against the loops via the shared
+                // kernel even-odd clipper — per-loop pairing + XOR across
+                // loops handles shared edges (a chord hatched as two
+                // half-discs) and nested islands correctly.
+                let intervals = cad_kernel::patterns::hatch_line_intervals(loops, line_origin, u);
+                for (t0, t1) in intervals {
+                    let p0 = line_origin + u * t0;
+                    let p1 = line_origin + u * t1;
+                    painter.line_segment(
+                        [self.w2s(p0, rect), self.w2s(p1, rect)],
+                        stroke);
                 }
                 s += spacing;
             }
@@ -19988,59 +20034,16 @@ impl CadApp {
                     let dvec = b - a;
                     let seg_len2 = dvec.x * dvec.x + dvec.y * dvec.y;
                     if seg_len2 < 1e-18 { continue; }
-                    // Use the segment itself as the parametric line:
-                    //   line(t) = a + t * (b - a), so t ∈ [0,1] is the
-                    //   drawable portion of THIS tile-segment. Clip
-                    //   against all loop edges with even-odd, intersect
-                    //   the resulting intervals with [0, 1].
-                    let mut hits: Vec<f64> = Vec::new();
-                    for l in loops {
-                        let m = l.len();
-                        if m < 2 { continue; }
-                        for k in 0..m {
-                            let p0 = l[k];
-                            let p1 = l[(k + 1) % m];
-                            if let Some(t) = line_segment_intersect_t(a, dvec, p0, p1) {
-                                // Filter to the segment's own parameter
-                                // range. `line_segment_intersect_t`
-                                // returns t for an INFINITE line through
-                                // a in direction dvec; hits at t<0 or
-                                // t>1 are intersections of that infinite
-                                // extension with boundary edges that lie
-                                // BEYOND our segment endpoints, and they
-                                // would corrupt the even-odd interval
-                                // walk if mixed in. Parity at the seg
-                                // endpoints is recovered separately via
-                                // point_in_polygon.
-                                if t > -1e-9 && t < 1.0 + 1e-9 {
-                                    hits.push(t.clamp(0.0, 1.0));
-                                }
-                            }
-                        }
-                    }
-                    // Even-odd parity at the segment START. Each in-range
-                    // crossing flips it; tail interval up to t=1 closes
-                    // the walk if we end inside.
-                    let a_in = loops.iter().fold(false,
-                        |acc, l| acc ^ point_in_polygon(a, l.iter().copied()));
-                    if hits.is_empty() {
-                        if !a_in { continue; }
-                        painter.line_segment(
-                            [self.w2s(a, rect), self.w2s(b, rect)],
-                            stroke);
-                        continue;
-                    }
-                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut inside = a_in;
-                    let mut t_prev = 0.0_f64;
-                    let mut intervals: Vec<(f64, f64)> = Vec::new();
-                    for &t in &hits {
-                        if inside { intervals.push((t_prev, t)); }
-                        inside = !inside;
-                        t_prev = t;
-                    }
-                    if inside { intervals.push((t_prev, 1.0)); }
+                    // Clip against the loops with the same per-loop + XOR
+                    // machinery as the family lines (kernel
+                    // hatch_line_intervals), then clamp the resulting
+                    // intervals to the segment's own t-range [0, 1]. The
+                    // XOR runs over the infinite line, so a segment
+                    // starting/ending INSIDE a loop is handled by intervals
+                    // that span past the clamp window.
+                    let intervals = cad_kernel::patterns::hatch_line_intervals(&loops, a, dvec);
                     for (t0, t1) in intervals {
+                        let (t0, t1) = (t0.clamp(0.0, 1.0), t1.clamp(0.0, 1.0));
                         if t1 - t0 > 1e-6 {
                             let p0 = a + dvec * t0;
                             let p1 = a + dvec * t1;
@@ -20116,6 +20119,20 @@ impl CadApp {
             None => Box::new(self.doc.dobjects.iter().enumerate()),
         };
         for (i, d) in iter {
+            // A boundary the user cannot SEE must not define a clickable
+            // region. This skips the invisible synthetic polylines the trace
+            // path materialises for its own hatches (`hatch_aux`), plus
+            // anything hidden or on an off/frozen layer.
+            //
+            // Without this, every traced hatch left boundaries behind that
+            // became candidates for the NEXT pick-point: a second click in the
+            // same area saw "2+ candidates contain the seed", declared a
+            // partial overlap, and deferred to the slow trace path — which
+            // materialised yet more hidden boundaries. The pollution compounded
+            // across a session. The island scan already filtered hidden
+            // dobjects (`skip (hidden)`); this scan did not, and the two
+            // disagreeing is what produced the asymmetry.
+            if !self.doc.is_visible(i) { continue; }
             let contains = match &d.geom {
                 // Treat polylines with coincident endpoints as closed too
                 // (the "drew it as a loop but forgot to type c Enter" case).
@@ -20177,12 +20194,49 @@ impl CadApp {
     /// intersection helper — same primitive that v2c splits on, just
     /// asked as a yes/no question without actually splitting.
     fn outer_has_crossings_with_others(&self, outer_idx: usize) -> bool {
-        let segs = crate::hatch_trace::tessellate_doc(&self.doc);
+        self.outer_has_crossings_with_others_scoped(outer_idx, None)
+    }
+
+    /// Scoped variant — `scope` limits which dobjects are tessellated
+    /// (typically `viewport_scope()`). Used by the hover preview so a
+    /// per-frame crossing check stays bounded by the visible set, not
+    /// the whole document.
+    fn outer_has_crossings_with_others_scoped(
+        &self,
+        outer_idx: usize,
+        scope: Option<&[usize]>,
+    ) -> bool {
+        let segs = match scope {
+            Some(s) => crate::hatch_trace::tessellate_doc_in_view_cancellable(
+                &self.doc, s, &crate::hatch_trace::never_cancelled()),
+            None => crate::hatch_trace::tessellate_doc(&self.doc),
+        };
         let outer_segs: Vec<usize> = segs.iter().enumerate()
             .filter(|(_, s)| s.src == outer_idx)
             .map(|(i, _)| i)
             .collect();
         if outer_segs.is_empty() { return false; }
+        // The outer's closed polygon for point-in tests. `None` for
+        // dobjects that aren't a single closed loop (the cheap path
+        // doesn't use them anyway).
+        let outer_poly = self.doc.dobjects.get(outer_idx)
+            .map(|d| closed_dobject_polygon(&d.geom))
+            .filter(|v| v.len() >= 3);
+        // Bbox of the outer polygon — a segment can only dip INTO the
+        // outer if it overlaps this box, so distant dobjects skip the
+        // point-in-polygon cost entirely (the pre-existing interior-
+        // crossing test above still runs for every segment).
+        let outer_bbox = outer_poly.as_ref().map(|poly| {
+            let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+            let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for v in poly {
+                if v.x < min.x { min.x = v.x; }
+                if v.y < min.y { min.y = v.y; }
+                if v.x > max.x { max.x = v.x; }
+                if v.y > max.y { max.y = v.y; }
+            }
+            (min, max)
+        });
         for &i in &outer_segs {
             for other in segs.iter() {
                 if other.src == outer_idx { continue; }
@@ -20196,7 +20250,59 @@ impl CadApp {
                         return true;
                     }
                 }
+                // A crossing at an ENDPOINT (a divider drawn snapped to
+                // the outer's boundary) is invisible to the
+                // interior-interior test above, yet it still subdivides
+                // the region — the cheap path would hatch the whole
+                // outer. Detect any other segment that DIPS INTO the
+                // outer: an endpoint or the midpoint strictly inside
+                // means it subdivides.
+                if let (Some(poly), Some((bmin, bmax))) = (&outer_poly, &outer_bbox) {
+                    if other.a.x < bmin.x || other.a.y < bmin.y
+                        || other.a.x > bmax.x || other.a.y > bmax.y
+                    {
+                        continue;
+                    }
+                    if point_in_polygon(other.a, poly.iter().copied())
+                        || point_in_polygon(other.b, poly.iter().copied())
+                    {
+                        return true;
+                    }
+                    let mid = (other.a + other.b) * 0.5;
+                    if point_in_polygon(mid, poly.iter().copied()) {
+                        return true;
+                    }
+                }
             }
+        }
+        false
+    }
+
+    /// True when any visible Text dobject's bbox overlaps the candidate
+    /// outer's bbox. When text touches the region, the cheap path must
+    /// defer to the trace — only the trace carries the glyph contours, so
+    /// letters get punched out as islands instead of being filled over.
+    /// (Bbox-only check: cheap enough for per-hover routing.)
+    /// Scoped variant — `scope` limits which dobjects are checked for text
+    /// overlap (typically `viewport_scope()`), so the per-click pick-path
+    /// test stays bounded by the visible set, not the whole document.
+    fn outer_overlaps_text_scoped(&self, outer_idx: usize, scope: Option<&[usize]>) -> bool {
+        let Some(d) = self.doc.dobjects.get(outer_idx) else { return false };
+        let (omin, omax) = d.geom.bbox();
+        let ids: Box<dyn Iterator<Item = usize>> = match scope {
+            Some(s) => Box::new(s.iter().copied()),
+            None => Box::new(0..self.doc.dobjects.len()),
+        };
+        for i in ids {
+            if i == outer_idx { continue; }
+            let Some(o) = self.doc.dobjects.get(i) else { continue };
+            if !o.style.visible { continue; }
+            let Geom::Text(t) = &o.geom else { continue };
+            if t.text.trim().is_empty() { continue; }
+            let (tmin, tmax) = o.geom.bbox();
+            if tmin.x > omax.x || tmax.x < omin.x
+                || tmin.y > omax.y || tmax.y < omin.y { continue; }
+            return true;
         }
         false
     }
@@ -20532,11 +20638,37 @@ impl CadApp {
         }
         for (idx, kind, h_opt, verts_opt) in decisions {
             if let Some(h) = h_opt {
-                handles.push(h);
-                match verts_opt {
-                    Some(nv) => self.hatch_dbg(format!(
-                        "  accept #{} ({}, closed, {} verts)", idx, kind, nv)),
-                    None => self.hatch_dbg(format!("  accept #{} ({})", idx, kind)),
+                // AutoCAD semantics (owner ruling): the hatch owns a HIDDEN
+                // boundary of its own, and the dobject the user drew stays an
+                // independent object. So do NOT bind to `h` — bake the picked
+                // shape into an invisible auxiliary polyline and bind to that.
+                //
+                // This is what the TRACE path has always done; the cheap /
+                // select-objects path used to reference the user's dobject
+                // directly, which is why a hatched rectangle / polygon / pline
+                // dragged its fill along while a traced circle or ellipse did
+                // not. Same command, two behaviours — now one.
+                match self.materialise_hatch_boundary(idx) {
+                    Some(aux) => {
+                        handles.push(aux);
+                        match verts_opt {
+                            Some(nv) => self.hatch_dbg(format!(
+                                "  accept #{} ({}, closed, {} verts) → baked to independent \
+                                 boundary 0x{:x} (source dobject untouched)", idx, kind, nv, aux)),
+                            None => self.hatch_dbg(format!(
+                                "  accept #{} ({}) → baked to independent boundary 0x{:x} \
+                                 (source dobject untouched)", idx, kind, aux)),
+                        }
+                    }
+                    None => {
+                        // Could not tessellate a usable loop — fall back to the
+                        // old direct reference rather than dropping the boundary.
+                        handles.push(h);
+                        self.hatch_dbg(format!(
+                            "  accept #{} ({}) — ! could not bake an independent boundary, \
+                             referencing the source dobject directly (it will move with the hatch)",
+                            idx, kind));
+                    }
                 }
             } else {
                 skipped += 1;
@@ -20575,6 +20707,36 @@ impl CadApp {
             cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
             cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
         };
+        // Phase 2 — pattern selection. Log which scenario was taken and, for a
+        // named pattern, whether the name actually resolves. An unknown name
+        // silently yields an EMPTY pattern (renders nothing, no error), which
+        // is one of the failures that reads to a user as "hatch is broken".
+        self.hatch_phase(2, "pattern selection");
+        match &pattern {
+            cad_kernel::HatchPattern::Solid =>
+                self.hatch_dbg("    scenario B: SOLID fill (pattern generation bypassed)"
+                               .to_string()),
+            cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } => {
+                let known = cad_kernel::patterns::PATTERN_NAMES.iter()
+                    .any(|p| p.eq_ignore_ascii_case(name));
+                self.hatch_dbg(format!(
+                    "    scenario A: predefined '{}' scale={:.4} angle={:.2}deg",
+                    name, scale, angle_deg));
+                if !known {
+                    self.hatch_dbg(format!(
+                        "    ! UNKNOWN PATTERN '{}' — resolves to an EMPTY definition, \
+                         so the hatch will render NOTHING. Known: {}",
+                        name, cad_kernel::patterns::PATTERN_NAMES.join(", ")));
+                }
+                if *scale <= 0.0 {
+                    self.hatch_dbg(format!(
+                        "    ! scale {:.4} is not positive — spacing collapses, \
+                         expect no visible lines", scale));
+                }
+            }
+        }
+        self.hatch_phase_absent(2, "scenario C user-defined spacing/double, \
+                                    scenario D gradient, scenario E inherit-properties");
         // EDIT-MODE: when the confirm panel's "Change pattern/Scale"
         // button armed this flow, REPLACE the pattern of the last
         // hatch (and its boundary handles, if a new selection was
@@ -20607,10 +20769,14 @@ impl CadApp {
             self.hatch_dbg(format!(
                 "  pushing Hatch dobject: pattern={}, scale={:.3}, angle={:.2}, {} boundary handle(s)",
                 pattern_label, pat_scale, pat_angle, loop_count));
-            self.doc.push(cad_kernel::Hatch {
+            // §5/WP6.1: a fresh HATCH is an interactive draw → stamp current
+            // specs + active layer here (moved out of the now-dumb Document::push).
+            let mut hd: DObject = cad_kernel::Hatch {
                 boundary_handles: handles,
                 pattern,
-            }.into());
+            }.into();
+            self.stamp_fresh_style(&mut hd.style);
+            self.doc.push(hd);
             self.touch_view();
             self.index_dirty = true;
             self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
@@ -20637,11 +20803,94 @@ impl CadApp {
         self.hatch_confirm_open = true;
         self.set_prompt(
             "hatch preview ready — Confirm(c)/Discard(d)/Change(ch)/+Point(p)/+Dobject(D) — type in cmd OR click panel buttons".to_string());
-        // Auto-dump after each apply so the log captures bbox + line-
-        // count diagnostics for the new hatch without making the user
-        // press the button. Only logs when the debug window is open
-        // (no-op otherwise via hatch_dbg).
+        // Phases 4/5/7 — verify what the hatch we just created actually
+        // RESOLVES and GENERATES. Both of these can come back empty while the
+        // command reports success, which is what makes them hard to report.
+        self.hatch_verify_last();
+        // Auto-dump after each apply so the log captures bbox + line-count
+        // diagnostics for every hatch in the document.
         self.dump_hatch_state();
+    }
+
+    /// Post-creation verification of the most recently created hatch
+    /// (workflow phases 4, 5 and 7). Resolves its boundary loops and runs the
+    /// real pattern generator over them, then reports anything that would make
+    /// the fill invisible — the failure modes that otherwise produce a
+    /// successfully-created hatch that simply does not appear:
+    ///   * boundary handles that no longer resolve (deleted / hidden layer)
+    ///   * a loop with fewer than 3 vertices
+    ///   * a pattern whose spacing x scale exceeds the region (zero lines)
+    ///   * a runaway cap hit inside the generator (silently emits nothing)
+    fn hatch_verify_last(&mut self) {
+        let Some(idx) = self.hatch_last_idx else { return };
+        let Some(d) = self.doc.dobjects.get(idx) else { return };
+        let Geom::Hatch(hh) = &d.geom else { return };
+        // Copy what we need out of the document up front — the logging calls
+        // below take `&mut self`.
+        let (h, pattern) = (hh.clone(), hh.pattern.clone());
+        let (handle, layer) = (d.handle, d.style.layer);
+        self.hatch_phase(4, "boundary processing — resolve loops");
+        let declared = h.boundary_handles.len();
+        let loops = cad_kernel::resolve_hatch_loops(&h, &self.doc);
+        self.hatch_dbg(format!(
+            "    {} handle(s) declared -> {} loop(s) resolved", declared, loops.len()));
+        if loops.len() < declared {
+            self.hatch_dbg(format!(
+                "    ! {} boundary handle(s) did NOT resolve (deleted, or on a \
+                 hidden/frozen layer) — those loops contribute nothing",
+                declared - loops.len()));
+        }
+        if loops.is_empty() {
+            self.hatch_dbg("    ! NO loops resolved — this hatch cannot render \
+                            anything at all".to_string());
+            return;
+        }
+        for (i, l) in loops.iter().enumerate() {
+            let role = if i == 0 { "outer" } else { "island(even-odd)" };
+            if l.len() < 3 {
+                self.hatch_dbg(format!(
+                    "    ! loop {} ({}) has {} vertex/vertices (<3) — degenerate, dropped",
+                    i, role, l.len()));
+            }
+        }
+        self.hatch_phase_absent(4, "self-intersection check, coincident-overlap check, \
+                                    loop-orientation (CCW outer / CW island), gap tolerance");
+
+        // Phase 5 — run the real generator and count what comes out.
+        self.hatch_phase(5, "pattern generation + clipping");
+        match &pattern {
+            cad_kernel::HatchPattern::Solid => {
+                self.hatch_dbg("    SOLID — no pattern lines; filled by \
+                                triangulation with even-odd holes".to_string());
+            }
+            cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } => {
+                let (segs, circs) = cad_kernel::patterns::hatch_geometry(
+                    &loops, &cad_kernel::patterns::lookup(name), *scale, *angle_deg);
+                self.hatch_dbg(format!(
+                    "    '{}' scale={:.4} angle={:.2} -> {} clipped segment(s), {} circle(s)",
+                    name, scale, angle_deg, segs.len(), circs.len()));
+                if segs.is_empty() && circs.is_empty() {
+                    // The doc's "Very small areas" / "Pattern too dense" cases.
+                    let (mut mn, mut mx) = (Vec2::new(f64::MAX, f64::MAX),
+                                            Vec2::new(f64::MIN, f64::MIN));
+                    for l in &loops { for v in l {
+                        mn.x = mn.x.min(v.x); mn.y = mn.y.min(v.y);
+                        mx.x = mx.x.max(v.x); mx.y = mx.y.max(v.y);
+                    } }
+                    self.hatch_dbg(format!(
+                        "    ! PATTERN PRODUCED NOTHING — region is {:.4} x {:.4}. \
+                         Either the spacing (x scale {:.4}) is larger than the region, \
+                         the pattern name is unknown, or a generation cap was hit. \
+                         Lower the scale to make lines appear.",
+                        mx.x - mn.x, mx.y - mn.y, scale));
+                }
+            }
+        }
+        self.hatch_phase(7, "hatch object created");
+        self.hatch_dbg(format!(
+            "    dobject #{} handle=0x{:x} layer={} — associativity: BY HANDLE \
+             (boundary geometry is NOT baked into the hatch)",
+            idx, handle, layer));
     }
 
     /// Pick-point hatch: BPOLY-style flow. First tries the cheap
@@ -20665,6 +20914,24 @@ impl CadApp {
     /// Replaces any existing in-flight worker (cancel old + spawn
     /// new). The previous worker's result is silently discarded — its
     /// receiver gets dropped.
+    /// Cancel any in-flight hatch-trace worker and DROP its receiver, so a
+    /// completed-but-undrained trace can't materialize after the cancel —
+    /// the Background-Ops invariant I-3 ("cancel = drop the result"). Setting
+    /// `op_cancel` only makes the worker exit sooner; dropping the receiver
+    /// (`hatch_worker = None`) is what guarantees `poll_hatch_worker` won't
+    /// apply the stale result (it early-returns when `hatch_worker` is None).
+    /// Single-sourced so Esc, a new command, and spawn-replace all cancel
+    /// identically. Returns whether a worker was running.
+    fn cancel_hatch_worker(&mut self) -> bool {
+        if self.hatch_worker.is_some() {
+            self.op_cancel.store(true, Ordering::Relaxed);
+            self.hatch_worker = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn spawn_hatch_worker(&mut self, seed: Vec2) {
         let scope = self.viewport_scope()
             .unwrap_or_else(|| (0..self.doc.dobjects.len()).collect());
@@ -20675,9 +20942,7 @@ impl CadApp {
         // If a worker is already running, cancel it. The old thread
         // will exit at its next cancel-check; its send will fail
         // harmlessly because we drop the receiver here.
-        if self.hatch_worker.is_some() {
-            self.op_cancel.store(true, Ordering::Relaxed);
-            self.hatch_worker = None;
+        if self.cancel_hatch_worker() {
             self.hatch_dbg("  (cancelled previous in-flight hatch worker)");
         }
         // Build the pattern args from the current pick-point session
@@ -20711,51 +20976,93 @@ impl CadApp {
         // `scope_for_thread` is remapped to `[0..scoped_n)` since the
         // dobjects are now at fresh contiguous indices in the snapshot.
         let mut doc_snapshot = cad_kernel::Document::default();
-        doc_snapshot.layers     = self.doc.layers.clone();
-        doc_snapshot.linetypes  = self.doc.linetypes.clone();
-        doc_snapshot.pens       = self.doc.pens.clone();
-        doc_snapshot.truecolors = self.doc.truecolors.clone();
+        doc_snapshot.layers      = self.doc.layers.clone();
+        doc_snapshot.linetypes   = self.doc.linetypes.clone();
+        doc_snapshot.pens        = self.doc.pens.clone();
+        doc_snapshot.truecolors  = self.doc.truecolors.clone();
+        doc_snapshot.text_styles = self.doc.text_styles.clone();
         doc_snapshot.dobjects   = scope.iter()
             .filter_map(|&i| self.doc.dobjects.get(i).cloned())
             .collect();
         let scoped_n = doc_snapshot.dobjects.len();
-        let cancel_for_thread = cancel.clone();
-        let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
         // The worker's scope is now the full range of the snapshot
         // (every dobject in the snapshot WAS in the original scope).
         // No remapping needed downstream — poll_hatch_worker only
         // consumes the trace's vertex loops, not the src indices.
         let scope_for_thread: Vec<usize> = (0..scoped_n).collect();
+        // Text glyph boundaries are rendered HERE (main thread — the
+        // FontManager is not Send) against the snapshot's indices, then
+        // moved into the worker.
+        let text_for_thread = {
+            let mut fm = self.font_manager.borrow_mut();
+            crate::hatch_trace::text_hatch_geom(
+                &doc_snapshot, &mut fm, &scope_for_thread)
+        };
+        let cancel_for_thread = cancel.clone();
+        let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
         thread::spawn(move || {
-            let mut log: Vec<String> = Vec::new();
-            log.push(format!(
-                "  worker started: seed=({:.3},{:.3}), {} dobjects in viewport scope ({} total)",
-                seed.x, seed.y, scope_for_thread.len(), doc_snapshot.dobjects.len()));
-            // Single end-to-end call — tessellates only viewport dobjects,
-            // splits at intersections, traces. Cancellable between phases.
-            let tb = crate::hatch_trace::trace_boundary_at_in_view_cancellable(
-                &doc_snapshot, &scope_for_thread, seed, &cancel_for_thread);
-            if cancel_for_thread.load(Ordering::Relaxed) {
-                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
-                return;
-            }
-            match tb {
-                Some(tb) => {
-                    log.push(format!(
-                        "  worker: traced outer {} verts, {} island(s)",
-                        tb.outer.len(), tb.islands.len()));
-                    let mut loops = Vec::with_capacity(1 + tb.islands.len());
-                    loops.push(tb.outer);
-                    loops.extend(tb.islands);
-                    let _ = tx.send(HatchWorkerResult::Success {
-                        loops, log_lines: log,
-                    });
+            // A3: a worker panic must still send a Failure (not die silently),
+            // so `poll_hatch_worker` can log it instead of leaving the doc
+            // untouched with a "hatching…" prompt stuck on screen.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut log: Vec<String> = Vec::new();
+                log.push(format!(
+                    "  worker started: seed=({:.3},{:.3}), {} dobjects in viewport scope ({} total)",
+                    seed.x, seed.y, scope_for_thread.len(), doc_snapshot.dobjects.len()));
+                // Single end-to-end call — tessellates only viewport dobjects,
+                // splits at intersections, traces. Cancellable between phases.
+                // The `_diag` variant additionally reports a count per stage,
+                // per-stage timings, a typed failure reason, and a gap probe.
+                let (tb, diag) = crate::hatch_trace::trace_boundary_at_in_view_diag(
+                    &doc_snapshot, &scope_for_thread, seed, &cancel_for_thread,
+                    &text_for_thread);
+                // Every stage of boundary detection, in order — this is the
+                // section that used to be a black box.
+                log.extend(diag.lines());
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    return HatchWorkerResult::Cancelled { log_lines: log };
                 }
-                None => {
-                    log.push("  worker: trace produced no boundary".to_string());
+                match tb {
+                    Some(tb) => {
+                        log.push(format!(
+                            "  worker: traced outer {} verts, {} island(s)",
+                            tb.outer.len(), tb.islands.len()));
+                        let mut loops = Vec::with_capacity(1 + tb.islands.len());
+                        loops.push(tb.outer);
+                        loops.extend(tb.islands);
+                        HatchWorkerResult::Success { loops, log_lines: log }
+                    }
+                    None => {
+                        // Typed reason instead of "trace returned None", and the
+                        // gap probe (if any) turns the dead end into an
+                        // instruction the user can act on.
+                        let mut reason = diag.fail.as_ref()
+                            .map(|f| f.describe())
+                            .unwrap_or_else(|| "trace produced no boundary".into());
+                        if let Some(g) = &diag.gap_probe {
+                            reason.push_str(&format!(
+                                " — it WOULD close at tolerance {:e} ({}x default), \
+                                 so look for a gap of about that size",
+                                g.eps, g.factor as i64));
+                        }
+                        log.push(format!("  worker: {}", reason));
+                        HatchWorkerResult::Failure { reason, log_lines: log }
+                    }
+                }
+            }));
+            match result {
+                Ok(r) => { let _ = tx.send(r); }
+                Err(msg) => {
+                    let detail = if let Some(s) = msg.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = msg.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
                     let _ = tx.send(HatchWorkerResult::Failure {
-                        reason: "trace returned None".into(),
-                        log_lines: log,
+                        reason: format!("hatch worker panicked: {}", detail),
+                        log_lines: vec![format!("  worker PANIC: {}", detail)],
                     });
                 }
             }
@@ -20822,30 +21129,7 @@ impl CadApp {
                 if self.hatch_preview_snap.is_none() {
                     self.hatch_preview_snap = Some(self.doc.clone());
                 }
-                let mut handles: Vec<cad_kernel::Handle> = Vec::new();
-                for loop_verts in loops {
-                    let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
-                        .map(|v| cad_kernel::PolyVertex { pos: *v, bulge: 0.0 })
-                        .collect();
-                    if verts.len() >= 2 {
-                        let first = verts[0].pos;
-                        let last  = verts[verts.len() - 1].pos;
-                        if (last - first).len() < crate::hatch_trace::JOIN_EPS {
-                            verts.pop();
-                        }
-                    }
-                    if verts.len() < 3 { continue; }
-                    let pl = cad_kernel::Polyline { vertices: verts, closed: true, widths: Vec::new() };
-                    let mut d = cad_kernel::DObject::from(pl);
-                    d.style = cad_kernel::Style::on_layer(worker.active_layer);
-                    // Synthetic auxiliary boundary — exists only so the
-                    // hatch has something to reference by handle. Don't
-                    // render it; the user never asked for this line on
-                    // the drawing.
-                    d.style.visible = false;
-                    let idx = self.doc.push(d);
-                    handles.push(self.doc.dobjects[idx].handle);
-                }
+                let handles = self.hatch_bake_loops(loops, worker.active_layer);
                 if handles.is_empty() {
                     self.hatch_dbg("  worker result had no usable polylines");
                     self.clear_prompt();
@@ -20856,31 +21140,12 @@ impl CadApp {
                     cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
                 };
                 let n_loops = handles.len();
-                let mut d = cad_kernel::DObject::from(cad_kernel::Hatch {
-                    boundary_handles: handles,
-                    pattern: worker.pattern.clone(),
-                });
-                d.style = cad_kernel::Style::on_layer(worker.active_layer);
-                self.doc.push(d);
-                self.touch_view();
-                self.index_dirty = true;
-                self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
-                self.history.push(format!(
-                    "  + hatch ({}): traced boundary, {} loop(s) materialised (async)",
-                    pattern_label, n_loops));
-                self.dump_hatch_state();
-                // PAUSE any active pick-point session and open the confirm
-                // panel — otherwise consecutive clicks would stack hatches
-                // before the user gets to confirm or discard the first one.
-                // The panel's "+ Pick Point" button re-arms the session.
-                if self.hatch_pick_point_armed {
-                    self.hatch_pick_point_armed = false;
-                    self.hatch_dbg(
-                        "  pick-point session paused — confirm panel open".to_string());
-                }
-                self.hatch_confirm_open = true;
-                self.set_prompt(
-                    "hatch preview ready — Confirm(c)/Discard(d)/Change(ch)/+Point(p)/+Dobject(D) — type in cmd OR click panel buttons".to_string());
+                self.commit_baked_hatch(
+                    handles,
+                    worker.pattern.clone(),
+                    worker.active_layer,
+                    format!("  + hatch ({}): traced boundary, {} loop(s) materialised (async)",
+                        pattern_label, n_loops));
             }
             HatchWorkerResult::Failure { reason, log_lines } => {
                 for line in log_lines { self.hatch_dbg(line); }
@@ -20888,6 +21153,12 @@ impl CadApp {
                 // Fall back to cheap path with auto-islands — same
                 // logic apply_pick_point_hatch's sync fallback uses.
                 let seed = worker.seed;
+                // Viewport-scoped (mirror apply_pick_point_hatch): only
+                // in-view text can contain the in-view click, so the TEXT
+                // PATH fallback below never renders off-screen glyphs.
+                let _ = self.ensure_index();
+                let fallback_scope: Vec<usize> = self.viewport_scope()
+                    .unwrap_or_else(|| (0..self.doc.dobjects.len()).collect());
                 if let Some(idx) = self.find_smallest_containing_closed(seed) {
                     let kind = self.doc.dobjects.get(idx)
                         .map(|d| dobject_kind_name(&d.geom))
@@ -20903,11 +21174,59 @@ impl CadApp {
                     self.selection = std::iter::once(idx).chain(islands).collect();
                     self.apply_hatch();
                     self.selection.clear();
+                } else if let Some(loops) = self.text_hatch_loops_at(seed, &fallback_scope) {
+                    // Text fallback: a glyph loop containing the click —
+                    // the letter itself is the boundary (outer + counters).
+                    self.hatch_dbg(format!(
+                        "  fallback → TEXT PATH {} glyph loop(s)", loops.len()));
+                    // Preview snapshot (see the Success arm's twin) — taken
+                    // BEFORE any bake so Discard reverts the aux polylines +
+                    // hatch and Confirm promotes the pre-hatch state onto the
+                    // undo stack. Without it, Discard is a no-op and the
+                    // hatch can never be undone.
+                    if self.hatch_preview_snap.is_none() {
+                        self.hatch_preview_snap = Some(self.doc.clone());
+                    }
+                    // Same pattern restore as the cheap fallback above —
+                    // the session's pattern (if armed) wins over whatever
+                    // the pending hatch pattern holds.
+                    if let Some(sess) = self.hatch_pick_point_session.clone() {
+                        self.pending_hatch_pattern = sess;
+                    }
+                    let (pat_name, pat_scale, pat_angle) =
+                        std::mem::replace(&mut self.pending_hatch_pattern, (None, 1.0, 0.0));
+                    let pattern = match pat_name {
+                        None       => cad_kernel::HatchPattern::Solid,
+                        Some(name) => cad_kernel::HatchPattern::Pattern {
+                            name:      name.to_ascii_uppercase(),
+                            scale:     pat_scale,
+                            angle_deg: pat_angle,
+                        },
+                    };
+                    let pattern_label = match &pattern {
+                        cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
+                        cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
+                    };
+                    let layer = self.doc.layers.active;
+                    let handles = self.hatch_bake_loops(loops, layer);
+                    if handles.is_empty() {
+                        self.hatch_dbg("  text fallback had no usable glyph loops");
+                        self.history.push(
+                            "  ! hatch pick-point: no closed boundary contains the click".into());
+                    } else {
+                        let n_loops = handles.len();
+                        self.commit_baked_hatch(
+                            handles, pattern, layer,
+                            format!("  + hatch ({}): TEXT PATH, {} glyph loop(s) materialised",
+                                pattern_label, n_loops));
+                    }
                 } else {
                     self.history.push(
                         "  ! hatch pick-point: no closed boundary contains the click".into());
                 }
-                // Restore prompt if session armed
+                // Restore prompt if session armed. If a fallback just
+                // committed (cheap/text path), the commit already paused the
+                // session and set the confirm-panel prompt — don't clear it.
                 if self.hatch_pick_point_armed {
                     let style = self.hatch_pick_point_session.as_ref()
                         .and_then(|(n, _, _)| n.clone())
@@ -20915,7 +21234,7 @@ impl CadApp {
                     self.set_prompt(format!(
                         "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
                         style));
-                } else {
+                } else if !self.hatch_confirm_open {
                     self.clear_prompt();
                 }
             }
@@ -20926,6 +21245,107 @@ impl CadApp {
                 self.clear_prompt();
             }
         }
+    }
+
+    /// Bake the closed shape at `src_idx` into an INVISIBLE auxiliary polyline
+    /// owned by the hatch, and return its handle.
+    ///
+    /// This is what keeps a hatch independent of the geometry the user drew:
+    /// the hatch references this copy, so moving / erasing / editing the
+    /// original leaves the fill alone (AutoCAD non-associative behaviour, and
+    /// the owner's ruling — "hatch will have hidden boundary of itself and
+    /// original boundary will remain as independent dobject").
+    ///
+    /// The copy is flagged `hatch_aux` so `resolve_hatch_loops` still resolves
+    /// it even though `visible` is false (a user-hidden boundary is skipped;
+    /// a synthetic one is not). Returns `None` when the shape does not
+    /// tessellate to a usable closed loop, so the caller can fall back.
+    fn materialise_hatch_boundary(&mut self, src_idx: usize) -> Option<cad_kernel::Handle> {
+        let src = self.doc.dobjects.get(src_idx)?;
+        let layer = src.style.layer;
+        // Single-loop case of `hatch_bake_loops` — the dedup / ≥3-vert /
+        // invisible + hatch_aux flag rules live in exactly one place.
+        // (`closed_dobject_polygon` may repeat the first vertex; the bake
+        // drops the closing duplicate.)
+        self.hatch_bake_loops(vec![closed_dobject_polygon(&src.geom)], layer)
+            .into_iter().next()
+    }
+
+    /// Bake traced/glyph vertex loops into SYNTHETIC boundary polylines on
+    /// `layer` and return their handles. Each loop becomes one invisible
+    /// (`visible` false) but still resolved (`hatch_aux`) closed polyline —
+    /// never rendered, existing only so the hatch has something to reference
+    /// by handle. Loops with fewer than 3 usable vertices are dropped.
+    /// Returns handles in order; empty when nothing was usable.
+    fn hatch_bake_loops(
+        &mut self,
+        loops: Vec<Vec<Vec2>>,
+        layer: cad_kernel::LayerId,
+    ) -> Vec<cad_kernel::Handle> {
+        let mut handles: Vec<cad_kernel::Handle> = Vec::new();
+        for loop_verts in loops {
+            let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
+                .map(|v| cad_kernel::PolyVertex { pos: *v, bulge: 0.0 })
+                .collect();
+            if verts.len() >= 2 {
+                let first = verts[0].pos;
+                let last  = verts[verts.len() - 1].pos;
+                if (last - first).len() < crate::hatch_trace::JOIN_EPS {
+                    verts.pop();
+                }
+            }
+            if verts.len() < 3 { continue; }
+            let pl = cad_kernel::Polyline { vertices: verts, closed: true, widths: Vec::new() };
+            let mut d = cad_kernel::DObject::from(pl);
+            d.style = cad_kernel::Style::on_layer(layer);
+            // Synthetic auxiliary boundary — exists only so the
+            // hatch has something to reference by handle. Don't
+            // render it; the user never asked for this line on
+            // the drawing. `hatch_aux` tells the hatch-loop
+            // resolver this is a synthetic boundary (still
+            // resolves) rather than a user-hidden one (skipped).
+            d.style.visible = false;
+            d.style.hatch_aux = true;
+            let idx = self.doc.push(d);
+            handles.push(self.doc.dobjects[idx].handle);
+        }
+        handles
+    }
+
+    /// Push a Hatch dobject bound to already-baked boundary handles, mark
+    /// the scene dirty, and open the confirm panel (pausing any active
+    /// pick-point session so consecutive clicks don't stack hatches before
+    /// the user confirms or discards the first one).
+    fn commit_baked_hatch(
+        &mut self,
+        handles: Vec<cad_kernel::Handle>,
+        pattern: cad_kernel::HatchPattern,
+        layer: cad_kernel::LayerId,
+        history_msg: String,
+    ) {
+        let mut d = cad_kernel::DObject::from(cad_kernel::Hatch {
+            boundary_handles: handles,
+            pattern,
+        });
+        d.style = cad_kernel::Style::on_layer(layer);
+        self.doc.push(d);
+        self.touch_view();
+        self.index_dirty = true;
+        self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
+        self.history.push(history_msg);
+        self.dump_hatch_state();
+        // PAUSE any active pick-point session and open the confirm
+        // panel — otherwise consecutive clicks would stack hatches
+        // before the user gets to confirm or discard the first one.
+        // The panel's "+ Pick Point" button re-arms the session.
+        if self.hatch_pick_point_armed {
+            self.hatch_pick_point_armed = false;
+            self.hatch_dbg(
+                "  pick-point session paused — confirm panel open".to_string());
+        }
+        self.hatch_confirm_open = true;
+        self.set_prompt(
+            "hatch preview ready — Confirm(c)/Discard(d)/Change(ch)/+Point(p)/+Dobject(D) — type in cmd OR click panel buttons".to_string());
     }
 
     fn apply_pick_point_hatch(&mut self, seed: Vec2) -> bool {
@@ -21001,6 +21421,15 @@ impl CadApp {
             })
             .map(|(i, d)| {
                 let kind = dobject_kind_name(&d.geom);
+                // Mirror the scan's own guard so the log explains the skip
+                // rather than silently omitting a dobject the reader can see
+                // listed in the snapshot above.
+                if !self.doc.is_visible(i) {
+                    return format!(
+                        "    #{:02} {} — skip (not visible: hidden{}, or off/frozen layer)",
+                        i, kind,
+                        if d.style.hatch_aux { " — synthetic hatch boundary" } else { "" });
+                }
                 match &d.geom {
                     Geom::Polyline(p) => {
                         if !polyline_is_effectively_closed(p) {
@@ -21071,6 +21500,9 @@ impl CadApp {
         //    other dobject → trace path (the planar subdivision has
         //    sub-faces inside the outer; the cheap path would
         //    incorrectly hatch the whole outer).
+        //  * Exactly 1 candidate BUT text overlaps it → trace path: the
+        //    letters must be punched out as islands, and only the trace
+        //    carries their glyph contours.
         //  * 2+ candidates contain the seed → trace path.
         let multiple = cheap_candidates.len() > 1;
         let single_outer_crossed = !multiple
@@ -21081,7 +21513,18 @@ impl CadApp {
                 "  --- single outer #{} has crossings with other dobjects → deferring to trace path ---",
                 cheap_candidates[0].0));
         }
-        if !multiple && !single_outer_crossed {
+        // Viewport-scoped like every sibling scan here — text outside the
+        // viewport can't overlap an in-view outer, so a full-doc sweep per
+        // click is pure waste (no early exit on text-less drawings either).
+        let single_outer_overlaps_text = !multiple && !single_outer_crossed
+            && cheap_candidates.len() == 1
+            && self.outer_overlaps_text_scoped(cheap_candidates[0].0, Some(&view_scope));
+        if single_outer_overlaps_text {
+            self.hatch_dbg(format!(
+                "  --- single outer #{} overlaps text → deferring to trace path (letters are shapes) ---",
+                cheap_candidates[0].0));
+        }
+        if !multiple && !single_outer_crossed && !single_outer_overlaps_text {
             if let Some(idx) = self.find_smallest_containing_closed_scoped(seed, Some(&view_scope)) {
                 let kind = self.doc.dobjects.get(idx)
                     .map(|d| dobject_kind_name(&d.geom))
@@ -21170,6 +21613,153 @@ impl CadApp {
                 cause: format!("click_select(i={}, shift={}, alt={}, fresh={})",
                     i, shift, alt, fresh),
             });
+        // Phase-10 (post-creation) instrumentation: record every selection that
+        // touches a hatch or a hatch's boundary. Without this the log covered
+        // hatch CREATION only, and the most-reported problems — "it selected 2
+        // things", "the boundary moved with the fill" — happened afterwards,
+        // invisible to the log.
+        self.hatch_dbg_selection("click_select", i);
+    }
+
+    /// The dobjects whose grips are live for the current selection:
+    /// the basket + `selected`, minus locked-layer objects, PLUS the
+    /// invisible auxiliary boundary of any selected hatch.
+    ///
+    /// `Geom::Hatch` has no geometry of its own, so `grip_points()` on it is
+    /// empty and a hatch was the one dobject you could select but not
+    /// grip-edit. Since a hatch owns an invisible auxiliary boundary,
+    /// substituting that boundary's index here gives the fill real,
+    /// draggable vertex grips for free: the same target set feeds grip
+    /// drawing, hover highlight, and grab-on-click, so one change covers
+    /// all three.
+    ///
+    /// The user's own drawn shape is never pulled in — only `hatch_aux`
+    /// boundaries, which exist solely to serve their hatch.
+    fn editable_grip_targets(&self) -> Vec<usize> {
+        let mut t: Vec<usize> = self.selection.clone();
+        if let Some(s) = self.selected { t.push(s); }
+        let hatch_boundaries: Vec<usize> = t.iter()
+            .filter_map(|&i| match self.doc.dobjects.get(i).map(|d| &d.geom) {
+                Some(Geom::Hatch(h)) => Some(h.boundary_handles.clone()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|bh| self.doc.dobjects.iter().position(|d| d.handle == bh))
+            .filter(|&bi| self.doc.dobjects.get(bi)
+                .map(|d| d.style.hatch_aux).unwrap_or(false))
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        // Drop locked-layer objects.
+        t.retain(|i| self.doc.is_selectable(*i));
+        // Append the aux boundaries AFTER that filter. `is_selectable` rejects
+        // anything invisible, and these are invisible by design — but that
+        // check exists to stop a hidden dobject being CLICKED, which is still
+        // true here: the user selected the hatch, and we are only borrowing its
+        // boundary's grips. The locked-layer half of the rule must still apply,
+        // so test that directly.
+        for bi in hatch_boundaries {
+            if self.doc.layers.selectable(
+                self.doc.dobjects.get(bi).map(|d| d.style.layer).unwrap_or(0))
+                && !t.contains(&bi)
+            {
+                t.push(bi);
+            }
+        }
+        t
+    }
+
+    /// Log a command that is about to run against a basket containing a hatch
+    /// or a hatch's boundary, naming which is which. Silent otherwise, so the
+    /// log stays about hatch.
+    fn hatch_dbg_command_on_selection(&mut self, canon: &str, raw: &str) {
+        if self.selection.is_empty() { return; }
+        let sel = self.selection.clone();
+        let mut hatches = Vec::new();
+        let mut boundaries = Vec::new();
+        for &i in &sel {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            if matches!(d.geom, Geom::Hatch(_)) { hatches.push(i); continue; }
+            let h = d.handle;
+            if self.doc.dobjects.iter().any(|x| matches!(&x.geom,
+                Geom::Hatch(hh) if hh.boundary_handles.contains(&h)))
+            {
+                boundaries.push(i);
+            }
+        }
+        if hatches.is_empty() && boundaries.is_empty() { return; }
+        self.hatch_dbg(format!(
+            "--- [10] command '{}' (typed '{}') on a basket of {} — hatches {:?}, \
+             hatch-boundaries {:?}; doc has {} dobject(s) before",
+            canon, raw, sel.len(), hatches, boundaries, self.doc.dobjects.len()));
+        if !boundaries.is_empty() {
+            self.hatch_dbg(format!(
+                "      NOTE: {:?} are boundaries a hatch references — an edit here \
+                 changes that fill too (this is the bonded case)", boundaries));
+        }
+    }
+
+    /// Log a selection event when it involves a hatch or something a hatch
+    /// references. `focus` is the dobject the user just clicked.
+    ///
+    /// Reports the relationship, which is the thing that is hard to see on
+    /// canvas: whether the clicked dobject IS a hatch, or is a boundary some
+    /// hatch points at, and which other basket members are tied to it.
+    fn hatch_dbg_selection(&mut self, cause: &str, focus: usize) {        // Cheap pre-check: only log when a hatch is involved at all.
+        let any_hatch = self.doc.dobjects.iter()
+            .any(|d| matches!(d.geom, Geom::Hatch(_)));
+        if !any_hatch { return; }
+        let sel = self.selection.clone();
+        let focus_handle = self.doc.dobjects.get(focus).map(|d| d.handle);
+        // Which hatches reference the clicked dobject?
+        let owners: Vec<usize> = match focus_handle {
+            Some(h) => self.doc.dobjects.iter().enumerate().filter(|(_, d)| {
+                matches!(&d.geom, Geom::Hatch(hh) if hh.boundary_handles.contains(&h))
+            }).map(|(i, _)| i).collect(),
+            None => Vec::new(),
+        };
+        let focus_kind = self.doc.dobjects.get(focus)
+            .map(|d| dobject_kind_name(&d.geom)).unwrap_or("?");
+        let is_hatch = matches!(self.doc.dobjects.get(focus).map(|d| &d.geom),
+                                Some(Geom::Hatch(_)));
+        let mut line = format!(
+            "--- [10] selection ({}) — clicked #{} ({}); basket now {:?}",
+            cause, focus, focus_kind, sel);
+        if is_hatch {
+            if let Some(Geom::Hatch(h)) = self.doc.dobjects.get(focus).map(|d| &d.geom) {
+                let n = h.boundary_handles.len();
+                line.push_str(&format!("; it is a HATCH over {} boundary handle(s)", n));
+            }
+        }
+        if !owners.is_empty() {
+            line.push_str(&format!(
+                "; this dobject IS a boundary of hatch {:?} — editing it edits that fill",
+                owners));
+        }
+        self.hatch_dbg(line);
+        // Spell out every hatch/boundary pair inside the basket, so a
+        // "2 dobjects selected but they move together" report is explained by
+        // the log rather than needing a screenshot.
+        for &i in &sel {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            if let Geom::Hatch(h) = &d.geom {
+                let bound: Vec<String> = h.boundary_handles.iter().map(|bh| {
+                    match self.doc.dobjects.iter().position(|x| x.handle == *bh) {
+                        Some(bi) => {
+                            let also = if sel.contains(&bi) { " ALSO-IN-BASKET" } else { "" };
+                            let vis = self.doc.dobjects.get(bi)
+                                .map(|b| if b.style.hatch_aux { "aux" }
+                                         else if b.style.visible { "user" } else { "hidden" })
+                                .unwrap_or("?");
+                            format!("#{}({}){}", bi, vis, also)
+                        }
+                        None => format!("0x{:x}(missing)", bh),
+                    }
+                }).collect();
+                self.hatch_dbg(format!(
+                    "      hatch #{} → boundaries [{}]", i, bound.join(", ")));
+            }
+        }
     }
 
     /// Translate every dobject in `self.selection` by `v`. Used by the
@@ -21182,13 +21772,14 @@ impl CadApp {
     fn apply_move(&mut self, v: Vec2) {
         if v.len() < EPS { return; }
         self.snapshot_doc();
-        for &i in &self.selection {
+        let targets = self.transform_targets_with_hatch_boundaries();
+        for &i in &targets {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 *d = d.translated(v);
             }
         }
         // Only the moved dobjects changed — re-bucket THOSE, not the whole drawing.
-        let moved = self.selection.clone();
+        let moved = targets.clone();
         self.index_absorb(&moved);
         // Save for `before`, then clear the live highlight.
         if !self.selection.is_empty() {
@@ -21198,6 +21789,37 @@ impl CadApp {
         self.intersections.clear();
         self.index_dirty = true;
         self.touch_view();
+    }
+
+    /// A hatch has no geometry of its own — it IS its boundary — so
+    /// `Geom::Hatch::{translated,rotated,scaled,mirrored}` are kernel no-ops and
+    /// the fill only follows if the boundary transforms. When the selection
+    /// contains a hatch, widen the transform target set to ALSO cover the
+    /// dobjects its boundary handles reference (matching AutoCAD: a hatch moves
+    /// with its boundary). They remain separate dobjects; this only widens WHICH
+    /// dobjects the transform touches. Used by every IN-PLACE transform:
+    /// `apply_move`, `apply_rotate`, `apply_scale`, and `apply_mirror`'s
+    /// `keep_original == false` branch. The COPY branches deliberately do NOT use
+    /// it — a hatch copied alone still references the ORIGINAL boundary
+    /// (duplicate_dobjects only remaps handles inside the duplicated set).
+    fn transform_targets_with_hatch_boundaries(&self) -> Vec<usize> {
+        let mut targets: Vec<usize> = self.selection.clone();
+        let mut seen: std::collections::HashSet<usize> =
+            self.selection.iter().copied().collect();
+        for &i in &self.selection {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            let Geom::Hatch(h) = &d.geom else { continue };
+            for handle in &h.boundary_handles {
+                // Dangling handles (boundary deleted) are skipped — the hatch
+                // shrinks rather than crashing.
+                if let Some(idx) = self.doc.index_of_handle(*handle) {
+                    if seen.insert(idx) {
+                        targets.push(idx);
+                    }
+                }
+            }
+        }
+        targets
     }
 
     /// Add every dobject index to the selection. Used by the `all` sub-command.
@@ -22219,12 +22841,15 @@ impl CadApp {
         // Snapshot available font names. v1 has exactly one ("standard");
         // when the LFF parser lands every loaded .lff joins this list
         // and the combo picks up new entries with no UI changes.
-        // Font choices the renderer can actually render today. When the
-        // LFF / SHX font loader lands these get appended automatically.
-        let font_choices: Vec<&'static str> = vec!["standard", "monospace"];
+        // Font choices: the two egui built-ins (CPU fallback) + every installed
+        // system font from the TTF engine.
+        let mut font_choices: Vec<String> =
+            vec!["standard".to_string(), "monospace".to_string()];
+        font_choices.extend(self.font_manager.borrow_mut().names().iter().cloned());
         egui::Window::new(if dialog.editing_id.is_some() {
                 "Edit Text Style"
             } else { "New Text Style" })
+            .order(egui::Order::Foreground)
             .id(egui::Id::new("text_style_dialog"))
             .open(&mut open)
             .resizable(false)
@@ -22248,12 +22873,46 @@ impl CadApp {
                             .selected_text(&dialog.font_name)
                             .width(220.0)
                             .show_ui(ui, |ui| {
-                                for f in &font_choices {
-                                    ui.selectable_value(
-                                        &mut dialog.font_name,
-                                        (*f).to_string(),
-                                        *f);
+                                // First-letter type-ahead: a typed letter jumps
+                                // the selection to the next matching font.
+                                let mut ch: Option<char> = None;
+                                ui.input_mut(|i| {
+                                    i.events.retain(|e| match e {
+                                        egui::Event::Text(t) => {
+                                            if let Some(c) = t.chars().next_back() {
+                                                ch = Some(c);
+                                            }
+                                            false
+                                        }
+                                        _ => true,
+                                    });
+                                });
+                                if let (Some(c), false) =
+                                    (ch, font_choices.is_empty())
+                                {
+                                    let lc = c.to_ascii_lowercase();
+                                    let n = font_choices.len();
+                                    let cur = font_choices.iter()
+                                        .position(|f| f == &dialog.font_name)
+                                        .unwrap_or(0);
+                                    for k in 1..=n {
+                                        let idx = (cur + k) % n;
+                                        if font_choices[idx].to_lowercase()
+                                            .starts_with(lc) {
+                                            dialog.font_name = font_choices[idx].clone();
+                                            break;
+                                        }
+                                    }
                                 }
+                                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                                    for f in &font_choices {
+                                        let r = ui.selectable_value(
+                                            &mut dialog.font_name, f.clone(), f);
+                                        if *f == dialog.font_name {
+                                            r.scroll_to_me(Some(egui::Align::Center));
+                                        }
+                                    }
+                                });
                             });
                         ui.end_row();
 
@@ -23492,7 +24151,7 @@ impl CadApp {
         let mut do_set_current = false;
         // Real installed fonts (from the cad_text engine) offered alongside the
         // two egui built-ins. Fetched once, before the UI closures capture `ui`.
-        let sys_fonts = self.font_manager.borrow().names();
+        let sys_fonts = self.font_manager.borrow_mut().names().to_vec();
         // Font-picker keyboard state pulled into locals (nested egui closures
         // can't also borrow `self`). Written back after the layout closure.
         let font_popup_id = egui::Id::new("text_font_popup");
@@ -23601,9 +24260,40 @@ impl CadApp {
                         pf_live = choices.get(pf_highlight).cloned();
                     });
                 ui.add_space(8.0);
-                // Variant — STUB (Bold/Italic land with the font loader).
-                pp_dropdown_box(ui, lw, "Regular", false)
-                    .on_hover_text("Bold / Italic variants — coming with the font loader");
+                // Variant — Regular / Bold / Italic / Bold Italic, writing the
+                // same style fields as the Row-4 Bold/Italic toggles.
+                let cur_var = match (cur.bold, cur.oblique.abs() > 1e-6) {
+                    (true, true) => "Bold Italic",
+                    (true, false) => "Bold",
+                    (false, true) => "Italic",
+                    (false, false) => "Regular",
+                };
+                let mut set_variant: Option<(bool, f64)> = None;
+                let vr = pp_dropdown_box(ui, lw, cur_var, true);
+                let vid = egui::Id::new("text_variant_popup");
+                if vr.clicked() { ui.memory_mut(|m| m.toggle_popup(vid)); }
+                egui::popup_below_widget(ui, vid, &vr,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(lw.max(120.0));
+                        for (label, b, o) in [
+                            ("Regular", false, 0.0),
+                            ("Bold", true, 0.0),
+                            ("Italic", false, ITALIC_RAD),
+                            ("Bold Italic", true, ITALIC_RAD),
+                        ] {
+                            let active = (cur.bold == b)
+                                && ((cur.oblique.abs() > 1e-6) == (o > 1e-6));
+                            if ui.selectable_label(active, label).clicked() {
+                                set_variant = Some((b, o));
+                            }
+                        }
+                    });
+                if let Some((b, o)) = set_variant {
+                    if let Some(s) = self.doc.text_styles.styles.get_mut(sid as usize) {
+                        s.bold = b;
+                        s.oblique = o;
+                    }
+                }
             });
             ui.add_space(gap);
             // Right column — preview on TOP, then the New / Set-current buttons
@@ -23789,8 +24479,6 @@ impl CadApp {
         let (cur_bold, cur_italic, cur_outline, mut cur_owidth) = self.doc.text_styles.get(sid)
             .map(|s| (s.bold, s.oblique.abs() > 1e-6, s.outline_only, s.outline_width))
             .unwrap_or((false, false, false, 0.0));
-        // Standard synthetic-italic shear when the Italic toggle is on (~12°).
-        const ITALIC_RAD: f64 = 0.209_439_5;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
             ui.vertical(|ui| {
@@ -23919,6 +24607,64 @@ impl CadApp {
                 s.underline = !cur_underline;
             }
         }
+    }
+
+    /// Font a text STYLE resolves to (a style may name a font the engine
+    /// doesn't know; resolution falls back to "standard").
+    fn resolve_style_font(&self, style: u32) -> String {
+        self.doc.text_styles.get(style)
+            .map(|s| s.font_name.clone())
+            .unwrap_or_else(|| "standard".to_string())
+    }
+
+    /// Font a Text entity resolves to: its explicit `font_name`, else its
+    /// style's font. Delegates to the kernel's single source of truth so
+    /// the renderer, TXTEXP, hatch tracing, and the Properties panel can
+    /// never drift apart.
+    fn resolve_text_font(&self, t: &cad_kernel::Text) -> String {
+        t.resolved_font_name(&self.doc.text_styles)
+    }
+
+    /// Glyph boundary geometry for every visible Text dobject in `scope` —
+    /// letters participate in hatch boundary tracing as shapes. One `src`
+    /// per entity keeps intra-word letter overlaps un-split, so connected
+    /// Persian/Arabic glyphs trace as whole letters.
+    fn text_hatch_geom(&self, scope: &[usize]) -> crate::hatch_trace::TextTraceGeom {
+        let mut fm = self.font_manager.borrow_mut();
+        crate::hatch_trace::text_hatch_geom(&self.doc, &mut fm, scope)
+    }
+
+    /// The glyph loops under `seed`: the smallest letter whose OUTER loop
+    /// contains the seed, returned as `[outer, holes…]`. Used when the
+    /// cheap path can't find a closed dobject but text does contain the
+    /// click (and as the worker-failure text fallback). `scope` limits
+    /// which Text dobjects are rendered — pass the viewport scope (text
+    /// outside it provably can't contain the in-view seed).
+    fn text_hatch_loops_at(&self, seed: Vec2, scope: &[usize]) -> Option<Vec<Vec<Vec2>>> {
+        let geom = self.text_hatch_geom(scope);
+        let area = |pts: &[Vec2]| -> f64 {
+            let n = pts.len();
+            if n < 3 { return f64::INFINITY; }
+            let mut a = 0.0;
+            for i in 0..n {
+                let p = pts[i];
+                let q = pts[(i + 1) % n];
+                a += p.x * q.y - q.x * p.y;
+            }
+            (a * 0.5).abs()
+        };
+        let mut best: Option<(f64, Vec<Vec<Vec2>>)> = None;
+        for (outer, holes) in &geom.glyphs {
+            if outer.len() < 3 || !point_in_polygon(seed, outer.iter().copied()) { continue; }
+            let a = area(outer);
+            if best.as_ref().map_or(true, |(ba, _)| a < *ba) {
+                let mut loops = Vec::with_capacity(1 + holes.len());
+                loops.push(outer.clone());
+                loops.extend(holes.iter().cloned());
+                best = Some((a, loops));
+            }
+        }
+        best.map(|(_, l)| l)
     }
 
     /// Shaped pen ADVANCE (world units) of `text` in the given font/height —
@@ -24873,11 +25619,12 @@ impl CadApp {
             HatchPattern::Pattern { name, .. } => name.clone(),
         };
         let loop_count = handles.len();
-        let hd: DObject = cad_kernel::Hatch {
+        let mut hd: DObject = cad_kernel::Hatch {
             boundary_handles: handles,
             pattern,
         }
         .into();
+        self.stamp_fresh_style(&mut hd.style);
         self.doc.push(hd);
         self.gpu_dirty = true;
         self.index_dirty = true;
@@ -27473,6 +28220,7 @@ impl CadApp {
     fn render_hatch_debug_window(&mut self, ctx: &egui::Context) {
         let mut open = self.hatch_debug_open;
         let mut do_dump_state = false;
+        let mut do_save_report = false;
         let win = egui::Window::new("Hatch Debug Log")
             .open(&mut open)
             .default_width(720.0)
@@ -27494,6 +28242,14 @@ impl CadApp {
                         .clicked()
                     {
                         do_dump_state = true;
+                    }
+                    if ui.button("💾 Save Report")
+                        .on_hover_text("Write the whole log plus a document snapshot \
+                                        to hatch_report.txt next to the app — the file \
+                                        to send when reporting a hatch problem.")
+                        .clicked()
+                    {
+                        do_save_report = true;
                     }
                     ui.label(format!("{} entries", self.hatch_debug_log.len()));
                     // Live status — what's the hatch flow doing right now?
@@ -27542,6 +28298,48 @@ impl CadApp {
         self.hatch_debug_open = open;
         if do_dump_state {
             self.dump_hatch_state();
+        }
+        if do_save_report {
+            self.save_hatch_report();
+        }
+    }
+
+    /// Write a self-contained hatch bug report to `hatch_report.txt` in the
+    /// working directory: environment, current hatch state, a fresh dump of
+    /// every Hatch dobject, then the full log. This is the single file to
+    /// attach when reporting a hatch problem — it carries the decision points
+    /// (phases 1-10), not just the end result.
+    fn save_hatch_report(&mut self) {
+        use std::fmt::Write as _;
+        // Refresh the per-hatch snapshot so the report always ends with
+        // current state rather than whatever was last dumped.
+        self.dump_hatch_state();
+        let mut s = String::new();
+        let _ = writeln!(s, "=== RUST-AutoRASM — HATCH DIAGNOSTIC REPORT ===");
+        let _ = writeln!(s, "dobjects        : {}", self.doc.dobjects.len());
+        let _ = writeln!(s, "layers          : {} (active '{}')",
+            self.doc.layers.len(),
+            self.doc.layers.get(self.doc.layers.active)
+                .map(|l| l.name.clone()).unwrap_or_else(|| "?".into()));
+        let _ = writeln!(s, "units           : {}", self.doc.units.name);
+        let _ = writeln!(s, "view scale      : {:.4} px/unit", self.scale);
+        let _ = writeln!(s, "selection       : {}", self.selection.len());
+        let _ = writeln!(s, "dialog open     : {}   pick-point armed: {}",
+            self.hatch_dialog_open, self.hatch_pick_point_armed);
+        let _ = writeln!(s, "pattern pending : {:?}", self.pending_hatch_pattern);
+        let _ = writeln!(s, "JOIN_EPS        : {:e}   (endpoint join / de-facto gap tolerance)",
+            crate::hatch_trace::JOIN_EPS);
+        let _ = writeln!(s, "\n--- LOG ({} entries) ---", self.hatch_debug_log.len());
+        for l in &self.hatch_debug_log { let _ = writeln!(s, "{}", l); }
+        let path = std::path::PathBuf::from("hatch_report.txt");
+        match std::fs::write(&path, s) {
+            Ok(()) => {
+                let where_ = std::fs::canonicalize(&path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| path.display().to_string());
+                self.history.push(format!("  ✔ hatch report written → {}", where_));
+            }
+            Err(e) => self.history.push(format!("  ! hatch report failed: {}", e)),
         }
     }
 
@@ -30306,6 +31104,86 @@ impl CadApp {
                     if let Some(id) = pick {
                         self.props_apply(targets, true, |d| {
                             if let Geom::Text(t) = &mut d.geom { t.style = id; } });
+                    }
+                    ui.end_row();
+
+                    // Font — per-entity override ("" = inherit the style's
+                    // font, shown as `(inherit) <style font>`). Picking a font
+                    // writes an EXPLICIT name; undo restores the previous one.
+                    ui.label("Font");
+                    let fonts: Vec<String> = targets.iter()
+                        .filter_map(|&i| self.doc.dobjects.get(i))
+                        .map(|d| if let Geom::Text(t) = &d.geom { t.font_name.clone() } else { String::new() })
+                        .collect();
+                    let shared_font: Option<String> = fonts.first()
+                        .filter(|f0| fonts.iter().all(|f| f == *f0))
+                        .cloned();
+                    // Style-resolved font for the `(inherit)` display — the
+                    // SAME resolver the renderer/TXTEXP use.
+                    let style_font: Option<String> = {
+                        let styles: Vec<u32> = targets.iter()
+                            .filter_map(|&i| self.doc.dobjects.get(i))
+                            .filter_map(|d| if let Geom::Text(t) = &d.geom { Some(t.style) } else { None })
+                            .collect();
+                        let mut it = styles.iter().map(|&sid| self.resolve_style_font(sid));
+                        match it.next() {
+                            Some(first) if it.all(|f| f == first) => Some(first),
+                            _ => None,
+                        }
+                    };
+                    let cur_font = match &shared_font {
+                        Some(f) if !f.is_empty() => f.clone(),
+                        Some(_) => format!("(inherit) {}", style_font.as_deref().unwrap_or("standard")),
+                        None => "*VARIES*".into(),
+                    };
+                    let mut pick_font: Option<String> = None;
+                    // System fonts cloned into a local BEFORE the ComboBox
+                    // closure (the RefCell borrow must not outlive it); the
+                    // name list itself is cached in the engine (no per-frame
+                    // sort).
+                    let mut font_choices: Vec<String> =
+                        vec!["standard".into(), "monospace".into()];
+                    {
+                        let mut fm = self.font_manager.borrow_mut();
+                        font_choices.extend_from_slice(fm.names());
+                    }
+                    egui::ComboBox::from_id_salt("props_textfont").selected_text(cur_font)
+                        .show_ui(ui, |ui| {
+                            for f in &font_choices {
+                                let selected = shared_font.as_deref() == Some(f.as_str());
+                                if ui.selectable_label(selected, f).clicked() {
+                                    pick_font = Some(f.clone());
+                                }
+                            }
+                        });
+                    if let Some(f) = pick_font {
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.font_name = f.clone(); } });
+                    }
+                    ui.end_row();
+
+                    ui.label("Bold");
+                    let shared_bold = self.props_shared_geom(targets, |g| {
+                        if let Geom::Text(t) = g { Some(t.bold as i64) } else { None } });
+                    let mut bold = shared_bold.map(|x| x != 0).unwrap_or(false);
+                    let resp = ui.checkbox(&mut bold, "");
+                    if resp.changed() {
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.bold = bold; } });
+                    }
+                    ui.end_row();
+
+                    ui.label("Italic");
+                    let shared_it = self.props_shared_geom(targets, |g| {
+                        if let Geom::Text(t) = g {
+                            Some((t.oblique.abs() > 1e-6) as i64)
+                        } else { None } });
+                    let mut ital = shared_it.map(|x| x != 0).unwrap_or(false);
+                    let resp = ui.checkbox(&mut ital, "");
+                    if resp.changed() {
+                        let shear = if ital { ITALIC_RAD } else { 0.0 };
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.oblique = shear; } });
                     }
                     ui.end_row();
 
@@ -40435,6 +41313,53 @@ impl CadApp {
                         skipped += 1;   // degenerate wall (start ≈ end)
                     }
                 }
+                // TXTEXP — text explodes into CLOSED glyph-outline polylines
+                // (one per contour; holes as separate closed loops). Hatch
+                // island resolution treats the loops even-odd, so a letter
+                // counter keeps working as a hatch island.
+                Geom::Text(t) => {
+                    let font = self.resolve_text_font(t);
+                    let req = cad_text::TextRequest {
+                        text: &t.text,
+                        font_name: &font,
+                        position: t.position,
+                        height: t.height,
+                        angle: t.angle,
+                        h_align: t.h_align,
+                        v_align: t.v_align,
+                        fill_mode: cad_text::FillMode::Fill,
+                        slant: t.oblique,
+                        x_scale: t.width_factor,
+                    };
+                    let glyphs = self.font_manager.borrow_mut().render_explode(&req);
+                    let mk_poly = |pts: &Vec<Vec2>| -> Geom {
+                        Geom::Polyline(cad_kernel::Polyline {
+                            vertices: pts.iter()
+                                .map(|p| cad_kernel::PolyVertex { pos: *p, bulge: 0.0 })
+                                .collect(),
+                            closed: true,
+                            widths: Vec::new(),
+                        })
+                    };
+                    let mut n_polys = 0usize;
+                    for (outer, holes) in &glyphs.glyph_polygons {
+                        if outer.len() >= 3 {
+                            to_add.push(DObject::with_style(mk_poly(outer), dstyle));
+                            n_polys += 1;
+                        }
+                        for h in holes {
+                            if h.len() >= 3 {
+                                to_add.push(DObject::with_style(mk_poly(h), dstyle));
+                                n_polys += 1;
+                            }
+                        }
+                    }
+                    if n_polys == 0 {
+                        skipped += 1; // empty / unshapeable text
+                    } else {
+                        to_remove.push(i);
+                    }
+                }
                 _ => skipped += 1,   // not explodable (line/circle/arc/…)
             }
         }
@@ -40881,12 +41806,16 @@ impl CadApp {
         ));
     }
 
-    /// Append a Hatch Debug Log entry. Cheap no-op when the window is
-    /// closed so wide instrumentation doesn't waste memory in normal
-    /// use. Per-frame counter prefix mirrors trim_dbg so cross-log
-    /// timing matches.
+    /// Append a Hatch Debug Log entry.
+    ///
+    /// ALWAYS RECORDS (HATCH_DEBUG §11). This used to early-return unless the
+    /// debug window happened to be open, which meant the ~60 log sites in the
+    /// hatch pipeline produced nothing in the one situation they exist for:
+    /// a user hits a bug, THEN opens the log — and finds it empty, because
+    /// recording only started at that moment. The window is now purely a
+    /// viewer over a buffer that has been filling all along. The 1000-line cap
+    /// keeps the cost bounded (it is a plain `Vec<String>`, drained in blocks).
     fn hatch_dbg<S: Into<String>>(&mut self, msg: S) {
-        if !self.hatch_debug_open { return; }
         const CAP: usize = 1000;
         if self.hatch_debug_log.len() >= CAP {
             self.hatch_debug_log.drain(..200);
@@ -40894,6 +41823,21 @@ impl CadApp {
         self.hatch_debug_log.push(format!(
             "[{:>5}] {}", self.trim_debug_frame, msg.into()
         ));
+    }
+
+    /// Stamp a phase banner into the hatch log. `n` is the phase number from
+    /// the AutoCAD HATCH workflow (1 Init, 2 Pattern, 3 Boundary detection,
+    /// 4 Boundary processing, 5 Pattern generation, 6 Preview, 7 Object
+    /// creation, 8 Edge cases, 9 Errors, 10 Post-creation) so a log read
+    /// top-to-bottom maps onto that reference workflow.
+    fn hatch_phase(&mut self, n: u8, title: &str) {
+        self.hatch_dbg(format!("--- [{}] {} ---", n, title));
+    }
+
+    /// Record that a workflow phase AutoCAD performs has no counterpart here,
+    /// so a log reader can tell "we skipped this" apart from "this failed".
+    fn hatch_phase_absent(&mut self, n: u8, what: &str) {
+        self.hatch_dbg(format!("    [{}] not implemented: {}", n, what));
     }
 
     /// Auto-open the Hatch Debug window at the start of a fresh `hatch`
@@ -40905,6 +41849,26 @@ impl CadApp {
         self.hatch_dbg(format!(
             "=== HATCH session START ===  doc.dobjects.len() = {}, selection.len() = {}",
             self.doc.dobjects.len(), self.selection.len()));
+
+        // Phase 1 — command initialisation. AutoCAD captures the current
+        // drafting settings here; record the same set so a report says which
+        // layer/colour/units the hatch was created under.
+        self.hatch_phase(1, "command init — drafting settings captured");
+        let layer_name = self.doc.layers.get(self.doc.layers.active)
+            .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
+        let (vis, frozen, locked) = self.doc.layers.get(self.doc.layers.active)
+            .map(|l| (l.visible, l.frozen, l.locked)).unwrap_or((true, false, false));
+        self.hatch_dbg(format!(
+            "    layer='{}' (visible={}, frozen={}, locked={}), color={:?}, units='{}'",
+            layer_name, vis, frozen, locked,
+            self.doc.current_color, self.doc.units.name));
+        let n_pat = cad_kernel::patterns::PATTERN_NAMES.len();
+        self.hatch_dbg(format!(
+            "    pattern catalog: {} built-in name(s), hardcoded (no .pat file loaded)",
+            n_pat));
+        self.hatch_phase_absent(1, "external .pat loading (acad.pat / acadiso.pat) \
+                                    — cad_io::pat parser exists but is not wired");
+        self.hatch_phase_absent(1, "UCS / elevation (2D app — world coordinates only)");
     }
 
     /// Wipe + open the debug log at the start of a fresh trim/extend
@@ -41994,16 +42958,20 @@ impl CadApp {
         let g2 = db.geom.clone();
         let style1 = da.style;
         self.snapshot_doc();
-        let trim = self.env.TrmMd;
+        let trim = self.env.TrmMd || (d1_dist < cad_kernel::EPS && d2_dist < cad_kernel::EPS);
         match cad_kernel::chamfer_geoms(&g1, pick1, &g2, pick2, d1_dist, d2_dist) {
             Ok(out) => {
                 if trim {
                     if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
                     if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
                 }
-                let mut bridge = DObject::new(out.bridge);
-                bridge.style = style1;
-                self.doc.push(bridge);
+                // Skip a None bridge — a d1=d2=0 chamfer is a clean sharp corner
+                // (g1_new/g2_new already trimmed), so there's no segment to add.
+                if let Some(bridge_geom) = out.bridge {
+                    let mut bridge = DObject::new(bridge_geom);
+                    bridge.style = style1;
+                    self.doc.push(bridge);
+                }
                 self.history.push(format!(
                     "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{} ({})",
                     d1_dist, d2_dist, idx1, idx2, if trim { "trim" } else { "no-trim" }));
@@ -42105,16 +43073,20 @@ impl CadApp {
         };
         let style1 = da.style;
         self.snapshot_doc();
-        let trim = self.env.TrmMd;
+        let trim = self.env.TrmMd || (d1_dist < cad_kernel::EPS && d2_dist < cad_kernel::EPS);
         match cad_kernel::chamfer_lines(&l1, pick1, &l2, pick2, d1_dist, d2_dist) {
             Ok(out) => {
                 if trim {
                     if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
                     if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
                 }
-                let mut bridge = DObject::new(out.bridge);
-                bridge.style = style1;
-                self.doc.push(bridge);
+                // Skip a None bridge — a d1=d2=0 chamfer is a clean sharp corner
+                // (g1_new/g2_new already trimmed), so there's no segment to add.
+                if let Some(bridge_geom) = out.bridge {
+                    let mut bridge = DObject::new(bridge_geom);
+                    bridge.style = style1;
+                    self.doc.push(bridge);
+                }
                 self.history.push(format!(
                     "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{} ({})",
                     d1_dist, d2_dist, idx1, idx2,
@@ -42187,6 +43159,342 @@ impl CadApp {
         self.touch_view();
     }
 
+    /// UCS — dispatch `ucs origin X,Y [rot]` / `save NAME` / `NAME` /
+    /// `delete NAME` / `rename OLD NEW` / `world` / bare (list). The
+    /// current UCS lives on the Document (persisted in RSM v27+).
+    fn apply_ucs(&mut self, args: &[String]) {
+        use cad_kernel::ucs::Ucs;
+        if args.is_empty() {
+            let cur = self.ucs_name();
+            let names: Vec<String> = self.doc.ucs_list.iter().map(|u| u.name.clone()).collect();
+            if names.is_empty() {
+                self.history.push(format!(
+                    "  ucs: current = {cur}  [origin X,Y, save NAME, NAME, world]"));
+            } else {
+                self.history.push(format!(
+                    "  ucs: current = {cur}  list: {}", names.join(", ")));
+            }
+            return;
+        }
+        let first = args[0].to_ascii_lowercase();
+        match first.as_str() {
+            "world" | "w" => {
+                self.doc.current_ucs = 0;
+                self.history.push("  ucs: current = World".into());
+            }
+            "save" | "s" => {
+                let Some(name) = args.get(1) else {
+                    self.history.push("  ! ucs: save needs a name".into());
+                    return;
+                };
+                let Some(u) = self.current_ucs().cloned() else {
+                    self.history.push(
+                        "  ! ucs: nothing to save — define an origin first (`ucs origin X,Y`)".into());
+                    return;
+                };
+                if self.doc.ucs_list.iter().any(|x| x.name.eq_ignore_ascii_case(name)) {
+                    self.history.push(format!(
+                        "  ! ucs: '{name}' already exists (delete it first)"));
+                    return;
+                }
+                let mut nu = u.clone();
+                nu.name = name.clone();
+                self.doc.ucs_list.push(nu);
+                self.doc.current_ucs = self.doc.ucs_list.len();   // new entry is current
+                self.history.push(format!(
+                    "  ucs: saved '{name}' and made it current"));
+            }
+            "delete" | "del" | "d" => {
+                let Some(name) = args.get(1) else {
+                    self.history.push("  ! ucs: delete needs a name".into());
+                    return;
+                };
+                let Some(idx) = self.doc.ucs_list.iter().position(|x| x.name.eq_ignore_ascii_case(name)) else {
+                    self.history.push(format!("  ! ucs: no system named '{name}'"));
+                    return;
+                };
+                self.doc.ucs_list.remove(idx);
+                if self.doc.current_ucs == idx + 1 {
+                    self.doc.current_ucs = 0;
+                } else if self.doc.current_ucs > idx + 1 {
+                    self.doc.current_ucs -= 1;
+                }
+                self.history.push(format!("  ucs: deleted '{name}'"));
+            }
+            "rename" | "r" => {
+                let (Some(from), Some(to)) = (args.get(1), args.get(2)) else {
+                    self.history.push("  ! ucs: rename needs OLD and NEW names".into());
+                    return;
+                };
+                let Some(idx) = self.doc.ucs_list.iter().position(|x| x.name.eq_ignore_ascii_case(from)) else {
+                    self.history.push(format!("  ! ucs: no system named '{from}'"));
+                    return;
+                };
+                if self.doc.ucs_list.iter().any(|x| x.name.eq_ignore_ascii_case(to)) {
+                    self.history.push(format!("  ! ucs: '{to}' already exists"));
+                    return;
+                }
+                self.doc.ucs_list[idx].name = to.clone();
+                self.history.push(format!("  ucs: renamed '{from}' → '{to}'"));
+            }
+            "origin" | "o" => {
+                let Some(xy) = args.get(1) else {
+                    self.history.push(
+                        "  ! ucs: origin needs X,Y  [e.g. `ucs origin 10,20 45`]".into());
+                    return;
+                };
+                let Some(p) = parse_xy(&self.calc, xy) else {
+                    self.history.push(format!(
+                        "  ! ucs: bad origin '{xy}' — use X,Y"));
+                    return;
+                };
+                let rot = args.get(2)
+                    .and_then(|t| t.trim().parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    .to_radians();
+                // Set the (unnamed) CURRENT system; `save` names it.
+                self.doc.ucs_list.push(Ucs {
+                    name: "Unnamed".into(),
+                    origin: p,
+                    rotation: rot,
+                });
+                self.doc.current_ucs = self.doc.ucs_list.len();
+                self.history.push(format!(
+                    "  ucs: origin=({:.3},{:.3}) rotation={:.2}° (unnamed — `ucs save NAME`)",
+                    p.x, p.y, rot.to_degrees()));
+            }
+            _ => {
+                // A bare name = make that system current.
+                let Some(idx) = self.doc.ucs_list.iter()
+                    .position(|x| x.name.eq_ignore_ascii_case(&args[0])) else {
+                    self.history.push(format!(
+                        "  ! ucs: no system named '{}'  [origin X,Y, save NAME, world]",
+                        args[0]));
+                    return;
+                };
+                self.doc.current_ucs = idx + 1;
+                self.history.push(format!(
+                    "  ucs: current = {}", self.doc.ucs_list[idx].name));
+            }
+        }
+    }
+
+    /// The current UCS (World when `current_ucs == 0`).
+    fn current_ucs(&self) -> Option<&cad_kernel::ucs::Ucs> {
+        if self.doc.current_ucs == 0 { return None; }
+        self.doc.ucs_list.get(self.doc.current_ucs - 1)
+    }
+
+    /// Convert a typed UCS-space point to world space (no-op in World).
+    fn ucs_to_world(&self, p: Vec2) -> Vec2 {
+        match self.current_ucs() {
+            Some(u) => u.to_world(p),
+            None => p,
+        }
+    }
+
+    /// Convert a world point to the current UCS (for display/readout).
+    fn world_to_ucs(&self, p: Vec2) -> Vec2 {
+        match self.current_ucs() {
+            Some(u) => u.to_ucs(p),
+            None => p,
+        }
+    }
+
+    /// Name of the current UCS ("World" when none is active).
+    fn ucs_name(&self) -> String {
+        self.current_ucs().map(|u| u.name.clone()).unwrap_or_else(|| "World".into())
+    }
+
+    /// LAYERSTATE — save / restore / delete / rename named layer states
+    /// (kernel `laystate` module). Bare name = restore; `?` lists.
+    fn apply_layerstate(&mut self, args: &[String]) {
+        use cad_kernel::laystate as ls;
+        if args.is_empty() {
+            let names = ls::names(&self.doc);
+            if names.is_empty() {
+                self.history.push(
+                    "  layerstate: no saved states  [save NAME to create one]".into());
+            } else {
+                self.history.push(format!(
+                    "  layerstate: {}", names.join(", ")));
+            }
+            return;
+        }
+        let first = args[0].to_ascii_lowercase();
+        match first.as_str() {
+            "save" | "s" => {
+                let Some(name) = args.get(1) else {
+                    self.history.push(
+                        "  ! layerstate: save needs a name, e.g. `layerstate save Plan`".into());
+                    return;
+                };
+                match ls::save(&mut self.doc, name) {
+                    Ok(()) => {
+                        self.index_dirty = true;
+                        self.history.push(format!(
+                            "  layerstate: saved '{name}' ({} layers)",
+                            self.doc.layers.layers.len()));
+                    }
+                    Err(e) => self.history.push(format!("  ! layerstate: {}", e)),
+                }
+            }
+            "delete" | "del" | "d" => {
+                let Some(name) = args.get(1) else {
+                    self.history.push("  ! layerstate: delete needs a name".into());
+                    return;
+                };
+                if ls::delete(&mut self.doc, name) {
+                    self.history.push(format!("  layerstate: deleted '{name}'"));
+                } else {
+                    self.history.push(format!(
+                        "  ! layerstate: no state named '{name}'"));
+                }
+            }
+            "rename" | "r" => {
+                let (Some(from), Some(to)) = (args.get(1), args.get(2)) else {
+                    self.history.push(
+                        "  ! layerstate: rename needs OLD and NEW names".into());
+                    return;
+                };
+                if ls::rename(&mut self.doc, from, to) {
+                    self.history.push(format!(
+                        "  layerstate: renamed '{from}' → '{to}'"));
+                } else {
+                    self.history.push(format!(
+                        "  ! layerstate: cannot rename '{from}' → '{to}'"));
+                }
+            }
+            "?" | "list" | "ls" => {
+                let names = ls::names(&self.doc);
+                if names.is_empty() {
+                    self.history.push("  ! layerstate: no saved states".into());
+                } else {
+                    self.history.push(format!(
+                        "  layerstate: {}", names.join(", ")));
+                }
+            }
+            _ => {
+                // Bare name = restore.
+                self.snapshot_doc();
+                if ls::restore(&mut self.doc, &args[0]) {
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    self.history.push(format!(
+                        "  layerstate: restored '{}'", args[0]));
+                } else {
+                    self.rollback_doc();
+                    self.history.push(format!(
+                        "  ! layerstate: no state named '{}'  [save NAME to create one]",
+                        args[0]));
+                }
+            }
+        }
+    }
+
+    /// PURGE — remove every unreferenced named item (layers, linetypes,
+    /// text/dim/wall styles, blocks). One undo entry; nothing to purge
+    /// fails visibly.
+    fn commit_purge(&mut self) {
+        self.snapshot_doc();
+        let report = cad_kernel::purge::purge(&mut self.doc);
+        if report.is_empty() {
+            self.rollback_doc();
+            self.history.push("  ! purge: nothing to purge".into());
+            return;
+        }
+        // Clamp current-style ids (removals may have shifted them).
+        let n_ts = self.doc.text_styles.styles.len() as u32;
+        let n_ds = self.doc.dim_styles.styles.len() as u32;
+        let n_ws = self.doc.wall_styles.styles.len() as u32;
+        if self.text_input_dialog_style_id >= n_ts {
+            self.text_input_dialog_style_id = cad_kernel::TextStyleTable::STANDARD;
+        }
+        if self.current_dim_style >= n_ds { self.current_dim_style = 0; }
+        if self.current_wall_style >= n_ws { self.current_wall_style = 0; }
+        for (label, v) in [
+            ("layer", &report.layers),
+            ("linetype", &report.linetypes),
+            ("text style", &report.text_styles),
+            ("dim style", &report.dim_styles),
+            ("wall style", &report.wall_styles),
+            ("block", &report.blocks),
+        ] {
+            if !v.is_empty() {
+                self.history.push(format!(
+                    "  ✓ purge: removed {} {}: {}", v.len(), label, v.join(", ")));
+            }
+        }
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.touch_view();
+    }
+
+    /// OVERKILL — dedupe `subset` (None = the whole drawing). One undo
+    /// entry; reports removed count; nothing to do fails visibly.
+    fn commit_overkill(&mut self, subset: Option<Vec<usize>>) {
+        let tol = 1e-6;   // drawing units — exact-coincidence hunt
+        let n_before = self.doc.dobjects.len();
+        self.snapshot_doc();
+        match subset {
+            None => {
+                let removed = cad_kernel::dedupe::dedupe(&mut self.doc.dobjects, tol);
+                let n = removed.len();
+                self.selection.clear();
+                self.selected = None;
+                if n == 0 {
+                    self.rollback_doc();
+                    self.history.push("  ! overkill: no duplicates found".into());
+                    return;
+                }
+                self.history.push(format!(
+                    "  ✓ overkill: removed {n} duplicate(s) from {n_before} dobject(s)"));
+            }
+            Some(indices) => {
+                // Dedupe only within the selected set (indices stay valid
+                // because removal happens at the end, highest first).
+                let mut sorted: Vec<usize> = indices.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                let mut drop: Vec<usize> = Vec::new();
+                for (k, &i) in sorted.iter().enumerate() {
+                    for &j in &sorted[k + 1..] {
+                        let same = match (
+                            self.doc.dobjects.get(i).map(|d| d.geom.clone()),
+                            self.doc.dobjects.get(j).map(|d| d.geom.clone()),
+                        ) {
+                            (Some(a), Some(b)) =>
+                                cad_kernel::dedupe::geoms_equal(&a, &b, tol),
+                            _ => false,
+                        };
+                        if same { drop.push(j); }
+                    }
+                }
+                drop.sort_unstable();
+                drop.dedup();
+                let n = drop.len();
+                if n == 0 {
+                    self.rollback_doc();
+                    self.history.push(
+                        "  ! overkill: no duplicates found in selection".into());
+                    return;
+                }
+                for &idx in drop.iter().rev() {
+                    if idx < self.doc.dobjects.len() {
+                        self.doc.dobjects.remove(idx);
+                    }
+                }
+                self.selection.clear();
+                self.selected = None;
+                self.history.push(format!(
+                    "  ✓ overkill: removed {n} duplicate(s) from selection"));
+            }
+        }
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.touch_view();
+    }
+
     fn apply_chlayer(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! chlayer: empty basket".into());
@@ -42235,8 +43543,12 @@ impl CadApp {
     fn apply_rotate(&mut self, pivot: Vec2, angle: f64) {
         if angle.abs() < EPS { return; }
         self.snapshot_doc();
-        let n = self.selection.len();
-        for &i in &self.selection {
+        // A selected hatch also rotates its boundary dobjects — a hatch has no
+        // geometry of its own, so `Geom::Hatch::rotated` is a kernel no-op and
+        // the fill only follows if the boundary does.
+        let targets = self.transform_targets_with_hatch_boundaries();
+        let n = targets.len();
+        for &i in &targets {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 d.geom = d.geom.rotated(pivot, angle);
             }
@@ -42282,8 +43594,10 @@ impl CadApp {
     fn apply_scale(&mut self, pivot: Vec2, factor: f64) {
         if (factor - 1.0).abs() < EPS || factor.abs() < EPS { return; }
         self.snapshot_doc();
-        let n = self.selection.len();
-        for &i in &self.selection {
+        // A selected hatch also scales its boundary dobjects (see apply_rotate).
+        let targets = self.transform_targets_with_hatch_boundaries();
+        let n = targets.len();
+        for &i in &targets {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 d.geom = d.geom.scaled(pivot, factor);
             }
@@ -42331,7 +43645,9 @@ impl CadApp {
     fn apply_mirror(&mut self, a: Vec2, b: Vec2, keep_original: bool) {
         if a.dist(b) < EPS { return; }
         self.snapshot_doc();
-        let n = self.selection.len();
+        // Counts differ per branch: copies come from the selection alone,
+        // the in-place flip touches the hatch-widened set.
+        let n;
         if keep_original {
             let copies: Vec<DObject> = self.selection.iter()
                 .filter_map(|&i| self.doc.dobjects.get(i))
@@ -42341,11 +43657,17 @@ impl CadApp {
                     new
                 })
                 .collect();
+            n = copies.len();
             for c in copies { self.doc.push(c); }
             self.selection_prev = self.selection.clone();
             self.selection.clear();
         } else {
-            for &i in &self.selection {
+            // Like the other in-place transforms, carry a selected hatch's
+            // boundary with it. The keep_original COPY branch deliberately does
+            // not (a hatch copied alone still references the original boundary).
+            let targets = self.transform_targets_with_hatch_boundaries();
+            n = targets.len();
+            for &i in &targets {
                 if let Some(d) = self.doc.dobjects.get_mut(i) {
                     d.geom = d.geom.mirrored(a, b);
                 }
@@ -42504,10 +43826,39 @@ impl CadApp {
     }
 
     #[track_caller]
+    /// §5 / WP6.1 (DOKKANDAR_MERGE_SPEC §4): apply the current Specs-rail defaults
+    /// (color / linetype / lineweight) + the active layer to a BRAND-NEW dobject's
+    /// style. This moved OUT of `Document::push` (which mis-stamped default-styled
+    /// COPIES) into the app layer, where "fresh interactive draw" intent is known.
+    /// Called ONLY from the fresh-draw commits: `add_dobject` + the hatch commit.
+    /// Copies / paste / array / mirror / load push straight through the now-dumb
+    /// `Document::push` and are never stamped. Only a still-fully-default style is
+    /// stamped (never clobbers an explicitly-styled object).
+    fn stamp_fresh_style(&self, style: &mut cad_kernel::Style) {
+        let fresh_default = style.layer == cad_kernel::LayerTable::LAYER_ZERO
+            && style.color == cad_kernel::Color::ByLayer
+            && style.linetype == cad_kernel::LinetypeTable::CONTINUOUS
+            && style.linetype_scale == 1.0
+            && style.lineweight == cad_kernel::Lineweight::ByLayer
+            && style.visible;
+        if fresh_default {
+            style.color      = self.doc.current_color;
+            style.linetype   = self.doc.current_linetype;
+            style.lineweight = self.doc.current_lineweight;
+        }
+        if style.layer == cad_kernel::LayerTable::LAYER_ZERO
+            && self.doc.layers.active != cad_kernel::LayerTable::LAYER_ZERO
+        {
+            style.layer = self.doc.layers.active;
+        }
+    }
+
     fn add_dobject(&mut self, geom: Geom, origin: &str) {
         let d = describe(&geom);
         let kind = dobject_kind_name(&geom).to_string();
-        let i = self.doc.push(DObject::new(geom));
+        let mut dobj = DObject::new(geom);
+        self.stamp_fresh_style(&mut dobj.style);   // §5/WP6.1 fresh-draw stamp
+        let i = self.doc.push(dobj);
         let handle = self.doc.dobjects[i].handle;
         crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::DocPush {
             index:     i,
@@ -42753,6 +44104,12 @@ impl CadApp {
         let (cells_total, idx_entries, cell_size) = g.stats();
         self.index = Some(g);
         self.index_dirty = false;
+        // B24: the hatch-fill cache is a function of boundary-dobject GEOMETRY,
+        // which is exactly what dirties the spatial index. Invalidate it here —
+        // in lockstep with the index rebuild — so it clears on geometry change
+        // but NOT on a pure selection/highlight/camera change (which sets
+        // `gpu_dirty` only). See the `hatch_cache` field comment.
+        self.hatch_cache.clear();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let avg = if !self.doc.dobjects.is_empty() {
             idx_entries as f64 / self.doc.dobjects.len() as f64
@@ -44222,6 +45579,46 @@ fn polar_angle_picker(ui: &mut egui::Ui, angle_deg: &mut f64, size: f32) -> egui
     response
 }
 
+/// Containment depth of every loop in `loops`: how many OTHER loops contain
+/// that loop's first vertex (bbox-pre-filtered — only loops whose bbox
+/// encloses the probe run the point-in-polygon test). Single source of
+/// truth for SOLID hatch even-odd: even depth → fill, odd depth → hole.
+/// Valid hatch boundaries don't cross, so one probe vertex per loop is
+/// enough (a loop cannot straddle another loop's boundary). Degenerate
+/// (empty) loops report depth 0.
+fn loop_depths(loops: &[Vec<Vec2>]) -> Vec<usize> {
+    let bboxes: Vec<(Vec2, Vec2)> = loops.iter().map(|l| {
+        let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for v in l {
+            mn = Vec2::new(mn.x.min(v.x), mn.y.min(v.y));
+            mx = Vec2::new(mx.x.max(v.x), mx.y.max(v.y));
+        }
+        (mn, mx)
+    }).collect();
+    (0..loops.len()).map(|li| {
+        let Some(probe) = loops[li].first().copied() else { return 0; };
+        loops.iter().enumerate().filter(|&(j, l)| {
+            if j == li || l.len() < 3 { return false; }
+            let (mn, mx) = bboxes[j];
+            if probe.x < mn.x || probe.x > mx.x || probe.y < mn.y || probe.y > mx.y {
+                return false;
+            }
+            point_in_polygon(probe, l.iter().copied())
+        }).count()
+    }).collect()
+}
+
+/// Even-odd classification for SOLID hatch fills: loop `i` is a FILL iff an
+/// EVEN number of OTHER loops contain it (a sample vertex of `i` is inside
+/// them). Outer loop → 0 containers → fill; first island → 1 → hole;
+/// island-in-hole → 2 → fill. Two DISJOINT regions are both fills — the
+/// old index-parity rule (`i % 2`) wrongly made every second disjoint
+/// region a hole, drawn in background colour and effectively invisible.
+fn solid_loop_is_fill(loops: &[Vec<Vec2>], i: usize) -> bool {
+    loop_depths(loops).get(i).map_or(false, |d| d % 2 == 0)
+}
+
 fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
     let vs: Vec<Vec2> = verts.into_iter().collect();
     let n = vs.len();
@@ -44992,6 +46389,31 @@ fn tessellate_ellipse_loop(e: &Ellipse, n: usize) -> Vec<Vec2> {
 /// segment) or if the line is parallel to the segment. Used by the
 /// hatch-pattern renderer to clip each parallel line against each
 /// boundary edge.
+/// Collapse near-identical t-values in a SORTED hit list. A pattern line
+/// passing exactly through a boundary VERTEX is reported once per adjacent
+/// edge — two hits at the same t — which corrupts even-odd pairing (the
+/// duplicate pair consumes itself and the segment vanishes). Dedupe with a
+/// relative epsilon so tiny hatches still merge correctly.
+///
+/// Kept as a unit-tested helper: the RENDER paths now delegate to the kernel
+/// `hatch_line_intervals` (which dedupes per-loop internally), but this
+/// documents the original fix and its regression lock.
+#[cfg_attr(not(test), allow(dead_code))]
+fn dedupe_hits(hits: &mut Vec<f64>) {
+    if hits.len() < 2 { return; }
+    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let scale = hits.last().unwrap().abs().max(1.0);
+    let eps = 1e-9 * scale;
+    let mut w = 1;
+    for i in 1..hits.len() {
+        if (hits[i] - hits[w - 1]).abs() > eps {
+            hits[w] = hits[i];
+            w += 1;
+        }
+    }
+    hits.truncate(w);
+}
+
 fn line_segment_intersect_t(o: Vec2, u: Vec2, a: Vec2, b: Vec2) -> Option<f64> {
     let d = b - a;
     // Parametric line: o + t*u; segment: a + s*d. Solve for (t, s).
@@ -47980,6 +49402,12 @@ impl eframe::App for CadApp {
             // reset at op start). When async/threading lands, this
             // is the signal the worker thread reads to bail out.
             self.op_cancel.store(true, Ordering::Relaxed);
+            // A1: DROP the hatch-trace worker's receiver too, so a
+            // completed-but-undrained Success can't materialize after Esc
+            // (Background-Ops I-3). The op_cancel above only speeds the
+            // worker's exit; dropping the receiver is what makes the cancel
+            // correct.
+            self.cancel_hatch_worker();
             self.hatch_pick_point_armed = false;
             self.hatch_pick_point_session = None;
             self.pending_hatch_pattern = (None, 1.0, 0.0);
@@ -50968,9 +52396,7 @@ impl eframe::App for CadApp {
                         // grip that looks lit-up actually grabs on click.
                         // GrpHvR is in screen pixels; convert to world.
                         let tol = self.env.GrpHvR as f64 / self.scale as f64;
-                        let mut targets: Vec<usize> = self.selection.clone();
-                        if let Some(s) = self.selected { targets.push(s); }
-                        targets.sort_unstable(); targets.dedup();
+                        let targets = self.editable_grip_targets();
                         'outer: for &idx in &targets {
                             let Some(d) = self.doc.dobjects.get(idx) else { continue; };
                             for (gp, role) in d.geom.grip_points() {
@@ -50980,6 +52406,24 @@ impl eframe::App for CadApp {
                                         role,
                                         grip_origin: gp,
                                     });
+                                    // Phase-10: a grip drag on a hatch's aux
+                                    // boundary reshapes that FILL — say so, or
+                                    // the log shows an edit to an invisible
+                                    // polyline with no stated connection.
+                                    if self.doc.dobjects.get(idx)
+                                        .map(|d| d.style.hatch_aux).unwrap_or(false)
+                                    {
+                                        let h = self.doc.dobjects[idx].handle;
+                                        let owners: Vec<usize> = self.doc.dobjects.iter()
+                                            .enumerate()
+                                            .filter(|(_, d)| matches!(&d.geom,
+                                                Geom::Hatch(hh) if hh.boundary_handles.contains(&h)))
+                                            .map(|(i, _)| i).collect();
+                                        self.hatch_dbg(format!(
+                                            "--- [10] grip drag on hatch boundary #{} ({:?}) at \
+                                             ({:.3},{:.3}) — reshapes hatch {:?}",
+                                            idx, role, gp.x, gp.y, owners));
+                                    }
                                     // Don't treat this click as a "select-
                                     // toggle click" — it's a grab.
                                     grip_drag_consumed_click = true;
@@ -52206,13 +53650,14 @@ impl eframe::App for CadApp {
             // Hatch generation (pattern scanline-clip, solid ear-clip) is the
             // expensive part; without caching it re-ran for EVERY hatch EVERY
             // frame → dense/many hatches froze the app. Now it runs once per
-            // doc change (cache cleared when gpu_dirty), with a PER-FRAME
+            // GEOMETRY change (cache cleared in `ensure_index`, which dirties
+            // only on geometry — a pure selection/highlight/camera change must
+            // NOT re-generate every hatch, B24/GP1), with a PER-FRAME
             // GENERATION BUDGET so a huge batch of new hatches fills in over
             // several frames instead of freezing one. Skipped in APX (dots
             // only). `hatch_building` drives the left-corner "building…" note.
             let mut hatch_building = 0usize;
             if self.render_mode != RenderMode::Apx {
-                if std::mem::take(&mut self.gpu_dirty) { self.hatch_cache.clear(); }
                 let pending: Vec<usize> = candidates.iter().copied().filter(|&i| {
                     self.doc.dobjects.get(i).map_or(false, |d|
                         matches!(d.geom, Geom::Hatch(_))
@@ -52229,7 +53674,7 @@ impl eframe::App for CadApp {
                     let handle = self.doc.dobjects[i].handle;
                     let entry = self.build_hatch_cache_entry(i);
                     work += entry.segs.len() + entry.circs.len()
-                          + entry.fills.len() + entry.holes.len();
+                          + entry.solid.iter().map(|(_, t)| t.len()).sum::<usize>();
                     self.hatch_cache.insert(handle, entry);
                     hatch_building -= 1;
                 }
@@ -52448,17 +53893,24 @@ impl eframe::App for CadApp {
                                         painter.circle_stroke(self.w2s(*c, rect), rpx, stroke);
                                     }
                                 }
-                                if !entry.fills.is_empty() || !entry.holes.is_empty() {
+                                if !entry.solid.is_empty() {
                                     let bg = egui::Color32::from_rgb(18, 22, 28);
-                                    let mut mesh = egui::Mesh::default();
-                                    let mut push_tri = |tri: &[Vec2; 3], col: egui::Color32| {
-                                        let base = mesh.vertices.len() as u32;
-                                        for v in tri { mesh.colored_vertex(self.w2s(*v, rect), col); }
-                                        mesh.add_triangle(base, base + 1, base + 2);
-                                    };
-                                    for tri in &entry.fills { push_tri(tri, color); }
-                                    for tri in &entry.holes { push_tri(tri, bg); }
-                                    painter.add(egui::Shape::mesh(mesh));
+                                    // Depth-ascending batches — one mesh per
+                                    // loop so nested islands (even depth)
+                                    // paint after the hole (odd depth) that
+                                    // contains them.
+                                    for (is_fill, tris) in &entry.solid {
+                                        let col = if *is_fill { color } else { bg };
+                                        let mut mesh = egui::Mesh::default();
+                                        for tri in tris {
+                                            let base = mesh.vertices.len() as u32;
+                                            for v in tri {
+                                                mesh.colored_vertex(self.w2s(*v, rect), col);
+                                            }
+                                            mesh.add_triangle(base, base + 1, base + 2);
+                                        }
+                                        painter.add(egui::Shape::mesh(mesh));
+                                    }
                                 }
                             }
                             drawn += 1;
@@ -52847,23 +54299,23 @@ impl eframe::App for CadApp {
                                                 color: packed,
                                             });
                                         }
-                                        if !entry.fills.is_empty() || !entry.holes.is_empty() {
+                                        if !entry.solid.is_empty() {
                                             let bgp = pack_rgba(
                                                 egui::Color32::from_rgb(18, 22, 28));
-                                            for tri in &entry.fills {
-                                                for v in tri {
-                                                    fills.push(FillVertex {
-                                                        x: (v.x + ox) as f32,
-                                                        y: (v.y + oy) as f32,
-                                                        color: packed });
-                                                }
-                                            }
-                                            for tri in &entry.holes {
-                                                for v in tri {
-                                                    fills.push(FillVertex {
-                                                        x: (v.x + ox) as f32,
-                                                        y: (v.y + oy) as f32,
-                                                        color: bgp });
+                                            // Depth-ascending batches pushed in
+                                            // buffer order so the rasterizer
+                                            // draws nested islands (even depth)
+                                            // after the hole (odd depth) that
+                                            // contains them.
+                                            for (is_fill, tris) in &entry.solid {
+                                                let col = if *is_fill { packed } else { bgp };
+                                                for tri in tris {
+                                                    for v in tri {
+                                                        fills.push(FillVertex {
+                                                            x: (v.x + ox) as f32,
+                                                            y: (v.y + oy) as f32,
+                                                            color: col });
+                                                    }
                                                 }
                                             }
                                         }
@@ -56089,13 +57541,13 @@ fn draw_dobject_thick(
                 (cad_kernel::TextHAlign::Right,  cad_kernel::TextVAlign::Middle)   => egui::Align2::RIGHT_CENTER,
                 (cad_kernel::TextHAlign::Right,  _)                                => egui::Align2::RIGHT_BOTTOM,
             };
-            // Resolve font: look up the style's font_name and pick the
-            // matching egui FontId. Unknown names fall back to
-            // proportional so old DXF files keep rendering.
-            let font_name = app.doc.text_styles.get(t.style)
-                .map(|s| s.font_name.as_str())
-                .unwrap_or("standard");
-            let font_id = font_id_for_font_name(font_name, size_px);
+            // Resolve font: the entity's explicit font, else its style's —
+            // the SAME chain TXTEXP and hatch tracing use (single source of
+            // truth, can't drift). Pick the matching egui FontId; unknown
+            // names fall back to proportional so old DXF files keep
+            // rendering.
+            let ttf_font = app.resolve_text_font(t);
+            let font_id = font_id_for_font_name(&ttf_font, size_px);
             // Rotation: egui's `text` doesn't support angles directly.
             // Use a Galley + manual transform if we ever need rotated
             // text. v1: ignore the angle and warn only when non-zero
@@ -56913,14 +58365,19 @@ const HATCH_GEN_WORK_BUDGET: usize = 200_000;
 /// Cached, COLOUR-LESS render geometry for ONE hatch (world space). Built by
 /// `CadApp::build_hatch_cache_entry`, reused every frame until the doc
 /// mutates. Pattern hatches populate `segs`/`circs`; solid hatches populate
-/// `fills`/`holes` (even boundary loops fill, odd loops over-draw the bg —
-/// poor-man's even-odd). Colour is applied at draw time so highlights work.
+/// `solid` — one triangle batch per boundary loop, ORDERED by containment
+/// depth ascending (outermost loop first, `true` = even depth = hatch
+/// colour, `false` = odd depth = bg over-draw). That depth order is what
+/// makes nested even-odd paint correctly: a depth-2 island (e.g. a letter
+/// counter inside a punched-out letter) is drawn AFTER the depth-1 hole
+/// that contains it, so the hole's bg cannot erase it. Colour is applied at
+/// draw time so highlights work.
 #[derive(Default, Clone)]
 struct HatchCacheEntry {
     segs:  Vec<(Vec2, Vec2)>,
     circs: Vec<(Vec2, f64)>,
-    fills: Vec<[Vec2; 3]>,
-    holes: Vec<[Vec2; 3]>,
+    /// `(is_fill, triangles)` per boundary loop, depth-ascending.
+    solid: Vec<(bool, Vec<[Vec2; 3]>)>,
 }
 
 fn gpu_push_seg(lines: &mut Vec<LineInstance>, a: Vec2, b: Vec2,
@@ -57121,10 +58578,18 @@ impl CadApp {
                 out.circs = circs;
             }
             cad_kernel::HatchPattern::Solid => {
-                for (li, lp) in self.resolve_hatch_loops(h).iter().enumerate() {
-                    let tris = ear_clip(lp);
-                    if li % 2 == 0 { out.fills.extend(tris); }
-                    else           { out.holes.extend(tris); }
+                let loops = self.resolve_hatch_loops(h);
+                // Depth-ascending per-loop batches — consumers draw them in
+                // this order so nested islands re-fill their parent holes
+                // (see HatchCacheEntry::solid).
+                let depths = loop_depths(&loops);
+                let mut order: Vec<usize> = (0..loops.len()).collect();
+                order.sort_by_cached_key(|&li| depths[li]);
+                for li in order {
+                    let tris = ear_clip(&loops[li]);
+                    if !tris.is_empty() {
+                        out.solid.push((depths[li] % 2 == 0, tris));
+                    }
                 }
             }
         }
@@ -57221,35 +58686,15 @@ impl CadApp {
             if line_count_estimate > 10_000.0 { continue; }
             while s <= s_max + 1e-9 {
                 let line_origin = base + n * s;
-                // Clip this infinite line against the loops — gather
-                // every (t-value, edge-orientation) intersection, sort,
-                // emit segments via even-odd.
-                let mut hits: Vec<f64> = Vec::new();
-                for l in loops {
-                    let m = l.len();
-                    if m < 2 { continue; }
-                    for i in 0..m {
-                        let a = l[i];
-                        let b = l[(i + 1) % m];
-                        if let Some(t) = line_segment_intersect_t(line_origin, u, a, b) {
-                            hits.push(t);
-                        }
-                    }
-                }
-                if hits.len() >= 2 {
-                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-                    // Pair consecutive hits — even-odd inside/outside.
-                    let mut i = 0;
-                    while i + 1 < hits.len() {
-                        let t0 = hits[i];
-                        let t1 = hits[i + 1];
-                        if (t1 - t0).abs() > 1e-6 {
-                            let p0 = line_origin + u * t0;
-                            let p1 = line_origin + u * t1;
-                            segs.push((p0, p1));
-                        }
-                        i += 2;
-                    }
+                // Clip this infinite line against the loops via the shared
+                // kernel even-odd clipper — per-loop pairing + XOR across
+                // loops handles shared edges (a chord hatched as two
+                // half-discs) and nested islands correctly.
+                let intervals = cad_kernel::patterns::hatch_line_intervals(loops, line_origin, u);
+                for (t0, t1) in intervals {
+                    let p0 = line_origin + u * t0;
+                    let p1 = line_origin + u * t1;
+                    segs.push((p0, p1));
                 }
                 s += spacing;
             }
@@ -57334,57 +58779,16 @@ impl CadApp {
                     let dvec = b - a;
                     let seg_len2 = dvec.x * dvec.x + dvec.y * dvec.y;
                     if seg_len2 < 1e-18 { continue; }
-                    // Use the segment itself as the parametric line:
-                    //   line(t) = a + t * (b - a), so t ∈ [0,1] is the
-                    //   drawable portion of THIS tile-segment. Clip
-                    //   against all loop edges with even-odd, intersect
-                    //   the resulting intervals with [0, 1].
-                    let mut hits: Vec<f64> = Vec::new();
-                    for l in loops {
-                        let m = l.len();
-                        if m < 2 { continue; }
-                        for k in 0..m {
-                            let p0 = l[k];
-                            let p1 = l[(k + 1) % m];
-                            if let Some(t) = line_segment_intersect_t(a, dvec, p0, p1) {
-                                // Filter to the segment's own parameter
-                                // range. `line_segment_intersect_t`
-                                // returns t for an INFINITE line through
-                                // a in direction dvec; hits at t<0 or
-                                // t>1 are intersections of that infinite
-                                // extension with boundary edges that lie
-                                // BEYOND our segment endpoints, and they
-                                // would corrupt the even-odd interval
-                                // walk if mixed in. Parity at the seg
-                                // endpoints is recovered separately via
-                                // point_in_polygon.
-                                if t > -1e-9 && t < 1.0 + 1e-9 {
-                                    hits.push(t.clamp(0.0, 1.0));
-                                }
-                            }
-                        }
-                    }
-                    // Even-odd parity at the segment START. Each in-range
-                    // crossing flips it; tail interval up to t=1 closes
-                    // the walk if we end inside.
-                    let a_in = loops.iter().fold(false,
-                        |acc, l| acc ^ point_in_polygon(a, l.iter().copied()));
-                    if hits.is_empty() {
-                        if !a_in { continue; }
-                        segs.push((a, b));
-                        continue;
-                    }
-                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut inside = a_in;
-                    let mut t_prev = 0.0_f64;
-                    let mut intervals: Vec<(f64, f64)> = Vec::new();
-                    for &t in &hits {
-                        if inside { intervals.push((t_prev, t)); }
-                        inside = !inside;
-                        t_prev = t;
-                    }
-                    if inside { intervals.push((t_prev, 1.0)); }
+                    // Clip against the loops with the same per-loop + XOR
+                    // machinery as the family lines (kernel
+                    // hatch_line_intervals), then clamp the resulting
+                    // intervals to the segment's own t-range [0, 1]. The
+                    // XOR runs over the infinite line, so a segment
+                    // starting/ending INSIDE a loop is handled by intervals
+                    // that span past the clamp window.
+                    let intervals = cad_kernel::patterns::hatch_line_intervals(&loops, a, dvec);
                     for (t0, t1) in intervals {
+                        let (t0, t1) = (t0.clamp(0.0, 1.0), t1.clamp(0.0, 1.0));
                         if t1 - t0 > 1e-6 {
                             let p0 = a + dvec * t0;
                             let p1 = a + dvec * t1;
@@ -58877,6 +60281,15 @@ mod factory_sketch_tests {
         }))
     }
 
+    /// Model a FRESH interactive sketch draw: `Document::push` is a pure append
+    /// now, so the active-layer stamp happens the way `add_dobject` does it
+    /// (`stamp_fresh_style`).
+    fn push_stamped(app: &mut CadApp, d: cad_kernel::DObject) -> usize {
+        let mut d = d;
+        app.stamp_fresh_style(&mut d.style);
+        app.doc.push(d)
+    }
+
     /// `CadApp::default()` ships three demo layers and starts on WALLS (red), so a test that
     /// means layer 0 has to say so.
     fn app_on_a_green_layer() -> (CadApp, u32) {
@@ -58893,7 +60306,7 @@ mod factory_sketch_tests {
         let (mut app, g) = app_on_a_green_layer();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
         assert_eq!(app.doc.layers.active, g, "the sketch inherits the drawing's active layer");
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
 
         let lines = app.factory.live_sketch_lines(&app.doc);
         assert!(!lines.is_empty(), "the live sketch shows in 3D at all");
@@ -58926,9 +60339,9 @@ mod factory_sketch_tests {
         let (mut app, g) = app_on_a_green_layer();
         app.doc.layers.active = LayerTable::LAYER_ZERO; // white
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
         app.doc.layers.active = g;
-        app.doc.push(unit_circle_at(5.0));
+        push_stamped(&mut app, unit_circle_at(5.0));
 
         let cols = line_colours(&app.factory.live_sketch_lines(&app.doc));
         assert_eq!(cols.len(), 2, "a white circle and a green circle are two colours, got {cols:?}");
@@ -58942,9 +60355,9 @@ mod factory_sketch_tests {
         let (mut app, g) = app_on_a_green_layer();
         app.doc.layers.active = LayerTable::LAYER_ZERO;
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
         app.doc.layers.active = g;
-        app.doc.push(unit_circle_at(5.0));
+        push_stamped(&mut app, unit_circle_at(5.0));
         app.factory_exit_sketch();
 
         let cols = line_colours(&app.factory.sketch_lines(&app.doc));
@@ -58964,7 +60377,7 @@ mod factory_sketch_tests {
     fn recolouring_a_layer_in_the_plan_updates_finished_sketches() {
         let (mut app, g) = app_on_a_green_layer();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
         app.factory_exit_sketch();
 
         let before = line_colours(&app.factory.sketch_lines(&app.doc));
@@ -58984,13 +60397,13 @@ mod factory_sketch_tests {
     fn a_finished_plane_keeps_its_hue_and_only_dims() {
         let (mut app, _g) = app_on_a_green_layer();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
         app.factory_exit_sketch();
         // A GENUINELY non-coplanar plane, or `factory_enter_sketch` reopens the first one.
         app.factory_enter_sketch(cad_solid::Frame::from_point_normal(
             glam::Vec3::ZERO, glam::Vec3::X,
         ));
-        app.doc.push(unit_circle_at(0.0));
+        push_stamped(&mut app, unit_circle_at(0.0));
 
         let live = line_colours(&app.factory.live_sketch_lines(&app.doc));
         let fin = line_colours(&app.factory.sketch_lines(&app.doc));
@@ -66678,6 +68091,668 @@ mod a_plane_shares_the_drawings_tables {
 /// Every closed loop on a face sketch used to extrude as its own solid, so a plate drawn with four
 /// bolt circles came out as five posts and the drafter had to cut the holes back out by hand —
 /// four more features, each of which then had to be kept beside the plate for ever.
+// A hatch has NO geometry of its own — `Geom::Hatch::{rotated,scaled,mirrored}`
+// are kernel no-ops, so the fill only follows if the BOUNDARY transforms. These
+// cover the in-place transforms beyond `apply_move`.
+#[cfg(test)]
+mod layerstate_flow_tests {
+    use super::*;
+
+    fn add_layer(app: &mut CadApp, name: &str) -> u32 {
+        app.doc.layers.add(cad_kernel::Layer {
+            name: name.into(), color: cad_kernel::color::Color::Aci(7),
+            linetype: 0, lineweight: cad_kernel::lineweight::Lineweight::Default,
+            visible: true, locked: false, frozen: false, plottable: true, order: 0,
+        })
+    }
+
+    #[test]
+    fn save_restore_via_command() {
+        let mut app = CadApp::default();
+        let id = add_layer(&mut app, "TestLayerAlpha");
+        if let Some(l) = app.doc.layers.get_mut(id) { l.visible = false; }
+        app.run_command("layerstate save TestState");
+        assert_eq!(app.doc.layer_states.len(), 1, "state stored");
+        assert!(!app.doc.layer_states[0].entries.iter()
+            .find(|e| e.layer == "TestLayerAlpha").unwrap().visible,
+            "captured hidden");
+        assert!(app.history.iter().any(|h| h.contains("saved 'TestState'")));
+        // Restore flips visibility back on.
+        if let Some(l) = app.doc.layers.get_mut(id) { l.visible = true; }
+        app.apply_layerstate(&["TestState".into()]);   // direct (bypass parser)
+        assert!(!app.doc.layers.get(id).unwrap().visible, "restored");
+        // Undo restores the visible=true state.
+        app.do_undo();
+        assert!(app.doc.layers.get(id).unwrap().visible);
+    }
+
+    #[test]
+    fn list_delete_rename() {
+        let mut app = CadApp::default();
+        app.run_command("layerstate save A");
+        app.run_command("layerstate save B");
+        app.run_command("layerstate ?");
+        assert!(app.history.iter().any(|h| h.contains("A")));
+        app.run_command("layerstate delete A");
+        app.run_command("layerstate rename B C");
+        app.run_command("layerstate ?");
+        assert!(app.history.iter().any(|h| h.contains("C"))
+            && !app.history.iter().any(|h| h.contains("list: A")));
+    }
+
+    #[test]
+    fn unknown_state_fails_visibly() {
+        let mut app = CadApp::default();
+        app.run_command("layerstate restore Nope");
+        assert!(app.history.iter().any(|h| h.contains("no state named")));
+        // Restore with no args lists.
+        app.run_command("layerstate");
+        assert!(app.history.iter().any(|h| h.contains("layerstate:")));
+    }
+}
+
+#[cfg(test)]
+mod ucs_flow_tests {
+    use super::*;
+
+    #[test]
+    fn ucs_origin_creates_and_sets_current() {
+        let mut app = CadApp::default();
+        app.run_command("ucs origin 100,200");
+        assert_eq!(app.doc.current_ucs, 1);
+        let u = app.current_ucs().cloned().unwrap();
+        assert_eq!((u.origin.x, u.origin.y), (100.0, 200.0));
+        assert_eq!(u.rotation, 0.0);
+        // Typed points land in WORLD space (UCS converted).
+        assert!((app.ucs_to_world(Vec2::new(1.0, 2.0)) - Vec2::new(101.0, 202.0)).len() < 1e-9);
+        // Readout shows UCS coords.
+        assert!((app.world_to_ucs(Vec2::new(101.0, 202.0)) - Vec2::new(1.0, 2.0)).len() < 1e-9);
+    }
+
+    #[test]
+    fn ucs_save_list_set_delete() {
+        let mut app = CadApp::default();
+        app.run_command("ucs origin 10,20 90");
+        app.run_command("ucs save Site");
+        assert_eq!(app.doc.ucs_list.len(), 2, "unnamed + named");
+        assert_eq!(app.doc.current_ucs, 2);
+        assert_eq!(app.ucs_name(), "Site");
+        // Switch back to world.
+        app.run_command("ucs world");
+        assert_eq!(app.ucs_name(), "World");
+        // Re-select by name.
+        app.run_command("ucs site");
+        assert_eq!(app.ucs_name(), "Site");
+        // Rotated UCS: x-axis points +Y (90°).
+        let u = app.current_ucs().unwrap();
+        let w = u.to_world(Vec2::new(1.0, 0.0));
+        assert!((w - Vec2::new(10.0, 21.0)).len() < 1e-9, "origin + rotated x-axis");
+        // Delete → back to world.
+        app.run_command("ucs delete Site");
+        assert_eq!(app.ucs_name(), "World");
+        assert_eq!(app.doc.ucs_list.len(), 1);
+        // Unknown name fails visibly.
+        app.run_command("ucs Nope");
+        assert!(app.history.iter().any(|h| h.contains("no system named")));
+    }
+
+    #[test]
+    fn ucs_origin_requires_coords() {
+        let mut app = CadApp::default();
+        app.run_command("ucs origin");
+        assert!(app.history.iter().any(|h| h.contains("origin needs X,Y")));
+        assert_eq!(app.doc.current_ucs, 0, "nothing created");
+    }
+}
+
+#[cfg(test)]
+mod overkill_flow_tests {
+    use super::*;
+
+    #[test]
+    fn overkill_removes_duplicates_from_whole_drawing() {
+        let mut app = CadApp::default();
+        let before = app.doc.dobjects.len();
+        // Add two duplicate lines.
+        let l1 = Geom::Line(cad_kernel::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(5.0, 0.0) });
+        let l2 = Geom::Line(cad_kernel::Line { a: Vec2::new(5.0, 0.0), b: Vec2::new(0.0, 0.0) });
+        app.add_dobject(l1, "test");
+        app.add_dobject(l2, "test");
+        assert_eq!(app.doc.dobjects.len(), before + 2);
+        app.commit_overkill(None);
+        assert_eq!(app.doc.dobjects.len(), before + 1);
+        // Undo restores both.
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), before + 2);
+    }
+
+    #[test]
+    fn overkill_no_duplicates_fails_visibly() {
+        let mut app = CadApp::default();
+        let before = app.doc.dobjects.len();
+        app.commit_overkill(None);
+        assert_eq!(app.doc.dobjects.len(), before, "nothing removed");
+        assert!(app.history.iter().any(|h| h.contains("no duplicates")),
+            "failure is reported: {:?}", app.history);
+    }
+
+    #[test]
+    fn overkill_selection_subset() {
+        let mut app = CadApp::default();
+        let base = app.doc.dobjects.len();
+        let c1 = Geom::Circle(cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 1.0 });
+        let c2 = Geom::Circle(cad_kernel::Circle { center: Vec2::new(0.0, 0.0), radius: 1.0 });
+        let l = Geom::Line(cad_kernel::Line { a: Vec2::new(9.0, 9.0), b: Vec2::new(10.0, 9.0) });
+        app.add_dobject(c1, "test");
+        app.add_dobject(c2, "test");
+        app.add_dobject(l, "test");
+        // Select the two circles only.
+        app.commit_overkill(Some(vec![base, base + 1]));
+        assert_eq!(app.doc.dobjects.len(), base + 2, "line survives");
+    }
+}
+
+#[cfg(test)]
+mod purge_flow_tests {
+    use super::*;
+
+    fn add_layer(app: &mut CadApp, name: &str) -> u32 {
+        app.doc.layers.add(cad_kernel::Layer {
+            name: name.into(), color: cad_kernel::color::Color::Aci(7),
+            linetype: 0, lineweight: cad_kernel::lineweight::Lineweight::Default,
+            visible: true, locked: false, frozen: false, plottable: true, order: 0,
+        })
+    }
+
+    #[test]
+    fn purge_removes_unused_layer_and_keeps_used() {
+        let mut app = CadApp::default();
+        // Drain whatever the default doc leaves unused, then test cleanly.
+        app.commit_purge();
+        let unused_id = add_layer(&mut app, "PurgeMe");
+        let used_id = add_layer(&mut app, "KeepMe");
+        let mut d = DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(1.0, 0.0) }));
+        d.style.layer = used_id;
+        app.doc.push(d);
+
+        app.commit_purge();
+        assert!(app.doc.layers.find("PurgeMe").is_none(), "unused purged");
+        let kept = app.doc.layers.find("KeepMe").expect("used kept");
+        let l = app.doc.dobjects.iter().rev()
+            .find(|x| matches!(x.geom, Geom::Line(_))).unwrap();
+        assert_eq!(l.style.layer, kept, "reference remapped");
+        assert_eq!(app.doc.layers.get(l.style.layer).map(|x| x.name.as_str()),
+            Some("KeepMe"));
+        assert!(app.history.iter().any(|h| h.contains("PurgeMe")));
+        let _ = unused_id;
+    }
+
+    #[test]
+    fn purge_nothing_fails_visibly() {
+        let mut app = CadApp::default();
+        // First purge drains the default doc's unused entries...
+        app.commit_purge();
+        // ...so the second has nothing left → visible failure.
+        app.commit_purge();
+        assert!(app.history.iter().any(|h| h.contains("nothing to purge")),
+            "failure is reported: {:?}", app.history);
+    }
+
+    #[test]
+    fn purge_undo_restores() {
+        let mut app = CadApp::default();
+        app.commit_purge();   // drain defaults first
+        let n_layers = app.doc.layers.layers.len();
+        add_layer(&mut app, "Temp");
+        assert_eq!(app.doc.layers.layers.len(), n_layers + 1);
+        app.commit_purge();
+        assert_eq!(app.doc.layers.layers.len(), n_layers);
+        app.do_undo();
+        assert_eq!(app.doc.layers.layers.len(), n_layers + 1);
+    }
+}
+
+#[cfg(test)]
+mod hatch_cancel_worker_tests {
+    use super::*;
+
+    fn dummy_worker(app: &CadApp) -> HatchWorker {
+        let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
+        let _ = tx;  // receiver alive; sender dropped
+        HatchWorker {
+            seed: Vec2::ZERO,
+            pattern: cad_kernel::HatchPattern::Solid,
+            active_layer: app.doc.layers.active,
+            cancel: StdArc::new(AtomicBool::new(false)),
+            rx,
+        }
+    }
+
+    #[test]
+    fn cancel_hatch_worker_drops_receiver_and_sets_flag() {
+        let mut app = CadApp::default();
+        app.op_cancel.store(false, Ordering::Relaxed);
+        app.hatch_worker = Some(dummy_worker(&app));
+        let cancelled = app.cancel_hatch_worker();
+        assert!(cancelled, "helper reports it cancelled a running worker");
+        assert!(app.hatch_worker.is_none(), "worker (receiver) dropped → no stale apply");
+        assert!(app.op_cancel.load(Ordering::Relaxed), "op_cancel set");
+    }
+
+    #[test]
+    fn cancel_hatch_worker_is_noop_when_idle() {
+        let mut app = CadApp::default();
+        app.op_cancel.store(false, Ordering::Relaxed);
+        assert!(!app.cancel_hatch_worker(), "no worker → returns false");
+        assert!(!app.op_cancel.load(Ordering::Relaxed), "op_cancel untouched when idle");
+    }
+}
+
+#[cfg(test)]
+mod hatch_dedupe_tests {
+    use super::*;
+
+    /// Issue #17 + hatch_aux: the kernel resolver skips boundaries on
+    /// INVISIBLE layers — except `hatch_aux` synthetic boundaries (the
+    /// pick-point trace's non-rendering polylines). A hatch whose
+    /// boundary is a worker-made aux polyline must still resolve.
+    #[test]
+    fn aux_boundaries_still_resolve_but_user_hidden_do_not() {
+        let mut app = CadApp::default();
+        // User-hidden boundary: invisible, NOT aux → skipped by the resolver.
+        let mut hidden = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        hidden.style.visible = false;
+        let h_idx = app.doc.push(hidden);
+        // Synthetic aux boundary: invisible BUT hatch_aux → still resolves.
+        let mut aux = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        aux.style.visible = false;
+        aux.style.hatch_aux = true;
+        let a_idx = app.doc.push(aux);
+
+        let hatch_hidden = cad_kernel::Hatch {
+            boundary_handles: vec![app.doc.dobjects[h_idx].handle],
+            pattern: cad_kernel::HatchPattern::Solid,
+        };
+        assert_eq!(app.resolve_hatch_loops(&hatch_hidden).len(), 0,
+            "user-hidden boundary must NOT resolve (issue #17)");
+
+        let hatch_aux = cad_kernel::Hatch {
+            boundary_handles: vec![app.doc.dobjects[a_idx].handle],
+            pattern: cad_kernel::HatchPattern::Solid,
+        };
+        assert_eq!(app.resolve_hatch_loops(&hatch_aux).len(), 1,
+            "hatch_aux synthetic boundary MUST resolve — pick-point hatch fills are empty without this");
+    }
+
+    /// Solid even-odd must classify by CONTAINMENT, not loop index:
+    /// two disjoint regions are BOTH fills (the old `i % 2` parity made
+    /// the second invisible), and a nested island is a hole.
+    #[test]
+    fn solid_loop_classification_disjoint_and_nested() {
+        let sq = |x: f64, y: f64, half: f64| -> Vec<Vec2> {
+            vec![
+                Vec2::new(x - half, y - half),
+                Vec2::new(x + half, y - half),
+                Vec2::new(x + half, y + half),
+                Vec2::new(x - half, y + half),
+            ]
+        };
+        // Two DISJOINT squares — both fills.
+        let disjoint = vec![sq(0.0, 0.0, 2.0), sq(10.0, 0.0, 2.0)];
+        assert!(solid_loop_is_fill(&disjoint, 0), "left square is a fill");
+        assert!(solid_loop_is_fill(&disjoint, 1),
+            "disjoint right square MUST be a fill — index parity made it invisible");
+        // Outer + nested island — island is a hole.
+        let nested = vec![sq(0.0, 0.0, 5.0), sq(0.0, 0.0, 1.0)];
+        assert!(solid_loop_is_fill(&nested, 0), "outer is a fill");
+        assert!(!solid_loop_is_fill(&nested, 1), "island is a hole");
+        // Island-in-hole — that loop is a fill again (even-odd).
+        let island_in_hole = vec![
+            sq(0.0, 0.0, 8.0),   // outer
+            sq(0.0, 0.0, 4.0),   // hole
+            sq(0.0, 0.0, 1.0),   // fill
+        ];
+        assert!(solid_loop_is_fill(&island_in_hole, 0));
+        assert!(!solid_loop_is_fill(&island_in_hole, 1));
+        assert!(solid_loop_is_fill(&island_in_hole, 2),
+            "island-in-hole is a fill again");
+    }
+
+    #[test]
+    fn dedupe_hits_collapses_vertex_double_counts() {
+        // The 45° pattern line through the CENTER of a 64-vertex circle
+        // hits at vertex angles 45/135/225/315° — each crossing reported
+        // TWICE (once per adjacent edge). Old code: [ta,ta,tb,tb] pairs
+        // consumed themselves → the whole line vanished. Dedupe must
+        // collapse to [ta, tb].
+        let mut hits = vec![1.0, 1.0, 9.0, 9.0];
+        dedupe_hits(&mut hits);
+        assert_eq!(hits, vec![1.0, 9.0]);
+        // Genuinely distinct hits survive, unsorted input sorts.
+        let mut hits2 = vec![5.0, 1.0, 3.0];
+        dedupe_hits(&mut hits2);
+        assert_eq!(hits2, vec![1.0, 3.0, 5.0]);
+        // Duplicates in the middle collapse too.
+        let mut hits3 = vec![0.0, 2.0, 2.0, 2.0, 7.0];
+        dedupe_hits(&mut hits3);
+        assert_eq!(hits3, vec![0.0, 2.0, 7.0]);
+    }
+
+    #[test]
+    fn hatch_center_line_survives_vertex_hits() {
+        // Regression: ANSI31 (45°) hatch over the DEFAULT center circle
+        // (64-vertex tessellation, vertex at 45°). The pattern line through
+        // (0,0) hits the boundary exactly at vertices — it must still be
+        // emitted by hatch_pattern_geometry.
+        let mut app = CadApp::default();
+        // Find the default circle at the origin.
+        let circle_idx = app.doc.dobjects.iter().position(|d|
+            matches!(d.geom, Geom::Circle(c) if c.center.len() < 1e-9))
+            .expect("default doc has a center circle");
+        let h = app.doc.dobjects[circle_idx].handle;
+        let n0 = app.doc.dobjects.len();
+        app.add_dobject(Geom::Hatch(cad_kernel::Hatch {
+            boundary_handles: vec![h],
+            pattern: cad_kernel::HatchPattern::Pattern {
+                name: "ANSI31".into(), scale: 1.0, angle_deg: 0.0,
+            },
+        }), "t");
+        let Geom::Hatch(hatch) = &app.doc.dobjects[n0].geom else { panic!() };
+        let (segs, _circs) = app.hatch_pattern_world_geometry(hatch);
+        // The 45° line through the origin crosses the r=30 circle at ±30√2
+        // along it — pre-fix both hits were double-counted and the line
+        // vanished. Now it survives as one segment.
+        let on_diag = |s: &(Vec2, Vec2)| {
+            (s.0.x.abs() - s.0.y.abs()).abs() < 1e-6
+                && (s.1.x.abs() - s.1.y.abs()).abs() < 1e-6
+        };
+        assert!(segs.iter().any(on_diag),
+            "the 45° line through the circle centre must survive vertex hits, got {} segs",
+            segs.len());
+    }
+}
+
+#[cfg(test)]
+mod hatch_cache_invalidation_tests {
+    use super::*;
+
+    // Build the spatial index once so `ensure_index` early-returns when clean
+    // (its clean-path guard is `!index_dirty && index.is_some()`).
+    fn app_with_index() -> CadApp {
+        let mut app = CadApp::default();
+        app.index_dirty = true;
+        app.ensure_index();
+        assert!(app.index.is_some());
+        app
+    }
+
+    // GP1: a pure SELECTION/highlight change (gpu_dirty, NOT index_dirty) must
+    // NOT invalidate the hatch cache — else clicking a dense-hatch drawing
+    // re-generates every hatch and stutters.
+    #[test]
+    fn selection_change_keeps_hatch_cache() {
+        let mut app = app_with_index();
+        app.hatch_cache.insert(42u64, HatchCacheEntry::default());
+        // Selection changed: render-dirty but geometry unchanged.
+        app.gpu_dirty = true;
+        app.index_dirty = false;
+        app.ensure_index();   // the invalidation point (Option B)
+        assert!(app.hatch_cache.contains_key(&42u64),
+            "selection change must NOT clear the hatch cache");
+    }
+
+    // GP9: a GEOMETRY change (index_dirty — a boundary added/moved/edited) MUST
+    // invalidate the hatch cache, else the fill goes stale.
+    #[test]
+    fn geometry_change_clears_hatch_cache() {
+        let mut app = app_with_index();
+        app.hatch_cache.insert(42u64, HatchCacheEntry::default());
+        app.index_dirty = true;   // geometry mutated
+        app.ensure_index();
+        assert!(app.hatch_cache.is_empty(),
+            "geometry change must clear the hatch cache");
+    }
+}
+
+#[cfg(test)]
+mod hatch_transform_tests {
+    use super::*;
+
+    // A 4×3 closed rect + a Solid hatch referencing it. Returns (boundary, hatch).
+    // Vertex 1 sits at (4,0): rotating 90° CCW about the origin sends it to
+    // (0,4), and a DOUBLE rotation to (-4,0) — the dedup test turns on that.
+    fn doc_with_hatch(app: &mut CadApp) -> (usize, usize) {
+        let rect = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 3.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 3.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let bhandle = rect.handle;
+        let bidx = app.doc.push(rect);
+        let hatch = DObject::new(Geom::Hatch(cad_kernel::Hatch {
+            boundary_handles: vec![bhandle],
+            pattern: cad_kernel::HatchPattern::Solid,
+        }));
+        let hidx = app.doc.push(hatch);
+        (bidx, hidx)
+    }
+
+    fn vertex(app: &CadApp, idx: usize, v: usize) -> Vec2 {
+        match &app.doc.dobjects[idx].geom {
+            Geom::Polyline(p) => p.vertices[v].pos,
+            other => panic!("expected the boundary Polyline, got {other:?}"),
+        }
+    }
+
+    // The dobject the USER drew must stay independent of the hatch: applying a
+    // hatch to a selected rectangle binds the fill to a baked, invisible copy,
+    // not to the rectangle itself.
+    //
+    // Regression (owner-reported): rectangle / polygon / pline took the cheap
+    // select-objects path, which referenced the user's dobject directly, so the
+    // fill dragged along when the shape moved — while a traced circle/ellipse
+    // (which always baked a copy) stayed independent. Same command, two
+    // behaviours.
+    #[test]
+    fn hatching_a_shape_bakes_an_independent_boundary() {
+        let mut app = CadApp::default();
+        let rect = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 3.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 3.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let user_handle = rect.handle;
+        let user_idx = app.doc.push(rect);
+        app.selection = vec![user_idx];
+        app.pending_hatch_pattern = (Some("ANSI31".into()), 1.0, 0.0);
+        app.apply_hatch();
+
+        let hidx = app.hatch_last_idx.expect("a hatch must have been created");
+        let Geom::Hatch(h) = &app.doc.dobjects[hidx].geom else { panic!("not a hatch") };
+        assert_eq!(h.boundary_handles.len(), 1);
+        let bound = h.boundary_handles[0];
+        assert_ne!(bound, user_handle,
+            "the hatch must NOT reference the dobject the user drew");
+
+        // The baked boundary exists, is invisible, and is flagged so loop
+        // resolution still honours it.
+        let bidx = app.doc.dobjects.iter().position(|d| d.handle == bound)
+            .expect("baked boundary must be in the document");
+        assert!(!app.doc.dobjects[bidx].style.visible, "baked boundary must be invisible");
+        assert!(app.doc.dobjects[bidx].style.hatch_aux, "baked boundary must be flagged hatch_aux");
+        // …and it must still resolve to a usable loop, or the fill renders nothing.
+        let loops = cad_kernel::resolve_hatch_loops(h, &app.doc);
+        assert_eq!(loops.len(), 1, "the baked boundary must resolve");
+
+        // The decisive behaviour: moving the user's shape leaves the fill put.
+        app.selection = vec![user_idx];
+        app.apply_move(Vec2::new(50.0, 0.0));
+        let after = cad_kernel::resolve_hatch_loops(
+            match &app.doc.dobjects[hidx].geom { Geom::Hatch(h) => h, _ => unreachable!() },
+            &app.doc);
+        let moved = after[0].iter().any(|p| p.x > 40.0);
+        assert!(!moved, "moving the user's shape must not drag the hatch with it");
+    }
+
+    // Selecting a hatch must expose GRIPS — the vertices of the boundary it
+    // owns — so the fill can be reshaped by dragging, like any other dobject.
+    // `Geom::Hatch::grip_points()` is empty (a hatch has no geometry of its
+    // own), so the grips come from substituting its aux boundary into the
+    // grip-target set.
+    #[test]
+    fn selecting_a_hatch_exposes_its_boundary_grips() {
+        let mut app = CadApp::default();
+        let rect = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 3.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 3.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let user_idx = app.doc.push(rect);
+        app.selection = vec![user_idx];
+        app.pending_hatch_pattern = (Some("ANSI31".into()), 1.0, 0.0);
+        app.apply_hatch();
+        let hidx = app.hatch_last_idx.expect("hatch created");
+
+        // Select ONLY the hatch.
+        app.selection = vec![hidx];
+        app.selected = None;
+        let targets = app.editable_grip_targets();
+
+        // The hatch itself yields no grips…
+        assert!(app.doc.dobjects[hidx].geom.grip_points().is_empty(),
+            "a Hatch has no grips of its own");
+        // …so its aux boundary must be in the target set, and must carry grips.
+        let Geom::Hatch(h) = &app.doc.dobjects[hidx].geom else { panic!() };
+        let bidx = app.doc.dobjects.iter()
+            .position(|d| d.handle == h.boundary_handles[0]).unwrap();
+        assert!(targets.contains(&bidx),
+            "the hatch's aux boundary must be a grip target so the fill is draggable");
+        let grips = app.doc.dobjects[bidx].geom.grip_points();
+        assert!(grips.len() >= 4, "expected boundary vertex grips, got {}", grips.len());
+
+        // Dragging one must reshape the fill.
+        let (gp, role) = grips[0];
+        let moved = app.doc.dobjects[bidx].geom.with_grip_moved(role, gp + Vec2::new(-5.0, -5.0));
+        app.doc.dobjects[bidx].geom = moved;
+        let loops = cad_kernel::resolve_hatch_loops(
+            match &app.doc.dobjects[hidx].geom { Geom::Hatch(h) => h, _ => unreachable!() },
+            &app.doc);
+        assert!(loops[0].iter().any(|p| p.x < -1.0 || p.y < -1.0),
+            "dragging a boundary grip must reshape the hatch's resolved loop");
+
+        // The user's own shape must NOT be dragged in as a grip target by this.
+        app.selection = vec![hidx];
+        assert!(!app.editable_grip_targets().contains(&user_idx),
+            "selecting a hatch must not expose grips on the shape the user drew");
+    }
+
+    // (a) Selecting ONLY the hatch and rotating must rotate its boundary, so the
+    // fill follows. Both stay SEPARATE dobjects — nothing is merged.
+    #[test]
+    fn rotating_a_hatch_also_rotates_its_boundary() {
+        let mut app = CadApp::default();
+        let (bidx, hidx) = doc_with_hatch(&mut app);
+        app.selection = vec![hidx];
+        app.apply_rotate(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        assert!((vertex(&app, bidx, 1) - Vec2::new(0.0, 4.0)).len() < 1e-9,
+            "boundary must rotate with the hatch: (4,0) -90°CCW-> (0,4)");
+        assert!(matches!(app.doc.dobjects[hidx].geom, Geom::Hatch(_)),
+            "the hatch stays a separate Hatch dobject (not merged)");
+    }
+
+    // (b) THE DEDUP TEST. Hatch AND its boundary both selected: the boundary must
+    // rotate exactly ONCE. Twice would land it at (-4,0) — the `seen` guard in
+    // transform_targets_with_hatch_boundaries is what prevents that.
+    #[test]
+    fn hatch_and_boundary_both_selected_rotates_boundary_once() {
+        let mut app = CadApp::default();
+        let (bidx, hidx) = doc_with_hatch(&mut app);
+        app.selection = vec![bidx, hidx];
+        app.apply_rotate(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        let got = vertex(&app, bidx, 1);
+        assert!((got - Vec2::new(0.0, 4.0)).len() < 1e-9,
+            "boundary rotated exactly ONCE; got {got:?} — (-4,0) would mean twice");
+    }
+
+    // Scale + mirror ride the same widened set.
+    #[test]
+    fn scaling_a_hatch_also_scales_its_boundary() {
+        let mut app = CadApp::default();
+        let (bidx, hidx) = doc_with_hatch(&mut app);
+        app.selection = vec![hidx];
+        app.apply_scale(Vec2::ZERO, 2.0);
+        assert!((vertex(&app, bidx, 1) - Vec2::new(8.0, 0.0)).len() < 1e-9,
+            "boundary must scale with the hatch: (4,0) -2x-> (8,0)");
+    }
+
+    #[test]
+    fn mirroring_a_hatch_in_place_also_mirrors_its_boundary() {
+        let mut app = CadApp::default();
+        let (bidx, hidx) = doc_with_hatch(&mut app);
+        app.selection = vec![hidx];
+        // Mirror across the Y axis: (4,0) -> (-4,0).
+        app.apply_mirror(Vec2::ZERO, Vec2::new(0.0, 1.0), false);
+        assert!((vertex(&app, bidx, 1) - Vec2::new(-4.0, 0.0)).len() < 1e-9,
+            "boundary must mirror with the hatch across the Y axis");
+    }
+
+    // (c) The COPY semantic is DELIBERATE and must not regress: a hatch copied
+    // alone still references the ORIGINAL boundary, so the boundary is NOT
+    // duplicated (rotate-copy clones the hatch itself and keeps its handles).
+    #[test]
+    fn rotate_copy_of_a_hatch_does_not_duplicate_the_boundary() {
+        let mut app = CadApp::default();
+        let (bidx, hidx) = doc_with_hatch(&mut app);
+        let bhandle = app.doc.dobjects[bidx].handle;
+        let before = app.doc.dobjects.len();
+        app.selection = vec![hidx];
+        app.rotate_copy = true;
+        app.apply_rotate_or_copy(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        assert_eq!(app.doc.dobjects.len(), before + 1,
+            "exactly ONE new dobject (the hatch copy) — the boundary is not copied");
+        // The copy is a Hatch still pointing at the ORIGINAL boundary handle:
+        // the copy branch clones the hatch and only re-stamps the copy's own
+        // handle — boundary handles are untouched. This is the deliberate semantic.
+        match &app.doc.dobjects[before].geom {
+            Geom::Hatch(h) => assert_eq!(h.boundary_handles, vec![bhandle],
+                "the copied hatch still references the ORIGINAL boundary"),
+            other => panic!("the copy should be a Hatch, got {other:?}"),
+        }
+        // ...and the original boundary did not move: copy leaves originals alone.
+        assert!((vertex(&app, bidx, 1) - Vec2::new(4.0, 0.0)).len() < 1e-9,
+            "rotate-COPY must not transform the original boundary in place");
+    }
+}
+
 #[cfg(test)]
 mod a_loop_inside_a_loop_is_a_hole {
     use super::*;
@@ -67748,10 +69823,13 @@ mod a_locked_layer_is_locked {
         let locked_layer = app.doc.layers.add(Layer {
             name: "LOCKED".into(), locked: true, ..Layer::layer_zero()
         });
-        app.doc.layers.active = locked_layer;
-        let locked = app.doc.push(DObject::new(Geom::Line(Line {
+        // push is a pure append now — set the layer explicitly (was: active-layer
+        // inherit via push).
+        let mut locked_d = DObject::new(Geom::Line(Line {
             a: Vec2::new(0.0, 50.0), b: Vec2::new(10.0, 50.0),
-        })));
+        }));
+        locked_d.style.layer = locked_layer;
+        let locked = app.doc.push(locked_d);
         assert_eq!(app.doc.dobjects[locked].style.layer, locked_layer, "the fixture is wired up");
         (app, free, locked)
     }

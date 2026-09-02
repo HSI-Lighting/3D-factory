@@ -163,3 +163,143 @@ the fields exist. Port upstream's `stamp_fresh_style` and call it from
   suite (`./tests/run_tests.sh`).
 - Consider the 12 GUI commands as follow-ups; each reuses the existing
   kernel module + CLI logic.
+
+## Continuation session (2026-09-01) — what got fixed
+
+Resumed on this machine; upstream at `/home/farzad/workspace/Rust/RUST-AutoRASM`
+(HEAD `b47dedc`). Items 1-5 and 8 are DONE; item 6 done except the four
+UI-panel items; item 7 done for 4 of 12 commands. All verified.
+
+- **1. snap.rs** — stale-grid candidate filter (`cand_ents.retain(< len)`) +
+  `stale_grid_indices_do_not_panic` test. (trim.rs G3 guard was already in.)
+- **2. intersect.rs** — G2 circle-circle gates use `scaled_tol(r.max)`; line-circle
+  migrated to `scaled_tol`; 4 scale-invariance tests. (G1/ellipse-ellipse already
+  in, fork even has the G7 dedup superset.)
+- **3. fillet/chamfer** — G4 `line_line` direction normalization + scale test;
+  `ChamferOut.bridge: Option<Geom>` (None at d1=d2=0) in modify.rs + fillet.rs +
+  both app.rs chamfer commits + sandbox; 2 new bridge tests. (Corner-pick rules
+  already matched upstream HEAD; layer draw-order a4590e6a was already in.)
+- **4. geom.rs** — `mirrored` negates EllipseArc start/sweep params + polyline
+  per-vertex bulge. (Wall infinite-form arm was already in.)
+- **5. document.rs** — `push` is a PURE APPEND; kernel tests updated; demo
+  objects and sketch/locked-layer tests now stamp or set layers explicitly.
+- **6. hatch (app.rs)** — `resolve_hatch_loops` delegates to
+  `cad_kernel::resolve_hatch_loops`; `dedupe_hits` + vertex-hit regression;
+  `outer_has_crossings_with_others_scoped` (dip detection + bbox fast path);
+  all 4 pattern-clip sites (families/tile/GPU/tile-GPU) use the kernel
+  `hatch_line_intervals` (per-loop pairing + XOR); `cancel_hatch_worker`
+  single-sourced (Esc, new command, spawn-replace) + worker panic→Failure;
+  `hatch_cache` invalidates in `ensure_index` (geometry, not selection);
+  `transform_targets_with_hatch_boundaries` wired into move/rotate/scale/
+  mirror in-place paths + 5 tests. NOT ported (deferred, feature-scale):
+  hover preview (e14d6ed7), boundary highlight (633a3ee9), inspector panel +
+  hatch_boundary accumulate (4aebb7b6), decoupled prompt (86ba2ded) — the
+  fork's pick-point flow commits one hatch per click with its own confirm
+  panel, so these need the accumulate infrastructure ported as a feature.
+- **7. GUI commands** — Purge, Overkill (with QueuedOp + selection flow),
+  LayerState, Ucs (incl. current_ucs/ucs_to_world/world_to_ucs/ucs_name)
+  are wired with tests. NOT ported (deferred): RevCloud, Area, QSelect,
+  Table, Xref, WBlock, Boundary, WallCleanup — each needs its GUI state
+  machine + click/prompt wiring (note: the CLI ignores these too; the
+  upstream app.rs arms are the reference).
+- **8. stamp_fresh_style** — added to app.rs and called from `add_dobject`,
+  the hatch commit, `script_commit_hatch`, and the launch demo objects
+  (paired with item 5's pure push).
+
+### Test infrastructure fix
+
+`docs/scripting_api.md` (458 lines) was missing from the fork since the
+merge — the ported pytest suite's `pyhelp`/`rasmhelp` and script tests
+failed on it (1149 failures). Restored from fork commit `71be37e`.
+`tests/test_rasm_files.py` asserted RSM version 34; the fork writes the
+renumbered VERSION 200 (merge decision) — assertion updated.
+
+### Verification (all green)
+
+- `cargo check --workspace` — 0 errors.
+- `cargo test -p cad_kernel` — 414 passed (was 406; +8 new).
+- `cargo test -p cad_app --bin simlux` — 1402 passed, 10 failed, 50 ignored;
+  the 10 are pre-existing on this machine (9× mesh_io/fbx + 1 wall-thickness
+  env `WlThk=5` issue, both documented in the 2026-08-29 summary).
+- `./tests/run_tests.sh` — 1473 passed, 0 failed.
+- Uncommitted: 9 modified files + restored `docs/scripting_api.md`.
+
+### Second continuation (2026-09-01, pm) — upstream hatch fixes imported
+
+Upstream advanced to HEAD `3d845ac` with 4 hatch commits since `b47dedc`; all
+ported (only app.rs + hatch_trace.rs touched; kernel unchanged):
+
+- **`0e5db2d`** — invisible boundaries are not pick-point candidates:
+  `collect_closed_containing_scoped` skips `!doc.is_visible(i)` (kills the
+  "2+ candidates → PARTIAL OVERLAP → slow trace → more hidden boundaries"
+  pollution loop); verdict logger mirrors the guard.
+- **`849ae94`** — boundary is always independent: `apply_hatch` now binds via
+  `materialise_hatch_boundary()` (bakes the picked shape into an invisible
+  `hatch_aux` polyline), so every path matches the trace path — hatching a
+  rectangle no longer bonds the fill to the drawn shape (owner ruling).
+  Plus post-creation instrumentation: `hatch_dbg_selection` (in
+  `click_select`) + `hatch_dbg_command_on_selection` (in `run_command_inner`)
+  log every selection/command touching a hatch or its boundary.
+- **`3d845ac`** — selecting a hatch exposes draggable grips:
+  `editable_grip_targets()` substitutes the selected hatch's aux boundary into
+  the grip-target set (grab loop now uses it); grip-drag logs which hatch an
+  aux-boundary drag reshapes. Locked-layer protection preserved.
+- **`c2ec9fe`** — process logging across the workflow: `hatch_dbg` ALWAYS
+  records (window is just a viewer); hatch_trace.rs copied wholesale (TraceDiag
+  per-stage counts/timings, typed TraceFail reasons, GapProbe at 10x/100x/1000x
+  JOIN_EPS — all additive; 18/18 tests pass); worker now calls
+  `trace_boundary_at_in_view_diag` and reports the typed failure + gap probe;
+  phase banners 1-10 via `hatch_phase`/`hatch_phase_absent` (Phase 1 in
+  `hatch_dbg_session_start`, Phase 2 pattern validation incl. UNKNOWN-pattern
+  and scale<=0 warnings, Phases 4/5/7 via `hatch_verify_last`); "💾 Save
+  Report" button writes `hatch_report.txt` (env + state + full log).
+
+Tests: 4 new (independent-boundary bake, grip exposure, aux-resolve regression
+lock earlier, plus the 3 diag tests inside hatch_trace.rs). Verification:
+`cargo check --workspace` clean; app 1409 passed / 10 pre-existing failures
+(mesh_io + env wall-thickness); kernel 414/414; hatch suites 33+18; pytest
+1473/1473.
+
+### Third continuation (2026-09-02) — text glyph fixes + hatch letters-as-shapes
+
+Upstream advanced to HEAD `cc95970` with 2 commits (hatch/text); ported:
+
+- **`ef5b8c1` text: TTF decode fix, per-entity font/bold/italic, TXTEXP**:
+  `cad_text` font.rs/lib.rs/render.rs copied wholesale (identical at base);
+  kernel text.rs copied (adds `Text::resolved_font_name`, the entity→style→
+  standard chain single source of truth); snap.rs gained the
+  `text_snaps_at_anchor` test (anchor=END/CEN/NEA/PER, no MID/QUA).
+  App: Text Style dialog font list now engine-backed (`borrow_mut().names()`,
+  type-ahead + ScrollArea — ported the section the fork still had on egui
+  builtins only); ITALIC_RAD hoisted to module const; text entity dialog
+  Variant dropdown (Regular/Bold/Italic/Bold Italic) replacing the STUB;
+  Properties panel Text section gains Font combo ((inherit) resolution via
+  `resolve_style_font`), Bold + Italic checkboxes (undo-safe props_apply);
+  TXTEXP arm in `apply_explode` — Text explodes into closed glyph-outline
+  polylines (outer + holes as separate loops); draw path routes per-entity
+  font through `resolve_text_font` (V1 egui path keeps standard/monospace
+  mapping but the resolution chain matches the engine/TXTEXP/hatch).
+- **`cc95970` hatch: glyph contours are boundary shapes**: hatch_trace.rs
+  copied wholesale (adds `TextTraceGeom`, `text_hatch_geom(doc, fm, scope)`,
+  render_explode plumbing; 22/22 tests incl. letters-as-islands, click-inside-
+  letter, real-font boundaries); app.rs gains `outer_overlaps_text[_scoped]`,
+  `resolve_style_font`, `resolve_text_font`, `text_hatch_geom`,
+  `text_hatch_loops_at`; pick-point routing defers single-outer+text-overlap
+  to the trace path (comment + `single_outer_overlaps_text`); worker snapshot
+  clones text_styles and renders glyph geometry on the main thread into
+  `text_for_thread` (passed to `trace_boundary_at_in_view_diag`); worker
+  Failure fallback gains TEXT PATH (smallest glyph loop containing the seed);
+  refactor: `hatch_bake_loops` + `commit_baked_hatch` helpers extract the
+  Success arm's bake+commit+confirm-panel code (reused by the text fallback);
+  CPU solid fill (`render_hatch_solid`) now depth-sorted even-odd painting
+  (islands-in-holes re-fill; replaces the earlier containment-parity pass —
+  the fork GPU cache path keeps `solid_loop_is_fill` since fills/holes lists
+  are order-independent).
+- Fork-absent features (hatch hover preview, hatch-region TRIM text cutters,
+  BOUNDARY-command glyph loops) — no fork equivalent to port; deferred list
+  unchanged.
+
+Tests: kernel 416 (snap text anchor + one more); app 1413 passed / 10
+pre-existing failures; hatch suites 37 + hatch_trace 22; cad_text 29; cad_io
+93; pytest 1473/1473; `cargo test --workspace --no-fail-fast` green except the
+10 known. Changes uncommitted.

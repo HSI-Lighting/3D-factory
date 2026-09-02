@@ -1417,14 +1417,21 @@ impl Geom {
                     major:  mirror_dir(ea.ellipse.major),
                     ratio:  ea.ellipse.ratio,
                 },
-                start_param: ea.start_param, sweep_param: ea.sweep_param,
+                // WP2.3 [M-P4]: the reconstructed minor axis (major'.perp()·ratio)
+                // flips sign under reflection, so param θ maps to −θ. Negate both
+                // start + sweep so the reflected endpoints are preserved and the
+                // arc sweeps the mirror-image (CW↔CCW) side — was: unchanged (wrong
+                // quadrant).
+                start_param: -ea.start_param, sweep_param: -ea.sweep_param,
             }),
             Geom::Point(pt) => Geom::Point(Point {
                 location: mirror(pt.location), style: pt.style, size: pt.size,
             }),
             Geom::Polyline(p) => Geom::Polyline(Polyline {
+                // WP1.6 [M-P1]: reflection reverses arc winding — negate every
+                // per-vertex bulge (vertex order unchanged), matching the Wall arm.
                 vertices: p.vertices.iter()
-                    .map(|v| PolyVertex { pos: mirror(v.pos), bulge: v.bulge })
+                    .map(|v| PolyVertex { pos: mirror(v.pos), bulge: -v.bulge })
                     .collect(),
                 closed: p.closed,
                 widths: p.widths.clone(),
@@ -4069,7 +4076,7 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.a.y, 2.0));
         } else { panic!() }
-        if let Geom::Line(l) = out.bridge {
+        if let Some(Geom::Line(l)) = out.bridge {
             assert!(approx_eq(l.a.x, 1.0)); assert!(approx_eq(l.a.y, 0.0));
             assert!(approx_eq(l.b.x, 0.0)); assert!(approx_eq(l.b.y, 2.0));
         } else { panic!() }

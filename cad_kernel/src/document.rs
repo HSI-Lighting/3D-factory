@@ -202,12 +202,16 @@ impl Document {
         objs + blocks + per_obj + std::mem::size_of::<Document>()
     }
 
-    pub fn push(&mut self, mut d: DObject) -> usize {
-        // If the Dobject is being added with the default Style, pull the
-        // active layer in so it inherits the user's current layer choice.
-        if d.style.layer == LayerTable::LAYER_ZERO && self.layers.active != LayerTable::LAYER_ZERO {
-            d.style.layer = self.layers.active;
-        }
+    /// PURE APPEND — add a dobject exactly as given, no styling. (§5 / WP6.1,
+    /// DOKKANDAR_MERGE_SPEC §4: the current-specs stamp + active-layer inheritance
+    /// were REMOVED from here and moved to the app-layer FRESH-DRAW commit
+    /// (`CadApp::stamp_fresh_style`, called from `add_dobject` + the hatch commit).
+    /// `push` cannot see caller intent, so it used a style-signature heuristic to
+    /// guess "fresh vs derived" — which mis-fired on a default-styled COPY, silently
+    /// re-colouring it. Copy / paste / array / mirror / file-load / block-explode /
+    /// `duplicate_dobjects` all flow through here and are now NEVER re-stamped
+    /// (AutoCAD-correct: COPY preserves the source's properties).
+    pub fn push(&mut self, d: DObject) -> usize {
         let i = self.dobjects.len();
         self.dobjects.push(d);
         i
@@ -254,7 +258,10 @@ mod tests {
     use crate::math::Vec2;
 
     #[test]
-    fn push_inherits_active_layer() {
+    fn push_is_pure_append_no_layer_inherit() {
+        // §5 / WP6.1: push no longer inherits the active layer — it's a pure
+        // append. Active-layer + current-specs now stamp at the app-layer
+        // fresh-draw commit (`CadApp::stamp_fresh_style`), not here.
         let mut doc = Document::default();
         let walls = doc.layers.add(Layer {
             name: "WALLS".into(), ..Layer::layer_zero()
@@ -263,7 +270,8 @@ mod tests {
         let i = doc.push(DObject::new(Geom::Circle(Circle {
             center: Vec2::ZERO, radius: 5.0,
         })));
-        assert_eq!(doc.dobjects[i].style.layer, walls);
+        assert_eq!(doc.dobjects[i].style.layer, LayerTable::LAYER_ZERO,
+            "push must NOT inherit the active layer any more");
     }
 
     #[test]
@@ -272,10 +280,10 @@ mod tests {
         let hidden = doc.layers.add(Layer {
             name: "HIDDEN".into(), visible: false, ..Layer::layer_zero()
         });
-        doc.layers.active = hidden;
-        let i = doc.push(DObject::new(Geom::Circle(Circle {
-            center: Vec2::ZERO, radius: 5.0,
-        })));
+        // push is pure now — set the layer explicitly (was: active-layer inherit).
+        let mut d = DObject::new(Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 }));
+        d.style.layer = hidden;
+        let i = doc.push(d);
         assert!(!doc.is_visible(i));
         assert!(!doc.is_selectable(i));
     }
@@ -286,10 +294,9 @@ mod tests {
         let locked = doc.layers.add(Layer {
             name: "LOCKED".into(), locked: true, ..Layer::layer_zero()
         });
-        doc.layers.active = locked;
-        let i = doc.push(DObject::new(Geom::Circle(Circle {
-            center: Vec2::ZERO, radius: 5.0,
-        })));
+        let mut d = DObject::new(Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 }));
+        d.style.layer = locked;
+        let i = doc.push(d);
         assert!(doc.is_visible(i));
         assert!(!doc.is_selectable(i));
     }

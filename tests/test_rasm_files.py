@@ -43,8 +43,9 @@ def test_save_rsm_writes_valid_binary(cadcli, tmp_path):
     data = path.read_bytes()
     info = rsm_reader.read_rsm(data)
     # The plan expected "version u16 = 1"; the writer emits the current
-    # VERSION constant (cad_io/src/rsm.rs) — asserted as-is.
-    assert info["version"] == 34
+    # VERSION constant (cad_io/src/rsm.rs) — asserted as-is. The SIMLUX fork
+    # renumbered its merged format to VERSION 200 (2026-08-29 merge decision).
+    assert info["version"] == 200
     assert info["dobject_count"] == 2
     # geom tags: 0 = Line, 1 = Circle
     assert info["first_geom_tag"] == 0

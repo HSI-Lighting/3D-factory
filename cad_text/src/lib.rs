@@ -50,6 +50,12 @@ pub struct RenderedGlyphs {
     /// caller closes it). Used to anti-alias the fill edge and to draw
     /// outline-mode / bold strokes with proper joins.
     pub outlines: Vec<Vec<Vec2>>,
+    /// Per-glyph closed polygon loops in WORLD space: `(outer, holes)` — one
+    /// entry per glyph. The outer contour plus its (possibly empty) hole
+    /// contours, classified by containment. This is the geometry TXTEXP turns
+    /// into closed Polyline dobjects; hatch island resolution works on the
+    /// loops unchanged.
+    pub glyph_polygons: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)>,
     /// World-space bounding box `(min, max)` of the rendered text
     /// (`(ZERO, ZERO)` for empty input).
     pub bbox: (Vec2, Vec2),
@@ -65,6 +71,7 @@ impl Default for RenderedGlyphs {
         RenderedGlyphs {
             fills: Vec::new(),
             outlines: Vec::new(),
+            glyph_polygons: Vec::new(),
             bbox: (Vec2::ZERO, Vec2::ZERO),
             advance: 0.0,
         }
@@ -127,8 +134,10 @@ impl FontManager {
     }
 
     /// Family names available to the picker (sorted, original case). Includes
-    /// the embedded fonts, so an RTL-capable font is always offered.
-    pub fn names(&self) -> Vec<String> {
+    /// the embedded fonts, so an RTL-capable font is always offered. The list
+    /// is cached (no per-call sort/alloc) and the first call also scans any
+    /// `.ttc`/`.otc` collections deferred from the startup scan.
+    pub fn names(&mut self) -> &[String] {
         self.index.names()
     }
 
@@ -143,20 +152,31 @@ impl FontManager {
     /// only when the string is empty or a font fails to parse (never because
     /// of a missing font).
     pub fn render(&mut self, req: &TextRequest<'_>) -> RenderedGlyphs {
+        self.render_with(req, false)
+    }
+
+    /// Render for TXTEXP — additionally fills `RenderedGlyphs.glyph_polygons`
+    /// (world-space outer + hole loops per glyph). The per-frame text render
+    /// path skips that work; only the one-shot explode command needs it.
+    pub fn render_explode(&mut self, req: &TextRequest<'_>) -> RenderedGlyphs {
+        self.render_with(req, true)
+    }
+
+    fn render_with(&mut self, req: &TextRequest<'_>, want_polygons: bool) -> RenderedGlyphs {
         let source = self.index.resolve(req.font_name);
         // Lazily load + parse the font on first use; cache success OR failure so
         // we don't re-read a bad file every frame.
         if !self.loaded.contains_key(&source) {
             let renderer = match &source {
-                FontSource::Path(p) => std::fs::read(p)
+                FontSource::Path(p, idx) => std::fs::read(p)
                     .ok()
-                    .and_then(TextRenderer::from_bytes),
+                    .and_then(|b| TextRenderer::from_bytes_with_index(b, *idx)),
                 FontSource::Embedded(bytes) => TextRenderer::from_bytes(bytes.to_vec()),
             };
             self.loaded.insert(source.clone(), renderer);
         }
         match self.loaded.get_mut(&source) {
-            Some(Some(r)) => r.render(req),
+            Some(Some(r)) => r.render_with_polygons(req, want_polygons),
             _ => RenderedGlyphs::default(),
         }
     }
@@ -234,7 +254,7 @@ mod tests {
     fn embedded_fonts_make_engine_always_ready() {
         // The embedded Liberation Sans + DejaVu Sans ship with the crate, so
         // the engine is ready even on a machine with ZERO installed fonts.
-        let fm = FontManager::new();
+        let mut fm = FontManager::new();
         assert!(fm.is_ready());
         let names = fm.names();
         assert!(

@@ -200,6 +200,21 @@ impl Text {
         let dy = (min.y - local.y).max(0.0).max(local.y - max.y);
         (dx * dx + dy * dy).sqrt()
     }
+
+    /// Font family this text renders with: its explicit `font_name`, else its
+    /// style's font, else `"standard"`. ONE source of truth — the renderer,
+    /// TXTEXP, and hatch boundary tracing all go through this so the fallback
+    /// chain can never drift apart.
+    pub fn resolved_font_name(&self, styles: &TextStyleTable) -> String {
+        if !self.font_name.is_empty() {
+            self.font_name.clone()
+        } else {
+            styles
+                .get(self.style)
+                .map(|s| s.font_name.clone())
+                .unwrap_or_else(|| "standard".to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,5 +451,30 @@ mod tests {
         // Width = 2 chars * 2.0 * 0.6 = 2.4; centred → -1.2 .. +1.2
         assert!((min.x + 1.2).abs() < 1e-9);
         assert!((max.x - 1.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resolved_font_name_chain() {
+        // Explicit entity font wins; else style font; else "standard".
+        let mut styles = TextStyleTable::with_defaults();
+        styles.styles[0].font_name = "style font".into();
+        styles.add(TextStyle {
+            name: "S2".into(),
+            font_name: "another".into(),
+            ..TextStyle::standard()
+        });
+
+        let mut t = Text::empty();
+        assert_eq!(t.resolved_font_name(&styles), "style font");
+
+        t.font_name = "explicit".into();
+        assert_eq!(t.resolved_font_name(&styles), "explicit");
+
+        t.font_name = String::new();
+        t.style = 1;
+        assert_eq!(t.resolved_font_name(&styles), "another");
+
+        t.style = 99; // dangling style → "standard"
+        assert_eq!(t.resolved_font_name(&styles), "standard");
     }
 }

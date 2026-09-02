@@ -562,8 +562,11 @@ pub fn fillet_lines(
 pub struct ChamferOut {
     pub g1_new: Geom,
     pub g2_new: Geom,
-    /// The chamfer line itself, connecting the two tangent points.
-    pub bridge: Geom,
+    /// The chamfer line connecting the two tangent points. `None` when both
+    /// distances are ~0 — the two objects just meet at the sharp corner and the
+    /// bridge would be a zero-length line (mirrors `FilletOut::arc == None` for
+    /// radius 0). Consumers must skip a `None` bridge.
+    pub bridge: Option<Geom>,
 }
 
 /// Chamfer two lines with distances `d1` along L1 and `d2` along L2 from the
@@ -603,9 +606,16 @@ pub fn chamfer_lines(
 
     let tp1 = i_pt + dir1 * d1;
     let tp2 = i_pt + dir2 * d2;
+    // A zero-length bridge (both distances ~0 → tp1 == tp2 == corner) is a
+    // clean sharp corner, not a chamfer — emit no bridge segment.
+    let bridge = if (tp1 - tp2).len() < EPS {
+        None
+    } else {
+        Some(Geom::Line(Line { a: tp1, b: tp2 }))
+    };
     Ok(ChamferOut {
         g1_new: Geom::Line(Line { a: endpoint_of_l1, b: tp1 }),
         g2_new: Geom::Line(Line { a: tp2, b: endpoint_of_l2 }),
-        bridge: Geom::Line(Line { a: tp1, b: tp2 }),
+        bridge,
     })
 }

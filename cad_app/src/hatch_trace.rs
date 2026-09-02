@@ -93,6 +93,134 @@ pub const JOIN_EPS: f64 = 1e-4;
 /// density (32-64 per curve), so hitting the cap = malformed input.
 const MAX_TRACE_STEPS: usize = 8192;
 
+// ===========================================================================
+//  DIAGNOSTICS  (HATCH_DEBUG §3 — "Boundary detection is the most critical
+//  phase; most failures occur here", and this module used to report a bare
+//  `Option` with the reason discarded.)
+//
+//  `TraceDiag` records one number per pipeline stage plus a typed failure
+//  reason, so a trace that returns nothing can still say WHY. Filled by the
+//  `*_diag` entry points; the plain entry points are unchanged and cost
+//  nothing extra.
+// ===========================================================================
+
+/// Why a boundary trace produced no result. Ordered by pipeline stage, so
+/// the variant alone tells you how far the trace got.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraceFail {
+    /// Esc / a superseding command cancelled the walk mid-flight.
+    Cancelled,
+    /// Nothing tessellated — the scope held no boundary-capable geometry.
+    NoSegments,
+    /// The +X ray from the seed crossed no surviving segment. Either the
+    /// seed is outside every closed region, or every candidate edge was
+    /// pruned as a dangle (an open stub, not part of any cycle).
+    NoRayHits { pruned_dangles: usize },
+    /// Rays hit edges, but no walk closed back on its start cluster. This
+    /// is the classic "boundary has a gap" signature — see `gap_probe`.
+    NoClosedLoop { hits_tried: usize },
+    /// Loops closed, but none of them contains the seed point.
+    NoLoopContainsSeed { loops_found: usize },
+}
+
+impl TraceFail {
+    /// One-line user-facing explanation, phrased as something actionable
+    /// rather than as an internal state name.
+    pub fn describe(&self) -> String {
+        match self {
+            TraceFail::Cancelled =>
+                "cancelled".into(),
+            TraceFail::NoSegments =>
+                "no boundary geometry in range (nothing to trace)".into(),
+            TraceFail::NoRayHits { pruned_dangles } => format!(
+                "the click is not enclosed by any edge ({} open stub(s) pruned)",
+                pruned_dangles),
+            TraceFail::NoClosedLoop { hits_tried } => format!(
+                "edges found but none form a CLOSED loop — {} start point(s) tried \
+                 (a gap in the boundary is the usual cause)", hits_tried),
+            TraceFail::NoLoopContainsSeed { loops_found } => format!(
+                "{} closed loop(s) found, but the click is inside none of them",
+                loops_found),
+        }
+    }
+}
+
+/// Result of re-running clustering at a looser tolerance after a failure.
+/// This is the diagnostic half of AutoCAD's HPGAPTOL: we do not silently
+/// bridge gaps, but we can tell the user the boundary WOULD have closed at
+/// tolerance `eps`, which turns a dead end into an instruction.
+#[derive(Debug, Clone)]
+pub struct GapProbe {
+    /// The endpoint-join tolerance at which a closed loop appeared.
+    pub eps: f64,
+    /// How many times larger than the default `JOIN_EPS` that is.
+    pub factor: f64,
+}
+
+/// Per-stage counts and timings for one trace attempt.
+#[derive(Debug, Clone, Default)]
+pub struct TraceDiag {
+    pub scope_dobjects:   usize,
+    pub raw_segments:     usize,
+    pub split_segments:   usize,
+    pub clusters:         usize,
+    pub dangles_pruned:   usize,
+    pub ray_hits:         usize,
+    pub hits_deduped:     usize,
+    pub loops_closed:     usize,
+    pub loops_degenerate: usize,
+    pub loops_duplicate:  usize,
+    pub outer_verts:      usize,
+    pub islands:          usize,
+    pub islands_augmented: usize,
+    pub ms_tessellate:    f64,
+    pub ms_split:         f64,
+    pub ms_trace:         f64,
+    pub ms_total:         f64,
+    pub fail:             Option<TraceFail>,
+    pub gap_probe:        Option<GapProbe>,
+}
+
+impl TraceDiag {
+    /// Render as log lines, one stage per line. Read top-to-bottom this is
+    /// the whole boundary-detection story for a single click.
+    pub fn lines(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        v.push(format!(
+            "  [3] tessellate   : {} dobject(s) in scope -> {} segment(s)   {:.1} ms",
+            self.scope_dobjects, self.raw_segments, self.ms_tessellate));
+        v.push(format!(
+            "  [3] split@isect  : {} -> {} segment(s)   {:.1} ms",
+            self.raw_segments, self.split_segments, self.ms_split));
+        v.push(format!(
+            "  [3] cluster      : {} node(s) @ JOIN_EPS={:e}",
+            self.clusters, JOIN_EPS));
+        v.push(format!(
+            "  [3] prune dangles: {} segment(s) removed (open stubs)",
+            self.dangles_pruned));
+        v.push(format!(
+            "  [3] ray cast +X  : {} hit(s), {} after dedupe",
+            self.ray_hits, self.hits_deduped));
+        v.push(format!(
+            "  [4] walk loops   : {} closed, {} degenerate(<3v), {} duplicate",
+            self.loops_closed, self.loops_degenerate, self.loops_duplicate));
+        match &self.fail {
+            None => v.push(format!(
+                "  [4] classify     : outer {} verts, {} island(s) ({} added by doc sweep)",
+                self.outer_verts, self.islands, self.islands_augmented)),
+            Some(f) => v.push(format!("  [9] FAILED       : {}", f.describe())),
+        }
+        if let Some(g) = &self.gap_probe {
+            v.push(format!(
+                "  [9] gap probe    : boundary WOULD close at tolerance {:e} ({}x the \
+                 default) — there is a gap of roughly that size in the outline",
+                g.eps, g.factor as i64));
+        }
+        v.push(format!("  [3] total        : {:.1} ms", self.ms_total));
+        v
+    }
+}
+
 /// One short straight segment from the doc-wide tessellation. Carries
 /// the source dobject's index so future refinements (intersection-
 /// splitting, reuse-existing-boundary mode) can attribute each segment
@@ -103,6 +231,99 @@ pub struct TessSeg {
     pub b:   Vec2,
     #[allow(dead_code)]
     pub src: usize,
+}
+
+/// Glyph boundary geometry for TEXT dobjects. The APP renders this via the
+/// cad_text engine (this module has no FontManager access) and passes it
+/// into the trace pipeline — each letter's closed contours join the boundary
+/// graph, so a letter is a shape like any other closed geometry.
+///
+/// `segs` all share ONE `src` per text entity, so `split_at_intersections`
+/// never splits letter-letter overlaps WITHIN one entity — connected
+/// Persian/Arabic glyphs that overlap/interlock trace as whole letters
+/// instead of decomposing into overlapping-face subdivisions.
+#[derive(Default, Clone)]
+pub struct TextTraceGeom {
+    /// Flattened glyph-contour segments (closed chains), `src` = entity idx.
+    pub segs: Vec<TessSeg>,
+    /// Per-glyph `(outer, holes)` closed loops in world space — grouped so
+    /// callers can pick "the glyph containing the seed" with its counters.
+    pub glyphs: Vec<(Vec<Vec2>, Vec<Vec<Vec2>>)>,
+}
+
+/// Render every visible Text dobject in `scope` into `TextTraceGeom`.
+/// Skips empty strings and unusable fonts (their glyphs simply produce no
+/// contours). One-off cost per trace run — the same order as rendering the
+/// text once.
+pub fn text_hatch_geom(
+    doc: &Document,
+    fm: &mut cad_text::FontManager,
+    scope: &[usize],
+) -> TextTraceGeom {
+    let mut out = TextTraceGeom::default();
+    for &i in scope {
+        let Some(d) = doc.dobjects.get(i) else { continue };
+        if !d.style.visible {
+            continue;
+        }
+        let Geom::Text(t) = &d.geom else { continue };
+        if t.text.trim().is_empty() {
+            continue;
+        }
+        let font = t.resolved_font_name(&doc.text_styles);
+        let req = cad_text::TextRequest {
+            text: &t.text,
+            font_name: &font,
+            position: t.position,
+            height: t.height,
+            angle: t.angle,
+            h_align: t.h_align,
+            v_align: t.v_align,
+            fill_mode: cad_text::FillMode::Fill,
+            slant: t.oblique,
+            x_scale: t.width_factor,
+        };
+        let glyphs = fm.render_explode(&req);
+        for (outer, holes) in glyphs.glyph_polygons {
+            if outer.len() < 3 {
+                continue;
+            }
+            push_loop_segs(&mut out.segs, i, &outer);
+            let g_outer = closed_loop(&outer);
+            let mut g_holes: Vec<Vec<Vec2>> = Vec::with_capacity(holes.len());
+            for h in &holes {
+                if h.len() < 3 {
+                    continue;
+                }
+                push_loop_segs(&mut out.segs, i, h);
+                g_holes.push(closed_loop(h));
+            }
+            out.glyphs.push((g_outer, g_holes));
+        }
+    }
+    out
+}
+
+/// Append a closed contour's edges to the segment soup. The flattening does
+/// NOT repeat the first vertex, so the closing edge wraps modulo n.
+fn push_loop_segs(out: &mut Vec<TessSeg>, src: usize, pts: &[Vec2]) {
+    let n = pts.len();
+    if n < 3 {
+        return;
+    }
+    for k in 0..n {
+        out.push(TessSeg { a: pts[k], b: pts[(k + 1) % n], src });
+    }
+}
+
+/// A closed loop with the first vertex repeated at the end (the convention
+/// the island-augment sweep and PIP helpers expect).
+fn closed_loop(pts: &[Vec2]) -> Vec<Vec2> {
+    let mut v = pts.to_vec();
+    if v.len() >= 2 && (v[0] - v[v.len() - 1]).len() > 1e-9 {
+        v.push(v[0]);
+    }
+    v
 }
 
 /// Per-cluster adjacency: list of (segment_index, other_cluster_id,
@@ -359,11 +580,23 @@ pub fn cluster_endpoints_cancellable(
     segs: &[TessSeg],
     cancel: &AtomicBool,
 ) -> (Vec<(usize, usize)>, Vec<Vec2>) {
+    cluster_endpoints_eps(segs, cancel, JOIN_EPS)
+}
+
+/// Clustering with an EXPLICIT join tolerance. Identical to
+/// `cluster_endpoints_cancellable` (which delegates here with `JOIN_EPS`);
+/// separated so the gap probe can re-run the graph build at a looser
+/// tolerance and report whether the boundary would have closed.
+pub fn cluster_endpoints_eps(
+    segs: &[TessSeg],
+    cancel: &AtomicBool,
+    eps: f64,
+) -> (Vec<(usize, usize)>, Vec<Vec2>) {
     let mut centres: Vec<Vec2> = Vec::new();
     let mut endpoints: Vec<(usize, usize)> = Vec::with_capacity(segs.len());
     let find_or_add = |p: Vec2, centres: &mut Vec<Vec2>| -> usize {
         for (i, c) in centres.iter().enumerate() {
-            if (*c - p).len() < JOIN_EPS { return i; }
+            if (*c - p).len() < eps { return i; }
         }
         centres.push(p);
         centres.len() - 1
@@ -656,33 +889,23 @@ pub struct TracedBoundary {
 }
 
 /// Full BPOLY pipeline. Returns `None` if no closed boundary surrounds
-/// the seed, or if every trace attempt failed.
-pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
-    let raw = tessellate_doc(doc);
+/// the seed, or if every trace attempt failed. `text` carries glyph
+/// contours for text dobjects (letters are shapes like any closed geometry).
+pub fn trace_boundary_at(
+    doc: &Document,
+    seed: Vec2,
+    text: &TextTraceGeom,
+) -> Option<TracedBoundary> {
+    let mut raw = tessellate_doc(doc);
+    raw.extend(text.segs.iter().copied());
     let mut tb = trace_boundary_from_raw(raw, seed)?;
     let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
     augment_islands_from_closed_dobjects(doc, &scope, seed, &mut tb);
+    augment_islands_from_text(text, seed, &mut tb);
     Some(tb)
 }
 
-/// Viewport-scoped variant — tessellates ONLY dobjects whose indices
-/// are in `scope` (typically a spatial-index query result for the
-/// visible world bbox). At 400k+ dobjects with ~50 visible, this
-/// makes the trace tractable; without it the trace tessellates all
-/// 400k and the worker thread runs effectively forever.
-pub fn trace_boundary_at_in_view(
-    doc:   &Document,
-    scope: &[usize],
-    seed:  Vec2,
-) -> Option<TracedBoundary> {
-    let never = never_cancelled();
-    let raw = tessellate_doc_in_view_cancellable(doc, scope, &never);
-    let mut tb = trace_boundary_from_raw(raw, seed)?;
-    augment_islands_from_closed_dobjects(doc, scope, seed, &mut tb);
-    Some(tb)
-}
-
-/// Cancellable variant of `trace_boundary_at_in_view`. Used by the
+/// Cancellable variant of the viewport-scoped trace. Used by the
 /// async worker thread — checks the cancel flag between phases so
 /// the user's Esc actually fires mid-op.
 pub fn trace_boundary_at_in_view_cancellable(
@@ -690,19 +913,80 @@ pub fn trace_boundary_at_in_view_cancellable(
     scope:  &[usize],
     seed:   Vec2,
     cancel: &AtomicBool,
+    text:   &TextTraceGeom,
 ) -> Option<TracedBoundary> {
-    let raw = tessellate_doc_in_view_cancellable(doc, scope, cancel);
-    if cancelled(cancel) { return None; }
+    trace_boundary_at_in_view_diag(doc, scope, seed, cancel, text).0
+}
+
+/// INSTRUMENTED twin of `trace_boundary_at_in_view_cancellable`: same
+/// pipeline, same result, but it also returns a `TraceDiag` carrying a
+/// count per stage, per-stage timings, a typed failure reason, and — when
+/// the walk failed — a gap probe saying whether a looser join tolerance
+/// would have closed the boundary.
+///
+/// This exists because boundary detection is where hatch failures happen
+/// and the plain entry point can only answer "no" with no explanation.
+pub fn trace_boundary_at_in_view_diag(
+    doc:    &Document,
+    scope:  &[usize],
+    seed:   Vec2,
+    cancel: &AtomicBool,
+    text:   &TextTraceGeom,
+) -> (Option<TracedBoundary>, TraceDiag) {
+    use std::time::Instant;
+    let t0 = Instant::now();
+    let mut diag = TraceDiag { scope_dobjects: scope.len(), ..Default::default() };
+
+    let mut raw = tessellate_doc_in_view_cancellable(doc, scope, cancel);
+    raw.extend(text.segs.iter().copied());
+    diag.raw_segments = raw.len();
+    diag.ms_tessellate = t0.elapsed().as_secs_f64() * 1000.0;
+    if cancelled(cancel) { diag.fail = Some(TraceFail::Cancelled); return (None, diag); }
+    if raw.is_empty()    { diag.fail = Some(TraceFail::NoSegments); return (None, diag); }
+
+    let t1 = Instant::now();
     let segs = split_at_intersections_cancellable(&raw, cancel);
-    if cancelled(cancel) { return None; }
-    let mut tb = trace_boundary_from_segs(segs, seed)?;
-    // Ray-cast tracing only discovers loops that the +X ray actually
-    // crosses. Closed primitives that sit above/below the seed's
-    // horizontal ray (and therefore aren't hit) get silently missed
-    // as islands. Sweep the doc once more for closed dobjects fully
-    // contained in the traced outer and add them.
+    diag.split_segments = segs.len();
+    diag.ms_split = t1.elapsed().as_secs_f64() * 1000.0;
+    if cancelled(cancel) { diag.fail = Some(TraceFail::Cancelled); return (None, diag); }
+
+    let t2 = Instant::now();
+    let tb = trace_boundary_from_segs_diag(segs.clone(), seed, &mut diag);
+    diag.ms_trace = t2.elapsed().as_secs_f64() * 1000.0;
+
+    let mut tb = match tb {
+        Some(tb) => tb,
+        None => {
+            // The boundary did not close. Re-run the graph build at looser
+            // join tolerances and report the first one that DOES close —
+            // the diagnostic half of a gap tolerance (we never bridge the
+            // gap silently, we just name it).
+            if matches!(diag.fail, Some(TraceFail::NoClosedLoop { .. })
+                                 | Some(TraceFail::NoRayHits { .. })) {
+                for factor in [10.0_f64, 100.0, 1000.0] {
+                    if cancelled(cancel) { break; }
+                    let mut probe = TraceDiag::default();
+                    if trace_from_segs_at_eps(&segs, seed, JOIN_EPS * factor, &mut probe)
+                        .is_some()
+                    {
+                        diag.gap_probe = Some(GapProbe {
+                            eps: JOIN_EPS * factor, factor });
+                        break;
+                    }
+                }
+            }
+            diag.ms_total = t0.elapsed().as_secs_f64() * 1000.0;
+            return (None, diag);
+        }
+    };
+    let before = tb.islands.len();
     augment_islands_from_closed_dobjects(doc, scope, seed, &mut tb);
-    Some(tb)
+    augment_islands_from_text(text, seed, &mut tb);
+    diag.islands_augmented = tb.islands.len().saturating_sub(before);
+    diag.outer_verts = tb.outer.len();
+    diag.islands = tb.islands.len();
+    diag.ms_total = t0.elapsed().as_secs_f64() * 1000.0;
+    (Some(tb), diag)
 }
 
 /// Approximate a single closed kernel dobject as a polygon. Used for
@@ -809,6 +1093,28 @@ fn augment_islands_from_closed_dobjects(
         // based trace handle that case rather than over-cutting.
         if !poly.iter().all(|v| point_in_polygon(*v, &tb.outer)) { continue; }
         tb.islands.push(poly);
+    }
+}
+
+/// Island sweep over the text glyph loops — same rules as the closed-dobject
+/// sweep. Every glyph OUTER inside the traced outer that doesn't contain the
+/// seed becomes an island (a letter punched out of the hatch). Glyph HOLES
+/// are swept too: a counter inside a letter island is a hole-in-hole, so
+/// even-odd fill re-fills it — exactly like a donut.
+fn augment_islands_from_text(text: &TextTraceGeom, seed: Vec2, tb: &mut TracedBoundary) {
+    let (omin, omax) = polygon_bbox(&tb.outer);
+    for (outer, holes) in &text.glyphs {
+        for poly in std::iter::once(outer).chain(holes.iter()) {
+            let (pmin, pmax) = polygon_bbox(poly);
+            if pmin.x < omin.x - JOIN_EPS || pmin.y < omin.y - JOIN_EPS
+                || pmax.x > omax.x + JOIN_EPS || pmax.y > omax.y + JOIN_EPS
+            { continue; }
+            if point_in_polygon(seed, poly) { continue; }
+            if tb.islands.iter().any(|i| polygons_equivalent(i, poly)) { continue; }
+            if polygons_equivalent(&tb.outer, poly) { continue; }
+            if !poly.iter().all(|v| point_in_polygon(*v, &tb.outer)) { continue; }
+            tb.islands.push(poly.clone());
+        }
     }
 }
 
@@ -949,6 +1255,104 @@ fn trace_boundary_from_segs(segs: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoun
     Some(TracedBoundary { outer, islands })
 }
 
+/// Diag-filling twin of `trace_boundary_from_segs` at the DEFAULT join
+/// tolerance. Records a count for every stage and, on failure, the typed
+/// reason. Behaviour is identical to the plain version.
+fn trace_boundary_from_segs_diag(
+    segs: Vec<TessSeg>,
+    seed: Vec2,
+    diag: &mut TraceDiag,
+) -> Option<TracedBoundary> {
+    trace_from_segs_at_eps(&segs, seed, JOIN_EPS, diag)
+}
+
+/// The instrumented walk, parameterised by join tolerance so the gap probe
+/// can re-run it at a looser `eps`. Mirrors `trace_boundary_from_segs`
+/// step for step; the only additions are the `diag` counters.
+fn trace_from_segs_at_eps(
+    segs: &[TessSeg],
+    seed: Vec2,
+    eps: f64,
+    diag: &mut TraceDiag,
+) -> Option<TracedBoundary> {
+    if segs.is_empty() {
+        diag.fail = Some(TraceFail::NoSegments);
+        return None;
+    }
+    let never = never_cancelled();
+    let (endpoints, cluster_pos) = cluster_endpoints_eps(segs, &never, eps);
+    diag.clusters = cluster_pos.len();
+    let mut adj = build_adjacency(segs, &endpoints, cluster_pos.len());
+    let dead = prune_dangles(&mut adj, segs.len());
+    diag.dangles_pruned = dead.iter().filter(|d| **d).count();
+
+    let hits = ray_cast_horiz(seed, segs);
+    let hits: Vec<(f64, usize, Vec2)> = hits.into_iter()
+        .filter(|(_, sidx, _)| !dead[*sidx])
+        .collect();
+    diag.ray_hits = hits.len();
+    if hits.is_empty() {
+        diag.fail = Some(TraceFail::NoRayHits { pruned_dangles: diag.dangles_pruned });
+        return None;
+    }
+
+    let mut seen_hits: Vec<Vec2> = Vec::new();
+    let hits_deduped: Vec<&(f64, usize, Vec2)> = hits.iter().filter(|(_, _, p)| {
+        if seen_hits.iter().any(|s| (*s - *p).len() < 1e-6) { false }
+        else { seen_hits.push(*p); true }
+    }).collect();
+    diag.hits_deduped = hits_deduped.len();
+
+    let mut traced: Vec<Vec<Vec2>> = Vec::new();
+    for &&(_, seg_idx, _) in &hits_deduped {
+        let (a_id, b_id) = endpoints[seg_idx];
+        let start_cluster =
+            if cluster_pos[a_id].y < cluster_pos[b_id].y { a_id } else { b_id };
+        let Some(loop_verts) = trace_loop(
+            seg_idx, start_cluster, segs, &endpoints, &adj, &cluster_pos)
+        else { continue; };                       // walk never closed
+        if loop_verts.len() < 3 { diag.loops_degenerate += 1; continue; }
+        if traced.iter().any(|t| polygons_equivalent(t, &loop_verts)) {
+            diag.loops_duplicate += 1; continue;
+        }
+        traced.push(loop_verts);
+    }
+    diag.loops_closed = traced.len();
+    if traced.is_empty() {
+        diag.fail = Some(TraceFail::NoClosedLoop { hits_tried: hits_deduped.len() });
+        return None;
+    }
+
+    let mut outer_idx: Option<usize> = None;
+    let mut outer_area = f64::INFINITY;
+    for (i, t) in traced.iter().enumerate() {
+        if !point_in_polygon(seed, t) { continue; }
+        let area = polygon_signed_area(t).abs();
+        if area < outer_area { outer_area = area; outer_idx = Some(i); }
+    }
+    let Some(outer_idx) = outer_idx else {
+        diag.fail = Some(TraceFail::NoLoopContainsSeed { loops_found: traced.len() });
+        return None;
+    };
+    let outer = traced[outer_idx].clone();
+    let (omin, omax) = polygon_bbox(&outer);
+    let mut islands: Vec<Vec<Vec2>> = Vec::new();
+    for (i, t) in traced.iter().enumerate() {
+        if i == outer_idx { continue; }
+        let (tmin, tmax) = polygon_bbox(t);
+        let inside_bbox = tmin.x >= omin.x - eps && tmin.y >= omin.y - eps
+                       && tmax.x <= omax.x + eps && tmax.y <= omax.y + eps;
+        if !inside_bbox { continue; }
+        if point_in_polygon(seed, t) { continue; }
+        if !t.iter().any(|v| point_in_polygon(*v, &outer)) { continue; }
+        if islands.iter().any(|x| polygons_equivalent(x, t)) { continue; }
+        islands.push(t.clone());
+    }
+    diag.outer_verts = outer.len();
+    diag.islands = islands.len();
+    Some(TracedBoundary { outer, islands })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,7 +1376,7 @@ mod tests {
             Line { a: Vec2::new(10.0, 10.0), b: Vec2::new(0.0, 10.0) }.into(),
             Line { a: Vec2::new(0.0, 10.0), b: Vec2::new(0.0, 0.0) }.into(),
         ]);
-        let tb = trace_boundary_at(&doc, Vec2::new(5.0, 5.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(5.0, 5.0), &TextTraceGeom::default())
             .expect("must trace 4-line square");
         let area = polygon_signed_area(&tb.outer).abs();
         assert!((area - 100.0).abs() < 1e-3, "expected ~100, got {}", area);
@@ -999,7 +1403,7 @@ mod tests {
             Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
         ]);
         // Seed inside square but to the LEFT of the circle
-        let tb = trace_boundary_at(&doc, Vec2::new(3.0, 10.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(3.0, 10.0), &TextTraceGeom::default())
             .expect("must trace outer + island");
         let outer_area = polygon_signed_area(&tb.outer).abs();
         assert!((outer_area - 400.0).abs() < 1e-2,
@@ -1025,7 +1429,7 @@ mod tests {
             Circle { center: Vec2::new(10.0, 10.0), radius: 3.0 }.into(),
         ]);
         // Seed at circle centre
-        let tb = trace_boundary_at(&doc, Vec2::new(10.0, 10.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(10.0, 10.0), &TextTraceGeom::default())
             .expect("must trace circle as outer");
         let area = polygon_signed_area(&tb.outer).abs();
         let circle_area_approx = std::f64::consts::PI * 3.0 * 3.0;
@@ -1041,7 +1445,7 @@ mod tests {
         let doc = doc_from(vec![
             Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }.into(),
         ]);
-        assert!(trace_boundary_at(&doc, Vec2::new(5.0, 100.0)).is_none());
+        assert!(trace_boundary_at(&doc, Vec2::new(5.0, 100.0), &TextTraceGeom::default()).is_none());
     }
 
     /// The partial-overlap case the user's log surfaced: two circles
@@ -1056,7 +1460,7 @@ mod tests {
         ]);
         // Seed in the lens (between the two centres, on the x-axis
         // both circles cover this point)
-        let tb = trace_boundary_at(&doc, Vec2::new(4.0, 0.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(4.0, 0.0), &TextTraceGeom::default())
             .expect("must trace the lens region between two overlapping circles");
         let area = polygon_signed_area(&tb.outer).abs();
         let single_circle_area = std::f64::consts::PI * 100.0;
@@ -1078,7 +1482,7 @@ mod tests {
             Circle { center: Vec2::new( 0.0,  3.0), radius: 6.0 }.into(),
         ]);
         // Seed at the centroid — inside all three circles
-        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 0.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 0.0), &TextTraceGeom::default())
             .expect("must trace the 3-circle common region");
         let area = polygon_signed_area(&tb.outer).abs();
         let single_circle_area = std::f64::consts::PI * 36.0;
@@ -1103,7 +1507,7 @@ mod tests {
             Line { a: Vec2::new(-15.0, 0.0), b: Vec2::new(15.0, 0.0) }.into(),
         ]);
         // Seed in the lower half.
-        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0), &TextTraceGeom::default())
             .expect("must trace lower half-disc despite outside-the-circle line stubs");
         let area = polygon_signed_area(&tb.outer).abs();
         let full_disc = std::f64::consts::PI * 100.0;
@@ -1123,7 +1527,7 @@ mod tests {
             Line { a: Vec2::new(-15.0,  3.0), b: Vec2::new(15.0, -3.0) }.into(),
         ]);
         // Seed in the small region just above the X crossing.
-        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 5.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 5.0), &TextTraceGeom::default())
             .expect("must trace a chord-bounded region of the disc");
         let area = polygon_signed_area(&tb.outer).abs();
         let full_disc = std::f64::consts::PI * 100.0;
@@ -1146,7 +1550,7 @@ mod tests {
         ]);
         // Seed in the lower half — its +X ray (y=-5) never reaches
         // the island at y∈[8,12].
-        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0))
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, -5.0), &TextTraceGeom::default())
             .expect("must trace outer disc");
         assert!(!tb.islands.is_empty(),
             "island above the seed's ray must still appear in tb.islands; got {} islands",
@@ -1227,7 +1631,7 @@ mod tests {
         let full = std::f64::consts::PI * 900.0;
         for seed in [Vec2::new(0.0, 10.0), Vec2::new(0.0, -10.0),
                      Vec2::new(15.0, -8.0), Vec2::new(-15.0, 12.0)] {
-            let tb = trace_boundary_at(&doc, seed)
+            let tb = trace_boundary_at(&doc, seed, &TextTraceGeom::default())
                 .unwrap_or_else(|| panic!("seed {:?}: must trace a half-disc", seed));
             let area = polygon_signed_area(&tb.outer).abs();
             let ratio = area / full;
@@ -1260,7 +1664,7 @@ mod tests {
             ]);
             let full = std::f64::consts::PI * 900.0;
             for seed in seeds {
-                let tb = trace_boundary_at(&doc, seed)
+                let tb = trace_boundary_at(&doc, seed, &TextTraceGeom::default())
                     .unwrap_or_else(|| panic!("line {:?}→{:?} seed {:?}: must trace", la, lb, seed));
                 let ratio = polygon_signed_area(&tb.outer).abs() / full;
                 assert!(ratio > 0.3 && ratio < 0.7,
@@ -1281,12 +1685,206 @@ mod tests {
         ]);
         let full = std::f64::consts::PI * 900.0;
         for seed in [Vec2::new(0.0, 20.0), Vec2::new(0.0, -20.0)] {
-            let tb = trace_boundary_at(&doc, seed)
+            let tb = trace_boundary_at(&doc, seed, &TextTraceGeom::default())
                 .unwrap_or_else(|| panic!("seed {:?}: must trace", seed));
             let ratio = polygon_signed_area(&tb.outer).abs() / full;
             assert!(ratio > 0.9,
                 "seed {:?}: floating chord cannot bound a sub-region — ratio {:.3} \
                  should be the full disc", seed, ratio);
+        }
+    }
+
+    // ---- diagnostics (TraceDiag / TraceFail / GapProbe) -------------------
+
+    /// A successful trace fills every stage counter, and reports no failure.
+    #[test]
+    fn diag_records_every_stage_on_success() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(0.0, 0.0), radius: 10.0 }.into(),
+        ]);
+        let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+        let never = never_cancelled();
+        let (tb, d) = trace_boundary_at_in_view_diag(
+            &doc, &scope, Vec2::new(0.0, 0.0), &never, &TextTraceGeom::default());
+        assert!(tb.is_some(), "circle must trace");
+        assert!(d.fail.is_none(), "no failure expected, got {:?}", d.fail);
+        assert_eq!(d.scope_dobjects, 1);
+        assert!(d.raw_segments > 0,   "tessellation stage not recorded");
+        assert!(d.clusters > 0,       "cluster stage not recorded");
+        assert!(d.ray_hits > 0,       "ray-cast stage not recorded");
+        assert!(d.loops_closed > 0,   "walk stage not recorded");
+        assert!(d.outer_verts >= 3,   "classify stage not recorded");
+        assert!(d.ms_total >= 0.0);
+        assert!(!d.lines().is_empty(), "diag must render log lines");
+    }
+
+    /// Clicking outside every closed region fails with a TYPED reason rather
+    /// than a bare `None` — the whole point of the diagnostics.
+    #[test]
+    fn diag_reports_typed_failure_when_seed_is_outside() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(0.0, 0.0), radius: 5.0 }.into(),
+        ]);
+        let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+        let never = never_cancelled();
+        let (tb, d) = trace_boundary_at_in_view_diag(
+            &doc, &scope, Vec2::new(500.0, 500.0), &never, &TextTraceGeom::default());
+        assert!(tb.is_none(), "seed far outside must not trace");
+        let fail = d.fail.clone().expect("a failure reason must be recorded");
+        assert!(matches!(fail, TraceFail::NoRayHits { .. }
+                             | TraceFail::NoClosedLoop { .. }
+                             | TraceFail::NoLoopContainsSeed { .. }),
+            "unexpected reason: {:?}", fail);
+        assert!(!fail.describe().is_empty(), "reason must be user-describable");
+    }
+
+    /// THE gap case: a square whose corner is left open by more than the join
+    /// tolerance does not trace — and the probe reports the looser tolerance
+    /// that WOULD have closed it, which is the actionable half of HPGAPTOL.
+    #[test]
+    fn diag_gap_probe_finds_the_tolerance_that_would_close() {
+        // 20x20 square, but the last edge stops 0.02 short of the start —
+        // far beyond JOIN_EPS (1e-4), within 1000x of it.
+        let gap = 0.02;
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(0.0, 0.0),  b: Vec2::new(20.0, 0.0) }.into(),
+            Line { a: Vec2::new(20.0, 0.0), b: Vec2::new(20.0, 20.0) }.into(),
+            Line { a: Vec2::new(20.0, 20.0),b: Vec2::new(0.0, 20.0) }.into(),
+            Line { a: Vec2::new(0.0, 20.0), b: Vec2::new(0.0, gap) }.into(),
+        ]);
+        let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+        let never = never_cancelled();
+        let (tb, d) = trace_boundary_at_in_view_diag(
+            &doc, &scope, Vec2::new(10.0, 10.0), &never, &TextTraceGeom::default());
+        assert!(tb.is_none(), "a {}-unit gap must not trace closed", gap);
+        assert!(d.fail.is_some(), "failure reason required");
+        let probe = d.gap_probe.clone().expect(
+            "gap probe must identify a tolerance that closes the boundary");
+        assert!(probe.eps >= JOIN_EPS,
+            "probe tolerance {} must be looser than the default", probe.eps);
+        // And the rendered lines must actually mention it, since that string
+        // is what reaches the user.
+        assert!(d.lines().iter().any(|l| l.contains("gap probe")),
+            "gap probe must appear in the log lines");
+    }
+
+    /// Text-like geometry: a closed "letter" square built from segments all
+    /// sharing ONE src (like one text entity).
+    fn letter_segs(src: usize, cx: f64, cy: f64, s: f64, out: &mut Vec<TessSeg>) {
+        let pts = [
+            Vec2::new(cx, cy), Vec2::new(cx + s, cy),
+            Vec2::new(cx + s, cy + s), Vec2::new(cx, cy + s),
+        ];
+        for k in 0..4 {
+            out.push(TessSeg { a: pts[k], b: pts[(k + 1) % 4], src });
+        }
+    }
+
+    #[test]
+    fn overlapping_letters_same_entity_trace_whole() {
+        // Two overlapping "letters" of ONE text entity (same src). The trace
+        // must NOT split their overlap (no intersection splitting inside an
+        // entity) — each letter traces as a whole closed square. This is the
+        // Persian/Arabic connected-script case.
+        let mut segs = Vec::new();
+        letter_segs(7, 0.0, 0.0, 2.0, &mut segs);            // A: 0..2 × 0..2
+        letter_segs(7, 1.5, 0.5, 1.0, &mut segs);            // B: nested overlap
+        let text = TextTraceGeom { segs, glyphs: Vec::new() };
+        let tb = trace_boundary_from_segs(
+            text.segs.clone(), Vec2::new(1.75, 1.0)).unwrap();
+        // Seed inside the overlap → smallest containing loop = letter B.
+        let area = polygon_signed_area(&tb.outer).abs();
+        assert!((area - 1.0).abs() < 1e-9,
+            "outer must be the whole smaller letter (area 1), got {}", area);
+        // The traced letter B is a 5-vertex square (4 + closing repeat) —
+        // no split vertices from the overlap.
+        assert_eq!(tb.outer.len(), 5, "letter must trace whole, got {:?}", tb.outer);
+    }
+
+    #[test]
+    fn text_letters_inside_outer_become_islands() {
+        // A rectangle outer (4 separate lines, srcs 0..3) with two text
+        // letters inside (src 9). Click outside the letters: the letters
+        // must come back as islands, letter + its counter both.
+        let doc = doc_from(vec![
+            Line { a: Vec2::new(0.0, 0.0),   b: Vec2::new(10.0, 0.0) }.into(),
+            Line { a: Vec2::new(10.0, 0.0),  b: Vec2::new(10.0, 10.0) }.into(),
+            Line { a: Vec2::new(10.0, 10.0), b: Vec2::new(0.0, 10.0) }.into(),
+            Line { a: Vec2::new(0.0, 10.0),  b: Vec2::new(0.0, 0.0) }.into(),
+        ]);
+        // Letter square 4..5 × 4..5 (src 9) with a counter 4.4..4.6.
+        let mut segs = Vec::new();
+        letter_segs(9, 4.0, 4.0, 1.0, &mut segs);
+        letter_segs(9, 4.4, 4.4, 0.2, &mut segs);
+        let outer_loop = vec![
+            Vec2::new(4.0, 4.0), Vec2::new(5.0, 4.0),
+            Vec2::new(5.0, 5.0), Vec2::new(4.0, 5.0), Vec2::new(4.0, 4.0)];
+        let hole_loop = vec![
+            Vec2::new(4.4, 4.4), Vec2::new(4.6, 4.4),
+            Vec2::new(4.6, 4.6), Vec2::new(4.4, 4.6), Vec2::new(4.4, 4.4)];
+        let text = TextTraceGeom {
+            segs,
+            glyphs: vec![(outer_loop.clone(), vec![hole_loop.clone()])],
+        };
+        let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+        let never = never_cancelled();
+        let (tb, _diag) = trace_boundary_at_in_view_diag(
+            &doc, &scope, Vec2::new(8.0, 8.0), &never, &text);
+        let tb = tb.expect("rectangle must trace with text inside");
+        // The letter outer must be an island.
+        assert!(tb.islands.iter().any(|i| polygons_equivalent(i, &outer_loop)),
+            "letter outer must be an island: {:?}", tb.islands);
+        // Its counter: a hole-in-hole → even-odd refills it; it must be
+        // present as an island too so pattern fills know about it.
+        assert!(tb.islands.iter().any(|i| polygons_equivalent(i, &hole_loop)),
+            "letter counter must be an island: {:?}", tb.islands);
+    }
+
+    #[test]
+    fn click_inside_letter_hatches_the_letter() {
+        // Seed inside a letter (src 9) with another letter nearby (same
+        // entity) — the outer must be the letter's whole loop, and the
+        // neighbouring letter must NOT leak into it.
+        let mut segs = Vec::new();
+        letter_segs(9, 0.0, 0.0, 2.0, &mut segs);   // clicked letter
+        letter_segs(9, 5.0, 0.0, 2.0, &mut segs);   // neighbour (far right)
+        let text = TextTraceGeom { segs, glyphs: Vec::new() };
+        let tb = trace_boundary_from_segs(text.segs.clone(), Vec2::new(1.0, 1.0))
+            .expect("seed inside a letter must trace it");
+        let area = polygon_signed_area(&tb.outer).abs();
+        assert!((area - 4.0).abs() < 1e-9, "outer must be the 2×2 letter");
+        assert_eq!(tb.outer.len(), 5, "letter traces whole");
+    }
+
+    #[test]
+    fn real_font_text_produces_glyph_boundaries() {
+        // End-to-end through the cad_text engine: a Text entity rendered by
+        // `text_hatch_geom` must yield closed glyph loops (O → outer + hole).
+        let mut doc = Document::default();
+        let mut t = cad_kernel::Text::empty();
+        t.text = "O".into();
+        t.position = Vec2::new(10.0, 10.0);
+        t.height = 2.0;
+        doc.push(DObject::new(Geom::Text(t)));
+        let mut fm = cad_text::FontManager::new();
+        let scope: Vec<usize> = (0..doc.dobjects.len()).collect();
+        let geom = text_hatch_geom(&doc, &mut fm, &scope);
+        assert_eq!(geom.glyphs.len(), 1, "'O' = one glyph");
+        let (outer, holes) = &geom.glyphs[0];
+        assert!(outer.len() >= 4, "outer loop must be closed");
+        assert_eq!(holes.len(), 1, "'O' must carry one counter");
+        assert!(holes[0].len() >= 4);
+        assert!(!geom.segs.is_empty());
+        // Segments form closed chains: each contour's segments close back.
+        for (o, hs) in &geom.glyphs {
+            let chain_closed = |l: &[Vec2]| {
+                let n = l.len();
+                (l[0] - l[n - 1]).len() < 1e-9 && n >= 4
+            };
+            assert!(chain_closed(o));
+            for h in hs {
+                assert!(chain_closed(h));
+            }
         }
     }
 }

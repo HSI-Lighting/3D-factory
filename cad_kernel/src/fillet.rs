@@ -141,6 +141,14 @@ fn loci_intersect(a: &Locus, b: &Locus) -> Vec<Vec2> {
 }
 
 fn line_line(p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2) -> Option<Vec2> {
+    // G4: NORMALIZE the directions before the parallel test. Callers pass raw
+    // (un-normalized) segment vectors (`piece_intersect`), so `denom` otherwise
+    // scaled with |d0|·|d1| — at large segment lengths a genuinely non-parallel
+    // pair could still fall under the fixed 1e-12 and be dropped. With unit
+    // directions `denom` is `sin(angle)`, scale-invariant. `t` is then in the
+    // same (unit) units, so `p0 + d0*t` still lands on the intersection.
+    let d0 = d0.normalized();
+    let d1 = d1.normalized();
     let denom = d0.cross(d1);
     if denom.abs() < 1e-12 { return None; }
     let t = (p1 - p0).cross(d1) / denom;
@@ -558,10 +566,19 @@ pub fn chamfer_geoms(
     let tp2 = walk_from_corner(&pc2, corner, p2, d2)
         .ok_or_else(|| "chamfer: distance exceeds object 2".to_string())?;
 
+    // FIX 1: d1≈d2≈0 → tp1==tp2==corner, so the bridge line is zero-length.
+    // Emit no bridge (like fillet's `arc: None` for r=0): g1_new/g2_new still
+    // trim to the sharp corner, giving a clean corner with no stray segment.
+    let bridge = if (tp1 - tp2).len() < EPS {
+        None
+    } else {
+        Some(Geom::Line(Line { a: tp1, b: tp2 }))
+    };
+
     Ok(ChamferOut {
         g1_new: rebuild_side(&ctx1, &pc1, tp1, p1),
         g2_new: rebuild_side(&ctx2, &pc2, tp2, p2),
-        bridge: Geom::Line(Line { a: tp1, b: tp2 }),
+        bridge,
     })
 }
 
@@ -932,6 +949,24 @@ mod tests {
         Geom::Line(Line { a: Vec2::new(ax, ay), b: Vec2::new(bx, by) })
     }
 
+    // G4 scale regression: a non-axis-aligned corner so the tangent-point radius
+    // check and the line_line denom carry coordinate-proportional noise. An r=5
+    // fillet must stay VALID at 1×, 1e3×, 1e6× (pre-fix: absolute 1e-6 / 1e-12
+    // dropped it at scale).
+    #[test]
+    fn fillet_scale_invariant_diagonal_corner() {
+        for s in [1.0, 1e3, 1e6] {
+            let l1 = line(0.0, 0.0, 100.0 * s, 20.0 * s);
+            let l2 = line(0.0, 0.0, 20.0 * s, 100.0 * s);
+            let p1 = Vec2::new(50.0 * s, 10.0 * s);
+            let p2 = Vec2::new(10.0 * s, 50.0 * s);
+            let r  = 5.0 * s;
+            let out = fillet_geoms(&l1, p1, &l2, p2, r);
+            assert!(out.is_ok(), "fillet must succeed at scale {s}: {:?}", out.as_ref().err());
+            assert!(out.unwrap().arc.is_some(), "fillet must produce an arc at scale {s}");
+        }
+    }
+
     #[test]
     fn fillet_two_perpendicular_lines() {
         // L1 along +x from origin, L2 along +y from origin. Corner at (0,0).
@@ -989,13 +1024,13 @@ mod tests {
         let line = Geom::Line(Line { a: Vec2::new(-50.0, 30.0), b: Vec2::new(50.0, 30.0) });
         let arc_pick = Vec2::new(0.0, 45.0);   // arc top — neutral
         let right = chamfer_geoms(&arc, arc_pick, &line, Vec2::new(40.0, 30.0), 5.0, 5.0).unwrap();
-        if let Geom::Line(b) = right.bridge {
+        if let Some(Geom::Line(b)) = right.bridge {
             assert!((b.a + b.b).x * 0.5 > 0.0, "line clicked right → bridge on the right, got {:?}", b);
-        }
+        } else { panic!("expected a bridge (right)"); }
         let left = chamfer_geoms(&arc, arc_pick, &line, Vec2::new(-40.0, 30.0), 5.0, 5.0).unwrap();
-        if let Geom::Line(b) = left.bridge {
+        if let Some(Geom::Line(b)) = left.bridge {
             assert!((b.a + b.b).x * 0.5 < 0.0, "line clicked left → bridge on the left, got {:?}", b);
-        }
+        } else { panic!("expected a bridge (left)"); }
     }
 
     #[test]
@@ -1205,12 +1240,40 @@ mod tests {
         let l2 = line(0.0, 0.0, 0.0, 10.0);
         let out = chamfer_geoms(&l1, Vec2::new(8.0, 0.0),
                                 &l2, Vec2::new(0.0, 8.0), 2.0, 3.0).unwrap();
-        if let Geom::Line(br) = out.bridge {
+        if let Some(Geom::Line(br)) = out.bridge {
             // bridge connects (2,0) and (0,3) in some order.
             let ok = (br.a.dist(Vec2::new(2.0, 0.0)) < 1e-6 && br.b.dist(Vec2::new(0.0, 3.0)) < 1e-6)
                   || (br.b.dist(Vec2::new(2.0, 0.0)) < 1e-6 && br.a.dist(Vec2::new(0.0, 3.0)) < 1e-6);
             assert!(ok, "bridge was {:?}", br);
-        } else { panic!(); }
+        } else { panic!("expected Some(Line) bridge"); }
+    }
+
+    #[test]
+    fn chamfer_zero_distance_has_no_bridge() {
+        // FIX 1: d1=d2=0 → a clean SHARP corner, no zero-length bridge segment.
+        let l1 = line(0.0, 0.0, 10.0, 0.0);
+        let l2 = line(0.0, 0.0, 0.0, 10.0);
+        let out = chamfer_geoms(&l1, Vec2::new(8.0, 0.0),
+                                &l2, Vec2::new(0.0, 8.0), 0.0, 0.0).unwrap();
+        assert!(out.bridge.is_none(), "d1=d2=0 must yield no bridge");
+        // Both sides still trim to the shared sharp corner at the origin.
+        if let Geom::Line(a) = out.g1_new {
+            assert!(a.a.dist(Vec2::ZERO) < 1e-9 || a.b.dist(Vec2::ZERO) < 1e-9,
+                "g1 must meet the corner (0,0)");
+        } else { panic!("g1_new should be a Line"); }
+        if let Geom::Line(b) = out.g2_new {
+            assert!(b.a.dist(Vec2::ZERO) < 1e-9 || b.b.dist(Vec2::ZERO) < 1e-9,
+                "g2 must meet the corner (0,0)");
+        } else { panic!("g2_new should be a Line"); }
+    }
+
+    #[test]
+    fn chamfer_nonzero_distance_has_bridge() {
+        let l1 = line(0.0, 0.0, 10.0, 0.0);
+        let l2 = line(0.0, 0.0, 0.0, 10.0);
+        let out = chamfer_geoms(&l1, Vec2::new(8.0, 0.0),
+                                &l2, Vec2::new(0.0, 8.0), 5.0, 5.0).unwrap();
+        assert!(out.bridge.is_some(), "d1=d2=5 must yield a bridge");
     }
 
     #[test]

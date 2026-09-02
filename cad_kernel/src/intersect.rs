@@ -326,7 +326,8 @@ pub fn intersect_line_circle(line: Line, c: Circle) -> Vec<Vec2> {
     let pd   = foot.dist(c.center);               // perpendicular distance to centre
     let r    = c.radius;
     // Tangent tolerance relative to the radius (geometric, length-independent).
-    let tol  = 1e-6 * r.max(1.0);
+    // WP0.2: this is the exemplar `scaled_tol` generalizes — same value.
+    let tol  = scaled_tol(r);
     if pd > r + tol { return vec![]; }            // genuine miss
     let half = (r * r - pd * pd).max(0.0).sqrt(); // half-chord length
     let ts: [f64; 2] = if half <= tol {
@@ -357,13 +358,19 @@ pub fn intersect_line_circle(line: Line, c: Circle) -> Vec<Vec2> {
 pub fn intersect_circle_circle(c1: Circle, c2: Circle) -> Vec<Vec2> {
     let d = c1.center.dist(c2.center);
 
+    // G2: scale the far/inside/tangent gates by the larger radius. Absolute EPS
+    // here rejected genuine tangencies at large scale — two r=60 circles just
+    // touching carry `d − (r1+r2)` noise ~ r·1e-16, which at r=6e7 is ~ 1e-9,
+    // enough to slip past a fixed EPS and drop the (real) single hit.
+    let tol = scaled_tol(c1.radius.max(c2.radius));
+
     if approx_zero(d) {
         return vec![];                        // concentric: ignore (coincident or none)
     }
-    if d > c1.radius + c2.radius + EPS {
+    if d > c1.radius + c2.radius + tol {
         return vec![];                        // too far apart
     }
-    if d < (c1.radius - c2.radius).abs() - EPS {
+    if d < (c1.radius - c2.radius).abs() - tol {
         return vec![];                        // one inside the other
     }
 
@@ -373,7 +380,7 @@ pub fn intersect_circle_circle(c1: Circle, c2: Circle) -> Vec<Vec2> {
     let dir = (c2.center - c1.center) / d;
     let mid = c1.center + dir * a;
 
-    if h < EPS {
+    if h < tol {
         return vec![mid];                     // tangent
     }
     let off = dir.perp() * h;
@@ -547,6 +554,82 @@ mod tests {
 
     fn approx_pt(p: Vec2, x: f64, y: f64) -> bool {
         approx_eq(p.x, x) && approx_eq(p.y, y)
+    }
+
+    // ---- scale-tolerance regression (WP0.2 / G1 / G2) ----
+    // These pin the "absolute epsilons drop real hits at large coordinates" bug.
+    // Each geometry is placed on a DIAGONAL so the distance/residual carries
+    // floating-point noise proportional to the coordinate magnitude — which at
+    // 1e6× dwarfs a fixed EPS and (pre-fix) mis-fired the gate.
+
+    #[test]
+    fn circle_circle_external_tangency_scale_invariant() {
+        // Two equal r=60 circles tangent EXTERNALLY along a 45° line (d = 2r).
+        // Exactly ONE point at every scale.
+        let s2 = 2.0_f64.sqrt();
+        for s in [1.0, 1e3, 1e6] {
+            let r = 60.0 * s;
+            let c1 = Circle { center: Vec2::new(0.0, 0.0), radius: r };
+            let c2 = Circle { center: Vec2::new(r * s2, r * s2), radius: r };
+            let hits = intersect_circle_circle(c1, c2);
+            assert_eq!(hits.len(), 1,
+                "external tangency must give exactly ONE point at scale {s} (r={r})");
+        }
+    }
+
+    #[test]
+    fn circle_circle_internal_tangency_scale_invariant() {
+        // Internal tangency: a big circle (r=120) and a small one (r=60) whose
+        // centres are r_big - r_small = 60 apart along a diagonal — one point.
+        let s2 = 2.0_f64.sqrt();
+        for s in [1.0, 1e3, 1e6] {
+            let (rb, rs) = (120.0 * s, 60.0 * s);
+            let off = (rb - rs) / s2;   // centre separation rb-rs along 45°
+            let c1 = Circle { center: Vec2::new(0.0, 0.0),        radius: rb };
+            let c2 = Circle { center: Vec2::new(off, off),        radius: rs };
+            let hits = intersect_circle_circle(c1, c2);
+            assert_eq!(hits.len(), 1,
+                "internal tangency must give exactly ONE point at scale {s}");
+        }
+    }
+
+    #[test]
+    fn circle_ellipse_hit_count_scale_invariant() {
+        // A circle overlapping an ellipse (both offset onto a diagonal). The
+        // number of intersections must be the SAME at 1×, 1e3×, 1e6× — pre-fix
+        // the squared-distance Newton residual rejected every root at scale.
+        fn hits(s: f64) -> usize {
+            let circle = Circle { center: Vec2::new(10.0 * s, 10.0 * s), radius: 50.0 * s };
+            let el = Ellipse {
+                center: Vec2::new(40.0 * s, 40.0 * s),
+                major:  Vec2::new(40.0 * s, 0.0),
+                ratio:  0.5,
+            };
+            intersect_circle_ellipse(circle, el).len()
+        }
+        let base = hits(1.0);
+        assert!(base > 0, "sanity: circle∩ellipse must intersect at 1× (got {base})");
+        for s in [1e3, 1e6] {
+            assert_eq!(hits(s), base,
+                "circle∩ellipse hit count must be scale-invariant (scale {s}: {} vs {base})",
+                hits(s));
+        }
+    }
+
+    #[test]
+    fn ellipse_ellipse_hit_count_scale_invariant() {
+        // Guards the DIMENSIONLESS-residual caller: its accept threshold is a
+        // FIXED 1e-6 (not char²), so it must stay correct AND not admit false
+        // roots at scale. Two crossing ellipses → same count at 1× and 1e6×.
+        fn hits(s: f64) -> usize {
+            let a = Ellipse { center: Vec2::new(0.0, 0.0), major: Vec2::new(60.0 * s, 0.0), ratio: 0.5 };
+            let b = Ellipse { center: Vec2::new(20.0 * s, 0.0), major: Vec2::new(0.0, 60.0 * s), ratio: 0.5 };
+            intersect_ellipse_ellipse(a, b).len()
+        }
+        let base = hits(1.0);
+        assert!(base > 0, "sanity: ellipse∩ellipse must intersect at 1× (got {base})");
+        assert_eq!(hits(1e6), base,
+            "ellipse∩ellipse hit count must be scale-invariant (1e6×: {} vs {base})", hits(1e6));
     }
 
     #[test]
