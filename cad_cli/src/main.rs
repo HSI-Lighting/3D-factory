@@ -211,7 +211,7 @@ fn apply_line(doc: &mut Document, cmd: Command) -> String {
         Command::Copy | Command::Rotate | Command::Scale
         | Command::Mirror | Command::Hatch { .. } | Command::DeleteSelected | Command::Undo
         | Command::Redo | Command::MatchProps | Command::Reverse
-        | Command::ChangeLayer | Command::Offset(_) | Command::Wall(_)
+        | Command::ChangeLayer | Command::Layers | Command::Offset(_) | Command::Wall(_)
         | Command::WallCleanup
         | Command::Linetype(_) | Command::ChProp(_) | Command::Text(_)
         | Command::TextStyle(_) | Command::DbgRecorder

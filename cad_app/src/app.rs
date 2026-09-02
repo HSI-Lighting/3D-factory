@@ -1900,6 +1900,12 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// OTHER selected dobjects whose grip sits at the SAME world point as the
+    /// one being dragged, with the role to move on each. AutoCAD moves every
+    /// coincident grip of the selection together — that is how shapes sharing
+    /// a corner stay joined, and how a hatch stays with the boundary it was
+    /// built from. Empty unless `grip_drag` is active.
+    grip_drag_peers: Vec<(usize, cad_kernel::GripRole)>,
     /// Snapshot from the last render pass — how many dobjects exist,
     /// how many landed in the viewport, how many were painted, plus
     /// per-cull skip counters. Surfaced in the "Screen Stats" floating
@@ -4725,6 +4731,7 @@ impl Default for CadApp {
             place_prompt_open: false,
             place_coord_prompt: false,
             grip_drag: None,
+            grip_drag_peers: Vec::new(),
             last_render_stats:   RenderStats::default(),
             screen_stats_open:   false,
             screen_stats_was_open: false,
@@ -18609,6 +18616,40 @@ impl CadApp {
                     self.snapshot_doc();
                     // Remove from highest index downward so earlier indices stay valid.
                     let mut sorted = self.selection.clone();
+                    // Erasing a HATCH must also erase the invisible auxiliary
+                    // boundary it owns. That boundary exists only to serve its
+                    // hatch, so once the hatch is gone it is unreachable
+                    // garbage — and worse, it stayed a closed region the
+                    // pick-point scan could still choose, so the NEXT hatch in
+                    // that area silently reused the deleted hatch's outline
+                    // instead of the polyline the user drew (owner-reported).
+                    //
+                    // Only `hatch_aux` boundaries are swept, and only when no
+                    // OTHER surviving hatch still references them.
+                    let erasing: std::collections::HashSet<usize> =
+                        sorted.iter().copied().collect();
+                    let mut orphans: Vec<usize> = Vec::new();
+                    for &i in &sorted {
+                        let Some(d) = self.doc.dobjects.get(i) else { continue };
+                        let Geom::Hatch(h) = &d.geom else { continue };
+                        for bh in &h.boundary_handles {
+                            let Some(bi) = self.doc.dobjects.iter()
+                                .position(|x| x.handle == *bh) else { continue };
+                            if !self.doc.dobjects[bi].style.hatch_aux { continue; }
+                            // Still needed by a hatch that is NOT being erased?
+                            let still_used = self.doc.dobjects.iter().enumerate()
+                                .any(|(hi, x)| !erasing.contains(&hi)
+                                    && matches!(&x.geom,
+                                        Geom::Hatch(hh) if hh.boundary_handles.contains(bh)));
+                            if !still_used { orphans.push(bi); }
+                        }
+                    }
+                    if !orphans.is_empty() {
+                        self.hatch_dbg(format!(
+                            "--- [10] erase: also removing {} orphaned hatch boundary/ies {:?}",
+                            orphans.len(), orphans));
+                        sorted.extend(orphans);
+                    }
                     sorted.sort_unstable();
                     sorted.dedup();
                     let n = sorted.len();
@@ -18644,6 +18685,10 @@ impl CadApp {
             }
             Ok(Command::Reverse)     => self.apply_reverse(),
             Ok(Command::ChangeLayer) => self.apply_chlayer(),
+            Ok(Command::Layers) => {
+                // AutoCAD LAYER / LA — open the Layer Properties Manager.
+                self.layer_panel_open = true;
+            }
             Ok(Command::ChProp(arg)) => {
                 match arg {
                     None => {
@@ -20656,6 +20701,14 @@ impl CadApp {
             None => Box::new(self.doc.dobjects.iter().enumerate()),
         };
         for (i, d) in iter {
+            // Same rule as `collect_closed_containing_scoped`: a boundary the
+            // user cannot SEE must not define a clickable region. These two
+            // functions MUST agree — when only the collector filtered, the
+            // candidate list showed the user's polyline while this picker
+            // returned a hidden `hatch_aux` boundary that happened to have a
+            // smaller bbox, so the log said "candidates: #16" and then
+            // "chose #17".
+            if !self.doc.is_visible(i) { continue; }
             let contains = match &d.geom {
                 Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
                     // Use the same tessellated polygon the renderer
@@ -50038,7 +50091,7 @@ const MODIFY_CMDS: &[(GlyphKind, &str, &'static str)] = &[
     (GlyphKind::Reverse,     "reverse",    "Reverse"),
     (GlyphKind::ArrayGrid,   "array",      "Array  (AR)"),
     (GlyphKind::MatchProps,  "matchprop",  "Match properties"),
-    (GlyphKind::ChangeLayer, "chlayer",    "Change layer"),
+    (GlyphKind::ChangeLayer, "layer",      "Layer  (LA)"),
     (GlyphKind::Erase,       "erase",      "Erase  (E)"),
     (GlyphKind::Block,       "block",      "Make block"),
     (GlyphKind::Insert,      "insert",     "Insert block"),
@@ -50476,6 +50529,7 @@ fn icon_for(key: &str) -> MenuIcon<'static> {
         "modify.explode"  => MenuIcon::Cmd(GlyphKind::Explode),
         "modify.matchprop"=> MenuIcon::Cmd(GlyphKind::MatchProps),
         "modify.chlayer"  => MenuIcon::Cmd(GlyphKind::ChangeLayer),
+        "modify.layer" | "layer" => MenuIcon::Cmd(GlyphKind::ChangeLayer),
         "modify.erase"    => MenuIcon::Cmd(GlyphKind::Erase),
         // Utilities / inquiry.
         "util.dist" => MenuIcon::Cmd(GlyphKind::Dist),
@@ -52372,6 +52426,7 @@ impl eframe::App for CadApp {
             }
             if self.grip_drag.is_some() {
                 self.grip_drag = None;
+                self.grip_drag_peers.clear();
                 self.history.push("  grip drag cancelled".into());
             }
             if self.text_draft != TextDraftState::Off {
@@ -53247,13 +53302,15 @@ impl eframe::App for CadApp {
                         .on_hover_text("Edit common properties of the selected dobject(s) — \
                                         layer, color, linetype, lineweight, and type-specific style");
                     if ipb { self.run_command("props"); ui.close_menu(); }
-                    for (name, id) in [
-                        ("Match Properties", "modify.matchprop"),
-                        ("Change Layer to Current", "modify.chlayer"),
-                    ] {
-                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
-                            { self.execute(id); ui.close_menu(); }
-                    }
+                    if paint_menu_row(ui, w, arrow_x, icon_for(icon_key("modify.matchprop")),
+                                      "Match Properties", nc, RowT::Plain).0
+                        { self.execute("modify.matchprop"); ui.close_menu(); }
+                    // `chlayer` (bulk-set selection to the active layer) is no longer a
+                    // rail entry — the layers glyph now opens the Layer Manager (`layer`).
+                    // Dispatch the token directly so this menu keeps the function.
+                    if paint_menu_row(ui, w, arrow_x, icon_for("modify.chlayer"),
+                                      "Change Layer to Current", nc, RowT::Plain).0
+                        { self.run_command("chlayer"); ui.close_menu(); }
                     menu_divider(ui, w);
                     if paint_menu_row(ui, w, arrow_x, icon_for("modify.erase"), "Erase", nc, RowT::Plain).0
                         { self.execute("modify.erase"); ui.close_menu(); }
@@ -55392,6 +55449,32 @@ impl eframe::App for CadApp {
                                              ({:.3},{:.3}) — reshapes hatch {:?}",
                                             idx, role, gp.x, gp.y, owners));
                                     }
+                                    // Every OTHER selected dobject with a grip
+                                    // at this SAME point joins the drag, so
+                                    // shapes sharing a corner stay joined and a
+                                    // hatch stays with its boundary (AutoCAD
+                                    // moves all coincident grips of the
+                                    // selection together). Previously the first
+                                    // match won and the rest silently stayed put.
+                                    let peers: Vec<(usize, cad_kernel::GripRole)> = targets
+                                        .iter()
+                                        .filter(|&&o| o != idx)
+                                        .filter_map(|&o| {
+                                            let od = self.doc.dobjects.get(o)?;
+                                            let (_, orole) = od.geom.grip_points()
+                                                .into_iter()
+                                                .find(|(ogp, _)| ogp.dist(gp) < tol)?;
+                                            Some((o, orole))
+                                        })
+                                        .collect();
+                                    if !peers.is_empty() {
+                                        self.hatch_dbg(format!(
+                                            "--- [10] grip drag: {} coincident grip(s) move together \
+                                             — primary #{}, peers {:?}",
+                                            peers.len() + 1, idx,
+                                            peers.iter().map(|(i, _)| *i).collect::<Vec<_>>()));
+                                    }
+                                    self.grip_drag_peers = peers;
                                     // Don't treat this click as a "select-
                                     // toggle click" — it's a grab.
                                     grip_drag_consumed_click = true;
@@ -55417,8 +55500,31 @@ impl eframe::App for CadApp {
                             // jitter) — zero motion just clears the grip state.
                             if delta.len() > 1e-9 {
                                 self.snapshot_doc();
-                                if let Some(d) = self.doc.dobjects.get_mut(gd.dobject_idx) {
-                                    d.geom = d.geom.with_grip_moved(gd.role, drop_world);
+                                let uniform = ctx.input(|inp| inp.modifiers.shift);
+                                // The dragged grip PLUS every coincident grip
+                                // on the other selected dobjects — all land on
+                                // the same drop point, so shapes that shared a
+                                // corner still share it afterwards.
+                                let mut moves: Vec<(usize, cad_kernel::GripRole)> =
+                                    vec![(gd.dobject_idx, gd.role)];
+                                moves.extend(self.grip_drag_peers.iter().copied());
+                                for (idx, role) in moves {
+                                    let Some(d) = self.doc.dobjects.get_mut(idx) else { continue };
+                                    // Issue #39 — corner grips on a closed
+                                    // 4-vertex polyline SCALE from the
+                                    // opposite corner (Shift = uniform);
+                                    // everything else keeps its vertex move.
+                                    if let cad_kernel::GripRole::PolyVertex(i) = role {
+                                        if let Some(scaled) =
+                                            d.geom.with_corner_scale(i, drop_world, uniform)
+                                        {
+                                            d.geom = scaled;
+                                        } else {
+                                            d.geom = d.geom.with_grip_moved(role, drop_world);
+                                        }
+                                    } else {
+                                        d.geom = d.geom.with_grip_moved(role, drop_world);
+                                    }
                                 }
                                 self.intersections.clear();
                                 self.index_dirty = true;
@@ -55430,6 +55536,7 @@ impl eframe::App for CadApp {
                             }
                         }
                         self.grip_drag = None;
+                        self.grip_drag_peers.clear();
                         grip_drag_consumed_click = true;
                     }
                 }
@@ -80287,5 +80394,157 @@ mod script_catalog_types_tests {
             app.param_value_scene(&[plain], "s", "free text").unwrap(),
             "free text"
         );
+    }
+}
+#[cfg(test)]
+mod hatch_erase_and_grip_parity_tests {
+    use super::*;
+
+    // Two selected dobjects sharing a corner must move that corner TOGETHER
+    // when it is dragged — the AutoCAD rule for coincident grips.
+    //
+    // Regression (owner-reported): the grab loop stopped at the first match
+    // (`break 'outer`) and the apply touched only that one dobject, so shapes
+    // that shared a corner came apart. Same root cause made a hatch part
+    // company with the boundary it was built from.
+    #[test]
+    fn coincident_grips_of_a_selection_move_together() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        let shared = Vec2::new(10.0, 0.0);
+        // Two squares meeting at `shared`.
+        let a = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: shared,               bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0,10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let b = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: shared,                 bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, 0.0),   bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, -10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, -10.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let ia = app.doc.push(a);
+        let ib = app.doc.push(b);
+        app.selection = vec![ia, ib];
+
+        // Both must expose a grip AT the shared corner.
+        let grips_a = app.doc.dobjects[ia].geom.grip_points();
+        let grips_b = app.doc.dobjects[ib].geom.grip_points();
+        let ra = grips_a.iter().find(|(p, _)| p.dist(shared) < 1e-9)
+            .map(|(_, r)| *r).expect("shape A has a grip at the shared corner");
+        let rb = grips_b.iter().find(|(p, _)| p.dist(shared) < 1e-9)
+            .map(|(_, r)| *r).expect("shape B has a grip at the shared corner");
+
+        // Simulate the grab+apply: primary + its coincident peer.
+        let drop = Vec2::new(14.0, 4.0);
+        for (idx, role) in [(ia, ra), (ib, rb)] {
+            let g = app.doc.dobjects[idx].geom.with_grip_moved(role, drop);
+            app.doc.dobjects[idx].geom = g;
+        }
+
+        // Neither shape may still hold the OLD corner — they moved as one.
+        for (idx, name) in [(ia, "A"), (ib, "B")] {
+            let Geom::Polyline(p) = &app.doc.dobjects[idx].geom else { panic!() };
+            assert!(p.vertices.iter().any(|v| v.pos.dist(drop) < 1e-6),
+                "shape {} must have the corner at the drop point", name);
+            assert!(!p.vertices.iter().any(|v| v.pos.dist(shared) < 1e-6),
+                "shape {} must not keep the old corner — the shapes came apart", name);
+        }
+    }
+
+    // Erasing a hatch must take its invisible auxiliary boundary with it.
+    //
+    // Regression (owner-reported): the boundary survived as unreachable
+    // garbage AND stayed a closed region the pick-point scan could choose, so
+    // the next hatch in that area silently reused the DELETED hatch's outline
+    // instead of the polyline the user drew.
+    #[test]
+    fn erasing_a_hatch_also_erases_its_aux_boundary() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();   // CadApp::default() seeds a demo scene
+        let rect = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 3.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 3.0), bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let user_idx = app.doc.push(rect);
+        app.selection = vec![user_idx];
+        app.pending_hatch_pattern = (Some("ANSI31".into()), 1.0, 0.0);
+        app.apply_hatch();
+        let hidx = app.hatch_last_idx.expect("hatch created");
+        let n_after_hatch = app.doc.dobjects.len();
+        assert_eq!(n_after_hatch, 3, "user shape + baked boundary + hatch");
+        // The confirm panel is open after apply — close it (Accept) so the
+        // erase command dispatches instead of bouncing on the panel gate.
+        app.hatch_confirm_accept();
+
+        // Erase ONLY the hatch.
+        app.selection = vec![hidx];
+        app.run_command("erase");
+
+        // Both the hatch and its aux boundary are gone; the user's shape stays.
+        assert_eq!(app.doc.dobjects.len(), 1,
+            "erasing the hatch must remove its aux boundary too, leaving only the user's shape");
+        assert!(!app.doc.dobjects.iter().any(|d| d.style.hatch_aux),
+            "no orphaned hatch_aux boundary may survive");
+        assert!(matches!(app.doc.dobjects[0].geom, Geom::Polyline(_)),
+            "the shape the user drew must survive");
+    }
+
+    // The pick-point scan and the smallest-containing picker must AGREE about
+    // which dobjects are eligible. Both must ignore invisible boundaries.
+    //
+    // Regression: only the collector filtered visibility, so the log read
+    // "candidates: #16 (the user's polyline)" and then "chose #17" — a hidden
+    // hatch_aux boundary with a smaller bbox.
+    #[test]
+    fn hidden_boundaries_are_ignored_by_both_pick_scans() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();   // the demo circle also contains the seed
+        // Big visible square.
+        let big = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),   bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, 20.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 20.0),  bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        let big_idx = app.doc.push(big);
+        // SMALLER hidden aux boundary around the same seed — the shape that
+        // used to win because nothing filtered it out.
+        let mut small = DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(5.0, 5.0),   bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(15.0, 5.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(15.0, 15.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(5.0, 15.0),  bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        }));
+        small.style.visible = false;
+        small.style.hatch_aux = true;
+        app.doc.push(small);
+
+        let seed = Vec2::new(10.0, 10.0);   // inside BOTH
+        let cands = app.collect_closed_containing_scoped(seed, None);
+        assert_eq!(cands.len(), 1, "only the visible square may be a candidate");
+        assert_eq!(cands[0].0, big_idx);
+        let chosen = app.find_smallest_containing_closed_scoped(seed, None);
+        assert_eq!(chosen, Some(big_idx),
+            "the picker must agree with the candidate scan and ignore the hidden boundary");
     }
 }

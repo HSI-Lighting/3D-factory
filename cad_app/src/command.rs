@@ -218,7 +218,7 @@ fn keywords_for(dispatch: &str) -> &'static [&'static str] {
         "reverse"    => &["flip", "invert", "direction"],
         "array"      => &["grid", "pattern", "repeat", "duplicate"],
         "matchprop"  => &["match", "properties", "copy format", "paint"],
-        "chlayer"    => &["change layer", "move layer"],
+        "layer"      => &["layers", "layer manager", "layer properties", "change layer"],
         "erase"      => &["delete", "remove", "del"],
         "block"      => &["group", "symbol", "make block"],
         "insert"     => &["place", "block", "symbol"],

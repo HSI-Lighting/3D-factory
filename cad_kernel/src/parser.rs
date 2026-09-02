@@ -97,6 +97,9 @@ pub enum Command {
     Reverse,
     /// Bulk-set every selected dobject's `style.layer` to the active layer.
     ChangeLayer,
+    /// Open the Layer Properties Manager panel (AutoCAD `LAYER` / `LA`).
+    /// Pure UI toggle — the app sets `layer_panel_open`.
+    Layers,
     /// Offset every selected dobject by a distance. App captures a side click.
     /// `None` means "use the persistent default" (`env.OfsDis`); the app
     /// resolves it. Matches the fillet pattern (radius optional).
@@ -437,6 +440,7 @@ impl Command {
             Command::MatchProps         => "MatchProps",
             Command::Reverse            => "Reverse",
             Command::ChangeLayer        => "ChangeLayer",
+            Command::Layers             => "Layers",
             Command::Offset(_)          => "Offset",
             Command::Wall(_)            => "Wall",
             Command::Text(_)            => "Text",
@@ -656,6 +660,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "matchprop" | "mp" => Ok(Command::MatchProps),
         "reverse" | "rev" => Ok(Command::Reverse),
         "chlayer" | "cl"  => Ok(Command::ChangeLayer),
+        "layer" | "la" | "layers" => Ok(Command::Layers),
         "offset" | "o"    => {
             // Bare `offset` → use env.OfsDis (the app resolves None).
             // `offset <d>` → use that distance and overwrite OfsDis on
