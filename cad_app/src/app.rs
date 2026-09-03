@@ -28888,9 +28888,9 @@ impl CadApp {
                 // mm_per_unit = mm_per_named(name) × scene_per_unit.
                 ui.horizontal(|ui| {
                     ui.label("Scale:");
-                    ui.add(egui::DragValue::new(&mut self.units_dlg_n).speed(0.1).range(1e-9..=1e12));
+                    ui.add(egui::DragValue::new(&mut self.units_dlg_n).update_while_editing(false).speed(0.1).range(1e-9..=1e12));
                     ui.label("mm =");
-                    ui.add(egui::DragValue::new(&mut self.units_dlg_m).speed(0.1).range(1e-9..=1e12));
+                    ui.add(egui::DragValue::new(&mut self.units_dlg_m).update_while_editing(false).speed(0.1).range(1e-9..=1e12));
                     ui.label("unit(s)");
                 });
                 ui.label(egui::RichText::new(
