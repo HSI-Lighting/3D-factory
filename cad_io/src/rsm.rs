@@ -735,6 +735,8 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom, tc: &cad_kernel::TrueColorTable) {    m
                 }
                 None => write_u32(w, 0),
             }
+            // v35 (AutoRASM) / v200 (3D-Factory) — uniform ribbon width.
+            write_f64(w, s.width);
         }
         Geom::Wall(wall) => {
             // tag 9 = Wall; centerline + thickness + (v3) style + bulge.
@@ -1888,7 +1890,10 @@ fn read_geom(r: &mut R, tc: &mut cad_kernel::TrueColorTable, ver: u16) -> Result
                 for _ in 0..kn { k.push(r.f64()?); }
                 if k.is_empty() { None } else { Some(k) }
             } else { None };
-            Geom::Spline(Spline { degree, control_points, weights, knots })
+            // v35 (AutoRASM stream) / v200 (unified) — uniform ribbon width.
+            // v100 factory-era files gate to 7, so they read 0.0 here.
+            let width = if ver >= 35 { r.f64()? } else { 0.0 };
+            Geom::Spline(Spline { degree, control_points, weights, knots, width })
         }
         9 => {
             let start = r.vec2()?;

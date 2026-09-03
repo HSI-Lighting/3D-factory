@@ -1116,6 +1116,7 @@ impl Geom {
                     control_points: cp,
                     weights: s.weights.clone(),
                     knots: s.knots.clone(),
+                    width: s.width,  // lengthen/trim preserves the ribbon width
                 }))
             }
             _ => Err("extend: unsupported target type (hatch extend not yet supported)"),

@@ -631,6 +631,11 @@ pub struct Spline {
     /// halves with `Some(non-uniform knots)` so a trimmed spline still
     /// evaluates exactly (issue #21).
     pub knots:          Option<Vec<f64>>,
+    /// Uniform ribbon width in drawing units (0 = a thin stroke, the default
+    /// and the AutoCAD spline look). Unlike a polyline's per-segment taper this
+    /// is ONE constant width for the whole curve; the SPLINE draw tool's
+    /// `Width` option and the Inspector set it. Scales with the geometry.
+    pub width:          f64,
 }
 
 impl Spline {
@@ -642,7 +647,7 @@ impl Spline {
             "Spline: weights count must match control_points count");
         assert!(control_points.len() > degree,
             "Spline: need more control points than degree");
-        Self { degree, control_points, weights, knots: None }
+        Self { degree, control_points, weights, knots: None, width: 0.0 }
     }
 
     /// Non-rational B-spline (all weights = 1.0). Same constraints as
@@ -650,6 +655,13 @@ impl Spline {
     pub fn new_bspline(degree: usize, control_points: Vec<Vec2>) -> Self {
         let n = control_points.len();
         Self::new(degree, control_points, vec![1.0; n])
+    }
+
+    /// Builder: set the uniform ribbon `width` (clamped to ≥ 0). Chains off
+    /// `new` / `new_bspline` so existing call sites stay a thin spline.
+    pub fn with_width(mut self, w: f64) -> Self {
+        self.width = w.max(0.0);
+        self
     }
 
     /// Bounding box of the control polygon (= valid superset of the
@@ -714,6 +726,7 @@ impl Spline {
                 .map(|p| Vec2::new(p.x, p.y)).collect(),
             weights: self.weights.clone(),
             knots: Some(c.knots.knots().to_vec()),
+            width: self.width,      // both halves inherit the ribbon width
         };
         (to_spline(l), to_spline(r))
     }
@@ -1007,7 +1020,9 @@ impl Geom {
             Geom::Spline(s) => Geom::Spline(Spline { degree: s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
                 weights: s.weights.clone(),
-                knots: s.knots.clone() }),
+                knots: s.knots.clone(),
+                // Same average-factor as the polyline arm (anisotropic scale).
+                width: s.width * 0.5 * (sx.abs() + sy.abs()) }),
             Geom::Circle(c) => {
                 let (major, ratio, _) = to_axes(
                     Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
@@ -1151,6 +1166,7 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| rot(*p)).collect(),
                 weights:        s.weights.clone(),
                 knots:          s.knots.clone(),
+                width:          s.width,      // rotation is width-invariant
             }),
             // Wall — rotate the centerline; thickness is direction-
             // invariant. Side lines re-derive from the new endpoints.
@@ -1282,6 +1298,7 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
                 weights:        s.weights.clone(),
                 knots:          s.knots.clone(),
+                width:          s.width * f_abs,   // uniform scale
             }),
             // Wall — scale the centerline + thickness uniformly so
             // the wall stays geometrically similar.
@@ -1443,6 +1460,7 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| mirror(*p)).collect(),
                 weights:        s.weights.clone(),
                 knots:          s.knots.clone(),
+                width:          s.width,      // mirror is width-invariant
             }),
             // Wall — mirror the centerline; thickness unchanged.
             Geom::Wall(w) => Geom::Wall(Wall {
@@ -1725,6 +1743,7 @@ impl Geom {
                 control_points: s.control_points.iter().rev().copied().collect(),
                 weights:        s.weights.iter().rev().copied().collect(),
                 knots:          s.knots.clone(),
+                width:          s.width,      // uniform width — reversal-invariant
             }),
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
             // Wall — reverse the centerline; thickness unchanged. The
@@ -1822,6 +1841,7 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| *p + off).collect(),
                 weights:        s.weights.clone(),
                 knots:          s.knots.clone(),
+                width:          s.width,      // translation is width-invariant
             }),
             Geom::Wall(w) => Geom::Wall(Wall {
                 start: w.start + off, end: w.end + off, thickness: w.thickness,
@@ -2928,6 +2948,69 @@ mod transform_tests {
     }
 
     #[test]
+    fn extend_ellipse_arc_grows_sweep_to_boundary() {
+        // Quarter ellipse arc (a=5, b=3): (5,0) → (0,3), swept CCW in PARAMETER
+        // space. Vertical boundary at x=-2 crosses the full ellipse in the
+        // upper-left quadrant (param ≈ 1.98 rad). Picking just past the (0,3) end
+        // must grow the sweep to reach it (start_param unchanged).
+        let ell = Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.6 };
+        let ea = Geom::EllipseArc(EllipseArc {
+            ellipse: ell, start_param: 0.0, sweep_param: std::f64::consts::FRAC_PI_2,
+        });
+        let boundary = Geom::Line(Line { a: Vec2::new(-2.0, -10.0), b: Vec2::new(-2.0, 10.0) });
+        let pick = Vec2::new(-0.5, 3.0);   // just past the (0,3) end
+        let out = ea.extend_to(&[boundary], pick, true).unwrap();
+        if let Geom::EllipseArc(a) = out {
+            assert!(a.start_param.abs() < 1e-9, "start moved: {}", a.start_param);
+            assert!(a.sweep_param > std::f64::consts::FRAC_PI_2,
+                "sweep didn't grow: {}", a.sweep_param);
+            assert!(a.sweep_param < std::f64::consts::PI,
+                "sweep overshot: {}", a.sweep_param);
+        } else { panic!("expected EllipseArc, got {out:?}"); }
+    }
+
+    #[test]
+    fn extend_closed_circle_and_ellipse_report_precisely() {
+        // A boundary that CROSSES the target (so `hits` is non-empty and the
+        // match arm is reached, not the earlier "no intersection" guard).
+        let boundary = Geom::Line(Line { a: Vec2::new(2.0, -10.0), b: Vec2::new(2.0, 10.0) });
+        let circle = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
+        let ell = Geom::Ellipse(Ellipse { center: Vec2::ZERO, major: Vec2::new(5.0, 0.0), ratio: 0.6 });
+        assert_eq!(
+            circle.extend_to(&[boundary.clone()], Vec2::new(5.0, 0.0), true).err(),
+            Some("extend: can't extend a closed circle"));
+        assert_eq!(
+            ell.extend_to(&[boundary], Vec2::new(5.0, 0.0), true).err(),
+            Some("extend: can't extend a closed ellipse"));
+    }
+
+    #[test]
+    fn spline_ribbon_width_survives_transforms() {
+        let sp = Spline::new_bspline(3, vec![
+            Vec2::new(0.0, 0.0), Vec2::new(3.0, 2.0),
+            Vec2::new(6.0, -1.0), Vec2::new(9.0, 1.0),
+        ]).with_width(0.4);
+        // Rotation, mirror, translation and reversal are width-invariant.
+        for out in [
+            Geom::Spline(sp.clone()).rotated(Vec2::ZERO, 0.7),
+            Geom::Spline(sp.clone()).mirrored(Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)),
+            Geom::Spline(sp.clone()).translated(Vec2::new(2.0, -3.0)),
+            Geom::Spline(sp.clone()).reversed(),
+        ] {
+            if let Geom::Spline(s) = out {
+                assert!((s.width - 0.4).abs() < 1e-12,
+                    "transform dropped the ribbon width: {}", s.width);
+            } else { panic!("expected a spline back"); }
+        }
+        // Uniform scale scales the width; with_width clamps negatives.
+        if let Geom::Spline(s) = Geom::Spline(sp.clone()).scaled(Vec2::ZERO, 2.0) {
+            assert!((s.width - 0.8).abs() < 1e-12, "scaled width: {}", s.width);
+        } else { panic!("expected a spline back"); }
+        assert_eq!(Spline::new_bspline(2, vec![Vec2::ZERO, Vec2::new(1.0, 0.0),
+            Vec2::new(2.0, 0.0)]).with_width(-3.0).width, 0.0);
+    }
+
+    #[test]
     fn document_level_apply_trim_pick_shape() {
         // Simulate what apply_trim_pick does in cad_app: trim target,
         // remove it from the Document, push the surviving pieces. Confirms
@@ -3540,6 +3623,7 @@ impl Geom {
                     control_points: new_ctrls,
                     weights:        s.weights.clone(),
                     knots:          s.knots.clone(),
+                    width:          s.width,
                 })
             }
             // ---- Point -------------------------------------------------

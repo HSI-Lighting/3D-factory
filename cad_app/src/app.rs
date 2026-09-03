@@ -2219,6 +2219,13 @@ pub struct CadApp {
     /// Per-segment (start,end) widths captured so far, parallel to
     /// `pending_bulges`. Drained into `Polyline.widths` on commit.
     pending_widths: Vec<(f64, f64)>,
+    /// SPLINE uniform ribbon width — one value for the whole curve (splines
+    /// have no per-segment taper). 0 = thin stroke. Applied at commit
+    /// (`Spline::with_width`). STICKY across splines like the pline width.
+    spline_width: f64,
+    /// The spline tool's `w`/`width` sub-command is waiting for a number (the
+    /// user chose `w`/`width`). The next command-line number sets `spline_width`.
+    spline_width_wait: bool,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -4802,6 +4809,8 @@ impl Default for CadApp {
             pline_next_width: (0.0, 0.0),
             pline_width_cap: PlineWidthCap::None,
             pending_widths: Vec::new(),
+            spline_width: 0.0,
+            spline_width_wait: false,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             zoom_state:    ZoomState::Off,
@@ -10467,6 +10476,7 @@ impl CadApp {
         self.pending.clear();
         self.pending_bulges.clear();
         self.pending_widths.clear();
+        self.spline_width_wait = false;   // spline width entry (value is sticky)
         // --- selection session ---
         self.select_mode = SelectMode::Off;
         self.select_remove_mode = false;
@@ -16812,6 +16822,14 @@ impl CadApp {
         self.empty_enter_count_in_select = 0;
     }
 
+    /// Compact number formatter for prompts / history (4 decimals, trailing
+    /// zeros trimmed). Ported with the spline ribbon-width sub-command.
+    fn fmt_r(v: f64) -> String {
+        let s = format!("{:.4}", v);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        if s.is_empty() || s == "-0" { "0".into() } else { s.to_string() }
+    }
+
     #[track_caller]
     /// Timing wrapper — measures how long a command takes to EXECUTE and stamps it
     /// onto the `CmdRun` event, so a dump answers "what made the app hang?" instead of
@@ -17741,6 +17759,37 @@ impl CadApp {
                         "  ! hatch panel awaiting: type `c`onfirm / `d`iscard / `ch`ange / `p`oint / `D`object".into());
                     return;
                 }
+            }
+        }
+
+        // ---- SPLINE sub-command: Width ------------------------------------
+        // One UNIFORM ribbon width for the whole spline (no per-segment taper).
+        // `w`/`width` arms a one-value entry; the next typed number sets it and
+        // it applies to THIS spline (and sticks as the default for the next).
+        // Intercepted before the parser so the number doesn't leak to another
+        // command.
+        if self.tool == Tool::Spline {
+            let lc = trimmed.to_ascii_lowercase();
+            if self.spline_width_wait {
+                if let Ok(v) = lc.parse::<f64>() {
+                    self.spline_width = v.max(0.0);
+                    self.spline_width_wait = false;
+                    self.history.push(format!(
+                        "  spline: width = {}", Self::fmt_r(self.spline_width)));
+                    self.set_prompt(current_hint(
+                        Tool::Spline, self.arc_method, self.pending.len()));
+                    return;
+                }
+                // Not a number → cancel the wait and let the token fall
+                // through to its own handler below.
+                self.spline_width_wait = false;
+            }
+            if matches!(lc.as_str(), "w" | "width") {
+                self.spline_width_wait = true;
+                self.set_prompt(format!(
+                    "spline: type ribbon width  <{}>  (0 = thin)",
+                    Self::fmt_r(self.spline_width)));
+                return;
             }
         }
 
@@ -33798,6 +33847,35 @@ impl CadApp {
                     ui.small("Colour: General ▸ Color.  Background / origin / type: planned.");
                     ui.end_row();
                 }
+                // ---- Spline: degree (read-only) + uniform ribbon width ----
+                // (tag 8 — the grid arm list skips straight from Hatch 7 to
+                // Wall 9; the spline section lives here.)
+                8 => {
+                    let shared_deg = self.props_shared_geom(targets, |g| {
+                        if let Geom::Spline(s) = g { Some(s.degree as i64) } else { None } });
+                    ui.label("Degree");
+                    ui.monospace(shared_deg.map(|d| d.to_string())
+                        .unwrap_or_else(|| "≠".into()));
+                    ui.end_row();
+
+                    // Ribbon WIDTH — one uniform value; 0 = thin. Editing
+                    // re-renders the ribbon (the spline tool's `Width` option
+                    // sets the default captured at commit).
+                    ui.label("Width");
+                    let shared_w = self.props_shared_geom(targets, |g| {
+                        if let Geom::Spline(s) = g { Some((s.width * 1e6).round() as i64) }
+                        else { None } });
+                    let mut w = shared_w.map(|x| x as f64 / 1e6).unwrap_or(0.0);
+                    let resp = ui.add(egui::DragValue::new(&mut w).update_while_editing(false)
+                        .speed(0.1).range(0.0..=1e9)
+                        .prefix(if shared_w.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Spline(s) = &mut d.geom { s.width = w.max(0.0); } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+                }
                 // ---- Wall: wall style + thickness ----
                 9 => {
                     ui.label("Wall style");
@@ -47590,7 +47668,8 @@ impl CadApp {
             let degree = 3.min(n - 1);
             let ctrls: Vec<Vec2> = self.pending.drain(..).collect();
             self.pending_bulges.clear();
-            let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
+            let spline = cad_kernel::Spline::new_bspline(degree, ctrls)
+                .with_width(self.spline_width);
             self.add_dobject(Geom::Spline(spline), "canvas");
             true
         } else {
@@ -52322,6 +52401,7 @@ impl eframe::App for CadApp {
             self.pending.clear();
             self.pending_bulges.clear();
             self.pending_widths.clear();
+            self.spline_width_wait = false;   // spline width entry (value is sticky)
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
             self.pline_dir_override = None;

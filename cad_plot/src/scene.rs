@@ -636,6 +636,7 @@ impl<'a> Builder<'a> {
                         control_points: control_points.clone(),
                         weights: vec![1.0; control_points.len()],
                         knots: None,
+                        width: 0.0,   // no width channel in VectorPrimitive
                     };
                     let n = curve_segments(bbox_diag * 0.5, std::f64::consts::TAU, s)
                         .clamp(32, 512);
