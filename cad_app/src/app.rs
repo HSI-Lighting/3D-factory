@@ -50559,7 +50559,10 @@ fn divmeasure_positions_for(geom: &Geom, count_or_dist: f64,
     } else {
         let n = (count_or_dist as usize).max(2);
         let ks: Vec<usize> = if geom_is_closed_loop(geom) { (0..n).collect() } else { (1..n).collect() };
-        for k in ks { out.push(point_at_arclen(&pts, &cum, total, total * k as f64 / n as f64)); }
+        for k in ks {
+            out.push(point_at_arclen(&pts, &cum, total, total * k as f64 / n as f64));
+            if out.len() >= 4000 { break; }   // same cap as the measure path
+        }
     }
     out
 }
