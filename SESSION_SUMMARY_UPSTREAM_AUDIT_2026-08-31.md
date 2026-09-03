@@ -88,6 +88,59 @@
   architecture decisions (hover/designate hatch flow, rail-card dock
   columns).
 
+## 2026-09-03 (evening, resumed on this machine) — backlog batch 3
+
+Resumed from the other machine's session end (`3b77d70`, clean, pushed).
+Its transcript was machine-local, so the handoff was this doc + the repo
+state. Commits (local only — see the push note at the end):
+
+- `ec82238` — AREA + LAYISO/LAYFRZ/LAYOFF/LAYON. AREA: click a closed
+  object → measured area+perimeter reported (kernel `measured_area` /
+  `measured_perimeter`); empty clicks accumulate a point polygon
+  (shoelace + closure perimeter), running total folds in via Enter,
+  `a`/`s` (or add/sub/subtract) toggle add/subtract mode, Esc exits;
+  pure inspection, never mutates the doc. LAYISO/LAYFRZ/LAYOFF: click a
+  dobject, its layer is frozen-isolated / frozen / turned off (one undo
+  entry per pick, no-op rolls back + reports); LayOn restores every
+  hidden/frozen layer in ONE undo entry. Arms, Esc cancels, pointer
+  click chain, gates (modal/snap/click-only), state dumps, and the
+  dbg_recorder WatchedState fields all wired. 10 regression tests.
+- `e8f8163` — DIVIDE + MEASURE. Pick a curve (or pickfirst) then type a
+  whole segment COUNT ≥ 2 (divide) or a positive segment LENGTH
+  (measure); marks are kernel `Point` dobjects (one undo entry).
+  Ported the upstream sampler trio (`sample_path_points` /
+  `point_at_arclen` / `geom_is_closed_loop`) plus a pure
+  `divmeasure_positions_for`; divide places N marks around closed loops
+  and N−1 interior marks on open curves; measure steps floor(len/dist)
+  marks from the start. Bad values re-prompt; Esc / empty-Enter exits.
+  5 regression tests.
+- `8e5d49c` — selection cycling: pointer-mode Tab cycles the selection
+  through stacked dobjects under the cursor (fresh spot = top candidate,
+  repeat Tab advances; the next click at the cycle spot honors the
+  highlighted candidate; any pointer click consumes the cycle state).
+  Invisible dobjects are never candidates. 2 regression tests. ALSO
+  fixes a latent purge bug found while testing: `commit_purge` left
+  `layers.active` dangling when it purged the active layer, so every
+  dobject failed `is_visible`/`is_selectable` until the user switched
+  layers — active layer is now clamped back to layer 0 (1 regression
+  test).
+
+Verification after batch 3: `cargo check --workspace` clean;
+`cargo test -p cad_app --bin simlux` 1477 passed / 0 failed / 50
+ignored (was 1469 after batch 1 + 2 — i.e. 28 new tests all green);
+pytest 1473/1473. Kernel untouched (416/416 suites unaffected).
+
+Still open (unchanged, app-side only): QSELECT/QDIM, LAYWALK, Point
+Style picker (current_point_style stamping + grid picker), XLINE/RAY/
+DONUT/CENTERMARK/WIPEOUT end-to-end (kernel types + grips exist; the
+fork's egui/GPU draw + creation flows needed), REGION/BOUNDARY,
+XREF/WBLOCK, ATTDEF/ATTEDIT, polar/path ARRAY, per-layout Plot dialog,
+plus the two architecture decisions. The next items are dialog/UI-heavy
+or need draw-pipeline arms, so they were left for interactive sessions.
+
+Note: the three commits are on `farzad-dev` locally; origin/farzad-dev
+is still at `3b77d70` — push when ready (`git push origin farzad-dev`).
+
 ---
 
 Audit of what RUST-AutoRASM (upstream) changes are still missing from
