@@ -3901,7 +3901,7 @@ impl Geom {
     /// polylines — callers fall back to the plain vertex move.
     pub fn with_corner_scale(&self, i: usize, new_pos: Vec2, uniform: bool) -> Option<Geom> {
         match self {
-            Geom::Polyline(p) if p.closed && p.vertices.len() == 4 => {
+            Geom::Polyline(p) if p.closed && p.vertices.len() == 4 && i < 4 => {
                 let anchor = p.vertices[(i + 2) % 4].pos;
                 let e1 = p.vertices[(i + 1) % 4].pos - anchor;
                 let e2 = p.vertices[(i + 3) % 4].pos - anchor;

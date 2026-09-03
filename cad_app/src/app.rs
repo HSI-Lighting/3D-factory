@@ -18339,8 +18339,13 @@ impl CadApp {
             Ok(Command::Add(e))   => self.add_dobject(e, "command"),
             Ok(Command::Delete(i)) => {
                 if i < self.doc.dobjects.len() {
-                    self.doc.dobjects.remove(i);
+                    let orphans = self.doc.erase_dobjects(vec![i]);
                     self.history.push(format!("  - removed #{}", i));
+                    if !orphans.is_empty() {
+                        self.history.push(format!(
+                            "  - also removed {} orphaned hatch boundary/ies {:?}",
+                            orphans.len(), orphans));
+                    }
                     self.selected = None;
                     self.intersections.clear();
                     self.index_dirty = true;
@@ -18616,47 +18621,24 @@ impl CadApp {
                     self.snapshot_doc();
                     // Remove from highest index downward so earlier indices stay valid.
                     let mut sorted = self.selection.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    let n = sorted.len();
                     // Erasing a HATCH must also erase the invisible auxiliary
-                    // boundary it owns. That boundary exists only to serve its
-                    // hatch, so once the hatch is gone it is unreachable
-                    // garbage — and worse, it stayed a closed region the
-                    // pick-point scan could still choose, so the NEXT hatch in
-                    // that area silently reused the deleted hatch's outline
-                    // instead of the polyline the user drew (owner-reported).
-                    //
-                    // Only `hatch_aux` boundaries are swept, and only when no
-                    // OTHER surviving hatch still references them.
-                    let erasing: std::collections::HashSet<usize> =
-                        sorted.iter().copied().collect();
-                    let mut orphans: Vec<usize> = Vec::new();
-                    for &i in &sorted {
-                        let Some(d) = self.doc.dobjects.get(i) else { continue };
-                        let Geom::Hatch(h) = &d.geom else { continue };
-                        for bh in &h.boundary_handles {
-                            let Some(bi) = self.doc.dobjects.iter()
-                                .position(|x| x.handle == *bh) else { continue };
-                            if !self.doc.dobjects[bi].style.hatch_aux { continue; }
-                            // Still needed by a hatch that is NOT being erased?
-                            let still_used = self.doc.dobjects.iter().enumerate()
-                                .any(|(hi, x)| !erasing.contains(&hi)
-                                    && matches!(&x.geom,
-                                        Geom::Hatch(hh) if hh.boundary_handles.contains(bh)));
-                            if !still_used { orphans.push(bi); }
-                        }
-                    }
+                    // boundary it owns — shared rule for every delete path
+                    // (`erase_dobjects` in cad_kernel/document.rs; one
+                    // handle→index pass, O(N + refs)). Only `hatch_aux`
+                    // boundaries are swept, and only when no OTHER surviving
+                    // hatch still references them. Otherwise the boundary
+                    // stays unreachable garbage — and a closed region the
+                    // pick-point scan could still choose, so the NEXT hatch
+                    // in that area silently reused the deleted hatch's
+                    // outline instead of the polyline the user drew.
+                    let orphans = self.doc.erase_dobjects(sorted);
                     if !orphans.is_empty() {
                         self.hatch_dbg(format!(
                             "--- [10] erase: also removing {} orphaned hatch boundary/ies {:?}",
                             orphans.len(), orphans));
-                        sorted.extend(orphans);
-                    }
-                    sorted.sort_unstable();
-                    sorted.dedup();
-                    let n = sorted.len();
-                    for &idx in sorted.iter().rev() {
-                        if idx < self.doc.dobjects.len() {
-                            self.doc.dobjects.remove(idx);
-                        }
                     }
                     self.selection_prev = self.selection.clone();
                     self.selection.clear();
@@ -19477,6 +19459,17 @@ impl CadApp {
                 self.history.push("  plot style table editor".into());
             }
             Ok(Command::Plot) => {
+                // The Plot dialog (and run_plot) resolve the MODEL against the
+                // document's layer table — which, while a layout tab is
+                // active, is the PAPER table (only the layout's own layers).
+                // A plot launched there would silently drop every model
+                // dobject on a paper-only layer. Layout output goes through
+                // the layout's Print-preview / plot flow instead.
+                if self.doc.active_layout.is_some() {
+                    self.history.push(
+                        "  ! plot: switch to the Model tab to plot model space (layouts print via their Print-preview)".into());
+                    return;
+                }
                 // Open the Plot dialog (paper/area/scale + table -> PDF). App
                 // dialog only — read-only on the doc, no undo. Start from the
                 // document's saved PAGESETUP.
@@ -20688,60 +20681,22 @@ impl CadApp {
     }
 
     /// Scoped variant — see `collect_closed_containing_scoped`.
+    ///
+    /// Deliberately delegates to the candidate scan instead of maintaining a
+    /// second copy of the eligibility rule (visibility filter, closed-shape
+    /// kinds, PIP test). The two functions MUST agree — when only the
+    /// collector filtered, the candidate list showed the user's polyline
+    /// while this picker returned a hidden `hatch_aux` boundary with a
+    /// smaller bbox ("candidates: #16" then "chose #17").
     fn find_smallest_containing_closed_scoped(
         &self,
         world: Vec2,
         scope: Option<&[usize]>,
     ) -> Option<usize> {
-        let mut best: Option<(usize, f64)> = None;
-        let iter: Box<dyn Iterator<Item = (usize, &DObject)>> = match scope {
-            Some(s) => Box::new(s.iter().filter_map(|&i| {
-                self.doc.dobjects.get(i).map(|d| (i, d))
-            })),
-            None => Box::new(self.doc.dobjects.iter().enumerate()),
-        };
-        for (i, d) in iter {
-            // Same rule as `collect_closed_containing_scoped`: a boundary the
-            // user cannot SEE must not define a clickable region. These two
-            // functions MUST agree — when only the collector filtered, the
-            // candidate list showed the user's polyline while this picker
-            // returned a hidden `hatch_aux` boundary that happened to have a
-            // smaller bbox, so the log said "candidates: #16" and then
-            // "chose #17".
-            if !self.doc.is_visible(i) { continue; }
-            let contains = match &d.geom {
-                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
-                    // Use the same tessellated polygon the renderer
-                    // would resolve, so PIP and render agree on the
-                    // shape (bulges + effective-closure both honoured).
-                    let verts = closed_dobject_polygon(&d.geom);
-                    point_in_polygon(world, verts)
-                }
-                Geom::Circle(c) => {
-                    (world - c.center).len() < c.radius
-                }
-                Geom::Ellipse(e) => {
-                    // Convert world point to ellipse-local coords:
-                    // project onto u_hat (major direction) + v_hat
-                    // (minor), divide by semi-axes, test sum of
-                    // squares against 1.
-                    let d = world - e.center;
-                    let a = e.semi_major().max(1e-12);
-                    let b = e.semi_minor().max(1e-12);
-                    let u = d.dot(e.u_hat()) / a;
-                    let v = d.dot(e.v_hat()) / b;
-                    u * u + v * v < 1.0
-                }
-                _ => false,
-            };
-            if !contains { continue; }
-            let (bmin, bmax) = d.geom.bbox();
-            let area = (bmax.x - bmin.x).abs() * (bmax.y - bmin.y).abs();
-            if best.map_or(true, |(_, ba)| area < ba) {
-                best = Some((i, area));
-            }
-        }
-        best.map(|(i, _)| i)
+        self.collect_closed_containing_scoped(world, scope)
+            .into_iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _, _)| i)
     }
 
     /// Smart hatch finaliser: collect handles of every CLOSED polyline
@@ -25295,17 +25250,12 @@ impl CadApp {
             }
             Op::Delete { indices } => {
                 self.snapshot_doc();
-                let mut sorted = indices;
-                sorted.sort_unstable();
-                sorted.dedup();
-                let n = sorted.len();
-                for &i in sorted.iter().rev() {
-                    if i < self.doc.dobjects.len() {
-                        self.doc.dobjects.remove(i);
-                    }
-                }
-                let gone: std::collections::HashSet<usize> =
-                    sorted.iter().copied().collect();
+                let mut gone: std::collections::HashSet<usize> =
+                    indices.iter().copied().collect();
+                let n = gone.len();
+                // Same shared aux-boundary sweep every delete path uses.
+                let orphans = self.doc.erase_dobjects(indices);
+                gone.extend(orphans.iter().copied());
                 self.selection.retain(|i| !gone.contains(i));
                 self.selected = None;
                 self.intersections.clear();
@@ -26034,15 +25984,10 @@ impl CadApp {
                 R::Ok(i)
             }
             Op::Delete { indices } => {
-                let mut sorted = indices.clone();
-                sorted.sort_unstable();
-                sorted.dedup();
-                let n = sorted.len();
-                for &i in sorted.iter().rev() {
-                    if i < doc.dobjects.len() {
-                        doc.dobjects.remove(i);
-                    }
-                }
+                // Ghost-preview delete — same shared aux-boundary sweep, run
+                // on the preview document.
+                let n = { let mut s = indices.clone(); s.sort_unstable(); s.dedup(); s.len() };
+                let _ = doc.erase_dobjects(indices.clone());
                 R::Ok(n)
             }
             Op::LayerAdd { name } => {
@@ -27949,7 +27894,36 @@ impl CadApp {
             }
         }); });
         if let Some(t) = ctx.data_mut(|d| d.remove_temp::<Option<usize>>(sk)) { self.switch_to_tab(t); }
-        if let Some(i) = ctx.data_mut(|d| d.remove_temp::<usize>(ck)) { if i < self.doc.layouts.len() { if self.doc.active_layout == Some(i) { self.switch_to_tab(None); } self.doc.layouts.remove(i); self.doc.active_layout = match self.doc.active_layout { Some(a) if a > i => Some(a-1), o => o }; } }
+        if let Some(i) = ctx.data_mut(|d| d.remove_temp::<usize>(ck)) {
+            if i < self.doc.layouts.len() {
+                // Closing a layout is an undoable doc edit — mark the drawing
+                // dirty too (autosave / unsaved-changes prompt), and snapshot
+                // BEFORE the swap so an undo restores this exact arrangement.
+                self.snapshot_doc();
+                // Any layout-bound dialog/edit state pointing at or past the
+                // removed slot must be cleared or shifted, or an open
+                // Viewport Properties dialog would silently edit a DIFFERENT
+                // layout after the removal.
+                let shift = |b: Option<(usize, usize)>| match b {
+                    Some((li, vi)) if li == i => None,
+                    Some((li, vi)) if li > i => Some((li - 1, vi)),
+                    b => b,
+                };
+                self.vp_edit_dialog = shift(self.vp_edit_dialog);
+                self.vp_edit_init_for = shift(self.vp_edit_init_for);
+                if self.viewport_draw_li == Some(i) {
+                    self.viewport_draw_state = 0;
+                    self.viewport_draw_li = None;
+                } else if let Some(li) = self.viewport_draw_li {
+                    if li > i { self.viewport_draw_li = Some(li - 1); }
+                }
+                if self.doc.active_layout == Some(i) { self.switch_to_tab(None); }
+                self.doc.layouts.remove(i);
+                self.doc.active_layout = match self.doc.active_layout {
+                    Some(a) if a > i => Some(a - 1), o => o
+                };
+            }
+        }
         if ctx.data_mut(|d| d.remove_temp::<bool>(nk)).unwrap_or(false) { self.show_new_layout_dialog = true; self.new_layout_name = format!("Layout {}", n_layouts + 1); self.new_layout_paper = PaperSize::A4; self.new_layout_landscape = true; }
     }
 
@@ -28007,6 +27981,7 @@ impl CadApp {
                 let ssc = self.scale; let sof = self.world_offset;
                 let page_white = egui::Color32::from_rgb(252, 252, 252);
                 let mut hatch_pending: Vec<(u64, HatchCacheEntry)> = Vec::new();
+                let mut badges: Vec<(Vec2, bool)> = Vec::new();
                 for vp in vps {
                     // Restore paper camera for screen-coordinate math
                     self.scale = ssc; self.world_offset = sof;
@@ -28052,7 +28027,24 @@ impl CadApp {
                     // its candidates are empty). Bound per frame like the model
                     // path so a dense batch of hatches can't spike one frame.
                     let mut hatch_work = 0usize;
-                    for (d_idx, d) in self.doc.dobjects.iter().enumerate() {
+                    // Candidates = the spatial index's window cells PLUS every
+                    // hatch (their bbox is a (0,0) placeholder, so they never
+                    // land in the window query — they warm independently).
+                    // Falls back to the full walk while the index is stale or
+                    // missing, exactly like the model path's viewport_scope().
+                    let mut cands: Vec<usize> =
+                        if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
+                            g.query_bbox(wmn, wmx).into_iter().map(|u| u as usize).collect()
+                        } else {
+                            (0..self.doc.dobjects.len()).collect()
+                        };
+                    cands.extend(self.doc.dobjects.iter().enumerate()
+                        .filter(|(_, d)| matches!(&d.geom, cad_kernel::Geom::Hatch(_)))
+                        .map(|(i, _)| i));
+                    cands.sort_unstable();
+                    cands.dedup();
+                    for &d_idx in &cands {
+                        let Some(d) = self.doc.dobjects.get(d_idx) else { continue };
                         if !d.style.visible { continue; }
                         if !l.layers.renders(d.style.layer) { continue; }
                         let is_hatch = matches!(&d.geom, cad_kernel::Geom::Hatch(_));
@@ -28075,11 +28067,10 @@ impl CadApp {
                         } else {
                             egui::Color32::from_rgb(r,g,b)
                         };
-                        if let cad_kernel::Geom::Hatch(h) = &d.geom {
+                        if let cad_kernel::Geom::Hatch(_) = &d.geom {
                             // Render the cached geometry (shared painter — the
                             // page's white is the hole over-draw colour), or
-                            // warm the cache (budgeted + once per frame) and
-                            // fall back to the boundary fill until built.
+                            // warm the cache (budgeted + once per frame).
                             let mut painted = false;
                             if let Some(entry) = self.hatch_cache.get(&d.handle) {
                                 paint_cached_hatch(&clip_painter, rect, self,
@@ -28096,9 +28087,13 @@ impl CadApp {
                                     paint_cached_hatch(&clip_painter, rect, self,
                                         &entry, ego, page_white);
                                     hatch_pending.push((d.handle, entry));
-                                } else {
-                                    self.render_hatch_fill(&clip_painter, rect, h, ego);
                                 }
+                                // Beyond this frame's budget: skip — the entry
+                                // warms on a later frame (the budget is consumed
+                                // in list order), so an uncached hatch is simply
+                                // not painted yet. Rendering it here unbudgeted
+                                // regenerated dense fills EVERY frame while a
+                                // layout tab was visible.
                             }
                             continue;
                         }
@@ -28115,8 +28110,24 @@ impl CadApp {
                     for (hh, entry) in hatch_pending.drain(..) {
                         self.hatch_cache.insert(hh, entry);
                     }
+                    if !self.layout_print_preview {
+                        // The viewport's top-right corner (paper coords) — the
+                        // lock badge paints there under the PAPER camera after
+                        // the loop restores it below.
+                        let (_mn, mx) = vg.bbox_world();
+                        badges.push((Vec2::new(mx.x, mx.y), vp.locked));
+                    }
                 }
                 self.scale = ssc; self.world_offset = sof;
+                // Lock badges — screen math under the paper camera, matching
+                // the click hit-test in `paper_space_input` exactly.
+                if !self.layout_print_preview {
+                    for (corner, locked) in &badges {
+                        let tr = self.w2s(*corner, rect);
+                        Self::paint_lock_badge(painter,
+                            egui::pos2(tr.x - 12.0, tr.y + 12.0), *locked);
+                    }
+                }
                 // Rubber-band for viewport creation
                 if self.viewport_draw_state == 2 { if let (Some(p1), Some(cs)) = (self.viewport_draw_p1, resp.hover_pos()) { let a = self.w2s(p1, rect); let rb = egui::Rect::from_two_pos(a, cs); painter.rect_stroke(rb, 0.0, egui::Stroke::new(1.2, egui::Color32::from_rgb(0, 200, 255))); } }
             } }
@@ -28169,7 +28180,12 @@ impl CadApp {
                     } }
                 }
                 // Start grip drag (resize).
-                if let Some((si, role)) = near_grip { if resp.drag_started() { if let Some(e) = ents.get(si) { if let Some(gp) = e.geom.grip_points().iter().find(|(_,r)| *r == role).map(|(p,_)|*p) { self.layout_grip_drag = Some((si, role, gp)); } } } }
+                if let Some((si, role)) = near_grip { if resp.drag_started() { if let Some(e) = ents.get(si) { if let Some(gp) = e.geom.grip_points().iter().find(|(_,r)| *r == role).map(|(p,_)|*p) {
+                    // One undo step per gesture — the drag writes the entity
+                    // every frame below.
+                    self.snapshot_doc();
+                    self.layout_grip_drag = Some((si, role, gp));
+                } } } }
                 // Start MOVE drag: press on a viewport body (not a grip). Auto-select.
                 if near_grip.is_none() && self.layout_grip_drag.is_none() && resp.drag_started() {
                     if let Some(pos) = resp.interact_pointer_pos() { let w = self.s2w(pos, rect);
@@ -28178,6 +28194,9 @@ impl CadApp {
                                 if !ui.input(|inp| inp.modifiers.shift) { self.layout_selection.clear(); }
                                 self.layout_selection.push(i);
                             }
+                            // One undo step per gesture (the MOVE below writes
+                            // per drag frame).
+                            self.snapshot_doc();
                             self.layout_move_last = Some(w);
                         }
                     }
@@ -28198,14 +28217,13 @@ impl CadApp {
                             let (nmn, nmx) = nvg.bbox_world();
                             !Self::layout_rect_overlaps(&ents, si, (nmn.x,nmn.y), (nmx.x,nmx.y))
                         } else { true };
-                        if ok { if let Some(layout) = self.doc.layouts.get_mut(li) { if let Some(entity) = layout.entities.get_mut(si) {
-                            entity.geom = new_geom;
-                            if let cad_kernel::Geom::Viewport(vg) = &entity.geom { if let Some(vi) = layout.viewports.iter().position(|v| v.shape_handle == Some(entity.handle)) {
-                                let vd = &mut layout.viewports[vi]; vd.rect_min = (vg.center.x-vg.width*0.5, vg.center.y-vg.height*0.5); vd.rect_max = (vg.center.x+vg.width*0.5, vg.center.y+vg.height*0.5);
-                                // P0: a mid-grip pans the model in the entity (authoritative);
-                                // mirror it back so the sidecar the renderer reads stays in sync.
-                                vd.model_center = (vg.model_center.x, vg.model_center.y); vd.model_zoom = vg.model_zoom; vd.model_scale = vg.model_scale; } }
-                        } } }
+                        if ok { if let Some(layout) = self.doc.layouts.get_mut(li) {
+                            if let Some(entity) = layout.entities.get_mut(si) { entity.geom = new_geom; }
+                            // Entity is authoritative — mirror rect + model
+                            // camera into the sidecar via the kernel helper so
+                            // the RSM writer / render loop can't drift.
+                            layout.sync_all_viewports();
+                        } }
                     }
                 } }
                 // Process MOVE drag (selected viewports, overlap-guarded per entity).
@@ -28214,20 +28232,20 @@ impl CadApp {
                     let sel = self.layout_selection.clone();
                     if let Some(layout) = self.doc.layouts.get_mut(li) {
                         for &si in &sel {
-                            let (nc, nmn, nmx, h) = {
+                            let (nc, nmn, nmx) = {
                                 let Some(entity) = layout.entities.get(si) else { continue };
                                 let cad_kernel::Geom::Viewport(vg) = &entity.geom else { continue };
                                 let nc = vg.center + dv;
-                                ((nc), (nc.x-vg.width*0.5, nc.y-vg.height*0.5), (nc.x+vg.width*0.5, nc.y+vg.height*0.5), entity.handle)
+                                ((nc), (nc.x-vg.width*0.5, nc.y-vg.height*0.5), (nc.x+vg.width*0.5, nc.y+vg.height*0.5))
                             };
                             if Self::layout_rect_overlaps(&ents, si, nmn, nmx) { continue; }
                             if let Some(entity) = layout.entities.get_mut(si) {
                                 if let cad_kernel::Geom::Viewport(vg) = &mut entity.geom { vg.center = nc; }
                             }
-                            if let Some(vd) = layout.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) {
-                                vd.rect_min = nmn; vd.rect_max = nmx;
-                            }
                         }
+                        // Entity is authoritative — mirror into the sidecar in
+                        // one place (Layout::sync_all_viewports).
+                        layout.sync_all_viewports();
                     }
                     self.layout_move_last = Some(w);
                 } } }
@@ -28249,6 +28267,7 @@ impl CadApp {
                         if pos.distance(egui::pos2(tr.x - 12.0, tr.y + 12.0)) < 11.0 { badge_handle = Some(e.handle); break; }
                     } }
                     if let Some(h) = badge_handle {
+                        self.snapshot_doc();
                         if let Some(layout) = self.doc.layouts.get_mut(li) { if let Some(v) = layout.viewports.iter_mut().find(|v| v.shape_handle == Some(h)) { v.locked = !v.locked; } }
                     } else {
                         let w = self.s2w(pos, rect);
@@ -28510,6 +28529,10 @@ impl CadApp {
             let o = if self.new_layout_landscape{cad_kernel::plotstyle::Orientation::Landscape}else{cad_kernel::plotstyle::Orientation::Portrait};
             let mut l = cad_kernel::Layout::new(&n,self.new_layout_paper,o);
             l.ctb_name = if self.new_layout_ctb.is_empty() { None } else { Some(self.new_layout_ctb.clone()) };
+            // Creating a layout is an undoable doc edit — mark the drawing
+            // dirty too, or layout-only sessions never trigger autosave / the
+            // unsaved-changes prompt.
+            self.snapshot_doc();
             self.doc.layouts.push(l); self.switch_to_tab(Some(self.doc.layouts.len()-1)); self.show_new_layout_dialog=false; }
         if cl { self.show_new_layout_dialog=false; }
     }
@@ -28527,10 +28550,9 @@ impl CadApp {
                 }
             }
         }
-        // mirror: the sidecar the render loop + RSM read
-        if let Some(vd) = layout.viewports.get_mut(vi) {
-            vd.model_center = center; vd.model_zoom = zoom; vd.model_scale = scale;
-        }
+        // mirror: the sidecar the render loop + RSM read — single source of
+        // truth (Layout::sync_all_viewports), so the two can't drift.
+        layout.sync_all_viewports();
     }
 
     fn set_viewport_ctb(&mut self, ent_idx: usize, new: Option<String>) {
@@ -28627,6 +28649,8 @@ impl CadApp {
         if self.layout_selection.is_empty() { return; }
         let li = match self.doc.active_layout { Some(i) => i, None => return };
         let sel = self.layout_selection.clone();
+        // One undo step for the whole copy batch.
+        self.snapshot_doc();
         let mut new_sel: Vec<usize> = Vec::new();
         let Some(layout) = self.doc.layouts.get_mut(li) else { return };
         for &si in &sel {
@@ -29949,6 +29973,14 @@ impl CadApp {
     /// the PDF in the default viewer.
     fn run_plot(&mut self) {
         use cad_kernel::plotstyle::{PlotStyleTable, PlotTarget};
+        // Belt-and-braces: model plots resolve against `doc.layers`, which is
+        // the PAPER table while a layout tab is active (see Command::Plot).
+        if self.doc.active_layout.is_some() {
+            self.plot_dialog_open = false;
+            self.history.push(
+                "  ! plot: switch to the Model tab to plot model space (layouts print via their Print-preview)".into());
+            return;
+        }
         let raw = self.plot_pdf_path.trim().to_string();
         if raw.is_empty() {
             self.history.push("  ! plot: no output path — press Plot and choose a file.".into());
@@ -41203,11 +41235,48 @@ impl CadApp {
 
     /// Put the drawing back, and invalidate everything that was derived from it.
     fn restore_doc(&mut self, doc: Document) {
+        // Any grip drag / paper-space drag in flight names indices (or
+        // geometry states) of the OLD document — a release after this
+        // restore would apply a stale vertex index to the new geometry.
+        // Kill the drags so the next gesture re-grabs cleanly.
+        self.grip_drag = None;
+        self.grip_drag_peers.clear();
+        self.layout_grip_drag = None;
+        self.layout_move_last = None;
+        self.viewport_draw_state = 0;
+        self.viewport_draw_p1 = None;
+        self.viewport_draw_p2 = None;
+        self.viewport_draw_li = None;
+        self.viewport_scale_dialog_open = false;
+        self.vp_edit_dialog = None;
+        self.vp_edit_init_for = None;
         self.doc = doc;
         self.selection.clear();
         self.selected = None;
+        self.layout_selection.clear();
         self.intersections.clear();
         self.index_dirty = true;
+        // The restored document carries the layer-table arrangement and
+        // active space of the SNAPSHOT moment. Re-sync the on-screen camera
+        // with the space the snapshot is in, or the canvas keeps the other
+        // tab's zoom/pan (and the swap invariant doc.layers == active
+        // space's table holds, but the camera lies).
+        match self.doc.active_layout {
+            Some(li) => {
+                if let Some(l) = self.doc.layouts.get(li) {
+                    self.scale = l.camera.zoom;
+                    self.world_offset = egui::vec2(l.camera.pan_x, l.camera.pan_y);
+                }
+            }
+            None => {
+                if let (Some(s), Some(o)) =
+                    (self.saved_model_scale.take(), self.saved_model_offset.take())
+                {
+                    self.scale = s;
+                    self.world_offset = o;
+                }
+            }
+        }
         self.touch_view();
     }
 
@@ -50529,7 +50598,6 @@ fn icon_for(key: &str) -> MenuIcon<'static> {
         "modify.explode"  => MenuIcon::Cmd(GlyphKind::Explode),
         "modify.matchprop"=> MenuIcon::Cmd(GlyphKind::MatchProps),
         "modify.chlayer"  => MenuIcon::Cmd(GlyphKind::ChangeLayer),
-        "modify.layer" | "layer" => MenuIcon::Cmd(GlyphKind::ChangeLayer),
         "modify.erase"    => MenuIcon::Cmd(GlyphKind::Erase),
         // Utilities / inquiry.
         "util.dist" => MenuIcon::Cmd(GlyphKind::Dist),

@@ -248,6 +248,65 @@ impl Document {
     pub fn index_of_handle(&self, h: crate::dobject::Handle) -> Option<usize> {
         self.dobjects.iter().position(|d| d.handle == h)
     }
+
+    /// Remove dobjects at `indices` (sorted + deduped internally, removed
+    /// highest-index-first so earlier indices stay valid). When the erased
+    /// set includes a HATCH, its invisible `hatch_aux` boundary dobjects are
+    /// swept too — but only when no OTHER hatch that is not being erased
+    /// still references them. Returns the swept orphan indices (those not
+    /// part of `indices`). One handle→index pass keeps this O(N + refs)
+    /// instead of a full-document scan per boundary handle.
+    pub fn erase_dobjects(&mut self, mut indices: Vec<usize>) -> Vec<usize> {
+        indices.sort_unstable();
+        indices.dedup();
+        if indices.is_empty() { return Vec::new(); }
+        let mut by_handle: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::with_capacity(self.dobjects.len());
+        for (i, d) in self.dobjects.iter().enumerate() {
+            by_handle.insert(d.handle, i);
+        }
+        let erasing: std::collections::HashSet<usize> =
+            indices.iter().copied().collect();
+        let is_aux = |i: usize| {
+            self.dobjects.get(i).map(|d| d.style.hatch_aux).unwrap_or(false)
+        };
+        // Single pass over surviving dobjects: which aux boundaries are
+        // still referenced by a hatch that survives this erase?
+        let mut still_used: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        for (hi, d) in self.dobjects.iter().enumerate() {
+            if erasing.contains(&hi) { continue; }
+            if let crate::geom::Geom::Hatch(h) = &d.geom {
+                for bh in &h.boundary_handles {
+                    if let Some(&bi) = by_handle.get(bh) {
+                        if is_aux(bi) { still_used.insert(bi); }
+                    }
+                }
+            }
+        }
+        let mut orphans: Vec<usize> = Vec::new();
+        for &i in &indices {
+            let Some(d) = self.dobjects.get(i) else { continue };
+            let crate::geom::Geom::Hatch(h) = &d.geom else { continue };
+            for bh in &h.boundary_handles {
+                if let Some(&bi) = by_handle.get(bh) {
+                    if is_aux(bi) && !still_used.contains(&bi) && !erasing.contains(&bi) {
+                        orphans.push(bi);
+                    }
+                }
+            }
+        }
+        orphans.sort_unstable();
+        orphans.dedup();
+        let mut all = indices;
+        all.extend(orphans.iter().copied());
+        all.sort_unstable();
+        all.dedup();
+        for &i in all.iter().rev() {
+            if i < self.dobjects.len() { self.dobjects.remove(i); }
+        }
+        orphans
+    }
 }
 
 #[cfg(test)]
