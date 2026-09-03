@@ -2336,6 +2336,9 @@ pub struct CadApp {
     select_remove_mode: bool,
     /// The last finalised selection — `prev` re-adds these indices.
     selection_prev:     Vec<usize>,
+    /// The last ERASE's dobjects (doc order) — the `oops` command restores
+    /// them independent of the undo stack (AutoCAD OOPS).
+    last_erased:        Vec<DObject>,
 
     // ---- Move tool (uses the active selection) ----
     move_state: MoveState,
@@ -3114,6 +3117,11 @@ pub struct CadApp {
 
     // ---- Plot dialog ----
     plot_dialog_open: bool,
+    // ---- Drawing Units dialog (DDUNITS) ----
+    units_dialog_open: bool,
+    units_dialog_draft: cad_kernel::Units,
+    units_dlg_n: f64,
+    units_dlg_m: f64,
     /// Output format: "pdf" (default), "svg" or "png".
     plot_format:      String,
     plot_suppress_viewer: bool,
@@ -4849,6 +4857,7 @@ impl Default for CadApp {
             armed_window_inside: None,
             select_remove_mode: false,
             selection_prev:     Vec::new(),
+            last_erased:        Vec::new(),
             move_state:         MoveState::Off,
             queued_op:          QueuedOp::None,
             pending_hatch_pattern: (None, 1.0, 0.0),
@@ -5120,6 +5129,10 @@ impl Default for CadApp {
             ctb_fingerprint: Vec::new(),
             layer_glyph_tex:    std::collections::HashMap::new(),
             plot_dialog_open: false,
+            units_dialog_open: false,
+            units_dialog_draft: cad_kernel::Units::default(),
+            units_dlg_n: 1.0,
+            units_dlg_m: 1.0,
             plot_format:      "pdf".into(),
             plot_suppress_viewer: false,
             plot_pdf_path:    String::new(),
@@ -17793,6 +17806,14 @@ impl CadApp {
             }
         }
 
+        // ---- Drawing Units dialog (AutoCAD DDUNITS). Bare `ddunits` opens
+        // the dialog; `units` keeps the fork's parser command (unit set +
+        // optional rescale).
+        if trimmed.eq_ignore_ascii_case("ddunits") {
+            self.open_units_dialog();
+            return;
+        }
+
         // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
         //
         // While the polyline tool is active, single-letter inputs are
@@ -18673,6 +18694,12 @@ impl CadApp {
                     sorted.sort_unstable();
                     sorted.dedup();
                     let n = sorted.len();
+                    // OOPS buffer: the erased dobjects, in doc order, so the
+                    // `oops` command can restore the LAST erase independent of
+                    // undo. (Aux boundaries swept below are NOT buffered.)
+                    self.last_erased = sorted.iter()
+                        .filter_map(|&idx| self.doc.dobjects.get(idx).cloned())
+                        .collect();
                     // Erasing a HATCH must also erase the invisible auxiliary
                     // boundary it owns — shared rule for every delete path
                     // (`erase_dobjects` in cad_kernel/document.rs; one
@@ -18696,6 +18723,21 @@ impl CadApp {
                     self.index_dirty = true;
                     self.touch_view();
                     self.history.push(format!("  - erased {} dobject(s)", n));
+                }
+            }
+            Ok(Command::Oops) => {
+                // Restore the last-erased dobjects (independent of undo).
+                if self.last_erased.is_empty() {
+                    self.fail_op("oops: nothing to restore — nothing erased yet");
+                } else {
+                    self.snapshot_doc();
+                    let n = self.last_erased.len();
+                    let mut reinserted: Vec<DObject> = std::mem::take(&mut self.last_erased);
+                    self.doc.dobjects.append(&mut reinserted);
+                    self.intersections.clear();
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    self.history.push(format!("  ↺ oops: restored {n} erased dobject(s)"));
                 }
             }
             Ok(Command::Undo) => self.do_undo(),
@@ -26754,6 +26796,189 @@ impl CadApp {
         None
     }
 
+    fn create_ctb_test_scene(&mut self) {
+        use cad_kernel::geom::{
+            Arc, Circle, Ellipse, EllipseArc, Hatch, HatchPattern, Line, Point, Polyline,
+            PolyVertex, Spline, Wall,
+        };
+        use cad_kernel::layout::{Layout, ViewportData, ViewportGeom};
+        use cad_kernel::plotstyle::{
+            EndStyle, JoinStyle, Orientation, PaperSize, PlotLinetype, PlotStyleTable, PlotWidth,
+        };
+        use cad_kernel::{Color, DObject, Geom, Style, Vec2};
+
+        let mut doc = Document::default();
+        doc.linetypes.linetypes.push(cad_kernel::linetype::Linetype::new("DASH", &[8.0, -4.0]));
+        let dash_id = (doc.linetypes.linetypes.len() - 1) as u32;
+
+        let aci = |c: u8| Style { color: Color::Aci(c), ..Style::default() };
+        let add = |doc: &mut Document, g: Geom, st: Style| -> cad_kernel::Handle {
+            let d = DObject::with_style(g, st);
+            let h = d.handle;
+            doc.push(d);
+            h
+        };
+
+        // ACI 1 — red: Square caps / Miter joins (2 mm via the CTB pen).
+        add(&mut doc, Geom::Line(Line { a: Vec2::new(-110.0, -20.0), b: Vec2::new(-30.0, 60.0) }), aci(1));
+        add(&mut doc, Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(20.0, 40.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(45.0, 65.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(70.0, 40.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(95.0, 65.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        }), aci(1));
+        // ACI 3 — green: Butt caps / Bevel joins.
+        add(&mut doc, Geom::Circle(Circle { center: Vec2::new(-70.0, 30.0), radius: 20.0 }), aci(3));
+        add(&mut doc, Geom::Arc(Arc {
+            center: Vec2::new(110.0, 0.0),
+            radius: 28.0,
+            start_angle: 0.5,
+            sweep_angle: 2.2,
+        }), aci(3));
+        // Closed square + a solid AND a pattern hatch on it.
+        let sq = add(&mut doc, Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(-30.0, -55.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, -55.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, -25.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(-30.0, -25.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        }), aci(3));
+        add(&mut doc, Geom::Hatch(Hatch { boundary_handles: vec![sq], pattern: HatchPattern::Solid }), aci(3));
+        add(&mut doc, Geom::Hatch(Hatch {
+            boundary_handles: vec![sq],
+            pattern: HatchPattern::Pattern { name: "ANSI31".into(), scale: 6.0, angle_deg: 0.0 },
+        }), aci(3));
+        // ACI 5 — blue: Round caps/joins.
+        add(&mut doc, Geom::Ellipse(Ellipse {
+            center: Vec2::new(-60.0, -30.0),
+            major: Vec2::new(25.0, 12.0),
+            ratio: 0.55,
+        }), aci(5));
+        add(&mut doc, Geom::EllipseArc(EllipseArc {
+            ellipse: Ellipse { center: Vec2::new(30.0, -15.0), major: Vec2::new(18.0, 9.0), ratio: 0.6 },
+            start_param: 0.3,
+            sweep_param: 2.6,
+        }), aci(5));
+        add(&mut doc, Geom::Spline(Spline::new_bspline(3, vec![
+            Vec2::new(-95.0, -45.0),
+            Vec2::new(-70.0, -80.0),
+            Vec2::new(-40.0, -35.0),
+            Vec2::new(-15.0, -70.0),
+        ])), aci(5));
+        add(&mut doc, Geom::Point(Point { location: Vec2::new(60.0, -40.0), style: 0, size: 0.0 }), aci(5));
+        // ACI 7 pen: 2 mm Square/Miter + a dashed linetype override — still
+        // defined for manual testing. The scene's own entities use VISIBLE
+        // colours (ACI 1/3/5) instead of white: white strokes and text are
+        // invisible on the white paper under the CTB Test (UseObject → white)
+        // and grayscale (white → white) CTBs — exactly like a real plot.
+        let mut dashed_style = aci(1);
+        dashed_style.linetype = dash_id;
+        add(&mut doc, Geom::Line(Line { a: Vec2::new(60.0, 10.0), b: Vec2::new(110.0, 60.0) }), dashed_style);
+        add(&mut doc, Geom::Wall(Wall {
+            start: Vec2::new(60.0, -60.0),
+            end: Vec2::new(110.0, -20.0),
+            thickness: 8.0,
+            style: 0,
+            bulge: 0.0,
+        }), aci(3));
+        let mut t = cad_kernel::Text::empty();
+        t.position = Vec2::new(-110.0, 85.0);
+        t.height = 8.0;
+        t.text = "CAP / JOIN TEST".into();
+        add(&mut doc, Geom::Text(t), aci(5));
+
+        // The test CTB — distinctive pens per ACI (see the doc comment).
+        let mut table = PlotStyleTable::named("CTB Test");
+        table.style_mut(1).lineweight = PlotWidth::Fixed(2.0);
+        table.style_mut(1).end_style = EndStyle::Square;
+        table.style_mut(1).join_style = JoinStyle::Miter;
+        table.style_mut(3).lineweight = PlotWidth::Fixed(2.0);
+        table.style_mut(3).end_style = EndStyle::Butt;
+        table.style_mut(3).join_style = JoinStyle::Bevel;
+        table.style_mut(5).lineweight = PlotWidth::Fixed(2.0);
+        table.style_mut(5).end_style = EndStyle::Round;
+        table.style_mut(5).join_style = JoinStyle::Round;
+        table.style_mut(7).lineweight = PlotWidth::Fixed(2.0);
+        table.style_mut(7).end_style = EndStyle::Square;
+        table.style_mut(7).join_style = JoinStyle::Miter;
+        table.style_mut(7).linetype = PlotLinetype::Id(dash_id);
+        let ctb_path = ctb_folder().join("CTB Test.pst");
+        if let Err(e) = std::fs::create_dir_all(ctb_folder()) {
+            self.history.push(format!("  ! test CTB folder create failed: {}", e));
+        }
+        match cad_io::save_plot_table(&ctb_path, &table) {
+            Ok(()) => self.history.push(format!("  test CTB saved → {}", ctb_path.display())),
+            Err(e) => self.history.push(format!("  ! test CTB save failed: {}", e)),
+        }
+
+        // The layout: three viewports over A3 landscape, each showing the WHOLE
+        // model with a different CTB — same content, three pen interpretations.
+        let mut layout = Layout::new("CTB Test", PaperSize::A3, Orientation::Landscape);
+        let model_c = Vec2::new(0.0, 5.0);
+        let vp_specs: [((f64, f64), (f64, f64), &str); 3] = [
+            ((16.0, 40.0), (140.0, 257.0), "CTB Test"),
+            ((156.0, 40.0), (280.0, 257.0), "monochrome"),
+            ((296.0, 40.0), (420.0, 257.0), "grayscale"),
+        ];
+        let n_vps = vp_specs.len();
+        for &((x0, y0), (x1, y1), ctb) in &vp_specs {
+            let vg = ViewportGeom {
+                center: Vec2::new((x0 + x1) * 0.5, (y0 + y1) * 0.5),
+                width: x1 - x0,
+                height: y1 - y0,
+                model_center: model_c,
+                model_zoom: 1.0,
+                model_scale: 0.55,
+                frame_visible: true,
+            };
+            let ent = DObject::new(Geom::Viewport(vg.clone()));
+            let h = ent.handle;
+            layout.entities.push(ent);
+            let mut vd = ViewportData::new((x0, y0), (x1, y1), (model_c.x, model_c.y), 1.0, 0.55);
+            vd.shape_handle = Some(h);
+            vd.ctb_name = Some(ctb.into());
+            layout.viewports.push(vd);
+        }
+        // Paper camera: fit the A3 sheet on a typical ~1400×900 canvas.
+        layout.camera.zoom = 3.0;
+        layout.camera.pan_x = 700.0 - 210.0 * 3.0;
+        layout.camera.pan_y = 450.0 - 148.5 * 3.0;
+        let li = doc.layouts.len();
+        doc.layouts.push(layout);
+
+        // Swap in and reset the caches (mirrors the open-file path).
+        self.doc = doc;
+        self.selection.clear();
+        self.selection_prev.clear();
+        self.layout_selection.clear();
+        self.selected = None;
+        self.intersections.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.hatch_cache.clear();
+        self.current_file = None;
+        self.index = None;
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.switch_to_tab(Some(li));
+        self.history.push(format!(
+            "  CTB test scene — layout 'CTB Test' ({} viewport(s): CTB Test / monochrome / grayscale); \
+             File → Plot previews the pens; exports apply the real cap/join styles",
+            n_vps));
+    }
+
+
+    // ---- selection helpers (list / select commands) -------------------
+
+    /// DISPLAY-ONLY sub-command chips for an active selection session, shown in
+
     /// A failed operation (fork-local): appends the `! ` marker to the
     /// history transcript. (Upstream also surfaces it in a status bar this
     /// build does not have.)
@@ -28559,6 +28784,160 @@ impl CadApp {
         else { if let (Some(s), Some(o)) = (self.saved_model_scale, self.saved_model_offset) { self.scale = s; self.world_offset = o; self.saved_model_scale = None; self.saved_model_offset = None; } }
         self.touch_view();
         self.index_dirty = true;
+    }
+
+    fn open_units_dialog(&mut self) {
+        self.units_dialog_draft = self.doc.units.clone();
+        // Seed "N mm = M units" from the current calibration: N = mm per unit,
+        // M = 1 (the canonical display of the same ratio the user last set).
+        let mpu = self.units_dialog_draft.mm_per_unit();
+        self.units_dlg_n = if mpu > 0.0 { mpu } else { 1.0 };
+        self.units_dlg_m = 1.0;
+        self.units_dialog_open = true;
+    }
+
+    /// Drawing Units dialog — AutoCAD DDUNITS analog. Length + Angle display
+    /// format/precision, the Insertion-scale unit (what 1 app unit represents),
+    /// and a live Sample Output. OK applies the draft to `doc.units`.
+    fn render_units_dialog(&mut self, ctx: &egui::Context) {
+        use cad_kernel::{LengthFormat, AngleFormat};
+        let mut ok = false; let mut cl = false;
+        // Precision options: 0 → "0", 1 → "0.0", … 8 → "0.00000000".
+        let prec_label = |p: u8| -> String {
+            if p == 0 { "0".to_string() } else { format!("0.{}", "0".repeat(p as usize)) }
+        };
+        let d = &mut self.units_dialog_draft;
+        egui::Window::new("Drawing Units")
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("units_dlg"))
+            .collapsible(false).resizable(false).default_width(340.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.)).show(ctx, |ui| {
+
+            ui.columns(2, |cols| {
+                // ---- Length ----
+                cols[0].group(|ui| {
+                    ui.label(egui::RichText::new("Length").strong());
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_salt("len_type")
+                        .width(140.0)
+                        .selected_text(d.length_format.label())
+                        .show_ui(ui, |ui| {
+                            for f in LengthFormat::ALL {
+                                ui.selectable_value(&mut d.length_format, f, f.label());
+                            }
+                        });
+                    ui.add_space(4.);
+                    ui.label("Precision:");
+                    egui::ComboBox::from_id_salt("len_prec")
+                        .width(140.0)
+                        .selected_text(prec_label(d.length_precision))
+                        .show_ui(ui, |ui| {
+                            for p in 0u8..=8 {
+                                ui.selectable_value(&mut d.length_precision, p, prec_label(p));
+                            }
+                        });
+                });
+                // ---- Angle ----
+                cols[1].group(|ui| {
+                    ui.label(egui::RichText::new("Angle").strong());
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_salt("ang_type")
+                        .width(140.0)
+                        .selected_text(d.angle_format.label())
+                        .show_ui(ui, |ui| {
+                            for f in AngleFormat::ALL {
+                                ui.selectable_value(&mut d.angle_format, f, f.label());
+                            }
+                        });
+                    ui.add_space(4.);
+                    ui.label("Precision:");
+                    egui::ComboBox::from_id_salt("ang_prec")
+                        .width(140.0)
+                        .selected_text(prec_label(d.angle_precision))
+                        .show_ui(ui, |ui| {
+                            for p in 0u8..=8 {
+                                ui.selectable_value(&mut d.angle_precision, p, prec_label(p));
+                            }
+                        });
+                    ui.checkbox(&mut d.angle_clockwise, "Clockwise");
+                });
+            });
+
+            ui.add_space(6.);
+            // ---- Insertion scale ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Insertion scale").strong());
+                ui.label("Unit type:");
+                let cur_label = d.insert_label();
+                egui::ComboBox::from_id_salt("insert_unit")
+                    .width(200.0)
+                    .selected_text(cur_label)
+                    .show_ui(ui, |ui| {
+                        for (disp, sym) in cad_kernel::INSERT_UNITS {
+                            let sel = d.name.eq_ignore_ascii_case(sym);
+                            if ui.selectable_label(sel, *disp).clicked() {
+                                d.name = sym.to_string();
+                            }
+                        }
+                    });
+                ui.add_space(6.);
+                // ---- Drawing scale: N mm = M units ----
+                // The physical calibration: `N` millimetres on paper/reality =
+                // `M` drawing units, measured in the selected unit type.
+                // scene_per_unit is derived on OK: mm_per_unit = N/M, and
+                // mm_per_unit = mm_per_named(name) × scene_per_unit.
+                ui.horizontal(|ui| {
+                    ui.label("Scale:");
+                    ui.add(egui::DragValue::new(&mut self.units_dlg_n).speed(0.1).range(1e-9..=1e12));
+                    ui.label("mm =");
+                    ui.add(egui::DragValue::new(&mut self.units_dlg_m).speed(0.1).range(1e-9..=1e12));
+                    ui.label("unit(s)");
+                });
+                ui.label(egui::RichText::new(
+                    "N mm = M drawing units — e.g. 1 mm = 100 units for a 1:100 \
+                     drawing; 1000 mm = 1 unit with metres selected = 1 m per unit.")
+                    .small().weak());
+            });
+
+            ui.add_space(6.);
+            // ---- Sample Output ----
+            ui.group(|ui| {
+                ui.label(egui::RichText::new("Sample Output").strong());
+                let (l1, l2) = d.sample_output();
+                ui.label(egui::RichText::new(l1).monospace());
+                ui.label(egui::RichText::new(l2).monospace());
+            });
+
+            ui.add_space(8.);
+            ui.horizontal(|ui| {
+                if ui.button("OK").clicked() { ok = true; }
+                if ui.button("Cancel").clicked() { cl = true; }
+            });
+        });
+
+        if ok {
+            // Apply the drawing scale: mm_per_unit = N/M, and
+            // mm_per_unit = mm_per_named(unit type) × scene_per_unit, so
+            // scene_per_unit = (N/M) / mm_per_named. "1 mm = 1 unit" (mm type)
+            // keeps the historical default (scene_per_unit = 1).
+            let d = &mut self.units_dialog_draft;
+            let ratio = if self.units_dlg_m > 0.0 { self.units_dlg_n / self.units_dlg_m } else { 1.0 };
+            let mpn = cad_kernel::Units::mm_per_named(&d.name);
+            d.scene_per_unit = if ratio > 0.0 && mpn > 0.0 {
+                (ratio / mpn).max(1e-9)
+            } else {
+                1.0
+            };
+            self.doc.units = self.units_dialog_draft.clone();
+            let u = &self.doc.units;
+            self.history.push(format!(
+                "  ✔ units → {} ({}, {} dp)  scale {:.6} mm/unit  angle {} ({} dp){}",
+                u.insert_label(), u.length_format.label(), u.length_precision,
+                u.mm_per_unit(), u.angle_format.label(), u.angle_precision,
+                if u.angle_clockwise { ", CW" } else { "" }));
+            self.units_dialog_open = false;
+        }
+        if cl { self.units_dialog_open = false; }
     }
 
     fn render_new_layout_dialog(&mut self, ctx: &egui::Context) {
@@ -53215,6 +53594,8 @@ impl eframe::App for CadApp {
                         ("Save As .dxf…", RowT::Plain), ("Save As .rsm…", RowT::Plain),
                         ("Import", RowT::Arrow),
                         ("Plot Style Tables", RowT::Arrow),
+                        ("Plot…", RowT::Plain),
+                        ("CTB Test Scene", RowT::Plain),
                         ("New parametric sketch", RowT::Plain), ("Exit", RowT::Plain),
                     ]);
                     ui.set_width(w);
@@ -53239,6 +53620,18 @@ impl eframe::App for CadApp {
                         ui, w, arrow_x, MenuIcon::None, "Plot Style Tables", nc, RowT::Arrow);
                     if pta { self.open_flyout(FlyMenu::PlotStyleTables, ptrect); }
                     let _ = ptb;
+                    menu_divider(ui, w);
+                    // Plot → PDF (plot/print/Ctrl+P) — model space only; the
+                    // plot command itself refuses while a layout tab is active.
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Plot…", nc, RowT::Plain).0
+                        { self.run_command("plot"); ui.close_menu(); }
+                    // CTB Test Scene — a shapes + layout + test-CTB playground so
+                    // cap/join/width/dash pen styles can be eyeballed per viewport
+                    // (and in exports) without hand-building a test document.
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "CTB Test Scene", nc, RowT::Plain).0 {
+                        self.create_ctb_test_scene();
+                        ui.close_menu();
+                    }
                     menu_divider(ui, w);
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "New parametric sketch", nc, RowT::Plain).0 {
                         self.run_command("clear");
@@ -54205,6 +54598,9 @@ impl eframe::App for CadApp {
         self.render_new_ctb_dialog(ctx);
         if self.plot_dialog_open {
             self.render_plot_dialog(ctx);
+        }
+        if self.units_dialog_open {
+            self.render_units_dialog(ctx);
         }
         if self.plot_preview_open {
             self.render_plot_preview_window(ctx);
