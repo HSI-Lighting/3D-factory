@@ -2223,6 +2223,10 @@ pub struct CadApp {
     /// have no per-segment taper). 0 = thin stroke. Applied at commit
     /// (`Spline::with_width`). STICKY across splines like the pline width.
     spline_width: f64,
+    /// Spline-tool degree override (issue #47): `qb`/QuadBezier drives the
+    /// spline tool at degree 2 — three control clicks (P0, P1, P2), then
+    /// Enter commits a quadratic B-spline. `None` = cubic (the default).
+    spline_degree_override: Option<usize>,
     /// The spline tool's `w`/`width` sub-command is waiting for a number (the
     /// user chose `w`/`width`). The next command-line number sets `spline_width`.
     spline_width_wait: bool,
@@ -4825,6 +4829,7 @@ impl Default for CadApp {
             pending_widths: Vec::new(),
             spline_width: 0.0,
             spline_width_wait: false,
+            spline_degree_override: None,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             zoom_state:    ZoomState::Off,
@@ -18505,12 +18510,29 @@ impl CadApp {
                     ToolKind::Rectangle  => Tool::Rectangle,
                     // Merged-in RUST-AutoRASM tools: map onto the nearest
                     // existing tool so the command still does something sane.
-                    ToolKind::Polygon | ToolKind::QuadBezier => Tool::Polyline,
+                    ToolKind::Polygon    => Tool::Polyline,
+                    ToolKind::QuadBezier => Tool::Spline,
                     ToolKind::Leader => Tool::Text,
                     ToolKind::AttrDef | ToolKind::AttEdit => Tool::Text,
                 };
+                // Issue #47 — `qb`/QuadBezier drafts a QUADRATIC B-spline:
+                // the spline tool at degree 2 (three control clicks P0..P2,
+                // Enter commits). Any other tool switch clears the override.
+                if kind == ToolKind::QuadBezier {
+                    self.spline_degree_override = Some(2);
+                } else {
+                    self.spline_degree_override = None;
+                }
                 self.pending.clear();
-                self.set_prompt(current_hint(self.tool, self.arc_method, 0));
+                if self.spline_degree_override == Some(2) {
+                    self.history.push(
+                        "  quadbezier (qb): click P0, P1, then P2   [Enter = commit, Esc cancels]"
+                            .to_string());
+                    self.set_prompt(
+                        "quadbezier: click P0, P1, then P2   [Enter = commit, Esc cancels]");
+                } else {
+                    self.set_prompt(current_hint(self.tool, self.arc_method, 0));
+                }
             }
             Ok(Command::SnapOverride(kind)) => {
                 // PER and TAN need a "from" anchor. That anchor is the draw's
@@ -48206,13 +48228,20 @@ impl CadApp {
         } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
             // Degree-3 (cubic) clamped/open uniform B-spline through the control
             // points; lower degree for <4 controls so the curve stays well-formed.
+            // `qb`/QuadBezier overrides the degree to 2 (quadratic — three
+            // control clicks P0..P2, AutoCAD QB).
             let n = self.pending.len();
-            let degree = 3.min(n - 1);
+            let degree = self.spline_degree_override.unwrap_or(3).min(n - 1);
+            let was_qb = self.spline_degree_override == Some(2);
+            self.spline_degree_override = None;
             let ctrls: Vec<Vec2> = self.pending.drain(..).collect();
             self.pending_bulges.clear();
             let spline = cad_kernel::Spline::new_bspline(degree, ctrls)
                 .with_width(self.spline_width);
             self.add_dobject(Geom::Spline(spline), "canvas");
+            if was_qb {
+                self.history.push("  ✓ quadbezier committed".into());
+            }
             true
         } else {
             false
@@ -52943,7 +52972,8 @@ impl eframe::App for CadApp {
             self.pending.clear();
             self.pending_bulges.clear();
             self.pending_widths.clear();
-            self.spline_width_wait = false;   // spline width entry (value is sticky)
+        self.spline_width_wait = false;   // spline width entry (value is sticky)
+        self.spline_degree_override = None;
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
             self.pline_dir_override = None;
