@@ -2886,6 +2886,10 @@ pub struct CadApp {
     /// LAYISO / LAYFRZ / LAYOFF click-pick — the clicked dobject's layer
     /// is the target; `Off` when idle. LayOn is immediate (no pick).
     layer_pick:     LayerPickState,
+    /// DIVIDE / MEASURE — pick a curve, then type the segment COUNT
+    /// (divide, equal parts) or the segment LENGTH (measure, stepped from
+    /// the start). Marks are POINT dobjects; `Off` when idle.
+    ptdist_state:   PtDistribState,
     /// Properties dialog: true while a numeric/text field edit GESTURE is
     /// in progress, so the per-change `snapshot_doc` fires once at the
     /// start of a drag/type (one undo step per gesture, not per frame).
@@ -4246,6 +4250,19 @@ pub struct AreaState {
 /// armed op targets. `Off` when idle.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LayerPickState { Off, Iso, Frz, OffLayer }
+
+/// DIVIDE / MEASURE — place POINT dobjects along a curve. Pick the object
+/// (Object phases), then type a segment COUNT (divide → equal parts) or a
+/// spacing DISTANCE (measure → stepped from the start end). The usize
+/// holds the picked object index.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PtDistribState {
+    Off,
+    DivideObject,
+    DivideValue(usize),
+    MeasureObject,
+    MeasureValue(usize),
+}
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
@@ -5075,6 +5092,7 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             area_state:     None,
             layer_pick:     LayerPickState::Off,
+            ptdist_state:   PtDistribState::Off,
             props_edit_gesture: false,
             block_editor:   None,
             cmd_flow:       None,
@@ -10543,6 +10561,7 @@ impl CadApp {
         self.dist_state = DistState::Off;
         self.area_state = None;
         self.layer_pick = LayerPickState::Off;
+        self.ptdist_state = PtDistribState::Off;
         self.lengthen_state = LengthenState::Off;
         self.break_state = BreakState::Off;
         self.align_state = AlignState::Off;
@@ -18431,6 +18450,36 @@ impl CadApp {
         if self.area_state.is_some() && self.area_suboption(trimmed) {
             return;
         }
+        // ---- DIVIDE / MEASURE value intercept ---------------------------
+        // After the curve pick, the typed reply IS the value: a whole
+        // segment COUNT (≥ 2) for divide, or a positive LENGTH for
+        // measure. Anything else falls through to the parser.
+        if let PtDistribState::DivideValue(idx) = self.ptdist_state {
+            if let Ok(v) = self.eval_number(trimmed) {
+                if v.fract().abs() < 1e-9 && v >= 2.0 {
+                    self.ptdist_state = PtDistribState::Off;
+                    self.apply_divmeasure_marks(idx, v, false);
+                    self.clear_prompt();
+                    return;
+                }
+                self.history.push(
+                    "  ! divide: the number of segments must be a whole number ≥ 2".into());
+                return;
+            }
+        }
+        if let PtDistribState::MeasureValue(idx) = self.ptdist_state {
+            if let Ok(v) = self.eval_number(trimmed) {
+                if v > 1e-9 {
+                    self.ptdist_state = PtDistribState::Off;
+                    self.apply_divmeasure_marks(idx, v, true);
+                    self.clear_prompt();
+                    return;
+                }
+                self.history.push(
+                    "  ! measure: the segment length must be positive".into());
+                return;
+            }
+        }
         // ---- Selection-mode shortcut intercept ----
         //
         // While a select session is active, single-letter input is a
@@ -19769,6 +19818,35 @@ impl CadApp {
                 self.index_dirty = true;
                 self.history.push(format!(
                     "  layon: {} layer(s) restored", changed));
+            }
+            Ok(Command::Divide) => {
+                // Pick a curve, then type the segment count. A pre-selected
+                // basket skips straight to the value prompt (pickfirst).
+                self.tool = Tool::None;
+                if let Some(&i) = self.selection.first() {
+                    self.ptdist_state = PtDistribState::DivideValue(i);
+                    self.set_prompt(
+                        "divide: type the number of segments  [Esc cancels]".to_string());
+                } else {
+                    self.ptdist_state = PtDistribState::DivideObject;
+                    self.set_prompt(
+                        "divide: click a curve to divide  [Esc exits]".to_string());
+                }
+            }
+            Ok(Command::Measure) => {
+                // Same flow as DIVIDE, but the typed value is a segment
+                // LENGTH measured along the curve from its start.
+                self.tool = Tool::None;
+                if let Some(&i) = self.selection.first() {
+                    self.ptdist_state = PtDistribState::MeasureValue(i);
+                    self.set_prompt(
+                        "measure: type the segment LENGTH (drawing units)  [Esc cancels]"
+                            .to_string());
+                } else {
+                    self.ptdist_state = PtDistribState::MeasureObject;
+                    self.set_prompt(
+                        "measure: click a curve to measure along  [Esc exits]".to_string());
+                }
             }
             Err(e) => {
                 // ---- Command-line calculator & user variables ------------
@@ -24172,6 +24250,7 @@ impl CadApp {
             dist_state:         format!("{:?}", self.dist_state),
             area_state:         self.area_state.is_some(),
             layer_pick:         format!("{:?}", self.layer_pick),
+            ptdist_state:       format!("{:?}", self.ptdist_state),
             text_draft:         format!("{:?}", self.text_draft),
             matchprops_state:   format!("{:?}", self.matchprops_state),
             align_state:        format!("{:?}", self.align_state),
@@ -47131,11 +47210,46 @@ impl CadApp {
         }
     }
 
+    /// DIVIDE / MEASURE commit: place POINT marks along the picked curve —
+    /// `count_or_dist` is a whole segment COUNT (divide) or a positive
+    /// segment LENGTH (measure). One undo entry; one history report.
+    fn apply_divmeasure_marks(&mut self, obj_idx: usize,
+                              count_or_dist: f64, is_measure: bool)
+    {
+        let Some(geom) = self.doc.dobjects.get(obj_idx).map(|d| d.geom.clone()) else {
+            self.history.push("  ! divide/measure: curve is gone".into());
+            return;
+        };
+        let positions = divmeasure_positions_for(&geom, count_or_dist, is_measure);
+        if positions.is_empty() {
+            self.history.push(format!(
+                "  ! {}: no marks to place (check the value)",
+                if is_measure { "measure" } else { "divide" }));
+            return;
+        }
+        let (color, layer) = (self.doc.current_color, self.doc.layers.active);
+        self.snapshot_doc();
+        for p in &positions {
+            let mut d = DObject::new(Geom::Point(cad_kernel::Point {
+                location: *p, style: 0, size: 0.0 }));
+            d.style.color = color;
+            d.style.layer = layer;
+            self.doc.push(d);
+        }
+        self.selection.clear();
+        self.selected = None;
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!(
+            "  {}: {} mark(s) placed",
+            if is_measure { "measure" } else { "divide" },
+            positions.len()));
+    }
+
     /// LAYISO / LAYFRZ / LAYOFF — apply the armed op to a layer id. One
     /// undo entry per pick; a no-op rolls the entry back and reports
     /// visibly.
-    fn handle_layer_pick(&mut self, lid: u32) {
-        if self.layer_pick == LayerPickState::Off { return; }
+    fn handle_layer_pick(&mut self, lid: u32) {        if self.layer_pick == LayerPickState::Off { return; }
         self.snapshot_doc();
         let layers = &mut self.doc.layers.layers;
         let changed = match self.layer_pick {
@@ -50274,6 +50388,90 @@ fn polygon_shoelace(pts: &[Vec2]) -> f64 {
     twice
 }
 
+/// Point at arc length `s` along a pre-sampled polyline (`pts` + cumulative
+/// lengths `cum`, total `total`). Used by DIVIDE / MEASURE.
+fn point_at_arclen(pts: &[Vec2], cum: &[f64], total: f64, s: f64) -> Vec2 {
+    let s = s.clamp(0.0, total);
+    let mut i = 1;
+    while i < pts.len() && cum[i] < s { i += 1; }
+    let i = i.min(pts.len() - 1);
+    let seg = cum[i] - cum[i - 1];
+    let f = if seg > 1e-12 { (s - cum[i - 1]) / seg } else { 0.0 };
+    pts[i - 1] + (pts[i] - pts[i - 1]) * f
+}
+
+/// A closed loop (circle / full ellipse / closed polyline) — DIVIDE places
+/// `n` marks around it, vs `n−1` interior marks on an open curve.
+fn geom_is_closed_loop(g: &Geom) -> bool {
+    matches!(g, Geom::Circle(_) | Geom::Ellipse(_))
+        || matches!(g, Geom::Polyline(p) if p.closed)
+}
+
+/// Sample a curve dobject into a dense polyline of world points for the
+/// arc-length distribution. Returns empty for non-curve geoms.
+fn sample_path_points(g: &Geom, n: usize) -> Vec<Vec2> {
+    use std::f64::consts::TAU;
+    let n = n.max(2);
+    match g {
+        Geom::Line(l) => (0..n).map(|i| {
+            let t = i as f64 / (n - 1) as f64;
+            l.a + (l.b - l.a) * t
+        }).collect(),
+        Geom::Circle(c) => (0..=n).map(|i| {
+            let a = i as f64 / n as f64 * TAU;
+            c.center + Vec2::new(a.cos(), a.sin()) * c.radius
+        }).collect(),
+        Geom::Arc(a) => (0..n).map(|i| {
+            let t = i as f64 / (n - 1) as f64;
+            let ang = a.start_angle + a.sweep_angle * t;
+            a.center + Vec2::new(ang.cos(), ang.sin()) * a.radius
+        }).collect(),
+        Geom::Ellipse(e) => (0..=n).map(|i| {
+            e.point_at(i as f64 / n as f64 * TAU)
+        }).collect(),
+        Geom::EllipseArc(ea) => (0..n).map(|i| {
+            let t = i as f64 / (n - 1) as f64;
+            ea.ellipse.point_at(ea.start_param + ea.sweep_param * t)
+        }).collect(),
+        Geom::Spline(s) => s.tessellate(n),
+        Geom::Polyline(p) => {
+            let mut out: Vec<Vec2> = p.vertices.iter().map(|v| v.pos).collect();
+            if p.closed { if let Some(f) = p.vertices.first() { out.push(f.pos); } }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// DIVIDE / MEASURE mark positions along `geom`: divide → `n` equal parts
+/// (n marks on a closed loop, n−1 interior marks on an open curve); measure
+/// → as many `dist`-long steps from the start as fit.
+fn divmeasure_positions_for(geom: &Geom, count_or_dist: f64,
+                            is_measure: bool) -> Vec<Vec2> {
+    let pts = sample_path_points(geom, 600);
+    if pts.len() < 2 { return Vec::new(); }
+    let mut cum = vec![0.0_f64; pts.len()];
+    for i in 1..pts.len() { cum[i] = cum[i - 1] + pts[i].dist(pts[i - 1]); }
+    let total = cum[pts.len() - 1];
+    if total < 1e-9 { return Vec::new(); }
+    let mut out = Vec::new();
+    if is_measure {
+        let d = count_or_dist.abs().max(1e-6);
+        if d >= total { return Vec::new(); }
+        // As many marks as fit, stepped from the start end.
+        let n = ((total - 1e-9) / d).floor() as usize;
+        for k in 1..=n {
+            out.push(point_at_arclen(&pts, &cum, total, k as f64 * d));
+            if out.len() >= 4000 { break; }
+        }
+    } else {
+        let n = (count_or_dist as usize).max(2);
+        let ks: Vec<usize> = if geom_is_closed_loop(geom) { (0..n).collect() } else { (1..n).collect() };
+        for k in ks { out.push(point_at_arclen(&pts, &cum, total, total * k as f64 / n as f64)); }
+    }
+    out
+}
+
 /// Short, capitalised label for a Dobject's underlying geometry. Used
 /// in dialog/window titles where the user wants to know "what kind of
 /// dobject am I editing?" without reading a full describe() line.
@@ -53398,6 +53596,10 @@ impl eframe::App for CadApp {
                 self.layer_pick = LayerPickState::Off;
                 self.history.push("  layer pick cancelled".into());
             }
+            if self.ptdist_state != PtDistribState::Off {
+                self.ptdist_state = PtDistribState::Off;
+                self.history.push("  divide/measure cancelled".into());
+            }
             if self.lengthen_state != LengthenState::Off {
                 self.lengthen_state = LengthenState::Off;
                 self.history.push("  lengthen cancelled".into());
@@ -53722,6 +53924,16 @@ impl eframe::App for CadApp {
         if trigger && cmd_is_empty && self.area_state.is_some() {
             if space_now { self.cmd.clear(); }
             self.area_finish_polygon();
+            return;
+        }
+        // DIVIDE / MEASURE value prompt — an empty Enter exits the value
+        // entry and the command (no default value exists).
+        if trigger && cmd_is_empty && matches!(self.ptdist_state,
+            PtDistribState::DivideValue(_) | PtDistribState::MeasureValue(_))
+        {
+            if space_now { self.cmd.clear(); }
+            self.ptdist_state = PtDistribState::Off;
+            self.clear_prompt();
             return;
         }
         // PEDIT — empty Enter exits the menu (Width step returns to the menu).
@@ -55982,6 +56194,7 @@ impl eframe::App for CadApp {
                 || self.dist_state          != DistState::Off
                 || self.area_state.is_some()
                 || self.layer_pick          != LayerPickState::Off
+                || self.ptdist_state        != PtDistribState::Off
                 || self.insert_state        != InsertState::Off
                 || self.cmd_flow.is_some()
                 || self.block_def_state     != BlockDefState::Off;
@@ -56372,6 +56585,7 @@ impl eframe::App for CadApp {
                 || self.dist_state       != DistState::Off
                 || self.area_state.is_some()
                 || self.layer_pick       != LayerPickState::Off
+                || self.ptdist_state     != PtDistribState::Off
                 // Block/insert POINT-PICK phases: a single click captures a
                 // coordinate (block base point, insert insertion point), so
                 // they must be click-only — otherwise grips on the still-
@@ -57240,6 +57454,33 @@ impl eframe::App for CadApp {
                         // AREA — a click on a closed object measures it; an
                         // empty click starts/extends the point polygon.
                         self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if matches!(self.ptdist_state,
+                        PtDistribState::DivideObject | PtDistribState::MeasureObject)
+                    {
+                        // DIVIDE / MEASURE — this click picks the curve.
+                        let is_measure = matches!(self.ptdist_state, PtDistribState::MeasureObject);
+                        let hit = self.nearest_entity_under(click_world,
+                                (self.env.PkBxSz.max(8) as f64)
+                                    / (self.scale as f64).max(1e-6));
+                        match hit {
+                            Some(idx) => {
+                                self.ptdist_state = if is_measure {
+                                    PtDistribState::MeasureValue(idx)
+                                } else {
+                                    PtDistribState::DivideValue(idx)
+                                };
+                                self.set_prompt(if is_measure {
+                                    "measure: type the segment LENGTH (drawing units)  [Esc cancels]"
+                                        .to_string()
+                                } else {
+                                    "divide: type the number of segments  [Esc cancels]"
+                                        .to_string()
+                                });
+                            }
+                            None => self.history.push(
+                                "  divide/measure — click ON a curve; missed".into()),
+                        }
                         self.refocus_cmd = true;
                     } else if self.layer_pick != LayerPickState::Off {
                         // LAYISO / LAYFRZ / LAYOFF — the click's dobject
@@ -72936,6 +73177,109 @@ mod area_lay_flow_tests {
         // Esc-cancel path: the reset helper clears both cleanly.
         app.area_state = None;
         app.layer_pick = LayerPickState::Off;
+    }
+
+    fn add_line(app: &mut CadApp, a: Vec2, b: Vec2) -> usize {
+        app.add_dobject(Geom::Line(cad_kernel::Line { a, b }), "test");
+        app.doc.dobjects.len() - 1
+    }
+
+    fn count_points(app: &CadApp, from: usize) -> usize {
+        app.doc.dobjects[from..].iter()
+            .filter(|d| matches!(d.geom, Geom::Point(_))).count()
+    }
+
+    #[test]
+    fn divide_line_places_interior_marks_only() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        let idx = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        app.selection = vec![idx];   // pickfirst → straight to the value prompt
+        app.run_command("divide");
+        assert_eq!(app.ptdist_state, PtDistribState::DivideValue(idx));
+        app.run_command("5");
+        assert_eq!(app.ptdist_state, PtDistribState::Off, "command finished");
+        assert_eq!(count_points(&app, base + 1), 4, "5 segments → 4 interior marks");
+        assert!(app.history.iter().any(|h| h.contains("divide: 4 mark(s) placed")),
+            "{:?}", app.history);
+        let xs: Vec<f64> = app.doc.dobjects[base + 1..].iter().filter_map(|d| match d.geom {
+            Geom::Point(p) => Some(p.location.x), _ => None }).collect();
+        assert_eq!(xs, vec![2.0, 4.0, 6.0, 8.0], "marks at every division point");
+        // One undo entry removes them all.
+        app.do_undo();
+        assert_eq!(app.doc.dobjects.len(), base + 1, "undo removes the marks");
+    }
+
+    #[test]
+    fn measure_line_steps_by_segment_length() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        let idx = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        app.selection = vec![idx];
+        app.run_command("measure");
+        assert_eq!(app.ptdist_state, PtDistribState::MeasureValue(idx));
+        app.run_command("3");
+        assert_eq!(count_points(&app, base + 1), 3, "floor(10/3) = 3 marks");
+        assert!(app.history.iter().any(|h| h.contains("measure: 3 mark(s) placed")),
+            "{:?}", app.history);
+        let xs: Vec<f64> = app.doc.dobjects[base + 1..].iter().filter_map(|d| match d.geom {
+            Geom::Point(p) => Some(p.location.x), _ => None }).collect();
+        assert_eq!(xs, vec![3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn divide_circle_marks_all_around() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        app.add_dobject(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0), radius: 10.0 }), "test");
+        let idx = app.doc.dobjects.len() - 1;
+        app.selection = vec![idx];
+        app.run_command("divide");
+        app.run_command("4");
+        assert_eq!(count_points(&app, base + 1), 4, "closed loop → n marks");
+        let pts: Vec<Vec2> = app.doc.dobjects[base + 1..].iter().filter_map(|d| match d.geom {
+            Geom::Point(p) => Some(p.location), _ => None }).collect();
+        for (k, p) in pts.iter().enumerate() {
+            let ang = k as f64 / 4.0 * std::f64::consts::TAU;
+            let expect = Vec2::new(ang.cos(), ang.sin()) * 10.0;
+            assert!((*p - expect).len() < 1e-6, "mark {k} at {:?} ≈ {:?}", p, expect);
+        }
+    }
+
+    #[test]
+    fn divide_bad_values_fail_visibly() {
+        let mut app = fresh_app();
+        let idx = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0));
+        app.selection = vec![idx];
+        app.run_command("divide");
+        app.run_command("2.5");
+        assert!(app.history.iter().any(|h| h.contains("whole number")),
+            "{:?}", app.history);
+        assert_eq!(app.ptdist_state, PtDistribState::DivideValue(idx),
+            "session survives a bad value");
+        app.run_command("measure");
+        app.run_command("0");
+        assert!(app.history.iter().any(|h| h.contains("must be positive")),
+            "{:?}", app.history);
+        assert_eq!(app.ptdist_state, PtDistribState::MeasureValue(idx));
+        // A valid value after the failures still applies: 10/5 → 1 mark
+        // at 5 (the endpoint at 10 is not marked).
+        app.run_command("5");
+        assert_eq!(count_points(&app, 0), 1, "{:?}", app.history);
+    }
+
+    #[test]
+    fn divide_measure_distance_too_long_places_nothing() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        let idx = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0));
+        app.selection = vec![idx];
+        app.run_command("measure");
+        app.run_command("10");
+        assert_eq!(app.doc.dobjects.len(), base + 1, "nothing placed");
+        assert!(app.history.iter().any(|h| h.contains("no marks to place")),
+            "{:?}", app.history);
     }
 }
 
