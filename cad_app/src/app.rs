@@ -50850,6 +50850,7 @@ enum FlyMenu {
     Method(String),   // arc/circle/fillet method list
     Insert,           // block names → `insert <name>`
     Import,           // File → Import (raster / vector)
+    Export,           // File → Export (PDF / SVG / PNG quick export)
     PlotStyleTables,  // File → Plot Style Tables (CTB manager)
     Dimension,        // Formative → Dimension
     Styles,           // Formative → Styles
@@ -50933,6 +50934,7 @@ enum FlyAct {
     Method(String, String),
     Insert(String),
     Import(bool),                 // true = raster underlay, false = vector trace
+    Export(String),               // File → Export quick export: pdf / svg / png
     NewCtb,                       // File → Plot Style Tables → New CTB…
     OpenCtb(String),              // File → Plot Style Tables → a built-in CTB
     OpenCtbFile(std::path::PathBuf), // File → Plot Style Tables → a saved .pst
@@ -51303,6 +51305,11 @@ impl CadApp {
                 FlyItem::act(FlyIcon::None, "Image as raster (underlay)…", FlyAct::Import(true)),
                 FlyItem::act(FlyIcon::None, "Image → vector (trace editor)…", FlyAct::Import(false)),
             ],
+            FlyMenu::Export => vec![
+                FlyItem::act(FlyIcon::None, "PDF…", FlyAct::Export("pdf".into())),
+                FlyItem::act(FlyIcon::None, "SVG…", FlyAct::Export("svg".into())),
+                FlyItem::act(FlyIcon::None, "PNG (300 dpi)…", FlyAct::Export("png".into())),
+            ],
             FlyMenu::PlotStyleTables => {
                 // CTB manager: New / built-ins / saved .pst tables + Plot Style
                 // Table Editor. The saved list is rebuilt every frame from the
@@ -51437,6 +51444,16 @@ impl CadApp {
             FlyAct::Insert(n) => self.run_command(&format!("insert {}", n)),
             FlyAct::Import(raster) => self.open_file_dialog(
                 if raster { FileDialogMode::ImportRaster } else { FileDialogMode::ImportImage }, ""),
+            FlyAct::Export(fmt) => {
+                // Quick export: whole drawing straight to the Save dialog, then
+                // write + open via the shared run_plot path (same flow as the
+                // Plot dialog's own OK — the dialog's format choice wins, so
+                // the ext is only the default).
+                self.plot_pdf_browse = true;
+                self.plot_run_after_save = true;
+                let ext = match fmt.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+                self.open_file_dialog(FileDialogMode::Save, &format!(".{}", ext));
+            }
             FlyAct::NewCtb => {
                 let saved = ctb_list();
                 self.new_ctb_name = format!("CTB {}", saved.len() + 1);
@@ -53790,8 +53807,9 @@ impl eframe::App for CadApp {
                     let (arrow_x, w) = menu_hug_geometry(ui, &[
                         ("New", RowT::Plain), ("Open .rsm / .dxf…", RowT::Plain),
                         (save_label.as_str(), RowT::Plain),
-                        ("Save As .dxf…", RowT::Plain), ("Save As .rsm…", RowT::Plain),
+                        ("Save As .dxf…", RowT::Plain),                         ("Save As .rsm…", RowT::Plain),
                         ("Import", RowT::Arrow),
+                        ("Export", RowT::Arrow),
                         ("Plot Style Tables", RowT::Arrow),
                         ("Plot…", RowT::Plain),
                         ("CTB Test Scene", RowT::Plain),
@@ -53812,6 +53830,10 @@ impl eframe::App for CadApp {
                     // Import ▸ — generalized flyout (raster / vector).
                     let (_ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Import", nc, RowT::Arrow);
                     if ia { self.open_flyout(FlyMenu::Import, irect); }
+                    menu_divider(ui, w);
+                    // Export ▸ — quick PDF/SVG/PNG export (whole drawing).
+                    let (_xb, xa, xrect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Export", nc, RowT::Arrow);
+                    if xa { self.open_flyout(FlyMenu::Export, xrect); }
                     menu_divider(ui, w);
                     // Plot Style Tables ▸ — CTB manager: New / built-ins / saved
                     // tables (defined in the app's <exe_dir>/ctb as .pst files).
