@@ -1,5 +1,41 @@
 # Upstream Sync Audit — Session Summary (2026-08-31)
 
+## 2026-09-03 update — both farzad-dev milestones pushed to origin
+
+- `b280954` — layout tabs/paper-space viewports + command-line bottom
+  strip ported from upstream working tree (`cc95970`): Model/Layout tab
+  bar with per-space camera + layer-table swap, viewport windows
+  (per-viewport camera/scale/CTB/lock), print-preview via shared
+  `paint_cached_hatch` w/ per-viewport culling, resizable command strip
+  with flyout close. Includes the code-review follow-ups
+  (normalize_layers_for_save before writers, grip bounds guards,
+  undo-aware viewport deletion, modal-in-layout gates).
+- `cc57211` — ported the genuinely-new content of upstream
+  `origin/farzad-dev` (windows-ui lineage, cc95970..fcf3079; its 12-commit
+  range nets to app.rs only): coincident-grip drag moves every selected
+  dobject sharing the dragged grip point (+ closed-4-vertex corner-scale
+  the fork's drop loop lacked), erase sweeps orphaned `hatch_aux`
+  boundaries of erased hatches, `find_smallest_containing_closed_scoped`
+  now ignores invisible dobjects like the candidate collector, and the
+  LAYER/LA/LAYERS command (opens Layer Properties Manager; Modify rail
+  glyph = "Layer (LA)"; chlayer still reachable via Modify menu + CLI).
+  3 regression tests added. Net diff (app.rs +304/−6) also included
+  hatch-log designation/Apply markers — fork's own bake-flow logging
+  already covers those, so they were not re-added.
+- Verification: kernel 416/416, cad_app 1449 passed / 10 pre-existing
+  failures (9 mesh_io fbx-texture assets + 1 factory wall env), pytest
+  1473/1473.
+- Remaining import candidates (not yet ported, catalogued 2026-09-03):
+  spline/pline ribbon width (kernel+RSM v35 + v35 read-compat), polar/
+  path ARRAY, DIVIDE/MEASURE, QSELECT/QDIM, fence/window TRIM/EXTEND,
+  LAYISO/LAYFRZ family, AREA, XLINE/RAY/DONUT/CENTERMARK/WIPEOUT,
+  XREF/WBLOCK, ATTDEF/ATTEDIT, REGION/BOUNDARY, selection cycling,
+  Drawing-Units dialog, per-layout Plot dialog, File→Export flyout,
+  Point Style, Quad Bézier, OOPS, CTB test scene, plus the hover/
+  designate hatch architecture decision.
+
+---
+
 Audit of what RUST-AutoRASM (upstream) changes are still missing from
 3D-factory (SIMLUX) after the 2026-08-29 merge. Everything is on the
 `farzad-dev` branch. Worktree clean, pushed to origin.
