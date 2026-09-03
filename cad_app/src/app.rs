@@ -2330,6 +2330,12 @@ pub struct CadApp {
     /// clicks. None = direction-based default (L→R inside, R→L crossing).
     /// Some(true) = forced inside-window, Some(false) = forced crossing.
     armed_window_inside: Option<bool>,
+    /// FENCE arming for TRIM/EXTEND target phases (and select sessions):
+    /// two clicks define a crossing line, every dobject it crosses is cut /
+    /// extended (or added to the selection). Cleared when the run finishes.
+    fence_armed:        bool,
+    /// First click of an armed fence, awaiting the second.
+    fence_first:        Option<Vec2>,
     /// When true, canvas clicks REMOVE the under-cursor dobject from the
     /// selection instead of adding. Toggled by typing `remove` / `add`
     /// during the session.
@@ -4855,6 +4861,8 @@ impl Default for CadApp {
             selection:          Vec::new(),
             window_first:       None,
             armed_window_inside: None,
+            fence_armed:        false,
+            fence_first:        None,
             select_remove_mode: false,
             selection_prev:     Vec::new(),
             last_erased:        Vec::new(),
@@ -10512,6 +10520,8 @@ impl CadApp {
         self.chamfer_state = ChamferState::Off;
         self.trim_state = TrimState::Off;
         self.extend_state = ExtendState::Off;
+        self.fence_armed = false;
+        self.fence_first = None;
         self.insert_state = InsertState::Off;
         self.block_def_state = BlockDefState::Off;
         // --- drafts + flows ---
@@ -17770,6 +17780,50 @@ impl CadApp {
                 _ => {
                     self.history.push(
                         "  ! hatch panel awaiting: type `c`onfirm / `d`iscard / `ch`ange / `p`oint / `D`object".into());
+                    return;
+                }
+            }
+        }
+
+        // ---- TRIM / EXTEND target phase: still the RUNNING command --------
+        // Typed input is a sub-command (Fence / Window / Crossing / Undo),
+        // NOT a new command — no hijack (typing `f` mustn't jump to Fillet,
+        // `line` mustn't start Line).
+        let in_trim_target = matches!(self.trim_state,
+            TrimState::PickingTargets(_) | TrimState::PickingTargetsAll);
+        let in_ext_target = matches!(self.extend_state,
+            ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll);
+        if in_trim_target || in_ext_target {
+            match trimmed.to_ascii_lowercase().as_str() {
+                "f" | "fence" => {   // arm a trim / extend fence
+                    self.fence_armed = true;
+                    self.fence_first = None;
+                    self.set_prompt(if in_ext_target {
+                        "extend: fence — click first point  [Esc cancels the fence]"
+                    } else {
+                        "trim: fence — click first point  [Esc cancels the fence]"
+                    });
+                    return;
+                }
+                "w" | "c" => {   // arm a two-click window / crossing box
+                    self.fence_armed = false;
+                    self.fence_first = None;
+                    self.armed_window_inside = Some(trimmed.to_ascii_lowercase() == "w");
+                    self.set_prompt(if in_ext_target {
+                        "extend: window — click FIRST corner  [Esc cancels]"
+                    } else {
+                        "trim: window — click FIRST corner  [Esc cancels]"
+                    });
+                    return;
+                }
+                // undo/redo stay live so a bad cut can be fixed without leaving.
+                "u" | "undo" | "redo" | "" => {}
+                _ => {   // swallow — never launch a new command mid-trim/extend
+                    self.history.push(if in_ext_target {
+                        "  (still extending — click a target, Fence, or Enter/Esc to finish)".into()
+                    } else {
+                        "  (still trimming — click a target, Fence, or Enter/Esc to finish)".into()
+                    });
                     return;
                 }
             }
@@ -45369,6 +45423,115 @@ impl CadApp {
         }
     }
 
+    /// Trim-FENCE: trim every dobject the fence segment p→q crosses, at the
+    /// crossing point (the piece the fence passes through is removed). Reuses
+    /// `apply_trim_pick` per crossing and re-remaps the stored cutter list
+    /// after each cut (same patch the single-click target flow does), so
+    /// stored cutter indices stay valid across several trims.
+    fn apply_trim_fence(&mut self, p: Vec2, q: Vec2) {
+        let all_mode = matches!(self.trim_state, TrimState::PickingTargetsAll);
+        let fence = Geom::Line(cad_kernel::Line { a: p, b: q });
+        // Crossing points of the fence segment with the CURRENT geometry.
+        let mut picks: Vec<Vec2> = Vec::new();
+        for i in 0..self.doc.dobjects.len() {
+            for ip in intersect(&self.doc.dobjects[i].geom, &fence) { picks.push(ip); }
+        }
+        let tol = 8.0 / self.scale as f64;
+        let mut cuts = 0usize;
+        for pick in picks {
+            // cutters: dynamic in all-mode; the (remapped) stored list otherwise.
+            let cutters: Vec<usize> = if all_mode {
+                (0..self.doc.dobjects.len()).collect()
+            } else if let TrimState::PickingTargets(c) = &self.trim_state {
+                c.clone()
+            } else { break; };
+            // Re-resolve the target by position — indices shift as we trim.
+            let Some(tgt) = self.nearest_entity_under(pick, tol) else { continue };
+            let n_before = self.doc.dobjects.len();
+            let tgt_was_cutter = cutters.contains(&tgt);
+            // A HATCH trim only APPENDS a hidden hole boundary (no removal /
+            // reorder), so the cutter indices stay valid — skip the patch.
+            let tgt_was_hatch = matches!(
+                self.doc.dobjects.get(tgt).map(|d| &d.geom), Some(Geom::Hatch(_)));
+            let did = self.apply_trim_pick(&cutters, tgt, pick);
+            let n_after = self.doc.dobjects.len();
+            if did && !all_mode && !tgt_was_hatch {
+                let n_pieces = n_after + 1 - n_before;
+                let first_new = n_after - n_pieces;
+                if let TrimState::PickingTargets(c) = &mut self.trim_state {
+                    c.retain(|&i| i != tgt);
+                    for c_i in c.iter_mut() { if *c_i > tgt { *c_i -= 1; } }
+                    if tgt_was_cutter && n_pieces > 0 { c.extend(first_new..n_after); }
+                }
+            }
+            if did { cuts += 1; }
+        }
+        self.history.push(format!("  trim (fence): {} cut(s)", cuts));
+    }
+
+    /// TRIM by a WINDOW/CROSSING drag in the target phase: the drag box acts as
+    /// a rectangular fence — every object crossing any of its FOUR edges is
+    /// trimmed at the crossing, reusing `apply_trim_fence` per edge. Window
+    /// (L→R) vs crossing (R→L) doesn't change what's removed (owner choice: the
+    /// part the box crosses); only the rubber-band colour differs.
+    fn apply_trim_window(&mut self, p1: Vec2, p2: Vec2) {
+        let (x0, x1) = (p1.x.min(p2.x), p1.x.max(p2.x));
+        let (y0, y1) = (p1.y.min(p2.y), p1.y.max(p2.y));
+        let bl = Vec2::new(x0, y0);
+        let br = Vec2::new(x1, y0);
+        let tr = Vec2::new(x1, y1);
+        let tl = Vec2::new(x0, y1);
+        for (a, b) in [(bl, br), (br, tr), (tr, tl), (tl, bl)] {
+            self.apply_trim_fence(a, b);
+        }
+    }
+
+    /// EXTEND-FENCE: extend every dobject the fence segment p→q crosses, growing
+    /// the end nearest the crossing toward the boundary edges. Mirrors
+    /// `apply_trim_fence`, but extend mutates dobjects IN PLACE (no
+    /// removal/append), so there's no cutter-index bookkeeping — the boundary
+    /// list stays valid across every extend.
+    fn apply_extend_fence(&mut self, p: Vec2, q: Vec2) {
+        let all_mode = matches!(self.extend_state, ExtendState::PickingTargetsAll);
+        let fence = Geom::Line(cad_kernel::Line { a: p, b: q });
+        // Crossing points of the fence segment with the CURRENT geometry.
+        let mut picks: Vec<Vec2> = Vec::new();
+        for i in 0..self.doc.dobjects.len() {
+            for ip in intersect(&self.doc.dobjects[i].geom, &fence) { picks.push(ip); }
+        }
+        let tol = 8.0 / self.scale as f64;
+        let mut n = 0usize;
+        for pick in picks {
+            let bounds: Vec<usize> = if all_mode {
+                (0..self.doc.dobjects.len()).collect()
+            } else if let ExtendState::PickingTargets(b) = &self.extend_state {
+                b.clone()
+            } else { break; };
+            // Re-resolve by position (extend never shifts indices, but a target
+            // may fall out of tolerance after growing — keep it defensive).
+            let Some(tgt) = self.nearest_entity_under(pick, tol) else { continue };
+            if self.apply_extend_pick(&bounds, tgt, pick) { n += 1; }
+        }
+        self.history.push(format!("  extend (fence): {} extended", n));
+    }
+
+    /// EXTEND by a WINDOW/CROSSING drag box in the target phase: the box edges
+    /// act as a rectangular fence, extending every object the box crosses.
+    /// Mirrors `apply_trim_window`; window (L→R) vs crossing (R→L) only changes
+    /// the rubber-band colour, not what gets extended.
+    fn apply_extend_window(&mut self, p1: Vec2, p2: Vec2) {
+        let (x0, x1) = (p1.x.min(p2.x), p1.x.max(p2.x));
+        let (y0, y1) = (p1.y.min(p2.y), p1.y.max(p2.y));
+        let bl = Vec2::new(x0, y0);
+        let br = Vec2::new(x1, y0);
+        let tr = Vec2::new(x1, y1);
+        let tl = Vec2::new(x0, y1);
+        for (a, b) in [(bl, br), (br, tr), (tr, tl), (tl, bl)] {
+            self.apply_extend_fence(a, b);
+        }
+    }
+
+
     fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
         let before_dobj_count = self.doc.dobjects.len();
         let _trim_pick_dbg = (cutters.to_vec(), target_idx, pick);
@@ -52983,6 +53146,8 @@ impl eframe::App for CadApp {
                 self.history.push("  extend cancelled".into());
             }
             if trim_running || extend_running {
+                self.fence_armed = false;
+                self.fence_first = None;
                 // Esc clears EVERYTHING — including any selection that was
                 // stashed when the op began. Restoring it would resurrect
                 // dashed-gray ghosts of items the user just cancelled
@@ -53292,6 +53457,8 @@ impl eframe::App for CadApp {
             {
                 self.trim_dbg("=== TRIM session END (Enter) ===");
                 self.trim_state = TrimState::Off;
+                self.fence_armed = false;
+                self.fence_first = None;
                 self.clear_prompt();
             } else if matches!(
                 self.extend_state,
@@ -53299,6 +53466,8 @@ impl eframe::App for CadApp {
             {
                 self.trim_dbg("=== EXTEND session END (Enter) ===");
                 self.extend_state = ExtendState::Off;
+                self.fence_armed = false;
+                self.fence_first = None;
                 self.clear_prompt();
             } else if (self.tool == Tool::Polyline && self.pending.len() >= 2)
                 || (self.tool == Tool::Spline && self.pending.len() >= 3)
@@ -56490,6 +56659,74 @@ impl eframe::App for CadApp {
                                 self.clear_prompt();
                             }
                             ScaleState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.fence_armed
+                        && (matches!(self.trim_state,
+                                TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+                            || matches!(self.extend_state,
+                                ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll))
+                    {
+                        // FENCE: two clicks define a crossing line. First click
+                        // parks in `fence_first`; the second runs it and
+                        // disarms. In the TRIM target phase it trims every
+                        // crossed dobject at the crossing; EXTEND grows them.
+                        let trimming = matches!(self.trim_state,
+                            TrimState::PickingTargets(_) | TrimState::PickingTargetsAll);
+                        if let Some(first) = self.fence_first.take() {
+                            if trimming {
+                                self.apply_trim_fence(first, world);
+                                self.set_prompt(
+                                    "trim: click a target, drag a window, or F = fence  [Enter/Esc ends]");
+                            } else {
+                                self.apply_extend_fence(first, world);
+                                self.set_prompt(
+                                    "extend: click a target, drag a window, or F = fence  [Enter/Esc ends]");
+                            }
+                            self.fence_armed = false;
+                        } else {
+                            self.fence_first = Some(world);
+                            self.history.push(
+                                "    fence: click SECOND point (the line's other end)".into());
+                            self.set_prompt(if trimming {
+                                "trim: fence — click second point  [Esc cancels the fence]"
+                            } else {
+                                "extend: fence — click second point  [Esc cancels the fence]"
+                            });
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.armed_window_inside.is_some()
+                        && (matches!(self.trim_state,
+                                TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+                            || matches!(self.extend_state,
+                                ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll))
+                    {
+                        // Two-click WINDOW / CROSSING box in the target phase
+                        // (typed `w` / `c`): the box edges act as a rectangular
+                        // fence. Direction doesn't change what is trimmed —
+                        // only the rubber-band colour.
+                        let trimming = matches!(self.trim_state,
+                            TrimState::PickingTargets(_) | TrimState::PickingTargetsAll);
+                        if let Some(first) = self.window_first.take() {
+                            self.armed_window_inside = None;
+                            if trimming {
+                                self.apply_trim_window(first, world);
+                                self.set_prompt(
+                                    "trim: click a target, drag a window, or F = fence  [Enter/Esc ends]");
+                            } else {
+                                self.apply_extend_window(first, world);
+                                self.set_prompt(
+                                    "extend: click a target, drag a window, or F = fence  [Enter/Esc ends]");
+                            }
+                        } else {
+                            self.window_first = Some(world);
+                            self.history.push(
+                                "    window: click OPPOSITE corner".into());
+                            self.set_prompt(if trimming {
+                                "trim: window — click second corner  [Esc cancels]"
+                            } else {
+                                "extend: window — click second corner  [Esc cancels]"
+                            });
                         }
                         self.refocus_cmd = true;
                     } else if matches!(
