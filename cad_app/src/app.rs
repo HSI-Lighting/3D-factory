@@ -2890,6 +2890,15 @@ pub struct CadApp {
     /// (divide, equal parts) or the segment LENGTH (measure, stepped from
     /// the start). Marks are POINT dobjects; `Off` when idle.
     ptdist_state:   PtDistribState,
+    /// Selection cycling (pointer-mode Tab): every dobject within the pick
+    /// aperture of the cursor, the current cycle index, and the screen
+    /// cell the list was built for. `pick_cycle_at` = (len, index, world)
+    /// of the highlighted candidate, honored by the next pointer click at
+    /// the same spot.
+    pick_cycle_index: usize,
+    pick_cycle_cell:  Option<(i32, i32)>,
+    pick_cands:       Vec<usize>,
+    pick_cycle_at:    Option<(usize, usize, Vec2)>,
     /// Properties dialog: true while a numeric/text field edit GESTURE is
     /// in progress, so the per-change `snapshot_doc` fires once at the
     /// start of a drag/type (one undo step per gesture, not per frame).
@@ -5093,6 +5102,10 @@ impl Default for CadApp {
             area_state:     None,
             layer_pick:     LayerPickState::Off,
             ptdist_state:   PtDistribState::Off,
+            pick_cycle_index: 0,
+            pick_cycle_cell:  None,
+            pick_cands:       Vec::new(),
+            pick_cycle_at:    None,
             props_edit_gesture: false,
             block_editor:   None,
             cmd_flow:       None,
@@ -10562,6 +10575,10 @@ impl CadApp {
         self.area_state = None;
         self.layer_pick = LayerPickState::Off;
         self.ptdist_state = PtDistribState::Off;
+        self.pick_cycle_index = 0;
+        self.pick_cycle_cell = None;
+        self.pick_cands.clear();
+        self.pick_cycle_at = None;
         self.lengthen_state = LengthenState::Off;
         self.break_state = BreakState::Off;
         self.align_state = AlignState::Off;
@@ -22149,6 +22166,74 @@ impl CadApp {
         // things", "the boundary moved with the fill" — happened afterwards,
         // invisible to the log.
         self.hatch_dbg_selection("click_select", i);
+    }
+
+    /// Every VISIBLE dobject within `tol_world` of `w`, nearest first.
+    /// Shared by selection cycling (pointer-mode Tab).
+    fn pick_candidates_at(&self, w: Vec2, tol_world: f64) -> Vec<usize> {
+        let pool: Vec<usize> = if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
+            g.query_near(w, tol_world).into_iter().map(|u| u as usize).collect()
+        } else {
+            (0..self.doc.dobjects.len()).collect()
+        };
+        let mut cands: Vec<(usize, f64)> = Vec::new();
+        for i in pool {
+            if !self.doc.is_visible(i) { continue; }
+            let d = self.doc.dobjects[i].distance_to_point(w);
+            if d < tol_world { cands.push((i, d)); }
+        }
+        cands.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        cands.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// Pointer-mode Tab — selection cycling through stacked dobjects under
+    /// the cursor. A fresh spot selects the top candidate (like a click
+    /// would); repeated Tabs at the same spot advance to the next one and
+    /// leave `pick_cycle_at` for the next click to honor.
+    fn cycle_pick_candidate(&mut self, w: Vec2, cell: (i32, i32), tol_world: f64) {
+        let fresh = self.pick_cycle_cell != Some(cell);
+        if fresh {
+            self.pick_cands = self.pick_candidates_at(w, tol_world);
+            self.pick_cycle_index = 0;
+            self.pick_cycle_cell = Some(cell);
+        }
+        if self.pick_cands.len() < 2 {
+            // Nothing stacked — Tab behaves like a plain pick of whatever
+            // is under the cursor (and stays silent when the spot is empty).
+            self.pick_cycle_at = None;
+            if let Some(&i) = self.pick_cands.first() {
+                self.click_select(i, false, false, true);
+            }
+            return;
+        }
+        if !fresh {
+            self.pick_cycle_index = (self.pick_cycle_index + 1) % self.pick_cands.len();
+        }
+        let i = self.pick_cands[self.pick_cycle_index];
+        self.pick_cycle_at = Some((self.pick_cands.len(), self.pick_cycle_index, w));
+        // Highlight the candidate: it becomes the current selection so the
+        // user sees what the next click will grab.
+        self.click_select(i, false, false, true);
+    }
+
+    /// The candidate the next pointer-mode click should select: the Tab-
+    /// cycled stacked dobject when the click lands at the cycle spot and a
+    /// deeper candidate was highlighted, else `None` (click normally).
+    fn cycled_pick_for(&self, w: Vec2, tol_world: f64) -> Option<usize> {
+        match self.pick_cycle_at {
+            Some((n, idx, at)) if n > 1 && idx > 0 && (w - at).len() <= tol_world => {
+                self.pick_cands.get(idx).copied()
+            }
+            _ => None,
+        }
+    }
+
+    /// Pointer-mode clicks (and any fresh select) consume the cycle state.
+    fn clear_pick_cycle(&mut self) {
+        self.pick_cycle_index = 0;
+        self.pick_cycle_cell = None;
+        self.pick_cands.clear();
+        self.pick_cycle_at = None;
     }
 
     /// The dobjects whose grips are live for the current selection:
@@ -47030,6 +47115,13 @@ impl CadApp {
         }
         if self.current_dim_style >= n_ds { self.current_dim_style = 0; }
         if self.current_wall_style >= n_ws { self.current_wall_style = 0; }
+        // Same clamp for the ACTIVE layer: purging the layer it pointed at
+        // left `layers.active` dangling (index past the end), which made
+        // every dobject's `is_visible`/`is_selectable` check fail (nothing
+        // could be picked or drawn until the user switched layers).
+        if self.doc.layers.active >= self.doc.layers.layers.len() as u32 {
+            self.doc.layers.active = cad_kernel::LayerTable::LAYER_ZERO;
+        }
         for (label, v) in [
             ("layer", &report.layers),
             ("linetype", &report.linetypes),
@@ -56380,6 +56472,21 @@ impl eframe::App for CadApp {
             }
             let snap_hit: Option<SnapHit> = snap_candidates
                 .get(self.snap_cycle_index).copied();
+            // Pointer-mode Tab (no snap phase): cycle the SELECTION through
+            // stacked dobjects under the cursor. Same consumed key — the two
+            // never compete because a snap phase is only active mid-draw /
+            // mid-point-pick (see `snap_phase_active`).
+            if tab_pressed && snap_candidates.is_empty()
+                && !snap_phase_active && self.tool == Tool::None
+                && self.select_mode == SelectMode::Off
+                && self.doc.active_layout.is_none()
+            {
+                if let Some(cur) = resp.hover_pos() {
+                    let w = self.s2w(cur, rect);
+                    let tol = 10.0 / (self.scale as f64).max(1e-6);
+                    self.cycle_pick_candidate(w, (cur.x as i32, cur.y as i32), tol);
+                }
+            }
 
             // Left-click handling:
             //   - if SELECT MODE is active: toggle dobject under cursor, or
@@ -57902,7 +58009,13 @@ impl eframe::App for CadApp {
                         let shift = ctx.input(|i| i.modifiers.shift);
                         let alt   = ctx.input(|i| i.modifiers.alt);
                         let tol_world = 10.0 / self.scale as f64;
-                        if let Some(i) = self.nearest_entity_under(world, tol_world) {
+                        // A Tab-cycled deeper candidate is honored when the
+                        // click lands at the cycle spot (any pointer-mode
+                        // click then consumes the cycle state).
+                        let hit = self.cycled_pick_for(world, tol_world)
+                            .or_else(|| self.nearest_entity_under(world, tol_world));
+                        self.clear_pick_cycle();
+                        if let Some(i) = hit {
                             // Pointer-mode pick: plain = fresh selection.
                             self.click_select(i, shift, alt, true);
                             // Picking a group member selects the whole group.
@@ -72985,6 +73098,26 @@ mod purge_flow_tests {
         app.do_undo();
         assert_eq!(app.doc.layers.layers.len(), n_layers + 1);
     }
+
+    #[test]
+    fn purge_clamps_the_active_layer() {
+        let mut app = CadApp::default();
+        app.commit_purge();   // drain defaults first
+        // Make the active layer an unused one, then purge it away.
+        let id = add_layer(&mut app, "ActiveVictim");
+        app.doc.layers.active = id;
+        app.commit_purge();
+        assert!(app.doc.layers.find("ActiveVictim").is_none(), "victim purged");
+        assert_eq!(app.doc.layers.active, cad_kernel::LayerTable::LAYER_ZERO,
+            "active layer clamped back to layer 0, not left dangling");
+        // A dobject on the clamped layer is visible/selectable again.
+        let mut d = DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(1.0, 0.0) }));
+        app.doc.push(d);
+        let idx = app.doc.dobjects.len() - 1;
+        assert!(app.doc.is_visible(idx) && app.doc.is_selectable(idx),
+            "picks work after the purge");
+    }
 }
 
 #[cfg(test)]
@@ -73280,6 +73413,54 @@ mod area_lay_flow_tests {
         assert_eq!(app.doc.dobjects.len(), base + 1, "nothing placed");
         assert!(app.history.iter().any(|h| h.contains("no marks to place")),
             "{:?}", app.history);
+    }
+
+    #[test]
+    fn selection_cycle_steps_through_stacked_dobjects() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        let a = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0));
+        let b = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0));
+        add_line(&mut app, Vec2::new(50.0, 50.0), Vec2::new(52.0, 50.0));
+        let w = Vec2::new(1.0, 0.0);   // on top of both stacked lines
+        let cands = app.pick_candidates_at(w, 1.0);
+        assert_eq!(cands, vec![a, b], "stacked candidates, nearest first");
+        let cell = (7_i32, 9_i32);
+        // First Tab at a fresh spot selects the top candidate.
+        app.cycle_pick_candidate(w, cell, 1.0);
+        assert_eq!(app.selection, vec![a], "top candidate selected first");
+        // Second Tab at the same spot advances to the stacked one beneath.
+        app.cycle_pick_candidate(w, cell, 1.0);
+        assert_eq!(app.selection, vec![b], "cycle advanced to #{}", b);
+        assert_eq!(app.pick_cycle_at, Some((2, 1, w)));
+        // The next click at the cycle spot honors the deeper candidate…
+        assert_eq!(app.cycled_pick_for(w, 1.0), Some(b));
+        // …but a click away from it (or after any other click) does not.
+        assert_eq!(app.cycled_pick_for(Vec2::new(0.5, 1.0), 1.0), None);
+        app.clear_pick_cycle();
+        assert_eq!(app.cycled_pick_for(w, 1.0), None);
+        assert_eq!(app.selection, vec![b], "clearing keeps the selection");
+    }
+
+    #[test]
+    fn selection_cycle_ignores_invisible_and_lone_candidates() {
+        let mut app = fresh_app();
+        let base = app.doc.dobjects.len();
+        let a = add_line(&mut app, Vec2::new(0.0, 0.0), Vec2::new(2.0, 0.0));
+        let lid = add_layer(&mut app, "Hidden");
+        let mut d = DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(2.0, 0.0) }));
+        d.style.layer = lid;
+        app.doc.push(d);
+        app.doc.layers.get_mut(lid).unwrap().visible = false;
+        let w = Vec2::new(1.0, 0.0);
+        let cands = app.pick_candidates_at(w, 1.0);
+        assert_eq!(cands, vec![a], "hidden layer dobject is not a candidate");
+        // A single candidate: Tab picks it and arms no deeper cycle.
+        app.cycle_pick_candidate(w, (3, 4), 1.0);
+        assert_eq!(app.selection, vec![a]);
+        assert_eq!(app.pick_cycle_at, None, "nothing stacked");
+        let _ = base;
     }
 }
 
