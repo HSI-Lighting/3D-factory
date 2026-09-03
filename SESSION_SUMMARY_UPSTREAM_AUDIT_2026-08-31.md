@@ -25,14 +25,47 @@
 - Verification: kernel 416/416, cad_app 1449 passed / 10 pre-existing
   failures (9 mesh_io fbx-texture assets + 1 factory wall env), pytest
   1473/1473.
-- Remaining import candidates (not yet ported, catalogued 2026-09-03):
-  spline/pline ribbon width (kernel+RSM v35 + v35 read-compat), polar/
-  path ARRAY, DIVIDE/MEASURE, QSELECT/QDIM, fence/window TRIM/EXTEND,
-  LAYISO/LAYFRZ family, AREA, XLINE/RAY/DONUT/CENTERMARK/WIPEOUT,
-  XREF/WBLOCK, ATTDEF/ATTEDIT, REGION/BOUNDARY, selection cycling,
-  Drawing-Units dialog, per-layout Plot dialog, File→Export flyout,
-  Point Style, Quad Bézier, OOPS, CTB test scene, plus the hover/
-  designate hatch architecture decision.
+
+## 2026-09-03 (later) — review fixes + backlog batch 1
+
+- `ac351d4` — full code-review pass on the branch diff (12 findings, all
+  fixed): stale grip `PolyVertex(i)` OOB after mid-drag undo (kernel
+  `with_corner_scale` now guards `i < 4`; `restore_doc` clears
+  grip/paper drags + re-syncs the canvas camera to the snapshot's active
+  space); paper-space viewport move/resize/lock/copy + new/close layout
+  now `snapshot_doc()` (unsaved/autosave/close-prompt/undo all work for
+  layout-only sessions); closing a tab shifts/clears layout-bound viewport
+  dialogs; paper render walks the spatial index per viewport + no
+  unbudgeted uncached-hatch fill; viewport lock badge actually painted;
+  model Plot gated to the Model tab; shared `Document::erase_dobjects`
+  aux-sweep (single pass, O(N+refs)) used by erase / `delete <i>` /
+  python `Op::Delete` / ghost preview; `find_smallest_containing_
+  closed_scoped` delegates to the candidate scan; entity→sidecar mirrors
+  call `Layout::sync_all_viewports`; dead `icon_for` arm removed.
+  Kernel 416/416; cad_app 1449 + 10 pre-existing; pytest 1473/1473.
+- `5904493` — uniform SPLINE RIBBON WIDTH ported (backlog): `Spline.width`
+  + `with_width`, propagation through split/scaled/rotated/mirrored/
+  reversed/translated/grip paths, trim preserves width, RSM write + read
+  for both lineages (AutoRASM v35 gate; fork v200; v100 factory files gate
+  at 7 → 0), plot scene flatten, spline-draw `w`/`width` sub-command
+  (sticky), Inspector Spline Width row, `fmt_r`, kernel regression tests
+  (width survives transforms, extend ellipse-arc, closed-shape errors).
+- `c0bad5f` — backlog quick wins: OOPS restores the last erase (buffer in
+  DeleteSelected arm; parser/CLI already had the command); File menu
+  Plot… row restored + CTB Test Scene playground (3-viewport A3 layout);
+  DDUNITS Drawing-Units dialog (bare `ddunits` intercepts pre-parser;
+  `units` keeps the fork's own command) — kernel `Units` already had the
+  formatting API.
+- Still open from the backlog (next sessions): polar/path ARRAY,
+  DIVIDE/MEASURE, QSELECT/QDIM, fence/window TRIM/EXTEND crossing,
+  LAYISO/LAYFRZ/LAYOFF/LAYON + LAYWALK, AREA, XLINE/RAY/DONUT/
+  CENTERMARK/WIPEOUT, XREF/WBLOCK, ATTDEF/ATTEDIT, REGION/BOUNDARY,
+  selection cycling, File→Export ▸ flyout, per-layout Plot dialog,
+  Point Style picker, Quad Bézier (`qb` degree-2 spline mode), plus the
+  two architecture decisions (hover/designate hatch flow, rail-card dock
+  columns). Note: source (cc95970) DOES contain every one of these
+  (verified by word counts); fork kernel parsers already carry most
+  Command variants — the gaps are app-side (arms, tools, menus).
 
 ---
 
