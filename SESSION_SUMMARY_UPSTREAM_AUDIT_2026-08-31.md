@@ -56,16 +56,37 @@
   DDUNITS Drawing-Units dialog (bare `ddunits` intercepts pre-parser;
   `units` keeps the fork's own command) — kernel `Units` already had the
   formatting API.
-- Still open from the backlog (next sessions): polar/path ARRAY,
-  DIVIDE/MEASURE, QSELECT/QDIM, fence/window TRIM/EXTEND crossing,
-  LAYISO/LAYFRZ/LAYOFF/LAYON + LAYWALK, AREA, XLINE/RAY/DONUT/
-  CENTERMARK/WIPEOUT, XREF/WBLOCK, ATTDEF/ATTEDIT, REGION/BOUNDARY,
-  selection cycling, File→Export ▸ flyout, per-layout Plot dialog,
-  Point Style picker, Quad Bézier (`qb` degree-2 spline mode), plus the
-  two architecture decisions (hover/designate hatch flow, rail-card dock
-  columns). Note: source (cc95970) DOES contain every one of these
-  (verified by word counts); fork kernel parsers already carry most
-  Command variants — the gaps are app-side (arms, tools, menus).
+
+## 2026-09-03 (evening) — backlog batch 2
+
+- `fd3e35d` — TRIM/EXTEND fence + window/crossing crossing modes: the four
+  upstream helpers (`apply_trim_fence` / `apply_trim_window` /
+  `apply_extend_fence` / `apply_extend_window`) verbatim; target-phase
+  sub-commands typed `f`/`fence` (two-click fence) and `w`/`c` (two-click
+  window box); other typed input is swallowed mid-trim/extend (no command
+  hijack); `fence_armed`/`fence_first` cleared on Enter/Esc/state reset.
+- `0d01011` — QuadBézier (`qb`/`quadbezier`/`quadratic`) wired: previously
+  the fork's SetTool arm sent ToolKind::QuadBezier into the POLYLINE tool;
+  now it enters the Spline tool with `spline_degree_override = Some(2)`
+  (P0..P2 clicks, Enter commits a quadratic B-spline); override cleared on
+  any other tool switch, commit or state reset.
+- `966a8ef` — File menu Export ▸ flyout (PDF / SVG / PNG quick export) via
+  the existing Save-dialog → run_plot flow (dialog format wins).
+- Suites after batch 2: kernel 419/419; cad_app suites green (hatch 40,
+  command 43, layer 24, numeric-field 1/1, parity 3/3 — full run 1449 + 10
+  pre-existing).
+- Still open from the backlog (next sessions — all confirmed present in
+  source cc95970; fork kernel parsers already carry most Command
+  variants; the gaps are app-side): polar/path ARRAY, DIVIDE/MEASURE,
+  QSELECT/QDIM, LAYISO/LAYFRZ/LAYOFF/LAYON + LAYWALK, AREA, XLINE/RAY/
+  DONUT/CENTERMARK/WIPEOUT (note: end-to-end entity ports need the fork's
+  draw/hit-test arms for these geom types — kernel types exist but the
+  fork app renders none of Xline/Donut/Wipeout today), XREF/WBLOCK,
+  ATTDEF/ATTEDIT, REGION/BOUNDARY, selection cycling, per-layout Plot
+  dialog, Point Style picker (fork has the Inspector Point style rows but
+  no `current_point_style` stamping or grid picker), plus the two
+  architecture decisions (hover/designate hatch flow, rail-card dock
+  columns).
 
 ---
 
