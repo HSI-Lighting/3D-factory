@@ -2878,6 +2878,14 @@ pub struct CadApp {
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
     dist_state:     DistState,
+    /// AREA measurement: `Some` while an `area` session is live (click a
+    /// closed object or accumulate a point polygon; `a`/`s` toggle
+    /// add/subtract; Enter folds the polygon in; Esc exits). Pure
+    /// inspection — never mutates the doc.
+    area_state:     Option<AreaState>,
+    /// LAYISO / LAYFRZ / LAYOFF click-pick — the clicked dobject's layer
+    /// is the target; `Off` when idle. LayOn is immediate (no pick).
+    layer_pick:     LayerPickState,
     /// Properties dialog: true while a numeric/text field edit GESTURE is
     /// in progress, so the per-change `snapshot_doc` fires once at the
     /// start of a drag/type (one undo step per gesture, not per frame).
@@ -4224,6 +4232,20 @@ pub enum ChamferDistWait { Off, WaitingD1, WaitingD2(f64) }
 /// printed to the history. Pure inspection — never mutates the doc.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum DistState { Off, WaitingForP1, WaitingForP2(Vec2) }
+
+/// AREA session state: `total` accumulates measured areas (sign ±1 in
+/// add/subtract mode); `pts` is the point polygon being picked.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AreaState {
+    pub total: f64,
+    pub sign:  f64,
+    pub pts:   Vec<Vec2>,
+}
+
+/// Layer-pick commands — the next click chooses a dobject whose layer the
+/// armed op targets. `Off` when idle.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LayerPickState { Off, Iso, Frz, OffLayer }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
@@ -5051,6 +5073,8 @@ impl Default for CadApp {
             insert_live:     None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
+            area_state:     None,
+            layer_pick:     LayerPickState::Off,
             props_edit_gesture: false,
             block_editor:   None,
             cmd_flow:       None,
@@ -10517,6 +10541,8 @@ impl CadApp {
         self.pedit_state = PeditState::Off;
         self.offset_state = OffsetState::Off;
         self.dist_state = DistState::Off;
+        self.area_state = None;
+        self.layer_pick = LayerPickState::Off;
         self.lengthen_state = LengthenState::Off;
         self.break_state = BreakState::Off;
         self.align_state = AlignState::Off;
@@ -18397,6 +18423,14 @@ impl CadApp {
                 return;
             }
         }
+        // ---- AREA sub-option intercept (AutoCAD AREA Add/Subtract) ----
+        // While an area session is live, `a`/`add` (add mode) and
+        // `s`/`sub`/`subtract` flip the sign of subsequent measurements.
+        // The empty-Enter fold-in is handled in update() (empty input
+        // never reaches run_command).
+        if self.area_state.is_some() && self.area_suboption(trimmed) {
+            return;
+        }
         // ---- Selection-mode shortcut intercept ----
         //
         // While a select session is active, single-letter input is a
@@ -19682,6 +19716,59 @@ impl CadApp {
                 } else {
                     self.commit_overkill(Some(self.selection.clone()));
                 }
+            }
+            Ok(Command::Area) => {
+                // AREA — click a closed object (its area is measured) or
+                // accumulate a point polygon. `a`/`s` toggle add/subtract;
+                // Enter folds the polygon in; Esc exits. Pure inspection.
+                self.tool = Tool::None;
+                self.area_state = Some(AreaState {
+                    total: 0.0, sign: 1.0, pts: Vec::new(),
+                });
+                self.set_prompt(
+                    "area: pick a closed object or pick points  [A=add  S=subtract  Enter=finish  Esc]"
+                        .to_string());
+            }
+            Ok(Command::LayIso) => {
+                self.tool = Tool::None;
+                self.layer_pick = LayerPickState::Iso;
+                self.set_prompt(
+                    "layiso: click a dobject — all OTHER layers freeze  [Esc exits]".to_string());
+            }
+            Ok(Command::LayFrz) => {
+                self.tool = Tool::None;
+                self.layer_pick = LayerPickState::Frz;
+                self.set_prompt(
+                    "layfrz: click a dobject to freeze its layer  [Esc exits]".to_string());
+            }
+            Ok(Command::LayOff) => {
+                self.tool = Tool::None;
+                self.layer_pick = LayerPickState::OffLayer;
+                self.set_prompt(
+                    "layoff: click a dobject to turn off its layer  [Esc exits]".to_string());
+            }
+            Ok(Command::LayOn) => {
+                // Immediate — no pick. Restore every layer to visible +
+                // thawed in one undo entry; a no-op reports visibly and
+                // leaves no undo entry behind.
+                self.tool = Tool::None;
+                let changed = self.doc.layers.layers.iter()
+                    .filter(|l| !l.visible || l.frozen).count();
+                if changed == 0 {
+                    self.history.push("  ! layon: no hidden or frozen layers to restore".into());
+                    return;
+                }
+                self.snapshot_doc();
+                for l in &mut self.doc.layers.layers {
+                    if !l.visible || l.frozen {
+                        l.visible = true;
+                        l.frozen = false;
+                    }
+                }
+                self.gpu_dirty = true;
+                self.index_dirty = true;
+                self.history.push(format!(
+                    "  layon: {} layer(s) restored", changed));
             }
             Err(e) => {
                 // ---- Command-line calculator & user variables ------------
@@ -24083,6 +24170,8 @@ impl CadApp {
             chamfer_state:      format!("{:?}", self.chamfer_state),
             offset_state:       format!("{:?}", self.offset_state),
             dist_state:         format!("{:?}", self.dist_state),
+            area_state:         self.area_state.is_some(),
+            layer_pick:         format!("{:?}", self.layer_pick),
             text_draft:         format!("{:?}", self.text_draft),
             matchprops_state:   format!("{:?}", self.matchprops_state),
             align_state:        format!("{:?}", self.align_state),
@@ -46945,6 +47034,167 @@ impl CadApp {
         self.touch_view();
     }
 
+    /// Report a measured area+perimeter into the history, and fold it into
+    /// the running total (sign ±1 for add/subtract mode).
+    fn report_area(&mut self, label: &str, area: f64, perim: Option<f64>) {
+        let sign_txt = if self.area_state.as_ref().map(|a| a.sign < 0.0).unwrap_or(false)
+            { " (subtract)" } else { "" };
+        let p_txt = match perim {
+            Some(p) => format!("  perimeter={p:.4}"),
+            None => String::new(),
+        };
+        self.history.push(format!(
+            "  area{sign_txt}: {label} area={area:.4}{p_txt}"));
+        if let Some(st) = self.area_state.as_mut() {
+            st.total += area * st.sign;
+            let t = st.total.abs();
+            self.history.push(format!(
+                "  area: total ({})= {t:.4}", if st.total >= 0.0 { "+" } else { "-" }));
+        }
+    }
+
+    /// One area click: a closed object under the cursor is measured; an
+    /// empty click starts/extends the point polygon.
+    fn area_click(&mut self, click_world: Vec2) {
+        if self.area_state.is_none() { return; }
+        let tol = (self.env.PkBxSz.max(8) as f64) / (self.scale as f64).max(1e-6);
+        let hit = self.nearest_entity_under(click_world, tol)
+            .and_then(|i| self.doc.dobjects.get(i))
+            .map(|d| d.geom.clone());
+        if let Some(g) = hit {
+            match g.measured_area() {
+                Some(a) => {
+                    let name = dobject_kind_name(&g).to_lowercase();
+                    self.report_area(&name, a, g.measured_perimeter());
+                    return;
+                }
+                None => {
+                    self.history.push(
+                        "  ! area: that object is not closed — pick a circle/ellipse/closed polyline/closed spline, or pick points".into());
+                    return;
+                }
+            }
+        }
+        // Empty click → point-polygon mode.
+        let starting = self.area_state.as_ref().map(|st| st.pts.is_empty()).unwrap_or(false);
+        if let Some(st) = self.area_state.as_mut() {
+            st.pts.push(click_world);
+            if st.pts.len() >= 3 {
+                let a = polygon_shoelace(&st.pts).abs() * 0.5;
+                self.history.push(format!(
+                    "  area: running polygon area = {a:.4}"));
+            }
+        }
+        if starting {
+            self.set_prompt(
+                "area: pick polygon points  [Enter=finish  Esc]".to_string());
+        }
+    }
+
+    /// Finish the point polygon (Enter while picking) and fold it in.
+    fn area_finish_polygon(&mut self) -> bool {
+        let Some(st) = self.area_state.as_ref() else { return false; };
+        if st.pts.len() < 3 {
+            self.history.push("  ! area: need at least 3 points".into());
+            if let Some(st) = self.area_state.as_mut() { st.pts.clear(); }
+            return true;
+        }
+        let pts = st.pts.clone();
+        let a = polygon_shoelace(&pts).abs() * 0.5;
+        let perim = pts.windows(2)
+            .fold(0.0, |acc, w| acc + (w[1] - w[0]).len())
+            + (pts[0] - pts[pts.len() - 1]).len();
+        if let Some(st) = self.area_state.as_mut() { st.pts.clear(); }
+        self.report_area("point polygon", a, Some(perim));
+        self.set_prompt(
+            "area: pick a closed object or pick points  [A=add  S=subtract  Enter=finish  Esc]"
+                .to_string());
+        true
+    }
+
+    /// `a`/`s` sub-options toggle add/subtract mode. Returns true when the
+    /// input was consumed by an area mode toggle.
+    fn area_suboption(&mut self, raw: &str) -> bool {
+        if self.area_state.is_none() { return false; }
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "a" | "add" => {
+                if let Some(st) = self.area_state.as_mut() { st.sign = 1.0; }
+                self.history.push("  area: ADD mode — areas are added to the total".into());
+                true
+            }
+            "s" | "sub" | "subtract" => {
+                if let Some(st) = self.area_state.as_mut() { st.sign = -1.0; }
+                self.history.push("  area: SUBTRACT mode — areas are subtracted from the total".into());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// LAYISO / LAYFRZ / LAYOFF — apply the armed op to a layer id. One
+    /// undo entry per pick; a no-op rolls the entry back and reports
+    /// visibly.
+    fn handle_layer_pick(&mut self, lid: u32) {
+        if self.layer_pick == LayerPickState::Off { return; }
+        self.snapshot_doc();
+        let layers = &mut self.doc.layers.layers;
+        let changed = match self.layer_pick {
+            LayerPickState::Iso => {
+                let mut n = 0usize;
+                for (i, l) in layers.iter_mut().enumerate() {
+                    if i as u32 != lid && !l.frozen {
+                        l.frozen = true;
+                        n += 1;
+                    }
+                }
+                n
+            }
+            LayerPickState::Frz => {
+                let already = layers.get(lid as usize)
+                    .map(|l| l.frozen).unwrap_or(false);
+                if !already {
+                    if let Some(l) = layers.get_mut(lid as usize) { l.frozen = true; }
+                }
+                if already { 0 } else { 1 }
+            }
+            LayerPickState::OffLayer => {
+                let already = layers.get(lid as usize)
+                    .map(|l| !l.visible).unwrap_or(false);
+                if !already {
+                    if let Some(l) = layers.get_mut(lid as usize) { l.visible = false; }
+                }
+                if already { 0 } else { 1 }
+            }
+            LayerPickState::Off => 0,
+        };
+        if changed == 0 {
+            self.rollback_doc();
+            self.history.push(format!(
+                "  ! {}: nothing changed (layer '{}' not found or already in that state)",
+                match self.layer_pick {
+                    LayerPickState::Iso => "layiso",
+                    LayerPickState::Frz => "layfrz",
+                    LayerPickState::OffLayer => "layoff",
+                    LayerPickState::Off => unreachable!(),
+                },
+                self.doc.layers.get(lid).map(|l| l.name.clone()).unwrap_or_default()));
+            return;
+        }
+        self.gpu_dirty = true;
+        self.index_dirty = true;
+        let name = self.doc.layers.get(lid)
+            .map(|l| l.name.clone()).unwrap_or_default();
+        match self.layer_pick {
+            LayerPickState::Iso => self.history.push(format!(
+                "  layiso: {} layer(s) frozen — '{}' stays", changed, name)),
+            LayerPickState::Frz => self.history.push(format!(
+                "  layfrz: '{}' frozen", name)),
+            LayerPickState::OffLayer => self.history.push(format!(
+                "  layoff: '{}' off", name)),
+            LayerPickState::Off => {}
+        }
+    }
+
     fn apply_chlayer(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! chlayer: empty basket".into());
@@ -50008,6 +50258,20 @@ fn bulge_from_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> f64 {
         -(std::f64::consts::TAU - ccw_sweep)
     };
     (signed_theta / 4.0).tan()
+}
+
+/// Shoelace double-area of a point polygon (signed; CCW positive). The
+/// callers halve it — kept as double-area to avoid intermediate division.
+fn polygon_shoelace(pts: &[Vec2]) -> f64 {
+    let mut twice = 0.0;
+    for w in pts.windows(2) {
+        twice += w[0].x * w[1].y - w[1].x * w[0].y;
+    }
+    let n = pts.len();
+    if n >= 3 {
+        twice += pts[n - 1].x * pts[0].y - pts[0].x * pts[n - 1].y;
+    }
+    twice
 }
 
 /// Short, capitalised label for a Dobject's underlying geometry. Used
@@ -53126,6 +53390,14 @@ impl eframe::App for CadApp {
                 self.dist_state = DistState::Off;
                 self.history.push("  dist cancelled".into());
             }
+            if self.area_state.is_some() {
+                self.area_state = None;
+                self.history.push("  area cancelled".into());
+            }
+            if self.layer_pick != LayerPickState::Off {
+                self.layer_pick = LayerPickState::Off;
+                self.history.push("  layer pick cancelled".into());
+            }
             if self.lengthen_state != LengthenState::Off {
                 self.lengthen_state = LengthenState::Off;
                 self.history.push("  lengthen cancelled".into());
@@ -53442,6 +53714,14 @@ impl eframe::App for CadApp {
                 // Point-pick steps: empty Enter just keeps waiting for the pick.
                 _ => {}
             }
+            return;
+        }
+        // AREA — an empty Enter folds the current point polygon into the
+        // running total (the session stays live until Esc). Empty input
+        // never reaches run_command, so it has to be handled here.
+        if trigger && cmd_is_empty && self.area_state.is_some() {
+            if space_now { self.cmd.clear(); }
+            self.area_finish_polygon();
             return;
         }
         // PEDIT — empty Enter exits the menu (Width step returns to the menu).
@@ -55700,6 +55980,8 @@ impl eframe::App for CadApp {
                 || self.stretch_state       != StretchState::Off
                 || self.break_state         != BreakState::Off
                 || self.dist_state          != DistState::Off
+                || self.area_state.is_some()
+                || self.layer_pick          != LayerPickState::Off
                 || self.insert_state        != InsertState::Off
                 || self.cmd_flow.is_some()
                 || self.block_def_state     != BlockDefState::Off;
@@ -55742,6 +56024,8 @@ impl eframe::App for CadApp {
                 // `insert` places a block at a point; `block` picks the
                 // definition's base point. All were silently snap-dead.
                 || self.dist_state       != DistState::Off
+                // `area` point-polygon clicks commit coordinates too.
+                || self.area_state.is_some()
                 || self.insert_state     != InsertState::Off
                 || self.cmd_flow.is_some()
                 // A grip drag commits a precise coordinate too — it needs
@@ -56086,6 +56370,8 @@ impl eframe::App for CadApp {
                 || self.fillet_state     != FilletState::Off
                 || self.chamfer_state    != ChamferState::Off
                 || self.dist_state       != DistState::Off
+                || self.area_state.is_some()
+                || self.layer_pick       != LayerPickState::Off
                 // Block/insert POINT-PICK phases: a single click captures a
                 // coordinate (block base point, insert insertion point), so
                 // they must be click-only — otherwise grips on the still-
@@ -56948,6 +57234,25 @@ impl eframe::App for CadApp {
                                 self.refresh_offset_prompt();
                             }
                             OffsetState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.area_state.is_some() {
+                        // AREA — a click on a closed object measures it; an
+                        // empty click starts/extends the point polygon.
+                        self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if self.layer_pick != LayerPickState::Off {
+                        // LAYISO / LAYFRZ / LAYOFF — the click's dobject
+                        // layer is the target.
+                        let lid = self.nearest_entity_under(click_world,
+                                (self.env.PkBxSz.max(8) as f64)
+                                    / (self.scale as f64).max(1e-6))
+                            .and_then(|i| self.doc.dobjects.get(i))
+                            .map(|d| d.style.layer);
+                        match lid {
+                            Some(l) => self.handle_layer_pick(l),
+                            None => self.fail_op(
+                                "layiso/layfrz/layoff: click a dobject on a layer"),
                         }
                         self.refocus_cmd = true;
                     } else if self.dist_state != DistState::Off {
@@ -72438,6 +72743,199 @@ mod purge_flow_tests {
         assert_eq!(app.doc.layers.layers.len(), n_layers);
         app.do_undo();
         assert_eq!(app.doc.layers.layers.len(), n_layers + 1);
+    }
+}
+
+#[cfg(test)]
+mod area_lay_flow_tests {
+    use super::*;
+
+    fn add_layer(app: &mut CadApp, name: &str) -> u32 {
+        app.doc.layers.add(cad_kernel::Layer {
+            name: name.into(), color: cad_kernel::color::Color::Aci(7),
+            linetype: 0, lineweight: cad_kernel::lineweight::Lineweight::Default,
+            visible: true, locked: false, frozen: false, plottable: true, order: 0,
+        })
+    }
+
+    /// CadApp::default() loads the three-demo-dobject workbench on its own
+    /// demo layer — deterministic tests clear it all first.
+    fn fresh_app() -> CadApp {
+        let mut app = CadApp::default();
+        app.run_command("clear");
+        app.commit_purge();
+        app
+    }
+
+    #[test]
+    fn area_click_on_circle_reports_its_area() {
+        let mut app = CadApp::default();
+        app.add_dobject(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0), radius: 2.0 }), "test");
+        app.run_command("area");
+        assert!(app.area_state.is_some(), "area session armed");
+        // Click exactly on the circumference (world point ON the circle).
+        app.area_click(Vec2::new(2.0, 0.0));
+        let expect = std::f64::consts::PI * 4.0;
+        assert!(app.history.iter().any(|h| h.contains(&format!("circle area={:.4}", expect))),
+            "circle measured: {:?}", app.history);
+        assert!(app.history.iter().any(|h| h.contains(&format!("total (+)= {:.4}", expect))),
+            "total folded in: {:?}", app.history);
+    }
+
+    #[test]
+    fn area_open_object_fails_visibly() {
+        let mut app = CadApp::default();
+        app.add_dobject(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(4.0, 0.0) }), "test");
+        app.run_command("area");
+        // Click ON the line (its distance_to_point is 0 there) — not closed.
+        app.area_click(Vec2::new(2.0, 0.0));
+        assert!(app.history.iter().any(|h| h.contains("not closed")),
+            "failure reported: {:?}", app.history);
+    }
+
+    #[test]
+    fn area_point_polygon_finishes_and_accumulates() {
+        let mut app = fresh_app();
+        app.run_command("area");
+        // Right triangle (0,0) (4,0) (0,3) → area 6, perimeter 12.
+        app.area_click(Vec2::new(0.0, 0.0));
+        app.area_click(Vec2::new(4.0, 0.0));
+        app.area_click(Vec2::new(0.0, 3.0));
+        app.area_finish_polygon();
+        assert!(app.history.iter().any(|h| h.contains("point polygon area=6.0000")),
+            "polygon folded: {:?}", app.history);
+        // A second polygon in SUBTRACT mode folds in with a minus sign.
+        app.run_command("s");   // subtract mode (area session still live)
+        assert!(app.history.iter().any(|h| h.contains("SUBTRACT")));
+        app.area_click(Vec2::new(0.0, 0.0));
+        app.area_click(Vec2::new(7.0, 0.0));
+        app.area_click(Vec2::new(0.0, 2.0));
+        app.area_finish_polygon();
+        assert!(app.history.iter().any(|h| h.contains("(subtract): point polygon area=7.0000")),
+            "subtract measured: {:?}", app.history);
+        assert!(app.history.iter().any(|h| h.contains("total (-)= 1.0000")),
+            "6 - 7 leaves a negative running total: {:?}", app.history);
+        // Esc-style cancel clears the session.
+        app.area_state = None;
+    }
+
+    #[test]
+    fn area_needs_three_points_to_finish() {
+        let mut app = CadApp::default();
+        app.run_command("area");
+        app.area_click(Vec2::new(0.0, 0.0));
+        app.area_click(Vec2::new(4.0, 0.0));
+        app.area_finish_polygon();
+        assert!(app.history.iter().any(|h| h.contains("need at least 3 points")),
+            "too-few failure reported: {:?}", app.history);
+    }
+
+    #[test]
+    fn layiso_freezes_every_other_layer() {        let mut app = CadApp::default();
+        let keep = add_layer(&mut app, "Keep");
+        let other = add_layer(&mut app, "HideMe");
+        app.run_command("layiso");
+        assert_eq!(app.layer_pick, LayerPickState::Iso);
+        app.handle_layer_pick(keep);
+        assert!(!app.doc.layers.get(keep).unwrap().frozen, "kept layer stays");
+        assert!(app.doc.layers.get(other).unwrap().frozen, "other frozen");
+        assert!(app.history.iter().any(|h| h.contains("layiso:") && h.contains("'Keep' stays")),
+            "report: {:?}", app.history);
+        // One undo entry undoes the freeze.
+        app.do_undo();
+        assert!(!app.doc.layers.get(other).unwrap().frozen, "undo thaws");
+    }
+
+    #[test]
+    fn layfrz_and_layoff_target_the_picked_layer() {
+        let mut app = CadApp::default();
+        let lid = add_layer(&mut app, "Target");
+        app.run_command("layfrz");
+        app.handle_layer_pick(lid);
+        assert!(app.doc.layers.get(lid).unwrap().frozen);
+        app.run_command("layoff");
+        app.handle_layer_pick(lid);
+        assert!(!app.doc.layers.get(lid).unwrap().visible, "off hides");
+        assert!(app.doc.layers.get(lid).unwrap().frozen, "frz state survives layoff");
+        app.do_undo();
+        app.do_undo();
+        let l = app.doc.layers.get(lid).unwrap();
+        assert!(l.visible && !l.frozen, "two undos restore: {:?}", l);
+    }
+
+    #[test]
+    fn laypick_noop_rolls_back_and_reports() {
+        let mut app = CadApp::default();
+        let lid = add_layer(&mut app, "Noop");
+        let depth_before = app.undo_stack.len();
+        app.run_command("layoff");
+        app.handle_layer_pick(lid);
+        assert!(!app.doc.layers.get(lid).unwrap().visible);
+        // Second pick on the same (now hidden) layer: nothing changes.
+        app.handle_layer_pick(lid);
+        assert!(app.history.iter().any(|h| h.contains("nothing changed")),
+            "no-op reported: {:?}", app.history);
+        assert_eq!(app.undo_stack.len(), depth_before + 1,
+            "no-op leaves no extra undo entry");
+    }
+
+    #[test]
+    fn layon_restores_all_layers_in_one_undo_step() {
+        let mut app = fresh_app();
+        let a = add_layer(&mut app, "A");
+        let b = add_layer(&mut app, "B");
+        app.run_command("layfrz");
+        app.handle_layer_pick(a);
+        app.run_command("layoff");
+        app.handle_layer_pick(b);
+        let before = app.undo_stack.len();
+        app.run_command("layon");
+        let la = app.doc.layers.get(a).unwrap();
+        let lb = app.doc.layers.get(b).unwrap();
+        assert!(la.visible && !la.frozen && lb.visible && !lb.frozen,
+            "all restored: A {:?} B {:?}", la, lb);
+        assert!(app.history.iter().any(|h| h.contains("layon: 2 layer(s) restored")),
+            "report: {:?}", app.history);
+        // One undo entry undoes the whole LayOn.
+        assert_eq!(app.undo_stack.len(), before + 1);
+        app.do_undo();
+        let la = app.doc.layers.get(a).unwrap();
+        let lb = app.doc.layers.get(b).unwrap();
+        assert!(la.frozen && !lb.visible, "undo restores both ops: A {:?} B {:?}", la, lb);
+    }
+
+    #[test]
+    fn layon_noop_fails_visibly() {
+        let mut app = fresh_app();
+        let before = app.undo_stack.len();
+        app.run_command("layon");
+        assert!(app.history.iter().any(|h| h.contains("no hidden or frozen")),
+            "no-op reported: {:?}", app.history);
+        assert_eq!(app.undo_stack.len(), before, "no undo entry for a no-op");
+    }
+
+    #[test]
+    fn area_and_layer_states_survive_parser_dispatch() {
+        // The run_command arms (not just the helpers) must arm the states.
+        let mut app = CadApp::default();
+        app.run_command("layfrz");
+        assert_eq!(app.layer_pick, LayerPickState::Frz);
+        app.run_command("layoff");
+        assert_eq!(app.layer_pick, LayerPickState::OffLayer);
+        app.run_command("layiso");
+        assert_eq!(app.layer_pick, LayerPickState::Iso);
+        app.run_command("area");
+        assert!(app.area_state.is_some());
+        // Typed sub-options while the area session is live are consumed.
+        app.run_command("add");
+        assert_eq!(app.area_state.as_ref().unwrap().sign, 1.0);
+        app.run_command("sub");
+        assert_eq!(app.area_state.as_ref().unwrap().sign, -1.0);
+        // Esc-cancel path: the reset helper clears both cleanly.
+        app.area_state = None;
+        app.layer_pick = LayerPickState::Off;
     }
 }
 

@@ -1050,6 +1050,8 @@ pub struct WatchedState {
     pub chamfer_state:       String,
     pub offset_state:        String,
     pub dist_state:          String,
+    pub area_state:          bool,
+    pub layer_pick:          String,
     pub text_draft:          String,
     pub matchprops_state:    String,
     pub align_state:         String,
@@ -1191,6 +1193,8 @@ pub fn diff_watched(
     diff_field!("chamfer_state",     chamfer_state);
     diff_field!("offset_state",      offset_state);
     diff_field!("dist_state",        dist_state);
+    diff_field!("area_state",        area_state);
+    diff_field!("layer_pick",        layer_pick);
     diff_field!("text_draft",        text_draft);
     diff_field!("matchprops_state",  matchprops_state);
     diff_field!("align_state",       align_state);
