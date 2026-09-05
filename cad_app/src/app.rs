@@ -3148,6 +3148,8 @@ pub struct CadApp {
 
     // ---- Plot dialog ----
     plot_dialog_open: bool,
+    // ---- QSELECT panel (filter selection) ----
+    qselect: QSelectState,
     // ---- Drawing Units dialog (DDUNITS) ----
     units_dialog_open: bool,
     units_dialog_draft: cad_kernel::Units,
@@ -5197,6 +5199,7 @@ impl Default for CadApp {
             ctb_fingerprint: Vec::new(),
             layer_glyph_tex:    std::collections::HashMap::new(),
             plot_dialog_open: false,
+            qselect: QSelectState::default(),
             units_dialog_open: false,
             units_dialog_draft: cad_kernel::Units::default(),
             units_dlg_n: 1.0,
@@ -19107,6 +19110,11 @@ impl CadApp {
                     "dim: click first point (or click a circle/arc for radius/diameter)  [Esc cancels]"
                     .to_string());
             }
+            Ok(Command::QDim) => self.apply_qdim(),
+            Ok(Command::QSelect) => {
+                self.tool = Tool::None;
+                self.qselect.open = true;
+            }
             Ok(Command::DimStyle(name_opt)) => {
                 // Open the Dimension Style Manager (the `dimstyle` page).
                 // With a name, pre-select that style in the list (and
@@ -27311,6 +27319,241 @@ impl CadApp {
     /// A failed operation (fork-local): appends the `! ` marker to the
     /// history transcript. (Upstream also surfaces it in a status bar this
     /// build does not have.)
+    /// QDIM — batch linear dimensions over the selected lines/polylines
+    /// (one aligned linear dim per straight segment, lifted above the
+    /// geometry by 1.5 text heights, current dim style). Upstream cc95970.
+    fn apply_qdim(&mut self) {
+        if self.selection.is_empty() {
+            self.fail_op("qdim: empty selection — select lines to dimension");
+            return;
+        }
+        let mut segs: Vec<(Vec2, Vec2)> = Vec::new();
+        for &i in &self.selection {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            match &d.geom {
+                Geom::Line(l) => segs.push((l.a, l.b)),
+                Geom::Polyline(p) => {
+                    for w in p.vertices.windows(2) {
+                        if (w[1].pos - w[0].pos).len() > 1e-9 {
+                            segs.push((w[0].pos, w[1].pos));
+                        }
+                    }
+                    if p.closed && p.vertices.len() > 2 {
+                        let a = p.vertices.last().unwrap().pos;
+                        let b = p.vertices[0].pos;
+                        if (b - a).len() > 1e-9 { segs.push((a, b)); }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if segs.is_empty() {
+            self.fail_op("qdim: no lines or polylines in the selection");
+            return;
+        }
+        self.snapshot_doc();
+        let h = self.doc.dim_styles.styles
+            .get(self.current_dim_style as usize)
+            .map(|s| s.text_height * s.overall_scale)
+            .unwrap_or(0.25);
+        let lift = (h * 1.5).max(0.5);
+        for (a, b) in &segs {
+            let chord = *b - *a;
+            let d = chord.len();
+            if d < 1e-9 { continue; }
+            let u = chord / d;
+            let n = Vec2::new(-u.y, u.x);
+            let mid = (*a + *b) * 0.5;
+            let dimline_pos = mid + n * lift;
+            self.doc.dobjects.push(DObject::new(Geom::Dimension(Dim {
+                kind: DimKind::Linear { p1: *a, p2: *b, dimline_pos, ortho: cad_kernel::LinearOrtho::Aligned },
+                style: self.current_dim_style,
+                text_override: None,
+            })));
+        }
+        self.history.push(format!(
+            "  ✓ qdim: {} dimension(s) placed over {} segment(s)",
+            segs.len(), segs.len()));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+
+    fn close_qselect_dialog(&mut self) {
+        self.qselect.open = false;
+        if self.current_prompt.starts_with("qselect") {
+            self.clear_prompt();
+        }
+    }
+
+    fn apply_qselect(&mut self) {
+        let q = self.qselect.clone();
+        let kind = q.kind_filter.as_deref();
+        let layer = q.layer_filter.as_deref();
+        let aci = q.color_filter;
+        let lt = q.linetype_filter.as_deref();
+        let mut matches: Vec<usize> = Vec::new();
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            let s = &d.style;
+            let k_ok = kind.map_or(true, |k| dobject_kind_name(&d.geom) == k);
+            let l_ok = layer.map_or(true, |l| {
+                self.doc.layers.get(s.layer).map(|x| x.name.eq_ignore_ascii_case(l))
+                    .unwrap_or(false)
+            });
+            let c_ok = aci.map_or(true, |a| match s.color {
+                cad_kernel::color::Color::Aci(c) => c == a,
+                _ => false,
+            });
+            let lt_ok = lt.map_or(true, |l| {
+                self.doc.linetypes.get(s.linetype).map(|x| x.name.eq_ignore_ascii_case(l))
+                    .unwrap_or(false)
+            });
+            if k_ok && l_ok && c_ok && lt_ok { matches.push(i); }
+        }
+        let n = self.doc.dobjects.len();
+        if q.include {
+            self.selection = matches.clone();
+        } else {
+            let m: std::collections::HashSet<usize> = matches.into_iter().collect();
+            self.selection = (0..n).filter(|i| !m.contains(i)).collect();
+        }
+        self.selected = None;
+        self.selection_prev = self.selection.clone();
+        let label = if q.include { "selected" } else { "kept (excluded matches)" };
+        self.history.push(format!(
+            "  qselect: {} dobject(s) {}", self.selection.len(), label));
+    }
+
+    fn render_qselect_dialog(&mut self, ctx: &egui::Context) {
+        if !self.qselect.open { return; }
+        let cfg = crate::dock::DockConfig {
+            id: "qselect", title: "QSELECT — filter selection", badge: None,
+            dock_region: crate::dock::DockRegion::Right,
+            alt_region: Some(crate::dock::DockRegion::Left),
+            any_edge: false, strip_h: 0.0,
+            dockable: false,             // floating-only
+            rail_header: true, collapsible: true,
+            size: 300.0, min: 280.0, max: 420.0,
+            resizable: false, flush_body: true, float_w: 300.0, float_max_h_frac: 0.9,
+        };
+        let mut state = self.qselect.dock_state.clone();
+        let mut open = true;
+        if matches!(state, crate::dock::DockState::Floating(_)) {
+            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 16.0, right: 16.0, top: 12.0, bottom: 14.0 })
+                    .show(ui, |ui| { self.qselect_panel_body(ui); });
+            });
+        }
+        self.qselect.dock_state = state;
+        if !open { self.close_qselect_dialog(); }
+    }
+
+    fn qselect_panel_body(&mut self, ui: &mut egui::Ui) {
+        use egui::RichText;
+        let mut apply = false;
+        ui.label(RichText::new("Filter the selection set").strong());
+        ui.add_space(6.0);
+
+        // Object type.
+        let mut kinds: Vec<String> = vec!["All".into()];
+        let mut seen = std::collections::HashSet::new();
+        for d in &self.doc.dobjects {
+            let k = dobject_kind_name(&d.geom).to_string();
+            if seen.insert(k.clone()) { kinds.push(k); }
+        }
+        kinds.sort_by_key(|k| k.to_lowercase());
+        let cur_k = self.qselect.kind_filter.clone().unwrap_or_else(|| "All".into());
+        ui.label("Object type");
+        egui::ComboBox::from_id_salt("qs_kind")
+            .selected_text(&cur_k)
+            .show_ui(ui, |ui| {
+                for k in &kinds {
+                    if ui.selectable_label(cur_k == *k, k).clicked() {
+                        self.qselect.kind_filter =
+                            if k == "All" { None } else { Some(k.clone()) };
+                    }
+                }
+            });
+
+        // Layer.
+        let mut layers: Vec<String> = vec!["All".into()];
+        layers.extend(self.doc.layers.layers.iter().map(|l| l.name.clone()));
+        let cur_l = self.qselect.layer_filter.clone().unwrap_or_else(|| "All".into());
+        ui.label("Layer");
+        egui::ComboBox::from_id_salt("qs_layer")
+            .selected_text(&cur_l)
+            .show_ui(ui, |ui| {
+                for l in &layers {
+                    if ui.selectable_label(cur_l == *l, l).clicked() {
+                        self.qselect.layer_filter =
+                            if l == "All" { None } else { Some(l.clone()) };
+                    }
+                }
+            });
+
+        // Color (ACI values actually in use).
+        let mut acis: Vec<u8> = Vec::new();
+        for d in &self.doc.dobjects {
+            if let cad_kernel::color::Color::Aci(c) = d.style.color {
+                if !acis.contains(&c) { acis.push(c); }
+            }
+        }
+        acis.sort_unstable();
+        let cur_c = self.qselect.color_filter
+            .map(|c| format!("ACI {c}")).unwrap_or_else(|| "All".into());
+        ui.label("Color");
+        egui::ComboBox::from_id_salt("qs_color")
+            .selected_text(&cur_c)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(cur_c == "All", "All").clicked() {
+                    self.qselect.color_filter = None;
+                }
+                for c in &acis {
+                    let label = format!("ACI {c}");
+                    if ui.selectable_label(cur_c == label, &label).clicked() {
+                        self.qselect.color_filter = Some(*c);
+                    }
+                }
+            });
+
+        // Linetype.
+        let mut lts: Vec<String> = vec!["All".into()];
+        lts.extend(self.doc.linetypes.linetypes.iter().map(|l| l.name.clone()));
+        let cur_t = self.qselect.linetype_filter.clone().unwrap_or_else(|| "All".into());
+        ui.label("Linetype");
+        egui::ComboBox::from_id_salt("qs_lt")
+            .selected_text(&cur_t)
+            .show_ui(ui, |ui| {
+                for t in &lts {
+                    if ui.selectable_label(cur_t == *t, t).clicked() {
+                        self.qselect.linetype_filter =
+                            if t == "All" { None } else { Some(t.clone()) };
+                    }
+                }
+            });
+
+        ui.add_space(8.0);
+        // Include / exclude.
+        ui.radio_value(&mut self.qselect.include, true, "Include in new selection");
+        ui.radio_value(&mut self.qselect.include, false, "Exclude from new selection");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("Apply").strong()).clicked() {
+                apply = true;
+            }
+            if ui.button("Close").clicked() {
+                self.qselect.open = false;
+            }
+        });
+        if apply {
+            self.apply_qselect();
+        }
+        ui.add_space(4.0);
+        ui.small(format!("{} dobject(s) in drawing", self.doc.dobjects.len()));
+    }
+
     fn fail_op(&mut self, msg: impl Into<String>) {
         self.history.push(format!("  ! {}", msg.into()));
     }
@@ -51402,6 +51645,34 @@ const MENU_FLYOUT_CLOSE_DELAY: f64 = 0.30;
 /// from `&self` (`flyout_items`) so dynamic content (block names, current
 /// method/style, toggle state, live labels) is always current; a click commits via
 /// `flyout_activate`. Submenus nest: a `Styles` row opens `DimStylePick`, etc.
+/// QSELECT dialog state (AutoCAD QSELECT analog). `None` filters mean
+/// "All". `include` = the matches become the new selection; `exclude` =
+/// everything EXCEPT the matches. Floating-only panel.
+#[derive(Clone, PartialEq, Debug)]
+pub struct QSelectState {
+    pub open: bool,
+    pub kind_filter: Option<String>,
+    pub layer_filter: Option<String>,
+    pub color_filter: Option<u8>,
+    pub linetype_filter: Option<String>,
+    pub include: bool,
+    pub dock_state: crate::dock::DockState,
+}
+
+impl Default for QSelectState {
+    fn default() -> Self {
+        QSelectState {
+            open: false,
+            kind_filter: None,
+            layer_filter: None,
+            color_filter: None,
+            linetype_filter: None,
+            include: true,
+            dock_state: crate::dock::DockState::Floating(Default::default()),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq)]
 enum FlyMenu {
     Method(String),   // arc/circle/fillet method list
@@ -55409,6 +55680,9 @@ impl eframe::App for CadApp {
         }
         if self.units_dialog_open {
             self.render_units_dialog(ctx);
+        }
+        if self.qselect.open {
+            self.render_qselect_dialog(ctx);
         }
         if self.plot_preview_open {
             self.render_plot_preview_window(ctx);
@@ -82405,5 +82679,54 @@ mod hatch_erase_and_grip_parity_tests {
         let chosen = app.find_smallest_containing_closed_scoped(seed, None);
         assert_eq!(chosen, Some(big_idx),
             "the picker must agree with the candidate scan and ignore the hidden boundary");
+    }
+}
+
+#[cfg(test)]
+mod qselect_tests {
+    use super::*;
+
+    #[test]
+    fn qselect_filters_by_type_and_layer() {
+        let mut app = CadApp::default();
+        let base = app.doc.dobjects.len();
+        // A red circle + a blue circle + a line.
+        let mk = |g: Geom, c: u8| {
+            let mut d = DObject::new(g);
+            d.style.color = cad_kernel::color::Color::Aci(c);
+            d
+        };
+        app.doc.push(mk(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(0.0, 0.0), radius: 1.0 }), 1));
+        app.doc.push(mk(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(5.0, 0.0), radius: 1.0 }), 3));
+        app.doc.push(mk(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(9.0, 0.0) }), 1));
+        assert_eq!(app.doc.dobjects.len(), base + 3, "3 pushes land (base={base})");
+        let base_circles = app.doc.dobjects.iter()
+            .filter(|d| matches!(d.geom, Geom::Circle(_))).count();
+        app.qselect.kind_filter = Some("Circle".into());
+        app.qselect.include = true;
+        app.apply_qselect();
+        assert_eq!(app.selection.len(), base_circles, "all circles");
+
+        app.qselect.color_filter = Some(1);
+        app.apply_qselect();
+        assert_eq!(app.selection.len(), 1, "red circle only");
+        if let Geom::Circle(c) = &app.doc.dobjects[app.selection[0]].geom {
+            assert!((c.center.x - 0.0).abs() < 1e-9);
+        } else { panic!("wrong pick"); }
+
+        // Exclude mode = everything except matches.
+        app.qselect.include = false;
+        app.apply_qselect();
+        assert_eq!(app.selection.len(), base + 2, "everything else");
+    }
+
+    #[test]
+    fn qselect_command_opens_dialog() {
+        let mut app = CadApp::default();
+        app.run_command("qselect");
+        assert!(app.qselect.open);
     }
 }
