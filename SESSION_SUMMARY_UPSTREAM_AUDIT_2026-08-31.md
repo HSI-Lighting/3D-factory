@@ -92,7 +92,7 @@
 
 Resumed from the other machine's session end (`3b77d70`, clean, pushed).
 Its transcript was machine-local, so the handoff was this doc + the repo
-state. Commits (local only — see the push note at the end):
+state. Commits:
 
 - `ec82238` — AREA + LAYISO/LAYFRZ/LAYOFF/LAYON. AREA: click a closed
   object → measured area+perimeter reported (kernel `measured_area` /
@@ -138,8 +138,24 @@ XREF/WBLOCK, ATTDEF/ATTEDIT, polar/path ARRAY, per-layout Plot dialog,
 plus the two architecture decisions. The next items are dialog/UI-heavy
 or need draw-pipeline arms, so they were left for interactive sessions.
 
-Note: the three commits are on `farzad-dev` locally; origin/farzad-dev
-is still at `3b77d70` — push when ready (`git push origin farzad-dev`).
+## 2026-09-05 — handoff state
+
+- `farzad-dev` at `b1fafc0`, worktree clean, pushed to origin (range
+  `3b77d70..b1fafc0`, 5 commits: ec82238, e8f8163, 8e5d49c, 7a3346b
+  [this doc], b1fafc0).
+- `b1fafc0` — post-review fixup: DIVIDE mark output capped at 4000 (the
+  MEASURE path already had the guard).
+- Final verification at HEAD `b1fafc0`: `cargo test -p cad_app --bin
+  simlux` 1477 passed / 0 failed / 50 ignored; `cargo check
+  --workspace` clean; pytest 1473/1473; kernel untouched.
+- Still open (app-side only — all confirmed present in upstream source;
+  next machine picks the order): QSELECT/QDIM, LAYWALK, Point Style
+  picker (current_point_style stamping + grid picker), XLINE/RAY/DONUT/
+  CENTERMARK/WIPEOUT end-to-end (kernel types + grips exist; the fork's
+  egui/GPU draw + creation flows needed), REGION/BOUNDARY, XREF/WBLOCK,
+  ATTDEF/ATTEDIT, polar/path ARRAY, per-layout Plot dialog, plus the two
+  architecture decisions (hover/designate hatch flow, rail-card dock
+  columns).
 
 ---
 
