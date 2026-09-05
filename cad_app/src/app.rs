@@ -3150,6 +3150,11 @@ pub struct CadApp {
     plot_dialog_open: bool,
     // ---- QSELECT panel (filter selection) ----
     qselect: QSelectState,
+    // ---- LAYWALK panel (preview layers in isolation) ----
+    laywalk_open:    bool,
+    laywalk_restore: Option<Vec<(bool, bool)>>,
+    laywalk_current: usize,
+    layer_search:    String,
     // ---- Drawing Units dialog (DDUNITS) ----
     units_dialog_open: bool,
     units_dialog_draft: cad_kernel::Units,
@@ -5200,6 +5205,10 @@ impl Default for CadApp {
             layer_glyph_tex:    std::collections::HashMap::new(),
             plot_dialog_open: false,
             qselect: QSelectState::default(),
+            laywalk_open:    false,
+            laywalk_restore: None,
+            laywalk_current: 0,
+            layer_search:    String::new(),
             units_dialog_open: false,
             units_dialog_draft: cad_kernel::Units::default(),
             units_dlg_n: 1.0,
@@ -19844,6 +19853,16 @@ impl CadApp {
                 self.history.push(format!(
                     "  layon: {} layer(s) restored", changed));
             }
+            Ok(Command::LayWalk) => {
+                self.tool = Tool::None;
+                self.laywalk_open = true;
+                self.laywalk_restore = Some(
+                    self.doc.layers.layers.iter().map(|l| (l.visible, l.frozen)).collect());
+                self.layer_search.clear();
+                self.set_prompt(
+                    "laywalk: pick a layer to preview  [Close restores]".to_string());
+            }
+
             Ok(Command::Divide) => {
                 // Pick a curve, then type the segment count. A pre-selected
                 // basket skips straight to the value prompt (pickfirst).
@@ -55683,6 +55702,73 @@ impl eframe::App for CadApp {
         }
         if self.qselect.open {
             self.render_qselect_dialog(ctx);
+        }
+        if self.laywalk_open {
+            let mut keep = true;
+            egui::Window::new("LAYER WALK")
+                .order(egui::Order::Foreground)
+                .open(&mut keep)
+                .resizable(true)
+                .default_pos(egui::pos2(240.0, 120.0))
+                .default_size(egui::vec2(280.0, 360.0))
+                .show(ctx, |ui| {
+                    ui.set_min_width(260.0);
+                    ui.label(egui::RichText::new(
+                        "Click a layer to preview it in isolation").size(11.0));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Filter");
+                        ui.text_edit_singleline(&mut self.layer_search);
+                    });
+                    ui.add_space(4.0);
+                    let search = self.layer_search.to_ascii_lowercase();
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        let rows: Vec<(usize, String, bool, bool)> =
+                            self.doc.layers.layers.iter().enumerate()
+                                .filter(|(_, l)| search.is_empty()
+                                    || l.name.to_ascii_lowercase().contains(&search))
+                                .map(|(id, l)| (id, l.name.clone(), l.visible, l.frozen))
+                                .collect();
+                        for (id, name, vis, frozen) in rows {
+                            let label = format!(
+                                "{}  [{}]{}",
+                                name,
+                                if vis { "on" } else { "off" },
+                                if frozen { " \u{2744}" } else { "" });
+                            if ui.selectable_label(id == self.laywalk_current, label).clicked() {
+                                self.laywalk_current = id;
+                                // Isolate: freeze every OTHER layer; the
+                                // restore snapshot heals on Close.
+                                for (i, ll) in self.doc.layers.layers.iter_mut().enumerate() {
+                                    ll.frozen = i != id;
+                                }
+                                self.gpu_dirty = true;
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply (keep)").clicked() {
+                            self.laywalk_restore = None;
+                            self.laywalk_open = false;
+                            self.clear_prompt();
+                        }
+                        if ui.button("Close (restore)").clicked() {
+                            if let Some(states) = self.laywalk_restore.take() {
+                                for (l, (vis, fro)) in self.doc.layers.layers.iter_mut()
+                                    .zip(states.iter())
+                                {
+                                    l.visible = *vis;
+                                    l.frozen = *fro;
+                                }
+                                self.gpu_dirty = true;
+                            }
+                            self.laywalk_open = false;
+                            self.clear_prompt();
+                        }
+                    });
+                });
+            if !keep { self.laywalk_open = false; }
         }
         if self.plot_preview_open {
             self.render_plot_preview_window(ctx);
