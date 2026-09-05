@@ -167,9 +167,27 @@ or need draw-pipeline arms, so they were left for interactive sessions.
   columns). Kernel/parser surfaces for Array/Xref/AttDef/AttEdit already
   exist in the fork.
 
----
+## 2026-09-05 (late) — backlog batch 5 (this machine, fe736d3..ef06e50)
 
-## 2026-09-05 — handoff state (batch 3, prior machine)
+- `cd68217` — polar + path ARRAY methods (dialog Linear/Polar/Path
+  toggle; polar count/fill°/rotate-items + centre X/Y or click-pick; path
+  pick the curve, divide-by-count or measure-by-distance with L/M/R
+  anchor, align-to-tangent; full-circle step divides by count, measure
+  steps as many as fit). 3 tests.
+- `ef06e50` — XREF (`xref attach <path>` click-places cached-child
+  instances; detach/reload by name; bare list; children rendered via
+  kernel `Xref::transform_geom`) + WBLOCK (selection or whole drawing →
+  own .rsm/.dxf via the Save dialog; `save_dialog_purpose` guards a
+  cancelled wblock dialog from hijacking a later Save As). 3 tests.
+- Full app suite: 1482 passed / 10 pre-existing failures (fbx-texture
+  assets + factory wall-env) / 50 ignored.
+- Still open: ATTDEF/ATTEDIT attribute flows (kernel `Geom::AttrDef` +
+  `block::AttrDef` exist; needs the fork's Tag→Prompt→Default→position
+  text-entry flow + per-instance value editor panel), per-layout Plot
+  dialog, and the two architecture decisions (hover/designate hatch flow,
+  rail-card dock columns).
+
+---
 
 - `farzad-dev` at `b1fafc0`, worktree clean, pushed to origin (range
   `3b77d70..b1fafc0`, 5 commits: ec82238, e8f8163, 8e5d49c, 7a3346b
