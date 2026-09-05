@@ -31219,34 +31219,85 @@ impl CadApp {
         }
         let k = self.doc.units.metres_per_unit;
         let as_declared = span * k;
-        if (PLAUSIBLE_MIN_M..=PLAUSIBLE_MAX_M).contains(&as_declared) {
-            return None;
-        }
-        // NAME THE UNIT THAT WOULD WORK. "Your unit is wrong" leaves the reader to guess which of
-        // six it should have been, and the arithmetic is the same one they would have to do.
-        let fits: Vec<(&str, f64)> = CANDIDATES
-            .iter()
-            .copied()
-            .filter(|(_, kk)| (PLAUSIBLE_MIN_M..=PLAUSIBLE_MAX_M).contains(&(span * kk)))
-            .collect();
-        let advice = match fits.as_slice() {
-            [] => "no standard unit makes this a building-sized drawing — check the geometry itself"
-                .to_string(),
-            [(n, kk)] => format!("`units {n}` would make it {:.2} m across", span * kk),
-            // AS COMMANDS, not as bare unit names. The reader has to type one of these, and
-            // "try m or ft" leaves them to work out that `units` is the word in front of it.
-            many => format!(
-                "try {}",
-                many.iter()
-                    .map(|(n, kk)| format!("`units {n}` ({:.2} m)", span * kk))
-                    .collect::<Vec<_>>()
-                    .join(" or "),
-            ),
+        let fits = |lo: f64, hi: f64| -> Vec<(&'static str, f64)> {
+            CANDIDATES.iter().copied().filter(|(_, kk)| (lo..=hi).contains(&(span * kk))).collect()
         };
+        if !(PLAUSIBLE_MIN_M..=PLAUSIBLE_MAX_M).contains(&as_declared) {
+            // NAME THE UNIT THAT WOULD WORK. "Your unit is wrong" leaves the reader to guess which
+            // of six it should have been, and the arithmetic is the same one they would have to do.
+            let advice = match fits(PLAUSIBLE_MIN_M, PLAUSIBLE_MAX_M).as_slice() {
+                [] => "no standard unit makes this a building-sized drawing — check the geometry \
+                       itself"
+                    .to_string(),
+                [(n, kk)] => format!("`units {n}` would make it {:.2} m across", span * kk),
+                // AS COMMANDS, not as bare unit names. The reader has to type one of these, and
+                // "try m or ft" leaves them to work out that `units` is the word in front of it.
+                many => format!(
+                    "try {}",
+                    many.iter()
+                        .map(|(n, kk)| format!("`units {n}` ({:.2} m)", span * kk))
+                        .collect::<Vec<_>>()
+                        .join(" or "),
+                ),
+            };
+            return Some(format!(
+                "  ⚠ units: this drawing is {span:.2} units across, which at 1 unit = {} is \
+                 {as_declared:.3} m — not a building. {advice}. (Setting the unit never moves \
+                 geometry.)",
+                self.doc.units.label(),
+            ));
+        }
+        // ---- AND THE CASE THE BAND ABOVE IS TOO WIDE TO CATCH ----------------------------------
+        //
+        // `FOR LUX - NEW.dwg` declares INCHES and contains MILLIMETRES. 40 723 units across is
+        // 40.7 m as authored and 1 034 m as declared — and 1 034 m is a perfectly ordinary site
+        // plan, so it sits inside the plausible band and the check above says nothing. The file
+        // opened at 25.4x scale, silently, and the owner had to know to type `units mm`.
+        //
+        // No amount of looking at the NUMBERS can separate these two readings: the coordinates are
+        // identical either way, only their meaning differs. Roundness, granularity, wall-thickness
+        // clustering — all of it is the same file. The only thing that discriminates is how big a
+        // building actually is, so that is what this asks, and it asks it narrowly.
+        //
+        // SO IT ASKS EXACTLY ONE QUESTION: is there a reading of this file that WOULD make it a
+        // building? A correctly declared plan is inside the band and never reaches here — the gym
+        // (33 m), the villa (24.9 m), the mashrabiya (3.2 m) and this same DWG under its honest
+        // millimetre declaration (16.6 m) all stop at the line above. A genuinely large drawing,
+        // an 800 m airport in millimetres, is outside the band but no other unit brings it back
+        // in, so it stays quiet too. What is left is the ambiguous set, and there a line is owed.
+        //
+        // IT DOES NOT INSIST ON A SINGLE ANSWER. An earlier cut of this only spoke when exactly one
+        // unit fitted, on the theory that two candidates are no advice — and it was silent on the
+        // very file it was written for, because 16 563 units is 16.6 m in millimetres AND 165.6 m
+        // in centimetres. Both readings are buildings; the user can tell which is theirs at a
+        // glance, and being shown two is not the same as being told nothing.
+        //
+        // THE COST IS A LINE ON A GENUINE SITE PLAN — a 1.2 km survey in metres is outside the band
+        // and centimetres would bring it in. That is accepted deliberately: SIMLUX is opened on
+        // floor plans, the note is one informational line, and a silent 25.4x scale error has now
+        // cost two sessions. See `a_genuine_site_plan_pays_for_this`.
+        const BUILDING_MIN_M: f64 = 2.0;
+        const BUILDING_MAX_M: f64 = 300.0;
+        if (BUILDING_MIN_M..=BUILDING_MAX_M).contains(&as_declared) {
+            return None; // the declaration reads as a building; nothing to say
+        }
+        let building = fits(BUILDING_MIN_M, BUILDING_MAX_M);
+        if building.is_empty() {
+            return None; // no re-reading helps, so there is no question to raise
+        }
+        // NOTHING IS RESCALED AND THE FILE'S OWN CLAIM IS KEPT. A drawing that states its unit is
+        // stating it; overriding that silently is the same class of magic as the bug this catches,
+        // and it would be wrong on every genuine site plan. Inform, name the one-word command, stop.
         Some(format!(
-            "  ⚠ units: this drawing is {span:.2} units across, which at 1 unit = {} is {as_declared:.3} m \
-             — not a building. {advice}. (Setting the unit never moves geometry.)",
+            "  ⚠ units: this drawing is {span:.0} units across, which at 1 unit = {} is \
+             {as_declared:.0} m — a site, not a building. If it is a building, {}. The file's \
+             declaration was kept and nothing was rescaled.",
             self.doc.units.label(),
+            building
+                .iter()
+                .map(|(n, kk)| format!("`units {n}` makes it {:.1} m", span * kk))
+                .collect::<Vec<_>>()
+                .join(" or "),
         ))
     }
 
@@ -67723,7 +67774,13 @@ mod the_declared_unit_is_checked_against_the_drawing {
             "33 000 mm is the same building, declared the other way",
         );
         assert!(drawing(4.0, 1.0).unit_sanity_note().is_none(), "a 4 m room is legitimate");
-        assert!(drawing(1_200.0, 1.0).unit_sanity_note().is_none(), "so is a 1.2 km site plan");
+        // A GENUINELY LARGE PLAN IS ALSO SILENT, as long as no other unit would shrink it into
+        // building range: an 800 m airport drawn in millimetres is 800 m under every reading that
+        // matters, so there is no question to ask about it.
+        assert!(
+            drawing(800_000.0, 0.001).unit_sanity_note().is_none(),
+            "an 800 m airport in millimetres is large, not misdeclared",
+        );
     }
 
     /// AN EMPTY DRAWING MAKES NO CLAIM, so there is nothing to contradict — and a new file must not
@@ -67751,6 +67808,121 @@ mod the_declared_unit_is_checked_against_the_drawing {
             app.unit_sanity_note().is_none(),
             "33 m across at 6.8 km from the origin is the owner's actual plan, correctly declared",
         );
+    }
+
+    /// THE CASE THE PLAUSIBLE BAND WAS TOO WIDE FOR. `FOR LUX - NEW.dwg` declares INCHES and holds
+    /// MILLIMETRES: 16 563 units is 16.6 m as authored and 421 m as declared, and 421 m is an
+    /// ordinary site plan — so the band said nothing and the file opened at 25.4x, silently.
+    #[test]
+    fn a_millimetre_drawing_declared_in_inches_is_caught() {
+        let app = drawing(16_563.0, 0.0254);
+        let w = app.unit_sanity_note().expect("421 m is not the building this drawing is");
+        assert!(w.contains("`units mm`"), "millimetres is the reading that works: {w}");
+        assert!(w.contains("16.6"), "and it must show what that would make it: {w}");
+        assert!(w.contains("421"), "against the 421 m the declaration claims: {w}");
+        // NOT AS A HARD CONTRADICTION, and distinguishably so. The declared reading here IS a
+        // possible drawing -- a kilometre-wide site -- just not this one, whereas the tier above
+        // fires on a size nothing could be. Two different claims must not read as one, or the
+        // softer one inherits a certainty it has not got.
+        let hard = drawing(33.0, 0.001).unit_sanity_note().expect("33 mm is the hard tier");
+        assert!(w.contains("a site, not a building"), "the soft tier names what it thinks it is: {w}");
+        assert!(
+            !hard.contains("a site, not a building"),
+            "and the hard tier must not borrow that hedge: {hard}",
+        );
+    }
+
+    /// WHAT KEEPS IT QUIET is that a re-reading has to actually exist. Nothing here has one.
+    #[test]
+    fn a_drawing_no_unit_would_rescue_says_nothing() {
+        // 1.5 m declared in metres: below the building band, and no standard unit lands it inside.
+        assert!(
+            drawing(1.5, 1.0).unit_sanity_note().is_none(),
+            "a 1.5 m detail is small, not wrong -- and nothing would make it a building",
+        );
+        // THE CONTROL FOR THE TEST ABOVE, and the half that matters most: the same drawing under
+        // its honest declaration. A check that fires on both is not a check, it is a warning on
+        // every file -- and these two differ ONLY in what they claim.
+        assert!(
+            drawing(16_563.0, 0.001).unit_sanity_note().is_none(),
+            "the same drawing declared in millimetres is 16.6 m and entirely correct",
+        );
+    }
+
+    /// THE PRICE, PAID KNOWINGLY. A 1.2 km survey declared in metres is a real drawing and a
+    /// correct one, and it collects a line it does not need, because centimetres would read it as
+    /// a 12 m building and this check cannot tell the two apart from the numbers alone.
+    ///
+    /// It is accepted: SIMLUX is opened on floor plans, this is one informational line on a rare
+    /// file, and the alternative — staying silent — is what let a 25.4x scale error through twice.
+    /// The line it gets must still be the SOFT one; a genuine site plan must never be told it is
+    /// not a building at all.
+    #[test]
+    fn a_genuine_site_plan_pays_for_this() {
+        let w = drawing(1_200.0, 1.0).unit_sanity_note().expect("it does now get a note");
+        assert!(w.contains("If it is a building"), "phrased as a question, not a verdict: {w}");
+        assert!(w.contains("`units cm`"), "and it names the reading it is asking about: {w}");
+    }
+}
+
+/// THE TWO DECLARATIONS OF THE SAME DRAWING, read through the real DWG path.
+///
+/// `FOR LUX - NEW.dwg` and `floor plan o2 first floor.dwg` are the same plan — same entity counts,
+/// same geometry — saved once claiming INCHES and once claiming MILLIMETRES. That makes them the
+/// only fair test of the check above: a synthetic pair proves the arithmetic, this pair proves the
+/// arithmetic is pointed at the right thing.
+///
+///     cargo test -p cad_app the_twin_declarations -- --ignored --nocapture
+#[cfg(test)]
+mod the_twin_declarations {
+    use super::*;
+
+    const DIR: &str =
+        r"D:\Dropbox\03--PROJECTS\03-PROJECTS\2026\SAEEDA MAM\SAEEDA MA'AM'S PROJECT-02\02";
+
+    fn opened(name: &str) -> Option<CadApp> {
+        let p = std::path::Path::new(DIR).join(name);
+        if !p.exists() {
+            eprintln!("{name} SKIPPED (not on this machine)");
+            return None;
+        }
+        let (doc, _) = cad_io::dwg::read_dwg(&p).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let mut app = CadApp::default();
+        app.doc = doc;
+        // THE THREE NUMBERS THE CHECK REASONS ABOUT, printed whether it passes or fails. When this
+        // test went red the first time the message said only "must be flagged", which is the one
+        // thing already known -- the span and the unit are what say WHY.
+        let (mut lo, mut hi) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+        for d in &app.doc.dobjects {
+            let (a, b) = d.geom.bbox();
+            lo = (lo.0.min(a.x), lo.1.min(a.y));
+            hi = (hi.0.max(b.x), hi.1.max(b.y));
+        }
+        let span = (hi.0 - lo.0).max(hi.1 - lo.1);
+        let k = app.doc.units.metres_per_unit;
+        eprintln!("{name:32} span {span:.1} units  unit {k}  = {:.1} m declared", span * k);
+        Some(app)
+    }
+
+    #[test]
+    #[ignore]
+    fn the_inch_declaration_is_flagged_and_the_millimetre_one_is_not() {
+        if let Some(app) = opened("FOR LUX - NEW.dwg") {
+            let w = app
+                .unit_sanity_note()
+                .expect("the inch declaration reads as a kilometre-wide site and must be flagged");
+            eprintln!("FOR LUX - NEW.dwg\n{w}");
+            assert!(w.contains("`units mm`"), "and must name millimetres: {w}");
+        }
+        // THE CONTROL, and the half that matters most: a check that fires on both files is not a
+        // check, it is a warning on every DWG. These two differ only in what they claim.
+        if let Some(app) = opened("floor plan o2 first floor.dwg") {
+            assert_eq!(
+                app.unit_sanity_note(),
+                None,
+                "the same drawing, correctly declared in millimetres, must open silently",
+            );
+        }
     }
 }
 
