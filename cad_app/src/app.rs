@@ -2883,6 +2883,11 @@ pub struct CadApp {
     /// add/subtract; Enter folds the polygon in; Esc exits). Pure
     /// inspection — never mutates the doc.
     area_state:     Option<AreaState>,
+    // ---- XLINE / RAY / DONUT / WIPEOUT placement flows (tool = None) ----
+    xline_state:    XlineState,
+    ray_state:      RayState,
+    donut_state:    DonutState,
+    wipeout_state:  WipeoutState,
     /// LAYISO / LAYFRZ / LAYOFF click-pick — the clicked dobject's layer
     /// is the target; `Off` when idle. LayOn is immediate (no pick).
     layer_pick:     LayerPickState,
@@ -4237,10 +4242,47 @@ fn list_drive_roots() -> Vec<std::path::PathBuf> {
 ///       click side / through-point → apply, back to WaitingForObject
 ///       Enter or Esc → Off
 /// `mode` carries either an explicit distance or "Through" semantics.
+/// XLINE click flow: base point, then a direction point (or H/V/A/Off).
+#[derive(Clone, PartialEq, Debug)]
+pub enum XlineState {
+    Off,
+    WaitingForBase,
+    WaitingForDir { base: Vec2 },
+}
+
+/// RAY click flow: base point, then a direction point (or H/V/A). The
+/// ray extends forward from the base only.
+#[derive(Clone, PartialEq, Debug)]
+pub enum RayState {
+    Off,
+    WaitingForBase,
+    WaitingForDir { base: Vec2 },
+}
+
+/// DONUT click flow: center → outer radius → inner radius; place-multiple
+/// until Esc/Enter. Radii come from the click distances.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DonutState {
+    Off,
+    WaitingCenter,
+    WaitingOuter { center: Vec2 },
+    WaitingInner { center: Vec2, outer_radius: f64 },
+}
+
+/// WIPEOUT click flow: two opposite corners define the opaque mask rect.
+#[derive(Clone, PartialEq, Debug)]
+pub enum WipeoutState {
+    Off,
+    WaitingFirstCorner,
+    WaitingSecondCorner { first: Vec2 },
+}
+
+
 /// Type `t`/`e`/`l`/`u`/<number> at any waiting prompt to swap modes
 /// or change distance; see the run_command intercept.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum OffsetMode { Distance(f64), Through }
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum OffsetState {
     Off,
@@ -5115,6 +5157,10 @@ impl Default for CadApp {
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             area_state:     None,
+            xline_state:    XlineState::Off,
+            ray_state:      RayState::Off,
+            donut_state:    DonutState::Off,
+            wipeout_state:  WipeoutState::Off,
             layer_pick:     LayerPickState::Off,
             ptdist_state:   PtDistribState::Off,
             pick_cycle_index: 0,
@@ -10596,6 +10642,10 @@ impl CadApp {
         self.offset_state = OffsetState::Off;
         self.dist_state = DistState::Off;
         self.area_state = None;
+        self.xline_state = XlineState::Off;
+        self.ray_state = RayState::Off;
+        self.donut_state = DonutState::Off;
+        self.wipeout_state = WipeoutState::Off;
         self.layer_pick = LayerPickState::Off;
         self.ptdist_state = PtDistribState::Off;
         self.pick_cycle_index = 0;
@@ -17875,6 +17925,10 @@ impl CadApp {
             }
         }
 
+        // ---- XLINE / RAY sub-options (H/V/A...) while their flows are armed.
+        if self.xline_state != XlineState::Off && self.xline_suboption(trimmed) { return; }
+        if self.ray_state != RayState::Off && self.ray_suboption(trimmed) { return; }
+
         // ---- TRIM / EXTEND target phase: still the RUNNING command --------
         // Typed input is a sub-command (Fence / Window / Crossing / Undo),
         // NOT a new command — no hijack (typing `f` mustn't jump to Fillet,
@@ -19820,6 +19874,31 @@ impl CadApp {
                 } else {
                     self.commit_overkill(Some(self.selection.clone()));
                 }
+            }
+            Ok(Command::Xline) => {
+                self.tool = Tool::None;
+                self.xline_state = XlineState::WaitingForBase;
+                self.set_prompt(
+                    "xline: pick base point  [H/V/A/Off  Esc exits]".to_string());
+            }
+            Ok(Command::Ray) => {
+                self.tool = Tool::None;
+                self.ray_state = RayState::WaitingForBase;
+                self.set_prompt(
+                    "ray: pick base point  [H/V/A  Esc exits]".to_string());
+            }
+            Ok(Command::Donut) => {
+                self.tool = Tool::None;
+                self.donut_state = DonutState::WaitingCenter;
+                self.set_prompt(
+                    "donut: click CENTER, then outer radius, then inner radius  [Esc exits]"
+                        .to_string());
+            }
+            Ok(Command::Wipeout) => {
+                self.tool = Tool::None;
+                self.wipeout_state = WipeoutState::WaitingFirstCorner;
+                self.set_prompt(
+                    "wipeout: pick first corner  [Esc exits]".to_string());
             }
             Ok(Command::Area) => {
                 // AREA — click a closed object (its area is measured) or
@@ -26879,6 +26958,170 @@ impl CadApp {
 
     /// Snapshot once, then add — ONE undo entry for a single-object script
     /// add (the same seam every canvas draw uses).
+
+    /// Commit one xline at (base, dir) and stay armed for the next base
+    /// click (place-multiple). Degenerate direction fails visibly.
+    fn commit_xline(&mut self, base: Vec2, dir: Vec2) {
+        let x = cad_kernel::Xline::new(base, dir);
+        self.add_dobject_undoable(Geom::Xline(x), "canvas");
+        self.history.push(format!(
+            "  + xline @ ({:.3},{:.3}) angle={:.3}\u{00B0}",
+            base.x, base.y, x.dir.angle().to_degrees()));
+        self.xline_state = XlineState::WaitingForBase;
+        self.set_prompt(
+            "xline: pick base point  [H/V/A/Off  Esc exits]".to_string());
+    }
+
+    /// Commit one ray at (base, dir) and stay armed for the next base
+    /// click (place-multiple, like xline).
+    fn commit_ray(&mut self, base: Vec2, dir: Vec2) {
+        let r = cad_kernel::Ray::new(base, dir);
+        self.add_dobject_undoable(Geom::Ray(r), "canvas");
+        self.history.push(format!(
+            "  + ray @ ({:.3},{:.3}) angle={:.3}\u{00B0}",
+            base.x, base.y, r.dir.angle().to_degrees()));
+        self.ray_state = RayState::WaitingForBase;
+        self.set_prompt(
+            "ray: pick base point  [H/V/A  Esc exits]".to_string());
+    }
+
+    /// Handle the ray sub-options (H/V/A) from the command line while the
+    /// ray flow is armed. Returns true when consumed.
+    fn ray_suboption(&mut self, raw: &str) -> bool {
+        let low = raw.trim().to_ascii_lowercase();
+        let state = self.ray_state.clone();
+        match state {
+            RayState::Off => false,
+            RayState::WaitingForBase | RayState::WaitingForDir { .. } => {
+                let base = match state {
+                    RayState::WaitingForDir { base } => base,
+                    _ => Vec2::ZERO,
+                };
+                if low == "h" || low == "horizontal" {
+                    self.commit_ray(base, Vec2::new(1.0, 0.0));
+                    true
+                } else if low == "v" || low == "vertical" {
+                    self.commit_ray(base, Vec2::new(0.0, 1.0));
+                    true
+                } else if low == "a" || low.starts_with("a") {
+                    let deg = raw.trim()[1..].trim().parse::<f64>().ok()
+                        .or_else(|| raw.trim().split_whitespace().nth(1)
+                            .and_then(|t| t.parse::<f64>().ok()));
+                    match deg {
+                        Some(d) => {
+                            let rad = d.to_radians();
+                            self.commit_ray(base,
+                                Vec2::new(rad.cos(), rad.sin()));
+                            true
+                        }
+                        None => {
+                            self.fail_op("ray: angle needs a value, e.g. a45");
+                            false
+                        }
+                    }
+                } else { false }
+            }
+        }
+    }
+
+    /// Handle the xline sub-options (H/V/A/Off) while the xline flow is
+    /// armed. Returns true when consumed.
+    fn xline_suboption(&mut self, raw: &str) -> bool {
+        let low = raw.trim().to_ascii_lowercase();
+        let state = self.xline_state.clone();
+        match state {
+            XlineState::Off => false,
+            XlineState::WaitingForBase | XlineState::WaitingForDir { .. } => {
+                let base = match state {
+                    XlineState::WaitingForDir { base } => base,
+                    _ => Vec2::ZERO,
+                };
+                if low == "off" || low == "o" {
+                    self.fail_op("xline: offset option needs a direction first — place the base + direction, then use offset");
+                    true
+                } else if low == "h" || low == "horizontal" {
+                    self.commit_xline(base, Vec2::new(1.0, 0.0));
+                    true
+                } else if low == "v" || low == "vertical" {
+                    self.commit_xline(base, Vec2::new(0.0, 1.0));
+                    true
+                } else if low == "a" || low.starts_with("a") {
+                    let deg = raw.trim()[1..].trim().parse::<f64>().ok()
+                        .or_else(|| raw.trim().split_whitespace().nth(1)
+                            .and_then(|t| t.parse::<f64>().ok()));
+                    match deg {
+                        Some(d) => {
+                            let rad = d.to_radians();
+                            self.commit_xline(base,
+                                Vec2::new(rad.cos(), rad.sin()));
+                            true
+                        }
+                        None => {
+                            self.fail_op("xline: angle needs a value, e.g. a45");
+                            false
+                        }
+                    }
+                } else { false }
+            }
+        }
+    }
+
+    /// Commit one donut (center + outer + inner radii) and stay armed for
+    /// the next one (place-multiple). Invalid radii fail visibly and the
+    /// flow returns to the OUTER click.
+    fn commit_donut(&mut self, center: Vec2, outer: f64, inner: f64) {
+        if outer < 1e-9 {
+            self.fail_op("donut: outer radius is zero");
+            self.donut_state = DonutState::WaitingOuter { center };
+            self.set_prompt(
+                "donut: click OUTER radius point  [Esc exits]".to_string());
+            return;
+        }
+        if inner >= outer - 1e-9 {
+            self.fail_op("donut: inner radius must be smaller than outer");
+            self.donut_state = DonutState::WaitingOuter { center };
+            self.set_prompt(
+                "donut: click OUTER radius point  [Esc exits]".to_string());
+            return;
+        }
+        let d = cad_kernel::Donut::new(center, inner, outer);
+        self.add_dobject_undoable(Geom::Donut(d), "canvas");
+        self.history.push(format!(
+            "  + donut @ ({:.3},{:.3})  outer={:.3} inner={:.3}",
+            center.x, center.y, outer, inner));
+        self.donut_state = DonutState::WaitingCenter;
+        self.set_prompt(
+            "donut: click CENTER, then outer radius, then inner radius  [Esc exits]"
+                .to_string());
+    }
+
+    /// Commit one wipeout rectangle between two opposite corners. Degenerate
+    /// rects fail visibly. Single placement (Esc to re-arm).
+    fn commit_wipeout(&mut self, a: Vec2, b: Vec2) {
+        let (mn, mx) = (
+            Vec2::new(a.x.min(b.x), a.y.min(b.y)),
+            Vec2::new(a.x.max(b.x), a.y.max(b.y)),
+        );
+        if (mx.x - mn.x) < 1e-9 || (mx.y - mn.y) < 1e-9 {
+            self.wipeout_state = WipeoutState::WaitingFirstCorner;
+            self.fail_op("wipeout: degenerate rectangle (zero width or height)");
+            self.set_prompt("wipeout: pick first corner  [Esc exits]".to_string());
+            return;
+        }
+        let pts = vec![
+            Vec2::new(mn.x, mn.y),
+            Vec2::new(mx.x, mn.y),
+            Vec2::new(mx.x, mx.y),
+            Vec2::new(mn.x, mx.y),
+        ];
+        self.add_dobject_undoable(Geom::Wipeout(cad_kernel::Wipeout { pts }), "canvas");
+        self.history.push(format!(
+            "  + wipeout @ ({:.3},{:.3})..({:.3},{:.3})",
+            mn.x, mn.y, mx.x, mx.y));
+        self.wipeout_state = WipeoutState::Off;
+        self.clear_prompt();
+    }
+
     fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
         self.snapshot_doc();
         self.add_dobject(geom, origin);
@@ -48551,6 +48794,35 @@ impl CadApp {
         self.w2s(Vec2::new(u.from_metres(world_m.x), u.from_metres(world_m.y)), rect)
     }
 
+
+    /// The visible part of an infinite xline, clipped to the canvas's world
+    /// bounds (world-space segment). `None` when the line misses the view.
+    fn xline_visible_segment(&self, x: &cad_kernel::Xline, rect: egui::Rect)
+        -> Option<cad_kernel::Line>
+    {
+        let lo = self.s2w(rect.min, rect);
+        let hi = self.s2w(rect.max, rect);
+        let grow = 2.0 / (self.scale as f64).max(1e-9);
+        x.clip_to_rect(
+            Vec2::new(lo.x.min(hi.x), lo.y.min(hi.y)) - Vec2::new(grow, grow),
+            Vec2::new(lo.x.max(hi.x), lo.y.max(hi.y)) + Vec2::new(grow, grow),
+        )
+    }
+
+    /// The visible part of a forward ray, clipped to the canvas's world
+    /// bounds (world-space segment). `None` when the ray misses the view.
+    fn ray_visible_segment(&self, r: &cad_kernel::Ray, rect: egui::Rect)
+        -> Option<cad_kernel::Line>
+    {
+        let lo = self.s2w(rect.min, rect);
+        let hi = self.s2w(rect.max, rect);
+        let grow = 2.0 / (self.scale as f64).max(1e-9);
+        r.clip_to_rect(
+            Vec2::new(lo.x.min(hi.x), lo.y.min(hi.y)) - Vec2::new(grow, grow),
+            Vec2::new(lo.x.max(hi.x), lo.y.max(hi.y)) + Vec2::new(grow, grow),
+        )
+    }
+
     fn s2w(&self, s: egui::Pos2, rect: egui::Rect) -> Vec2 {
         let c = rect.center();
         Vec2::new(
@@ -50932,6 +51204,10 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Text(_)       => "Text",
         Geom::Dimension(_)  => "Dimension",
         Geom::BlockRef(_)   => "Block",
+        Geom::Xline(_)      => "Xline",
+        Geom::Ray(_)        => "Ray",
+        Geom::Donut(_)      => "Donut",
+        Geom::Wipeout(_)    => "Wipeout",
         _                   => "Entity",
     }
 }
@@ -54061,6 +54337,22 @@ impl eframe::App for CadApp {
             if self.area_state.is_some() {
                 self.area_state = None;
                 self.history.push("  area cancelled".into());
+            }
+            if self.xline_state != XlineState::Off {
+                self.xline_state = XlineState::Off;
+                self.history.push("  xline cancelled".into());
+            }
+            if self.ray_state != RayState::Off {
+                self.ray_state = RayState::Off;
+                self.history.push("  ray cancelled".into());
+            }
+            if self.donut_state != DonutState::Off {
+                self.donut_state = DonutState::Off;
+                self.history.push("  donut cancelled".into());
+            }
+            if self.wipeout_state != WipeoutState::Off {
+                self.wipeout_state = WipeoutState::Off;
+                self.history.push("  wipeout cancelled".into());
             }
             if self.layer_pick != LayerPickState::Off {
                 self.layer_pick = LayerPickState::Off;
@@ -58012,6 +58304,92 @@ impl eframe::App for CadApp {
                         // AREA — a click on a closed object measures it; an
                         // empty click starts/extends the point polygon.
                         self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if self.xline_state != XlineState::Off {
+                        // XLINE: base click → direction click; place-multiple.
+                        match self.xline_state.clone() {
+                            XlineState::WaitingForBase => {
+                                self.xline_state = XlineState::WaitingForDir { base: click_world };
+                                self.history.push(format!(
+                                    "    xline: BASE = ({:.3},{:.3}) — click DIRECTION point (or H/V/A)",
+                                    click_world.x, click_world.y));
+                                self.set_prompt(
+                                    "xline: click DIRECTION point  [H/V/A/Off  Esc exits]");
+                            }
+                            XlineState::WaitingForDir { base } => {
+                                let dir = click_world - base;
+                                if dir.len() < 1e-9 {
+                                    self.fail_op("xline: direction coincides with base");
+                                } else {
+                                    self.commit_xline(base, dir);
+                                }
+                            }
+                            XlineState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.ray_state != RayState::Off {
+                        // RAY: base click → direction click; place-multiple.
+                        match self.ray_state.clone() {
+                            RayState::WaitingForBase => {
+                                self.ray_state = RayState::WaitingForDir { base: click_world };
+                                self.history.push(format!(
+                                    "    ray: BASE = ({:.3},{:.3}) — click DIRECTION point (or H/V/A)",
+                                    click_world.x, click_world.y));
+                                self.set_prompt(
+                                    "ray: click DIRECTION point  [H/V/A  Esc exits]");
+                            }
+                            RayState::WaitingForDir { base } => {
+                                let d = click_world - base;
+                                if d.len() < 1e-9 {
+                                    self.fail_op("ray: direction point coincides with base");
+                                } else {
+                                    self.commit_ray(base, d);
+                                }
+                            }
+                            RayState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.donut_state != DonutState::Off {
+                        // DONUT: center → outer → inner; place-multiple.
+                        match self.donut_state.clone() {
+                            DonutState::WaitingCenter => {
+                                self.donut_state = DonutState::WaitingOuter { center: click_world };
+                                self.set_prompt(
+                                    "donut: click OUTER radius point  [Esc exits]");
+                            }
+                            DonutState::WaitingOuter { center } => {
+                                let r = click_world.dist(center);
+                                if r < 1e-9 {
+                                    self.fail_op("donut: outer radius is zero");
+                                } else {
+                                    self.donut_state = DonutState::WaitingInner {
+                                        center, outer_radius: r,
+                                    };
+                                    self.set_prompt(
+                                        "donut: click INNER radius point  [Esc exits]");
+                                }
+                            }
+                            DonutState::WaitingInner { center, outer_radius } => {
+                                self.commit_donut(center, outer_radius,
+                                    click_world.dist(center));
+                            }
+                            DonutState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.wipeout_state != WipeoutState::Off {
+                        // WIPEOUT: two opposite corners; single placement.
+                        match self.wipeout_state.clone() {
+                            WipeoutState::WaitingFirstCorner => {
+                                self.wipeout_state =
+                                    WipeoutState::WaitingSecondCorner { first: click_world };
+                                self.set_prompt(
+                                    "wipeout: pick opposite corner  [Esc exits]");
+                            }
+                            WipeoutState::WaitingSecondCorner { first } => {
+                                self.commit_wipeout(first, click_world);
+                            }
+                            WipeoutState::Off => unreachable!(),
+                        }
                         self.refocus_cmd = true;
                     } else if matches!(self.ptdist_state,
                         PtDistribState::DivideObject | PtDistribState::MeasureObject)
@@ -62639,6 +63017,50 @@ fn draw_dobject_thick(
     match g {
         Geom::Line(l) => {
             painter.line_segment([app.w2s(l.a, rect), app.w2s(l.b, rect)], stroke);
+        }
+        Geom::Xline(x) => {
+            // Infinite line — draw only the part inside the visible area.
+            if let Some(seg) = app.xline_visible_segment(x, rect) {
+                painter.line_segment(
+                    [app.w2s(seg.a, rect), app.w2s(seg.b, rect)], stroke);
+            }
+        }
+        Geom::Ray(r) => {
+            if let Some(seg) = app.ray_visible_segment(r, rect) {
+                painter.line_segment(
+                    [app.w2s(seg.a, rect), app.w2s(seg.b, rect)], stroke);
+            }
+        }
+        Geom::Donut(d) => {
+            // Filled ring: outer disc in the object colour, hole punched in
+            // the canvas background (CPU painter — same look as the hatch
+            // cache's hole over-draw).
+            let bg = egui::Color32::from_rgb(18, 22, 28);
+            let n = 48;
+            let ring = |r: f64, col: egui::Color32| {
+                let pts: Vec<egui::Pos2> = (0..=n).map(|i| {
+                    let t = std::f64::consts::TAU * (i as f64 / n as f64);
+                    app.w2s(d.center + Vec2::new(r * t.cos(), r * t.sin()), rect)
+                }).collect();
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: pts, closed: true, fill: col,
+                    stroke: egui::epaint::PathStroke::NONE,
+                }));
+            };
+            ring(d.outer_radius, stroke.color);
+            if d.inner_radius > 1e-9 { ring(d.inner_radius, bg); }
+        }
+        Geom::Wipeout(w) => {
+            // Mask: filled with the paper/canvas colour (AutoCAD wipeout).
+            let pts: Vec<egui::Pos2> = w.pts.iter()
+                .map(|p| app.w2s(*p, rect)).collect();
+            if pts.len() >= 3 {
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: pts, closed: true,
+                    fill: crate::theme::color::SURFACE_0,
+                    stroke: egui::epaint::PathStroke::NONE,
+                }));
+            }
         }
         Geom::Circle(c) => {
             let center = app.w2s(c.center, rect);
@@ -82978,5 +83400,55 @@ mod point_style_tests {
             assert_eq!(p.style, 35);
             assert_eq!(p.size, -5.0);
         } else { panic!("expected a Point"); }
+    }
+}
+
+#[cfg(test)]
+mod entity_flow_tests {
+    use super::*;
+
+    #[test]
+    fn xline_and_ray_commits_land_with_correct_geom() {
+        let mut app = CadApp::default();
+        app.run_command("xline");
+        assert!(app.xline_state != XlineState::Off);
+        app.commit_xline(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0));
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::Xline(x) = &last.geom {
+            assert!(x.dir.dist(Vec2::new(1.0, 0.0)) < 1e-9);
+        } else { panic!("expected Xline"); }
+        app.run_command("ray");
+        app.commit_ray(Vec2::new(2.0, 0.0), Vec2::new(0.0, 1.0));
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::Ray(r) = &last.geom {
+            assert!(r.dir.dist(Vec2::new(0.0, 1.0)) < 1e-9);
+        } else { panic!("expected Ray"); }
+    }
+
+    #[test]
+    fn donut_requires_inner_smaller_than_outer() {
+        let mut app = CadApp::default();
+        app.commit_donut(Vec2::ZERO, 5.0, 2.0);
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::Donut(d) = &last.geom {
+            assert_eq!(d.inner_radius, 2.0);
+            assert_eq!(d.outer_radius, 5.0);
+        } else { panic!("expected Donut"); }
+        let n = app.doc.dobjects.len();
+        // Invalid (inner >= outer) must fail without committing.
+        app.commit_donut(Vec2::ZERO, 5.0, 6.0);
+        assert_eq!(app.doc.dobjects.len(), n, "no dobject for an invalid donut");
+        assert!(app.donut_state != DonutState::Off, "flow re-arms");
+    }
+
+    #[test]
+    fn wipeout_commits_a_rect_and_resets_flow() {
+        let mut app = CadApp::default();
+        app.commit_wipeout(Vec2::new(1.0, 1.0), Vec2::new(5.0, 4.0));
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::Wipeout(w) = &last.geom {
+            assert_eq!(w.pts.len(), 4);
+        } else { panic!("expected Wipeout"); }
+        assert_eq!(app.wipeout_state, WipeoutState::Off);
     }
 }
