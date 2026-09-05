@@ -2885,6 +2885,7 @@ pub struct CadApp {
     area_state:     Option<AreaState>,
     // ---- XLINE / RAY / DONUT / WIPEOUT placement flows (tool = None) ----
     xline_state:    XlineState,
+    centermark_state: CenterMarkState,
     ray_state:      RayState,
     donut_state:    DonutState,
     wipeout_state:  WipeoutState,
@@ -4242,6 +4243,14 @@ fn list_drive_roots() -> Vec<std::path::PathBuf> {
 ///       click side / through-point → apply, back to WaitingForObject
 ///       Enter or Esc → Off
 /// `mode` carries either an explicit distance or "Through" semantics.
+/// CENTERMARK click flow: click a circle/arc (sizes the mark) or any
+/// point (default/override size). Place-multiple; Esc exits.
+#[derive(Clone, PartialEq, Debug)]
+pub enum CenterMarkState {
+    Off,
+    WaitingForClick { size_override: Option<f64> },
+}
+
 /// XLINE click flow: base point, then a direction point (or H/V/A/Off).
 #[derive(Clone, PartialEq, Debug)]
 pub enum XlineState {
@@ -5158,6 +5167,7 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             area_state:     None,
             xline_state:    XlineState::Off,
+            centermark_state: CenterMarkState::Off,
             ray_state:      RayState::Off,
             donut_state:    DonutState::Off,
             wipeout_state:  WipeoutState::Off,
@@ -10643,6 +10653,7 @@ impl CadApp {
         self.dist_state = DistState::Off;
         self.area_state = None;
         self.xline_state = XlineState::Off;
+        self.centermark_state = CenterMarkState::Off;
         self.ray_state = RayState::Off;
         self.donut_state = DonutState::Off;
         self.wipeout_state = WipeoutState::Off;
@@ -19875,6 +19886,21 @@ impl CadApp {
                     self.commit_overkill(Some(self.selection.clone()));
                 }
             }
+            Ok(Command::CenterMark(size_override)) => {
+                // Click-to-place: a circle/arc click sizes the mark to the
+                // entity; empty clicks use the typed override or the default.
+                self.tool = Tool::None;
+                self.centermark_state = CenterMarkState::WaitingForClick {
+                    size_override,
+                };
+                self.set_prompt(if size_override.is_some() {
+                    format!("centermark: click a circle/arc (or any point)  size={:.3}  [Esc cancels]",
+                        size_override.unwrap_or(0.0))
+                } else {
+                    "centermark: click a circle/arc — or any point for a default-size mark  [Esc cancels]"
+                        .to_string()
+                });
+            }
             Ok(Command::Xline) => {
                 self.tool = Tool::None;
                 self.xline_state = XlineState::WaitingForBase;
@@ -27120,6 +27146,57 @@ impl CadApp {
             mn.x, mn.y, mx.x, mx.y));
         self.wipeout_state = WipeoutState::Off;
         self.clear_prompt();
+    }
+
+
+    /// Commit one center mark at `pos`. Clicking a circle/arc sizes the
+    /// mark to ~18% of its radius; a typed size override wins; empty
+    /// clicks use 0.5 world units. Place-multiple.
+    fn commit_centermark_at(&mut self, pos: Vec2, size_override: Option<f64>) {
+        let tol = (self.env.PkBxSz.max(8) as f64) / (self.scale as f64).max(1e-6);
+        let hit = self.nearest_entity_under(pos, tol)
+            .and_then(|i| self.doc.dobjects.get(i))
+            .map(|d| d.geom.clone());
+        // A click ON a circle/arc's CENTRE (or anywhere inside it) should
+        // still size to that entity — the edge-distance pick above misses
+        // it (distance is measured to the rim). Sweep for a circle/arc
+        // whose CENTER is within tolerance of the click.
+        let hit = hit.or_else(|| {
+            self.doc.dobjects.iter().rev().find_map(|d| match &d.geom {
+                Geom::Circle(c) if (c.center - pos).len() <= tol.max(c.radius * 0.5) =>
+                    Some(Geom::Circle(*c)),
+                Geom::Arc(a) if (a.center - pos).len() <= tol.max(a.radius * 0.5) =>
+                    Some(Geom::Arc(*a)),
+                Geom::Ellipse(e) if (e.center - pos).len() <= tol.max(e.semi_major() * 0.5) =>
+                    Some(Geom::Ellipse(*e)),
+                Geom::EllipseArc(ea) if (ea.ellipse.center - pos).len()
+                    <= tol.max(ea.ellipse.semi_major() * 0.5) =>
+                    Some(Geom::EllipseArc(*ea)),
+                _ => None,
+            })
+        });
+        let size = match size_override {
+            Some(s) => s.max(1e-6),
+            None => match hit {
+                Some(Geom::Circle(c)) => (c.radius * 0.18).max(1e-3),
+                Some(Geom::Arc(a)) => (a.radius * 0.18).max(1e-3),
+                Some(Geom::Ellipse(e)) => (e.semi_major() * 0.18).max(1e-3),
+                Some(Geom::EllipseArc(ea)) => (ea.ellipse.semi_major() * 0.18).max(1e-3),
+                _ => 0.5,   // default world size for an empty click
+            },
+        };
+        self.add_dobject_undoable(
+            Geom::CenterMark(cad_kernel::CenterMark {
+                center: pos,
+                size,
+                rotation: 0.0,
+            }),
+            "canvas");
+        self.history.push(format!(
+            "  + centermark @ ({:.3},{:.3}) size={:.3}",
+            pos.x, pos.y, size));
+        self.set_prompt(
+            "centermark: click another circle/arc or point  [Esc exits]".to_string());
     }
 
     fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
@@ -51208,6 +51285,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Ray(_)        => "Ray",
         Geom::Donut(_)      => "Donut",
         Geom::Wipeout(_)    => "Wipeout",
+        Geom::CenterMark(_) => "CenterMark",
         _                   => "Entity",
     }
 }
@@ -54341,6 +54419,10 @@ impl eframe::App for CadApp {
             if self.xline_state != XlineState::Off {
                 self.xline_state = XlineState::Off;
                 self.history.push("  xline cancelled".into());
+            }
+            if self.centermark_state != CenterMarkState::Off {
+                self.centermark_state = CenterMarkState::Off;
+                self.history.push("  centermark cancelled".into());
             }
             if self.ray_state != RayState::Off {
                 self.ray_state = RayState::Off;
@@ -58304,6 +58386,12 @@ impl eframe::App for CadApp {
                         // AREA — a click on a closed object measures it; an
                         // empty click starts/extends the point polygon.
                         self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if let CenterMarkState::WaitingForClick { size_override } =
+                        self.centermark_state.clone()
+                    {
+                        // CENTERMARK: this click places the mark (place-multiple).
+                        self.commit_centermark_at(click_world, size_override);
                         self.refocus_cmd = true;
                     } else if self.xline_state != XlineState::Off {
                         // XLINE: base click → direction click; place-multiple.
@@ -63049,6 +63137,17 @@ fn draw_dobject_thick(
             };
             ring(d.outer_radius, stroke.color);
             if d.inner_radius > 1e-9 { ring(d.inner_radius, bg); }
+        }
+        Geom::CenterMark(cm) => {
+            // Crosshair mark: two crossing lines of length `size` through
+            // the centre, rotated by `rotation`.
+            let c = app.w2s(cm.center, rect);
+            let half = (cm.size as f32 * 0.5) * app.scale;
+            let (sin, cos) = (cm.rotation as f32).sin_cos();
+            let d = egui::vec2(cos * half, sin * half);
+            let n = egui::vec2(-sin * half, cos * half);
+            painter.line_segment([c - d, c + d], stroke);
+            painter.line_segment([c - n, c + n], stroke);
         }
         Geom::Wipeout(w) => {
             // Mask: filled with the paper/canvas colour (AutoCAD wipeout).
@@ -83450,5 +83549,31 @@ mod entity_flow_tests {
             assert_eq!(w.pts.len(), 4);
         } else { panic!("expected Wipeout"); }
         assert_eq!(app.wipeout_state, WipeoutState::Off);
+    }
+}
+
+#[cfg(test)]
+mod centermark_tests {
+    use super::*;
+
+    #[test]
+    fn centermark_commits_with_sized_mark() {
+        let mut app = CadApp::default();
+        // Place a circle so the click near its centre sizes the mark.
+        app.doc.push(DObject::new(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::new(10.0, 10.0), radius: 4.0 })));
+        app.commit_centermark_at(Vec2::new(10.0, 10.0), None);
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::CenterMark(cm) = &last.geom {
+            assert!((cm.size - 4.0 * 0.18).abs() < 1e-6,
+                "mark sized from the circle radius: {}", cm.size);
+            assert!(cm.center.dist(Vec2::new(10.0, 10.0)) < 1e-9);
+        } else { panic!("expected CenterMark"); }
+        // Size override wins.
+        app.commit_centermark_at(Vec2::new(30.0, 30.0), Some(2.5));
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::CenterMark(cm) = &last.geom {
+            assert!((cm.size - 2.5).abs() < 1e-6);
+        } else { panic!("expected CenterMark"); }
     }
 }
