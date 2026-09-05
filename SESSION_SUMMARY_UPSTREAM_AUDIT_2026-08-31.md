@@ -167,7 +167,29 @@ or need draw-pipeline arms, so they were left for interactive sessions.
   columns). Kernel/parser surfaces for Array/Xref/AttDef/AttEdit already
   exist in the fork.
 
-## 2026-09-05 (late) — backlog batch 5 (this machine, fe736d3..ef06e50)
+## 2026-09-05 (end) — backlog batch 6 (this machine): ATTDEF/ATTEDIT + layout Plot — CODE BACKLOG COMPLETE
+
+- `ad37765` — ATTDEF (atd): tag → prompt → default → position state
+  machine fed by bare command lines (Esc cancels, click or typed x,y
+  commits the AttrDef, repeats) + ATTEDIT (ate): pick a block instance
+  whose definition carries AttrDefs → Edit Attributes panel (values
+  prefilled from defaults) → Apply writes BlockRef.attr_values
+  (parallel-by-index, one undo). 3 tests.
+- `f37e154` — per-layout Plot dialog: Plot on a layout tab now renders the
+  1:1 paper dialog (layout paper + viewport count + CTB picker that sets
+  the active layout's CTB + format), and the plot pipeline targets the
+  ACTIVE LAYOUT via `PlotConfig::plot_layout_index` (was hardcoded None);
+  window-area never demanded for layout plots. 2 tests.
+- Full app suite: 1487 passed / 10 pre-existing failures (fbx-texture
+  assets + factory wall-env) / 50 ignored. Kernel 419/419; pytest
+  1473/1473.
+- The code backlog from the upstream audit is now COMPLETE (all features
+  ported across batches 1–6). The only remaining upstream items are the
+  two architecture DECISIONS (not pure ports): the hover/designate hatch
+  preview flow (the fork deliberately uses click→bake) and rail-card dock
+  columns (the fork's dock is an any-edge superset).
+
+---
 
 - `cd68217` — polar + path ARRAY methods (dialog Linear/Polar/Path
   toggle; polar count/fill°/rotate-items + centre X/Y or click-pick; path
