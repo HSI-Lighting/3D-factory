@@ -2885,6 +2885,7 @@ pub struct CadApp {
     area_state:     Option<AreaState>,
     // ---- XLINE / RAY / DONUT / WIPEOUT placement flows (tool = None) ----
     xline_state:    XlineState,
+    boundary_state: BoundaryState,
     centermark_state: CenterMarkState,
     ray_state:      RayState,
     donut_state:    DonutState,
@@ -3672,6 +3673,9 @@ pub enum QueuedOp {
     /// Block dialog. On Enter the finalised selection is kept and the
     /// (stashed) dialog re-opens so they can finish defining the block.
     BlockReopen,
+    /// Region — applied on Enter: closed curves in the finalised selection
+    /// are converted to Region dobjects (one undo entry).
+    Region,
     /// Stretch — the selection session (crossing window; Shift excludes)
     /// picks the objects; on Enter we capture the crossing box and proceed
     /// to the base / second-point clicks.
@@ -4243,6 +4247,15 @@ fn list_drive_roots() -> Vec<std::path::PathBuf> {
 ///       click side / through-point → apply, back to WaitingForObject
 ///       Enter or Esc → Off
 /// `mode` carries either an explicit distance or "Through" semantics.
+/// BOUNDARY/BPOLY click flow: click INSIDE a closed region; the hatch
+/// tracer emits its boundary (outer loop + islands) as closed polylines.
+/// Loops until Esc.
+#[derive(Clone, PartialEq, Debug)]
+pub enum BoundaryState {
+    Off,
+    WaitingForPick,
+}
+
 /// CENTERMARK click flow: click a circle/arc (sizes the mark) or any
 /// point (default/override size). Place-multiple; Esc exits.
 #[derive(Clone, PartialEq, Debug)]
@@ -5167,6 +5180,7 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             area_state:     None,
             xline_state:    XlineState::Off,
+            boundary_state: BoundaryState::Off,
             centermark_state: CenterMarkState::Off,
             ray_state:      RayState::Off,
             donut_state:    DonutState::Off,
@@ -10653,6 +10667,7 @@ impl CadApp {
         self.dist_state = DistState::Off;
         self.area_state = None;
         self.xline_state = XlineState::Off;
+        self.boundary_state = BoundaryState::Off;
         self.centermark_state = CenterMarkState::Off;
         self.ray_state = RayState::Off;
         self.donut_state = DonutState::Off;
@@ -19205,6 +19220,24 @@ impl CadApp {
                     "dim: click first point (or click a circle/arc for radius/diameter)  [Esc cancels]"
                     .to_string());
             }
+            Ok(Command::Boundary) => {
+                self.tool = Tool::None;
+                self.boundary_state = BoundaryState::WaitingForPick;
+                self.set_prompt(
+                    "boundary: click INSIDE a closed region  [Esc exits]".to_string());
+            }
+            Ok(Command::Region) => {
+                self.tool = Tool::None;
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Region;
+                    self.set_prompt(
+                        "region: select closed curves  [Enter=convert  Esc=cancel]"
+                            .to_string());
+                } else {
+                    self.apply_region();
+                }
+            }
             Ok(Command::QDim) => self.apply_qdim(),
             Ok(Command::QSelect) => {
                 self.tool = Tool::None;
@@ -20481,6 +20514,10 @@ impl CadApp {
             QueuedOp::Erase => {
                 // Replay the same path Command::DeleteSelected uses.
                 self.run_command("erase");
+            }
+            QueuedOp::Region => {
+                self.apply_region();
+                self.clear_prompt();
             }
             QueuedOp::Overkill => {
                 // Empty selection (Enter with nothing picked) → whole drawing.
@@ -27197,6 +27234,85 @@ impl CadApp {
             pos.x, pos.y, size));
         self.set_prompt(
             "centermark: click another circle/arc or point  [Esc exits]".to_string());
+    }
+
+
+    /// REGION — convert every closed curve in the selection into a Region
+    /// dobject (same fill loop; one undo entry for the batch).
+    fn apply_region(&mut self) {
+        let mut converted = 0usize;
+        let mut skipped = 0usize;
+        let decisions: Vec<(usize, Vec<Vec2>)> = self.selection.iter().filter_map(|&idx| {
+            let d = self.doc.dobjects.get(idx)?;
+            let loop_pts = closed_dobject_polygon(&d.geom);
+            if loop_pts.len() < 3 { skipped += 1; None } else { Some((idx, loop_pts)) }
+        }).collect();
+        if decisions.is_empty() {
+            self.fail_op("region: no closed curve in selection (circle/ellipse/closed polyline/closed spline)");
+            return;
+        }
+        self.snapshot_doc();
+        for (idx, loop_pts) in decisions {
+            if let Some(d) = self.doc.dobjects.get_mut(idx) {
+                d.geom = Geom::Region(cad_kernel::Region { loop_pts });
+                converted += 1;
+            }
+        }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!(
+            "  \u{229B} region: converted {converted} closed curve(s){}",
+            if skipped > 0 { format!(" ({skipped} skipped — not closed)") } else { String::new() }));
+    }
+
+    /// BOUNDARY/BPOLY — trace the closed region under `seed` (the SAME
+    /// algorithm as hatch pick-point: tessellate → split → cluster →
+    /// adjacency → ray-cast → walk) and emit the outer loop + islands as
+    /// closed Polyline dobjects. Stays armed for more picks; Esc exits.
+    /// A click outside any region fails visibly.
+    fn commit_boundary_at(&mut self, seed: Vec2) {
+        let scope: Vec<usize> = (0..self.doc.dobjects.len()).collect();
+        let text = self.text_hatch_geom(&scope);
+        let Some(tb) = crate::hatch_trace::trace_boundary_at(&self.doc, seed, &text) else {
+            self.history.push(format!(
+                "  ! boundary: no closed region under ({:.3},{:.3})",
+                seed.x, seed.y));
+            self.set_prompt(
+                "boundary: click INSIDE a closed region  [Esc exits]".to_string());
+            return;
+        };
+        let mut loops: Vec<Vec<Vec2>> = Vec::new();
+        loops.push(tb.outer);
+        loops.extend(tb.islands);
+        // One undo entry for the whole click.
+        self.snapshot_doc();
+        let mut made = 0usize;
+        for lp in loops {
+            if lp.len() < 4 { continue; }   // needs ≥3 real vertices
+            let mut pts: Vec<Vec2> = lp;
+            if (pts[0] - pts[pts.len() - 1]).len() < 1e-6 {
+                pts.pop();                  // drop the closing repeat
+            }
+            if pts.len() < 3 { continue; }
+            let pl = Geom::Polyline(Polyline {
+                vertices: pts.iter().map(|p| PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                closed: true,
+                widths: Vec::new(),
+            });
+            self.add_dobject(pl, "boundary");
+            made += 1;
+        }
+        if made == 0 {
+            self.rollback_doc();
+            self.history.push(
+                "  ! boundary: traced region had no usable loops".into());
+            return;
+        }
+        self.history.push(format!(
+            "  \u{2194} boundary: {made} closed loop(s) traced"));
+        self.set_prompt(
+            "boundary: click INSIDE another closed region  [Esc exits]".to_string());
     }
 
     fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
@@ -51286,6 +51402,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Donut(_)      => "Donut",
         Geom::Wipeout(_)    => "Wipeout",
         Geom::CenterMark(_) => "CenterMark",
+        Geom::Region(_)     => "Region",
         _                   => "Entity",
     }
 }
@@ -54423,6 +54540,10 @@ impl eframe::App for CadApp {
             if self.centermark_state != CenterMarkState::Off {
                 self.centermark_state = CenterMarkState::Off;
                 self.history.push("  centermark cancelled".into());
+            }
+            if self.boundary_state != BoundaryState::Off {
+                self.boundary_state = BoundaryState::Off;
+                self.history.push("  boundary cancelled".into());
             }
             if self.ray_state != RayState::Off {
                 self.ray_state = RayState::Off;
@@ -58386,6 +58507,10 @@ impl eframe::App for CadApp {
                         // AREA — a click on a closed object measures it; an
                         // empty click starts/extends the point polygon.
                         self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if self.boundary_state == BoundaryState::WaitingForPick {
+                        // BOUNDARY — click INSIDE a closed region (place-multiple).
+                        self.commit_boundary_at(click_world);
                         self.refocus_cmd = true;
                     } else if let CenterMarkState::WaitingForClick { size_override } =
                         self.centermark_state.clone()
@@ -63137,6 +63262,17 @@ fn draw_dobject_thick(
             };
             ring(d.outer_radius, stroke.color);
             if d.inner_radius > 1e-9 { ring(d.inner_radius, bg); }
+        }
+        Geom::Region(rg) => {
+            // Filled region — solid fill in the object colour.
+            let pts: Vec<egui::Pos2> = rg.loop_pts.iter()
+                .map(|p| app.w2s(*p, rect)).collect();
+            if pts.len() >= 3 {
+                painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                    points: pts, closed: true, fill: stroke.color,
+                    stroke: egui::epaint::PathStroke::NONE,
+                }));
+            }
         }
         Geom::CenterMark(cm) => {
             // Crosshair mark: two crossing lines of length `size` through
@@ -83575,5 +83711,55 @@ mod centermark_tests {
         if let Geom::CenterMark(cm) = &last.geom {
             assert!((cm.size - 2.5).abs() < 1e-6);
         } else { panic!("expected CenterMark"); }
+    }
+}
+
+#[cfg(test)]
+mod region_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn region_converts_closed_selection_curves() {
+        let mut app = CadApp::default();
+        let sq = app.doc.push(DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),   bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0),  bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        })));
+        let line = app.doc.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(20.0, 20.0), b: Vec2::new(40.0, 20.0) })));
+        app.selection = vec![sq, line];
+        app.apply_region();
+        assert!(matches!(app.doc.dobjects[sq].geom, Geom::Region(_)),
+            "closed curve became a Region");
+        assert!(matches!(app.doc.dobjects[line].geom, Geom::Line(_)),
+            "open line untouched");
+    }
+
+    #[test]
+    fn boundary_traces_a_closed_square() {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        app.doc.push(DObject::new(Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0),   bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, 0.0),  bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(20.0, 20.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 20.0),  bulge: 0.0 },
+            ],
+            closed: true, widths: Vec::new(),
+        })));
+        let before = app.doc.dobjects.len();
+        app.commit_boundary_at(Vec2::new(10.0, 10.0));   // inside
+        assert!(app.doc.dobjects.len() > before,
+            "a boundary polyline was emitted");
+        let added = &app.doc.dobjects[before..];
+        assert!(added.iter().any(|d| matches!(&d.geom,
+                Geom::Polyline(p) if p.closed && p.vertices.len() == 4)),
+            "closed 4-vertex polyline traced");
     }
 }
