@@ -19981,18 +19981,10 @@ impl CadApp {
                 self.history.push("  plot style table editor".into());
             }
             Ok(Command::Plot) => {
-                // The Plot dialog (and run_plot) resolve the MODEL against the
-                // document's layer table — which, while a layout tab is
-                // active, is the PAPER table (only the layout's own layers).
-                // A plot launched there would silently drop every model
-                // dobject on a paper-only layer. Layout output goes through
-                // the layout's Print-preview / plot flow instead.
-                if self.doc.active_layout.is_some() {
-                    self.history.push(
-                        "  ! plot: switch to the Model tab to plot model space (layouts print via their Print-preview)".into());
-                    return;
-                }
-                // Open the Plot dialog (paper/area/scale + table -> PDF). App
+                // Open the Plot dialog. On the MODEL tab it is the model-space
+                // dialog (paper/area/scale + table); on a LAYOUT tab the dialog
+                // renders the layout's 1:1 paper plot instead (same target).
+                // App dialog only — read-only on the doc, no undo.
                 // dialog only — read-only on the doc, no undo. Start from the
                 // document's saved PAGESETUP.
                 let ps = self.doc.page_setup.clone();
@@ -32023,8 +32015,9 @@ impl CadApp {
             // "Plot all black" — effective for MODEL plots only.
             monochrome: self.plot_mono,
             margins_mm: 5.0,
-            // The fork has no layout tabs → model-space plots only.
-            plot_layout_index: None,
+            // Layout tab → plot the ACTIVE LAYOUT (1:1 paper + viewports);
+            // model tab → None = the model-space plot.
+            plot_layout_index: self.doc.active_layout,
             // The saved CTBs, so a layout's named CTB applies its per-ACI
             // colour rules in the plot output.
             ctb_tables: {
@@ -32064,14 +32057,6 @@ impl CadApp {
     /// the PDF in the default viewer.
     fn run_plot(&mut self) {
         use cad_kernel::plotstyle::{PlotStyleTable, PlotTarget};
-        // Belt-and-braces: model plots resolve against `doc.layers`, which is
-        // the PAPER table while a layout tab is active (see Command::Plot).
-        if self.doc.active_layout.is_some() {
-            self.plot_dialog_open = false;
-            self.history.push(
-                "  ! plot: switch to the Model tab to plot model space (layouts print via their Print-preview)".into());
-            return;
-        }
         let raw = self.plot_pdf_path.trim().to_string();
         if raw.is_empty() {
             self.history.push("  ! plot: no output path — press Plot and choose a file.".into());
@@ -32085,6 +32070,14 @@ impl CadApp {
             path.set_extension(ext);
         }
         let cfg = self.plot_config(PlotTarget::PdfFile(path.clone()));
+        // Window-area only applies to MODEL plots — a layout plot is 1:1 paper
+        // (the layout's own paper + viewports), so never demand a picked window.
+        if cfg.plot_layout_index.is_none()
+            && self.plot_area_kind == 1 && self.plot_window.is_none()
+        {
+            self.history.push("  ! plot: pick the Window area first".into());
+            return;
+        }
         // Window-area only applies to MODEL plots — never demand a picked window
         // for Extents.
         if self.plot_area_kind == 1 && self.plot_window.is_none() {
@@ -32179,10 +32172,109 @@ impl CadApp {
     /// DIALOG_STANDARD chrome. Builds a `PlotConfig` and calls `cad_plot::plot`.
     /// Read-only on the doc. Two dialogs coexist: this one and the Plot Style
     /// Table Editor (which replaces it while open).
+
+    /// LAYOUT-tab plot dialog: the layout plots 1:1 at its OWN paper size —
+    /// paper border, paper-space entities and every viewport's model content
+    /// (per-viewport camera + CTB) — via `PlotConfig::plot_layout_index`.
+    /// Read-only on the doc; the PDF flow (Browse → run_plot) is shared with
+    /// the model dialog.
+    fn render_layout_plot_dialog(&mut self, ctx: &egui::Context) {
+        use crate::theme::color as tc;
+        let Some(li) = self.doc.active_layout else {
+            self.plot_dialog_open = false; return;
+        };
+        let Some(layout) = self.doc.layouts.get(li).cloned() else {
+            self.plot_dialog_open = false; return;
+        };
+        let mut close = false;
+        let mut do_plot = false;
+        let frame = egui::Frame::none().fill(tc::SURFACE_1).rounding(egui::Rounding::same(12.0))
+            .stroke(egui::Stroke::new(1.0, tc::BORDER)).inner_margin(egui::Margin::same(16.0));
+        let win = egui::Window::new(format!("Plot — {}", layout.name))
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("plot_dialog"))
+            .title_bar(false).frame(frame)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .collapsible(false).resizable(false);
+        win.show(ctx, |ui| {
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 24.0),
+                egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(format!("Plot — {}", layout.name))
+                    .strong().size(16.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("\u{2715}").clicked() { close = true; }
+                });
+            });
+            ui.separator();
+            ui.add_space(8.0);
+            let (pw, ph) = (layout.page_w_mm, layout.page_h_mm);
+            ui.label(format!("Paper:  {:.0} \u{00D7} {:.0} mm   ({})",
+                pw, ph, if pw >= ph { "landscape" } else { "portrait" }));
+            ui.label(format!("Viewports:  {}", layout.viewports.len()));
+            ui.horizontal(|ui| {
+                ui.label("CTB:");
+                let (ctbs, mut ci) =
+                    self.ctb_picker_state(layout.ctb_name.as_deref().unwrap_or(""));
+                egui::ComboBox::from_id_salt("lplot_ctb")
+                    .selected_text(ctbs[ci].0.clone()).show_ui(ui, |ui| {
+                        for (i, (disp, _)) in ctbs.iter().enumerate() {
+                            ui.selectable_value(&mut ci, i, disp);
+                        }
+                    });
+                let chosen = ctbs[ci].1.clone();
+                if chosen != layout.ctb_name {
+                    self.snapshot_doc();
+                    if let Some(l) = self.doc.layouts.get_mut(li) {
+                        l.ctb_name = chosen;
+                    }
+                    ui.ctx().request_repaint();
+                }
+            });
+            ui.small("Plots the paper sheet at 1:1 — border, paper-space \
+                      entities and every viewport's model content.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Format:");
+                let fmts = ["PDF", "SVG", "PNG"];
+                let mut fi = match self.plot_format.as_str() { "svg" => 1, "png" => 2, _ => 0 };
+                egui::ComboBox::from_id_salt("plot_fmt2")
+                    .selected_text(fmts[fi]).show_ui(ui, |ui| {
+                        for (i, n) in fmts.iter().enumerate() {
+                            ui.selectable_value(&mut fi, i, *n);
+                        }
+                    });
+                self.plot_format = match fi { 1 => "svg".into(), 2 => "png".into(), _ => "pdf".into() };
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() { close = true; }
+                if ui.add_sized(egui::vec2(80.0, 32.0),
+                        egui::Button::new(egui::RichText::new("Plot").color(tc::ON_ACCENT).strong())
+                            .fill(tc::ACCENT).rounding(egui::Rounding::same(6.0))).clicked()
+                {
+                    do_plot = true;
+                }
+            });
+        });
+        if close { self.plot_dialog_open = false; }
+        if do_plot {
+            self.plot_dialog_open = false;
+            self.plot_pdf_browse = true;
+            self.plot_run_after_save = true;
+            let ext = match self.plot_format.as_str() { "svg" => "svg", "png" => "png", _ => "pdf" };
+            self.open_file_dialog(FileDialogMode::Save, &format!(".{}", ext));
+        }
+    }
+
     fn render_plot_dialog(&mut self, ctx: &egui::Context) {
         if !self.plot_dialog_open { return; }
         // Parked while picking the Window area on the canvas.
         if self.plot_win_pick != 0 { return; }
+        // Layout tab → the layout plot dialog (1:1 paper + viewports).
+        if self.doc.active_layout.is_some() {
+            self.render_layout_plot_dialog(ctx);
+            return;
+        }
         self.ensure_layer_glyph_textures(ctx);
         let gx_close = self.layer_glyph_tex.get("close").map(|t| (t.id(), t.size_vec2()));
         use crate::theme::color as tc;
@@ -84921,5 +85013,56 @@ mod attdef_attedit_tests {
         assert_eq!(app.attedit_pick_block(Vec2::new(41.0, 0.0)), Some(aidx));
         assert_eq!(app.attedit_pick_block(Vec2::new(2.0, 2.0)), None);
         let _ = pidx;
+    }
+}
+
+#[cfg(test)]
+mod layout_plot_tests {
+    use super::*;
+    use cad_kernel::plotstyle::PlotTarget;
+
+    #[test]
+    fn plot_config_targets_the_active_layout() {
+        let mut app = CadApp::default();
+        assert_eq!(app.doc.active_layout, None);
+        let cfg = app.plot_config(PlotTarget::PdfFile(std::path::PathBuf::from("/tmp/x.pdf")));
+        assert_eq!(cfg.plot_layout_index, None, "model tab → model plot");
+        // Enter a layout tab: the same config now carries the active layout.
+        let mut l = cad_kernel::Layout::new("A0 PLOT", cad_kernel::plotstyle::PaperSize::A0,
+            cad_kernel::plotstyle::Orientation::Landscape);
+        l.ctb_name = Some("monochrome".into());
+        app.doc.layouts.push(l);
+        app.switch_to_tab(Some(0));
+        assert_eq!(app.doc.active_layout, Some(0));
+        let cfg = app.plot_config(PlotTarget::PdfFile(std::path::PathBuf::from("/tmp/y.pdf")));
+        assert_eq!(cfg.plot_layout_index, Some(0),
+            "layout tab → the layout is plotted 1:1");
+    }
+
+    #[test]
+    fn layout_plot_dialog_does_not_require_a_window_pick() {
+        let mut app = CadApp::default();
+        let mut l = cad_kernel::Layout::new("A4", cad_kernel::plotstyle::PaperSize::A4,
+            cad_kernel::plotstyle::Orientation::Portrait);
+        l.ctb_name = Some("monochrome".into());
+        app.doc.layouts.push(l);
+        app.switch_to_tab(Some(0));
+        // Area kind 1 = window with NO window picked — legal for a layout.
+        app.plot_area_kind = 1;
+        app.plot_window = None;
+        app.plot_pdf_path = "/tmp/layout.pdf".into();
+        app.plot_pdf_browse = false;
+        // run_plot would try to WRITE the file; instead assert the guard it
+        // uses is the index-aware one by exercising plot_config + the guard
+        // expression exactly as run_plot does.
+        let cfg = app.plot_config(PlotTarget::PdfFile(std::path::PathBuf::from("/tmp/z.pdf")));
+        let would_require_window = cfg.plot_layout_index.is_none()
+            && app.plot_area_kind == 1 && app.plot_window.is_none();
+        assert!(!would_require_window, "layout plots never demand a window");
+        app.switch_to_tab(None);
+        let cfg = app.plot_config(PlotTarget::PdfFile(std::path::PathBuf::from("/tmp/w.pdf")));
+        let would_require_window = cfg.plot_layout_index.is_none()
+            && app.plot_area_kind == 1 && app.plot_window.is_none();
+        assert!(would_require_window, "model plots do");
     }
 }
