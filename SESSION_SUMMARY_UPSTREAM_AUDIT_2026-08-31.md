@@ -167,7 +167,58 @@ or need draw-pipeline arms, so they were left for interactive sessions.
   columns). Kernel/parser surfaces for Array/Xref/AttDef/AttEdit already
   exist in the fork.
 
-## 2026-09-05 (end) — backlog batch 6 (this machine): ATTDEF/ATTEDIT + layout Plot — CODE BACKLOG COMPLETE
+## 2026-09-05 (late) — architecture decisions + execution plan
+
+Owner decisions (2026-09-05):
+1. HATCH: adopt the upstream designate flow (hover preview → designate
+   region(s) → boundary set → Apply commits one multi-loop hatch),
+   replacing the fork's click→bake flow.
+2. RAIL UX: port upstream dock_card / dock_column rail overflow cards.
+
+### Hatch designate adoption — phased plan (fork-native, kernel untouched)
+
+Phase 1 — candidate preview without baking:
+- Add `hatch_candidate: Option<HatchCandidate>` (loops, pattern, layer,
+  scope) + `hatch_designated: Vec<HatchCandidate>` + hover throttle
+  state (`hatch_hover_at: f64`, `hatch_hover_pt: Vec2`).
+- Hover (hatch_pick_point_armed, pointer moved > ~8 px since last trace,
+  no worker pending): spawn_hatch_worker_scoped(seed, view_scope) →
+  poll_hatch_worker result now STORES the loops into `hatch_candidate`
+  instead of baking (remove the bake path from the success arm).
+- Paint the candidate ghost (render_hatch_solid + pattern hatch on the
+  canvas at the existing hatch draw hook) with the pending pattern.
+Phase 2 — designate + boundary set:
+- Canvas click while armed: designate `hatch_candidate` (find the source
+  idx + islands via the existing cheap path when the worker hasn't
+  resolved; AutoCAD: click inside) → append to `hatch_designated`,
+  log count, stay armed.
+- Hatch dialog panel: "(N) boundary/boundaries — Apply / Clear" rows;
+  also an undo-tick before Apply's single commit.
+- Apply (dialog/panel or Enter): snapshot once → for each designated
+  candidate materialise its aux boundary (materialise_hatch_boundary) →
+  push ONE hatch referencing every aux handle → clear set → log.
+  Keep the existing confirm-panel Accept/Discard only as a pattern
+  change step; remove auto-confirm from the bake path.
+Phase 3 — tests + legacy trim:
+- Rework pick-point flow tests to designate→apply; bake-mode tests that
+  exercise `apply_pick_point_hatch`/worker bake switch to the new
+  candidate API; keep selection→apply_hatch unchanged. Add hover tests
+  (trace w/o bake) + multi-region single-hatch test (2 aux loops, 1
+  hatch). Full suite + pytest green, then commit.
+
+### Card columns — planned phases (Phase 4)
+- Map upstream dock.rs dock_card/dock_column (555-618) onto the fork's
+  any-edge dock as an additional dock style (NOT a replacement); port
+  the render host + hover-open/close delay, then re-parent rail-group
+  overflow rows (currently FlyMenu-based) onto cards group-by-group,
+  keeping FlyAct dispatch. Verify each rail group.
+
+Backlog code features: COMPLETE (batches 1–6). Kernel 419/419; app
+1487 passed / 10 pre-existing (fbx assets + wall env); pytest 1473/1473.
+
+---
+
+## 2026-09-05 (end) — backlog batch 6: ATTDEF/ATTEDIT + layout Plot (CODE BACKLOG COMPLETE)
 
 - `ad37765` — ATTDEF (atd): tag → prompt → default → position state
   machine fed by bare command lines (Esc cancels, click or typed x,y
