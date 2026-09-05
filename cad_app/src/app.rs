@@ -2896,6 +2896,15 @@ pub struct CadApp {
     /// add/subtract; Enter folds the polygon in; Esc exits). Pure
     /// inspection — never mutates the doc.
     area_state:     Option<AreaState>,
+    /// Pending XREF attach — awaiting the insertion-point click.
+    xref_pending: Option<cad_kernel::Xref>,
+    /// WBLOCK: the sub-document (selection / whole drawing) to write when
+    /// the Save dialog confirms. See `save_dialog_purpose`.
+    wblock_subdoc: Option<cad_kernel::Document>,
+    /// What the current Save-mode file dialog is for: 0 = normal Save As /
+    /// quick export, 1 = WBLOCK (so a cancelled wblock dialog can never
+    /// hijack a later Save As).
+    save_dialog_purpose: u8,
     // ---- XLINE / RAY / DONUT / WIPEOUT placement flows (tool = None) ----
     xline_state:    XlineState,
     boundary_state: BoundaryState,
@@ -3689,6 +3698,9 @@ pub enum QueuedOp {
     /// Region — applied on Enter: closed curves in the finalised selection
     /// are converted to Region dobjects (one undo entry).
     Region,
+    /// WBlock — applied on Enter: the finalised selection (or the whole
+    /// drawing when empty) is written to its own file.
+    WBlock,
     /// Stretch — the selection session (crossing window; Shift excludes)
     /// picks the objects; on Enter we capture the crossing box and proceed
     /// to the base / second-point clicks.
@@ -5204,6 +5216,9 @@ impl Default for CadApp {
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             area_state:     None,
+            xref_pending:   None,
+            wblock_subdoc:  None,
+            save_dialog_purpose: 0,
             xline_state:    XlineState::Off,
             boundary_state: BoundaryState::Off,
             centermark_state: CenterMarkState::Off,
@@ -10693,6 +10708,7 @@ impl CadApp {
         self.area_state = None;
         self.xline_state = XlineState::Off;
         self.boundary_state = BoundaryState::Off;
+        self.xref_pending = None;
         self.centermark_state = CenterMarkState::Off;
         self.ray_state = RayState::Off;
         self.donut_state = DonutState::Off;
@@ -19959,6 +19975,21 @@ impl CadApp {
                         .to_string()
                 });
             }
+            Ok(Command::WBlock) => {
+                self.tool = Tool::None;
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::WBlock;
+                    self.set_prompt(
+                        "wblock: select dobjects  (Enter = whole drawing)".to_string());
+                } else {
+                    self.apply_wblock();
+                }
+            }
+            Ok(Command::Xref(args)) => {
+                self.tool = Tool::None;
+                self.apply_xref(&args);
+            }
             Ok(Command::Xline) => {
                 self.tool = Tool::None;
                 self.xline_state = XlineState::WaitingForBase;
@@ -20543,6 +20574,10 @@ impl CadApp {
             QueuedOp::Region => {
                 self.apply_region();
                 self.clear_prompt();
+            }
+            QueuedOp::WBlock => {
+                // Empty selection + Enter → whole drawing (AutoCAD WBLOCK).
+                self.apply_wblock();
             }
             QueuedOp::Overkill => {
                 // Empty selection (Enter with nothing picked) → whole drawing.
@@ -27338,6 +27373,207 @@ impl CadApp {
             "  \u{2194} boundary: {made} closed loop(s) traced"));
         self.set_prompt(
             "boundary: click INSIDE another closed region  [Esc exits]".to_string());
+    }
+
+
+    /// Load an external drawing file into a snapshot Document. RSM or DXF
+    /// by extension; `None` on read error.
+    fn load_external_doc(&self, path: &str) -> Option<cad_kernel::Document> {
+        let bytes = std::fs::read(path).ok()?;
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".dxf") {
+            cad_io::dxf::read_dxf(&String::from_utf8_lossy(&bytes)).ok()
+        } else {
+            cad_io::rsm::read_rsm(&bytes).ok()
+        }
+    }
+
+    /// XREF dispatch — attach / list / detach / reload.
+    fn apply_xref(&mut self, args: &[String]) {
+        if args.is_empty() {
+            let n = self.doc.dobjects.iter()
+                .filter(|d| matches!(d.geom, Geom::Xref(_))).count();
+            let names: Vec<String> = self.doc.dobjects.iter()
+                .filter_map(|d| match &d.geom {
+                    Geom::Xref(x) => Some(format!("{} -> {}", x.name, x.path)),
+                    _ => None,
+                }).collect();
+            if names.is_empty() {
+                self.history.push(
+                    "xref: no references  [attach <path> to add one]".into());
+            } else {
+                self.history.push(format!(
+                    "xref: {n} reference(s): {}", names.join("; ")));
+            }
+            return;
+        }
+        match args[0].to_ascii_lowercase().as_str() {
+            "attach" | "a" => {
+                let Some(path) = args.get(1) else {
+                    self.fail_op("xref: attach needs a file path");
+                    return;
+                };
+                let Some(doc) = self.load_external_doc(path) else {
+                    self.fail_op(format!("xref: cannot read '{path}' (RSM or DXF)"));
+                    return;
+                };
+                let name = std::path::Path::new(path)
+                    .file_stem().map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                self.xref_pending = Some(cad_kernel::Xref {
+                    name, path: path.clone(),
+                    insert: Vec2::ZERO,
+                    scale: 1.0,
+                    rotation: 0.0,
+                    cached: doc.dobjects,
+                });
+                self.set_prompt(
+                    "xref: click the insertion point  [Esc cancels]".to_string());
+            }
+            "detach" | "d" => {
+                let Some(name) = args.get(1) else {
+                    self.fail_op("xref: detach needs a name");
+                    return;
+                };
+                self.snapshot_doc();
+                let before = self.doc.dobjects.len();
+                self.doc.dobjects.retain(|d| !matches!(&d.geom,
+                    Geom::Xref(x) if x.name.eq_ignore_ascii_case(name)));
+                let removed = before - self.doc.dobjects.len();
+                if removed == 0 {
+                    self.rollback_doc();
+                    self.fail_op(format!("xref: no reference named '{name}'"));
+                } else {
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    self.history.push(format!(
+                        "xref: detached {removed} reference(s) named '{name}'"));
+                }
+            }
+            "reload" | "r" => {
+                let Some(name) = args.get(1) else {
+                    self.fail_op("xref: reload needs a name");
+                    return;
+                };
+                self.snapshot_doc();
+                // Collect paths first (avoid a borrow of `self` while
+                // iterating `self.doc.dobjects` mutably).
+                let paths: Vec<String> = self.doc.dobjects.iter()
+                    .filter_map(|d| match &d.geom {
+                        Geom::Xref(x) if x.name.eq_ignore_ascii_case(name) =>
+                            Some(x.path.clone()),
+                        _ => None,
+                    }).collect();
+                if paths.is_empty() {
+                    self.rollback_doc();
+                    self.fail_op(format!("xref: no reference named '{name}'"));
+                    return;
+                }
+                let mut changed = 0usize;
+                for p in &paths {
+                    if let Some(doc) = self.load_external_doc(p) {
+                        for d in self.doc.dobjects.iter_mut() {
+                            let Geom::Xref(x) = &mut d.geom else { continue };
+                            if x.path == *p {
+                                x.cached = doc.dobjects.clone();
+                                changed += 1;
+                            }
+                        }
+                    }
+                }
+                if changed == 0 {
+                    self.rollback_doc();
+                    self.fail_op(format!("xref: '{name}' file(s) unreadable — nothing reloaded"));
+                } else {
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    self.history.push(format!(
+                        "xref: reloaded {changed} reference(s) named '{name}'"));
+                }
+            }
+            _ => self.fail_op(format!(
+                "xref: unknown option '{}' — attach <path> | detach <name> | reload <name>",
+                args[0])),
+        }
+    }
+
+    /// Commit the pending xref at `pos`, then stay armed for the next
+    /// placement (place-multiple).
+    fn commit_xref_at(&mut self, pos: Vec2) {
+        let Some(mut x) = self.xref_pending.take() else { return };
+        x.insert = pos;
+        self.add_dobject_undoable(Geom::Xref(x.clone()), "canvas");
+        self.history.push(format!(
+            "  + xref '{}' @ ({:.3},{:.3})  ({} children)",
+            x.name, pos.x, pos.y, x.cached.len()));
+        self.set_prompt(
+            "xref: click the insertion point  [Esc cancels]".to_string());
+        self.xref_pending = Some(x);
+    }
+
+
+    /// WBLOCK — save the selection (or the whole drawing when the selection
+    /// is empty) to its own .rsm/.dxf file via the Save dialog.
+    fn apply_wblock(&mut self) {
+        let mut sub = cad_kernel::Document::default();
+        sub.layers = self.doc.layers.clone();
+        sub.linetypes = self.doc.linetypes.clone();
+        sub.pens = self.doc.pens.clone();
+        sub.truecolors = self.doc.truecolors.clone();
+        sub.text_styles = self.doc.text_styles.clone();
+        sub.dim_styles = self.doc.dim_styles.clone();
+        sub.wall_styles = self.doc.wall_styles.clone();
+        sub.plot_styles = self.doc.plot_styles.clone();
+        sub.units = self.doc.units.clone();
+        if self.selection.is_empty() {
+            sub.dobjects = self.doc.dobjects.clone();
+        } else {
+            sub.dobjects = self.selection.iter()
+                .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+                .collect();
+        }
+        if sub.dobjects.is_empty() {
+            self.fail_op("wblock: nothing to write — select dobjects or draw first");
+            self.clear_prompt();
+            return;
+        }
+        self.open_file_dialog(FileDialogMode::Save, ".rsm");
+        self.wblock_subdoc = Some(sub);
+        self.save_dialog_purpose = 1;
+        self.set_prompt(
+            "wblock: choose a filename for the selection  [Esc cancels]".to_string());
+    }
+
+    /// Save an ARBITRARY document to `path` (the shared writer used by
+    /// `do_save` for the main doc and by WBLOCK for the sub-document).
+    fn save_doc_to(&mut self, path: &str, doc: &cad_kernel::Document) -> bool {
+        let lower = path.to_ascii_lowercase();
+        let bytes: Vec<u8> = if lower.ends_with(".dxf") {
+            cad_io::dxf::write_dxf(doc).into_bytes()
+        } else if lower.ends_with(".rsm") {
+            cad_io::rsm::write_rsm(doc)
+        } else {
+            self.history.push(format!(
+                "  ! save '{}': unknown extension (expected .dxf or .rsm)", path
+            ));
+            return false;
+        };
+        match std::fs::write(path, &bytes) {
+            Ok(()) => {
+                self.history.push(format!(
+                    "  saved '{}'  ({} bytes)", path, bytes.len()));
+                if lower.ends_with(".dxf") {
+                    for line in cad_io::dxf::dxf_export_degradations(doc) {
+                        self.history.push(format!("  \u{00B7} {}", line));
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                self.history.push(format!("  ! save '{}': {}", path, e));
+                false
+            }
+        }
     }
 
     fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
@@ -41863,6 +42099,9 @@ impl CadApp {
     }
 
     fn open_file_dialog(&mut self, mode: FileDialogMode, ext: &str) {
+        if mode == FileDialogMode::Save {
+            self.save_dialog_purpose = 0;   // WBLOCK re-sets it after opening
+        }
         let dir = self.file_dialog_dir.clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
@@ -42381,7 +42620,25 @@ impl CadApp {
                         format!("{}{}", name, dlg.ext)
                     };
                     let path = dlg.dir.join(fname);
-                    self.do_save(&path.to_string_lossy());
+                    let path = path.to_string_lossy().into_owned();
+                    if self.save_dialog_purpose == 1 {
+                        // WBLOCK confirm — write the pending sub-document.
+                        if let Some(sub) = self.wblock_subdoc.take() {
+                            let n = sub.dobjects.len();
+                            if self.save_doc_to(&path, &sub) {
+                                self.history.push(format!(
+                                    "  wblock: wrote {} dobject(s) to '{}'", n, path));
+                            }
+                            self.clear_prompt();
+                        } else {
+                            self.do_save(&path);
+                        }
+                    } else {
+                        // Any stale wblock sub-doc (cancelled dialog) must not
+                        // hijack a normal Save As.
+                        self.wblock_subdoc = None;
+                        self.do_save(&path);
+                    }
                 }
                 FileDialogMode::PickFolder => {
                     // The Radiance output folder: the browsed dir, or a new subfolder in it.
@@ -51574,6 +51831,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Wipeout(_)    => "Wipeout",
         Geom::CenterMark(_) => "CenterMark",
         Geom::Region(_)     => "Region",
+        Geom::Xref(_)       => "Xref",
         _                   => "Entity",
     }
 }
@@ -54723,6 +54981,11 @@ impl eframe::App for CadApp {
             if self.boundary_state != BoundaryState::Off {
                 self.boundary_state = BoundaryState::Off;
                 self.history.push("  boundary cancelled".into());
+            }
+            if self.xref_pending.is_some() {
+                self.xref_pending = None;
+                self.clear_prompt();
+                self.history.push("  xref attach cancelled".into());
             }
             if self.array_pick_center {
                 self.array_pick_center = false;
@@ -58839,6 +59102,11 @@ impl eframe::App for CadApp {
                             None => self.history.push(
                                 "  array (path) — click ON a curve; missed".into()),
                         }
+                        self.refocus_cmd = true;
+                    } else if self.xref_pending.is_some() {
+                        // XREF attach — this click is the insertion point
+                        // (place-multiple).
+                        self.commit_xref_at(click_world);
                         self.refocus_cmd = true;
                     } else if self.boundary_state == BoundaryState::WaitingForPick {
                         // BOUNDARY — click INSIDE a closed region (place-multiple).
@@ -63627,6 +63895,14 @@ fn draw_dobject_thick(
                     fill: crate::theme::color::SURFACE_0,
                     stroke: egui::epaint::PathStroke::NONE,
                 }));
+            }
+        }
+        Geom::Xref(x) => {
+            // Resolved children, transformed + drawn recursively (their own
+            // per-dobject styles are flattened into the xref's stroke colour).
+            for d in &x.cached {
+                let tg = x.transform_geom(&d.geom);
+                draw_dobject(painter, rect, app, &tg, stroke.color);
             }
         }
         Geom::Circle(c) => {
@@ -84172,5 +84448,72 @@ mod array_polar_path_tests {
         app.generate_path_array();
         assert_eq!(app.doc.dobjects.len(), before + 5,
             "5 divide placements fill the path");
+    }
+}
+
+#[cfg(test)]
+mod xref_wblock_tests {
+    use super::*;
+
+    #[test]
+    fn xref_attach_detach_list_round_trip() {
+        let mut app = CadApp::default();
+        let mut doc = cad_kernel::Document::default();
+        doc.dobjects.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(5.0, 5.0) })));
+        app.doc.dobjects.push(DObject::new(Geom::Xref(cad_kernel::Xref {
+            name: "plan-a".into(), path: "/tmp/x.rsm".into(),
+            insert: Vec2::ZERO, scale: 1.0, rotation: 0.0,
+            cached: doc.dobjects,
+        })));
+        // list
+        app.apply_xref(&[]);
+        let listed = app.history.iter().any(|h| h.contains("plan-a"));
+        assert!(listed, "list names the reference");
+        // detach
+        app.apply_xref(&["detach".into(), "plan-a".into()]);
+        assert!(!app.doc.dobjects.iter()
+            .any(|d| matches!(d.geom, Geom::Xref(_))));
+    }
+
+    #[test]
+    fn xref_pending_commit_places_at_click() {
+        let mut app = CadApp::default();
+        let mut doc = cad_kernel::Document::default();
+        doc.dobjects.push(DObject::new(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::ZERO, radius: 3.0 })));
+        app.xref_pending = Some(cad_kernel::Xref {
+            name: "plan-b".into(), path: "/tmp/b.rsm".into(),
+            insert: Vec2::ZERO, scale: 1.0, rotation: 0.0,
+            cached: doc.dobjects,
+        });
+        app.commit_xref_at(Vec2::new(9.0, 4.0));
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::Xref(x) = &last.geom {
+            assert!(x.insert.dist(Vec2::new(9.0, 4.0)) < 1e-9);
+            assert_eq!(x.cached.len(), 1);
+        } else { panic!("expected Xref"); }
+        assert!(app.xref_pending.is_some(), "place-multiple stays armed");
+    }
+
+    #[test]
+    fn wblock_subdoc_holds_selection_and_whole_drawing() {
+        let mut app = CadApp::default();
+        app.selection.clear();
+        // Selection mode: only the picked dobjects go to the sub-doc.
+        let a = app.doc.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(1.0, 0.0) })));
+        let _b = app.doc.push(DObject::new(Geom::Circle(cad_kernel::Circle {
+            center: Vec2::ZERO, radius: 1.0 })));
+        app.selection = vec![a];
+        app.apply_wblock();
+        let sub = app.wblock_subdoc.as_ref().expect("sub-doc pending");
+        assert_eq!(sub.dobjects.len(), 1, "selection only");
+        assert_eq!(app.save_dialog_purpose, 1);
+        // Whole drawing when selection empty.
+        app.selection.clear();
+        app.apply_wblock();
+        let sub = app.wblock_subdoc.as_ref().expect("sub-doc pending");
+        assert!(sub.dobjects.len() >= 2, "whole drawing (no selection)");
     }
 }
