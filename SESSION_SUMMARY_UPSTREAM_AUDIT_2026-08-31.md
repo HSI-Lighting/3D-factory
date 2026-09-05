@@ -167,7 +167,50 @@ or need draw-pipeline arms, so they were left for interactive sessions.
   columns). Kernel/parser surfaces for Array/Xref/AttDef/AttEdit already
   exist in the fork.
 
-## 2026-09-05 (late) — architecture decisions + execution plan
+## 2026-09-05 (latest) — WINDOWS-UI branch of the source repo (next task)
+
+The source repo RUST-AutoRASM carries a parallel lineage:
+`origin/windows-ui-session-2026-06-20` (fetched at `ced2204`, ahead of
+the ported `farzad-dev`/fcf3079 content by 2+ windows-only commits and a
+long re-based feature history). The user wants its changes applied to
+this fork too.
+
+- Full reference tree extracted at `/home/farzad/windows-wt` (git archive
+  of ced2204) for diffing. Repo worktree add failed under /tmp — use the
+  archive extraction.
+- Net delta vs the ported base (origin/farzad-dev fcf3079) is large:
+  +9671/−1313 across 42 files (app.rs +6424, hatch_trace +710, fill.rs
+  NEW 375, rsm +228, hatch_resolve +180, geom +195, dock ±165, snap +136,
+  cad_wall +77, recorder +30, dxf +10, style +10, trim +19, intersect
+  +19, plus Cargo.lock/-toml/.gitignore noise).
+- KNOWN windows-only families to verify+port (from branch log): inspector
+  rework (colour chart beside the panel instead of across the canvas;
+  wall geometry section + multi-wall editing; hatch style/pattern/scale/
+  angle as GRID rows; linetype dropdown with glyphs, capped width),
+  per-wall centreline (kernel Wall field + RSM v39) + cad_wall +77,
+  recorder records WHERE every menu/dialog/popup opens/closes,
+  hatch text contributes its bounding RECT as a boundary hole (099d916),
+  hatch log records selections + full scene unconditionally, chamfer on
+  walls, hatch layer visibility, block pick/insert, wall cleanup, gated
+  repaint, resolved grid bboxes, shift-click deselect, spline cutter
+  errors, interior polyline extend, two-point break, RSM index
+  validation.
+- IMPORTANT: fork vs windows is bidirectional (fork ahead on lighting/
+  3D/layout tabs/scripting/backlog batches). DO NOT wholesale-copy files.
+  Re-run the directional 3-agent catalog (kernel/io, cad_app non-app,
+  app.rs+hatch_trace) against `/home/farzad/windows-wt`, then port
+  windows-only content in the usual phased batches with per-batch suite
+  verification. The catalog agents were started 2026-09-05 and aborted —
+  they have NOT run to completion; nothing from the windows branch has
+  been ported yet.
+- Fork state at handoff: origin/farzad-dev = `0a19589`; kernel 419/419;
+  cad_app 1487 passed / 10 pre-existing failures (fbx texture assets +
+  factory wall-env); pytest 1473/1473; tree clean (only .obsidian noise).
+  Remaining-after-backlog: the two architecture decisions adopted
+  (hatch designate flow + dock card columns) with the phased plan above —
+  those phases have NOT started.
+
+---
 
 Owner decisions (2026-09-05):
 1. HATCH: adopt the upstream designate flow (hover preview → designate
