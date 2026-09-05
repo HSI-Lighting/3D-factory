@@ -2898,6 +2898,9 @@ pub struct CadApp {
     area_state:     Option<AreaState>,
     /// Pending XREF attach — awaiting the insertion-point click.
     xref_pending: Option<cad_kernel::Xref>,
+    // ---- ATTDEF / ATTEDIT flows (tool = None; state-machine driven) ----
+    attr_def_flow:  AttrDefFlow,
+    attedit_state:  AttEditState,
     /// WBLOCK: the sub-document (selection / whole drawing) to write when
     /// the Save dialog confirms. See `save_dialog_purpose`.
     wblock_subdoc: Option<cad_kernel::Document>,
@@ -4281,6 +4284,25 @@ pub enum BoundaryState {
     WaitingForPick,
 }
 
+/// ATTDEF flow — the three typed text fields of a block attribute
+/// definition, then a click (or typed x,y) places the slot.
+#[derive(Clone, PartialEq, Debug)]
+pub enum AttrDefFlow {
+    Off,
+    AwaitingTag,
+    AwaitingPrompt { tag: String },
+    AwaitingDefault { tag: String, prompt: String },
+    AwaitingPosition { tag: String, prompt: String, default: String },
+}
+
+/// ATTEDIT — pick a block instance, then edit its attribute values.
+#[derive(Clone, PartialEq, Debug)]
+pub enum AttEditState {
+    Off,
+    WaitingForPick,
+    Editing { idx: usize, values: Vec<String> },
+}
+
 /// CENTERMARK click flow: click a circle/arc (sizes the mark) or any
 /// point (default/override size). Place-multiple; Esc exits.
 #[derive(Clone, PartialEq, Debug)]
@@ -5217,6 +5239,8 @@ impl Default for CadApp {
             dist_state:     DistState::Off,
             area_state:     None,
             xref_pending:   None,
+            attr_def_flow:  AttrDefFlow::Off,
+            attedit_state:  AttEditState::Off,
             wblock_subdoc:  None,
             save_dialog_purpose: 0,
             xline_state:    XlineState::Off,
@@ -10709,6 +10733,8 @@ impl CadApp {
         self.xline_state = XlineState::Off;
         self.boundary_state = BoundaryState::Off;
         self.xref_pending = None;
+        self.attr_def_flow = AttrDefFlow::Off;
+        self.attedit_state = AttEditState::Off;
         self.centermark_state = CenterMarkState::Off;
         self.ray_state = RayState::Off;
         self.donut_state = DonutState::Off;
@@ -18040,6 +18066,52 @@ impl CadApp {
             }
         }
 
+        // ---- ATTDEF flow: tag → prompt → default → (click places it).
+        // Each bare line feeds the next field; empty keeps default; a typed
+        // `x,y` while awaiting the position commits there.
+        if self.attr_def_flow != AttrDefFlow::Off {
+            match self.attr_def_flow.clone() {
+                AttrDefFlow::AwaitingTag => {
+                    let tag = trimmed.trim().to_string();
+                    if tag.is_empty() {
+                        self.attr_def_flow = AttrDefFlow::Off;
+                        self.clear_prompt();
+                        self.history.push("  attdef: cancelled".into());
+                    } else {
+                        self.attr_def_flow = AttrDefFlow::AwaitingPrompt { tag: tag.clone() };
+                        self.set_prompt(format!(
+                            "attdef: prompt text for \"{tag}\"  (Enter = none)  [Esc cancels]"));
+                    }
+                    return;
+                }
+                AttrDefFlow::AwaitingPrompt { tag } => {
+                    let prompt = trimmed.trim().to_string();
+                    self.attr_def_flow =
+                        AttrDefFlow::AwaitingDefault { tag: tag.clone(), prompt };
+                    self.set_prompt(format!(
+                        "attdef: default value for \"{tag}\"  (Enter = none)  [Esc cancels]"));
+                    return;
+                }
+                AttrDefFlow::AwaitingDefault { tag, prompt } => {
+                    let default = trimmed.trim().to_string();
+                    self.attr_def_flow =
+                        AttrDefFlow::AwaitingPosition { tag: tag.clone(), prompt: prompt.clone(), default };
+                    self.set_prompt(format!(
+                        "attdef: click position for \"{tag}\"  [Esc cancels]"));
+                    return;
+                }
+                AttrDefFlow::AwaitingPosition { tag, prompt, default } => {
+                    if let Ok(p) = cad_kernel::parser::parse_pt(trimmed) {
+                        self.commit_attdef_at(p, &tag, &prompt, &default);
+                        return;
+                    }
+                    // Esc or a click places the def; other commands fall
+                    // through (the flow stays armed until then).
+                }
+                AttrDefFlow::Off => {}
+            }
+        }
+
         // ---- SPLINE sub-command: Width ------------------------------------
         // One UNIFORM ribbon width for the whole spline (no per-segment taper).
         // `w`/`width` arms a one-value entry; the next typed number sets it and
@@ -18767,7 +18839,9 @@ impl CadApp {
                     ToolKind::Polygon    => Tool::Polyline,
                     ToolKind::QuadBezier => Tool::Spline,
                     ToolKind::Leader => Tool::Text,
-                    ToolKind::AttrDef | ToolKind::AttEdit => Tool::Text,
+                    // ATTDEF / ATTEDIT run as state machines (tool = None);
+                    // the flow prompts begin in the branch below.
+                    ToolKind::AttrDef | ToolKind::AttEdit => Tool::None,
                 };
                 // Issue #47 — `qb`/QuadBezier drafts a QUADRATIC B-spline:
                 // the spline tool at degree 2 (three control clicks P0..P2,
@@ -18784,6 +18858,10 @@ impl CadApp {
                             .to_string());
                     self.set_prompt(
                         "quadbezier: click P0, P1, then P2   [Enter = commit, Esc cancels]");
+                } else if kind == ToolKind::AttrDef {
+                    self.attr_def_prompt();
+                } else if kind == ToolKind::AttEdit {
+                    self.attedit_start();
                 } else {
                     self.set_prompt(current_hint(self.tool, self.arc_method, 0));
                 }
@@ -27576,6 +27654,132 @@ impl CadApp {
         }
     }
 
+
+    // ---- ATTDEF / ATTEDIT -------------------------------------------------
+
+    /// ATTDEF start — enter the TAG, prompt + default on the command line.
+    fn attr_def_prompt(&mut self) {
+        self.attr_def_flow = AttrDefFlow::AwaitingTag;
+        self.set_prompt("attdef: enter TAG name  (Esc cancels)".to_string());
+    }
+
+    /// Commit an attribute definition slot at `pos`, then repeat (AutoCAD
+    /// ATTDEF keeps arming the next definition).
+    fn commit_attdef_at(&mut self, pos: Vec2, tag: &str, prompt: &str, default: &str) {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            self.history.push("  ! attdef: empty tag skipped".into());
+            self.attr_def_flow = AttrDefFlow::Off;
+            self.clear_prompt();
+            return;
+        }
+        let height = self.env.TxHt;
+        self.add_dobject_undoable(
+            Geom::AttrDef(cad_kernel::AttrDef {
+                tag: tag.to_string(),
+                prompt: prompt.trim().to_string(),
+                default: default.trim().to_string(),
+                position: pos,
+                height,
+                angle: 0.0,
+                style: cad_kernel::TextStyleTable::STANDARD,
+                visible: true,
+            }),
+            "canvas");
+        self.history.push(format!(
+            "  + attdef: <{}> @ ({:.3},{:.3}) h={}",
+            tag, pos.x, pos.y, height));
+        self.attr_def_flow = AttrDefFlow::Off;
+        self.clear_prompt();
+        // Stay armed for another definition (AutoCAD ATTDEF repeats).
+        self.attr_def_prompt();
+    }
+
+    /// ATTEDIT start — wait for a pick.
+    fn attedit_start(&mut self) {
+        self.attedit_state = AttEditState::WaitingForPick;
+        self.set_prompt(
+            "attedit: click a block instance with attributes  [Esc exits]".to_string());
+    }
+
+    /// The dobject index of the block instance under `pos` whose definition
+    /// carries at least one AttrDef (only those can be attribute-edited).
+    fn attedit_pick_block(&self, pos: Vec2) -> Option<usize> {
+        let tol = (self.env.PkBxSz.max(8) as f64) / (self.scale as f64).max(1e-6);
+        self.nearest_entity_under(pos, tol).and_then(|i| {
+            match &self.doc.dobjects.get(i)?.geom {
+                Geom::BlockRef(br) => {
+                    let blk = self.doc.blocks.get(br.block)?;
+                    if blk.dobjects.iter().any(|d| matches!(d.geom, Geom::AttrDef(_))) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// Open the attribute editor dialog for block instance `idx`.
+    fn attedit_open_for(&mut self, idx: usize) {
+        let Some(d) = self.doc.dobjects.get(idx) else {
+            self.fail_op("attedit: block instance vanished");
+            self.attedit_state = AttEditState::Off;
+            self.clear_prompt();
+            return;
+        };
+        let Geom::BlockRef(br) = &d.geom else {
+            self.fail_op("attedit: not a block instance");
+            self.attedit_state = AttEditState::Off;
+            self.clear_prompt();
+            return;
+        };
+        let Some(blk) = self.doc.blocks.get(br.block) else {
+            self.fail_op("attedit: block definition missing");
+            self.attedit_state = AttEditState::Off;
+            self.clear_prompt();
+            return;
+        };
+        // Parallel by index: value i ↔ the i-th AttrDef in definition order.
+        let values = blk.dobjects.iter()
+            .filter_map(|d| match &d.geom {
+                Geom::AttrDef(a) => Some(a.default.clone()),
+                _ => None,
+            })
+            .collect();
+        self.attedit_state = AttEditState::Editing { idx, values };
+        self.set_prompt(
+            "attedit: edit values in the panel, then Apply  [Esc cancels]".to_string());
+    }
+
+    /// Write the edited values back onto instance `idx`'s BlockRef
+    /// (parallel by index to the definition's AttrDefs). One undo step.
+    fn attedit_write_values(&mut self, idx: usize,
+                            tags: &[String], values: &[String]) -> bool {
+        if self.doc.dobjects.get(idx).map(|d| matches!(d.geom, Geom::BlockRef(_)))
+            .unwrap_or(false)
+        {
+            self.snapshot_doc();
+            if let Some(d) = self.doc.dobjects.get_mut(idx) {
+                if let Geom::BlockRef(br) = &mut d.geom {
+                    let n = tags.len();
+                    br.attr_values = values.iter().take(n).cloned().collect();
+                    while br.attr_values.len() < n {
+                        br.attr_values.push(String::new());
+                    }
+                    self.history.push(format!(
+                        "  \u{270E} attedit: updated {} attribute value(s) on block #{}",
+                        tags.len(), idx));
+                    self.index_dirty = true;
+                    self.gpu_dirty = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn add_dobject_undoable(&mut self, geom: Geom, origin: &str) {
         self.snapshot_doc();
         self.add_dobject(geom, origin);
@@ -28177,6 +28381,94 @@ impl CadApp {
                     .small().weak());
             });
         if !open { self.point_style_picker_open = false; }
+    }
+
+
+    /// ATTEDIT attribute-value editor — a small floating panel listing the
+    /// selected block instance's attribute tags with editable values. Apply
+    /// writes them back into the instance's `BlockRef.attr_values`
+    /// (parallel by index to the definition's AttrDef dobjects).
+    fn render_attedit_dialog(&mut self, ctx: &egui::Context) {
+        let AttEditState::Editing { idx, values } = self.attedit_state.clone() else {
+            return;
+        };
+        let mut values = values;
+        // Pull the CURRENT tags from the definition each frame.
+        let (tags, height): (Vec<String>, f64) = self.doc.dobjects.get(idx)
+            .and_then(|d| match &d.geom {
+                Geom::BlockRef(br) => self.doc.blocks.get(br.block)
+                    .map(|blk| {
+                        let tags: Vec<String> = blk.dobjects.iter()
+                            .filter_map(|cd| match &cd.geom {
+                                Geom::AttrDef(a) => Some(a.tag.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        let h = blk.dobjects.iter().filter_map(|cd| match &cd.geom {
+                            Geom::AttrDef(a) => Some(a.height),
+                            _ => None,
+                        }).next().unwrap_or(0.25);
+                        (tags, h)
+                    }),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut open = true;
+        let mut apply = false;
+        let mut close = false;
+        egui::Window::new("Edit Attributes")
+            .id(egui::Id::new("attedit_dialog"))
+            .open(&mut open)
+            .default_pos(egui::pos2(60.0, 60.0))
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new(
+                        if tags.is_empty() {
+                            "This block has no attribute definitions."
+                        } else {
+                            "Enter values for the block's attributes:"
+                        }
+                    ).size(12.0));
+                    ui.add_space(6.0);
+                    for (i, tag) in tags.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("<{tag}>"))
+                                .strong().size(12.0));
+                            let v = values.get_mut(i)
+                                .cloned()
+                                .unwrap_or_default();
+                            let mut v = v;
+                            let resp = ui.add_sized(
+                                egui::vec2(ui.available_width() - 40.0, 22.0),
+                                egui::TextEdit::singleline(&mut v));
+                            if resp.changed() {
+                                while values.len() <= i { values.push(String::new()); }
+                                values[i] = v;
+                            }
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() { apply = true; }
+                        if ui.button("Close").clicked() { close = true; }
+                    });
+                    ui.label(egui::RichText::new(format!(
+                        "block instance #{} — text height {:.3}",
+                        idx, height)).color(crate::theme::color::TEXT_MUTED).size(10.5));
+                });
+            });
+        if !open || close {
+            self.attedit_state = AttEditState::Off;
+            self.clear_prompt();
+            return;
+        }
+        if apply {
+            if self.attedit_write_values(idx, &tags, &values) {
+                self.attedit_state = AttEditState::Off;
+                self.clear_prompt();
+            }
+        }
     }
 
     fn close_qselect_dialog(&mut self) {
@@ -54987,6 +55279,16 @@ impl eframe::App for CadApp {
                 self.clear_prompt();
                 self.history.push("  xref attach cancelled".into());
             }
+            if self.attr_def_flow != AttrDefFlow::Off {
+                self.attr_def_flow = AttrDefFlow::Off;
+                self.clear_prompt();
+                self.history.push("  attdef cancelled".into());
+            }
+            if self.attedit_state != AttEditState::Off {
+                self.attedit_state = AttEditState::Off;
+                self.clear_prompt();
+                self.history.push("  attedit cancelled".into());
+            }
             if self.array_pick_center {
                 self.array_pick_center = false;
                 self.clear_prompt();
@@ -56853,6 +57155,7 @@ impl eframe::App for CadApp {
         if self.qselect.open {
             self.render_qselect_dialog(ctx);
         }
+        self.render_attedit_dialog(ctx);
         if self.point_style_picker_open {
             self.render_point_style_picker(ctx);
         }
@@ -59117,6 +59420,23 @@ impl eframe::App for CadApp {
                     {
                         // CENTERMARK: this click places the mark (place-multiple).
                         self.commit_centermark_at(click_world, size_override);
+                        self.refocus_cmd = true;
+                    } else if let AttrDefFlow::AwaitingPosition { tag, prompt, default } =
+                        self.attr_def_flow.clone()
+                    {
+                        // ATTDEF placement click — tag/prompt/default already set.
+                        self.commit_attdef_at(click_world, &tag, &prompt, &default);
+                        self.refocus_cmd = true;
+                    } else if self.attedit_state == AttEditState::WaitingForPick {
+                        // ATTEDIT pick click — a block instance with attributes.
+                        if let Some(i) = self.attedit_pick_block(click_world) {
+                            self.attedit_open_for(i);
+                        } else {
+                            self.fail_op(
+                                "attedit: click a block instance with attributes");
+                            self.attedit_state = AttEditState::Off;
+                            self.clear_prompt();
+                        }
                         self.refocus_cmd = true;
                     } else if self.xline_state != XlineState::Off {
                         // XLINE: base click → direction click; place-multiple.
@@ -84515,5 +84835,91 @@ mod xref_wblock_tests {
         app.apply_wblock();
         let sub = app.wblock_subdoc.as_ref().expect("sub-doc pending");
         assert!(sub.dobjects.len() >= 2, "whole drawing (no selection)");
+    }
+}
+
+#[cfg(test)]
+mod attdef_attedit_tests {
+    use super::*;
+
+    #[test]
+    fn attdef_flow_places_definition_entities() {
+        let mut app = CadApp::default();
+        app.run_command("attdef");
+        assert_eq!(app.attr_def_flow, AttrDefFlow::AwaitingTag);
+        // Feed the fields directly (the intercept does the same).
+        app.attr_def_flow = AttrDefFlow::AwaitingPosition {
+            tag: "DOOR_NO".into(), prompt: "Door number".into(), default: "1".into(),
+        };
+        let before = app.doc.dobjects.len();
+        app.commit_attdef_at(Vec2::new(5.0, 5.0), "DOOR_NO", "Door number", "1");
+        assert_eq!(app.doc.dobjects.len(), before + 1);
+        let last = app.doc.dobjects.last().unwrap();
+        if let Geom::AttrDef(a) = &last.geom {
+            assert_eq!(a.tag, "DOOR_NO");
+            assert_eq!(a.default, "1");
+            assert!(a.position.dist(Vec2::new(5.0, 5.0)) < 1e-9);
+        } else { panic!("expected AttrDef"); }
+        // Flow re-arms for the next definition.
+        assert_eq!(app.attr_def_flow, AttrDefFlow::AwaitingTag);
+    }
+
+    fn block_with_attr_def(app: &mut CadApp) -> (u32, usize) {
+        let mut blk = cad_kernel::Block { name: "door".into(), base: Vec2::ZERO, dobjects: Vec::new(), smart: false, params: Vec::new(), cut_edges: Vec::new() };
+        let def = DObject::new(Geom::AttrDef(cad_kernel::AttrDef {
+            tag: "NO".into(), prompt: String::new(), default: "42".into(),
+            position: Vec2::ZERO, height: 1.0, angle: 0.0,
+            style: cad_kernel::TextStyleTable::STANDARD, visible: true,
+        }));
+        blk.dobjects.push(def);
+        let id = app.doc.blocks.add(blk);
+        let idx = app.doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
+            block: id,
+            insert: Vec2::ZERO,
+            scale: 1.0, scale_y: 1.0, rotation: 0.0,
+            mirror_x: false,
+            attr_values: Vec::new(),
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        })));
+        (id, idx)
+    }
+
+    #[test]
+    fn attedit_opens_and_writes_instance_values() {
+        let mut app = CadApp::default();
+        let (_, idx) = block_with_attr_def(&mut app);
+        app.attedit_open_for(idx);
+        assert!(matches!(app.attedit_state, AttEditState::Editing { .. }));
+        let AttEditState::Editing { values, .. } = app.attedit_state.clone() else { unreachable!() };
+        assert_eq!(values, vec!["42".to_string()], "prefill = the default");
+        // Apply: value → instance.
+        assert!(app.attedit_write_values(idx, &["NO".to_string()], &["7".to_string()]));
+        let d = app.doc.dobjects.get(idx).unwrap();
+        if let Geom::BlockRef(br) = &d.geom {
+            assert_eq!(br.attr_values, vec!["7".to_string()]);
+        } else { panic!("expected BlockRef"); }
+    }
+
+    #[test]
+    fn attedit_pick_only_accepts_blocks_with_attributes() {
+        let mut app = CadApp::default();
+        // Plain block (no AttrDefs) — pick must refuse.
+        let mut plain = cad_kernel::Block { name: "plain".into(), base: Vec2::ZERO, dobjects: Vec::new(), smart: false, params: Vec::new(), cut_edges: Vec::new() };
+        let pid = app.doc.blocks.add(plain);
+        let pidx = app.doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
+            block: pid,
+            insert: Vec2::new(0.0, 0.0),
+            scale: 1.0, scale_y: 1.0, rotation: 0.0, mirror_x: false,
+            attr_values: Vec::new(),
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        })));
+        let (_, aidx) = block_with_attr_def(&mut app);
+        // Move the attr block off the plain one before picking.
+        if let Some(d) = app.doc.dobjects.get_mut(aidx) {
+            if let Geom::BlockRef(br) = &mut d.geom { br.insert = Vec2::new(40.0, 0.0); }
+        }
+        assert_eq!(app.attedit_pick_block(Vec2::new(41.0, 0.0)), Some(aidx));
+        assert_eq!(app.attedit_pick_block(Vec2::new(2.0, 2.0)), None);
+        let _ = pidx;
     }
 }
