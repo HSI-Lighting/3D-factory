@@ -3150,6 +3150,14 @@ pub struct CadApp {
     plot_dialog_open: bool,
     // ---- QSELECT panel (filter selection) ----
     qselect: QSelectState,
+    // ---- POINT style/size (PDMODE §6) ----
+    /// Current point display style (PDMODE) stamped onto each new Point.
+    current_point_style: u8,
+    /// Current point size (PDSIZE): negative = % of view height, positive =
+    /// drawing units, 0 = default. Default -5.0 = 5% of the viewport height.
+    current_point_size: f32,
+    /// PDMODE picker window (typed `pdmode` / `ddptype`).
+    point_style_picker_open: bool,
     // ---- LAYWALK panel (preview layers in isolation) ----
     laywalk_open:    bool,
     laywalk_restore: Option<Vec<(bool, bool)>>,
@@ -5205,6 +5213,9 @@ impl Default for CadApp {
             layer_glyph_tex:    std::collections::HashMap::new(),
             plot_dialog_open: false,
             qselect: QSelectState::default(),
+            current_point_style: 0,
+            current_point_size: -5.0,
+            point_style_picker_open: false,
             laywalk_open:    false,
             laywalk_restore: None,
             laywalk_current: 0,
@@ -17947,6 +17958,16 @@ impl CadApp {
             return;
         }
 
+        // ---- POINT style dialog: pdmode / pd / ddptype -------------------
+        if trimmed.eq_ignore_ascii_case("pdmode")
+            || trimmed.eq_ignore_ascii_case("pd")
+            || trimmed.eq_ignore_ascii_case("ddptype")
+        {
+            self.point_style_picker_open = !self.point_style_picker_open;
+            self.clear_prompt();
+            return;
+        }
+
         // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
         //
         // While the polyline tool is active, single-letter inputs are
@@ -27398,6 +27419,68 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
+
+
+    /// PDMODE picker — a style/size grid (AutoCAD DDptype-lite). Choosing a
+    /// tile sets `current_point_style` immediately (new Points stamp it); the
+    /// size row edits `current_point_size` (negative % of view).
+    fn render_point_style_picker(&mut self, ctx: &egui::Context) {
+        use crate::theme::color as tc;
+        let mut open = true;
+        egui::Window::new("Point Style")
+            .order(egui::Order::Foreground)
+            .id(egui::Id::new("pt_style_picker"))
+            .collapsible(false).resizable(false)
+            .default_pos(egui::pos2(300.0, 200.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(240.0);
+                ui.label(egui::RichText::new("Style (PDMODE) — new points stamp it")
+                    .weak().size(11.0));
+                const STYLES: [u8; 8] = [0, 2, 3, 32, 35, 64, 67, 96];
+                let mut set_style: Option<u8> = None;
+                egui::Grid::new("pt_style_grid").spacing(egui::vec2(6.0, 6.0)).show(ui, |ui| {
+                    for (k, pd) in STYLES.iter().enumerate() {
+                        let (rect, resp) =
+                            ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+                        let is_cur = self.current_point_style == *pd;
+                        ui.painter().rect(rect, egui::Rounding::same(4.0), tc::SURFACE_0,
+                            egui::Stroke::new(if is_cur { 2.0 } else { 1.0 },
+                                if is_cur { tc::ACCENT } else { tc::BORDER }));
+                        paint_point_style(ui.painter(), rect.center(), *pd, 7.0,
+                            egui::Stroke::new(1.6,
+                                if is_cur { tc::ACCENT } else { tc::TEXT_PRIMARY }));
+                        if resp.clicked() { set_style = Some(*pd); }
+                        if resp.hovered() {
+                            resp.on_hover_text(format!("{} — PDMODE {}", point_style_name(*pd), pd));
+                        }
+                        if (k + 1) % 4 == 0 { ui.end_row(); }
+                    }
+                });
+                if let Some(pd) = set_style {
+                    self.current_point_style = pd;
+                    self.history.push(format!(
+                        "  point style → {} (PDMODE {})", point_style_name(pd), pd));
+                }
+                ui.add_space(6.0);
+                ui.label("Size");
+                // PDSIZE convention: negative = % of view height.
+                let mut pct = (-self.current_point_size).max(0.01);
+                let resp = ui.horizontal(|ui| {
+                    ui.label("% of view:");
+                    ui.add(egui::DragValue::new(&mut pct).update_while_editing(false)
+                        .speed(0.25).range(0.5..=50.0))
+                });
+                if resp.response.changed() {
+                    self.current_point_size = -(pct as f32);
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "Positive PDSIZE = drawing units; 0 = default 5%.")
+                    .small().weak());
+            });
+        if !open { self.point_style_picker_open = false; }
+    }
 
     fn close_qselect_dialog(&mut self) {
         self.qselect.open = false;
@@ -49069,7 +49152,9 @@ impl CadApp {
                 let loc = self.pending[0];
                 self.pending.clear();
                 self.add_dobject(Geom::Point(Point {
-                    location: loc, style: 0, size: 0.0,
+                    location: loc,
+                    style: self.current_point_style,
+                    size: self.current_point_size,
                 }), "canvas");
             }
             // Polyline never finalises via the click-count path — it
@@ -55703,6 +55788,9 @@ impl eframe::App for CadApp {
         if self.qselect.open {
             self.render_qselect_dialog(ctx);
         }
+        if self.point_style_picker_open {
+            self.render_point_style_picker(ctx);
+        }
         if self.laywalk_open {
             let mut keep = true;
             egui::Window::new("LAYER WALK")
@@ -62058,6 +62146,65 @@ fn distance_world_to_geom(g: &Geom, p: Vec2) -> f64 {
     }
 }
 
+
+/// POINT display marker name (PDMODE §6 list — the styles the picker offers).
+fn point_style_name(pd: u8) -> &'static str {
+    match pd {
+        0 => "Dot", 2 => "Plus", 3 => "Cross", 32 => "Circle·Dot",
+        35 => "Circle·X", 64 => "Square·Dot", 67 => "Square·X", 96 => "Circle+Square",
+        _ => "custom",
+    }
+}
+
+/// POINT display marker, PDMODE-dispatched, centred at `c` (screen px) with
+/// enclosing half-size `half` (px). PDMODE decode: base `pdmode & 7` = 0 dot /
+/// 2 plus / 3 cross (1 = blank); `& 32` adds a circle; `& 64` adds a square.
+fn paint_point_style(p: &egui::Painter, c: egui::Pos2, pdmode: u8, half: f32,
+                     stroke: egui::Stroke) {
+    let col    = stroke.color;
+    let base   = pdmode & 7;
+    let circle = pdmode & 32 != 0;
+    let square = pdmode & 64 != 0;
+    if square {
+        p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(half * 2.0, half * 2.0)),
+            egui::Rounding::ZERO, stroke);
+    }
+    if circle {
+        p.circle_stroke(c, if square { half * 0.9 } else { half }, stroke);
+    }
+    let arm = half * 0.98;
+    match base {
+        2 => {
+            p.line_segment([c - egui::vec2(arm, 0.0), c + egui::vec2(arm, 0.0)], stroke);
+            p.line_segment([c - egui::vec2(0.0, arm), c + egui::vec2(0.0, arm)], stroke);
+        }
+        3 => {
+            let d = arm * 0.72;
+            p.line_segment([c - egui::vec2(d, d), c + egui::vec2(d, d)], stroke);
+            p.line_segment([c + egui::vec2(d, -d), c - egui::vec2(d, -d)], stroke);
+        }
+        _ => {}
+    }
+    if base == 0 {
+        let dr = if circle || square { (half * 0.26).max(1.2) } else { (half * 0.42).max(1.6) };
+        p.circle_filled(c, dr, col);
+    }
+}
+
+/// Screen half-size (px) for a point marker from `Point.size` (PDSIZE): size <
+/// 0 = |size|% of the viewport height; size > 0 = drawing units; 0 = default
+/// ~5% of the view.
+fn point_half_px(size: f32, scale: f32, viewport_h_px: f32) -> f32 {
+    let h = if size < 0.0 {
+        (-size / 100.0) * viewport_h_px * 0.5
+    } else if size > 0.0 {
+        size * scale * 0.5
+    } else {
+        0.05 * viewport_h_px * 0.5
+    };
+    h.clamp(2.0, viewport_h_px * 0.5)
+}
+
 fn draw_dobject(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -62535,15 +62682,11 @@ fn draw_dobject_thick(
             painter.add(egui::Shape::line(pts, stroke));
         }
         Geom::Point(pt) => {
-            // POINT renders as a small cross-hair glyph at the location.
-            // PDMODE / PDSIZE will dispatch glyph variants when wired;
-            // today every point draws the same '+'.
+            // PDMODE / PDSIZE point marker (the style/size stamped when the
+            // point was placed — see current_point_style/current_point_size).
             let sp = app.w2s(pt.location, rect);
-            let s = 4.0_f32;
-            painter.line_segment(
-                [egui::pos2(sp.x - s, sp.y), egui::pos2(sp.x + s, sp.y)], stroke);
-            painter.line_segment(
-                [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
+            let half = point_half_px(pt.size, app.scale, rect.height());
+            paint_point_style(painter, sp, pt.style, half, stroke);
         }
         Geom::Polyline(p) => {
             // Tapered-width polyline → filled strips per segment. Otherwise the
@@ -82814,5 +82957,26 @@ mod qselect_tests {
         let mut app = CadApp::default();
         app.run_command("qselect");
         assert!(app.qselect.open);
+    }
+}
+
+#[cfg(test)]
+mod point_style_tests {
+    use super::*;
+
+    #[test]
+    fn point_commit_stamps_current_style_and_size() {
+        let mut app = CadApp::default();
+        app.current_point_style = 35;      // Circle·X
+        app.current_point_size = -5.0;     // 5% of view
+        // Emulate the point-tool commit (Tool::Point, 1 pending click).
+        app.tool = Tool::Point;
+        app.pending = vec![Vec2::new(3.0, 4.0)];
+        app.try_finalise();                 // (Tool::Point, 1) arm
+        let last = app.doc.dobjects.last().expect("a point was committed");
+        if let Geom::Point(p) = &last.geom {
+            assert_eq!(p.style, 35);
+            assert_eq!(p.size, -5.0);
+        } else { panic!("expected a Point"); }
     }
 }
