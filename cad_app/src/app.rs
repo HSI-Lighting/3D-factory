@@ -2249,6 +2249,19 @@ pub struct CadApp {
     array_rows: usize,
     array_dx:   f64,
     array_dy:   f64,
+    // Polar / path methods — see ArrayMethod.
+    array_method:      ArrayMethod,
+    array_count:       usize,
+    array_fill_deg:    f64,
+    array_rotate_items: bool,
+    array_center:      Vec2,
+    array_pick_center: bool,
+    array_path_idx:    Option<usize>,
+    array_path_measure: bool,
+    array_path_dist:   f64,
+    array_path_align:  bool,
+    array_path_anchor: PathAnchor,
+    array_pick_path:   bool,
 
     // intersection modes (no more global O(N²) auto-recompute)
     intersect_pending_click: bool,           // one-shot "intersect near next click"
@@ -4962,6 +4975,18 @@ impl Default for CadApp {
             zoom_state:    ZoomState::Off,
             view_history:  Vec::new(),
             array_open:     false,
+            array_method:      ArrayMethod::Linear,
+            array_count:       6,
+            array_fill_deg:    360.0,
+            array_rotate_items: true,
+            array_center:      Vec2::new(100.0, 100.0),
+            array_pick_center: false,
+            array_path_idx:    None,
+            array_path_measure: false,
+            array_path_dist:   25.0,
+            array_path_align:  true,
+            array_path_anchor: PathAnchor::Start,
+            array_pick_path:   false,
             picking_source: false,
             array_cols:     10,
             array_rows:     10,
@@ -49725,6 +49750,152 @@ impl CadApp {
 
     // ---- array generator -----------------------------------------------
 
+
+    /// POLAR array — `array_count` copies of every source stepped evenly
+    /// around `array_center` over `array_fill_deg` total. The first copy is
+    /// the source itself (skipped). `array_rotate_items` spins each copy
+    /// about the pole (AutoCAD default); off = revolve the bbox anchor
+    /// without spinning.
+    fn generate_polar_array(&mut self) {
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        if sources.is_empty() {
+            self.history.push("  ! array: no sources selected".into());
+            return;
+        }
+        let count = self.array_count.max(1);
+        let center = self.array_center;
+        let new_dobjects = count.saturating_sub(1) * sources.len();
+        if new_dobjects == 0 {
+            self.history.push("  ! array (polar): count must be ≥ 2".into());
+            return;
+        }
+        // A full 360° fill must NOT double up item 0 and item `count` on the
+        // same spot — the step divides the fill by `count` for a full circle
+        // and by `count-1` for a partial fan (AutoCAD convention).
+        let full = (self.array_fill_deg.abs() - 360.0).abs() < 1e-6;
+        let divisor = if full { count } else { (count - 1).max(1) };
+        let step = (self.array_fill_deg / divisor as f64).to_radians();
+        let rotate = self.array_rotate_items;
+
+        self.doc.dobjects.reserve(new_dobjects);
+        for k in 1..count {
+            let ang = step * k as f64;
+            let (sn, cs) = ang.sin_cos();
+            for d in duplicate_dobjects(&sources, |g| {
+                if rotate {
+                    g.rotated(center, ang)
+                } else {
+                    let (mn, mx) = g.bbox();
+                    let anchor = (mn + mx) * 0.5;
+                    let rel = anchor - center;
+                    let moved = center + Vec2::new(rel.x * cs - rel.y * sn,
+                                                   rel.x * sn + rel.y * cs);
+                    g.translated(moved - anchor)
+                }
+            }) {
+                self.doc.dobjects.push(d);
+            }
+        }
+        let new_total = self.doc.dobjects.len();
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty   = true;
+        self.history.push(format!(
+            "  + array (polar): {} items × {} source(s) over {}° = {} new → {} total",
+            count, sources.len(), self.array_fill_deg, new_dobjects, new_total,
+        ));
+        self.ensure_index();
+    }
+
+    /// The (point, tangent-angle) placements for a PATH array along
+    /// `path_geom`, honouring divide/measure spacing + the L/M/R anchor.
+    /// Empty if the path can't be sampled.
+    fn path_array_placements(&self, path_geom: &Geom) -> Vec<(Vec2, f64)> {
+        let pts = sample_path_points(path_geom, 600);
+        if pts.len() < 2 { return Vec::new(); }
+        let mut cum = vec![0.0_f64; pts.len()];
+        for i in 1..pts.len() { cum[i] = cum[i - 1] + pts[i].dist(pts[i - 1]); }
+        let total = cum[pts.len() - 1];
+        if total < 1e-9 { return Vec::new(); }
+        let at = |s: f64| -> (Vec2, f64) {
+            let s = s.clamp(0.0, total);
+            let mut i = 1;
+            while i < pts.len() && cum[i] < s { i += 1; }
+            let i = i.min(pts.len() - 1);
+            let seg = cum[i] - cum[i - 1];
+            let f = if seg > 1e-12 { (s - cum[i - 1]) / seg } else { 0.0 };
+            let p = pts[i - 1] + (pts[i] - pts[i - 1]) * f;
+            let dir = pts[i] - pts[i - 1];
+            (p, dir.y.atan2(dir.x))
+        };
+        let ss: Vec<f64> = if self.array_path_measure {
+            let dist = self.array_path_dist.abs().max(1e-6);
+            let count = ((total / dist).floor() as usize + 1).max(1);
+            let span = count.saturating_sub(1) as f64 * dist;
+            let base = match self.array_path_anchor {
+                PathAnchor::Start  => 0.0,
+                PathAnchor::End    => total - span,
+                PathAnchor::Middle => (total - span) * 0.5,
+            };
+            (0..count).map(|k| base + k as f64 * dist).collect()
+        } else {
+            let count = self.array_count.max(2);
+            (0..count).map(|k| total * k as f64 / (count - 1) as f64).collect()
+        };
+        ss.into_iter().map(at).collect()
+    }
+
+    /// PATH array — copies of every source at each path placement, rotated
+    /// onto the tangent when `array_path_align`. Sources are always kept.
+    fn generate_path_array(&mut self) {
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        if sources.is_empty() {
+            self.history.push("  ! array: no sources selected".into());
+            return;
+        }
+        let Some(pi) = self.array_path_idx else {
+            self.history.push("  ! array (path): pick a path curve first".into());
+            return;
+        };
+        let Some(path_geom) = self.doc.dobjects.get(pi).map(|d| d.geom.clone()) else {
+            self.history.push("  ! array (path): the path dobject is gone — re-pick".into());
+            return;
+        };
+        let placements = self.path_array_placements(&path_geom);
+        if placements.len() < 2 {
+            self.history.push("  ! array (path): that dobject isn't a usable path curve".into());
+            return;
+        }
+        let base_ang = placements[0].1;
+        let align = self.array_path_align;
+        self.doc.dobjects.reserve(placements.len() * sources.len());
+        for (pt, ang) in &placements {
+            let (pt, ang) = (*pt, *ang);
+            let rot = if align { ang - base_ang } else { 0.0 };
+            for d in duplicate_dobjects(&sources, |g| {
+                let (mn, mx) = g.bbox();
+                let anchor = (mn + mx) * 0.5;
+                let g = g.translated(pt - anchor);
+                if align { g.rotated(pt, rot) } else { g }
+            }) {
+                self.doc.dobjects.push(d);
+            }
+        }
+        let new_total = self.doc.dobjects.len();
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty   = true;
+        self.history.push(format!(
+            "  + array (path): {} items × {} source(s) along #{} = {} new → {} total",
+            placements.len(), sources.len(), pi, placements.len() * sources.len(), new_total,
+        ));
+        self.ensure_index();
+    }
+
     fn generate_array(&mut self) {
         // Multi-source: iterate `self.selection` (the standard basket).
         // Every grid cell instantiates a copy of every source, offset
@@ -52220,6 +52391,14 @@ const MENU_FLYOUT_CLOSE_DELAY: f64 = 0.30;
 /// from `&self` (`flyout_items`) so dynamic content (block names, current
 /// method/style, toggle state, live labels) is always current; a click commits via
 /// `flyout_activate`. Submenus nest: a `Styles` row opens `DimStylePick`, etc.
+/// ARRAY method — which generator the Array dialog's Apply runs.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ArrayMethod { Linear, Polar, Path }
+
+/// PATH-array anchor along the path (measure mode): first / last / centred.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum PathAnchor { Start, Middle, End }
+
 /// QSELECT dialog state (AutoCAD QSELECT analog). `None` filters mean
 /// "All". `include` = the matches become the new selection; `exclude` =
 /// everything EXCEPT the matches. Floating-only panel.
@@ -54545,6 +54724,16 @@ impl eframe::App for CadApp {
                 self.boundary_state = BoundaryState::Off;
                 self.history.push("  boundary cancelled".into());
             }
+            if self.array_pick_center {
+                self.array_pick_center = false;
+                self.clear_prompt();
+                self.history.push("  array (polar) centre pick cancelled".into());
+            }
+            if self.array_pick_path {
+                self.array_pick_path = false;
+                self.clear_prompt();
+                self.history.push("  array (path) pick cancelled".into());
+            }
             if self.ray_state != RayState::Off {
                 self.ray_state = RayState::Off;
                 self.history.push("  ray cancelled".into());
@@ -56110,12 +56299,23 @@ impl eframe::App for CadApp {
                     .filter_map(|&i| self.doc.dobjects.get(i)
                         .map(|d| (i, describe(&d.geom))))
                     .collect();
-                egui::Window::new("Rectangular Array")
+                egui::Window::new("Array")
                     .resizable(false)
                     .collapsible(false)
                     .show(ctx, |ui| {
                         ui.set_min_width(360.0);
-                        ui.label("Duplicates the selected dobject(s) into a grid.");
+                        ui.label("Duplicates the selected dobject(s).");
+                        ui.horizontal(|ui| {
+                            for (m, name) in [(ArrayMethod::Linear, "Linear"),
+                                              (ArrayMethod::Polar, "Polar"),
+                                              (ArrayMethod::Path,  "Path")] {
+                                if ui.selectable_label(self.array_method == m, name).clicked() {
+                                    self.array_method = m;
+                                    self.array_pick_center = false;
+                                    self.array_pick_path = false;
+                                }
+                            }
+                        });
                         ui.separator();
 
                         // Source row: "Select sources" button + count + first-source preview
@@ -56174,8 +56374,107 @@ impl eframe::App for CadApp {
                             ui.add(egui::DragValue::new(&mut self.array_dy).update_while_editing(false).speed(1.0)
                                 .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
                         });
-                        let cells = self.array_cols * self.array_rows;
-                        let new_dobjects = cells.saturating_sub(1) * sources.len().max(1);
+                        // ---- per-method parameters ----
+                        if self.array_method == ArrayMethod::Polar {
+                            ui.horizontal(|ui| {
+                                ui.label("center X");
+                                let calc = &self.calc;
+                                let mut cx = self.array_center.x;
+                                if ui.add(egui::DragValue::new(&mut cx).update_while_editing(false).speed(1.0)
+                                    .custom_parser(move |s| crate::calc::parse_drag(calc, s))).changed() {
+                                    self.array_center.x = cx;
+                                }
+                                ui.label("Y");
+                                let calc = &self.calc;
+                                let mut cy = self.array_center.y;
+                                if ui.add(egui::DragValue::new(&mut cy).update_while_editing(false).speed(1.0)
+                                    .custom_parser(move |s| crate::calc::parse_drag(calc, s))).changed() {
+                                    self.array_center.y = cy;
+                                }
+                                if ui.button(if self.array_pick_center { "Picking…" } else { "Pick ⌖" }).clicked() {
+                                    self.array_pick_center = !self.array_pick_center;
+                                    if self.array_pick_center {
+                                        self.set_prompt("array (polar): click the CENTRE point  [Esc cancels]");
+                                    } else { self.clear_prompt(); }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("items");
+                                let calc = &self.calc;
+                                ui.add(egui::DragValue::new(&mut self.array_count).update_while_editing(false)
+                                    .range(2..=4096_usize).speed(1)
+                                    .custom_parser(move |s| {
+                                        crate::calc::parse_drag_int(calc, s, 2, 4096).map(|n| n as f64)
+                                    }));
+                                ui.label("fill°");
+                                let calc = &self.calc;
+                                ui.add(egui::DragValue::new(&mut self.array_fill_deg).update_while_editing(false)
+                                    .speed(1.0).range(-360.0..=360.0)
+                                    .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
+                            });
+                            ui.checkbox(&mut self.array_rotate_items, "rotate items");
+                        }
+                        if self.array_method == ArrayMethod::Path {
+                            ui.horizontal(|ui| {
+                                let picked = self.array_path_idx
+                                    .map(|pi| self.doc.dobjects.get(pi).is_some()).unwrap_or(false);
+                                if ui.add_enabled(!self.array_pick_path,
+                                    egui::Button::new(if picked { "Re-pick path ✓" } else { "Pick path ⌖" }))
+                                    .clicked()
+                                {
+                                    self.array_pick_path = true;
+                                    self.set_prompt("array (path): click the path CURVE  [Esc cancels]");
+                                }
+                                if self.array_pick_path { ui.label("picking…"); }
+                            });
+                            ui.checkbox(&mut self.array_path_measure, "measure (fixed distance)");
+                            if self.array_path_measure {
+                                ui.horizontal(|ui| {
+                                    ui.label("distance");
+                                    let calc = &self.calc;
+                                    ui.add(egui::DragValue::new(&mut self.array_path_dist).update_while_editing(false)
+                                        .speed(1.0).range(0.001..=1e6)
+                                        .custom_parser(move |s| crate::calc::parse_drag(calc, s)));
+                                });
+                                ui.horizontal(|ui| {
+                                    for (a, name) in [(PathAnchor::Start, "Left"),
+                                                      (PathAnchor::Middle, "Middle"),
+                                                      (PathAnchor::End, "Right")] {
+                                        if ui.selectable_label(self.array_path_anchor == a, name).clicked() {
+                                            self.array_path_anchor = a;
+                                        }
+                                    }
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.label("items");
+                                    let calc = &self.calc;
+                                    ui.add(egui::DragValue::new(&mut self.array_count).update_while_editing(false)
+                                        .range(2..=4096_usize).speed(1)
+                                        .custom_parser(move |s| {
+                                            crate::calc::parse_drag_int(calc, s, 2, 4096).map(|n| n as f64)
+                                        }));
+                                });
+                            }
+                            ui.checkbox(&mut self.array_path_align, "align to path");
+                        }
+                        // ---- count preview ----
+                        let (cells, new_dobjects) = match self.array_method {
+                            ArrayMethod::Linear => {
+                                let c = self.array_cols * self.array_rows;
+                                (c, c.saturating_sub(1) * sources.len().max(1))
+                            }
+                            ArrayMethod::Polar => {
+                                (self.array_count, self.array_count.saturating_sub(1) * sources.len().max(1))
+                            }
+                            ArrayMethod::Path => {
+                                let path_items = self.array_path_idx
+                                    .and_then(|pi| self.doc.dobjects.get(pi).map(|d| d.geom.clone()))
+                                    .map(|g| self.path_array_placements(&g).len())
+                                    .unwrap_or(0);
+                                (path_items, path_items * sources.len().max(1))
+                            }
+                        };
                         let total_after = self.doc.dobjects.len() + new_dobjects;
                         ui.label(format!(
                             "{} cell(s) × {} source(s) = {} new dobjects → {} total",
@@ -56215,7 +56514,15 @@ impl eframe::App for CadApp {
                     self.set_prompt(
                         "array: pick source dobject(s), Enter to finish  [Esc=cancel]".to_string());
                 }
-                if do_generate { self.generate_array(); }
+                if do_generate {
+                    match self.array_method {
+                        ArrayMethod::Linear => self.generate_array(),
+                        ArrayMethod::Polar  => self.generate_polar_array(),
+                        ArrayMethod::Path   => self.generate_path_array(),
+                    }
+                    self.array_pick_center = false;
+                    self.array_pick_path = false;
+                }
                 if close_it    { self.array_open = false; }
             }
         }
@@ -58507,6 +58814,31 @@ impl eframe::App for CadApp {
                         // AREA — a click on a closed object measures it; an
                         // empty click starts/extends the point polygon.
                         self.area_click(click_world);
+                        self.refocus_cmd = true;
+                    } else if self.array_pick_center {
+                        // ARRAY (polar) — this click is the ring centre.
+                        self.array_center = click_world;
+                        self.array_pick_center = false;
+                        self.clear_prompt();
+                        self.history.push(format!(
+                            "  array (polar): centre = ({:.3},{:.3})",
+                            click_world.x, click_world.y));
+                        self.refocus_cmd = true;
+                    } else if self.array_pick_path {
+                        // ARRAY (path) — this click picks the path curve.
+                        let tol = (self.env.PkBxSz.max(8) as f64)
+                            / (self.scale as f64).max(1e-6);
+                        match self.nearest_entity_under(click_world, tol) {
+                            Some(pi) => {
+                                self.array_path_idx = Some(pi);
+                                self.array_pick_path = false;
+                                self.clear_prompt();
+                                self.history.push(format!(
+                                    "  array (path): path = #{}", pi));
+                            }
+                            None => self.history.push(
+                                "  array (path) — click ON a curve; missed".into()),
+                        }
                         self.refocus_cmd = true;
                     } else if self.boundary_state == BoundaryState::WaitingForPick {
                         // BOUNDARY — click INSIDE a closed region (place-multiple).
@@ -83761,5 +84093,84 @@ mod region_boundary_tests {
         assert!(added.iter().any(|d| matches!(&d.geom,
                 Geom::Polyline(p) if p.closed && p.vertices.len() == 4)),
             "closed 4-vertex polyline traced");
+    }
+}
+
+#[cfg(test)]
+mod array_polar_path_tests {
+    use super::*;
+
+    fn mk_source(app: &mut CadApp) -> usize {
+        app.selection.clear();
+        app.doc.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(2.0, 0.0) })))
+    }
+
+    #[test]
+    fn polar_array_rings_around_the_centre() {
+        let mut app = CadApp::default();
+        let src = mk_source(&mut app);
+        app.selection = vec![src];
+        app.array_method = ArrayMethod::Polar;
+        app.array_count = 8;
+        app.array_fill_deg = 360.0;
+        app.array_rotate_items = false;
+        app.array_center = Vec2::ZERO;
+        let before = app.doc.dobjects.len();
+        app.generate_polar_array();
+        assert_eq!(app.doc.dobjects.len(), before + 7,
+            "8 items: source + 7 copies");
+        // Copies sit on a ring of radius 2 around the origin (source bbox
+        // anchor starts at (1,0), so revolve keeps distance 1... every copy
+        // bbox-anchored at distance ~1 from the centre).
+        let copies: Vec<Vec2> = app.doc.dobjects[before..].iter()
+            .map(|d| d.geom.bbox()).map(|(mn, mx)| (mn + mx) * 0.5).collect();
+        for c in &copies {
+            assert!((c.len() - 1.0).abs() < 1e-6,
+                "copy anchor on the 1-unit ring: {:?}", c);
+        }
+    }
+
+    #[test]
+    fn path_array_measure_places_items_along_a_line() {
+        let mut app = CadApp::default();
+        let src = mk_source(&mut app);
+        let path = app.doc.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(50.0, 0.0) })));
+        app.selection = vec![src];
+        app.array_method = ArrayMethod::Path;
+        app.array_path_idx = Some(path);
+        app.array_path_measure = true;
+        app.array_path_dist = 10.0;
+        app.array_path_anchor = PathAnchor::Start;
+        app.array_path_align = false;
+        let before = app.doc.dobjects.len();
+        app.generate_path_array();
+        // 50-unit path @ 10-unit spacing = 6 placements (0..50).
+        assert_eq!(app.doc.dobjects.len(), before + 6,
+            "6 path placements × 1 source");
+        // Copies are centred on the path samples (bbox centre → path pt).
+        let cs: Vec<f64> = app.doc.dobjects[before..].iter()
+            .map(|d| d.geom.bbox()).map(|(mn, mx)| (mn.x + mx.x) * 0.5).collect();
+        assert!((cs[0] - 0.0).abs() < 1e-6 && (cs[5] - 50.0).abs() < 1e-6,
+            "centred on the path samples 0..50 @10: {:?}", cs);
+    }
+
+    #[test]
+    fn path_array_divide_spans_the_whole_path() {
+        let mut app = CadApp::default();
+        let src = mk_source(&mut app);
+        let path = app.doc.push(DObject::new(Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(40.0, 0.0) })));
+        app.selection = vec![src];
+        app.array_method = ArrayMethod::Path;
+        app.array_path_idx = Some(path);
+        app.array_path_measure = false;
+        app.array_count = 5;
+        app.array_path_align = false;
+        let before = app.doc.dobjects.len();
+        app.generate_path_array();
+        assert_eq!(app.doc.dobjects.len(), before + 5,
+            "5 divide placements fill the path");
     }
 }
