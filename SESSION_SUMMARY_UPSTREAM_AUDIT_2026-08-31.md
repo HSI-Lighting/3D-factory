@@ -138,7 +138,38 @@ XREF/WBLOCK, ATTDEF/ATTEDIT, polar/path ARRAY, per-layout Plot dialog,
 plus the two architecture decisions. The next items are dialog/UI-heavy
 or need draw-pipeline arms, so they were left for interactive sessions.
 
-## 2026-09-05 — handoff state
+## 2026-09-05 (evening) — backlog batch 4 (this machine, fe736d3..17728c8)
+
+- `fe736d3` — QDIM (batch aligned linear dims over selected segments) +
+  QSELECT panel (type/layer/colour/linetype filters, include/exclude).
+- `ce5cd54` — LAYWALK (layer isolation preview panel w/ filter; Apply keeps
+  / Close restores the snapshot).
+- `fb7732f` — PDMODE/PDSIZE point styles: `point_style_name` /
+  `paint_point_style` / `point_half_px`; points now render their stamped
+  style+size; Point tool stamps current style/size; typed `pdmode`/`pd`/
+  `ddptype` opens the Point Style picker grid.
+- `6ff282f` — XLINE / RAY / DONUT / WIPEOUT end-to-end: click flows in the
+  pointer router (H/V/A[deg] typed sub-options for xline/ray), rendering
+  (xline/ray clip to visible world bounds; donut filled ring; wipeout
+  surface mask), kind names. Picking already worked via the kernel
+  distance path.
+- `6f3a432` — CENTERMARK click-to-place (circle/arc click sizes the mark
+  ~18% of radius; `centermark N` override; crosshair render arm).
+- `17728c8` — REGION (selected closed curves → filled Region dobjects on
+  Enter via QueuedOp::Region) + BOUNDARY/BPOLY (hatch tracer emits outer
+  loop + islands as closed polylines per inside-click).
+- Full app suite at HEAD: 1476 passed / 10 pre-existing failures (9
+  mesh_io fbx-texture asset tests + 1 factory wall-env) / 50 ignored;
+  pytest 1473/1473. +21 regression tests this batch.
+- Still open (app-side, confirmed in source cc95970): polar/path ARRAY,
+  XREF/WBLOCK, ATTDEF/ATTEDIT, per-layout Plot dialog, plus the two
+  architecture decisions (hover/designate hatch flow, rail-card dock
+  columns). Kernel/parser surfaces for Array/Xref/AttDef/AttEdit already
+  exist in the fork.
+
+---
+
+## 2026-09-05 — handoff state (batch 3, prior machine)
 
 - `farzad-dev` at `b1fafc0`, worktree clean, pushed to origin (range
   `3b77d70..b1fafc0`, 5 commits: ec82238, e8f8163, 8e5d49c, 7a3346b
