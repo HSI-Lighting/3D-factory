@@ -13,6 +13,51 @@ use std::path::{Path, PathBuf};
 use cad_light::{IesProfile, Material, RaySettings};
 use serde::{Deserialize, Serialize};
 
+/// Embedded-blob keys inside the drawing file (`Document::extra_blobs`) — the
+/// payloads that ride in the RSM v201 section / the DXF `SIMLUX_DATA` XRECORDs
+/// when the user chooses "inside the file" instead of separate JSON files.
+/// `cad_io` transports them opaquely; these keys are the app's half of the
+/// agreement.
+pub const CFG_BLOB: &str = "simlux-config";
+pub const RESULTS_BLOB: &str = "simlux-results";
+
+/// WHERE THE 3D PROJECT'S EXTRA DATA LIVES when the drawing is saved.
+///
+/// * [`ExtraDataStore::Sidecar`] — the historic behaviour: `<drawing>.simlux.json`
+///   (+ `.simlux-result.json`) beside the file.
+/// * [`ExtraDataStore::Embedded`] — the payload is written INSIDE the drawing:
+///   an RSM extra-blobs section (v201) or DXF XRECORDs, so the file is
+///   self-contained and copying just the `.dxf`/`.rsm` carries the project.
+///
+/// Only `.rsm` and `.dxf` can embed. A `.dwg` is written through AutoCAD's
+/// converter and read back with a model-space-only parser, so it is always
+/// stored sidecar-style (see `SavePayload` handling in the app).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ExtraDataStore {
+    #[default]
+    Sidecar,
+    Embedded,
+}
+
+/// THE ONE PLACE THE RULE "can this drawing's extra data ride inside the file?"
+/// lives. `store` is the app's chosen mode and `path` the drawing being written.
+///
+/// EVERY save-side decision must go through this: the worker's actual embed
+/// (`save_file_worker`), the results snapshot gate (`spawn_save_thread`), the
+/// sidecar-result deferral (`save_light_results`), the after-calculation save
+/// (`save_calc_results_embedded`), the failure-dialog retry, and the Save-As
+/// dialog's `.dwg` handling are all copies of this predicate — a drift between
+/// any two of them silently drops a fresh calculation (the deferral stops the
+/// sidecar write while the snapshot gate forgets to embed) or strands a stale
+/// result file that every open then asks about.
+pub fn can_embed(store: ExtraDataStore, path: &std::path::Path) -> bool {
+    if store != ExtraDataStore::Embedded {
+        return false;
+    }
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.ends_with(".dxf") || lower.ends_with(".rsm")
+}
+
 /// One promoted "alive wall" as it survives a save. Mirrors `factory::WallInst`, but
 /// footprint points are `[f32; 2]` rather than `glam::Vec2`: glam is built WITHOUT its
 /// `serde` feature here, and the on-disk shape should not track a maths library's
@@ -537,6 +582,36 @@ pub fn load(drawing: &Path) -> Result<Option<SimluxConfig>, String> {
     let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let cfg: SimluxConfig = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     Ok(Some(cfg))
+}
+
+/// Serialize a config for EMBEDDING inside the drawing file (RSM v201 section /
+/// DXF XRECORD). COMPACT — not the pretty-printed sidecar form: the embedded
+/// copy of a heavy project is written on every save, and indentation would
+/// inflate a 300 MB payload by ~10% for no reader's benefit.
+pub fn cfg_to_embed_bytes(cfg: &SimluxConfig) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(cfg).map_err(|e| e.to_string())
+}
+
+/// Parse a config that came out of the drawing file. Fails the open on a parse
+/// error, exactly like a corrupt sidecar does — silently dropping a 3D project
+/// because its bytes would not parse is how "it loads an older version"
+/// reports itself.
+pub fn cfg_from_embed_bytes(bytes: &[u8]) -> Result<SimluxConfig, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("embedded extra data: {e}"))
+}
+
+/// A compact JSON-string description of what a config holds (counts only), for
+/// the open log and the choose-which-one dialog.
+pub fn cfg_summary(cfg: &SimluxConfig) -> String {
+    let f = &cfg.factory;
+    format!(
+        "{} feature(s), {} wall(s), {} furniture asset(s), {} placed, {} texture(s)",
+        f.model.features.len(),
+        f.walls.len(),
+        f.furniture_lib.len(),
+        f.furniture.len(),
+        f.textures.len(),
+    )
 }
 
 /// PUT `tmp` IN PLACE OF `dest`, retrying, and NEVER destroying `tmp` if it cannot.

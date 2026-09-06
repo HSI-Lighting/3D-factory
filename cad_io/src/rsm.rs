@@ -109,10 +109,24 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 //   * ver 101..=199 — nothing wrote these; refused like a future version.
 //   * ver == 200  — the merged stream: base + their sections + the UNIFIED
 //     units block (name, scene_per_unit, formats, metres_per_unit, source).
+//   * ver == 201  — the merged stream PLUS the extra-blobs section (opaque
+//     per-document application payloads, see `write_extra_blobs`), written
+//     ONLY when the document carries one. A drawing with no extra data is
+//     still written as v200, byte-identical to before, so ordinary files
+//     stay readable by every older build.
 const VERSION: u16  = 200;
+/// The stream version used when the document embeds extra-data blobs (v201:
+/// + one length-prefixed blob section after page setup, inside the CRC).
+const VERSION_WITH_BLOBS: u16 = 201;
+/// The highest stream version this reader accepts — today, v201 (an embedded-
+/// data file). v202+ files are refused like any future version.
+const VERSION_MAX: u16 = VERSION_WITH_BLOBS;
 /// Version gate for the merged UNIFIED units block (v200). Older merged files
 /// do not exist yet — this is the first version of the merged line.
 const V_UNIFIED_UNITS: u16 = 200;
+/// Version gate for the embedded extra-data blobs section (v201). Files older
+/// than that have no section and load with none.
+const V_EXTRA_BLOBS: u16 = 201;
 /// The 3D-Factory lineage's units-only version (its v7 base + units trailer).
 const V_FACTORY_UNITS: u16 = 100;
 
@@ -124,7 +138,12 @@ const V_FACTORY_UNITS: u16 = 100;
 pub fn write_rsm(doc: &Document) -> Vec<u8> {
     let mut w = Vec::with_capacity(1024 + doc.dobjects.len() * 64);
     w.extend_from_slice(&MAGIC);
-    write_u16(&mut w, VERSION);
+    // A drawing with NO embedded extra data is written as plain v200 — byte-identical
+    // to what this writer always produced, so ordinary files never carry the format
+    // bump and every older build keeps opening them. Only a document that actually
+    // embeds payloads (the app's "inside the file" choice) gets the v201 stream.
+    let ver = if doc.extra_blobs.is_empty() { VERSION } else { VERSION_WITH_BLOBS };
+    write_u16(&mut w, ver);
     write_u16(&mut w, 0);
 
     write_linetype_table(&mut w, &doc.linetypes);
@@ -145,6 +164,12 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_layer_states(&mut w, &doc.layer_states);            // v26
     write_ucs(&mut w, &doc.ucs_list, doc.current_ucs);        // v27
     write_page_setup(&mut w, &doc.page_setup);                // v28
+    // v201 — embedded extra-data blobs (opaque name+bytes payloads). Written only
+    // for v201 streams; the section must sit between page setup and the CRC so the
+    // checksum covers it, and the reader (gated on ver >= 201) parses it in place.
+    if ver >= V_EXTRA_BLOBS {
+        write_extra_blobs(&mut w, &doc.extra_blobs);
+    }
 
     // v18 — trailing CRC-32 of everything written above. Appending (rather
     // than wrapping) keeps old readers working: they simply ignore the
@@ -153,6 +178,52 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     w.extend_from_slice(&crc32(&w).to_le_bytes());
 
     w
+}
+
+/// v201 — the extra-data blobs section: `count`, then per blob a length-prefixed
+/// name and the raw payload bytes. The bytes are OPAQUE to the format — JSON from
+/// the app today, anything else later — so this is just transport.
+fn write_extra_blobs(w: &mut Vec<u8>, blobs: &[(String, Vec<u8>)]) {
+    write_u32(w, blobs.len() as u32);
+    for (name, bytes) in blobs {
+        write_str(w, name);
+        write_u64(w, bytes.len() as u64);
+        w.extend_from_slice(bytes);
+    }
+}
+
+/// v201 — read the extra-data blobs section back. A malformed section fails the
+/// open (like every other section): silently dropping application payloads is how
+/// a project's furniture comes back missing.
+fn read_extra_blobs(r: &mut R) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let count = r.u32()?;
+    if count > 1_000_000 {
+        return Err(format!("RSM: extra-blobs section declares {count} blobs — corrupt file"));
+    }
+    let mut out = Vec::with_capacity(count.min(16) as usize);
+    for _ in 0..count {
+        let name = r.str()?;
+        let len = r.u64()?;
+        if len > r.bytes.len() as u64 {
+            return Err("RSM: extra-blob length overruns the file".to_string());
+        }
+        let bytes = r.take(len as usize)?.to_vec();
+        // Names travel unvalidated into later DXF dictionary entries, so refuse
+        // anything a line-oriented format could be poisoned with. The section is
+        // still consumed (we are past the name and length already).
+        if !blob_name_ok(&name) {
+            continue;
+        }
+        out.push((name, bytes));
+    }
+    Ok(out)
+}
+
+/// A blob name that is safe to write out as a DXF dictionary entry name —
+/// printable ASCII, short. The RSM format itself is binary and could carry
+/// anything, but the app writes both formats from one document.
+fn blob_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && name.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 
 /// CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320), table-driven and
@@ -1114,10 +1185,10 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     let _embedded_ver = magic[3];   // historic; today we read VERSION below
     let ver = r.u16()?;
     let _pad = r.u16()?;
-    if ver > VERSION {
+    if ver > VERSION_MAX {
         return Err(format!(
             "RSM: file version {} is newer than this build reads (v{})",
-            ver, VERSION));
+            ver, VERSION_MAX));
     }
 
     let linetypes  = read_linetype_table(&mut r)?;
@@ -1242,6 +1313,13 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     } else {
         cad_kernel::pagesetup::PageSetup::default()
     };
+    // v201 — embedded extra-data blobs (opaque application payloads). Older
+    // files have no section and load with none.
+    let extra_blobs = if ver >= V_EXTRA_BLOBS {
+        read_extra_blobs(&mut r)?
+    } else {
+        Vec::new()
+    };
     if !groups.is_empty() {
         let mut live: std::collections::HashSet<u64> = std::collections::HashSet::new();
         live.extend(dobjects.iter().map(|d| d.handle));
@@ -1295,6 +1373,7 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
         ucs_list,
         current_ucs,
         page_setup,
+        extra_blobs,
         ..Document::default()
     })
 }
@@ -3213,5 +3292,60 @@ mod tests {
         let bytes = write_rsm(&doc);
         // < 100 KB headroom — typical is ~70 KB for 1000 lines + table overhead.
         assert!(bytes.len() < 100_000, "1000 lines → {} bytes (expected < 100k)", bytes.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v201 extra-blobs section (Document::extra_blobs)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod extra_blob_tests {
+    use super::*;
+
+    fn read(bytes: &[u8]) -> Document {
+        read_rsm(bytes).expect("parse")
+    }
+    fn write(doc: &Document) -> Vec<u8> {
+        write_rsm(doc)
+    }
+
+    fn version_of(bytes: &[u8]) -> u16 {
+        u16::from_le_bytes(bytes[4..6].try_into().unwrap())
+    }
+
+    #[test]
+    fn blobs_round_trip_and_bump_the_version_to_201() {
+        let mut d = Document::default();
+        d.set_extra_blob("simlux-config", b"{\"cfg\":true}".to_vec());
+        d.set_extra_blob("simlux-results", vec![0u8, 1, 2, 3, 250, 251, 252]);
+        let bytes = write(&d);
+        assert_eq!(version_of(&bytes), 201, "a file with embedded data is v201");
+        let back = read(&bytes);
+        assert_eq!(back.extra_blob("simlux-config"), Some(&b"{\"cfg\":true}"[..]));
+        assert_eq!(
+            back.extra_blob("simlux-results"),
+            Some(&[0u8, 1, 2, 3, 250, 251, 252][..]),
+            "binary payload bytes must survive verbatim",
+        );
+    }
+
+    /// A large blob (the app's furniture payloads run to hundreds of MB) is
+    /// length-prefixed and restored whole — not bounded by any small-count limit.
+    #[test]
+    fn a_large_blob_survives() {
+        let mut d = Document::default();
+        let big: Vec<u8> = (0..1_000_000u32).map(|k| (k % 251) as u8).collect();
+        d.set_extra_blob("big", big.clone());
+        let back = read(&write(&d));
+        assert_eq!(back.extra_blob("big"), Some(big.as_slice()));
+    }
+
+    /// A drawing with NO extra data is still written as plain v200 — byte layout
+    /// unchanged, so every older build opens ordinary files as it always did.
+    #[test]
+    fn no_blobs_keeps_version_200() {
+        let bytes = write(&Document::default());
+        assert_eq!(version_of(&bytes), 200);
     }
 }

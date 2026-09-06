@@ -100,6 +100,20 @@ pub struct Document {
     /// Model-space page setup (PAGESETUP) — the Plot dialog starts from this
     /// and `pagesetup` edits it. Persisted in RSM (v28+).
     pub page_setup: crate::pagesetup::PageSetup,
+    /// OPAQUE application payloads that ride INSIDE the drawing file instead of
+    /// beside it — the 3D project's extra data (the SIMLUX config + saved light
+    /// results, each JSON) carried by the RSM extra-blobs section (v201) or by
+    /// DXF XRECORDs under the `SIMLUX_DATA` named-objects dictionary.
+    ///
+    /// OPAQUE BY DESIGN: `cad_kernel` only transports name + bytes, `cad_io`
+    /// writes/reads them verbatim, and the app owns the meaning. The kernel has
+    /// no serde and must not grow a dependency on the app's data types.
+    ///
+    /// KEPT EMPTY WHILE A DOCUMENT IS BEING EDITED. The app attaches a payload
+    /// just before serializing a save and takes it back out after a load, so
+    /// the undo history (which snapshots whole `Document`s) never clones
+    /// megabytes of furniture geometry with every edit.
+    pub extra_blobs: Vec<(String, Vec<u8>)>,
     // Reserved for future slices — leave the field list extensible:
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
@@ -131,6 +145,7 @@ impl Default for Document {
             ucs_list:           Vec::new(),
             current_ucs:        0,
             page_setup:         crate::pagesetup::PageSetup::default(),
+            extra_blobs:        Vec::new(),
         }
     }
 }
@@ -176,6 +191,28 @@ impl Document {
         d.adopt_tables_from(self);
         d.units = self.units.clone();
         d
+    }
+
+    /// Set (or replace) one embedded extra-data blob, by name.
+    pub fn set_extra_blob(&mut self, name: &str, bytes: Vec<u8>) {
+        self.extra_blobs.retain(|(n, _)| n != name);
+        self.extra_blobs.push((name.to_string(), bytes));
+    }
+
+    /// The embedded extra-data blob with `name`, if any.
+    pub fn extra_blob(&self, name: &str) -> Option<&[u8]> {
+        self.extra_blobs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| b.as_slice())
+    }
+
+    /// Take the embedded extra-data blob with `name` out of the document, if any.
+    /// The app calls this right after a load so the payload bytes are not carried
+    /// into editing snapshots.
+    pub fn take_extra_blob(&mut self, name: &str) -> Option<Vec<u8>> {
+        let i = self.extra_blobs.iter().position(|(n, _)| n == name)?;
+        Some(self.extra_blobs.remove(i).1)
     }
 
     /// Append a Dobject. Returns its new index in `dobjects`.

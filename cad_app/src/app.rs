@@ -969,6 +969,13 @@ struct LoadPayload {
     /// Furniture meshes DECODED on the worker (blob → verts + AABB) — the multi-second part of a
     /// load, kept off the UI thread. Empty when there is no sidecar.
     furniture: Vec<crate::factory::FurnitureAsset>,
+    /// The parsed SIMLUX config EMBEDDED inside the drawing (RSM v201 section /
+    /// DXF XRECORD), when the file carries one. Same drained-`furniture_lib`
+    /// convention as `sidecar`: decoded meshes land in `embedded_furniture`.
+    embedded: Option<crate::simlux_io::SimluxConfig>,
+    embedded_furniture: Vec<crate::factory::FurnitureAsset>,
+    /// The saved light results embedded in the drawing, if the file carried them.
+    embedded_results: Option<crate::light_store::StoredResults>,
     /// Per-stage timings (ms) captured in the worker, re-emitted to the recorder on the main
     /// thread: `(read, parse, sidecar-read+parse, furniture-decode)`.
     read_ms: u64,
@@ -979,6 +986,34 @@ struct LoadPayload {
     /// anything that is not a DWG. Carried rather than logged on the worker, because the worker
     /// has no history panel to log to.
     dwg_note: Option<String>,
+}
+
+/// A drawing that carried BOTH an embedded 3D project AND a `.simlux.json` beside
+/// it — which is the file's extra data? Shown once, right after the open; the
+/// user's answer also decides the storage mode of the next save (following the
+/// file's mode, per the Save-As dialog).
+struct PendingExtraChoice {
+    path: String,
+    /// The sidecar-file source (config + its decoded furniture).
+    sidecar_cfg: Option<crate::simlux_io::SimluxConfig>,
+    sidecar_furn: Vec<crate::factory::FurnitureAsset>,
+    /// The embedded-in-file source.
+    embedded_cfg: Option<crate::simlux_io::SimluxConfig>,
+    embedded_furn: Vec<crate::factory::FurnitureAsset>,
+    /// Embedded saved light results — restored only if the embedded side wins,
+    /// else the sidecar result file is tried (the historic behaviour).
+    embedded_results: Option<crate::light_store::StoredResults>,
+}
+
+/// The answer to the "which copy of the 3D project data?" dialog — and the
+/// storage mode of every later save follows it (a file loaded from its embedded
+/// payload keeps saving embedded; one loaded from its sidecar keeps using the
+/// sidecar). See [`PendingExtraChoice`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtraPick {
+    Embedded,
+    Sidecar,
+    Neither,
 }
 
 /// Result of a save worker: bytes written + a note for the history log.
@@ -1102,10 +1137,45 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
     } else {
         return Err(format!("unknown extension on '{path}': expected .dxf, .dwg or .rsm"));
     };
-    // ---- read + parse the SIMLUX sidecar (historically the slow, freezing stage) ------
+    // ---- read + parse the SIMLUX config: EMBEDDED in the file and/or sidecar ------
+    // Two places the 3D project can live. A drawing saved with "inside the file"
+    // carries its payload as RSM extra-blobs / DXF XRECORDs (taken out of the doc
+    // below, so the loaded document goes to editing with none); one saved with
+    // separate files has `<drawing>.simlux.json` beside it. Both are parsed here
+    // off the UI thread — historically the slow, freezing stage — and when both
+    // exist the MAIN thread asks which one to load (see `apply_loaded`).
+    //
+    // ONLY the two formats this app writes itself can carry an embedded project.
+    // A `.dwg` never gets one on save, and one that shows up anyway (a converter's
+    // DXF may preserve the dictionary from an embedded source file) is dropped —
+    // DWG is always sidecar, and an embedded mode on a file that cannot embed
+    // would strand every later calculation result. Everything else under the
+    // blob keys or with a foreign name is dropped too: blobs exist only between a
+    // load and the app re-embedding its own data at the next save.
     let t3 = std::time::Instant::now();
+    let mut doc = doc;
+    let embeddable_format = lower.ends_with(".dxf") || lower.ends_with(".rsm");
+    let embedded_cfg_bytes = if embeddable_format {
+        doc.take_extra_blob(crate::simlux_io::CFG_BLOB)
+    } else {
+        None
+    };
+    let embedded_results = if embeddable_format {
+        doc.take_extra_blob(crate::simlux_io::RESULTS_BLOB)
+            .and_then(|b| crate::light_store::from_embed_bytes(&b))
+    } else {
+        None
+    };
+    doc.extra_blobs.clear();
     let mut sidecar = crate::simlux_io::load(std::path::Path::new(path))
         .map_err(|e| format!("sidecar: {e}"))?;
+    let mut embedded = match &embedded_cfg_bytes {
+        Some(b) => Some(
+            crate::simlux_io::cfg_from_embed_bytes(b)
+                .map_err(|e| format!("embedded extra data: {e}"))?,
+        ),
+        None => None,
+    };
     let sidecar_ms = t3.elapsed().as_millis() as u64;
     // ---- decode furniture geometry HERE, off the UI thread ----------------------------
     // A 2M-triangle asset is ~74 MB of floats; decoding it (base64+inflate) + computing its
@@ -1118,11 +1188,20 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
         ),
         None => Vec::new(),
     };
+    let embedded_furniture = match embedded.as_mut() {
+        Some(cfg) => crate::factory::FactoryState::decode_furniture_lib(
+            std::mem::take(&mut cfg.factory.furniture_lib),
+        ),
+        None => Vec::new(),
+    };
     let furn_ms = t4.elapsed().as_millis() as u64;
     Ok(Box::new(LoadPayload {
         doc,
         sidecar,
         furniture,
+        embedded,
+        embedded_furniture,
+        embedded_results,
         read_ms,
         parse_ms,
         sidecar_ms,
@@ -1141,10 +1220,18 @@ fn atomic_write(path: &str, bytes: &[u8]) -> std::io::Result<()> {
     // The rename is RETRIED, and the temp is KEPT if it still cannot be done — see
     // `simlux_io::replace_file`. This used to `remove_file(&tmp)` on failure, throwing away the
     // only copy of what had just been written.
-    let tmp = format!("{path}.savetmp");
+    //
+    // The temp name is UNIQUE PER WRITE, exactly like the sidecar writer's: three background
+    // save workers (modal, autosave, after-calculation embed) can now overlap on one path, and
+    // a shared `{path}.savetmp` would let one writer truncate another's temp mid-write and
+    // publish a torn file at the rename.
+    let tmp = format!("{path}.savetmp.{}", TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     std::fs::write(&tmp, bytes)?;
     crate::simlux_io::replace_file(std::path::Path::new(&tmp), std::path::Path::new(path))
 }
+
+/// Sequence for unique `.savetmp` names (see [`atomic_write`]).
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Normalize a document for serialization. At RUNTIME the layer tables live
 /// in the SWAPPED arrangement while a layout tab is active (doc.layers = that
@@ -1167,6 +1254,8 @@ fn save_file_worker(
     doc: Document,
     mut cfg: crate::simlux_io::SimluxConfig,
     furn_geom: Vec<crate::factory::FurnitureGeomRaw>,
+    store: crate::simlux_io::ExtraDataStore,
+    results: Option<crate::light_store::StoredResults>,
 ) -> Result<SavePayload, String> {
     // Compress furniture geometry HERE (deflate of tens of MB) — the expensive part of a save,
     // kept off the UI thread. `cfg` came from `build_simlux_config_lite` with empty blobs, in
@@ -1182,6 +1271,25 @@ fn save_file_worker(
     let mut doc = doc;
     normalize_layers_for_save(&mut doc);
     let lower = path.to_ascii_lowercase();
+    // EMBED or SIDECAR? "Inside the file" is only possible for the two formats this
+    // app writes itself — RSM (its native v201 section) and DXF (its SIMLUX_DATA
+    // XRECORDs). A DWG goes out through AutoCAD's converter and is read back with a
+    // model-space-only parser, so its extra data always lives in the sidecar files.
+    let embed = crate::simlux_io::can_embed(store, std::path::Path::new(path));
+    if embed {
+        // Attach the payload to the document BEFORE the writer runs, so the bytes
+        // land inside the drawing. Compact serialization — this copy is written on
+        // every save and is not meant for human reading (see `cfg_to_embed_bytes`).
+        let cfg_bytes = crate::simlux_io::cfg_to_embed_bytes(&cfg)
+            .map_err(|e| format!("serialize extra data: {e}"))?;
+        doc.set_extra_blob(crate::simlux_io::CFG_BLOB, cfg_bytes);
+        if let Some(r) = results {
+            match crate::light_store::to_embed_bytes(&r) {
+                Ok(b) => doc.set_extra_blob(crate::simlux_io::RESULTS_BLOB, b),
+                Err(e) => return Err(format!("serialize the saved calculation: {e}")),
+            }
+        }
+    }
     let bytes: Vec<u8> = if lower.ends_with(".dxf") || lower.ends_with(".dwg") {
         // A DWG GOES OUT AS DXF FIRST. Nothing here writes DWG — it is closed, versioned and
         // undocumented — so the drawing is written in the format this app owns and handed to the
@@ -1213,8 +1321,10 @@ fn save_file_worker(
     } else {
         atomic_write(path, &bytes).map_err(|e| format!("write '{path}': {e}"))?;
     }
-    // The sidecar is always written (matching the old synchronous path); it carries SIMLUX +
-    // the 3D model. Any sidecar failure is reported but does not fail the drawing save.
+    // The extra data is then stored the way the user chose: embedded in the file just
+    // written (and any now-stale sidecar files removed, so a later open cannot find
+    // two copies and ask which to load), or written as the sidecar it always was.
+    // Either way a failure is reported but does not fail the drawing save.
     let solids = cfg.factory.model.features.len();
     let walls = cfg.factory.walls.len();
     // WHAT WENT INTO THE FILE, COUNTED — including the imports, which are the expensive half of a
@@ -1231,28 +1341,59 @@ fn save_file_worker(
     let texs = cfg.factory.textures.len();
     let imports = format!(", {furn} asset(s)/{insts} placed, {texs} texture(s)");
     let mut simlux_failed = None;
-    let note = match crate::simlux_io::save(std::path::Path::new(path), &cfg) {
-        Ok(_) if solids > 0 => format!(
-            "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s){imports}",
-            path, bytes.len(), solids, walls),
-        Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX{imports}", path, bytes.len()),
-        // NOT "saved". The drawing was written and the SIMLUX half — the 3D model, the furniture,
-        // the fittings, the results — was NOT, and a line that opens with the word "saved" is read
-        // as success and closed on. Reported as: made a calculation, saved, reopened, "nothing was
-        // saved" — because the only thing saying otherwise was a clause at the end of a line that
-        // began by claiming the opposite.
-        Err(e) => {
-            // AND AS DATA, not only as prose. `apply_saved` has to know the project did not reach
-            // disk, and parsing that fact back out of a sentence is how a message and a state come
-            // to disagree about it.
-            simlux_failed = Some(e.clone());
+    let note = if embed {
+        // The stale sidecar pair (project + results) is deleted — the file now IS the
+        // project, and leaving the older copies beside it would make every open ask
+        // which one to load. Best-effort: a file that cannot be removed is left (the
+        // open-time dialog still offers both) and the leftover is NAMED, not silent.
+        let mut leftover = None;
+        let dwg_path = std::path::Path::new(path);
+        for stale in [
+            crate::simlux_io::sidecar_path(dwg_path),
+            crate::light_store::result_path(dwg_path),
+        ] {
+            if stale.exists() {
+                if let Err(e) = std::fs::remove_file(&stale) {
+                    leftover = Some(format!("old '{}' left in place: {}", stale.display(), e));
+                }
+            }
+        }
+        let note = if solids > 0 {
             format!(
-                "  ⚠ SIMLUX DID NOT SAVE — the drawing '{}' was written ({} bytes) but the 3D \
-                 model, furniture, fittings and results were NOT.\n     {}",
-                path,
-                bytes.len(),
-                e,
-            )
+                "  saved '{}'  ({} bytes) · SIMLUX embedded in file: {} solid(s), {} wall(s){imports}",
+                path, bytes.len(), solids, walls)
+        } else {
+            format!("  saved '{}'  ({} bytes) · SIMLUX embedded in file{imports}", path, bytes.len())
+        };
+        match leftover {
+            Some(l) => format!("{note}\n     ⚠ {l}"),
+            None => note,
+        }
+    } else {
+        // THE SIDECAR — written exactly as this worker always wrote it.
+        match crate::simlux_io::save(std::path::Path::new(path), &cfg) {
+            Ok(_) if solids > 0 => format!(
+                "  saved '{}'  ({} bytes) · SIMLUX + {} solid(s), {} wall(s){imports}",
+                path, bytes.len(), solids, walls),
+            Ok(_) => format!("  saved '{}'  ({} bytes) · SIMLUX{imports}", path, bytes.len()),
+            // NOT "saved". The drawing was written and the SIMLUX half — the 3D model, the furniture,
+            // the fittings, the results — was NOT, and a line that opens with the word "saved" is read
+            // as success and closed on. Reported as: made a calculation, saved, reopened, "nothing was
+            // saved" — because the only thing saying otherwise was a clause at the end of a line that
+            // began by claiming the opposite.
+            Err(e) => {
+                // AND AS DATA, not only as prose. `apply_saved` has to know the project did not reach
+                // disk, and parsing that fact back out of a sentence is how a message and a state come
+                // to disagree about it.
+                simlux_failed = Some(e.clone());
+                format!(
+                    "  ⚠ SIMLUX DID NOT SAVE — the drawing '{}' was written ({} bytes) but the 3D \
+                     model, furniture, fittings and results were NOT.\n     {}",
+                    path,
+                    bytes.len(),
+                    e,
+                )
+            }
         }
     };
     Ok(SavePayload { bytes: bytes.len(), note, simlux_failed })
@@ -1294,7 +1435,13 @@ fn convert_dxf_to_dwg(
     // The first version deleted the destination before running the converter, so a conversion that
     // then failed had already destroyed the drawing it was saving over. Caught by the test named
     // for exactly that, which is the reason to write the test before believing the code.
-    let staged = dwg.with_extension("dwg.savetmp");
+    //
+    // Unique per call, like the drawing temp: an after-calculation embed save can run alongside
+    // a modal save, and two converters writing one staging file would fight over it.
+    let staged = dwg.with_extension(format!(
+        "dwg.savetmp.{}",
+        TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_file(&staged);
     let (in_s, out_s) = (dxf.to_string_lossy().to_string(), staged.to_string_lossy().to_string());
 
@@ -2666,6 +2813,27 @@ pub struct CadApp {
     /// Path of the currently open/saved drawing — set on successful open/save.
     /// `Save` writes here directly; `None` falls back to Save As.
     current_file: Option<std::path::PathBuf>,
+    /// Where the 3D project's extra data goes on save: separate `.simlux.json`
+    /// files beside the drawing (the historic behaviour) or embedded INSIDE the
+    /// `.rsm`/`.dxf` (RSM v201 section / DXF XRECORDs).
+    ///
+    /// FOLLOWS THE FILE'S MODE: an open that loaded its project from the file
+    /// sets [`ExtraDataStore::Embedded`], one that used a sidecar sets
+    /// [`ExtraDataStore::Sidecar`] — so plain Save and autosave keep writing
+    /// the way the file was stored, and only the Save-As dialog changes it.
+    /// A `.dwg` is always sidecar (the DWG path cannot carry the payload
+    /// reliably); saving a DWG forces this back to Sidecar.
+    extra_store: crate::simlux_io::ExtraDataStore,
+    /// A just-opened drawing carried BOTH an embedded 3D project and a
+    /// `.simlux.json` beside it — `Some` while the choose-one dialog is up.
+    /// See [`PendingExtraChoice`] and [`Self::render_extra_choice_dialog`].
+    extra_choice: Option<Box<PendingExtraChoice>>,
+    /// A background save carrying a fresh CALCULATION into an embedded-mode
+    /// drawing (the embedded analogue of `save_light_results`) — its result
+    /// channel while one is running, plus a re-try flag for when the app was
+    /// busy (modal save / autosave) at the moment the calculation finished.
+    results_rx: Option<std::sync::mpsc::Receiver<BusyMsg>>,
+    results_due: bool,
     /// True when the drawing has edits not yet written to disk. Set on every snapshot (an edit),
     /// cleared on open/save. Drives the close-confirmation prompt so an accidental window-close
     /// can't silently discard work.
@@ -4228,6 +4396,10 @@ pub struct FileDialog {
     /// Active file-type filter AND (in Save mode) the format extension —
     /// ".dxf" or ".rsm". The directory list shows only files matching it.
     pub ext:      String,
+    /// Save mode only — where the 3D project's extra data goes: inside the file
+    /// (`.dxf`/`.rsm` only) or into separate `.simlux.json` files beside it.
+    /// Seeded from the app's current mode on open; confirming commits the choice.
+    pub embed_extra: bool,
     pub error:    Option<String>,
 }
 
@@ -4235,7 +4407,7 @@ impl FileDialog {
     fn new(mode: FileDialogMode, dir: std::path::PathBuf, ext: &str) -> Self {
         let path_buf = dir.to_string_lossy().to_string();
         FileDialog { mode, dir, filename: String::new(), path_buf,
-                     ext: ext.to_string(), error: None }
+                     ext: ext.to_string(), embed_extra: false, error: None }
     }
 }
 
@@ -5140,6 +5312,10 @@ impl Default for CadApp {
             file_dialog_dir: None,
             file_preview: None,
             current_file: None,
+            extra_store: crate::simlux_io::ExtraDataStore::default(),
+            extra_choice: None,
+            results_rx: None,
+            results_due: false,
             unsaved: false,
             close_confirm: false,
             arch_modal_open: false,
@@ -20305,6 +20481,22 @@ impl CadApp {
             return;
         }
         let Some(path) = self.current_file.clone() else { return };
+        // EMBEDDED MODE HAS NO SIDECAR TO PATCH. The variables ride on the next
+        // save/autosave, which embeds them in the file with everything else — and
+        // `unsaved` is marked so the close guard and the autosave timer actually
+        // fire one. (Patching a fresh sidecar beside an embedded file would
+        // recreate the two-copies situation every open asks about. Rewriting the
+        // whole drawing per variable assignment would make every keystroke a
+        // multi-hundred-MB save.)
+        if self.extra_store == crate::simlux_io::ExtraDataStore::Embedded {
+            self.unsaved = true;
+            self.history.push(
+                "  calc variable set — the drawing stores its data inside the file, so \
+                 variables are embedded on the next save"
+                    .into(),
+            );
+            return;
+        }
         let vars = self.calc.persist_map();
         // A cheap stat decides the path. The no-sidecar case builds the fresh
         // config HERE (the worker cannot borrow the app), so the new sidecar
@@ -38573,18 +38765,14 @@ impl CadApp {
         }
     }
 
-    /// Write the current calculation beside the drawing.
-    ///
-    /// Quiet when there is nothing to write or nowhere to write it. An UNSAVED drawing has no
-    /// path, so its result has nowhere to live — it is picked up by the next save instead, which
-    /// is where the project gets a name.
-    fn save_light_results(&mut self) {
-        let Some(path) = self.current_file.clone() else { return };
-        let Some(fp) = self.light.results_fingerprint else { return };
+    /// The current calculation, as its persisted record — `None` when there is
+    /// nothing to persist (no result, stale, or the fingerprint is missing).
+    fn current_stored_results(&self) -> Option<crate::light_store::StoredResults> {
+        let fp = self.light.results_fingerprint?;
         if self.light.rooms.is_empty() || self.light.results_stale {
-            return;
+            return None;
         }
-        let stored = crate::light_store::StoredResults::of(
+        Some(crate::light_store::StoredResults::of(
             &self.light.rooms,
             &self.light.surfaces,
             &self.light.last_timings,
@@ -38597,7 +38785,29 @@ impl CadApp {
             // THE MODE THE ANSWER WAS COMPUTED IN, not the one the switch is on now -- those are
             // different questions and `results_mode` is the one that describes these numbers.
             self.light.results_mode == Some(crate::light::CalcMode::Express),
-        );
+        ))
+    }
+
+    /// Write the current calculation beside the drawing.
+    ///
+    /// SIDECAR MODE ONLY — in Embedded mode the results ride inside the file on the
+    /// next save (`spawn_save_thread` embeds `current_stored_results`), and after a
+    /// fresh calculation `save_calc_results_embedded` writes the file right away.
+    ///
+    /// Quiet when there is nothing to write or nowhere to write it. An UNSAVED drawing has no
+    /// path, so its result has nowhere to live — it is picked up by the next save instead, which
+    /// is where the project gets a name.
+    fn save_light_results(&mut self) {
+        // EMBEDDED MODE: results ride inside the file on the next save. A drawing
+        // whose format cannot embed (DWG) is never in that mode — but check the
+        // format too, so a stale flag can never strand a result.
+        if let Some(p) = &self.current_file {
+            if crate::simlux_io::can_embed(self.extra_store, p) {
+                return;
+            }
+        }
+        let Some(path) = self.current_file.clone() else { return };
+        let Some(stored) = self.current_stored_results() else { return };
         match crate::light_store::save(&path, &stored) {
             Ok(p) => self.history.push(format!(
                 "  calculation saved → '{}' ({} room(s))",
@@ -38610,12 +38820,93 @@ impl CadApp {
         }
     }
 
+    /// After a calculation on an EMBEDDED-mode drawing: the result is not its own
+    /// small file, so keeping it crash-safe means re-writing the drawing with the
+    /// result inside it. Exactly what the sidecar mode does for a result alone,
+    /// only heavier — a background save through the same worker the autosave uses,
+    /// so the UI never waits on it. Runs when the app is idle; the re-try flag
+    /// makes a save that lost the race (modal save / autosave in flight) fire once
+    /// that save is done instead of being dropped.
+    fn save_calc_results_embedded(&mut self) {
+        // The mode can change (Save As) between a calculation finishing and this
+        // running; a drawing that cannot embed has no embedded results to protect.
+        if !self.can_embed_current() {
+            self.results_due = false;
+            return;
+        }
+        if self.busy.is_some() || self.autosave_rx.is_some() || self.results_rx.is_some() {
+            self.results_due = true;
+            return;
+        }
+        let Some(path) = self.current_file.clone() else { return };
+        if self.current_stored_results().is_none() {
+            return; // nothing to persist yet (nothing was calculated)
+        }
+        self.results_due = false;
+        self.results_rx = Some(self.spawn_save_thread(path.to_string_lossy().into_owned()));
+    }
+
+    /// Drain a background after-calculation embed save (see [`Self::save_calc_results_embedded`])
+    /// and re-try one that was deferred while another save was running.
+    fn tick_results_save(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        if let Some(rx) = &self.results_rx {
+            match rx.try_recv() {
+                Ok(BusyMsg::Saved(res)) => {
+                    self.results_rx = None;
+                    match res {
+                        Ok(p) => {
+                            let where_ = self
+                                .current_file
+                                .clone()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            self.history.push(format!(
+                                "  calculation saved → embedded in '{where_}' ({} bytes)",
+                                p.bytes
+                            ));
+                        }
+                        Err(e) => self.history.push(format!("  ! calculation not saved: {e}")),
+                    }
+                }
+                Ok(_) => self.results_rx = None,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => self.results_rx = None,
+            }
+        }
+        if self.results_due
+            && self.busy.is_none()
+            && self.autosave_rx.is_none()
+            && self.results_rx.is_none()
+        {
+            self.save_calc_results_embedded();
+        }
+    }
+
+    /// Whether the CURRENT file is in embedded mode on a format that can embed —
+    /// the `can_embed` rule applied to `extra_store` + `current_file`. One
+    /// definition, so the results-save path and the deferral gates cannot drift.
+    fn can_embed_current(&self) -> bool {
+        match &self.current_file {
+            Some(p) => crate::simlux_io::can_embed(self.extra_store, p),
+            None => false,
+        }
+    }
+
     /// Read back the calculation saved beside `drawing`, if it still describes this scene.
     ///
     /// Called after the project is fully installed — the model has to be standing before the
     /// fingerprint means anything, since it is mostly a hash of the model.
     fn restore_light_results(&mut self, drawing: &std::path::Path) {
-        let Some(stored) = crate::light_store::load(drawing) else { return };
+        let stored = crate::light_store::load(drawing);
+        self.restore_light_results_from(stored);
+    }
+
+    /// Install a stored calculation (from the sidecar result file, or embedded in
+    /// the drawing) if it still describes this scene. See [`Self::restore_light_results`]
+    /// for the ordering contract.
+    fn restore_light_results_from(&mut self, stored: Option<crate::light_store::StoredResults>) {
+        let Some(stored) = stored else { return };
         let plan = self.plan_doc().clone();
         let Some(current) = self.light.current_fingerprint(&plan, Some(&self.factory)) else {
             return;
@@ -38672,7 +38963,15 @@ impl CadApp {
                     // protects against is the app never reaching a save — a crash, a power cut, or
                     // somebody closing the window on a result they were still reading — and a
                     // minutes-long answer held only in memory is exactly what those lose.
-                    self.save_light_results();
+                    //
+                    // The shape depends on where the project lives: a sidecar-mode drawing gets
+                    // its small result file; an embedded-mode drawing is re-saved on a background
+                    // worker with the result inside it.
+                    if self.extra_store == crate::simlux_io::ExtraDataStore::Embedded {
+                        self.save_calc_results_embedded();
+                    } else {
+                        self.save_light_results();
+                    }
                 }
                 self.touch_view();
                 return;
@@ -41618,7 +41917,7 @@ impl CadApp {
                 let dropped = self.factory.apply_persist_prebuilt(fac, furniture);
                 self.refresh_aperture_transparency();
                 self.light.apply_config(cfg, &self.doc);
-                self.history.push("  SIMLUX setup loaded (sidecar)".into());
+                self.history.push("  SIMLUX setup loaded".into());
                 if had_solids {
                     // Show the building rather than leaving it invisible behind a closed
                     // panel — a restored model the user cannot see reads as "not loaded".
@@ -41724,6 +42023,17 @@ impl CadApp {
         self.env.GrdSpc * plan_k / active_k
     }
     fn do_save(&mut self, path: &str) {
+        // While the "which copy of the 3D project data?" question is up, the
+        // factory is still EMPTY and its mode unset — saving now would write the
+        // blank state over whichever copy the user is about to pick.
+        if self.extra_choice.is_some() {
+            self.history.push(
+                "  ! save deferred — this drawing has two copies of its 3D project data; pick \
+                 which one to load first"
+                    .into(),
+            );
+            return;
+        }
         let est = self.last_save_ms.max(200);
         self.busy = Some(BusyOp {
             kind: BusyKind::Save,
@@ -41770,6 +42080,14 @@ impl CadApp {
         let Some(b) = self.busy.as_ref() else { return };
         let kind = b.kind;
         let path = b.path.clone();
+        // A modal save must never run beside the background after-calculation
+        // save: both write the same drawing, and the older snapshot of the
+        // results save could land last and silently revert newer edits. Wait a
+        // frame (the state machine above calls this every frame until `rx` is
+        // set), so the results worker drains first.
+        if kind == BusyKind::Save && self.results_rx.is_some() {
+            return;
+        }
         let rx = match kind {
             BusyKind::Load => {
                 let (tx, rx) = std::sync::mpsc::channel::<BusyMsg>();
@@ -41786,16 +42104,28 @@ impl CadApp {
 
     /// Prepare the save on the MAIN thread (a doc clone + a config with empty furniture blobs +
     /// the raw flattened geometry — all fast memcpy) and hand it to a background worker that does
-    /// the deflate + serialize + write. Returns the result channel. Shared by the modal Save and
-    /// the silent autosave.
+    /// the deflate + serialize + write. Returns the result channel. Shared by the modal Save, the
+    /// silent autosave, and the after-a-calculation embed save.
+    ///
+    /// In EMBEDDED mode the current saved calculation is snapshotted here (main thread) and rides
+    /// inside the file with the config; in Sidecar mode it is written out separately afterwards
+    /// by `save_light_results`, exactly as it always was.
     fn spawn_save_thread(&self, path: String) -> std::sync::mpsc::Receiver<BusyMsg> {
         let (tx, rx) = std::sync::mpsc::channel::<BusyMsg>();
         // The PLAN, not whatever document a live face-sketch has parked in `self.doc`.
         let doc = self.plan_doc().clone();
         let cfg = self.build_simlux_config_lite();
         let geom = self.factory.furniture_geom_flat();
+        let store = self.extra_store;
+        let results = if crate::simlux_io::can_embed(store, std::path::Path::new(&path)) {
+            self.current_stored_results()
+        } else {
+            None
+        };
         std::thread::spawn(move || {
-            let _ = tx.send(BusyMsg::Saved(save_file_worker(&path, doc, cfg, geom)));
+            let _ = tx.send(BusyMsg::Saved(save_file_worker(
+                &path, doc, cfg, geom, store, results,
+            )));
         });
         rx
     }
@@ -41808,6 +42138,9 @@ impl CadApp {
             doc,
             sidecar,
             furniture,
+            embedded,
+            embedded_furniture,
+            embedded_results,
             read_ms,
             parse_ms,
             sidecar_ms,
@@ -41821,6 +42154,11 @@ impl CadApp {
         // would mean the eventual `factory_exit_sketch` restores the OLD drawing over the one
         // just opened, and files the newly opened drawing away inside a sketch slot.
         self.factory_exit_sketch();
+        // A NEW OPEN REPLACES THE DOCUMENT, so any unanswered "which copy of the 3D project
+        // data?" question from the PREVIOUS file is void — keeping it would let an answer
+        // install the old file's project and storage mode onto the one just opened (and would
+        // refuse every save on the new file until answered).
+        self.extra_choice = None;
         // Re-emit the worker's stage timings to the recorder so a slow open still pins blame.
         self.stage_evt("read file", 0, std::time::Duration::from_millis(read_ms), "worker");
         self.stage_evt("parse doc", n, std::time::Duration::from_millis(parse_ms), "worker");
@@ -41846,18 +42184,57 @@ impl CadApp {
         // Frame the drawing, record where the file came from.
         self.fit_view_to_drawing();
         self.current_file = Some(std::path::PathBuf::from(path));
-        // Apply the SIMLUX sidecar (may rebuild the 3D model — the one recompute() we pay on open).
-        // Furniture was decoded on the worker, so this no longer blocks on a huge mesh.
+        // Apply the SIMLUX extra data (may rebuild the 3D model — the one recompute() we pay on
+        // open). Furniture was decoded on the worker, so this no longer blocks on a huge mesh.
+        //
+        // THREE sources can exist: embedded in the file, the `.simlux.json` beside it — and
+        // BOTH at once (an older sidecar next to a file saved "inside itself"). Both is a real
+        // question for the user, asked once; one is applied straight away.
         self.stage_evt("sidecar", n, std::time::Duration::from_millis(sidecar_ms), "worker parse");
-        self.stage_evt("furniture decode", furniture.len(), std::time::Duration::from_millis(furn_ms), "worker");
-        if let Some(cfg) = sidecar {
+        self.stage_evt("furniture decode",
+            furniture.len() + embedded_furniture.len(),
+            std::time::Duration::from_millis(furn_ms), "worker");
+        if sidecar.is_some() && embedded.is_some() {
+            // Hold both until the user says which one this file's project is. The drawing and
+            // its unit are installed below; the 3D install happens on the answer.
+            self.extra_choice = Some(Box::new(PendingExtraChoice {
+                path: path.to_string(),
+                sidecar_cfg: sidecar,
+                sidecar_furn: furniture,
+                embedded_cfg: embedded,
+                embedded_furn: embedded_furniture,
+                embedded_results,
+            }));
+            self.history.push(format!(
+                "  ⚠ extra data: the drawing embeds a 3D project AND '{}' sits beside it — \
+                 which one loads?",
+                crate::simlux_io::sidecar_path(std::path::Path::new(path))
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "simlux.json".into()),
+            ));
+        } else if let Some(cfg) = sidecar {
+            self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
             self.install_simlux_config(cfg, furniture);
+            // AFTER the extra data, never before: the fingerprint a stored result is checked
+            // against is mostly a hash of the 3D model, and until `install_simlux_config` has
+            // rebuilt it this project looks like an empty one — every saved result would read
+            // as belonging to a different building and be refused.
+            self.restore_light_results(std::path::Path::new(path));
+        } else if let Some(cfg) = embedded {
+            self.extra_store = crate::simlux_io::ExtraDataStore::Embedded;
+            self.install_simlux_config(cfg, embedded_furniture);
+            // The file's own embedded results first; the sidecar result file as the fallback
+            // for a drawing that was embedded after its last calculation.
+            let stored = embedded_results
+                .or_else(|| crate::light_store::load(std::path::Path::new(path)));
+            self.restore_light_results_from(stored);
+        } else {
+            // No project anywhere (a plain drawing) — the historic behaviour: the next save
+            // writes a fresh sidecar beside it.
+            self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
+            self.restore_light_results(std::path::Path::new(path));
         }
-        // AFTER the sidecar, never before: the fingerprint a stored result is checked against is
-        // mostly a hash of the 3D model, and until `install_simlux_config` has rebuilt it this
-        // project looks like an empty one — every saved result would read as belonging to a
-        // different building and be refused.
-        self.restore_light_results(std::path::Path::new(path));
         self.unsaved = false; // freshly opened → matches the file on disk
         self.history.push(format!(
             "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l));
@@ -42005,6 +42382,122 @@ impl CadApp {
         ))
     }
 
+    /// Install whichever copy of the 3D project data the user chose. Runs on the
+    /// main thread, exactly like the equivalent branch of [`Self::apply_loaded`].
+    fn choose_extra_data(&mut self, pick: ExtraPick) {
+        let Some(p) = self.extra_choice.take() else { return };
+        let p = *p;
+        let path = std::path::PathBuf::from(&p.path);
+        match pick {
+            ExtraPick::Embedded => {
+                self.extra_store = crate::simlux_io::ExtraDataStore::Embedded;
+                if let Some(cfg) = p.embedded_cfg {
+                    self.install_simlux_config(cfg, p.embedded_furn);
+                    // The file's own results first; the sidecar result file as a
+                    // fallback (a project embedded after its last calculation).
+                    let stored = p.embedded_results
+                        .or_else(|| crate::light_store::load(&path));
+                    self.restore_light_results_from(stored);
+                }
+                self.history.push(format!(
+                    "  extra data: loaded the copy inside '{}' — further saves keep it inside \
+                     the file",
+                    p.path
+                ));
+            }
+            ExtraPick::Sidecar => {
+                self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
+                if let Some(cfg) = p.sidecar_cfg {
+                    self.install_simlux_config(cfg, p.sidecar_furn);
+                    self.restore_light_results(&path);
+                }
+                self.history.push(format!(
+                    "  extra data: loaded the .simlux.json copy beside '{}' — further saves keep \
+                     using separate files",
+                    p.path
+                ));
+            }
+            ExtraPick::Neither => {
+                self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
+                self.history.push(format!(
+                    "  extra data: nothing loaded — drawing '{}' opened without its 3D project",
+                    p.path
+                ));
+            }
+        }
+        self.touch_view();
+    }
+
+    /// A drawing that carries BOTH an embedded 3D project and a `.simlux.json`
+    /// beside it — show the choice once, after the open; the drawing itself is
+    /// already on screen. Nothing can proceed on the 3D side until it is answered
+    /// (the model the fixtures and results belong to is whichever copy is chosen),
+    /// so the dialog stays until one of the three options is clicked.
+    fn render_extra_choice_dialog(&mut self, ctx: &egui::Context) {
+        let Some(p) = &self.extra_choice else { return };
+        let mut pick: Option<ExtraPick> = None;
+        egui::Window::new("Which 3D project data should load?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.label(
+                    "This drawing has TWO copies of its 3D project data (the model, furniture, \
+                     materials and lighting):",
+                );
+                ui.add_space(6.0);
+                for (label, cfg) in [
+                    ("Inside the drawing file".to_string(), p.embedded_cfg.as_ref()),
+                    (
+                        format!(
+                            "Beside it — {}",
+                            crate::simlux_io::sidecar_path(std::path::Path::new(&p.path))
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "simlux.json".into())
+                        ),
+                        p.sidecar_cfg.as_ref(),
+                    ),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).strong());
+                        if let Some(c) = cfg {
+                            ui.weak(crate::simlux_io::cfg_summary(c));
+                        }
+                    });
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    "Which copy should this session work with? Whichever you choose, the next \
+                     Save stores the project the way you chose — the other copy is removed \
+                     then. Save As can switch the storage mode any time.",
+                );
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([460.0, 26.0], egui::Button::new("Load the copy inside the file"))
+                    .clicked()
+                {
+                    pick = Some(ExtraPick::Embedded);
+                }
+                if ui
+                    .add_sized([460.0, 26.0], egui::Button::new("Load the .simlux.json copy"))
+                    .clicked()
+                {
+                    pick = Some(ExtraPick::Sidecar);
+                }
+                if ui
+                    .add_sized([460.0, 26.0], egui::Button::new("Load neither — drawing only"))
+                    .clicked()
+                {
+                    pick = Some(ExtraPick::Neither);
+                }
+            });
+        if let Some(pick) = pick {
+            self.choose_extra_data(pick);
+        }
+    }
+
     /// THE SAVE THAT DID NOT SAVE, in front of the user until they say they have seen it.
     ///
     /// Everything below already existed except this window: the rename is retried for ~1.5 s, the
@@ -42050,7 +42543,16 @@ impl CadApp {
                     if let Some(p) = self.current_file.clone() {
                         if ui.button("Save again").clicked() {
                             self.save_failure = None;
-                            self.do_save_now(&p.to_string_lossy());
+                            let embedded_ok =
+                                crate::simlux_io::can_embed(self.extra_store, &p);
+                            if embedded_ok {
+                                // The retry must keep the project inside the file —
+                                // `do_save_now` writes the drawing only, sidecar-style,
+                                // and would drop the very payload that failed.
+                                self.do_save(&p.to_string_lossy());
+                            } else {
+                                self.do_save_now(&p.to_string_lossy());
+                            }
                         }
                     }
                     if ui.button("I understand — leave it unsaved").clicked() {
@@ -42131,8 +42633,18 @@ impl CadApp {
         }
 
         // 2) Should we start one? Only for an already-saved drawing with pending edits, and not
-        //    while a modal load/save is in flight.
-        if !self.autosave_on || self.busy.is_some() || !self.unsaved {
+        //    while a modal load/save or another background save is in flight — and never while
+        //    the open-time "which copy of the 3D project data?" question is unanswered (saving
+        //    then would write the empty factory over the copies the user is about to choose
+        //    between). Two writers on one path must not overlap: the after-calculation embed
+        //    save holds an older snapshot, and if it landed after this one it would silently
+        //    revert everything since.
+        if !self.autosave_on
+            || self.busy.is_some()
+            || !self.unsaved
+            || self.extra_choice.is_some()
+            || self.results_rx.is_some()
+        {
             return;
         }
         let Some(path) = self.current_file.as_ref().map(|p| p.to_string_lossy().to_string()) else {
@@ -42359,7 +42871,11 @@ impl CadApp {
             Err("unsupported file type".into())
         };
         self.file_preview = Some(match parsed {
-            Ok(doc) => {
+            Ok(mut doc) => {
+                // The preview only draws the 2D plan; drop any embedded extra-data
+                // payload (which can be hundreds of MB) the moment it is parsed,
+                // or the open dialog would hold a whole project in RAM per peek.
+                doc.extra_blobs.clear();
                 let mut bb: Option<(Vec2, Vec2)> = None;
                 for d in &doc.dobjects {
                     let (a, b) = d.bbox();
@@ -42489,7 +43005,13 @@ impl CadApp {
         let dir = self.file_dialog_dir.clone()
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        self.file_dialog = Some(FileDialog::new(mode, dir, ext));
+        let mut dlg = FileDialog::new(mode, dir, ext);
+        // Save-As shows the extra-data choice pre-set to the current mode, so a
+        // plain "Save As" in the same format changes nothing unless asked.
+        if mode == FileDialogMode::Save {
+            dlg.embed_extra = self.extra_store == crate::simlux_io::ExtraDataStore::Embedded;
+        }
+        self.file_dialog = Some(dlg);
     }
 
     /// Render the file browser window. Pure `std::fs` — lists sub-dirs and
@@ -42656,6 +43178,46 @@ impl CadApp {
                                     dlg.filename.clear();
                                 }
                             });
+                            // WHERE THE 3D PROJECT DATA GOES — only a real drawing Save As, and
+                            // only for the two formats that can carry it. WBLOCK writes a bare
+                            // sub-document (no project data at all), and a .pst / plot-output
+                            // save is not a drawing, so neither shows the row. A .dwg cannot
+                            // embed reliably (see `save_file_worker`), so the choice is disabled
+                            // and forced back to separate files on confirm.
+                            let is_drawing_save = dlg.mode == FileDialogMode::Save
+                                && self.save_dialog_purpose == 0
+                                && self.plotstyle_pst_io.is_none()
+                                && !self.plot_pdf_browse
+                                && self.wblock_subdoc.is_none();
+                            if is_drawing_save {
+                                ui.horizontal(|ui| {
+                                    ui.label("3D project data");
+                                    let dwg = dlg.ext == ".dwg";
+                                    ui.add_enabled_ui(!dwg, |ui| {
+                                        ui.selectable_value(
+                                            &mut dlg.embed_extra,
+                                            true,
+                                            "Inside this file",
+                                        );
+                                        ui.selectable_value(
+                                            &mut dlg.embed_extra,
+                                            false,
+                                            "Separate JSON files",
+                                        );
+                                    });
+                                    if dwg {
+                                        ui.weak(
+                                            "AutoCAD DWG cannot carry the extra data — always \
+                                             separate files",
+                                        );
+                                    } else {
+                                        ui.weak(
+                                            "3D model, furniture, materials, lighting and saved \
+                                             results",
+                                        );
+                                    }
+                                });
+                            }
                         }
                         ui.horizontal(|ui| {
                             ui.label(if dlg.mode == FileDialogMode::PickFolder { "Subfolder" } else { "File" });
@@ -43021,6 +43583,18 @@ impl CadApp {
                         // Any stale wblock sub-doc (cancelled dialog) must not
                         // hijack a normal Save As.
                         self.wblock_subdoc = None;
+                        // COMMIT THE EXTRA-DATA CHOICE. It is the mode of every
+                        // following plain Save / autosave too, until this dialog
+                        // changes it again — the file the user chose to write with
+                        // "inside the file" stays that way on Ctrl+S, exactly as a
+                        // file opened from an embedded project does.
+                        self.extra_store = if dlg.ext == ".dwg" {
+                            crate::simlux_io::ExtraDataStore::Sidecar
+                        } else if dlg.embed_extra {
+                            crate::simlux_io::ExtraDataStore::Embedded
+                        } else {
+                            crate::simlux_io::ExtraDataStore::Sidecar
+                        };
                         self.do_save(&path);
                     }
                 }
@@ -55074,6 +55648,8 @@ impl eframe::App for CadApp {
 
         // Autosave: silent background re-save of the current file a few minutes after an edit.
         self.tick_autosave();
+        // After-calculation embed save (embedded-mode drawings) — drain + re-try.
+        self.tick_results_save();
         // Calculator-variables sidecar patch (worker) — drain its result.
         self.tick_calc_sidecar();
 
@@ -57737,6 +58313,8 @@ impl eframe::App for CadApp {
         self.render_radiance_dialog(ctx); // shown only while a Radiance run exists
         self.render_rename_plane_dialog(ctx); // shown only while a plane is being renamed
         self.render_unit_prompt_dialog(ctx);  // once per project, the first time the Factory opens
+        // A file carrying both an embedded project and a sidecar — which one loads?
+        self.render_extra_choice_dialog(ctx);
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
@@ -68898,6 +69476,7 @@ fn calculate_on_real_project() {
         }
         let payload = Box::new(LoadPayload {
             doc: opened, sidecar: None, furniture: Vec::new(),
+            embedded: None, embedded_furniture: Vec::new(), embedded_results: None,
             read_ms: 0, parse_ms: 0, sidecar_ms: 0, furn_ms: 0, dwg_note: None,
         });
         app.apply_loaded("C:/tmp/opened.rsm", payload);
@@ -70434,7 +71013,20 @@ mod autosave_tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
         atomic_write(&ps, b"world!!").unwrap(); // replace an existing file
         assert_eq!(std::fs::read(&p).unwrap(), b"world!!");
-        assert!(!std::path::Path::new(&format!("{ps}.savetmp")).exists(), "temp cleaned up");
+        // Temps are uniquely numbered per write (concurrent workers share the path);
+        // after a successful rename none of them may remain.
+        let leftovers = std::fs::read_dir(p.parent().unwrap())
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with(&format!("{}.savetmp.", p.file_name().unwrap().to_string_lossy()))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "temp cleaned up");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -72142,6 +72734,9 @@ mod imported_drawing_scale {
             doc,
             sidecar: None,
             furniture: Vec::new(),
+            embedded: None,
+            embedded_furniture: Vec::new(),
+            embedded_results: None,
             read_ms: 0,
             parse_ms: 0,
             sidecar_ms: 0,
@@ -78089,7 +78684,9 @@ mod a_project_survives_a_save_and_a_load {
         let cfg = app.build_simlux_config_lite();
         let geom = app.factory.furniture_geom_flat();
         assert_eq!(cfg.factory.furniture_lib.len(), 1, "the config leaving the UI thread has it");
-        save_file_worker(&path, doc, cfg, geom).expect("the save must succeed");
+        save_file_worker(&path, doc, cfg, geom,
+            crate::simlux_io::ExtraDataStore::Sidecar, None,)
+            .expect("the save must succeed");
 
         // …and exactly what an open does.
         let payload = load_file_worker(&path).expect("the load must succeed");
@@ -78130,6 +78727,8 @@ mod a_project_survives_a_save_and_a_load {
             app.plan_doc().clone(),
             app.build_simlux_config_lite(),
             app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            None,
         )
         .expect("save");
 
@@ -80853,7 +81452,8 @@ mod a_drawing_can_be_saved_as_dwg {
         let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // A converter that cannot be run at all.
         std::env::set_var("RUSTCAD_DXF2DWG", "simlux-no-such-converter-xyz {in} {out}");
-        let r = save_file_worker(&path.to_string_lossy(), doc, cfg, Vec::new());
+        let r = save_file_worker(&path.to_string_lossy(), doc, cfg, Vec::new(),
+            crate::simlux_io::ExtraDataStore::Sidecar, None);
         std::env::remove_var("RUSTCAD_DXF2DWG");
 
         assert!(r.is_err(), "a save that could not convert reported success");
@@ -80878,6 +81478,8 @@ mod a_drawing_can_be_saved_as_dwg {
             Document::default(),
             crate::simlux_io::SimluxConfig::default(),
             Vec::new(),
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            None,
         );
         std::env::remove_var("RUSTCAD_DXF2DWG");
 
@@ -80899,6 +81501,8 @@ mod a_drawing_can_be_saved_as_dwg {
             Document::default(),
             crate::simlux_io::SimluxConfig::default(),
             Vec::new(),
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            None,
         );
         let e = match e {
             Err(e) => e,
@@ -82910,6 +83514,8 @@ mod a_failed_save_is_not_reported_as_a_save {
             Document::default(),
             crate::simlux_io::SimluxConfig::default(),
             Vec::new(),
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            None,
         )
         .expect("the DRAWING half must still succeed -- that is what makes this a HALF save");
 
@@ -85064,5 +85670,354 @@ mod layout_plot_tests {
         let would_require_window = cfg.plot_layout_index.is_none()
             && app.plot_area_kind == 1 && app.plot_window.is_none();
         assert!(would_require_window, "model plots do");
+    }
+}
+
+/// THE 3D PROJECT CAN LIVE INSIDE THE DRAWING FILE ("Inside this file" in Save
+/// As) instead of in `.simlux.json` beside it — RSM extra-blobs / DXF XRECORDs.
+/// These tests drive the same real workers the app uses, in both directions.
+#[cfg(test)]
+mod an_embedded_project_survives_a_save_and_a_load {
+    use super::*;
+
+    /// A drawing + one solid + one placed furniture asset + one texture — the
+    /// same shape the sidecar round-trip test uses, so the two tests compare.
+    fn furnished_app() -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1000.0, 0.0),
+        })));
+        app.factory.add_box();
+        let mesh = crate::mesh_io::parse_obj(
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n",
+        );
+        let a = app.factory.add_furniture_asset("model_embed".into(), mesh);
+        app.factory.place_furniture(a, glam::Vec3::new(2.0, 3.0, 0.0));
+        app.factory.add_texture("mat0".into(), 4, 4, vec![255; 4 * 4 * 4]);
+        app
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("simlux_embed_{name}"));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    fn clean(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(path));
+        let _ = std::fs::remove_file(crate::light_store::result_path(path));
+    }
+
+    /// The whole way round through a real .dxf: save embedded → reopen → the
+    /// model, the furniture and the texture are back, and NO sidecar exists.
+    #[test]
+    fn a_dxf_saved_embedded_reopens_self_contained() {
+        let app = furnished_app();
+        let path = scratch("dxf").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+
+        let payload = save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("the embedded save must succeed");
+        assert!(payload.simlux_failed.is_none(), "{}", payload.note);
+
+        // The file alone carries the project — nothing was written beside it.
+        assert!(
+            !crate::simlux_io::sidecar_path(&path).exists(),
+            ".simlux.json must not exist after an embedded save",
+        );
+        assert!(
+            !crate::light_store::result_path(&path).exists(),
+            ".simlux-result.json must not exist after an embedded save",
+        );
+        // And the drawing bytes actually contain the payload.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("SIMLUX_DATA"),
+            "the DXF must carry the SIMLUX_DATA dictionary",
+        );
+
+        // …and exactly what an open does.
+        let payload = load_file_worker(&path_s).expect("the load must succeed");
+        assert!(payload.sidecar.is_none(), "no sidecar was written, so none can load");
+        let embedded = payload.embedded.as_ref().expect("the embedded project must load");
+        assert_eq!(embedded.factory.furniture.len(), 1, "the PLACED instance is back");
+        assert_eq!(embedded.factory.textures.len(), 1, "the texture is back");
+        assert!(
+            !embedded.factory.model.features.is_empty(),
+            "the solid model is back",
+        );
+        assert_eq!(payload.embedded_furniture.len(), 1, "the asset geometry is back");
+        assert!(
+            !payload.embedded_furniture[0].positions.is_empty(),
+            "the asset came back with geometry",
+        );
+
+        clean(&path);
+    }
+
+    /// The RSM leg of the same story, TRANSPORT-ONLY: the config rides inside
+    /// the v201 stream and comes back to the loader. (The drawing is a bare 2D
+    /// plan — a factory model places furniture-symbol dobjects with ByLayer
+    /// linetypes, which trip a separate pre-existing RSM validation bug this
+    /// feature does not touch.)
+    #[test]
+    fn an_rsm_saved_embedded_reopens_self_contained() {
+        // A bare plan document and a hand-built config — CadApp::default()'s doc
+        // already carries default dobjects with ByLayer linetypes, which trip a
+        // separate pre-existing RSM validation bug this feature does not touch.
+        let mut doc = cad_kernel::Document::default();
+        doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1000.0, 0.0),
+        })));
+        let path = scratch("rsm").join("plan.rsm");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+
+        let mut cfg = crate::simlux_io::SimluxConfig::default();
+        cfg.vars.insert("width".to_string(), "4.2*2".to_string());
+        cfg.layers_3d.insert("WALLS".to_string(), 3.0);
+        save_file_worker(
+            &path_s,
+            doc,
+            cfg,
+            Vec::new(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            Some(crate::light_store::StoredResults::default()),
+        )
+        .expect("the embedded .rsm save must succeed");
+        assert!(!crate::simlux_io::sidecar_path(&path).exists(), "no sidecar beside an .rsm");
+        let bytes = std::fs::read(&path).unwrap();
+        let ver = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        assert_eq!(ver, 201, "the RSM must be v201 when it embeds data");
+
+        let payload = load_file_worker(&path_s).expect("the load must succeed");
+        assert!(payload.sidecar.is_none(), "no sidecar was written");
+        let embedded = payload.embedded.expect("the embedded project must load");
+        assert_eq!(embedded.vars.get("width").map(|s| s.as_str()), Some("4.2*2"));
+        assert_eq!(embedded.layers_3d.get("WALLS"), Some(&3.0));
+        assert!(
+            payload.embedded_results.is_some(),
+            "the saved light results rode inside the file too",
+        );
+        clean(&path);
+    }
+
+    /// A SIDECAR MODE save beside an older embedded file is the reverse migration:
+    /// the file is rewritten WITHOUT the payload and the sidecar comes back. (The
+    /// old sidecar the file used to read from is long gone — it was deleted at the
+    /// embedded save.)
+    #[test]
+    fn saving_sidecar_after_embedded_rewrites_a_clean_drawing() {
+        let app = furnished_app();
+        let path = scratch("back").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("embedded save");
+        assert!(!crate::simlux_io::sidecar_path(&path).exists(), "no sidecar yet");
+
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            None,
+        )
+        .expect("sidecar save");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("SIMLUX_DATA"),
+            "a sidecar-mode drawing must not carry the SIMLUX_DATA dictionary",
+        );
+        let doc = cad_io::dxf::read_dxf(&text).expect("still parses");
+        assert!(doc.extra_blobs.is_empty(), "the payload was not left in the file");
+        assert!(crate::simlux_io::sidecar_path(&path).exists(), "the sidecar is back");
+        clean(&path);
+    }
+
+    /// The embedded STALE sidecar cleanup: saving embedded over a drawing that
+    /// still had old JSON files beside it removes them, so the next open does not
+    /// find two copies and ask.
+    #[test]
+    fn an_embedded_save_removes_a_stale_sidecar_pair() {
+        let app = furnished_app();
+        let path = scratch("stale").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+        // Plant an old sidecar pair next to the path, as an earlier save left it.
+        let side = crate::simlux_io::sidecar_path(&path);
+        let res = crate::light_store::result_path(&path);
+        std::fs::write(&side, b"{ }").unwrap();
+        std::fs::write(&res, b"{ }").unwrap();
+
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("embedded save");
+        assert!(!side.exists(), "the stale .simlux.json must be removed");
+        assert!(!res.exists(), "the stale .simlux-result.json must be removed");
+        clean(&path);
+    }
+
+    /// A file carrying BOTH an embedded project and a sidecar: the load worker
+    /// hands back both, and `apply_loaded` asks instead of silently picking one —
+    /// the choice installs the picked copy and sets the store mode for later saves.
+    #[test]
+    fn a_file_with_both_copies_asks_and_the_answer_sticks() {
+        let app = furnished_app();
+        let path = scratch("both").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+        // One copy inside the file…
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("embedded save");
+        // …and an older sidecar planted back beside it (e.g. a restored backup).
+        // Written by hand via the sidecar writer — a full SIDE-CAR MODE save of
+        // the drawing would rewrite the file without the embedded copy, which is
+        // the reverse migration rather than the both-copies situation.
+        let mut cfg = app.build_simlux_config_lite();
+        cfg.vars.insert("older".to_string(), "1".to_string());
+        crate::simlux_io::save(&path, &cfg).expect("plant the older sidecar");
+        assert!(crate::simlux_io::sidecar_path(&path).exists(), "both copies now exist");
+
+        let payload = load_file_worker(&path_s).expect("the load must succeed");
+        assert!(payload.sidecar.is_some(), "the sidecar copy was read");
+        assert!(payload.embedded.is_some(), "the embedded copy was read");
+
+        // The real install path: the drawing opens, the 3D side waits on the user.
+        let mut app = CadApp::default();
+        app.apply_loaded(&path_s, payload);
+        assert!(app.extra_choice.is_some(), "both copies must raise the question");
+        assert!(app.factory.furniture.is_empty(), "nothing is installed before the answer");
+        assert!(
+            app.history.iter().any(|h| h.contains("TWO copies") || h.contains("both")),
+            "the ask must be recorded in the history: {:?}",
+            app.history.last(),
+        );
+
+        // Pick the sidecar copy — the mode follows for every later save.
+        app.choose_extra_data(ExtraPick::Sidecar);
+        assert!(app.extra_choice.is_none(), "the question is answered");
+        assert_eq!(app.factory.furniture.len(), 1, "the chosen copy is installed");
+        assert_eq!(
+            app.extra_store,
+            crate::simlux_io::ExtraDataStore::Sidecar,
+            "a sidecar answer makes further saves write sidecars",
+        );
+
+        clean(&path);
+    }
+
+    /// The question also honours the EMBEDDED answer: choosing the copy inside
+    /// the file installs it and makes further saves embed.
+    #[test]
+    fn the_answer_can_be_the_embedded_copy() {
+        let app = furnished_app();
+        let path = scratch("both2").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("embedded save");
+        let mut cfg = app.build_simlux_config_lite();
+        crate::simlux_io::save(&path, &cfg).expect("plant the older sidecar");
+
+        let mut app = CadApp::default();
+        let payload = load_file_worker(&path_s).expect("load");
+        app.apply_loaded(&path_s, payload);
+        assert!(app.extra_choice.is_some());
+        app.choose_extra_data(ExtraPick::Embedded);
+        assert_eq!(app.extra_store, crate::simlux_io::ExtraDataStore::Embedded);
+        assert_eq!(app.factory.furniture.len(), 1, "the embedded copy is installed");
+        assert!(app.extra_choice.is_none());
+        clean(&path);
+    }
+
+    /// While the question is unanswered the factory is still empty — a save now
+    /// would write that blank state over the file, so it is refused until the
+    /// user picks. (This is the autosave + stale-history class of bug, again.)
+    #[test]
+    fn save_is_refused_while_the_question_is_unanswered() {
+        let mut app = CadApp::default();
+        app.extra_choice = Some(Box::new(PendingExtraChoice {
+            path: "x.dxf".into(),
+            sidecar_cfg: None,
+            sidecar_furn: Vec::new(),
+            embedded_cfg: None,
+            embedded_furn: Vec::new(),
+            embedded_results: None,
+        }));
+        app.do_save("x.dxf");
+        assert!(app.busy.is_none(), "the save must not start");
+        assert!(
+            app.history.iter().any(|h| h.contains("save deferred")),
+            "and must say why: {:?}",
+            app.history.last(),
+        );
+    }
+
+    /// Loading a file that ONLY embeds (no sidecar) sets the mode to Embedded, so
+    /// plain Save and autosave keep the project inside the file.
+    #[test]
+    fn an_embedded_only_load_follows_with_embedded_saves() {
+        let app = furnished_app();
+        let path = scratch("only").join("plan.dxf");
+        let path_s = path.to_string_lossy().into_owned();
+        clean(&path);
+        save_file_worker(
+            &path_s,
+            app.plan_doc().clone(),
+            app.build_simlux_config_lite(),
+            app.factory.furniture_geom_flat(),
+            crate::simlux_io::ExtraDataStore::Embedded,
+            None,
+        )
+        .expect("embedded save");
+
+        let mut app = CadApp::default();
+        let payload = load_file_worker(&path_s).expect("load");
+        assert!(payload.sidecar.is_none());
+        app.apply_loaded(&path_s, payload);
+        assert_eq!(app.extra_store, crate::simlux_io::ExtraDataStore::Embedded);
+        assert_eq!(app.factory.furniture.len(), 1, "the embedded copy was installed");
+        assert!(app.extra_choice.is_none(), "no question when only one copy exists");
+        clean(&path);
     }
 }

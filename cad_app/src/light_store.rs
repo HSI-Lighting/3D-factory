@@ -320,6 +320,19 @@ pub fn load(drawing: &Path) -> Option<StoredResults> {
     serde_json::from_str(&text).ok()
 }
 
+/// Serialize a result for EMBEDDING inside the drawing file. Compact, like the
+/// sidecar file — never pretty-printed (see [`save`]).
+pub fn to_embed_bytes(r: &StoredResults) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(r).map_err(|e| e.to_string())
+}
+
+/// Parse a result that came out of the drawing file. Lenient exactly like
+/// [`load`]: the result is a cache of a calculation that can be run again, so
+/// bytes that will not parse are reported as absent, not as an error.
+pub fn from_embed_bytes(bytes: &[u8]) -> Option<StoredResults> {
+    serde_json::from_slice(bytes).ok()
+}
+
 /// Write it, atomically — temp then rename, so a close or a crash mid-write cannot leave half a
 /// result where the last good one was.
 pub fn save(drawing: &Path, r: &StoredResults) -> Result<PathBuf, String> {

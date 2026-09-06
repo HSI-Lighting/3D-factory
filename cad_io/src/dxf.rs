@@ -18,6 +18,63 @@ use cad_kernel::{
     Polyline, Vec2,
 };
 
+/// Named-objects dictionary the app's embedded extra data lives under (see
+/// [`write_objects`]). Kept out of the `ACAD_*` namespace AutoCAD reserves.
+const SIMLUX_DATA_DICT: &str = "SIMLUX_DATA";
+/// First-chunk marker of every embedded XRECORD payload, so a reader can tell an
+/// app record from anything a third-party tool wrote under the same dictionary.
+const BLOB_MARKER: &str = "3DF:v1:";
+/// DXF group-code-1 values are capped at 255 characters; 250 leaves headroom.
+const BLOB_CHUNK: usize = 250;
+
+// ---- tiny base64 (standard alphabet, padded) ----------------------------------
+// The DXF parser trims whitespace off every value line, so a payload cannot be
+// stored as raw text (a chunk boundary can always fall inside a run of spaces).
+// Base64 has no whitespace and no multi-byte characters, so chunked base64 is
+// byte-exact through any whitespace-trimming reader — and it lets a payload be
+// binary rather than UTF-8. cad_io is deliberately dependency-free, hence this
+// 30-line hand-rolled pair rather than a crate.
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(B64[(n >> 18 & 63) as usize] as char);
+        out.push(B64[(n >> 12 & 63) as usize] as char);
+        if chunk.len() > 1 { out.push(B64[(n >> 6 & 63) as usize] as char); } else { out.push('='); }
+        if chunk.len() > 2 { out.push(B64[(n & 63) as usize] as char); } else { out.push('='); }
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.bytes() {
+        if c == b'=' {
+            break; // padding; nothing valid follows
+        }
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 // ============================================================================
 //   READER
 // ============================================================================
@@ -49,6 +106,10 @@ pub fn read_dxf_with_stats(text: &str) -> Result<(Document, usize), String> {
                     // in the table before any INSERT in ENTITIES resolves them.
                     "BLOCKS"   => i = read_blocks(&pairs, i + 2, &mut doc, &mut skipped),
                     "ENTITIES" => i = read_entities(&pairs, i + 2, &mut doc, &mut skipped),
+                    // OBJECTS used to be skipped wholesale; it is walked now for
+                    // the embedded-extra-data dictionary, and everything else in
+                    // it is still passed over untouched.
+                    "OBJECTS"  => i = read_objects(&pairs, i + 2, &mut doc),
                     // HEADER carries $INSUNITS — the file's own statement of what one
                     // drawing unit means. Skipping it (which this reader once did) is
                     // why an architectural plan in millimetres arrived
@@ -159,6 +220,111 @@ fn skip_to_endsec(pairs: &[(i32, &str)], start: usize) -> usize {
         i += 1;
     }
     pairs.len()
+}
+
+/// OBJECTS section — walked ONLY for the embedded extra-data dictionary
+/// (`SIMLUX_DATA`, written by [`write_objects`]); every other named object
+/// (plot styles, layouts, other apps' dictionaries) is passed over untouched,
+/// exactly as it was when the whole section was skipped.
+///
+/// The writer happens to put the root dictionary first and the XRECORDs after,
+/// but a file saved by another tool may order its objects any way it likes, so
+/// the records are collected first and resolved after the scan rather than
+/// trusting file order.
+fn read_objects(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
+    #[derive(Default)]
+    struct Obj {
+        xrec: bool,
+        handle: String,
+        /// XRECORD: every group-code-1 value, concatenated (the chunked payload).
+        text: String,
+        /// DICTIONARY: (entry name, child handle) pairs.
+        kids: Vec<(String, String)>,
+    }
+    let mut objs: Vec<Obj> = Vec::new();
+    let mut i = start;
+    let mut end = pairs.len();
+    while i < pairs.len() {
+        let (c, v) = pairs[i];
+        if c == 0 && v == "ENDSEC" {
+            end = i + 1;
+            break;
+        }
+        if c == 0 {
+            let xrec = v == "XRECORD";
+            let is_dict = v == "DICTIONARY";
+            if xrec || is_dict {
+                let mut o = Obj::default();
+                o.xrec = xrec;
+                i += 1;
+                while i < pairs.len() && pairs[i].0 != 0 {
+                    match (pairs[i].0, xrec) {
+                        (5, _) => o.handle = pairs[i].1.to_string(),
+                        (1, true) => o.text.push_str(pairs[i].1),
+                        // A dictionary entry is (3 name, 350 child-handle).
+                        (3, false) => {
+                            let name = pairs[i].1.to_string();
+                            if i + 1 < pairs.len() && pairs[i + 1].0 == 350 {
+                                o.kids.push((name, pairs[i + 1].1.to_string()));
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if !o.handle.is_empty() {
+                    objs.push(o);
+                }
+                continue;   // `i` is on the next object's 0 group — handled above
+            }
+        }
+        i += 1;
+    }
+    // Resolve: some dictionary lists a SIMLUX_DATA entry → its child dictionary
+    // → that dictionary's XRECORD children, each carrying one blob by name.
+    // The handle map makes the per-child lookup O(1); a hostile file could
+    // otherwise name a dictionary with millions of children and make every
+    // lookup a full scan of millions of collected objects.
+    let xrec_index: std::collections::HashMap<&str, usize> = objs
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.xrec)
+        .map(|(i, o)| (o.handle.as_str(), i))
+        .collect();
+    let data_dict = objs.iter().find_map(|o| {
+        if o.xrec { return None; }
+        o.kids.iter()
+            .find(|(n, _)| n == SIMLUX_DATA_DICT)
+            .map(|(_, h)| h.clone())
+    });
+    if let Some(dd) = data_dict {
+        if let Some(dir) = objs.iter().find(|o| !o.xrec && o.handle == dd) {
+            for (name, xh) in &dir.kids {
+                // Blob names become DICTIONARY entry names on the next save, so
+                // anything that could corrupt a line-oriented DXF (a newline, a
+                // control character, a megabyte-long name) is refused here.
+                if !blob_name_ok(name) {
+                    continue;
+                }
+                // An XRECORD is accepted only with the marker prefix — anything
+                // else is somebody else's data, and stays unread. The payload is
+                // base64 (see the writer), so decode restores the exact bytes.
+                let Some(&oi) = xrec_index.get(xh.as_str()) else { continue };
+                let Some(text) = objs[oi].text.strip_prefix(BLOB_MARKER) else { continue };
+                let Some(bytes) = b64_decode(text) else { continue };
+                doc.set_extra_blob(name, bytes);
+            }
+        }
+    }
+    end
+}
+
+/// A blob name that is safe to write back out as a DICTIONARY entry name
+/// (group code 3) — printable ASCII, short. Anything else belongs to a hostile
+/// or corrupt file and is refused on read rather than re-embedded on save.
+fn blob_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 128 && name.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 
 fn read_tables(pairs: &[(i32, &str)], start: usize, doc: &mut Document) -> usize {
@@ -1174,7 +1340,7 @@ pub fn write_dxf(doc: &Document) -> String {
     // yet defined in OBJECTS (written last), so its handle set is reserved up
     // front. Reserving them first just makes them the lowest handles — order in
     // the file doesn't matter, only uniqueness + coherent back-pointers.
-    let obj = ObjectHandles::alloc(&mut h);
+    let obj = ObjectHandles::alloc(&mut h, doc.extra_blobs.len());
     let mut body = String::with_capacity(64 * 1024);
     let brt = write_tables(&mut body, doc, &mut h, &obj);
     write_blocks(&mut body, doc, &mut h, &brt);   // MUST precede ENTITIES —
@@ -1182,7 +1348,7 @@ pub fn write_dxf(doc: &Document) -> String {
                                                   // in file order; an INSERT
                                                   // resolves its block by name.
     write_entities(&mut body, doc, &mut h, &brt);
-    write_objects(&mut body, &obj);               // after ENTITIES (standard order)
+    write_objects(&mut body, &obj, &doc.extra_blobs); // after ENTITIES (standard order)
 
     let mut s = String::with_capacity(body.len() + 512);
     write_header(&mut s, &h, doc);
@@ -1241,14 +1407,31 @@ struct ObjectHandles {
     group:       String,
     psns:        String,
     placeholder: String,
+    /// The embedded-extra-data graph — the `SIMLUX_DATA` dictionary + one XRECORD
+    /// per payload blob — allocated only when the document carries blobs.
+    blobs: Option<BlobHandles>,
+}
+/// Handles for the embedded extra-data graph (see [`write_objects`]).
+struct BlobHandles {
+    dict: String,
+    xr:   Vec<String>,   // one XRECORD handle per blob, aligned with `blobs`
 }
 impl ObjectHandles {
-    fn alloc(h: &mut HandleGen) -> Self {
+    fn alloc(h: &mut HandleGen, blob_count: usize) -> Self {
+        let blobs = if blob_count > 0 {
+            Some(BlobHandles {
+                dict: h.alloc(),
+                xr: (0..blob_count).map(|_| h.alloc()).collect(),
+            })
+        } else {
+            None
+        };
         ObjectHandles {
             root:        h.alloc(),
             group:       h.alloc(),
             psns:        h.alloc(),
             placeholder: h.alloc(),
+            blobs,
         }
     }
 }
@@ -1256,8 +1439,16 @@ impl ObjectHandles {
 /// OBJECTS section: the root named-object dictionary, an empty `ACAD_GROUP`, and
 /// the `ACAD_PLOTSTYLENAME` dictionary whose default + `Normal` entry point at a
 /// single `ACDBPLACEHOLDER`. LAYER records reference this placeholder via `390`.
-/// (The reader skips the whole section via `skip_to_endsec`.)
-fn write_objects(s: &mut String, o: &ObjectHandles) {
+///
+/// EMBEDDED EXTRA DATA rides here too, when the document carries any
+/// (`doc.extra_blobs`): a `SIMLUX_DATA` dictionary under the root, holding one
+/// XRECORD per blob named after it. Each XRECORD stores its bytes as repeated
+/// group-code-1 lines (DXF caps a single string value at 255 characters, so a
+/// payload is chunked), prefixed with the `3DF:v1:` marker so a reader can tell
+/// this record from anything a third-party app may also have written under the
+/// same dictionary name. AutoCAD preserves named objects it does not
+/// understand, so an embedded project survives a round trip through real CAD.
+fn write_objects(s: &mut String, o: &ObjectHandles, blobs: &[(String, Vec<u8>)]) {
     pair(s, 0, "SECTION");
     pair(s, 2, "OBJECTS");
 
@@ -1269,6 +1460,9 @@ fn write_objects(s: &mut String, o: &ObjectHandles) {
     pair_i(s, 281, 1);
     pair(s, 3, "ACAD_GROUP");         pair(s, 350, &o.group);
     pair(s, 3, "ACAD_PLOTSTYLENAME"); pair(s, 350, &o.psns);
+    if let Some(bh) = &o.blobs {
+        pair(s, 3, SIMLUX_DATA_DICT); pair(s, 350, &bh.dict);
+    }
 
     // ACAD_GROUP — empty dictionary.
     pair(s, 0, "DICTIONARY");
@@ -1291,6 +1485,43 @@ fn write_objects(s: &mut String, o: &ObjectHandles) {
     pair(s, 0, "ACDBPLACEHOLDER");
     pair(s, 5, &o.placeholder);
     pair(s, 330, &o.psns);
+
+    // SIMLUX_DATA — the embedded extra data: one XRECORD per blob, named by the
+    // blob's key, holding its payload chunked into code-1 lines.
+    if let (Some(bh), Some(extra)) = (&o.blobs, (blobs.len() > 0).then_some(blobs)) {
+        pair(s, 0, "DICTIONARY");
+        pair(s, 5, &bh.dict);
+        pair(s, 330, &o.root);
+        pair(s, 100, "AcDbDictionary");
+        pair_i(s, 281, 1);
+        for ((name, _), xh) in extra.iter().zip(bh.xr.iter()) {
+            pair(s, 3, name); pair(s, 350, xh);
+        }
+        for ((_, bytes), xh) in extra.iter().zip(bh.xr.iter()) {
+            // Base64 keeps the payload byte-exact through the chunking and any
+            // whitespace-trimming reader; the marker guards against a foreign
+            // XRECORD that happens to share the dictionary name.
+            let text = b64_encode(bytes);
+            pair(s, 0, "XRECORD");
+            pair(s, 5, xh);
+            pair(s, 330, &bh.dict);
+            pair(s, 100, "AcDbXrecord");
+            pair_i(s, 280, 1);        // duplicate-record-cloning flag
+            pair(s, 1, BLOB_MARKER);  // its own line: no copy of the payload
+            // Walk the base64 string BY OFFSET — the reader concatenates every
+            // code-1 line, so the marker line above is simply the first chunk.
+            // Slicing by offset (base64 is pure ASCII, every byte a char
+            // boundary) keeps this O(n): re-owning the shrinking remainder on
+            // every iteration would copy the whole payload n/250 times, which
+            // is quadratic on the hundreds-of-MB payloads this exists for.
+            let mut start = 0;
+            while start < text.len() {
+                let end = (start + BLOB_CHUNK).min(text.len());
+                pair(s, 1, &text[start..end]);
+                start = end;
+            }
+        }
+    }
 
     pair(s, 0, "ENDSEC");
 }
@@ -3596,5 +3827,89 @@ mod mtext_entity_tests {
         if let Geom::Text(t) = &back.dobjects[0].geom {
             assert_eq!(t.text, "hello");
         } else { panic!(); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedded extra data (Document::extra_blobs) — DXF XRECORD transport
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod extra_blob_tests {
+    use super::*;
+
+    fn round_trip(doc: &Document) -> Document {
+        let text = write_dxf(doc);
+        read_dxf(&text).expect("round-trip parse")
+    }
+
+    fn blob_doc() -> Document {
+        let mut d = Document::default();
+        d.set_extra_blob("simlux-config", br#"{"furniture_lib":[],"textures":[{"name":"x"}]}"#.to_vec());
+        d
+    }
+
+    /// A payload smaller than one chunk is stored and read back whole.
+    #[test]
+    fn small_blob_round_trips() {
+        let back = round_trip(&blob_doc());
+        assert_eq!(
+            back.extra_blob("simlux-config").map(|b| b.to_vec()),
+            Some(br#"{"furniture_lib":[],"textures":[{"name":"x"}]}"#.to_vec()),
+        );
+    }
+
+    /// A payload large enough to need chunking (the code-1 limit is 255 chars)
+    /// is reassembled exactly — including multi-byte UTF-8 split boundaries.
+    #[test]
+    fn large_blob_is_chunked_and_reassembled() {
+        let mut d = Document::default();
+        // A payload with multibyte chars sitting at every possible chunk offset.
+        let mut body = String::from("خاکی — طراحی");
+        for k in 0..4000 {
+            body.push_str(&format!(" {k}"));
+        }
+        d.set_extra_blob("big", body.clone().into_bytes());
+        let back = round_trip(&d);
+        assert_eq!(
+            back.extra_blob("big").map(|b| String::from_utf8_lossy(b).into_owned()),
+            Some(body),
+            "the chunked payload must reassemble byte-for-byte",
+        );
+    }
+
+    /// Two blobs (the config + the saved light results) survive together.
+    #[test]
+    fn two_blobs_round_trip_in_one_file() {
+        let mut d = Document::default();
+        d.set_extra_blob("simlux-config", b"cfg-json".to_vec());
+        d.set_extra_blob("simlux-results", b"results-json".to_vec());
+        let back = round_trip(&d);
+        assert_eq!(back.extra_blob("simlux-config"), Some(&b"cfg-json"[..]));
+        assert_eq!(back.extra_blob("simlux-results"), Some(&b"results-json"[..]));
+    }
+
+    /// A drawing with nothing embedded writes NO SIMLUX_DATA dictionary and reads
+    /// back with no blobs — the ordinary file's shape is unchanged.
+    #[test]
+    fn no_blobs_writes_no_dictionary() {
+        let text = write_dxf(&Document::default());
+        assert!(!text.contains(SIMLUX_DATA_DICT));
+        assert!(read_dxf(&text).expect("parse").extra_blobs.is_empty());
+    }
+
+    /// A foreign XRECORD under the SIMLUX_DATA name without the marker prefix is
+    /// not mistaken for ours — somebody else's data stays unread.
+    #[test]
+    fn unmasked_foreign_record_is_ignored() {
+        let text = write_dxf(&blob_doc());
+        // Rewrite the marker prefix of every value line, simulating data written
+        // by a different application under the same dictionary name.
+        let text = text.replace(BLOB_MARKER, "XYZ:");
+        let back = read_dxf(&text).expect("still parses");
+        assert!(
+            back.extra_blobs.is_empty(),
+            "a record without the marker must not load as ours",
+        );
     }
 }
