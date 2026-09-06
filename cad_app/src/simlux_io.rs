@@ -20,6 +20,13 @@ use serde::{Deserialize, Serialize};
 /// agreement.
 pub const CFG_BLOB: &str = "simlux-config";
 pub const RESULTS_BLOB: &str = "simlux-results";
+/// The RSM's native geometry blob — see `factory::furniture_geom_native`. An
+/// RSM embedded save splits the payload: `CFG_BLOB` carries the config JSON
+/// WITHOUT geometry (the `*_b64` fields empty) and this blob carries the mesh
+/// float arrays as raw deflated bytes, so opening skips the base64 text layer.
+/// DXF (a text format) cannot hold raw bytes and keeps geometry inside
+/// `CFG_BLOB`, base64 as always.
+pub const GEOM_BLOB: &str = "simlux-geom";
 
 /// WHERE THE 3D PROJECT'S EXTRA DATA LIVES when the drawing is saved.
 ///

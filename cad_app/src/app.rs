@@ -974,6 +974,11 @@ struct LoadPayload {
     /// convention as `sidecar`: decoded meshes land in `embedded_furniture`.
     embedded: Option<crate::simlux_io::SimluxConfig>,
     embedded_furniture: Vec<crate::factory::FurnitureAsset>,
+    /// Textures DECODED on the worker (PNG → RGBA), in record order, so the UI
+    /// thread never blocks on dozens of PNG decodes at install. One list per
+    /// source, aligned with `sidecar` / `embedded`.
+    sidecar_textures: Vec<crate::factory::TextureAsset>,
+    embedded_textures: Vec<crate::factory::TextureAsset>,
     /// The saved light results embedded in the drawing, if the file carried them.
     embedded_results: Option<crate::light_store::StoredResults>,
     /// Per-stage timings (ms) captured in the worker, re-emitted to the recorder on the main
@@ -1000,6 +1005,10 @@ struct PendingExtraChoice {
     /// The embedded-in-file source.
     embedded_cfg: Option<crate::simlux_io::SimluxConfig>,
     embedded_furn: Vec<crate::factory::FurnitureAsset>,
+    /// Decoded textures for each source (worker-side PNG decode; aligned with
+    /// the config's record order).
+    sidecar_tex: Vec<crate::factory::TextureAsset>,
+    embedded_tex: Vec<crate::factory::TextureAsset>,
     /// Embedded saved light results — restored only if the embedded side wins,
     /// else the sidecar result file is tried (the historic behaviour).
     embedded_results: Option<crate::light_store::StoredResults>,
@@ -1155,6 +1164,13 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
     let t3 = std::time::Instant::now();
     let mut doc = doc;
     let embeddable_format = lower.ends_with(".dxf") || lower.ends_with(".rsm");
+    // RSM-only: the native geometry blob (see `furniture_geom_native`). DXF has
+    // no such blob — its geometry lives inside the config JSON as base64.
+    let native_geom = if lower.ends_with(".rsm") {
+        doc.take_extra_blob(crate::simlux_io::GEOM_BLOB)
+    } else {
+        None
+    };
     let embedded_cfg_bytes = if embeddable_format {
         doc.take_extra_blob(crate::simlux_io::CFG_BLOB)
     } else {
@@ -1188,10 +1204,30 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
         ),
         None => Vec::new(),
     };
+    // PNG → RGBA on the WORKER too (dozens of textures on the gym plan). The
+    // install would otherwise decode every one of them on the UI thread.
+    let sidecar_textures = match sidecar.as_ref() {
+        Some(cfg) => crate::factory::decode_texture_list(&cfg.factory.textures),
+        None => Vec::new(),
+    };
     let embedded_furniture = match embedded.as_mut() {
+        // An RSM embedded save stores the geometry as raw deflated bytes in its
+        // own blob — decode that (no base64). A file WITHOUT the blob (an older
+        // embed, or the blob damaged away) falls back to the JSON base64 fields,
+        // which is where DXF embeds always carry it.
+        Some(cfg) if native_geom.is_some() => {
+            crate::factory::FactoryState::decode_furniture_lib_native(
+                std::mem::take(&mut cfg.factory.furniture_lib),
+                native_geom.as_deref().unwrap_or_default(),
+            )
+        }
         Some(cfg) => crate::factory::FactoryState::decode_furniture_lib(
             std::mem::take(&mut cfg.factory.furniture_lib),
         ),
+        None => Vec::new(),
+    };
+    let embedded_textures = match embedded.as_ref() {
+        Some(cfg) => crate::factory::decode_texture_list(&cfg.factory.textures),
         None => Vec::new(),
     };
     let furn_ms = t4.elapsed().as_millis() as u64;
@@ -1201,6 +1237,8 @@ fn load_file_worker(path: &str) -> Result<Box<LoadPayload>, String> {
         furniture,
         embedded,
         embedded_furniture,
+        sidecar_textures,
+        embedded_textures,
         embedded_results,
         read_ms,
         parse_ms,
@@ -1257,26 +1295,39 @@ fn save_file_worker(
     store: crate::simlux_io::ExtraDataStore,
     results: Option<crate::light_store::StoredResults>,
 ) -> Result<SavePayload, String> {
-    // Compress furniture geometry HERE (deflate of tens of MB) — the expensive part of a save,
-    // kept off the UI thread. `cfg` came from `build_simlux_config_lite` with empty blobs, in
-    // the same order as `furn_geom`.
-    for (rec, g) in cfg.factory.furniture_lib.iter_mut().zip(furn_geom.iter()) {
-        rec.pos_b64 = crate::factory::encode_f32_blob(&g.pos);
-        rec.nrm_b64 = crate::factory::encode_f32_blob(&g.nrm);
-        rec.uv_b64 = if g.uv.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.uv) };
-        rec.alpha_b64 = if g.alpha.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.alpha) };
-    }
-    // CRITICAL: never serialize the swapped (active-tab) table arrangement —
-    // the RSM/DXF writers expect doc.layers = model table.
-    let mut doc = doc;
-    normalize_layers_for_save(&mut doc);
     let lower = path.to_ascii_lowercase();
     // EMBED or SIDECAR? "Inside the file" is only possible for the two formats this
     // app writes itself — RSM (its native v201 section) and DXF (its SIMLUX_DATA
     // XRECORDs). A DWG goes out through AutoCAD's converter and is read back with a
     // model-space-only parser, so its extra data always lives in the sidecar files.
     let embed = crate::simlux_io::can_embed(store, std::path::Path::new(path));
+    // An RSM payload is BINARY end to end, so the furniture geometry skips the
+    // base64 layer entirely: the config JSON stays geometry-less and the meshes
+    // ride as raw deflated bytes in their own blob (`simlux-geom`). DXF is text —
+    // its XRECORDs cannot hold raw bytes — so it keeps the base64-in-JSON form.
+    let native_geom = embed && lower.ends_with(".rsm");
+    // Compress furniture geometry HERE (deflate of tens of MB) — the expensive part of a save,
+    // kept off the UI thread. `cfg` came from `build_simlux_config_lite` with empty blobs, in
+    // the same order as `furn_geom`. The native-RSM path does not run this loop: its geometry
+    // goes to `furniture_geom_native` directly, and the JSON must stay free of the base64 text
+    // (which is exactly what opening no longer has to decode).
+    if !native_geom {
+        for (rec, g) in cfg.factory.furniture_lib.iter_mut().zip(furn_geom.iter()) {
+            rec.pos_b64 = crate::factory::encode_f32_blob(&g.pos);
+            rec.nrm_b64 = crate::factory::encode_f32_blob(&g.nrm);
+            rec.uv_b64 = if g.uv.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.uv) };
+            rec.alpha_b64 = if g.alpha.is_empty() { String::new() } else { crate::factory::encode_f32_blob(&g.alpha) };
+        }
+    }
+    // CRITICAL: never serialize the swapped (active-tab) table arrangement —
+    // the RSM/DXF writers expect doc.layers = model table.
+    let mut doc = doc;
+    normalize_layers_for_save(&mut doc);
     if embed {
+        if native_geom {
+            let geom_bytes = crate::factory::furniture_geom_native(&furn_geom);
+            doc.set_extra_blob(crate::simlux_io::GEOM_BLOB, geom_bytes);
+        }
         // Attach the payload to the document BEFORE the writer runs, so the bytes
         // land inside the drawing. Compact serialization — this copy is written on
         // every save and is not meant for human reading (see `cfg_to_embed_bytes`).
@@ -41878,7 +41929,7 @@ impl CadApp {
                 let furniture = crate::factory::FactoryState::decode_furniture_lib(
                     std::mem::take(&mut cfg.factory.furniture_lib),
                 );
-                self.install_simlux_config(cfg, furniture);
+                self.install_simlux_config(cfg, furniture, None);
             }
             Ok(None) => {}
             Err(e) => self.history.push(format!("  ! SIMLUX load: {}", e)),
@@ -41892,6 +41943,7 @@ impl CadApp {
         &mut self,
         mut cfg: crate::simlux_io::SimluxConfig,
         furniture: Vec<crate::factory::FurnitureAsset>,
+        textures: Option<Vec<crate::factory::TextureAsset>>,
     ) {
         {
                 // Command-line calculator variables, BEFORE `cfg` is consumed
@@ -41914,7 +41966,7 @@ impl CadApp {
                 let fac = cfg.factory.clone();
                 let had_solids = !fac.is_empty() || !furniture.is_empty();
                 let n_solids = fac.model.features.len();
-                let dropped = self.factory.apply_persist_prebuilt(fac, furniture);
+                let dropped = self.factory.apply_persist_prebuilt(fac, furniture, textures);
                 self.refresh_aperture_transparency();
                 self.light.apply_config(cfg, &self.doc);
                 self.history.push("  SIMLUX setup loaded".into());
@@ -42140,6 +42192,8 @@ impl CadApp {
             furniture,
             embedded,
             embedded_furniture,
+            sidecar_textures,
+            embedded_textures,
             embedded_results,
             read_ms,
             parse_ms,
@@ -42191,8 +42245,9 @@ impl CadApp {
         // BOTH at once (an older sidecar next to a file saved "inside itself"). Both is a real
         // question for the user, asked once; one is applied straight away.
         self.stage_evt("sidecar", n, std::time::Duration::from_millis(sidecar_ms), "worker parse");
-        self.stage_evt("furniture decode",
-            furniture.len() + embedded_furniture.len(),
+        self.stage_evt("asset decode (meshes + textures)",
+            furniture.len() + embedded_furniture.len()
+                + sidecar_textures.len() + embedded_textures.len(),
             std::time::Duration::from_millis(furn_ms), "worker");
         if sidecar.is_some() && embedded.is_some() {
             // Hold both until the user says which one this file's project is. The drawing and
@@ -42201,8 +42256,10 @@ impl CadApp {
                 path: path.to_string(),
                 sidecar_cfg: sidecar,
                 sidecar_furn: furniture,
+                sidecar_tex: sidecar_textures,
                 embedded_cfg: embedded,
                 embedded_furn: embedded_furniture,
+                embedded_tex: embedded_textures,
                 embedded_results,
             }));
             self.history.push(format!(
@@ -42215,7 +42272,7 @@ impl CadApp {
             ));
         } else if let Some(cfg) = sidecar {
             self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
-            self.install_simlux_config(cfg, furniture);
+            self.install_simlux_config(cfg, furniture, Some(sidecar_textures));
             // AFTER the extra data, never before: the fingerprint a stored result is checked
             // against is mostly a hash of the 3D model, and until `install_simlux_config` has
             // rebuilt it this project looks like an empty one — every saved result would read
@@ -42223,7 +42280,7 @@ impl CadApp {
             self.restore_light_results(std::path::Path::new(path));
         } else if let Some(cfg) = embedded {
             self.extra_store = crate::simlux_io::ExtraDataStore::Embedded;
-            self.install_simlux_config(cfg, embedded_furniture);
+            self.install_simlux_config(cfg, embedded_furniture, Some(embedded_textures));
             // The file's own embedded results first; the sidecar result file as the fallback
             // for a drawing that was embedded after its last calculation.
             let stored = embedded_results
@@ -42392,7 +42449,7 @@ impl CadApp {
             ExtraPick::Embedded => {
                 self.extra_store = crate::simlux_io::ExtraDataStore::Embedded;
                 if let Some(cfg) = p.embedded_cfg {
-                    self.install_simlux_config(cfg, p.embedded_furn);
+                    self.install_simlux_config(cfg, p.embedded_furn, Some(p.embedded_tex));
                     // The file's own results first; the sidecar result file as a
                     // fallback (a project embedded after its last calculation).
                     let stored = p.embedded_results
@@ -42408,7 +42465,7 @@ impl CadApp {
             ExtraPick::Sidecar => {
                 self.extra_store = crate::simlux_io::ExtraDataStore::Sidecar;
                 if let Some(cfg) = p.sidecar_cfg {
-                    self.install_simlux_config(cfg, p.sidecar_furn);
+                    self.install_simlux_config(cfg, p.sidecar_furn, Some(p.sidecar_tex));
                     self.restore_light_results(&path);
                 }
                 self.history.push(format!(
@@ -69476,7 +69533,9 @@ fn calculate_on_real_project() {
         }
         let payload = Box::new(LoadPayload {
             doc: opened, sidecar: None, furniture: Vec::new(),
-            embedded: None, embedded_furniture: Vec::new(), embedded_results: None,
+            embedded: None, embedded_furniture: Vec::new(),
+            sidecar_textures: Vec::new(), embedded_textures: Vec::new(),
+            embedded_results: None,
             read_ms: 0, parse_ms: 0, sidecar_ms: 0, furn_ms: 0, dwg_note: None,
         });
         app.apply_loaded("C:/tmp/opened.rsm", payload);
@@ -72736,6 +72795,8 @@ mod imported_drawing_scale {
             furniture: Vec::new(),
             embedded: None,
             embedded_furniture: Vec::new(),
+            sidecar_textures: Vec::new(),
+            embedded_textures: Vec::new(),
             embedded_results: None,
             read_ms: 0,
             parse_ms: 0,
@@ -83965,7 +84026,7 @@ mod the_real_projects_lux {
         app.doc = cad_io::dxf::read_dxf(&text).expect("parse");
         let furniture =
             crate::factory::FactoryState::decode_furniture_lib(cfg.factory.furniture_lib.clone());
-        app.install_simlux_config(cfg, furniture);
+        app.install_simlux_config(cfg, furniture, None);
         app.factory.recompute();
 
         println!(
@@ -85787,11 +85848,23 @@ mod an_embedded_project_survives_a_save_and_a_load {
         let mut cfg = crate::simlux_io::SimluxConfig::default();
         cfg.vars.insert("width".to_string(), "4.2*2".to_string());
         cfg.layers_3d.insert("WALLS".to_string(), 3.0);
+        // One furniture ASSET in the library — its geometry must ride the native
+        // deflated blob, not base64 text inside the config JSON.
+        cfg.factory.furniture_lib.push(crate::simlux_io::FurnitureAssetRec {
+            name: "chair".into(),
+            ..Default::default()
+        });
+        let geom = vec![crate::factory::FurnitureGeomRaw {
+            pos: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            nrm: vec![0.0f32; 12],
+            uv: vec![],
+            alpha: vec![],
+        }];
         save_file_worker(
             &path_s,
             doc,
             cfg,
-            Vec::new(),
+            geom,
             crate::simlux_io::ExtraDataStore::Embedded,
             Some(crate::light_store::StoredResults::default()),
         )
@@ -85809,6 +85882,19 @@ mod an_embedded_project_survives_a_save_and_a_load {
         assert!(
             payload.embedded_results.is_some(),
             "the saved light results rode inside the file too",
+        );
+        // The furniture geometry came back from the NATIVE blob. The record is
+        // drained out of the config by the decode (exactly as the sidecar path
+        // drains it), so what matters is the decoded asset holding the meshes.
+        assert_eq!(payload.embedded_furniture.len(), 1, "the native geometry decoded");
+        assert!(
+            embedded.factory.furniture_lib.is_empty(),
+            "the decoded records are drained from the config",
+        );
+        assert_eq!(
+            payload.embedded_furniture[0].positions.len(),
+            4,
+            "all four vertices came back from the deflated blob",
         );
         clean(&path);
     }
@@ -85980,8 +86066,10 @@ mod an_embedded_project_survives_a_save_and_a_load {
             path: "x.dxf".into(),
             sidecar_cfg: None,
             sidecar_furn: Vec::new(),
+            sidecar_tex: Vec::new(),
             embedded_cfg: None,
             embedded_furn: Vec::new(),
+            embedded_tex: Vec::new(),
             embedded_results: None,
         }));
         app.do_save("x.dxf");

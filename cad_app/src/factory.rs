@@ -3085,7 +3085,7 @@ pub fn encode_f32_blob(floats: &[f32]) -> String {
 pub fn decode_f32_blob(s: &str) -> Vec<f32> {
     use base64::Engine;
     let Ok(comp) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) else { return Vec::new() };
-    let Ok(bytes) = miniz_oxide::inflate::decompress_to_vec(&comp) else { return Vec::new() };
+    let Some(bytes) = inflate_raw_deflate(&comp, None) else { return Vec::new() };
     bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
@@ -3100,6 +3100,277 @@ fn flat2(v: &[[f32; 2]]) -> Vec<f32> {
     let mut o = Vec::with_capacity(v.len() * 2);
     for p in v { o.extend_from_slice(p); }
     o
+}
+
+// ---------------------------------------------------------------------------
+// NATIVE geometry transport for the RSM's embedded payload
+// ---------------------------------------------------------------------------
+//
+// The sidecar (and the DXF XRECORD payload, which is TEXT) stores furniture
+// geometry as base64(deflate(LE f32)) inside the JSON. The RSM itself is
+// BINARY, so the base64 layer there is pure overhead: it is decoded on every
+// open for no reader's benefit, and its text inflates the JSON the app parses
+// on the way in. Embedded RSM saves therefore split the payload:
+//
+//   * "simlux-config" — the config JSON WITHOUT any geometry (`*_b64` empty),
+//     i.e. the metadata only;
+//   * "simlux-geom"   — this native blob: per asset (IN `furniture_lib`
+//     ORDER), each of pos/nrm/uv/alpha as `deflate(LE f32 bytes)` — the very
+//     bytes the base64 side would carry, minus the text encoding.
+//
+// The compressor is miniz's fast deflate (the on-disk bytes are therefore the
+// same as the first day's — old files and old builds need no migration). The
+// DECOMPRESSOR is zune-inflate (~2x miniz on float-dense data), and the whole
+// blob is inflated in PARALLEL across assets, since every field is
+// independent. Together they turn the dominant open cost — turning geometry
+// back into floats — into a fraction of what it was.
+//
+// A blob is LENIENT like `decode_f32_blob`: an unreadable asset decodes to
+// empty arrays (a corrupt or truncated section degrades like a corrupt
+// base64 string would, instead of failing the open).
+
+/// Header/magic of the native geometry blob, so a future format bump is
+/// detectable instead of silently misread.
+const GEOM_NATIVE_MAGIC: &[u8; 5] = b"3DFG1";
+
+/// Raw-deflate decompression shared by every geometry path — miniz writes the
+/// streams, zune reads them back ~2x faster (pure Rust, no C).
+pub fn inflate_raw_deflate(comp: &[u8], limit: Option<usize>) -> Option<Vec<u8>> {
+    let options = match limit {
+        Some(n) => zune_inflate::DeflateOptions::default().set_limit(n),
+        None => zune_inflate::DeflateOptions::default(),
+    };
+    let mut dec = zune_inflate::DeflateDecoder::new_with_options(comp, options);
+    dec.decode_deflate().ok()
+}
+
+/// Encode a `furniture_geom_flat()` result as the native geometry blob for an
+/// RSM embedded save. Order matches `furniture_lib`, 1:1 with the JSON records.
+pub fn furniture_geom_native(geom: &[FurnitureGeomRaw]) -> Vec<u8> {
+    fn deflate_le_f32(floats: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(floats.len() * 4);
+        for f in floats {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        // Level 1 — float-dense data barely shrinks further at higher levels,
+        // and this keeps the RSM and the sidecar twins.
+        miniz_oxide::deflate::compress_to_vec(&bytes, 1)
+    }
+    let mut out = Vec::with_capacity(64 + geom.len() * 32);
+    out.extend_from_slice(GEOM_NATIVE_MAGIC);
+    out.extend_from_slice(&(geom.len() as u32).to_le_bytes());
+    for g in geom {
+        for f in [&g.pos, &g.nrm, &g.uv, &g.alpha] {
+            let comp = deflate_le_f32(f);
+            out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            out.extend_from_slice(&comp);
+        }
+    }
+    out
+}
+
+/// One compressed field of one asset in the native blob.
+#[derive(Clone, Copy)]
+struct GeomField<'a> {
+    n: usize,
+    comp: &'a [u8],
+}
+
+/// Decode a [`furniture_geom_native`] blob back into per-asset raw float
+/// arrays `(pos, nrm, uv, alpha)` in file order — in PARALLEL across the
+/// assets, since each decompresses independently. Lenient: any malformed or
+/// truncated part yields empty arrays for the assets it affects.
+fn decode_furniture_geom_native(bytes: &[u8]) -> Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+    if bytes.get(0..5) != Some(GEOM_NATIVE_MAGIC) {
+        return Vec::new();
+    }
+    let mut i = GEOM_NATIVE_MAGIC.len();
+    let take4 = |b: &[u8], i: &mut usize| -> Option<u32> {
+        let s = b.get(*i..*i + 4)?;
+        *i += 4;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let Some(count) = take4(bytes, &mut i) else { return Vec::new() };
+    let count = (count as usize).min(1_000_000);
+    // Pass 1 (serial, cheap): find each asset's four field slices.
+    let mut fields: Vec<[GeomField; 4]> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut f: [GeomField; 4] =
+            std::array::from_fn(|_| GeomField { n: 0, comp: &[] });
+        let mut ok = true;
+        for slot in f.iter_mut() {
+            let Some(n) = take4(bytes, &mut i) else { ok = false; break };
+            let Some(clen) = take4(bytes, &mut i) else { ok = false; break };
+            let Some(comp) = bytes.get(i..i + clen as usize) else { ok = false; break };
+            i += clen as usize;
+            *slot = GeomField { n: n as usize, comp };
+        }
+        if !ok {
+            break;
+        }
+        fields.push(f);
+    }
+    // Pass 2 (parallel): each worker decompresses a contiguous run of assets.
+    let n_workers = decode_workers_for(fields.len());
+    let per = fields.len().div_ceil(n_workers);
+    let mut decoded: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> =
+        (0..fields.len()).map(|_| None).collect();
+    std::thread::scope(|sc| {
+        let mut handles = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
+            let start = w * per;
+            if start >= fields.len() {
+                break; // fewer assets than the pool allows
+            }
+            let end = ((w + 1) * per).min(fields.len());
+            let chunk = &fields[start..end];
+            handles.push(sc.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for asset in chunk {
+                        let mut parts: [(Vec<f32>, bool); 4] = Default::default();
+                        let mut asset_ok = true;
+                        for (slot, field) in parts.iter_mut().zip(asset.iter()) {
+                            if let Some(raw) = inflate_field(field) {
+                                *slot = (raw, true);
+                            } else {
+                                asset_ok = false;
+                                break;
+                            }
+                        }
+                        out.push(if asset_ok {
+                            Some((
+                                std::mem::take(&mut parts[0].0),
+                                std::mem::take(&mut parts[1].0),
+                                std::mem::take(&mut parts[2].0),
+                                std::mem::take(&mut parts[3].0),
+                            ))
+                        } else {
+                            None
+                        });
+                    }
+                    (start, out)
+            }));
+        }
+        for h in handles {
+            if let Ok((start, out)) = h.join() {
+                for (k, r) in out.into_iter().enumerate() {
+                    decoded[start + k] = r;
+                }
+            }
+        }
+    });
+    decoded.into_iter().map(|d| d.unwrap_or_default()).collect()
+}
+
+/// Decompress one field back to its (already length-bounded) float vector.
+fn inflate_field(f: &GeomField<'_>) -> Option<Vec<f32>> {
+    let want = f.n.checked_mul(4)?;
+    // The writer compresses exactly `n * 4` bytes, so that is the size limit
+    // zune inflates to — it also bounds the allocation against a corrupt file.
+    let raw = inflate_raw_deflate(f.comp, Some(want))?;
+    if raw.len() < want {
+        return None;
+    }
+    Some(
+        raw.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+// ---- parallel record decode -------------------------------------------------
+// One record is one furniture asset — base64 text decode (sidecar/DXF), inflate,
+// bounds and LOD proxies are all independent per asset. Running the records
+// across cores turns a ~2 s single-threaded decode into a fraction of that on
+// the worker. The pool is capped at 8 so the transient record copies (only the
+// text formats carry geometry in the records) stay bounded.
+
+fn decode_workers_for(n: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(n.max(1))
+}
+
+/// Split `items` into one contiguous chunk per worker, in original order.
+fn chunk_workers<T>(items: Vec<T>) -> Vec<Vec<T>> {
+    let n = items.len();
+    if n <= 1 {
+        return vec![items];
+    }
+    let n_w = decode_workers_for(n);
+    let per = n.div_ceil(n_w);
+    let mut chunks: Vec<Vec<T>> = (0..n_w).map(|_| Vec::with_capacity(per)).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        chunks[i / per].push(item);
+    }
+    chunks
+}
+
+/// Run the per-record decode over a small pool, preserving order.
+fn decode_recs_in_parallel(
+    recs: Vec<crate::simlux_io::FurnitureAssetRec>,
+    decode: impl Fn(crate::simlux_io::FurnitureAssetRec) -> FurnitureAsset + Send + Sync,
+) -> Vec<FurnitureAsset> {
+    let chunks = chunk_workers(recs);
+    let decode = &decode;
+    if chunks.len() == 1 {
+        return chunks
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| decode(r))
+            .collect();
+    }
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| sc.spawn(move || chunk.into_iter().map(|r| decode(r)).collect::<Vec<_>>()))
+            .collect();
+        let mut out = Vec::with_capacity(handles.len().saturating_mul(8));
+        for h in handles {
+            out.extend(h.join().unwrap_or_default());
+        }
+        out
+    })
+}
+
+type NativeParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// The native route's per-record decode: a record + the float arrays the blob
+/// reader decompressed for it (already parallel), assembled into an asset.
+fn decode_pairs_in_parallel(
+    recs: Vec<crate::simlux_io::FurnitureAssetRec>,
+    parts: Vec<NativeParts>,
+    decode: impl Fn(crate::simlux_io::FurnitureAssetRec, NativeParts) -> FurnitureAsset + Send + Sync,
+) -> Vec<FurnitureAsset> {
+    let pairs: Vec<(crate::simlux_io::FurnitureAssetRec, NativeParts)> =
+        recs.into_iter().zip(parts.into_iter()).collect();
+    let chunks = chunk_workers(pairs);
+    let decode = &decode;
+    if chunks.len() == 1 {
+        return chunks
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(r, p)| decode(r, p))
+            .collect();
+    }
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| sc.spawn(move || chunk.into_iter().map(|(r, p)| decode(r, p)).collect::<Vec<_>>()))
+            .collect();
+        let mut out = Vec::with_capacity(handles.len().saturating_mul(8));
+        for h in handles {
+            out.extend(h.join().unwrap_or_default());
+        }
+        out
+    })
 }
 
 /// One furniture mesh's geometry, FLATTENED but NOT yet compressed. Handed to a save worker so the
@@ -3122,6 +3393,41 @@ pub fn encode_texture_png_b64(w: u32, h: u32, rgba: &[u8]) -> String {
         return String::new();
     }
     base64::engine::general_purpose::STANDARD.encode(&png)
+}
+
+/// Decode a persisted texture list back into [`TextureAsset`]s, IN ORDER, so
+/// furniture/feature texture indices keep pointing where they did on disk.
+/// PNG decode is per-texture independent work, so this runs across cores —
+/// the live load path calls it on the WORKER, keeping ~50-100 PNG decodes off
+/// the UI thread. A record that fails to decode becomes a 1×1 grey placeholder,
+/// exactly like the inline decode it replaces.
+pub fn decode_texture_list(recs: &[crate::simlux_io::TextureRec]) -> Vec<TextureAsset> {
+    fn decode_one(r: &crate::simlux_io::TextureRec) -> TextureAsset {
+        decode_texture_rec(r).unwrap_or_else(|| {
+            TextureAsset::new(r.name.clone(), 1, 1, vec![200, 200, 200, 255])
+        })
+    }
+    let n = recs.len();
+    if n <= 1 {
+        return recs.iter().map(decode_one).collect();
+    }
+    let n_w = decode_workers_for(n);
+    let per = n.div_ceil(n_w);
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..n_w)
+            .map(|w| {
+                let start = w * per;
+                let end = ((w + 1) * per).min(n);
+                let chunk = &recs[start..end];
+                sc.spawn(move || chunk.iter().map(decode_one).collect::<Vec<_>>())
+            })
+            .collect();
+        let mut out = Vec::with_capacity(n);
+        for h in handles {
+            out.extend(h.join().unwrap_or_default());
+        }
+        out
+    })
 }
 
 /// Decode a persisted [`crate::simlux_io::TextureRec`] back into a [`TextureAsset`].
@@ -6777,55 +7083,95 @@ impl FactoryState {
     /// [`Self::apply_persist_prebuilt`], so the UI thread never blocks.
     pub fn apply_persist(&mut self, mut d: crate::simlux_io::FactoryDoc) -> usize {
         let lib = Self::decode_furniture_lib(std::mem::take(&mut d.furniture_lib));
-        self.apply_persist_prebuilt(d, lib)
+        self.apply_persist_prebuilt(d, lib, None)
     }
 
     /// Decode furniture records (blob/JSON → `FurnitureAsset` with its cached AABB). Pure (no
     /// `self`), so a worker thread can run it off the UI thread — this is the heavy part of a load.
+    /// Rebuild a [`FurnitureAsset`] from a persisted record + its DECODED float
+    /// arrays — the shared tail of every decode path, so the JSON-base64 route
+    /// and the RSM-native route cannot drift apart.
+    fn furniture_asset_from_parts(
+        a: crate::simlux_io::FurnitureAssetRec,
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        uvs: Vec<[f32; 2]>,
+        alpha: Vec<f32>,
+    ) -> FurnitureAsset {
+        let color = if a.color == [0.0, 0.0, 0.0] { [0.82, 0.82, 0.84] } else { a.color };
+        let mut fa = FurnitureAsset::new(a.name, positions, normals, color);
+        fa.uvs = uvs;
+        fa.alpha = alpha;
+        fa.source_path = (!a.source_path.is_empty()).then_some(a.source_path);
+        fa.alpha_resolved = a.alpha_resolved;
+        if a.part_ids.len() == fa.positions.len() / 3 {
+            fa.part_ids = a.part_ids; // keep per-piece grouping across a reload
+        }
+        fa.emitters = a
+            .emitters
+            .iter()
+            .map(|e| FurnEmitter { pos: [e[0] as f32, e[1] as f32, e[2] as f32], lumens: e[3], watts: e[4] })
+            .collect();
+        fa.cct_k = a.cct_k;
+        // BUILD THE DISPLAY PROXY HERE, ON THE WORKER, not on the first frame that draws.
+        //
+        // `lod_geom` is lazy and cached, which was harmless while `needs_lod` refused every
+        // textured asset and so never ran at all. Now that it runs, the laziness moved
+        // 175 ms of decimation onto the UI thread at the moment the model first appears —
+        // measured on the gym plan, five assets at 30–36 ms each — landing in the same
+        // frame as the first GPU upload of the whole scene. It read as a 517 ms frame.
+        //
+        // This function exists to keep exactly this kind of work off the main thread (see
+        // `apply_persist_prebuilt`), so the proxy belongs in it. Warming `group_geom` first
+        // is not incidental: `lod_geom` needs it, and doing it here keeps that off the UI
+        // thread as well.
+        if fa.needs_lod() {
+            let _ = fa.group_geom();
+            let _ = fa.lod_geom();
+        }
+        fa
+    }
+
+    /// Decode a persisted furniture library whose geometry came as base64 JSON
+    /// blobs (the sidecar and the DXF XRECORD payload, both text formats).
+    /// Assets are independent, so the decode runs ACROSS CORES.
     pub fn decode_furniture_lib(recs: Vec<crate::simlux_io::FurnitureAssetRec>) -> Vec<FurnitureAsset> {
-        recs.into_iter()
-            .map(|a| {
-                let color = if a.color == [0.0, 0.0, 0.0] { [0.82, 0.82, 0.84] } else { a.color };
-                // Prefer the compact blobs; fall back to legacy JSON arrays for old sidecars.
+        // One record → one asset (its b64 geometry, legacy arrays as fallback).
+        fn decode_one(mut a: crate::simlux_io::FurnitureAssetRec) -> FurnitureAsset {
+            let un3 = |v: Vec<f32>| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[f32; 3]>>();
+            let un2 = |v: Vec<f32>| v.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>();
+            // Prefer the compact blobs; fall back to legacy JSON arrays for old sidecars.
+            // (mem::take, never a plain move: the record is handed to the shared
+            // builder WHOLE, and a partially-moved struct cannot be passed on.)
+            let positions = if !a.pos_b64.is_empty() { un3(decode_f32_blob(&a.pos_b64)) } else { std::mem::take(&mut a.positions) };
+            let normals = if !a.nrm_b64.is_empty() { un3(decode_f32_blob(&a.nrm_b64)) } else { std::mem::take(&mut a.normals) };
+            let uvs = if !a.uv_b64.is_empty() { un2(decode_f32_blob(&a.uv_b64)) } else { std::mem::take(&mut a.uvs) };
+            let alpha = if !a.alpha_b64.is_empty() { decode_f32_blob(&a.alpha_b64) } else { Vec::new() };
+            FactoryState::furniture_asset_from_parts(a, positions, normals, uvs, alpha)
+        }
+        decode_recs_in_parallel(recs, decode_one)
+    }
+
+    /// Decode a persisted furniture library whose geometry arrived as the RSM's
+    /// NATIVE compressed blob (see `furniture_geom_native`) — the same records,
+    /// in the same order, geometry taken from the binary instead of the JSON.
+    /// Decompression is already parallel inside the blob reader; the asset
+    /// assembly (bounds, LOD proxies) is parallel here too.
+    pub fn decode_furniture_lib_native(
+        recs: Vec<crate::simlux_io::FurnitureAssetRec>,
+        native: &[u8],
+    ) -> Vec<FurnitureAsset> {
+        let parts = decode_furniture_geom_native(native);
+        decode_pairs_in_parallel(
+            recs,
+            parts,
+            |a, parts| {
                 let un3 = |v: Vec<f32>| v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<[f32; 3]>>();
                 let un2 = |v: Vec<f32>| v.chunks_exact(2).map(|c| [c[0], c[1]]).collect::<Vec<[f32; 2]>>();
-                let positions = if !a.pos_b64.is_empty() { un3(decode_f32_blob(&a.pos_b64)) } else { a.positions };
-                let normals = if !a.nrm_b64.is_empty() { un3(decode_f32_blob(&a.nrm_b64)) } else { a.normals };
-                let uvs = if !a.uv_b64.is_empty() { un2(decode_f32_blob(&a.uv_b64)) } else { a.uvs };
-                let alpha = if !a.alpha_b64.is_empty() { decode_f32_blob(&a.alpha_b64) } else { Vec::new() };
-                let mut fa = FurnitureAsset::new(a.name, positions, normals, color);
-                fa.uvs = uvs;
-                fa.alpha = alpha;
-                fa.source_path = (!a.source_path.is_empty()).then_some(a.source_path);
-                fa.alpha_resolved = a.alpha_resolved;
-                if a.part_ids.len() == fa.positions.len() / 3 {
-                    fa.part_ids = a.part_ids; // keep per-piece grouping across a reload
-                }
-                fa.emitters = a
-                    .emitters
-                    .iter()
-                    .map(|e| FurnEmitter { pos: [e[0] as f32, e[1] as f32, e[2] as f32], lumens: e[3], watts: e[4] })
-                    .collect();
-                fa.cct_k = a.cct_k;
-                // BUILD THE DISPLAY PROXY HERE, ON THE WORKER, not on the first frame that draws.
-                //
-                // `lod_geom` is lazy and cached, which was harmless while `needs_lod` refused every
-                // textured asset and so never ran at all. Now that it runs, the laziness moved
-                // 175 ms of decimation onto the UI thread at the moment the model first appears —
-                // measured on the gym plan, five assets at 30–36 ms each — landing in the same
-                // frame as the first GPU upload of the whole scene. It read as a 517 ms frame.
-                //
-                // This function exists to keep exactly this kind of work off the main thread (see
-                // `apply_persist_prebuilt`), so the proxy belongs in it. Warming `group_geom` first
-                // is not incidental: `lod_geom` needs it, and doing it here keeps that off the UI
-                // thread as well.
-                if fa.needs_lod() {
-                    let _ = fa.group_geom();
-                    let _ = fa.lod_geom();
-                }
-                fa
-            })
-            .collect()
+                let (p, n, u, al) = parts;
+                FactoryState::furniture_asset_from_parts(a, un3(p), un3(n), un2(u), al)
+            },
+        )
     }
 
     /// Install a persisted model whose furniture library was ALREADY decoded (see
@@ -6835,6 +7181,7 @@ impl FactoryState {
         &mut self,
         d: crate::simlux_io::FactoryDoc,
         furniture_lib: Vec<FurnitureAsset>,
+        textures: Option<Vec<TextureAsset>>,
     ) -> usize {
         let have: std::collections::HashSet<u32> =
             d.model.features.iter().map(|f| f.id).collect();
@@ -6895,13 +7242,15 @@ impl FactoryState {
         self.ceilings = d.ceilings.into_iter().filter(|id| have.contains(id)).collect();
         // Furniture library was already decoded (off-thread on the live load path).
         self.furniture_lib = furniture_lib;
-        // Textures first — furniture/feature assignments index into this list. Decode each;
-        // a texture that fails to decode becomes a 1×1 placeholder so LATER indices stay valid.
-        self.textures = d
-            .textures
-            .iter()
-            .map(|r| decode_texture_rec(r).unwrap_or_else(|| TextureAsset::new(r.name.clone(), 1, 1, vec![200, 200, 200, 255])))
-            .collect();
+        // Textures first — furniture/feature assignments index into this list.
+        // Decode EACH, either on the worker (the live load path hands the ready
+        // list over so the UI thread never blocks on 77 PNG decodes) or here
+        // from the records (tests and the sync fallback paths). A texture that
+        // fails to decode becomes a 1×1 placeholder so LATER indices stay valid.
+        self.textures = match textures {
+            Some(t) => t,
+            None => decode_texture_list(&d.textures),
+        };
         let ntex = self.textures.len();
         // Keep only instances whose asset still exists.
         let nlib = self.furniture_lib.len();
@@ -11873,7 +12222,7 @@ mod persist_perf_tests {
         // Load worker: decode furniture off-thread; main thread installs the prebuilt lib.
         let lib = FactoryState::decode_furniture_lib(std::mem::take(&mut doc.furniture_lib));
         let mut st2 = FactoryState::default();
-        st2.apply_persist_prebuilt(doc, lib);
+        st2.apply_persist_prebuilt(doc, lib, None);
         let after = st2.furniture_lib[idx].positions.clone();
         assert_eq!(before.len(), after.len(), "vertex count preserved");
         assert!(before.iter().zip(&after).all(|(a, b)|
@@ -17188,5 +17537,77 @@ mod apertures_fill_the_gap_they_cut {
             f.aperture_section_at_z(0.8).is_empty(),
             "furniture must not be drawn into the wall plan",
         );
+    }
+}
+
+/// The RSM's NATIVE geometry transport (`furniture_geom_native` ↔
+/// `decode_furniture_lib_native`): raw deflated float arrays, no base64 —
+/// opened faster than the JSON-sidecar text the DXF/sidecar paths use.
+#[cfg(test)]
+mod native_geom_tests {
+    use super::*;
+
+    fn raw(pos: &[[f32; 3]], uv: Option<&[[f32; 2]]>) -> FurnitureGeomRaw {
+        FurnitureGeomRaw {
+            pos: flat3(pos),
+            nrm: flat3(pos), // normals need not be real for a transport test
+            uv: uv.map(flat2).unwrap_or_default(),
+            alpha: if uv.is_some() { vec![1.0; pos.len()] } else { Vec::new() },
+        }
+    }
+
+    #[test]
+    fn geometry_round_trips_through_the_native_blob() {
+        let geom = vec![
+            raw(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], None),
+            raw(&[[2.0, 2.0, 2.0], [3.0, 2.0, 2.0], [2.0, 3.0, 2.0]], Some(&[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])),
+        ];
+        // A denser input for the shrink claim — deflate of a handful of verts can
+        // legitimately grow (stream headers), which says nothing about real meshes.
+        let mut dense: Vec<[f32; 3]> = Vec::new();
+        for k in 0..4000 {
+            dense.push([(k % 97) as f32, (k % 89) as f32, (k % 83) as f32]);
+        }
+        let dblob = furniture_geom_native(&[raw(&dense, None)]);
+        assert!(dblob.len() < dense.len() * 12, "deflate must shrink the dense arrays");
+
+        let blob = furniture_geom_native(&geom);
+        assert!(blob.starts_with(b"3DFG1"));
+        let parts = decode_furniture_geom_native(&blob);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].0.len(), 12, "four xyz verts");
+        assert!(parts[0].2.is_empty(), "no UVs on the first asset");
+        assert_eq!(parts[1].2.len(), 6, "three uv pairs on the second");
+        assert_eq!(parts[1].3.len(), 3, "alpha rides with the uv'd asset");
+    }
+
+    #[test]
+    fn a_missing_or_truncated_blob_decodes_to_empties() {
+        assert!(decode_furniture_geom_native(b"nope").is_empty());
+        assert!(decode_furniture_geom_native(b"3DFG1").is_empty(), "no count");
+        let geom = vec![raw(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], None)];
+        let blob = furniture_geom_native(&geom);
+        let cut = &blob[..blob.len() - 3]; // truncate mid-stream
+        let parts = decode_furniture_geom_native(cut);
+        assert!(
+            parts.is_empty() || parts[0].0.len() <= 6,
+            "a truncated blob must not fabricate geometry",
+        );
+    }
+
+    #[test]
+    fn records_decode_native_to_the_same_assets_as_the_json_route() {
+        use crate::simlux_io::FurnitureAssetRec;
+        let mut recs = vec![FurnitureAssetRec { name: "chair".into(), ..Default::default() }];
+        let pos = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let blob = furniture_geom_native(&[raw(&pos, None)]);
+        let assets = FactoryState::decode_furniture_lib_native(
+            std::mem::take(&mut recs), &blob);
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].positions.len(), 3, "geometry arrived from the blob");
+        assert_eq!(assets[0].name, "chair");
+        let local = (assets[0].local_min, assets[0].local_max);
+        assert_eq!(local.0, [0.0, 0.0, 0.0]);
+        assert_eq!(local.1, [1.0, 1.0, 0.0]);
     }
 }

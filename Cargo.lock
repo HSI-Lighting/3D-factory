@@ -328,6 +328,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "zune-inflate",
 ]
 
 [[package]]
