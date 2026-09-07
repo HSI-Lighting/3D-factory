@@ -2682,6 +2682,19 @@ pub struct CadApp {
     factory_scene_ver: u64,
     /// Which viewport is ACTIVE (last interacted with) — the modifier dispatch signal.
     active_view: ActiveView,
+    /// Which WORKSPACE the top ribbon is showing. The ribbon applies this as a
+    /// single-view preset; menus may still open extra panels on top of it.
+    view_mode: ViewMode,
+    /// The ribbon hid the 2D canvas to enter a 3D workspace, then a face sketch
+    /// (which is drawn ON the 2D canvas) had to re-show it — remember to put it
+    /// back when that sketch closes.
+    mode_auto_showed_2d: bool,
+    /// One frame of `exact_width` when the SIMLUX 3D view is chosen on the
+    /// ribbon, so the viewport expands to fill the window once (stored width
+    /// then keeps it freely resizable, like the workspace split entry).
+    view3d_fill_pending: bool,
+    /// Same one-frame fill for the 3D Factory viewport.
+    factory_fill_pending: bool,
     /// O(1) "is dobject i selected?" lookup for the DRAW LOOP, rebuilt once per frame.
     ///
     /// ⚠️ This exists because `self.selection.contains(&i)` is a LINEAR SCAN of a Vec,
@@ -5096,6 +5109,50 @@ impl ActiveView {
     }
 }
 
+/// The WORKSPACE chosen on the top view-mode ribbon — which viewport fills the
+/// window and which tool set the left mode panel carries.
+///
+/// Selecting a mode applies a single-view workspace preset (2D canvas /
+/// SIMLUX 3D viewport / 3D Factory viewport). The panels remain independently
+/// openable from the menus on top of it; pressing the ribbon tab again restores
+/// the clean preset.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewMode {
+    /// The 2D drafting canvas (full drawing + modify toolset; rails return).
+    #[default]
+    TwoD,
+    /// The SIMLUX lighting 3D viewport — the lit scene, full window.
+    Simlux3D,
+    /// The 3D Factory solid-modelling viewport.
+    Factory3D,
+}
+
+impl ViewMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::TwoD => "2D Drafting",
+            ViewMode::Simlux3D => "SIMLUX 3D",
+            ViewMode::Factory3D => "3D Factory",
+        }
+    }
+
+    fn ribbon_label(self) -> &'static str {
+        match self {
+            ViewMode::TwoD => "🗎   2D Drafting",
+            ViewMode::Simlux3D => "☀   SIMLUX 3D",
+            ViewMode::Factory3D => "⬢   3D Factory",
+        }
+    }
+
+    fn ribbon_tip(self) -> &'static str {
+        match self {
+            ViewMode::TwoD => "The drafting canvas — the full 2D drawing + modify toolset. The Draw/Modify rails and this panel carry the tools.",
+            ViewMode::Simlux3D => "The SIMLUX lighting view — the lit scene in 3D, with fittings, calculation and display tools on the left.",
+            ViewMode::Factory3D => "The 3D Factory — build rooms, walls, storeys and solids from 2D outlines; sketch on any face.",
+        }
+    }
+}
+
 /// Transient authoring state for the **Materials Factory** node editor. The node graphs live here,
 /// keyed by texture index; each is seeded from its [`crate::factory::TextureAsset`] on first open and
 /// compiled back onto it on every edit, so nothing extra is persisted (the material's flat fields
@@ -5324,6 +5381,10 @@ impl Default for CadApp {
             texture_rgba:            std::collections::HashMap::new(),
             factory_scene_ver:       0,
             active_view:         ActiveView::TwoD,
+            view_mode:           ViewMode::TwoD,
+            mode_auto_showed_2d: false,
+            view3d_fill_pending: false,
+            factory_fill_pending: false,
             sel_mask:            Vec::new(),
             gpu_dirty:    true,
             view_seq: 1,
@@ -6424,27 +6485,9 @@ impl CadApp {
         self.commit_light_undo();
         // …and the two that delete go through the shared path, so a fixture placed from the
         // library takes its symbol with it. Deleting here used to leave the block on the plan.
-        if let Some(id) = action.remove_fixture {
-            self.delete_fixtures(&[id]);
-        }
-        if action.clear_fixtures {
-            let all: Vec<u32> = self.light.luminaires.iter().map(|l| l.id).collect();
-            let (lights, blocks) = self.delete_fixtures(&all);
-            self.light.last_msg =
-                format!("Cleared {lights} fixture(s) and {blocks} symbol(s).");
-        }
-        if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
-        if let Some(id) = action.import_layer {
-            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-            self.light.import_layer(plan, id);
-        }
-        if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
-        if action.import_photometry {
-            self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
-        }
-        if action.calculate {
-            self.start_calculation();
-        }
+        // Shared with the 3D viewport toolbar (mode panel) via `apply_light_actions`, so the
+        // panel's and the toolbar's action handling can never drift apart.
+        self.apply_light_actions(action);
     }
 
     /// WHICH WINDOW the command line is talking to.
@@ -11120,6 +11163,15 @@ impl CadApp {
         if self.factory.session.is_some() {
             self.factory_exit_sketch();
         }
+        // A face sketch is DRAWN ON THE 2D CANVAS (the plan document is swapped
+        // for the plane's below). In an exclusive 3D workspace the ribbon has
+        // hidden the canvas — re-show it for the session and put it back when
+        // the sketch closes, so "draw on this face" still works from the
+        // full-window 3D view.
+        if !self.two_d_open && !matches!(self.view_mode, ViewMode::TwoD) {
+            self.two_d_open = true;
+            self.mode_auto_showed_2d = true;
+        }
         // REOPEN an existing sketch on this same plane rather than starting a blank new one,
         // so returning to a face shows the work already drawn there — otherwise every visit
         // makes a fresh empty sketch and the previous drawing seems to vanish. This is also what
@@ -11237,6 +11289,24 @@ impl CadApp {
     /// Close the sketch: put the drawn document back into the model and restore the
     /// model-space document + its undo history.
     fn factory_exit_sketch(&mut self) {
+        // The ribbon's exclusive 3D workspace had auto-shown the 2D canvas for
+        // this sketch — put it back now the drafting is done. Only when the
+        // user has NOT meanwhile switched to the 2D workspace (that one keeps
+        // the canvas by definition).
+        if self.mode_auto_showed_2d {
+            self.mode_auto_showed_2d = false;
+            if !matches!(self.view_mode, ViewMode::TwoD) {
+                self.two_d_open = false;
+                // While the canvas was up it reserved its strip, so the 3D
+                // panel's stored width was clamped down — re-arm the one-frame
+                // full-window fill so the exclusive workspace reclaims it.
+                match self.view_mode {
+                    ViewMode::Factory3D => self.factory_fill_pending = true,
+                    ViewMode::Simlux3D => self.view3d_fill_pending = true,
+                    ViewMode::TwoD => {}
+                }
+            }
+        }
         self.factory.sketch_ref.clear();
         // AN UNAPPLIED CUTOUT EDIT PUTS ITS OPENING BACK, whichever way the sketch was left.
         //
@@ -13595,12 +13665,19 @@ impl CadApp {
         // the 2D view closed this panel is free to fill everything the SIMLUX panel is not using.
         let keep_2d = if self.two_d_open { MIN_VIEW_W } else { 0.0 };
         let factory_max = (ctx.available_rect().width() - keep_2d).max(MIN_VIEW_W);
-        egui::SidePanel::right("factory_3d_panel")
+        // Ribbon entry pins ONE frame of exact width so the viewport fills the
+        // window; after that egui's stored width keeps it freely resizable.
+        let entering_fill = self.factory_fill_pending;
+        self.factory_fill_pending = false;
+        let mut factory_panel = egui::SidePanel::right("factory_3d_panel")
             .min_width(240.0)
             .max_width(factory_max)
             .resizable(true)
-            .default_width(420.0)
-            .show(ctx, |ui| {
+            .default_width(420.0);
+        if entering_fill {
+            factory_panel = factory_panel.exact_width(factory_max);
+        }
+        factory_panel.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("3D Factory");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -16780,6 +16857,11 @@ impl CadApp {
         let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
         let mut leave_workspace = false;
+        // Ribbon entry to the exclusive SIMLUX 3D workspace pins one frame of
+        // exact width so the viewport fills the window; after that the stored
+        // width keeps it freely resizable (same trick as the split entry below).
+        let entering_fill = self.view3d_fill_pending && !split;
+        self.view3d_fill_pending = false;
         // Opening the picker mutates `self.file_dialog`, and the panel closure already holds
         // `self` — so the request is carried out after the panel is drawn.
         let mut open_ies_picker = false;
@@ -16831,6 +16913,11 @@ impl CadApp {
         };
         let keep_2d = if self.two_d_open { MIN_VIEW_W } else { 0.0 };
         let max = (ctx.screen_rect().width() - factory_w - keep_2d).max(MIN_VIEW_W);
+        // Width left AFTER everything reserved earlier this frame (the mode-tools
+        // panel, the inspector…) — the exclusive full-window fill must not exceed
+        // it, or the panel would overlap the left panel (the historical overlap
+        // bug this function's max-clamp already exists for).
+        let fill_w = (ctx.available_rect().width() - keep_2d).max(MIN_VIEW_W);
         let entering_split = split && !self.simlux_split_prev;
         self.simlux_split_prev = split;
         let base = egui::SidePanel::right("simlux_3d_panel")
@@ -16839,7 +16926,10 @@ impl CadApp {
             // Never let it swallow the window: the half it is paired with has to stay usable, and a
             // panel dragged past the far edge cannot be dragged back.
             .max_width(max);
-        let base = if entering_split {
+        let base = if entering_fill {
+            // Fill the window: the ribbon's exclusive SIMLUX 3D workspace.
+            base.exact_width(fill_w)
+        } else if entering_split {
             // One frame of exact_width pins the STORED width to half; from the next frame on the
             // drag handle is back and it stays wherever the user puts it.
             base.exact_width(half)
@@ -16871,23 +16961,27 @@ impl CadApp {
                 // panel, so "how do I add a light" had no answer anywhere on screen.
                 // The toolbar edits the REPORT's scale — one set of settings for the window and
                 // the page alike. Taken out and put back so both borrows are short.
-                let room_max = self.light_room_max();
-                let mut ropts = std::mem::take(&mut self.report_opts);
-                let strays = self.stray_light_ids().len();
-                let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays,
-                    &|s| crate::calc::parse_drag(&self.calc, s));
-                self.report_opts = ropts;
-                if act.import_photometry {
-                    open_ies_picker = true;
-                }
-                if act.calculate {
-                    // THE PLAN. The live preview 100 lines above already reads `plan_doc()`; this
-                    // reached for `self.doc` again, so the picture and the number printed under it
-                    // were fed by two different documents.
-                    self.start_calculation();
-                }
-                if act.export_report {
-                    self.export_light_report();
+                // In the exclusive SIMLUX 3D workspace the SAME toolbar lives in the left mode
+                // panel (it is the mode's tool surface), so it is not repeated here.
+                if !matches!(self.view_mode, ViewMode::Simlux3D) {
+                    let room_max = self.light_room_max();
+                    let mut ropts = std::mem::take(&mut self.report_opts);
+                    let strays = self.stray_light_ids().len();
+                    let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays,
+                        &|s| crate::calc::parse_drag(&self.calc, s));
+                    self.report_opts = ropts;
+                    if act.import_photometry {
+                        open_ies_picker = true;
+                    }
+                    if act.calculate {
+                        // THE PLAN. The live preview 100 lines above already reads `plan_doc()`; this
+                        // reached for `self.doc` again, so the picture and the number printed under it
+                        // were fed by two different documents.
+                        self.start_calculation();
+                    }
+                    if act.export_report {
+                        self.export_light_report();
+                    }
                 }
                 if self.light.grid.is_some() {
                     // THE REPORT'S BANDS — the same scale the floor sheet is painted in.
@@ -17111,6 +17205,637 @@ impl CadApp {
             self.light.view3d_open = open;
         }
     }
+    // ===== view-mode ribbon + per-mode left tool panel =====================
+
+    /// Apply the chosen workspace preset. Pressing the active tab again simply
+    /// re-applies it (that is the "restore the clean preset" gesture).
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        // A live face sketch keeps its Finish/Apply-reshape/Cancel UI inside the
+        // 3D Factory panel. A preset that closes that panel must commit the
+        // sketch FIRST — otherwise the session (and an un-applied cutout stash)
+        // is orphaned with no exit surface on screen. `factory_exit_sketch` is
+        // the same commit path opening a file uses.
+        if !matches!(mode, ViewMode::Factory3D) && self.factory.session.is_some() {
+            self.factory_exit_sketch();
+        }
+        self.view_mode = mode;
+        match mode {
+            ViewMode::TwoD => {
+                self.factory.open = false;
+                self.light.simlux_mode = false;
+                self.light.view3d_open = false;
+                self.two_d_open = true;
+                self.mode_auto_showed_2d = false;
+                self.active_view = ActiveView::TwoD;
+            }
+            ViewMode::Simlux3D => {
+                self.light.simlux_mode = false; // NOT the split — an exclusive 3D view
+                self.light.view3d_open = true;
+                self.factory.open = false;
+                // A face sketch is drawn on the 2D canvas: keep it available for
+                // the session (auto-hidden again when the sketch closes).
+                self.two_d_open = self.factory.session.is_some();
+                self.mode_auto_showed_2d = self.two_d_open;
+                self.view3d_fill_pending = true;
+                self.active_view = ActiveView::TwoD; // commands still target the plan
+            }
+            ViewMode::Factory3D => {
+                self.factory.open = true;
+                self.light.simlux_mode = false;
+                self.light.view3d_open = false;
+                self.two_d_open = self.factory.session.is_some();
+                self.mode_auto_showed_2d = self.two_d_open;
+                self.factory_fill_pending = true;
+                self.active_view = ActiveView::ThreeD;
+            }
+        }
+    }
+
+    /// Keep the chosen workspace coherent frame-to-frame.
+    ///
+    /// The panels have their own ✕ buttons and factory flows open/close them on
+    /// their own — a 3D workspace whose viewport has just been closed must fall
+    /// back to the 2D workspace instead of leaving a dead layout, and the 2D
+    /// workspace never leaves the user with no view at all (parity with
+    /// `keep_one_view_open`).
+    fn normalize_view_mode(&mut self) {
+        match self.view_mode {
+            ViewMode::TwoD => {
+                if !self.two_d_open
+                    && !self.factory.open
+                    && !self.light.view3d_open
+                    && !self.light.simlux_mode
+                {
+                    self.two_d_open = true;
+                }
+            }
+            ViewMode::Factory3D => {
+                if !self.factory.open && self.factory.session.is_none() {
+                    self.view_mode = ViewMode::TwoD;
+                    self.two_d_open = true;
+                    self.active_view = ActiveView::TwoD;
+                }
+            }
+            ViewMode::Simlux3D => {
+                if !self.light.view3d_open && !self.light.simlux_mode {
+                    self.view_mode = ViewMode::TwoD;
+                    self.two_d_open = true;
+                    self.active_view = ActiveView::TwoD;
+                }
+            }
+        }
+    }
+
+    /// The top view-mode ribbon: 2D Drafting | SIMLUX 3D | 3D Factory.
+    fn render_mode_ribbon(&mut self, ctx: &egui::Context) {
+        use crate::theme::color as tc;
+        let mode = self.view_mode;
+        egui::TopBottomPanel::top("mode_ribbon")
+            .frame(egui::Frame::none().fill(tc::SURFACE_1))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("VIEW")
+                            .small()
+                            .strong()
+                            .color(tc::TEXT_MUTED),
+                    );
+                    ui.add_space(6.0);
+                    for m in [ViewMode::TwoD, ViewMode::Simlux3D, ViewMode::Factory3D] {
+                        let on = mode == m;
+                        let resp = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(m.ribbon_label())
+                                        .color(if on { tc::ACCENT } else { tc::TEXT_SECONDARY })
+                                        .size(12.5)
+                                        .strong(),
+                                )
+                                .fill(if on { tc::SURFACE_2 } else { egui::Color32::TRANSPARENT })
+                                .stroke(if on {
+                                    egui::Stroke::new(1.0, tc::ACCENT)
+                                } else {
+                                    egui::Stroke::NONE
+                                })
+                                .min_size(egui::vec2(0.0, 24.0))
+                                .rounding(egui::Rounding::same(5.0)),
+                            )
+                            .on_hover_text(m.ribbon_tip());
+                        if resp.clicked() {
+                            // Re-pressing the ACTIVE tab re-applies its preset —
+                            // the one-click reset back from a mixed manual state
+                            // (menus can still stack panels on top of a mode).
+                            let changed = self.view_mode != m;
+                            self.set_view_mode(m);
+                            if changed {
+                                self.history.push(format!("  view mode → {}", m.label()));
+                            }
+                        }
+                        ui.add_space(2.0);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(mode.label())
+                                .small()
+                                .color(tc::TEXT_MUTED),
+                        )
+                        .on_hover_text("The workspace owns the window — other views close; menus can still open them on top.");
+                        ui.add_space(10.0);
+                    });
+                });
+                ui.add_space(4.0);
+            });
+    }
+
+    /// The left tool panel — one tool surface per ribbon mode.
+    fn render_mode_tools_panel(&mut self, ctx: &egui::Context) {
+        use crate::theme::color as tc;
+        let mode = self.view_mode;
+        egui::SidePanel::left("mode_tools_panel")
+            .default_width(286.0)
+            .min_width(240.0)
+            .max_width(380.0)
+            .resizable(true)
+            .frame(egui::Frame::none().fill(tc::SURFACE_1))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(mode.label())
+                            .size(13.0)
+                            .color(tc::ACCENT)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("mode tools")
+                                .small()
+                                .color(tc::TEXT_MUTED),
+                        );
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        match mode {
+                            ViewMode::TwoD => self.mode_tools_2d(ui),
+                            ViewMode::Simlux3D => self.mode_tools_simlux(ui),
+                            ViewMode::Factory3D => self.mode_tools_factory(ui),
+                        }
+                    });
+            });
+    }
+
+    /// One wide labelled row that dispatches an existing command (same registry
+    /// path and active-highlight as the Draw/Modify rails). `id` is the
+    /// namespaced registry id (`"draw.line"`); `cmd` the dispatch token the
+    /// rails highlight (`"line"`).
+    fn mode_tool_row(&mut self, ui: &mut egui::Ui, id: &str, cmd: &str, label: &str, tip: &str) {
+        use crate::theme::color as tc;
+        let active = self.rail_active == cmd;
+        let btn = egui::Button::new(
+            egui::RichText::new(label)
+                .size(12.5)
+                .color(if active { tc::ACCENT } else { tc::TEXT_SECONDARY }),
+        )
+        .fill(if active { tc::SURFACE_2 } else { egui::Color32::TRANSPARENT })
+        .stroke(if active {
+            egui::Stroke::new(1.0, tc::ACCENT)
+        } else {
+            egui::Stroke::NONE
+        })
+        .min_size(egui::vec2(ui.available_width(), 24.0))
+        .rounding(egui::Rounding::same(4.0));
+        if ui.add(btn).on_hover_text(tip).clicked() {
+            self.rail_active = cmd.to_string();
+            self.execute(id);
+        }
+    }
+
+    /// Group heading inside a mode panel.
+    fn mode_tool_heading(&self, ui: &mut egui::Ui, title: &str) {
+        use crate::theme::color as tc;
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(title)
+                .small()
+                .strong()
+                .color(tc::TEXT_MUTED),
+        );
+        ui.separator();
+    }
+
+    /// 2D workspace: the drawing + modify sets (same commands as the rails),
+    /// then the SIMLUX actions that live on the 2D plan.
+    fn mode_tools_2d(&mut self, ui: &mut egui::Ui) {
+        self.mode_tool_heading(ui, "DRAW");
+        for (_, cmd, tip) in DRAW_CMDS {
+            let label = tip.split("  (").next().unwrap_or(tip);
+            self.mode_tool_row(ui, &format!("draw.{cmd}"), cmd, label, tip);
+        }
+        self.mode_tool_heading(ui, "MODIFY");
+        for (_, cmd, tip) in MODIFY_CMDS {
+            let label = tip.split("  (").next().unwrap_or(tip);
+            self.mode_tool_row(ui, &format!("modify.{cmd}"), cmd, label, tip);
+        }
+        self.mode_tool_heading(ui, "SIMLUX · ON THE PLAN");
+        let mut placing = self.light.place_mode;
+        if ui
+            .selectable_label(placing, "＋ Place luminaire (click plan)")
+            .on_hover_text("Arm placement: each click on the plan drops a luminaire point at the active fitting")
+            .clicked()
+        {
+            self.light.place_mode = !placing;
+            if self.light.place_mode {
+                self.light.aim_mode = false;
+            }
+        }
+        let mut aiming = self.light.aim_mode;
+        if ui
+            .selectable_label(aiming, "⌖ Aim a light at a point")
+            .on_hover_text("Two clicks: pick the luminaire, then the point it aims at (plan)")
+            .clicked()
+        {
+            self.light.aim_mode = !aiming;
+            if self.light.aim_mode {
+                self.light.place_mode = false;
+            }
+        }
+        let mut overlay = self.light.show_overlay;
+        if ui
+            .selectable_label(overlay, "▦ Lux overlay on 2D plan")
+            .on_hover_text("Paint the last calculation's lux values on the plan")
+            .clicked()
+        {
+            self.light.show_overlay = !overlay;
+        }
+        if ui
+            .button("⚡ Calculate lux")
+            .on_hover_text("Run the lighting calculation on the room(s) and show results")
+            .clicked()
+        {
+            self.light.window_open = true;
+            self.start_calculation();
+        }
+    }
+
+    /// SIMLUX 3D workspace: the real grouped toolbar (fittings · luminaires ·
+    /// calculation · surfaces · display · report) hosted here as the mode's
+    /// tool surface, then the panel windows it belongs with.
+    fn mode_tools_simlux(&mut self, ui: &mut egui::Ui) {
+        let room_max = self.light_room_max();
+        let mut ropts = std::mem::take(&mut self.report_opts);
+        let strays = self.stray_light_ids().len();
+        let act = self.light.toolbar_ui(ui, &mut ropts, room_max, strays,
+            &|s| crate::calc::parse_drag(&self.calc, s));
+        self.report_opts = ropts;
+        self.apply_light_actions(act);
+        // Placement/aim happen by clicking the PLAN — if the exclusive workspace
+        // has hidden it, surface it while ANY click-the-plan flow is armed
+        // (place-mode, aim-mode, or the Illuminaire library's ▣ Place, which
+        // disarms the other two), and put it back once disarmed. An open face
+        // sketch keeps it: drafting is on the canvas.
+        let armed = self.light.place_mode
+            || self.light.aim_mode
+            || self.light.place_fitting.is_some();
+        if matches!(self.view_mode, ViewMode::Simlux3D) {
+            if armed && !self.two_d_open {
+                self.two_d_open = true;
+            } else if !armed
+                && self.two_d_open
+                && self.factory.session.is_none()
+            {
+                self.two_d_open = false;
+                // Reclaim the full-window fill the episode shrank (the stored
+                // panel width was clamped while the canvas reserved its strip).
+                self.view3d_fill_pending = true;
+            }
+        }
+        ui.separator();
+        let mut light_win = self.light.window_open;
+        if ui
+            .checkbox(&mut light_win, "Light panel (settings + results)")
+            .changed()
+        {
+            self.light.window_open = light_win;
+        }
+        let mut lib_open = self.light.illuminaire_open;
+        let lib_resp = ui
+            .checkbox(&mut lib_open, "💡 Illuminaire (fittings library)")
+            .on_hover_text("Your library of fittings — a 2D block paired with a photometric file");
+        if lib_resp.changed() {
+            let was = self.light.illuminaire_open;
+            self.light.illuminaire_open = lib_open;
+            // Scan on OPEN, so a folder set last session is populated without
+            // the user having to press anything to see what is in it.
+            if lib_open && !was {
+                self.light.lib_scanned = crate::illuminaire::scan_folder(&self.light.lib_folder);
+            }
+        }
+    }
+
+    /// Apply the actions the SIMLUX panel/toolbar ask the app to run (the
+    /// union of what the Light window and the 3D toolbar each apply).
+    fn apply_light_actions(&mut self, act: crate::light::LightAction) {
+        if let Some(id) = act.remove_fixture {
+            self.delete_fixtures(&[id]);
+        }
+        if act.clear_fixtures {
+            let all: Vec<u32> = self.light.luminaires.iter().map(|l| l.id).collect();
+            let (lights, blocks) = self.delete_fixtures(&all);
+            self.light.last_msg =
+                format!("Cleared {lights} fixture(s) and {blocks} symbol(s).");
+        }
+        if act.shift_to_simlux {
+            self.shift_selection_to_simlux_layer();
+        }
+        if let Some(id) = act.import_layer {
+            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
+            self.light.import_layer(plan, id);
+        }
+        if let Some(id) = act.remove_layer {
+            self.light.remove_room_layer(id);
+        }
+        if act.import_photometry {
+            self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
+        }
+        if act.calculate {
+            self.start_calculation();
+        }
+        if act.export_report {
+            self.export_light_report();
+        }
+    }
+
+    /// 3D Factory workspace: build from 2D, storeys, view toggles, add-solid,
+    /// and the factory's grouped menus (openings · apertures · architecture ·
+    /// textures · scene import).
+    fn mode_tools_factory(&mut self, ui: &mut egui::Ui) {
+        use crate::theme::color as tc;
+        let in_sketch = self.factory.session.is_some();
+        // ---- Build from a 2D outline --------------------------------------
+        self.mode_tool_heading(ui, "BUILD");
+        for (label, tip, run) in [
+            ("⌂  Make building (from outline)", "Turn the selected closed 2D outline into a solid mass", 0u8),
+            ("⬒  Make 3D walls", "Promote selected 2D lines/walls/arcs to 3D walls", 1),
+            ("⬓  Make floor", "Make a floor slab from the selected closed outline", 2),
+            ("⬒  Make ceiling", "Make a ceiling slab from the selected closed outline", 3),
+            ("⬚  Make room (from outline)", "Floor slab + perimeter walls + ceiling from the selected closed outline", 4),
+        ] {
+            let resp = ui
+                .add_enabled(
+                    !in_sketch,
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(12.5)
+                            .color(tc::TEXT_SECONDARY),
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .min_size(egui::vec2(ui.available_width(), 24.0))
+                    .rounding(egui::Rounding::same(4.0)),
+                )
+                .on_hover_text(if in_sketch {
+                    "Finish the face sketch first (the plan actions are parked while drafting on a face)"
+                } else {
+                    tip
+                });
+            if resp.clicked() {
+                match run {
+                    0 => self.do_make_building(),
+                    1 => self.do_make_3d_wall(),
+                    2 => self.do_make_slab(true),
+                    3 => self.do_make_slab(false),
+                    _ => self.do_make_room(),
+                }
+            }
+        }
+        // ---- Storeys -------------------------------------------------------
+        self.mode_tool_heading(ui, "STOREY");
+        ui.horizontal(|ui| {
+            let n = self.factory.storeys.len();
+            if n == 0 {
+                ui.label(egui::RichText::new("no storeys").small().weak());
+                return;
+            }
+            let act = self.factory.active_storey.min(n - 1);
+            let base = self.factory.active_base_z();
+            if ui
+                .add_enabled(act > 0, egui::Button::new("▼").min_size(egui::vec2(22.0, 20.0)))
+                .on_hover_text("Down a level")
+                .clicked()
+            {
+                self.factory.active_storey = act - 1;
+            }
+            ui.label(
+                egui::RichText::new(format!("{}  ·  {base:.2} m", self.factory.storeys[act].name))
+                    .size(12.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(255, 200, 120)),
+            );
+            if ui
+                .add_enabled(act + 1 < n, egui::Button::new("▲").min_size(egui::vec2(22.0, 20.0)))
+                .on_hover_text("Up a level")
+                .clicked()
+            {
+                self.factory.active_storey = act + 1;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("＋ level on top")
+                .on_hover_text("Add an empty storey on top and make it active")
+                .clicked()
+            {
+                self.snapshot_factory();
+                let i = self.factory.add_storey_on_top();
+                self.history.push(format!(
+                    "  storey '{}' added — new geometry now builds at {:.2} m",
+                    self.factory.storeys[i].name,
+                    self.factory.storey_base_z(i),
+                ));
+            }
+            if ui
+                .button("⇑ duplicate floor")
+                .on_hover_text("Copy this level's building, walls and solids onto a new level above")
+                .clicked()
+            {
+                self.snapshot_factory();
+                match self.factory.duplicate_storey_up() {
+                    Some(i) => {
+                        self.factory.recompute();
+                        self.factory.fit();
+                        self.history.push(format!(
+                            "  floor duplicated up to '{}' (at {:.2} m)",
+                            self.factory.storeys[i].name,
+                            self.factory.storey_base_z(i),
+                        ));
+                    }
+                    None => {
+                        self.undo_stack.pop();
+                        self.factory.status =
+                            "nothing on this level to duplicate — build something first".into();
+                    }
+                }
+            }
+        });
+        // ---- Add / generate ------------------------------------------------
+        self.mode_tool_heading(ui, "ADD");
+        click_menu_button(ui, "▼ 3D solids", |ui| {
+            for k in crate::factory::Draw3dKind::ALL {
+                if ui.button(format!("{}  {}", k.icon(), k.label())).clicked() {
+                    self.factory.draw3d = Some(crate::factory::Draw3dDialog::new(k));
+                    ui.close_menu();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Parametric 3D primitives — opens the Draw3D dialog");
+        click_menu_button(ui, "▼ Openings", |ui| {
+            self.factory_openings_menu(ui);
+        })
+        .response
+        .on_hover_text("Select, resize or delete cutouts (windows/doors/recesses)");
+        click_menu_button(ui, "▼ Apertures", |ui| {
+            self.factory_apertures_menu(ui);
+        })
+        .response
+        .on_hover_text("Doors & windows: import one, or draw a rectangle on a wall and the app cuts the opening + fits a door/window into it");
+        click_menu_button(ui, "▼ Architecture", |ui| {
+            self.factory_architecture_menu(ui);
+        })
+        .response
+        .on_hover_text("Generate a staircase (straight or U-shape), a spiral stair, or a ramp");
+        click_menu_button(ui, "▼ Textures", |ui| {
+            self.factory_textures_menu(ui);
+        })
+        .response
+        .on_hover_text("Colour or texture the selected object");
+        click_menu_button(ui, "▼ FBC scene import", |ui| {
+            self.factory_scene_import_menu(ui);
+        })
+        .response
+        .on_hover_text("Import a whole scene exported from Blender (.glb / .gltf / .fbx) at its real-world size");
+        // ---- View toggles --------------------------------------------------
+        self.mode_tool_heading(ui, "VIEW");
+        let plan_on = self.factory.show_plan;
+        if ui
+            .selectable_label(plan_on, "▦ Plan underlay")
+            .on_hover_text("Show the 2D drawing on the ground as a reference underlay")
+            .clicked()
+        {
+            self.factory.show_plan = !plan_on;
+        }
+        if plan_on {
+            let xray = self.factory.plan_xray;
+            if ui
+                .selectable_label(xray, "☒ X-ray plan")
+                .on_hover_text("Draw the plan THROUGH the model")
+                .clicked()
+            {
+                self.factory.plan_xray = !xray;
+            }
+        }
+        let hide_on = self.factory.hide_ceilings;
+        let n_ceil = self.factory.ceilings.len();
+        if ui
+            .selectable_label(hide_on, format!("▤ Hide ceilings ({n_ceil})"))
+            .on_hover_text(
+                "Hide room/ceiling slabs so you can see inside. Only tracked ceilings \
+                 count — a solid building's top or bare walls have none.",
+            )
+            .clicked()
+        {
+            self.factory.hide_ceilings = !hide_on;
+            self.factory.dirty = true;
+            self.factory.recompute();
+            if n_ceil == 0 {
+                self.factory.status =
+                    "no ceilings to hide — try 'Cutaway' to see inside anything".into();
+            }
+        }
+        let cut_on = self.factory.cutaway;
+        if ui
+            .selectable_label(cut_on, "⊔ Cutaway (clip above a plane)")
+            .on_hover_text("See inside anything — clips the view above a horizontal cut plane (Shift+X in the 3D view)")
+            .clicked()
+        {
+            self.factory.cutaway = !cut_on;
+            self.factory.status = format!("cutaway {}", if cut_on { "off" } else { "on" });
+        }
+        for (flag, label, tip) in [
+            (self.factory.show_grid, "⌖ Grid", "Show the 3D grid"),
+            (self.factory.show_ground, "▭ Ground", "Show the ground plane"),
+            (self.factory.show_origin, "◎ Origin", "Show the origin axes"),
+            (self.factory.snap_3d, "🔗 3D snapping", "Snap picks to object vertices/edges in 3D"),
+        ] {
+            let on = flag;
+            if ui
+                .selectable_label(on, label)
+                .on_hover_text(tip)
+                .clicked()
+            {
+                match label {
+                    "⌖ Grid" => self.factory.show_grid = !on,
+                    "▭ Ground" => self.factory.show_ground = !on,
+                    "◎ Origin" => self.factory.show_origin = !on,
+                    _ => self.factory.snap_3d = !on,
+                }
+            }
+        }
+        let gizmo = self.factory.gizmo_mode;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("gizmo").small().weak());
+            if ui
+                .selectable_label(gizmo == crate::factory::GizmoMode::Move, "↔ Move")
+                .on_hover_text("Drag the arms to move the selection")
+                .clicked()
+            {
+                self.factory.gizmo_mode = crate::factory::GizmoMode::Move;
+            }
+            if ui
+                .selectable_label(gizmo == crate::factory::GizmoMode::Rotate, "⟳ Rotate")
+                .on_hover_text("Drag a ring to rotate the selection about that axis")
+                .clicked()
+            {
+                self.factory.gizmo_mode = crate::factory::GizmoMode::Rotate;
+            }
+        });
+        // ---- Frame / render / clear ---------------------------------------
+        ui.horizontal(|ui| {
+            if ui.button("⌖ Frame").on_hover_text("Fit the model in the view").clicked() {
+                if self.factory.dirty {
+                    self.factory.recompute();
+                }
+                self.factory.fit();
+            }
+            if ui
+                .button(if self.factory.sun.enabled { "☀ Sun" } else { "☀ Sun…" })
+                .on_hover_text("Daylight: locate the sun from the building's latitude/longitude, date and time")
+                .clicked()
+            {
+                self.sun_modal_open = !self.sun_modal_open;
+            }
+            if ui
+                .selectable_label(self.render_modal_open, "⏺ Render")
+                .on_hover_text("Path-traced render — true global illumination, like Blender's Cycles")
+                .clicked()
+            {
+                self.render_modal_open = !self.render_modal_open;
+            }
+        });
+        if ui
+            .button(egui::RichText::new("🗑 Clear model").color(tc::DANGER))
+            .on_hover_text("Remove every solid, room, wall and furniture instance")
+            .clicked()
+        {
+            self.snapshot_factory();
+            self.factory.clear();
+        }
+    }
+
     // ===== end SIMLUX lighting ==========================================
 
     /// True when ANY command / draw tool / modify flow is mid-operation. Used
@@ -55567,6 +56292,11 @@ impl eframe::App for CadApp {
         }
         self.factory_was_open = self.factory.open;
 
+        // Keep the ribbon's chosen workspace coherent: a 3D mode whose viewport
+        // was closed by its own ✕ falls back to the 2D workspace; the 2D
+        // workspace never leaves the user with no view at all.
+        self.normalize_view_mode();
+
         // Install the global design-token Visuals so every default-styled widget
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
         // theme. Also fixes square menu corners (menu_rounding = ZERO).
@@ -57452,6 +58182,11 @@ impl eframe::App for CadApp {
         // The customize drop window (anchored just under the QAT bar).
         self.mark("topbar"); self.qat_customize_window(ctx);
 
+        // ---- VIEW MODE RIBBON — 2D Drafting | SIMLUX 3D | 3D Factory ------
+        // Sits directly under the menu bar: selecting a mode applies that
+        // workspace's single-view preset, and the left mode panel retools for it.
+        self.render_mode_ribbon(ctx); self.mark("viewribbon");
+
         // ---- top toolbar ------------------------------------------------
         // Top toolbar — all draw/modify icons moved to the left rails, so this
         // panel only exists to surface an intersection-result label. Render it
@@ -58321,10 +59056,19 @@ impl eframe::App for CadApp {
                 });
             });
 
-        // ---- left command rails + right Inspector dock — added BEFORE the
-        // command bar so the rails + dock span full height (menu → status) and
-        // the command bar stays confined to the CENTER column (WORKSPACE_SYSTEM).
-        self.render_command_rails(ctx);
+        // ---- per-mode tools panel + left command rails + right Inspector dock
+        // — added BEFORE the command bar so the rails + dock span full height
+        // (menu → status) and the command bar stays confined to the CENTER
+        // column (WORKSPACE_SYSTEM).
+        // The mode panel is first (outermost left) and retools with the ribbon.
+        self.render_mode_tools_panel(ctx);
+        // The Draw/Modify rails are the 2D DRAFTING surface: they make sense
+        // whenever the 2D canvas is usable — in the 2D workspace, in the SIMLUX
+        // split workspace (its left half is an interactive plan by design), or
+        // while a face sketch has re-shown the canvas inside a 3D workspace.
+        if self.two_d_open || self.light.simlux_mode || self.factory.session.is_some() {
+            self.render_command_rails(ctx);
+        }
         if self.info_panel_open {
             self.render_info_panel(ctx);
         }
@@ -67848,6 +68592,100 @@ impl CadApp {
         }).collect()
     }
 
+}
+
+#[cfg(test)]
+mod view_mode_tests {
+    use super::*;
+
+    // ── VIEW-MODE RIBBON ───────────────────────────────────────────────────
+    //
+    // The ribbon's three workspaces are single-view presets over the four
+    // viewport booleans. A preset must close the OTHER views, show exactly its
+    // own, and be idempotent when re-pressed.
+
+    #[test]
+    fn two_d_preset_shows_only_the_canvas() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Simlux3D);
+        app.set_view_mode(ViewMode::Factory3D);
+        assert!(app.factory.open && app.active_view == ActiveView::ThreeD);
+        app.set_view_mode(ViewMode::TwoD);
+        assert!(app.two_d_open, "canvas open");
+        assert!(!app.factory.open, "factory closed");
+        assert!(!app.light.view3d_open && !app.light.simlux_mode, "simlux closed");
+        assert_eq!(app.active_view, ActiveView::TwoD);
+    }
+
+    #[test]
+    fn factory_preset_fills_the_factory_view_only() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Factory3D);
+        assert!(app.factory.open && app.active_view == ActiveView::ThreeD);
+        assert!(!app.two_d_open, "canvas hidden");
+        assert!(!app.light.view3d_open && !app.light.simlux_mode, "simlux closed");
+        assert!(app.factory_fill_pending, "one-frame full-width fill armed");
+        // Idempotent: re-pressing restores the same preset.
+        app.two_d_open = true;
+        app.set_view_mode(ViewMode::Factory3D);
+        assert!(!app.two_d_open && app.factory.open);
+    }
+
+    #[test]
+    fn simlux_preset_fills_the_3d_view_only() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Simlux3D);
+        assert!(app.light.view3d_open && !app.light.simlux_mode, "exclusive 3D (not the split)");
+        assert!(!app.two_d_open, "canvas hidden");
+        assert!(!app.factory.open, "factory closed");
+        assert!(app.view3d_fill_pending, "one-frame full-width fill armed");
+    }
+
+    #[test]
+    fn sketch_auto_shows_the_canvas_and_puts_it_back() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Factory3D);
+        assert!(!app.two_d_open);
+        // Entering a face sketch (drawn on the 2D canvas) re-shows it…
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(app.two_d_open && app.mode_auto_showed_2d);
+        // …and leaving the sketch restores the exclusive workspace, re-arming
+        // the full-window fill the episode shrank.
+        app.factory_exit_sketch();
+        assert!(!app.two_d_open && !app.mode_auto_showed_2d);
+        assert!(app.factory_fill_pending, "fill re-armed on restore");
+    }
+
+    #[test]
+    fn switching_away_mid_sketch_commits_the_sketch_not_orphans_it() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Factory3D);
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(app.factory.session.is_some());
+        // Pressing "2D Drafting" mid-sketch must not strand the session: the
+        // factory panel (its only Finish/Cancel surface) is about to close.
+        app.set_view_mode(ViewMode::TwoD);
+        assert!(app.factory.session.is_none(), "sketch committed");
+        assert!(app.two_d_open && !app.factory.open);
+    }
+
+    #[test]
+    fn closed_3d_viewport_falls_back_to_two_d() {
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Factory3D);
+        app.factory.open = false; // the panel's ✕ does exactly this
+        app.normalize_view_mode();
+        assert_eq!(app.view_mode, ViewMode::TwoD);
+        assert!(app.two_d_open);
+
+        let mut app = CadApp::default();
+        app.set_view_mode(ViewMode::Simlux3D);
+        app.light.view3d_open = false;
+        app.light.simlux_mode = false;
+        app.normalize_view_mode();
+        assert_eq!(app.view_mode, ViewMode::TwoD);
+        assert!(app.two_d_open);
+    }
 }
 
 #[cfg(test)]
