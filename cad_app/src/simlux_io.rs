@@ -105,6 +105,29 @@ pub struct RoomRec {
     /// one. Removing it on delete is what returns the building to solid.
     #[serde(default)]
     pub carve: Option<u32>,
+    /// Where the room came from — one list holds built 3D rooms, plan
+    /// designations and layer imports. `Built` for any file written before
+    /// this existed.
+    #[serde(default)]
+    pub origin: crate::factory::RoomOrigin,
+    /// ImportedLayer rooms only: the doc layer name this room binds to.
+    #[serde(default)]
+    pub layer_name: Option<String>,
+    /// ImportedLayer rooms only: the doc handles whose outlines extrude into
+    /// the scene. Handles are stable across a save and a load.
+    #[serde(default)]
+    pub handles: Vec<u64>,
+}
+
+/// ONE ROOM DESIGNATED ON THE 2D PLAN — a closed outline, named by hand and
+/// captured in METRES at designation time. These are the calculation targets of
+/// a 2D-only project (no 3D Factory rooms): each footprint gets its own grid
+/// and its own per-room figures, exactly like a Factory room would.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlanRoomRec {
+    pub name: String,
+    /// The closed outline, in metres, wound in plan order.
+    pub footprint: Vec<[f32; 2]>,
 }
 
 /// One building level. Mirrors `factory::Storey`. `base_z` is NOT stored — it is derived
@@ -573,6 +596,9 @@ pub struct SimluxConfig {
     /// written before this existed loads clean with an empty store.
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
+    /// Rooms designated on the 2D plan — the calc targets of a 2D-only project.
+    #[serde(default)]
+    pub plan_rooms: Vec<PlanRoomRec>,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

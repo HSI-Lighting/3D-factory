@@ -177,12 +177,84 @@ pub struct RoomInst {
     /// Without this the void outlived the room and left a permanent hole — the area could never be
     /// built in again.
     pub carve: Option<u32>,
+    /// WHERE THE ROOM CAME FROM — the ONE room list the 3D Factory, the SIMLUX
+    /// calculation and the plan all read (rooms are rooms, whether they are
+    /// solids yet or only an outline on the plan).
+    pub origin: RoomOrigin,
+    /// ImportedLayer only: the doc layer this room binds to, by name (stable
+    /// across save/load) and by the handles it resolves to.
+    pub layer_name: Option<String>,
+    pub handles: Vec<u64>,
+}
+
+/// How a room entered the project. [`RoomInst`]s of every origin live in ONE
+/// list and are all calculation targets (each footprint gets its own grid);
+/// only [`RoomOrigin::Built`] rooms own 3D features.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum RoomOrigin {
+    /// Made into a real 3D room (own floor/walls/ceiling features).
+    #[default]
+    Built,
+    /// Designated on the 2D plan from a closed outline — footprint only, no
+    /// solids yet. "Build" turns it into a [`RoomOrigin::Built`] room.
+    PlanDesignated,
+    /// Imported from a 2D drawing layer (the legacy per-layer room); its
+    /// geometry is the layer's drafted outlines, extruded to `height`.
+    ImportedLayer,
+}
+
+impl RoomOrigin {
+    /// The badge a room list shows.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            RoomOrigin::Built => "⌂",
+            RoomOrigin::PlanDesignated => "◫",
+            RoomOrigin::ImportedLayer => "⬚",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RoomOrigin::Built => "3D room",
+            RoomOrigin::PlanDesignated => "plan room",
+            RoomOrigin::ImportedLayer => "layer room",
+        }
+    }
 }
 
 impl RoomInst {
     /// Overall height of the built structure — what actually occupies space.
     pub fn overall_height(&self) -> f32 {
         self.floor_t + self.height + if self.open_top { 0.0 } else { self.ceiling_t }
+    }
+
+    /// Whether the room owns 3D features — [`RoomOrigin::Built`] only. A plan
+    /// designation or a layer import has a footprint and a name but no solids.
+    pub fn is_built(&self) -> bool {
+        matches!(self.origin, RoomOrigin::Built)
+    }
+
+    /// The (unbuilt) defaults a room starts with; shared by every creation path
+    /// so a plan room, a layer import and a built room agree on slab defaults.
+    fn fresh(id: u32, name: String, footprint: Vec<Vec2>, height: f32, f: &FactoryState) -> RoomInst {
+        RoomInst {
+            id,
+            name,
+            footprint,
+            base_z: f.active_base_z(),
+            height: height.max(0.05),
+            floor_t: f.room_floor.max(0.02),
+            ceiling_t: f.ceiling_thickness.max(0.02),
+            wall_t: f.wall_thickness.max(0.02),
+            open_top: f.room_open_top,
+            floor: None,
+            walls: Vec::new(),
+            ceiling: None,
+            carve: None,
+            origin: RoomOrigin::PlanDesignated,
+            layer_name: None,
+            handles: Vec::new(),
+        }
     }
 
     /// Where to put the room's NAME on the plan — a point guaranteed to be inside the outline.
@@ -278,6 +350,61 @@ impl RoomInst {
             j = i;
         }
         inside
+    }
+}
+
+/// The parameter set a room is CONSTRUCTED with.
+///
+/// [`FactoryState::add_room`] fills it from the factory's current settings
+/// ("just build it, using what the panel says"); the plan-room flows fill it
+/// from what the user entered in the room-details form (or what the designated
+/// room record carried), so a room asked for as "3 m clear on a 1.2 m storey"
+/// is built exactly so — the settings are only the default answer, never a
+/// silent override.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomBuildSpec {
+    /// Z the room STANDS on — the "start height" (the storey base a plan
+    /// room is asked for). Floor slab bottom.
+    pub base_z: f32,
+    /// Slab under the room.
+    pub floor_t: f32,
+    /// CLEAR height: floor top to ceiling underside. The slabs are
+    /// additional, so the structure is `floor_t + clear_h + ceiling_t`
+    /// tall. See the `room_height_meaning` tests.
+    pub clear_h: f32,
+    /// Wall thickness of the ring the room builds for itself (a room
+    /// carved from a solid building needs none — see `add_room`).
+    pub wall_t: f32,
+    /// Slab above the room.
+    pub ceiling_t: f32,
+    /// True = no ceiling slab ("open to the sky").
+    pub open_top: bool,
+}
+
+impl RoomBuildSpec {
+    /// The current settings' defaults — what "just build it" means.
+    pub fn from_factory(f: &FactoryState) -> Self {
+        Self {
+            base_z: f.active_base_z(),
+            floor_t: f.room_floor,
+            clear_h: f.room_height,
+            wall_t: f.wall_thickness,
+            ceiling_t: f.ceiling_thickness,
+            open_top: f.room_open_top,
+        }
+    }
+
+    /// The values a room RECORD carries — what was asked (or defaulted)
+    /// when the room was designated, kept so the build honours them.
+    pub fn from_room(r: &RoomInst) -> Self {
+        Self {
+            base_z: r.base_z,
+            floor_t: r.floor_t,
+            clear_h: r.height,
+            wall_t: r.wall_t,
+            ceiling_t: r.ceiling_t,
+            open_top: r.open_top,
+        }
     }
 }
 
@@ -1811,6 +1938,8 @@ pub enum RoomError {
     NoBuilding,
     /// The outline itself was invalid (too few points / no area / self-crossing).
     Profile(cad_solid::ProfileError),
+    /// No room with that id (a build raced a delete).
+    NoSuchRoom,
 }
 
 
@@ -6347,6 +6476,20 @@ impl FactoryState {
     }
 
     pub fn add_room(&mut self, footprint: &[Vec2]) -> Result<u32, RoomError> {
+        self.add_room_spec(footprint, RoomBuildSpec::from_factory(self))
+    }
+
+    /// Construct a room from an outline with EXPLICIT parameters, rather than
+    /// whatever the factory's settings happen to say right now.
+    ///
+    /// The settings are DEFAULTS, and that distinction is the point: a plan
+    /// room asks for its details (start height, clear height, thicknesses)
+    /// before it is made, and the build must honour the ANSWER — not silently
+    /// re-derive the room from `room_height`/`active_base_z()` after the user
+    /// typed a different number. [`RoomInst::fresh`] still seeds the room
+    /// record's defaults; every field is then overwritten from `p` so the
+    /// record and the geometry can never disagree.
+    pub fn add_room_spec(&mut self, footprint: &[Vec2], p: RoomBuildSpec) -> Result<u32, RoomError> {
         // CONSTRUCTIVE room — built from an outline as a complete enclosed space, with NO
         // pre-existing building required:
         //
@@ -6358,10 +6501,10 @@ impl FactoryState {
         // This is what "draw a room, get a room" should mean. (The old behaviour carved a
         // void from a solid building — which left a hollow ring whenever there was no
         // matching building.)
-        let base = self.active_base_z();
-        let floor_t = self.room_floor.max(0.02);
-        let h = self.room_height.max(0.05);
-        let wall_t = self.wall_thickness.max(0.02);
+        let base = p.base_z;
+        let floor_t = p.floor_t.max(0.02);
+        let h = p.clear_h.max(0.05);
+        let wall_t = p.wall_t.max(0.02);
 
         // If this room sits inside a SOLID building, carve its interior column out of that
         // building so the building becomes a WALL (an annulus around the room) rather than a
@@ -6416,8 +6559,8 @@ impl FactoryState {
 
         // CEILING slab on top of the walls, tracked so it can be hidden — unless open sky.
         let mut ceiling_id = None;
-        if !self.room_open_top {
-            let ct = self.ceiling_thickness.max(0.02);
+        if !p.open_top {
+            let ct = p.ceiling_t.max(0.02);
             if let Some(cid) = self.add_slab(footprint, ct, wall_base + h + ct) {
                 self.feature_color.insert(cid, CEIL_COL);
                 self.ceilings.insert(cid);
@@ -6428,21 +6571,18 @@ impl FactoryState {
         // REGISTER the room, so it can be found, named, re-heighted and deleted as one thing.
         let rid = self.next_room_id;
         self.next_room_id += 1;
-        self.rooms.push(RoomInst {
-            id: rid,
-            name: format!("Room {rid}"),
-            footprint: footprint.to_vec(),
-            base_z: base,
-            height: h,
-            floor_t,
-            ceiling_t: self.ceiling_thickness.max(0.02),
-            wall_t,
-            open_top: self.room_open_top,
-            floor: Some(floor_id),
-            walls: wall_ids.clone(),
-            ceiling: ceiling_id,
-            carve,
-        });
+        let mut room = RoomInst::fresh(rid, format!("Room {rid}"), footprint.to_vec(), h, self);
+        room.origin = RoomOrigin::Built;
+        room.base_z = base;              // fresh() seeded the ACTIVE storey; the spec overrides
+        room.floor_t = floor_t;
+        room.ceiling_t = p.ceiling_t.max(0.02);
+        room.wall_t = wall_t;
+        room.open_top = p.open_top;
+        room.floor = Some(floor_id);
+        room.walls = wall_ids.clone();
+        room.ceiling = ceiling_id;
+        room.carve = carve;
+        self.rooms.push(room);
 
         // A ROOM IS ONE OBJECT.
         //
@@ -6472,12 +6612,12 @@ impl FactoryState {
         self.dirty = true;
         // What the room actually occupies, versus the number that was typed.
         //
-        // `room_height` is the CLEAR height, so the structure is always taller than it by the two
+        // `p.clear_h` is the CLEAR height, so the structure is always taller than it by the two
         // slabs. When that overruns the building the ceiling stands proud of the top, and the only
         // evidence is a picture that looks wrong — which is exactly how it was reported. Stated
         // here so the answer is in the status line and the history, not only in a menu that has
         // since been closed.
-        let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
+        let ct = if p.open_top { 0.0 } else { p.ceiling_t.max(0.02) };
         let overall = floor_t + h + ct;
         self.status = format!(
             "Room: {} clear, {} overall ({} floor + {} clear{}).{}",
@@ -6799,6 +6939,154 @@ impl FactoryState {
         self.status = format!("Deleted {name}.");
     }
 
+    /// Designate a closed outline (METRES) as an UNBUILT plan room — footprint,
+    /// name and defaults only, no solids until "build". It is a lux calc target
+    /// from the moment it exists (each footprint gets its own grid). Returns
+    /// the new room id.
+    pub fn add_designated_room(&mut self, name: &str, footprint_m: &[Vec2]) -> u32 {
+        let rid = self.next_room_id;
+        self.next_room_id += 1;
+        let name = if name.trim().is_empty() {
+            format!("Room {rid}")
+        } else {
+            name.trim().to_string()
+        };
+        let mut r =
+            RoomInst::fresh(rid, name, footprint_m.to_vec(), self.room_height.max(0.05), self);
+        r.origin = RoomOrigin::PlanDesignated;
+        self.rooms.push(r);
+        self.dirty = true;
+        rid
+    }
+
+    /// BUILD an unbuilt room into a real 3D room: its solids are carved/built
+    /// from the very footprint it was designated with, then the name and the
+    /// parameters the plan room carried (start height, clear height, slab and
+    /// wall thicknesses) are applied to the built record and the unbuilt one
+    /// is dropped. Returns the new (built) room id.
+    pub fn build_designated_room(&mut self, id: u32) -> Result<u32, RoomError> {
+        let Some(i) = self.room_index(id) else {
+            return Err(RoomError::NoSuchRoom);
+        };
+        if self.rooms[i].is_built() {
+            return Ok(id);
+        }
+        let fp = self.rooms[i].footprint.clone();
+        let name = self.rooms[i].name.clone();
+        // The record's WHOLE parameter set travels into the build — not just
+        // the height, or a room designated as "3 m clear on a 1.2 m storey"
+        // would come back built from whatever the settings say today.
+        let spec = RoomBuildSpec::from_room(&self.rooms[i]);
+        let old = id;
+        self.add_room_spec(&fp, spec)?;
+        let i = self.rooms.len() - 1;
+        let rid = self.rooms[i].id;
+        self.rooms[i].name = name;
+        self.rooms[i].origin = RoomOrigin::Built;
+        self.rooms.retain(|r| r.id != old);
+        self.status = "Room built — its footprint became its walls, floor and ceiling.".into();
+        Ok(rid)
+    }
+
+    /// Import the drafted geometry of one layer as an [`RoomOrigin::ImportedLayer`]
+    /// room. The handles (the layer's objects, bound live to the doc) extrude
+    /// into the scene at the room's height; the calc target is the layer's
+    /// LARGEST closed polyline ring, in metres. A layer with no closed ring
+    /// still imports — it shapes the walls, just has no room to report.
+    /// Re-importing a layer replaces its previous import.
+    pub fn import_layer_as_room(&mut self, doc: &cad_kernel::Document, layer_id: u32) -> u32 {
+        let layer_name = doc
+            .layers
+            .get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| format!("layer {layer_id}"));
+        let handles: Vec<u64> = doc
+            .dobjects
+            .iter()
+            .filter(|d| d.style.layer == layer_id)
+            .map(|d| d.handle)
+            .collect();
+        self.rooms.retain(|r| {
+            !(r.origin == RoomOrigin::ImportedLayer && r.layer_name.as_deref() == Some(layer_name.as_str()))
+        });
+        let footprint = Self::closed_ring_on_layer(doc, layer_id);
+        let rid = self.next_room_id;
+        self.next_room_id += 1;
+        let mut r = RoomInst::fresh(rid, layer_name.clone(), footprint, self.room_height.max(0.05), self);
+        r.origin = RoomOrigin::ImportedLayer;
+        r.layer_name = Some(layer_name);
+        r.handles = handles;
+        self.rooms.push(r);
+        self.dirty = true;
+        rid
+    }
+
+    /// Index of an ImportedLayer room by its layer name.
+    pub fn room_index_of_layer(&self, layer_name: &str) -> Option<usize> {
+        self.rooms.iter().position(|r| {
+            r.origin == RoomOrigin::ImportedLayer && r.layer_name.as_deref() == Some(layer_name)
+        })
+    }
+
+    /// Drop an imported-layer room by its layer name (re-import or untick).
+    pub fn remove_imported_layer_room(&mut self, layer_name: &str) {
+        let before = self.rooms.len();
+        self.rooms.retain(|r| {
+            !(r.origin == RoomOrigin::ImportedLayer && r.layer_name.as_deref() == Some(layer_name))
+        });
+        if self.rooms.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    /// The largest closed polyline ring on a layer, in METRES (the doc unit
+    /// converts, exactly like every plan→factory hand-off). Empty when the
+    /// layer has no closed ring — such a layer still shapes the scene.
+    fn closed_ring_on_layer(doc: &cad_kernel::Document, layer_id: u32) -> Vec<Vec2> {
+        let k = doc.units.metres_per_unit;
+        let k = if k.is_finite() && k > 0.0 { k } else { 1.0 };
+        let ring_area = |ring: &[Vec2]| -> f32 {
+            if ring.len() < 3 {
+                return 0.0;
+            }
+            let mut a2 = 0.0f32;
+            for i in 0..ring.len() {
+                let (u, v) = (ring[i], ring[(i + 1) % ring.len()]);
+                a2 += u.x * v.y - v.x * u.y;
+            }
+            a2.abs() * 0.5
+        };
+        let mut best: Option<(f32, Vec<Vec2>)> = None;
+        for d in &doc.dobjects {
+            if d.style.layer != layer_id {
+                continue;
+            }
+            let ring = match &d.geom {
+                cad_kernel::Geom::Polyline(p)
+                    if p.closed && p.vertices.len() >= 3 =>
+                {
+                    let mut pts: Vec<Vec2> = p
+                        .vertices
+                        .iter()
+                        .map(|v| Vec2::new((v.pos.x * k) as f32, (v.pos.y * k) as f32))
+                        .collect();
+                    if (pts[0] - pts[pts.len() - 1]).length() > 1e-4 {
+                        pts.push(pts[0]);
+                    }
+                    Some(pts)
+                }
+                _ => None,
+            };
+            if let Some(ring) = ring {
+                let a = ring_area(&ring);
+                if a > 1e-6 && best.as_ref().is_none_or(|(ba, _)| a > *ba) {
+                    best = Some((a, ring));
+                }
+            }
+        }
+        best.map(|(_, ring)| ring).unwrap_or_default()
+    }
+
     /// The OPENINGS inside a room — indices into `furniture`, for apertures whose position falls
     /// within that room's outline.
     ///
@@ -7033,6 +7321,9 @@ impl FactoryState {
                     walls: r.walls.clone(),
                     ceiling: r.ceiling,
                     carve: r.carve,
+                    origin: r.origin,
+                    layer_name: r.layer_name.clone(),
+                    handles: r.handles.clone(),
                 })
                 .collect(),
             next_room_id: self.next_room_id,
@@ -7367,6 +7658,9 @@ impl FactoryState {
                 walls: r.walls.into_iter().filter(|f| have.contains(f)).collect(),
                 ceiling: r.ceiling.filter(|f| have.contains(f)),
                 carve: r.carve.filter(|f| have.contains(f)),
+                origin: r.origin,
+                layer_name: r.layer_name,
+                handles: r.handles,
             })
             .collect();
         let highest = self.rooms.iter().map(|r| r.id).max().unwrap_or(0);
