@@ -1462,6 +1462,15 @@ pub struct LightState {
     /// SIMLUX room (Phase B/C): imported source layers, each extruded to its
     /// own `height`. Empty ⇒ `calculate` falls back to extruding the whole doc.
     pub room: Vec<RoomLayer>,
+    /// Rooms DESIGNATED ON THE 2D PLAN — a closed outline the user picked and
+    /// named (see the mode command panel's ROOMS section). Each is a calculation
+    /// target with its own grid, the same way a Factory room would be. The
+    /// footprints are captured in METRES at designation time.
+    ///
+    /// The engine's per-room path needs NO 3D model: the wall scene still comes
+    /// from the 2D extrusion (or the imported room layers), while the grids and
+    /// per-room figures are per designated footprint.
+    pub plan_rooms: Vec<crate::simlux_io::PlanRoomRec>,
     /// Work-plane height above the floor, metres (typ. 0.8 m desk height).
     pub plane_height: f32,
     /// Target grid cell size, metres (clamped to 8..64 cells per axis).
@@ -1777,14 +1786,11 @@ impl LightState {
             lib_name_buf: String::new(),
             rooms: Vec::new(),
             profiles,
-            // NOT the built-in. Starting with a fitting already chosen makes the second step of
-            // the workflow invisible: every point silently becomes a generic downlight and the
-            // user never learns that a fitting is something they pick. Empty means "not chosen",
-            // which is the truth on a fresh project.
             active_profile: UNASSIGNED.to_string(),
             materials: default_materials(),
             room_height: 3.0,
             room: Vec::new(),
+            plan_rooms: Vec::new(),
             plane_height: 0.8,
             cell_size: 0.25,
             settings: RaySettings::default(),
@@ -2735,7 +2741,11 @@ impl LightState {
     ///
     /// A project with no rooms gets one unnamed target with no footprint, which is the whole-model
     /// fallback the 2D-only path has always used.
-    fn calc_targets(f: Option<&crate::factory::FactoryState>) -> Vec<(String, Vec<glam::Vec2>)> {
+    ///
+    /// Rooms designated ON THE 2D PLAN ([`Self::plan_rooms`]) stand in for Factory rooms: they
+    /// are the per-room targets of a 2D-only project (no 3D model, or a model with no rooms).
+    /// The naming rule is the same as the Factory one so a blank name reads as "Room N".
+    fn calc_targets(&self, f: Option<&crate::factory::FactoryState>) -> Vec<(String, Vec<glam::Vec2>)> {
         let rooms: Vec<(String, Vec<glam::Vec2>)> = f
             .map(|f| {
                 f.rooms
@@ -2753,10 +2763,34 @@ impl LightState {
                     .collect()
             })
             .unwrap_or_default();
-        if rooms.is_empty() {
+        if !rooms.is_empty() {
+            return rooms;
+        }
+        // No Factory rooms → the designated plan rooms, if any.
+        let plan: Vec<(String, Vec<glam::Vec2>)> = self
+            .plan_rooms
+            .iter()
+            .filter(|r| r.footprint.len() >= 3)
+            .enumerate()
+            .map(|(i, r)| {
+                let name = if r.name.trim().is_empty() {
+                    format!("Room {}", i + 1)
+                } else {
+                    r.name.trim().to_string()
+                };
+                let fp = r
+                    .footprint
+                    .iter()
+                    .map(|p| glam::Vec2::new(p[0], p[1]))
+                    .collect();
+                (name, fp)
+            })
+            .collect();
+        if plan.is_empty() {
+            // Still nothing — the whole-model fallback.
             vec![(String::new(), Vec::new())]
         } else {
-            rooms
+            plan
         }
     }
 
@@ -3167,6 +3201,19 @@ impl LightState {
                 }
             }
         }
+        // Designated PLAN rooms are hashed unconditionally: they become the
+        // targets exactly when the factory block above is empty, and a room
+        // added while a roomless model exists must still invalidate a stored
+        // result.
+        h.u64(self.plan_rooms.len() as u64);
+        for r in &self.plan_rooms {
+            h.u64(r.name.len() as u64);
+            h.u64(r.footprint.len() as u64);
+            for p in &r.footprint {
+                h.f32(p[0]);
+                h.f32(p[1]);
+            }
+        }
         hash_json(&mut h, "lums", &self.luminaires);
         hash_json(&mut h, "materials", &self.materials);
         hash_json(&mut h, "settings", &self.settings);
@@ -3385,7 +3432,7 @@ impl LightState {
         // altogether on a non-rectangular plan, were computed, painted and counted in Ē and U₀.
         //
         // `mesh_bbox` stays as the fallback for a 2D-only project, which has no rooms to ask about.
-        let targets = Self::calc_targets(factory);
+        let targets = self.calc_targets(factory);
         let any_room = targets.iter().any(|(_, p)| p.len() >= 3);
         let bounds = if any_room {
             // Every room has its own footprint; the fallback is only for a target without one.
@@ -3740,6 +3787,7 @@ impl LightState {
             next_luminaire_id: self.next_id,
             symbol_of: self.symbol_of.clone(),
             maintenance: Some(self.maintenance),
+            plan_rooms: self.plan_rooms.clone(),
             // Command-line calculator variables — `light` doesn't own them
             // either; the app fills the map (build_simlux_config_common).
             vars: BTreeMap::new(),
@@ -3750,6 +3798,7 @@ impl LightState {
     /// library, restore materials/settings/defaults, and rebuild the room by
     /// resolving persisted layer NAMES back to ids + their current handles.
     pub fn apply_config(&mut self, cfg: crate::simlux_io::SimluxConfig, doc: &Document) {
+        self.plan_rooms = cfg.plan_rooms;
         for (k, v) in cfg.ies_library {
             self.profiles.insert(k, v);
         }
@@ -9561,5 +9610,80 @@ mod the_mode_is_reachable_and_survives {
         cfg.express = false; // as an older sidecar deserialises
         s.apply_config(cfg, &Document::default());
         assert_eq!(s.mode, CalcMode::Thorough);
+    }
+}
+
+#[cfg(test)]
+mod designated_plan_rooms_are_the_2d_calc_targets {
+    use super::*;
+
+    fn room_rec(name: &str, pts: &[[f32; 2]]) -> crate::simlux_io::PlanRoomRec {
+        crate::simlux_io::PlanRoomRec {
+            name: name.to_string(),
+            footprint: pts.to_vec(),
+        }
+    }
+
+    #[test]
+    fn nothing_designated_keeps_the_whole_model_fallback() {
+        let light = LightState::new();
+        let t = light.calc_targets(None);
+        assert_eq!(t.len(), 1);
+        assert!(t[0].1.is_empty(), "no footprint → the whole-model fallback");
+    }
+
+    #[test]
+    fn a_designated_room_becomes_the_target_of_a_2d_project() {
+        let mut light = LightState::new();
+        light.plan_rooms.push(room_rec(
+            "",
+            &[[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0], [0.0, 0.0]],
+        ));
+        let t = light.calc_targets(None);
+        assert_eq!(t.len(), 1, "one designated room → one target");
+        assert_eq!(t[0].0, "Room 1", "blank names read as Room N, like Factory rooms");
+        assert_eq!(t[0].1.len(), 5);
+    }
+
+    #[test]
+    fn a_factory_with_rooms_still_wins_over_plan_rooms() {
+        let mut light = LightState::new();
+        light.plan_rooms.push(room_rec("Office", &[[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0]]));
+        let mut f = crate::factory::FactoryState::default();
+        f.rooms.push(crate::factory::RoomInst {
+            id: 1,
+            name: "Model room".into(),
+            footprint: vec![
+                glam::Vec2::new(0.0, 0.0),
+                glam::Vec2::new(5.0, 0.0),
+                glam::Vec2::new(5.0, 4.0),
+                glam::Vec2::new(0.0, 4.0),
+            ],
+            base_z: 0.0,
+            height: 3.0,
+            floor_t: 0.2,
+            ceiling_t: 0.2,
+            wall_t: 0.3,
+            open_top: false,
+            floor: None,
+            walls: Vec::new(),
+            ceiling: None,
+            carve: None,
+        });
+        let t = light.calc_targets(Some(&f));
+        assert_eq!(t.len(), 1);
+        assert_ne!(t[0].0, "Office", "the 3D model's rooms are the authority");
+    }
+
+    #[test]
+    fn plan_rooms_survive_the_config_round_trip() {
+        let mut s = LightState::new();
+        s.plan_rooms.push(room_rec("Hall", &[[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]]));
+        let cfg = s.to_config(&Document::default());
+        let mut s2 = LightState::new();
+        s2.apply_config(cfg, &Document::default());
+        assert_eq!(s2.plan_rooms.len(), 1);
+        assert_eq!(s2.plan_rooms[0].name, "Hall");
+        assert_eq!(s2.plan_rooms[0].footprint.len(), 4);
     }
 }

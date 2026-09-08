@@ -107,6 +107,17 @@ pub struct RoomRec {
     pub carve: Option<u32>,
 }
 
+/// ONE ROOM DESIGNATED ON THE 2D PLAN — a closed outline, named by hand and
+/// captured in METRES at designation time. These are the calculation targets of
+/// a 2D-only project (no 3D Factory rooms): each footprint gets its own grid
+/// and its own per-room figures, exactly like a Factory room would.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlanRoomRec {
+    pub name: String,
+    /// The closed outline, in metres, wound in plan order.
+    pub footprint: Vec<[f32; 2]>,
+}
+
 /// One building level. Mirrors `factory::Storey`. `base_z` is NOT stored — it is derived
 /// by summing the heights below, so the stack cannot be loaded non-contiguous.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -573,6 +584,9 @@ pub struct SimluxConfig {
     /// written before this existed loads clean with an empty store.
     #[serde(default)]
     pub vars: std::collections::BTreeMap<String, String>,
+    /// Rooms designated on the 2D plan — the calc targets of a 2D-only project.
+    #[serde(default)]
+    pub plan_rooms: Vec<PlanRoomRec>,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

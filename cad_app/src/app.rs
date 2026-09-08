@@ -7282,10 +7282,48 @@ impl CadApp {
             return;
         }
         let show_ghost = self.light.place_mode && self.simlux_2d_layer_live();
-        if self.light.luminaires.is_empty() && !show_ghost {
+        if self.light.luminaires.is_empty() && !show_ghost && self.light.plan_rooms.is_empty() {
             return;
         }
         let clip = painter.with_clip_rect(rect);
+
+        // DESIGNATED ROOMS — thin cyan outlines with their names. Rooms are
+        // plan features (see the ROOMS section in the mode command panel), so
+        // they stay visible whether or not any SIMLUX panel is open.
+        if !self.light.plan_rooms.is_empty() {
+            let room_col = egui::Color32::from_rgb(90, 200, 230);
+            for r in &self.light.plan_rooms {
+                let fp: Vec<egui::Pos2> = r
+                    .footprint
+                    .iter()
+                    .map(|p| self.w2s_m(Vec2::new(p[0] as f64, p[1] as f64), rect))
+                    .collect();
+                if fp.len() >= 3 {
+                    let mut pts = fp.clone();
+                    pts.push(fp[0]); // close the ring
+                    clip.add(egui::Shape::line(
+                        pts,
+                        egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(90, 200, 230, 190)),
+                    ));
+                }
+                // The name above the ring's first corner, in the room's colour.
+                if let Some(first) = fp.first() {
+                    let name = if r.name.trim().is_empty() {
+                        "Room".to_string()
+                    } else {
+                        r.name.trim().to_string()
+                    };
+                    clip.text(
+                        egui::pos2(first.x + 5.0, first.y - 6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        name,
+                        egui::FontId::proportional(10.0),
+                        room_col,
+                    );
+                }
+            }
+        }
+
         let gold = egui::Color32::from_rgb(255, 214, 90);
         let dark = egui::Color32::from_rgb(70, 48, 0);
         let sel = egui::Color32::from_rgb(120, 190, 255);
@@ -35432,21 +35470,41 @@ impl CadApp {
     /// collapse chevron: click the heading to fold/unfold the section's rows.
     /// Returns `true` when the section's content should be drawn. A section's
     /// state is keyed by `id` and shared across the workspaces.
+    ///
+    /// The heading is a full-width BAND (background fill + top/bottom hairline)
+    /// so a category reads at a glance against the row list below it.
     fn mode_section(&mut self, ui: &mut egui::Ui, id: &str, name: &str, tip: &str) -> bool {
         let open = !self.mode_sections_closed.contains(id);
         ui.add_space(3.0);
+        let band = egui::Color32::from_rgb(38, 47, 58);    // #262F3A
+        let band_hi = egui::Color32::from_rgb(46, 57, 70); // hovered
+        let hair = egui::Color32::from_rgb(28, 35, 44);
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 21.0), egui::Sense::click());
+            egui::vec2(ui.available_width(), 22.0), egui::Sense::click());
         let p = ui.painter_at(rect);
-        if resp.hovered() {
-            p.rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-        }
-        let col = egui::Color32::from_rgb(150, 165, 185);
+        p.rect_filled(rect, 0.0, if resp.hovered() { band_hi } else { band });
+        p.rect_filled(egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top()),
+            egui::pos2(rect.right(), rect.top() + 1.0)), 0.0, hair);
+        p.rect_filled(egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - 1.0),
+            egui::pos2(rect.right(), rect.bottom())), 0.0, hair);
+        // A 3px accent tick on the left marks the band as a category header.
+        let tick = if open {
+            egui::Color32::from_rgb(0, 200, 235)
+        } else {
+            egui::Color32::from_rgb(60, 90, 105)
+        };
+        p.rect_filled(egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.top() + 2.0),
+            egui::pos2(rect.left() + 3.0, rect.bottom() - 2.0)), 0.0, tick);
+        let ink = egui::Color32::from_rgb(178, 194, 214);
         let cy = rect.center().y;
-        p.text(egui::pos2(rect.left() + 6.0, cy), egui::Align2::LEFT_CENTER,
-            if open { "▾" } else { "▸" }, egui::FontId::proportional(9.0), col);
-        p.text(egui::pos2(rect.left() + 18.0, cy), egui::Align2::LEFT_CENTER,
-            name, egui::FontId::proportional(10.5), col);
+        p.text(egui::pos2(rect.left() + 10.0, cy), egui::Align2::LEFT_CENTER,
+            if open { "▾" } else { "▸" }, egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(120, 145, 170));
+        p.text(egui::pos2(rect.left() + 22.0, cy), egui::Align2::LEFT_CENTER,
+            name, egui::FontId::proportional(10.5), ink);
         let resp = resp.on_hover_text(tip);
         if resp.clicked() {
             if open {
@@ -35456,6 +35514,7 @@ impl CadApp {
             }
             return !open;
         }
+        ui.add_space(1.0);
         open
     }
 
@@ -35678,16 +35737,78 @@ impl CadApp {
         if self.mode_section(ui, "2d-light", "LIGHT PLACEMENT",
             "Lighting commands that act on the plan — the SIMLUX tab is where the results are viewed in 3D")
         {
+        // What the NEXT click would drop — the right-hand hint names the
+        // active fitting, and the tooltip says how to change it.
+        let fitting_name = if self.light.profiles.contains_key(&self.light.active_profile) {
+            self.light.active_profile.clone()
+        } else {
+            String::new()
+        };
+        let tip_owned = if fitting_name.is_empty() {
+            "Click the plan to mark each light position. NO fitting is picked yet — what you \
+             drop here will need one before it emits (open the Light panel row below and pick \
+             a fitting).\nDrag a marker to move it · Esc to stop."
+                .to_string()
+        } else {
+            format!(
+                "Click the plan to drop a point with the fitting '{fitting_name}'. Drag a \
+                 marker to move it · Esc to stop.\nTo change what is placed (fitting, mount \
+                 height): the Light panel row below, or 💡 Illuminaire."
+            )
+        };
+        let hint: Option<&str> = if fitting_name.is_empty() {
+            Some("no fitting — edit row below")
+        } else {
+            Some(&fitting_name)
+        };
         if Self::mode_text_row(ui, "＋", "Place luminaire",
-            "Click the plan to mark each light position · drag a marker to move it · Esc to stop",
-            None, self.light.place_mode)
+            &tip_owned, hint, self.light.place_mode)
         {
             self.light.place_mode = !self.light.place_mode;
             if self.light.place_mode {
                 self.light.aim_mode = false;
                 self.light.aim_pick = None;
+                if !self.light.profiles.contains_key(&self.light.active_profile) {
+                    // A point dropped with no fitting emits nothing and the plan gives no
+                    // hint why — default to the built-in profile so placement always places
+                    // something real, and say which.
+                    self.light.active_profile = crate::light::BUILTIN.to_string();
+                }
+                let what = self.light.active_profile.clone();
+                let h = self.light.mount_height;
+                self.light.last_msg = format!(
+                    "Placing {what} · mounted at {h:.2} m — click the plan · Esc stops. \
+                     Fitting + height change in the Light panel."
+                );
+            }
+        }
+        // The Light panel IS the editor for what was placed: the fixture list (select a row
+        // to find that light on the plan), dimming, mount height, the fitting a point uses,
+        // and the rooms. It used to be unreachable from the 2D workspace — the only way to
+        // change a placed light's properties was a menu the workspace never surfaced.
+        if Self::mode_text_row(ui, "🎛", "Light panel (edit placed lights…)",
+            "The editor for your lights: click a fixture row to select it on the plan; dim, \
+             mount height, the fitting it uses and the rooms are all edited here.",
+            None, self.light.window_open)
+        {
+            self.light.window_open = !self.light.window_open;
+            if self.light.window_open {
                 self.light.last_msg =
-                    "Click the plan to mark each light position · drag a marker to move it · Esc to stop.".into();
+                    "Light panel — click a fixture row to find that light on the plan. \
+                     Dim, height and fitting are edited here.".into();
+            }
+        }
+        if Self::mode_text_row(ui, "⌖", "Aim a light at a point",
+            "Click a fitting, then click the point it should light — it stays exactly where it \
+             is, only the direction changes",
+            None, self.light.aim_mode)
+        {
+            self.light.aim_mode = !self.light.aim_mode;
+            self.light.aim_pick = None;
+            if self.light.aim_mode {
+                self.light.place_mode = false;
+                self.light.last_msg =
+                    "Aim: click a fitting, then click the point it should light.".into();
             }
         }
         if Self::mode_text_row(ui, "💡", "Illuminaire (fittings)",
@@ -35707,7 +35828,126 @@ impl CadApp {
             self.light.show_overlay = !self.light.show_overlay;
         }
         }
+
+        // ROOMS — designate closed outlines on the plan as the rooms the lux
+        // calculation reports per-room. A 2D-only project has no 3D Factory
+        // rooms, so these footprints ARE the calc targets (their own grid, Ē
+        // and U₀ each), exactly like Factory rooms.
+        if self.mode_section(ui, "2d-rooms", "ROOMS",
+            "Name the plan's rooms: select a CLOSED outline and designate it. Each designated room \
+             is calculated and reported separately (its own grid) instead of one whole-plan number")
+        {
+            let n = self.light.plan_rooms.len();
+            let room_count_hint: Option<String> = if n > 0 {
+                Some(format!("{n} designated"))
+            } else {
+                None
+            };
+            if Self::mode_text_row(ui, "⌂", "Designate room (selected outline)",
+                "Select a CLOSED outline (drawn walls/room perimeter) on the plan, then click this \
+                 to name it a room. Rooms are drawn cyan on the plan and each gets its own lux \
+                 result when you Calculate.",
+                room_count_hint.as_deref(),
+                false)
+            {
+                match self.slab_outline_from_selection() {
+                    Some(outline) => self.designate_plan_room(outline),
+                    None => {
+                        let msg = "select a CLOSED outline first, then designate it as a room";
+                        self.history.push(format!("  ! room: {msg}"));
+                        self.light.last_msg = msg.into();
+                    }
+                }
+            }
+            // The designated rooms, each with its own ✕.
+            let rooms = self.light.plan_rooms.clone();
+            let mut remove: Option<usize> = None;
+            for (i, r) in rooms.iter().enumerate() {
+                let pts = r.footprint.len();
+                let name = if r.name.trim().is_empty() {
+                    format!("Room {}", i + 1)
+                } else {
+                    r.name.trim().to_string()
+                };
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    let resp = ui.add(
+                        egui::Button::new(egui::RichText::new("✕").size(10.0))
+                            .frame(false)
+                            .min_size(egui::vec2(14.0, 16.0)),
+                    )
+                    .on_hover_text(format!("Remove '{name}' — it is no longer a calculation room"));
+                    if resp.clicked() {
+                        remove = Some(i);
+                    }
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&name).size(12.5))
+                            .sense(egui::Sense::hover()),
+                    )
+                    .on_hover_text(format!("Closed outline with {pts} corners, metres — footprint \
+                        captured at designation. The drawing it was taken from can be edited \
+                        freely; the room keeps this outline."));
+                });
+            }
+            if let Some(i) = remove {
+                self.remove_plan_room(i);
+            }
+            if n == 0 {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("no rooms yet — draw each room's closed outline, \
+                    select it, and designate it above")
+                    .size(11.0).weak());
+            }
+        }
         ui.add_space(2.0);
+    }
+
+    /// The next unused auto-name for a designated plan room ("Room 1", "Room 2", …).
+    fn next_plan_room_name(&self) -> String {
+        let mut i = 1;
+        loop {
+            let cand = format!("Room {i}");
+            if !self.light.plan_rooms.iter().any(|r| r.name == cand) {
+                return cand;
+            }
+            i += 1;
+        }
+    }
+
+    /// Designate a closed outline (metres) as a plan room — a calculation
+    /// target with its own grid. The outline is captured as-is; the plan
+    /// geometry it was selected from stays editable.
+    fn designate_plan_room(&mut self, outline: Vec<glam::Vec2>) {
+        let name = self.next_plan_room_name();
+        let footprint: Vec<[f32; 2]> = outline.iter().map(|p| [p.x, p.y]).collect();
+        self.light.plan_rooms.push(crate::simlux_io::PlanRoomRec {
+            name: name.clone(),
+            footprint,
+        });
+        self.history.push(format!(
+            "  room '{name}' designated on the plan — Calculate now reports it as its own room"
+        ));
+        self.light.last_msg = format!(
+            "'{name}' designated — run ⚡ Calculate and it gets its own grid and figures"
+        );
+    }
+
+    /// Drop a designated plan room.
+    fn remove_plan_room(&mut self, i: usize) {
+        let name = self
+            .light
+            .plan_rooms
+            .get(i)
+            .map(|r| r.name.clone())
+            .unwrap_or_default();
+        if self.light.plan_rooms.get(i).is_none() {
+            return;
+        }
+        self.light.plan_rooms.remove(i);
+        self.history.push(format!(
+            "  room '{}' no longer designated — the drawing is untouched",
+            if name.is_empty() { format!("Room {}", i + 1) } else { name }
+        ));
     }
 
     /// SIMLUX workspace (3D lighting viewport): calculation, results and 3D
@@ -75980,6 +76220,31 @@ mod mode_workspaces_are_exclusive {
         // Esc-style stop puts the layer back off.
         app.light.place_mode = false;
         assert!(!app.simlux_2d_layer_live());
+    }
+
+    /// Designation from the plan names rooms in order, and removing one frees
+    /// its name for the next designation.
+    #[test]
+    fn plan_rooms_are_named_in_order_and_removable() {
+        let mut app = CadApp::default();
+        let rect = |x: f32, y: f32| {
+            vec![
+                glam::Vec2::new(x, y),
+                glam::Vec2::new(x + 5.0, y),
+                glam::Vec2::new(x + 5.0, y + 4.0),
+                glam::Vec2::new(x, y + 4.0),
+            ]
+        };
+        app.designate_plan_room(rect(0.0, 0.0));
+        app.designate_plan_room(rect(20.0, 0.0));
+        assert_eq!(app.light.plan_rooms.len(), 2);
+        assert_eq!(app.light.plan_rooms[0].name, "Room 1");
+        assert_eq!(app.light.plan_rooms[1].name, "Room 2");
+
+        app.remove_plan_room(0);
+        assert_eq!(app.light.plan_rooms.len(), 1);
+        app.designate_plan_room(rect(0.0, 20.0));
+        assert_eq!(app.light.plan_rooms.last().unwrap().name, "Room 1", "the freed name is reused");
     }
 }
 
