@@ -353,6 +353,61 @@ impl RoomInst {
     }
 }
 
+/// The parameter set a room is CONSTRUCTED with.
+///
+/// [`FactoryState::add_room`] fills it from the factory's current settings
+/// ("just build it, using what the panel says"); the plan-room flows fill it
+/// from what the user entered in the room-details form (or what the designated
+/// room record carried), so a room asked for as "3 m clear on a 1.2 m storey"
+/// is built exactly so — the settings are only the default answer, never a
+/// silent override.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomBuildSpec {
+    /// Z the room STANDS on — the "start height" (the storey base a plan
+    /// room is asked for). Floor slab bottom.
+    pub base_z: f32,
+    /// Slab under the room.
+    pub floor_t: f32,
+    /// CLEAR height: floor top to ceiling underside. The slabs are
+    /// additional, so the structure is `floor_t + clear_h + ceiling_t`
+    /// tall. See the `room_height_meaning` tests.
+    pub clear_h: f32,
+    /// Wall thickness of the ring the room builds for itself (a room
+    /// carved from a solid building needs none — see `add_room`).
+    pub wall_t: f32,
+    /// Slab above the room.
+    pub ceiling_t: f32,
+    /// True = no ceiling slab ("open to the sky").
+    pub open_top: bool,
+}
+
+impl RoomBuildSpec {
+    /// The current settings' defaults — what "just build it" means.
+    pub fn from_factory(f: &FactoryState) -> Self {
+        Self {
+            base_z: f.active_base_z(),
+            floor_t: f.room_floor,
+            clear_h: f.room_height,
+            wall_t: f.wall_thickness,
+            ceiling_t: f.ceiling_thickness,
+            open_top: f.room_open_top,
+        }
+    }
+
+    /// The values a room RECORD carries — what was asked (or defaulted)
+    /// when the room was designated, kept so the build honours them.
+    pub fn from_room(r: &RoomInst) -> Self {
+        Self {
+            base_z: r.base_z,
+            floor_t: r.floor_t,
+            clear_h: r.height,
+            wall_t: r.wall_t,
+            ceiling_t: r.ceiling_t,
+            open_top: r.open_top,
+        }
+    }
+}
+
 /// An open sketch-on-plane session.
 ///
 /// **The core trick of 3D_Factory:** while this is live, the app's active `doc` IS the
@@ -6421,6 +6476,20 @@ impl FactoryState {
     }
 
     pub fn add_room(&mut self, footprint: &[Vec2]) -> Result<u32, RoomError> {
+        self.add_room_spec(footprint, RoomBuildSpec::from_factory(self))
+    }
+
+    /// Construct a room from an outline with EXPLICIT parameters, rather than
+    /// whatever the factory's settings happen to say right now.
+    ///
+    /// The settings are DEFAULTS, and that distinction is the point: a plan
+    /// room asks for its details (start height, clear height, thicknesses)
+    /// before it is made, and the build must honour the ANSWER — not silently
+    /// re-derive the room from `room_height`/`active_base_z()` after the user
+    /// typed a different number. [`RoomInst::fresh`] still seeds the room
+    /// record's defaults; every field is then overwritten from `p` so the
+    /// record and the geometry can never disagree.
+    pub fn add_room_spec(&mut self, footprint: &[Vec2], p: RoomBuildSpec) -> Result<u32, RoomError> {
         // CONSTRUCTIVE room — built from an outline as a complete enclosed space, with NO
         // pre-existing building required:
         //
@@ -6432,10 +6501,10 @@ impl FactoryState {
         // This is what "draw a room, get a room" should mean. (The old behaviour carved a
         // void from a solid building — which left a hollow ring whenever there was no
         // matching building.)
-        let base = self.active_base_z();
-        let floor_t = self.room_floor.max(0.02);
-        let h = self.room_height.max(0.05);
-        let wall_t = self.wall_thickness.max(0.02);
+        let base = p.base_z;
+        let floor_t = p.floor_t.max(0.02);
+        let h = p.clear_h.max(0.05);
+        let wall_t = p.wall_t.max(0.02);
 
         // If this room sits inside a SOLID building, carve its interior column out of that
         // building so the building becomes a WALL (an annulus around the room) rather than a
@@ -6490,8 +6559,8 @@ impl FactoryState {
 
         // CEILING slab on top of the walls, tracked so it can be hidden — unless open sky.
         let mut ceiling_id = None;
-        if !self.room_open_top {
-            let ct = self.ceiling_thickness.max(0.02);
+        if !p.open_top {
+            let ct = p.ceiling_t.max(0.02);
             if let Some(cid) = self.add_slab(footprint, ct, wall_base + h + ct) {
                 self.feature_color.insert(cid, CEIL_COL);
                 self.ceilings.insert(cid);
@@ -6504,6 +6573,11 @@ impl FactoryState {
         self.next_room_id += 1;
         let mut room = RoomInst::fresh(rid, format!("Room {rid}"), footprint.to_vec(), h, self);
         room.origin = RoomOrigin::Built;
+        room.base_z = base;              // fresh() seeded the ACTIVE storey; the spec overrides
+        room.floor_t = floor_t;
+        room.ceiling_t = p.ceiling_t.max(0.02);
+        room.wall_t = wall_t;
+        room.open_top = p.open_top;
         room.floor = Some(floor_id);
         room.walls = wall_ids.clone();
         room.ceiling = ceiling_id;
@@ -6538,12 +6612,12 @@ impl FactoryState {
         self.dirty = true;
         // What the room actually occupies, versus the number that was typed.
         //
-        // `room_height` is the CLEAR height, so the structure is always taller than it by the two
+        // `p.clear_h` is the CLEAR height, so the structure is always taller than it by the two
         // slabs. When that overruns the building the ceiling stands proud of the top, and the only
         // evidence is a picture that looks wrong — which is exactly how it was reported. Stated
         // here so the answer is in the status line and the history, not only in a menu that has
         // since been closed.
-        let ct = if self.room_open_top { 0.0 } else { self.ceiling_thickness.max(0.02) };
+        let ct = if p.open_top { 0.0 } else { p.ceiling_t.max(0.02) };
         let overall = floor_t + h + ct;
         self.status = format!(
             "Room: {} clear, {} overall ({} floor + {} clear{}).{}",
@@ -6886,9 +6960,10 @@ impl FactoryState {
     }
 
     /// BUILD an unbuilt room into a real 3D room: its solids are carved/built
-    /// from the very footprint it was designated with, then the name and clear
-    /// height the plan room carried are applied to the built record and the
-    /// unbuilt one is dropped. Returns the new (built) room id.
+    /// from the very footprint it was designated with, then the name and the
+    /// parameters the plan room carried (start height, clear height, slab and
+    /// wall thicknesses) are applied to the built record and the unbuilt one
+    /// is dropped. Returns the new (built) room id.
     pub fn build_designated_room(&mut self, id: u32) -> Result<u32, RoomError> {
         let Some(i) = self.room_index(id) else {
             return Err(RoomError::NoSuchRoom);
@@ -6898,16 +6973,16 @@ impl FactoryState {
         }
         let fp = self.rooms[i].footprint.clone();
         let name = self.rooms[i].name.clone();
-        let h = self.rooms[i].height;
+        // The record's WHOLE parameter set travels into the build — not just
+        // the height, or a room designated as "3 m clear on a 1.2 m storey"
+        // would come back built from whatever the settings say today.
+        let spec = RoomBuildSpec::from_room(&self.rooms[i]);
         let old = id;
-        // `add_room` returns the floor FEATURE id, not the room id — the record
-        // it just pushed is simply the last one.
-        self.add_room(&fp)?;
+        self.add_room_spec(&fp, spec)?;
         let i = self.rooms.len() - 1;
         let rid = self.rooms[i].id;
         self.rooms[i].name = name;
         self.rooms[i].origin = RoomOrigin::Built;
-        self.set_room_height(rid, h);
         self.rooms.retain(|r| r.id != old);
         self.status = "Room built — its footprint became its walls, floor and ceiling.".into();
         Ok(rid)

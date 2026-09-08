@@ -2206,6 +2206,13 @@ pub struct CadApp {
     /// the canvas rect only changes when the user resizes the app
     /// window).
     canvas_screen_rect: Option<egui::Rect>,
+    /// The demo plan a fresh app ships with is drawn at REAL room sizes
+    /// (thousands of drawing units in the default millimetre document), so
+    /// the default launch camera — origin plus a couple of hundred units —
+    /// would show an empty canvas. Framed once on the first real frame, while
+    /// the view is still pristine (`view_history` empty), so the plan is on
+    /// screen; a file open refits by itself and the user's own zoom is theirs.
+    demo_view_set: bool,
     /// Open/closed state for each dockable Window panel. Default true
     /// for the most-used panels. Toggled from the Tools menu.
     cmd_window_open:     bool,
@@ -2240,6 +2247,14 @@ pub struct CadApp {
     /// section is keyed by). Absent = open. Shared across the three workspaces
     /// so a choice made in one mode is honoured in the others.
     mode_sections_closed: std::collections::HashSet<String>,
+    /// The open "Make room" details form, or None. Set by the 2D ROOMS row
+    /// when the selection is a valid closed outline; the outline + the asked
+    /// parameters live here until the user confirms (one undo step) or
+    /// cancels / Escs / the workspace changes away from the 2D drafting view.
+    room_form: Option<RoomForm>,
+    /// Request focus for the form's NAME field on the next frame it draws
+    /// (set when the form opens, so the first keystroke goes to the name).
+    room_form_focus_name: bool,
     /// Screen rect of the top menu-bar panel (updated each frame). Used to
     /// keep a hover-opened category menu open while the pointer is still over
     /// its button, and close it once the pointer leaves both bar and popup.
@@ -5165,6 +5180,26 @@ impl Mode {
     }
 }
 
+/// The "Make room (from selected outline)" details form — what the app asks
+/// before a plan outline becomes a real 3D room. Opened from the 2D ROOMS
+/// panel with the validated outline; the parameters here (with the factory
+/// settings as defaults) are exactly what the built room is constructed with,
+/// so asking is honest: the answer is what gets built.
+#[derive(Clone)]
+pub struct RoomForm {
+    /// The closed outline (metres) the room is built from.
+    pub outline: Vec<glam::Vec2>,
+    /// What the room is called; empty falls back to "Room N".
+    pub name: String,
+    /// START height — the Z the room stands on (floor slab bottom).
+    pub base_z: f32,
+    /// CLEAR height — floor top to ceiling underside; the slabs are extra.
+    pub height: f32,
+    pub floor_t: f32,
+    pub wall_t: f32,
+    pub ceiling_t: f32,
+}
+
 /// Transient authoring state for the **Materials Factory** node editor. The node graphs live here,
 /// keyed by texture index; each is seeded from its [`crate::factory::TextureAsset`] on first open and
 /// compiled back onto it on every edit, so nothing extra is persisted (the material's flat fields
@@ -5234,6 +5269,7 @@ impl Default for CadApp {
             dock_undock_hold:    HashMap::new(),
             dock_dragging:       std::collections::HashSet::new(),
             canvas_screen_rect:  None,
+            demo_view_set:       false,
             press_time:          None,
             press_pos:           None,
             cmd_window_open:     true,
@@ -5245,6 +5281,8 @@ impl Default for CadApp {
             simlux_full_pin:     false,
             factory_full_pin:    false,
             mode_sections_closed: std::collections::HashSet::new(),
+            room_form:           None,
+            room_form_focus_name: false,
             menubar_rect:        egui::Rect::NOTHING,
             layers_window_open:  false,
             pens_window_open:    false,
@@ -5754,42 +5792,53 @@ impl Default for CadApp {
         // Demo dobjects so the canvas is never empty on first launch.
         // (push is a pure append now — stamp the fresh-draw style so the
         // demos land on the active WALLS layer as before.)
+        //
+        // SIZED AS A REAL PLAN, NOT DECORATION: the drawing unit is the
+        // document's default millimetre (1 unit = 1 mm), and these figures
+        // are drawn at ROOM magnitudes — the closed rectangle is a 6000 ×
+        // 4500 mm (6 × 4.5 m) room outline, selectable and Make-room-able
+        // right away; the other figures sit around it in the same few-metre
+        // ranges. They used to be ±(20–90)-unit centimetre-scale sketches,
+        // which no room could ever be made from. The view is framed once on
+        // the first real frame (`demo_view_set`), so the plan is on screen.
         let mut demo_line: DObject = Line {
-            a: Vec2::new(-40.0, -20.0), b: Vec2::new(40.0, 20.0),
+            a: Vec2::new(-8000.0, -5000.0), b: Vec2::new(-3500.0, -1500.0),
         }.into();
         s.stamp_fresh_style(&mut demo_line.style);
         s.doc.push(demo_line);
         let mut demo_circle: DObject = Circle {
-            center: Vec2::new(0.0, 0.0), radius: 30.0,
+            center: Vec2::new(9000.0, 4500.0), radius: 2500.0,
         }.into();
         s.stamp_fresh_style(&mut demo_circle.style);
         s.doc.push(demo_circle);
         let mut demo_arc: DObject = Arc {
-            center: Vec2::new(0.0, 0.0), radius: 45.0,
+            center: Vec2::new(8000.0, -3500.0), radius: 2500.0,
             start_angle: 0.0, sweep_angle: std::f64::consts::PI,
         }.into();
         s.stamp_fresh_style(&mut demo_arc.style);
         s.doc.push(demo_arc);
         let mut demo_ellipse: DObject = Ellipse {
-            center: Vec2::new(-60.0, -30.0),
-            major:  Vec2::new(25.0, 12.0),    // semi-major ≈ 27.7, rotation ≈ 25.6°
-            ratio:  0.55,                     // semi-minor ≈ 15.2
+            center: Vec2::new(-7500.0, 3500.0),
+            major:  Vec2::new(2000.0, 1000.0),   // semi-major ≈ 2.2 m, rotation ≈ 26.6°
+            ratio:  0.55,                        // semi-minor ≈ 1.2 m
         }.into();
         s.stamp_fresh_style(&mut demo_ellipse.style);
         s.doc.push(demo_ellipse);
-        // Demo point + polyline (Slice E preview).
+        // Demo point (Slice E preview).
         let mut demo_point: DObject = Point {
-            location: Vec2::new(60.0, -40.0), style: 0, size: 0.0,
+            location: Vec2::new(-4500.0, -6000.0), style: 0, size: 0.0,
         }.into();
         s.stamp_fresh_style(&mut demo_point.style);
         s.doc.push(demo_point);
+        // The room — a closed 6000 × 4500 mm rectangle (6 × 4.5 m). The one
+        // figure that can become a room TODAY: select it, then 2D view ▸
+        // ROOMS ▸ "Make room (from selected outline)".
         let mut demo_pl: DObject = Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::new(50.0,  40.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(70.0,  60.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(90.0,  40.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(80.0,  20.0), bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(55.0,  25.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(-3000.0, -2250.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(3000.0, -2250.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(3000.0, 2250.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(-3000.0, 2250.0), bulge: 0.0 },
             ],
             closed: true,
             widths: Vec::new(),
@@ -5797,7 +5846,8 @@ impl Default for CadApp {
         s.stamp_fresh_style(&mut demo_pl.style);
         s.doc.push(demo_pl);
         s.recompute();
-        s.history.push("RUST_CAD math workbench — three demo dobjects loaded.".into());
+        s.history.push("Fresh drawing — a 6 × 4.5 m room outline plus demo figures (millimetre units).".into());
+        s.history.push("Select the closed rectangle and make it a room: 2D view ▸ ROOMS ▸ Make room (from selected outline).".into());
         s.history.push("Pick a tool from the top toolbar, or type 'help'.".into());
         s
     }
@@ -35859,7 +35909,7 @@ impl CadApp {
         // U₀ — and rooms made here are REAL 3D rooms at once, visible in the
         // 3D Factory view.
         if self.mode_section(ui, "2d-rooms", "ROOMS",
-            "Every room here gets its own lux result and exists in the 3D Factory view. Select a              CLOSED outline on the plan and make it a room — it is built at once.")
+            "Every room here gets its own lux result and exists in the 3D Factory view. Select a              CLOSED outline on the plan and make it a room — it asks for the room's details,              then builds it at once.")
         {
             let n = self.factory.rooms.len();
             let count_hint: Option<String> = if n > 0 {
@@ -35868,18 +35918,11 @@ impl CadApp {
                 None
             };
             if Self::mode_text_row(ui, "⌂", "Make room (from selected outline)",
-                "Select a CLOSED outline (drawn walls/room perimeter) on the plan, then click this.                  The room is BUILT at once — walls, floor and ceiling solids, visible in the 3D                  Factory view — and is a lux calculation room with its own grid from the start.",
+                "Select a CLOSED outline (drawn walls/room perimeter) on the plan, then click this.                  You're asked the room's details — name, start height, clear height and slab                  thicknesses — then it is BUILT at once: walls, floor and ceiling solids in the                  3D Factory view, and a lux calculation room with its own grid from the start.",
                 count_hint.as_deref(),
                 false)
             {
-                match self.slab_outline_from_selection() {
-                    Some(outline) => self.make_room_from_selected_outline(outline),
-                    None => {
-                        let msg = "select a CLOSED outline first, then make it a room";
-                        self.history.push(format!("  ! room: {msg}"));
-                        self.light.last_msg = msg.into();
-                    }
-                }
+                self.request_make_room();
             }
             // The rooms — one row each: badge, name, height, [⬆ build when
             // unbuilt] and ✕. Height edits the record (a built room's walls
@@ -35979,42 +36022,235 @@ impl CadApp {
         ui.add_space(2.0);
     }
 
-    /// Make a REAL 3D room from a closed outline selected on the plan — the
-    /// one action a plan room needs. The record (name, footprint, height) is
-    /// created and then BUILT in the same act: walls, floor and ceiling
-    /// solids appear in the 3D Factory view, and the footprint is a lux calc
-    /// target from the start. Undoable as one step.
-    fn make_room_from_selected_outline(&mut self, outline: Vec<glam::Vec2>) {
-        // The outline lives on the PLAN; a face-sketch's document is a wall's
-        // (u, v) and must not build rooms there.
+    /// "Make room (from selected outline)" row: validate the selection, then
+    /// ASK for the room's details instead of building instantly with defaults.
+    /// The outline stays in [`Self::room_form`] (it belongs to the 2D plan)
+    /// until the user confirms — one undo step — or cancels.
+    fn request_make_room(&mut self) {
+        if self.refuse_plan_action_in_sketch("Make room") {
+            return;
+        }
+        let Some(outline) = self.slab_outline_from_selection() else {
+            let msg = "select a CLOSED outline first, then make it a room";
+            self.history.push(format!("  ! room: {msg}"));
+            self.light.last_msg = msg.into();
+            return;
+        };
+        let f = &self.factory;
+        self.room_form = Some(RoomForm {
+            outline,
+            name: format!("Room {}", f.next_room_id),
+            base_z: f.active_base_z(),
+            height: f.room_height.max(0.05),
+            floor_t: f.room_floor.max(0.02),
+            wall_t: f.wall_thickness.max(0.02),
+            ceiling_t: f.ceiling_thickness.max(0.02),
+        });
+        self.room_form_focus_name = true;
+    }
+
+    /// The modal the row opened — the room's details (name, start height,
+    /// clear height, slab/wall thicknesses) with the settings as defaults.
+    ///
+    /// A modal backed like the close-confirm dialog: dimmed Order::Middle
+    /// backdrop, Foreground window, Esc answers it (the global Esc handler
+    /// clears the form and stops — see `update`), and any mode change away
+    /// from the drafting workspace abandons the question unanswered.
+    fn render_room_form(&mut self, ctx: &egui::Context) {
+        if self.room_form.is_none() {
+            return;
+        }
+        // The question belongs to the plan; a workspace change (only possible
+        // programmatically — the backdrop swallows tab clicks) ends it.
+        if self.mode != Mode::Cad2D {
+            self.room_form = None;
+            self.room_form_focus_name = false;
+            return;
+        }
+        let mut f = self.room_form.take().expect("checked above");
+        let u = self.factory.units.clone();
+        let calc = &self.calc;
+        let mut focus_name = self.room_form_focus_name;
+        let mut make = false;
+        let mut cancel = false;
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("room_form_backdrop"))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(150));
+                ui.allocate_rect(screen, egui::Sense::click_and_drag());
+            });
+
+        egui::Window::new("Make room")
+            .id(egui::Id::new("room_form"))
+            .order(egui::Order::Foreground)
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(egui::Frame::window(&ctx.style()))
+            .show(ctx, |ui| {
+                ui.set_width(370.0);
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "The selected outline becomes a real 3D room — walls, floor and \
+                         ceiling solids in the 3D Factory view — and a lux room with its \
+                         own grid from the start.",
+                    )
+                    .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("name").small().weak()));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut f.name)
+                            .desired_width(170.0)
+                            .hint_text("room name"),
+                    );
+                    if focus_name {
+                        resp.request_focus();
+                        focus_name = false;
+                    }
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("start height").small().weak()));
+                    crate::factory::length_ui(ui, &u, &mut f.base_z, 0.5, -1e5, 1e5, calc)
+                        .on_hover_text(
+                            "The Z the room STANDS on — the bottom of the floor slab. \
+                             Defaults to the current storey's base; raise it to start the \
+                             room above the ground.",
+                        );
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("clear height").small().weak()));
+                    crate::factory::length_ui(ui, &u, &mut f.height, 0.02, 0.3, 30.0, calc)
+                        .on_hover_text(
+                            "CLEAR height — floor top to ceiling underside. The floor and \
+                             ceiling slabs are extra, so the structure is always this much \
+                             taller than the number here.",
+                        );
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("wall").small().weak()));
+                    crate::factory::length_ui(ui, &u, &mut f.wall_t, 0.01, 0.02, 2.0, calc)
+                        .on_hover_text(
+                            "The room's OWN perimeter walls — how thick the ring of walls \
+                             around the outline is built (a room carved out of a solid \
+                             building keeps the building's material instead).",
+                        );
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("floor").small().weak()));
+                    crate::factory::length_ui(ui, &u, &mut f.floor_t, 0.01, 0.02, 2.0, calc)
+                        .on_hover_text("Slab below the room");
+                });
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([96.0, 18.0], egui::Label::new(
+                        egui::RichText::new("ceiling").small().weak()));
+                    crate::factory::length_ui(ui, &u, &mut f.ceiling_t, 0.01, 0.02, 2.0, calc)
+                        .on_hover_text("Slab above the room");
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Make room").strong())).clicked() {
+                        make = true;
+                    }
+                    if ui.add(egui::Button::new("Cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+                ui.add_space(4.0);
+            });
+        self.room_form_focus_name = focus_name;
+        if cancel {
+            // Nothing was asked for and nothing was built.
+            self.room_form_focus_name = false;
+            return;
+        }
+        if !make {
+            self.room_form = Some(f); // still editing — keep the entries
+            return;
+        }
+        self.room_form_focus_name = false;
+        self.build_room_form(f);
+    }
+
+    /// Build the room the form described — the confirmed answer is the
+    /// parameter set the room is constructed with (`FactoryState::add_room_spec`),
+    /// renamed to whatever was asked, all as ONE undoable step.
+    fn build_room_form(&mut self, f: RoomForm) {
         if self.refuse_plan_action_in_sketch("Make room") {
             return;
         }
         self.snapshot_factory();
-        let id = self.factory.add_designated_room("", &outline);
-        match self.factory.build_designated_room(id) {
-            Ok(rid) => {
-                let name = self
-                    .factory
-                    .rooms
-                    .iter()
-                    .find(|r| r.id == rid)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_default();
+        let spec = crate::factory::RoomBuildSpec {
+            base_z: f.base_z,
+            floor_t: f.floor_t,
+            clear_h: f.height,
+            wall_t: f.wall_t,
+            ceiling_t: f.ceiling_t,
+            open_top: self.factory.room_open_top,
+        };
+        match self.factory.add_room_spec(&f.outline, spec) {
+            Ok(_floor) => {
+                // `add_room_spec` pushed the room record last — give it the name
+                // that was asked for (empty falls back to "Room N").
+                let built_name = if let Some(r) = self.factory.rooms.last_mut() {
+                    let n = f.name.trim();
+                    if n.is_empty() {
+                        format!("Room {}", r.id)
+                    } else {
+                        r.name = n.to_string();
+                        r.name.clone()
+                    }
+                } else {
+                    String::from("Room")
+                };
                 self.history.push(format!(
-                    "  room '{name}' made from the plan outline — built in the 3D Factory view and a              lux room with its own grid. Select it on the plan or build another."
+                    "  room '{built_name}' made from the plan outline — built in the 3D Factory view and              a lux room with its own grid. Select it on the plan or build another."
                 ));
                 self.light.last_msg = format!(
-                    "'{name}' built from the selected outline — see it in the 3D Factory view; ⚡              Calculate reports it as its own room"
+                    "'{built_name}' built from the selected outline — see it in the 3D Factory view; ⚡              Calculate reports it as its own room"
                 );
             }
             Err(e) => {
-                self.undo_stack.pop(); // the designation never happened
+                self.undo_stack.pop(); // nothing was created
                 let why = room_error_why(e);
                 self.history.push(format!("  ! room: {why}"));
                 self.light.last_msg = why;
             }
         }
+    }
+
+    /// Make a REAL 3D room from a closed outline with the factory's CURRENT
+    /// defaults (no questions) — the tests' and programmatic path. The panel
+    /// row ([`Self::request_make_room`]) asks for the details first.
+    fn make_room_from_selected_outline(&mut self, outline: Vec<glam::Vec2>) {
+        let f = &self.factory;
+        let form = RoomForm {
+            outline,
+            name: String::new(),
+            base_z: f.active_base_z(),
+            height: f.room_height.max(0.05),
+            floor_t: f.room_floor.max(0.02),
+            wall_t: f.wall_thickness.max(0.02),
+            ceiling_t: f.ceiling_thickness.max(0.02),
+        };
+        self.build_room_form(form);
     }
 
     /// SIMLUX workspace (3D lighting viewport): calculation, results and 3D
@@ -47276,6 +47512,24 @@ impl CadApp {
         }
     }
 
+    /// Frame the demo plan a fresh app ships with — ONCE, on the first real
+    /// frame ([`Self::demo_view_set`]). The demo geometry is drawn at real
+    /// room sizes (thousands of drawing-units in the millimetre document), so
+    /// the launch camera (origin ± a couple of hundred units) would show an
+    /// empty canvas. Guarded so it never overrides the user: only while no
+    /// file is open and the view history is still empty (no zoom has
+    /// happened), and once done it never runs again.
+    fn maybe_frame_demo_plan(&mut self) {
+        if !self.demo_view_set
+            && self.canvas_screen_rect.is_some()
+            && self.current_file.is_none()
+            && self.view_history.is_empty()
+        {
+            self.demo_view_set = true;
+            self.fit_view_to_drawing();
+        }
+    }
+
     /// ZOOM All — limits-or-extents. This app has no drawing-limits concept, so
     /// All == Extents; an empty drawing resets to a default view.
     fn zoom_all(&mut self) {
@@ -56256,6 +56510,13 @@ impl eframe::App for CadApp {
         // `factory_was_open` there), so nothing else needs to.
         self.enforce_mode_workspaces();
 
+        // First real frame of a fresh app: frame the demo plan once. The
+        // canvas rect exists from the previous frame (else we would fit to
+        // the 800×600 fallback and misframe the real window), the user has
+        // not zoomed anywhere yet (view history empty), and no file is open
+        // (open does its own fit). After this the view is the user's.
+        self.maybe_frame_demo_plan();
+
         // Install the global design-token Visuals so every default-styled widget
         // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
         // theme. Also fixes square menu corners (menu_rounding = ZERO).
@@ -56391,6 +56652,9 @@ impl eframe::App for CadApp {
         if self.close_confirm {
             self.render_close_confirm(ctx);
         }
+        // The room-details modal (2D ROOMS ▸ "Make room (from selected
+        // outline)") — bails when no form is open.
+        self.render_room_form(ctx);
 
         // Autosave: silent background re-save of the current file a few minutes after an edit.
         self.tick_autosave();
@@ -56466,6 +56730,14 @@ impl eframe::App for CadApp {
 
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // The room-details question OWNS Esc while it is open: it cancels
+            // the question, and nothing under the modal may also cancel — an
+            // Esc that is answering a dialog is not also abandoning a draft.
+            if self.room_form.is_some() {
+                self.room_form = None;
+                self.room_form_focus_name = false;
+                return;
+            }
             // 3D placement: Esc cancels a primitive waiting for its point.
             if self.factory.place_pending.is_some() {
                 self.factory.place_pending = None;
@@ -56923,6 +57195,14 @@ impl eframe::App for CadApp {
         // command — so committing a value in any numeric field re-ran whatever was last typed.
         // With `clear` or `erase` behind it that empties the drawing, and the only visible effect
         // is that everything vanishes the moment a number is confirmed.
+        //
+        // The room-details modal owns Enter the same way: an idle Enter (or
+        // Space) under it must not repeat the last command behind the dialog —
+        // eat the key so nothing below can see it.
+        if self.room_form.is_some() && !self.typing_in_a_field() {
+            let _ = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let _ = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        }
         let typing_elsewhere = self.typing_in_a_field();
         let enter_now  = !typing_elsewhere && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let space_now  = !typing_elsewhere && ctx.input(|i| i.key_pressed(egui::Key::Space));
@@ -58997,7 +59277,16 @@ impl eframe::App for CadApp {
         // user-resizable height by dragging the top edge; remembered across runs
         // (`env.CmdBarH`). A visual left grip (§2, no move handle) whose
         // right-click opens the sticky "Close command bar" flyout.
-        if self.cmd_window_open {
+        //
+        // A 2D DRAFTING SURFACE — the SIMLUX and 3D Factory workspaces are
+        // viewports, and show no command line. `cmd_window_open` still records
+        // the user's choice across tab switches (closing the bar in the 2D
+        // workspace keeps it closed after a 3D visit), and the bar's stored
+        // height is untouched by the frames it is absent from, so it returns
+        // exactly as it was left. The 3D workspace viewports therefore run
+        // full-width to the window's right edge AND full-height to the status
+        // bar — no strip is reserved for typing there.
+        if self.cmd_window_open && self.mode == Mode::Cad2D {
             use crate::theme::color as tc;
             // §7 height computed from the mono line height so CMD_HIST_LINES
             // whole lines fit; the bar is USER-RESIZABLE by dragging its top
@@ -76216,9 +76505,10 @@ mod mode_workspaces_are_exclusive {
         assert_eq!(app.mode, Mode::Cad2D, "drafting owns the window");
     }
 
-    /// REGRESSION — the bottom COMMAND BAR must keep its height, and the 3D
-    /// viewports must fill exactly what the workspace leaves, across tab
-    /// round-trips.
+    /// REGRESSION — the bottom COMMAND BAR belongs to the 2D drafting
+    /// workspace: it must keep its height, the 3D viewports must fill the
+    /// whole workspace (no command strip reserved there), and the bar must
+    /// come back exactly as it was left, across tab round-trips.
     ///
     /// The bug it pins: the full-window SIMLUX/3D Factory viewports reserved
     /// every pixel before the command bar was laid out, squeezing the bar into
@@ -76226,13 +76516,17 @@ mod mode_workspaces_are_exclusive {
     /// panel's stored HEIGHT upward every frame it stayed squeezed, and
     /// returning to the 2D view reopened the command bar as a wall covering
     /// the canvas (fixed by dragging its top edge back down). The bar is now
-    /// laid out BEFORE the viewports — full width under them — so its height
-    /// never moves.
+    /// laid out BEFORE the viewports, and only in the drafting workspace: the
+    /// SIMLUX and 3D Factory workspaces never lay it out at all, so their
+    /// viewports run to the window's right edge and down to the status bar
+    /// while the bar's stored height freezes for the visit — it cannot ratchet
+    /// because nothing ever squeezes it.
     #[test]
     fn command_bar_height_survives_workspace_round_trips() {
         const W: f32 = 1920.0;
         const H: f32 = 1080.0;
         let mut central = egui::Rect::NOTHING;
+        let mut bar_added = false;
         let mut frame = |app: &mut CadApp, ctx: &egui::Context| {
             let input = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -76240,11 +76534,13 @@ mod mode_workspaces_are_exclusive {
                 ..Default::default()
             };
             central = egui::Rect::NOTHING;
+            bar_added = false;
             let _ = ctx.run(input, |ctx| {
-                // update() order: tabs → mode panel → command bar → viewports.
+                // update() order: tabs → mode panel → command bar (2D only) → viewports.
                 app.render_mode_tabs(ctx);
                 app.render_mode_command_panel(ctx);
-                if app.cmd_window_open {
+                if app.cmd_window_open && app.mode == Mode::Cad2D {
+                    bar_added = true;
                     use crate::theme::color as tc;
                     let line_h = {
                         let fid = ctx.style().text_styles
@@ -76294,39 +76590,52 @@ mod mode_workspaces_are_exclusive {
                 get("command").height(),
                 get("command").width(),
                 central.width(),
+                get("simlux_3d_panel").height(),
+                get("factory_3d_panel").height(),
+                bar_added,
             )
         };
         let mut app = CadApp::default();
         let ctx = egui::Context::default();
-        let (_, _, _, fresh_h, _, _) = frame(&mut app, &ctx);
+        let (_, _, _, fresh_h, _, _, _, _, added) = frame(&mut app, &ctx);
+        assert!(added, "the 2D workspace shows the command bar");
         assert!(fresh_h > 60.0 && fresh_h < 200.0, "sane bar height: {fresh_h:.0}");
 
         app.switch_mode(Mode::Factory);
         for _ in 0..3 {
-            frame(&mut app, &ctx);
+            let (m, _, f, h, _, _, _, fh, added) = frame(&mut app, &ctx);
+            assert!(!added, "the Factory workspace draws no command bar");
+            assert!((h - fresh_h).abs() < 1.0, "bar height frozen while hidden: {h:.0}");
+            assert!(f >= W - m - 1.0, "the Factory viewport fills the workspace width: {f:.0}");
+            assert!(fh > 990.0, "…and runs down to the status bar: {fh:.0}");
         }
         app.switch_mode(Mode::Cad2D);
         for _ in 0..2 {
             frame(&mut app, &ctx);
         }
-        let (m, _, f, h, w, c) = frame(&mut app, &ctx);
+        let (m, _, f, h, w, c, _, _, added) = frame(&mut app, &ctx);
+        assert!(added, "back in 2D the command bar is drawn again");
         assert!((h - fresh_h).abs() < 1.0, "bar height back in 2D: {h:.0} vs {fresh_h:.0}");
+        assert!(w > 1400.0, "bar spans the workspace width: {w:.0}");
         assert!((m - 242.0).abs() < 0.5, "mode panel keeps its width: {m:.0}");
         assert!(c > 1200.0, "canvas has room again: {c:.0}");
         let _ = (f, w);
 
         app.switch_mode(Mode::Simlux);
         for _ in 0..3 {
-            let (m, s, _, h, w, _) = frame(&mut app, &ctx);
-            assert!((h - fresh_h).abs() < 1.0, "bar height stable in SIMLUX: {h:.0}");
-            assert!(s <= W - m + 1.0, "viewport never overlaps the mode panel: {s:.0}");
-            assert!(w > 1400.0, "bar spans the workspace width: {w:.0}");
+            let (m, s, _, h, _, _, sh, _, added) = frame(&mut app, &ctx);
+            assert!(!added, "the SIMLUX workspace draws no command bar");
+            assert!((h - fresh_h).abs() < 1.0, "bar height frozen while hidden: {h:.0}");
+            assert!(s >= W - m - 1.0 && s <= W - m + 1.0,
+                "SIMLUX viewport fills the whole workspace: {s:.0} (mode panel {m:.0})");
+            assert!(sh > 990.0, "…down to the status bar: {sh:.0}");
         }
         app.switch_mode(Mode::Cad2D);
         for _ in 0..2 {
             frame(&mut app, &ctx);
         }
-        let (_, _, _, h, _, c) = frame(&mut app, &ctx);
+        let (_, _, _, h, _, c, _, _, added) = frame(&mut app, &ctx);
+        assert!(added, "back in 2D the command bar is drawn again");
         assert!((h - fresh_h).abs() < 1.0, "bar height still intact after SIMLUX: {h:.0}");
         assert!(c > 1200.0, "canvas still has room: {c:.0}");
     }
@@ -76436,6 +76745,226 @@ mod mode_workspaces_are_exclusive {
         assert_eq!(r.name, "Room 1");
         assert!(r.footprint.len() >= 4, "the plan outline became its footprint");
         assert_eq!(app.undo_stack.len(), 1, "making the room is ONE undoable step");
+    }
+
+    /// "Make room" no longer builds instantly: a valid closed outline opens
+    /// the details form (nothing built, settings as the prefilled defaults);
+    /// an open path still explains what to do instead of opening anything.
+    #[test]
+    fn make_room_asks_for_details_first() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        app.doc.dobjects.clear();
+        let ring = cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex {
+                    pos: cad_kernel::Vec2::new(x, y),
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        });
+        app.doc.push(cad_kernel::DObject::new(ring));
+        app.selection.push(0);
+
+        let f = &app.factory;
+        let (expect_base, expect_h) = (f.active_base_z(), f.room_height.max(0.05));
+        app.request_make_room();
+        assert!(
+            app.room_form.is_some(),
+            "a valid closed outline must open the details form"
+        );
+        assert!(
+            app.factory.rooms.is_empty(),
+            "opening the form must not build anything yet"
+        );
+        let f = app.room_form.as_ref().unwrap();
+        assert_eq!(f.name, "Room 1", "the default name comes from the next room number");
+        assert_eq!(f.base_z, expect_base, "start height defaults to the active storey");
+        assert_eq!(f.height, expect_h, "clear height defaults to the room-height setting");
+        assert!(f.outline.len() >= 4, "the selected outline travels into the form");
+
+        // An OPEN path is walls-only → say what to do; no form.
+        let mut app2 = CadApp::default();
+        app2.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        app2.doc.dobjects.clear();
+        let open = cad_kernel::Geom::Line(cad_kernel::Line {
+            a: cad_kernel::Vec2::new(0.0, 0.0),
+            b: cad_kernel::Vec2::new(5.0, 0.0),
+        });
+        app2.doc.push(cad_kernel::DObject::new(open));
+        app2.selection.push(0);
+        app2.request_make_room();
+        assert!(app2.room_form.is_none(), "an open path must not open the form");
+        assert!(
+            app2.history.last().unwrap_or(&String::new()).contains("CLOSED outline"),
+            "and it must say what is wrong: {:?}",
+            app2.history.last()
+        );
+    }
+
+    /// The form's ANSWERS are the room: confirming builds it at the asked
+    /// start height with the asked clear height and thicknesses — and the
+    /// built geometry really stands there (floor slab bottom at base_z, walls
+    /// from base_z + floor, ceiling above the clear height), not wherever the
+    /// settings/active storey would have put it.
+    #[test]
+    fn the_form_answers_become_the_room() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        app.doc.dobjects.clear();
+        let ring = cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex {
+                    pos: cad_kernel::Vec2::new(x, y),
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        });
+        app.doc.push(cad_kernel::DObject::new(ring));
+        app.selection.push(0);
+        app.request_make_room();
+
+        let mut f = app.room_form.take().unwrap();
+        f.name = "Lobby".into();
+        f.base_z = 1.2;   // start height — above the ground
+        f.height = 3.1;   // clear height
+        f.floor_t = 0.2;
+        f.wall_t = 0.3;
+        f.ceiling_t = 0.25;
+        app.build_room_form(f);
+
+        assert_eq!(app.factory.rooms.len(), 1);
+        let r = &app.factory.rooms[0];
+        assert!(r.is_built());
+        assert_eq!(r.name, "Lobby", "the asked name is the built name");
+        assert!((r.base_z - 1.2).abs() < 1e-4, "start height: {}", r.base_z);
+        assert!((r.height - 3.1).abs() < 1e-4, "clear height: {}", r.height);
+        assert!((r.wall_t - 0.3).abs() < 1e-4, "wall thickness: {}", r.wall_t);
+        assert!((r.floor_t - 0.2).abs() < 1e-4, "floor slab: {}", r.floor_t);
+        assert!((r.ceiling_t - 0.25).abs() < 1e-4, "ceiling slab: {}", r.ceiling_t);
+        assert!(r.floor.is_some() && !r.walls.is_empty() && r.ceiling.is_some());
+
+        // The GEOMETRY stands where it was asked: floor slab lift at the start
+        // height, walls on top of it, ceiling at base + floor + clear.
+        let lift_of = |st: &crate::factory::FactoryState, id: u32| {
+            st.model.features.iter().find(|f| f.id == id).map(|f| f.placement.lift).unwrap_or(f32::NAN)
+        };
+        assert!((lift_of(&app.factory, r.floor.unwrap()) - 1.2).abs() < 1e-3);
+        for w in &r.walls {
+            assert!(
+                (lift_of(&app.factory, *w) - 1.4).abs() < 1e-3,
+                "walls stand on the floor slab at base + floor"
+            );
+        }
+        assert!(
+            (lift_of(&app.factory, r.ceiling.unwrap()) - 4.5).abs() < 1e-3,
+            "ceiling underside at base + floor + clear height"
+        );
+        assert_eq!(app.undo_stack.len(), 1, "one undoable step for the whole act");
+    }
+
+    /// Escaping / cancelling the form abandons the outline: no room, no undo
+    /// entry, nothing in the history about a built room.
+    #[test]
+    fn cancelling_the_room_form_builds_nothing() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        app.doc.dobjects.clear();
+        let ring = cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex {
+                    pos: cad_kernel::Vec2::new(x, y),
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        });
+        app.doc.push(cad_kernel::DObject::new(ring));
+        app.selection.push(0);
+        app.request_make_room();
+        assert!(app.room_form.is_some());
+
+        // Exactly what the Esc handler and the Cancel button both do.
+        app.room_form = None;
+        app.room_form_focus_name = false;
+
+        assert!(app.factory.rooms.is_empty(), "cancelling must not build");
+        assert!(app.undo_stack.is_empty(), "…and must not leave an undo entry");
+        assert!(
+            !app.history.iter().any(|h| h.contains("made from the plan outline")),
+            "…and must not claim a room was made"
+        );
+    }
+
+    /// The demo plan a fresh app ships with must make a REAL room: its closed
+    /// rectangle is 6000 × 4500 drawing-units in the default MILLIMETRE
+    /// document, so as a room it comes out ~6 × 4.5 m. (The old demo figures
+    /// were ±(20–90)-unit centimetre sketches — no room could ever come out
+    /// of those.)
+    #[test]
+    fn the_demo_plan_makes_a_real_metre_room() {
+        let mut app = CadApp::default();
+        assert_eq!(
+            app.doc.units.metres_per_unit, 0.001,
+            "a fresh document is millimetre space"
+        );
+        let ring_idx = app
+            .doc
+            .dobjects
+            .iter()
+            .position(|d| matches!(&d.geom, cad_kernel::Geom::Polyline(p) if p.closed))
+            .expect("the demo plan ships a closed room outline");
+        app.selection.push(ring_idx);
+
+        let outline = app
+            .slab_outline_from_selection()
+            .expect("the closed demo outline must yield one");
+        let (mut mnx, mut mny, mut mxx, mut mxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in &outline {
+            mnx = mnx.min(p.x); mny = mny.min(p.y);
+            mxx = mxx.max(p.x); mxy = mxy.max(p.y);
+        }
+        assert!((mxx - mnx - 6.0).abs() < 1e-3, "room width ≈ 6 m, got {}", mxx - mnx);
+        assert!((mxy - mny - 4.5).abs() < 1e-3, "room depth ≈ 4.5 m, got {}", mxy - mny);
+
+        app.make_room_from_selected_outline(outline);
+        assert_eq!(app.factory.rooms.len(), 1);
+        let r = &app.factory.rooms[0];
+        assert!(r.is_built(), "the demo outline builds a real room");
+        assert!(r.floor.is_some() && r.ceiling.is_some(), "with both slabs");
+        assert_eq!(r.walls.len(), 4, "a rectangle room has four perimeter walls");
+    }
+
+    /// The first-frame hook frames the demo plan once — the launch camera
+    /// would otherwise show empty space around the origin — and never touches
+    /// the view again.
+    #[test]
+    fn the_demo_plan_is_framed_once_on_first_launch() {
+        let mut app = CadApp::default();
+        app.canvas_screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0), egui::vec2(1600.0, 1000.0)));
+        let (s0, o0) = (app.scale, app.world_offset);
+
+        app.maybe_frame_demo_plan();
+        assert!(app.demo_view_set, "the hook must have run");
+        assert!(app.scale < s0, "the plan needs zooming OUT, not the 6 px/unit launch zoom");
+        assert_ne!(app.world_offset, o0, "the view recentred on the plan");
+        let s1 = app.scale;
+
+        // A second call — and calls once the user has zoomed — are no-ops.
+        app.maybe_frame_demo_plan();
+        assert_eq!(app.scale, s1, "the view is framed exactly once");
+        app.view_history.push((0.5, egui::Vec2::ZERO));
+        app.maybe_frame_demo_plan();
+        assert_eq!(app.scale, s1, "a user zoom never gets overridden");
     }
 }
 
@@ -77529,15 +78058,21 @@ mod hatch_dedupe_tests {
 
     #[test]
     fn hatch_center_line_survives_vertex_hits() {
-        // Regression: ANSI31 (45°) hatch over the DEFAULT center circle
-        // (64-vertex tessellation, vertex at 45°). The pattern line through
+        // Regression: ANSI31 (45°) hatch over a 64-vertex circle AT THE
+        // ORIGIN (tessellation vertex at 45°). The pattern line through
         // (0,0) hits the boundary exactly at vertices — it must still be
         // emitted by hatch_pattern_geometry.
+        //
+        // Self-contained fixture: the demo plan used to ship this circle;
+        // it now ships a room outline at real sizes and must not be leaned
+        // on as test geometry.
         let mut app = CadApp::default();
-        // Find the default circle at the origin.
-        let circle_idx = app.doc.dobjects.iter().position(|d|
-            matches!(d.geom, Geom::Circle(c) if c.center.len() < 1e-9))
-            .expect("default doc has a center circle");
+        app.doc.dobjects.clear();
+        let mut circle: DObject = Circle {
+            center: Vec2::new(0.0, 0.0), radius: 30.0,
+        }.into();
+        app.stamp_fresh_style(&mut circle.style);
+        let circle_idx = app.doc.push(circle);
         let h = app.doc.dobjects[circle_idx].handle;
         let n0 = app.doc.dobjects.len();
         app.add_dobject(Geom::Hatch(cad_kernel::Hatch {
