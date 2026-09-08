@@ -702,10 +702,12 @@ fn builtin_downlight() -> IesProfile {
 #[derive(Default)]
 pub struct LightAction {
     pub calculate: bool,
-    /// Import every dobject on this source-layer id into the room (Phase B).
+    /// Import every dobject on this source-layer id as an ImportedLayer room.
     pub import_layer: Option<u32>,
-    /// Drop this imported room layer.
-    pub remove_layer: Option<u32>,
+    /// Edit a room's clear height (the room lives in `factory.rooms`).
+    pub set_room_height: Option<(u32, f32)>,
+    /// Remove a room (any origin) — see `FactoryState::delete_room`.
+    pub remove_room: Option<u32>,
     /// Move the current selection onto the dedicated SIMLUX layer + use it for 3D.
     pub shift_to_simlux: bool,
     /// Open the file browser to import a photometric file — the same gesture as importing
@@ -723,16 +725,8 @@ pub struct LightAction {
     pub clear_fixtures: bool,
 }
 
-/// One imported source layer of the room: the drafted dobjects on `layer_id`,
-/// extruded to a per-layer `height` (SIMLUX layer-grouped room model — D1/D2).
-/// Handle-based so the set survives redraws / re-ordering of the document.
-#[derive(Clone)]
-pub struct RoomLayer {
-    pub layer_id: u32,
-    pub name: String,
-    pub height: f32,
-    pub handles: Vec<u64>,
-}
+/// (Legacy per-layer room groups now live in `factory.rooms` with
+/// [`crate::factory::RoomOrigin::ImportedLayer`] — see `simlux_io::RoomRec`.)
 
 
 
@@ -1459,18 +1453,10 @@ pub struct LightState {
     /// Room (extrusion) height, metres — default height for newly imported
     /// layers and the fallback when no layer has been imported yet.
     pub room_height: f32,
-    /// SIMLUX room (Phase B/C): imported source layers, each extruded to its
-    /// own `height`. Empty ⇒ `calculate` falls back to extruding the whole doc.
-    pub room: Vec<RoomLayer>,
-    /// Rooms DESIGNATED ON THE 2D PLAN — a closed outline the user picked and
-    /// named (see the mode command panel's ROOMS section). Each is a calculation
-    /// target with its own grid, the same way a Factory room would be. The
-    /// footprints are captured in METRES at designation time.
-    ///
-    /// The engine's per-room path needs NO 3D model: the wall scene still comes
-    /// from the 2D extrusion (or the imported room layers), while the grids and
-    /// per-room figures are per designated footprint.
-    pub plan_rooms: Vec<crate::simlux_io::PlanRoomRec>,
+    /// (Rooms — plan-designated, imported layers and built 3D rooms — live in
+    /// ONE list: `factory.rooms`, each tagged with its
+    /// [`crate::factory::RoomOrigin`]. This light state holds only RESULTS:
+    /// [`Self::rooms`].)
     /// Work-plane height above the floor, metres (typ. 0.8 m desk height).
     pub plane_height: f32,
     /// Target grid cell size, metres (clamped to 8..64 cells per axis).
@@ -1789,8 +1775,6 @@ impl LightState {
             active_profile: UNASSIGNED.to_string(),
             materials: default_materials(),
             room_height: 3.0,
-            room: Vec::new(),
-            plan_rooms: Vec::new(),
             plane_height: 0.8,
             cell_size: 0.25,
             settings: RaySettings::default(),
@@ -2391,34 +2375,6 @@ impl LightState {
     /// Import (Phase B) every drafted dobject on `layer_id` into the room, at
     /// the current default height. Re-importing the same layer refreshes its
     /// handle set and keeps its chosen height.
-    pub fn import_layer(&mut self, doc: &Document, layer_id: u32) {
-        let handles: Vec<u64> = doc.dobjects.iter()
-            .filter(|d| d.style.layer == layer_id)
-            .map(|d| d.handle)
-            .collect();
-        let name = doc.layers.get(layer_id)
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| format!("layer {layer_id}"));
-        let n = handles.len();
-        if let Some(g) = self.room.iter_mut().find(|g| g.layer_id == layer_id) {
-            g.handles = handles;
-            g.name = name.clone();
-        } else {
-            self.room.push(RoomLayer { layer_id, name: name.clone(), height: self.room_height, handles });
-        }
-        self.last_msg =
-            format!("Imported {n} object(s) from layer '{name}' — set height, then Calculate.");
-    }
-
-    /// Drop one imported room layer (Phase B).
-    pub fn remove_room_layer(&mut self, layer_id: u32) {
-        self.room.retain(|g| g.layer_id != layer_id);
-    }
-
-    /// Every handle across all imported room layers (for plan highlight / count).
-    pub fn room_handles(&self) -> Vec<u64> {
-        self.room.iter().flat_map(|g| g.handles.iter().copied()).collect()
-    }
 
     /// Run the lux engine on `doc` and store the grid + plane + scene.
     /// The ONE geometry source, shared by the 3D view and the calculation.
@@ -2438,14 +2394,26 @@ impl LightState {
         if !from_3d.is_empty() {
             return from_3d;
         }
-        if self.room.is_empty() {
-            extrude(doc, self.room_height)
-        } else {
+        // Imported-layer rooms (legacy per-layer imports, now unified room
+        // records): their layers' drafted outlines extrude to each room's
+        // height. When none exist the whole 2D document extrudes, exactly as
+        // before — that fallback covers plan-designated rooms' walls too.
+        let layer_rooms: Vec<&crate::factory::RoomInst> = factory
+            .map(|f| {
+                f.rooms
+                    .iter()
+                    .filter(|r| r.origin == crate::factory::RoomOrigin::ImportedLayer && !r.handles.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !layer_rooms.is_empty() {
             let mut m = Vec::new();
-            for g in &self.room {
+            for g in layer_rooms {
                 m.extend(extrude_handles(doc, &g.handles, g.height));
             }
             m
+        } else {
+            extrude(doc, self.room_height)
         }
     }
 
@@ -2742,10 +2710,10 @@ impl LightState {
     /// A project with no rooms gets one unnamed target with no footprint, which is the whole-model
     /// fallback the 2D-only path has always used.
     ///
-    /// Rooms designated ON THE 2D PLAN ([`Self::plan_rooms`]) stand in for Factory rooms: they
-    /// are the per-room targets of a 2D-only project (no 3D model, or a model with no rooms).
-    /// The naming rule is the same as the Factory one so a blank name reads as "Room N".
-    fn calc_targets(&self, f: Option<&crate::factory::FactoryState>) -> Vec<(String, Vec<glam::Vec2>)> {
+    /// THE ONE LIST: `factory.rooms` holds built 3D rooms, plan designations and
+    /// imported layer rooms alike (each tagged with its origin), and every one of
+    /// them with a real footprint is a target.
+    fn calc_targets(f: Option<&crate::factory::FactoryState>) -> Vec<(String, Vec<glam::Vec2>)> {
         let rooms: Vec<(String, Vec<glam::Vec2>)> = f
             .map(|f| {
                 f.rooms
@@ -2763,34 +2731,10 @@ impl LightState {
                     .collect()
             })
             .unwrap_or_default();
-        if !rooms.is_empty() {
-            return rooms;
-        }
-        // No Factory rooms → the designated plan rooms, if any.
-        let plan: Vec<(String, Vec<glam::Vec2>)> = self
-            .plan_rooms
-            .iter()
-            .filter(|r| r.footprint.len() >= 3)
-            .enumerate()
-            .map(|(i, r)| {
-                let name = if r.name.trim().is_empty() {
-                    format!("Room {}", i + 1)
-                } else {
-                    r.name.trim().to_string()
-                };
-                let fp = r
-                    .footprint
-                    .iter()
-                    .map(|p| glam::Vec2::new(p[0], p[1]))
-                    .collect();
-                (name, fp)
-            })
-            .collect();
-        if plan.is_empty() {
-            // Still nothing — the whole-model fallback.
+        if rooms.is_empty() {
             vec![(String::new(), Vec::new())]
         } else {
-            plan
+            rooms
         }
     }
 
@@ -3194,6 +3138,12 @@ impl LightState {
         if let Some(f) = factory {
             h.u64(f.rooms.len() as u64);
             for r in &f.rooms {
+                h.u64(r.origin as u64);
+                // The height extrudes an imported layer's walls, so it is an
+                // input even though a built room's geometry already is one.
+                if r.origin == crate::factory::RoomOrigin::ImportedLayer {
+                    h.f32(r.height);
+                }
                 h.u64(r.footprint.len() as u64);
                 for p in &r.footprint {
                     h.f32(p.x);
@@ -3201,35 +3151,10 @@ impl LightState {
                 }
             }
         }
-        // Designated PLAN rooms are hashed unconditionally: they become the
-        // targets exactly when the factory block above is empty, and a room
-        // added while a roomless model exists must still invalidate a stored
-        // result.
-        h.u64(self.plan_rooms.len() as u64);
-        for r in &self.plan_rooms {
-            h.u64(r.name.len() as u64);
-            h.u64(r.footprint.len() as u64);
-            for p in &r.footprint {
-                h.f32(p[0]);
-                h.f32(p[1]);
-            }
-        }
         hash_json(&mut h, "lums", &self.luminaires);
         hash_json(&mut h, "materials", &self.materials);
         hash_json(&mut h, "settings", &self.settings);
         hash_json(&mut h, "maintenance", &self.maintenance);
-        // `RoomLayer` is not `Serialize`, so this one is by hand -- four fields, and the compiler
-        // will not warn if a fifth is added. Kept small and named for exactly that reason.
-        h.u64(self.room.len() as u64);
-        for g in &self.room {
-            h.u64(g.layer_id as u64);
-            h.str(&g.name);
-            h.f32(g.height);
-            h.u64(g.handles.len() as u64);
-            for x in &g.handles {
-                h.u64(*x);
-            }
-        }
         h.f32(self.cell_size);
         h.f32(self.plane_height);
         h.f32(self.eye_height);
@@ -3432,7 +3357,7 @@ impl LightState {
         // altogether on a non-rectangular plan, were computed, painted and counted in Ē and U₀.
         //
         // `mesh_bbox` stays as the fallback for a 2D-only project, which has no rooms to ask about.
-        let targets = self.calc_targets(factory);
+        let targets = Self::calc_targets(factory);
         let any_room = targets.iter().any(|(_, p)| p.len() >= 3);
         let bounds = if any_room {
             // Every room has its own footprint; the fallback is only for a target without one.
@@ -3730,15 +3655,10 @@ impl LightState {
     /// regenerated in `new`).
     pub fn to_config(&self, doc: &Document) -> crate::simlux_io::SimluxConfig {
         use std::collections::BTreeMap;
-        let mut layers_3d = BTreeMap::new();
-        for g in &self.room {
-            let name = doc
-                .layers
-                .get(g.layer_id)
-                .map(|l| l.name.clone())
-                .unwrap_or_else(|| g.name.clone());
-            layers_3d.insert(name, g.height);
-        }
+        // Rooms (plan designations, layer imports, built rooms) live in the
+        // FACTORY record, not here — the two legacy fields below are written
+        // empty and kept only so old files still migrate on load.
+        let layers_3d = BTreeMap::new();
         let mut ies_library = BTreeMap::new();
         for (k, v) in &self.profiles {
             if k != BUILTIN {
@@ -3787,7 +3707,7 @@ impl LightState {
             next_luminaire_id: self.next_id,
             symbol_of: self.symbol_of.clone(),
             maintenance: Some(self.maintenance),
-            plan_rooms: self.plan_rooms.clone(),
+            plan_rooms: Vec::new(),
             // Command-line calculator variables — `light` doesn't own them
             // either; the app fills the map (build_simlux_config_common).
             vars: BTreeMap::new(),
@@ -3798,7 +3718,8 @@ impl LightState {
     /// library, restore materials/settings/defaults, and rebuild the room by
     /// resolving persisted layer NAMES back to ids + their current handles.
     pub fn apply_config(&mut self, cfg: crate::simlux_io::SimluxConfig, doc: &Document) {
-        self.plan_rooms = cfg.plan_rooms;
+        // cfg.plan_rooms / cfg.layers_3d are LEGACY fields — the app migrates
+        // them into `factory.rooms` when a config is installed (install_simlux_config).
         for (k, v) in cfg.ies_library {
             self.profiles.insert(k, v);
         }
@@ -3866,18 +3787,6 @@ impl LightState {
         }
         if cfg.eye_height > 0.0 {
             self.eye_height = cfg.eye_height;
-        }
-        self.room.clear();
-        for (name, height) in cfg.layers_3d {
-            if let Some(lid) = doc.layers.find(&name) {
-                let handles: Vec<u64> = doc
-                    .dobjects
-                    .iter()
-                    .filter(|d| d.style.layer == lid)
-                    .map(|d| d.handle)
-                    .collect();
-                self.room.push(RoomLayer { layer_id: lid, name, height, handles });
-            }
         }
     }
 
@@ -4486,83 +4395,92 @@ Type \n                     `straylights` to list them, `straylights purge` to r
         action
     }
 
-    pub fn panel_ui(&mut self, ui: &mut egui::Ui, layers: &[(u32, String)]) -> LightAction {
+    pub fn panel_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        layers: &[(u32, String)],
+        rooms: &[crate::factory::RoomInst],
+    ) -> LightAction {
         let mut action = LightAction::default();
         ui.set_min_width(260.0);
 
-        // ---- ① Room — mark layers "use for 3D"; each extrudes to its height ----
-        ui.label(egui::RichText::new("① Room  ·  use layers for 3D").strong());
-        ui.label(
-            egui::RichText::new("Tick the layers that form the room.")
-                .small()
-                .weak(),
-        );
-        if ui
-            .button("⬚  Move selection → SIMLUX layer")
-            .on_hover_text("Put the selected geometry on a dedicated SIMLUX layer and use it for 3D")
-            .clicked()
-        {
-            action.shift_to_simlux = true;
-        }
-        egui::Grid::new("simlux_layer_use3d")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                for (id, name) in layers {
-                    let group = self.room.iter().find(|g| g.layer_id == *id);
-                    let mut on = group.is_some();
-                    let n = group.map(|g| g.handles.len()).unwrap_or(0);
-                    if ui
-                        .checkbox(&mut on, name.as_str())
-                        .on_hover_text("Use this layer's geometry in the 3D model / lux calc")
-                        .changed()
-                    {
-                        if on {
-                            action.import_layer = Some(*id);
-                        } else {
-                            action.remove_layer = Some(*id);
-                        }
-                    }
-                    ui.label(
-                        egui::RichText::new(if on { format!("{n} obj") } else { String::new() })
-                            .small()
-                            .weak(),
-                    );
-                    ui.end_row();
-                }
-            });
-        if self.room.is_empty() {
+        // ---- ① Rooms — ONE list (plan designations ◫, layer imports ⬚,
+        // built 3D rooms ⌂). Every room is a calculation room: its footprint
+        // gets its own grid. Heights edit the record; a built room's walls
+        // follow through `FactoryState::set_room_height`.
+        ui.label(egui::RichText::new("① Rooms").strong());
+        if rooms.is_empty() {
             ui.label(
-                egui::RichText::new("No layers imported → Calculate extrudes the whole drawing.")
+                egui::RichText::new("None yet — in the 2D view's ROOMS list, select a closed \
+                    outline and 'Make room': it is built at once and gets its own lux result. \
+                    Or import a layer below.")
                     .small()
                     .weak(),
             );
-        } else {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("② Extrude  ·  per-layer height (m)").strong());
-            egui::Grid::new("simlux_room_groups")
-                .num_columns(4)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for g in &mut self.room {
-                        ui.label(egui::RichText::new(&g.name).strong());
-                        ui.label(
-                            egui::RichText::new(format!("{} obj", g.handles.len()))
-                                .small()
-                                .weak(),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut g.height).update_while_editing(false)
-                                .speed(0.05)
-                                .suffix(" m")
-                                .range(0.1..=20.0),
-                        );
-                        if ui.button("✕").on_hover_text("Remove from room").clicked() {
-                            action.remove_layer = Some(g.layer_id);
+        }
+        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            for r in rooms {
+                let name = r.name.clone();
+                ui.horizontal(|ui| {
+                    let detail = match r.origin {
+                        crate::factory::RoomOrigin::Built => {
+                            format!("built 3D room · {:.2} m clear", r.height)
                         }
-                        ui.end_row();
+                        crate::factory::RoomOrigin::PlanDesignated => {
+                            format!("designated on the plan · {:.2} m clear", r.height)
+                        }
+                        crate::factory::RoomOrigin::ImportedLayer => format!(
+                            "layer '{}' · {} obj(s)",
+                            r.layer_name.clone().unwrap_or_default(),
+                            r.handles.len()
+                        ),
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{}  {}", r.origin.glyph(), &name))
+                            .size(12.0),
+                    )
+                    .on_hover_text(detail);
+                    let mut h = r.height;
+                    if ui
+                        .add(egui::DragValue::new(&mut h).update_while_editing(false)
+                            .speed(0.05)
+                            .suffix(" m")
+                            .range(0.1..=20.0))
+                        .on_hover_text("Clear height")
+                        .changed()
+                    {
+                        action.set_room_height = Some((r.id, h));
+                    }
+                    if ui.button("✕").on_hover_text("Remove this room").clicked() {
+                        action.remove_room = Some(r.id);
                     }
                 });
+            }
+        });
+        // Import a drafted layer as a room (its closed outlines extrude into
+        // the walls; its largest ring becomes the room footprint).
+        let imported: Vec<String> = rooms
+            .iter()
+            .filter(|r| r.origin == crate::factory::RoomOrigin::ImportedLayer)
+            .filter_map(|r| r.layer_name.clone())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("＋ import a layer:").small().weak());
+            for (id, name) in layers {
+                if imported.contains(name) {
+                    continue;
+                }
+                if ui.small_button(name).clicked() {
+                    action.import_layer = Some(*id);
+                }
+            }
+        });
+        if !imported.is_empty() {
+            ui.label(
+                egui::RichText::new("Imported layers extrude into the walls at their room height;                     Calculate extrudes the whole drawing when none are imported.")
+                    .small()
+                    .weak(),
+            );
         }
         ui.separator();
 
@@ -9614,76 +9532,83 @@ mod the_mode_is_reachable_and_survives {
 }
 
 #[cfg(test)]
-mod designated_plan_rooms_are_the_2d_calc_targets {
+mod rooms_are_one_list_in_factory_state {
     use super::*;
 
-    fn room_rec(name: &str, pts: &[[f32; 2]]) -> crate::simlux_io::PlanRoomRec {
-        crate::simlux_io::PlanRoomRec {
-            name: name.to_string(),
-            footprint: pts.to_vec(),
-        }
+    fn rect(x: f32, y: f32) -> Vec<glam::Vec2> {
+        vec![
+            glam::Vec2::new(x, y),
+            glam::Vec2::new(x + 5.0, y),
+            glam::Vec2::new(x + 5.0, y + 4.0),
+            glam::Vec2::new(x, y + 4.0),
+        ]
     }
 
     #[test]
-    fn nothing_designated_keeps_the_whole_model_fallback() {
+    fn no_rooms_keeps_the_whole_model_fallback() {
         let light = LightState::new();
-        let t = light.calc_targets(None);
+        let t = LightState::calc_targets(None);
         assert_eq!(t.len(), 1);
         assert!(t[0].1.is_empty(), "no footprint → the whole-model fallback");
     }
 
     #[test]
-    fn a_designated_room_becomes_the_target_of_a_2d_project() {
-        let mut light = LightState::new();
-        light.plan_rooms.push(room_rec(
-            "",
-            &[[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0], [0.0, 0.0]],
-        ));
-        let t = light.calc_targets(None);
-        assert_eq!(t.len(), 1, "one designated room → one target");
-        assert_eq!(t[0].0, "Room 1", "blank names read as Room N, like Factory rooms");
-        assert_eq!(t[0].1.len(), 5);
-    }
-
-    #[test]
-    fn a_factory_with_rooms_still_wins_over_plan_rooms() {
-        let mut light = LightState::new();
-        light.plan_rooms.push(room_rec("Office", &[[0.0, 0.0], [10.0, 0.0], [10.0, 6.0], [0.0, 6.0]]));
+    fn an_unbuilt_plan_room_is_a_calc_target_like_a_built_one() {
         let mut f = crate::factory::FactoryState::default();
-        f.rooms.push(crate::factory::RoomInst {
-            id: 1,
-            name: "Model room".into(),
-            footprint: vec![
-                glam::Vec2::new(0.0, 0.0),
-                glam::Vec2::new(5.0, 0.0),
-                glam::Vec2::new(5.0, 4.0),
-                glam::Vec2::new(0.0, 4.0),
-            ],
-            base_z: 0.0,
-            height: 3.0,
-            floor_t: 0.2,
-            ceiling_t: 0.2,
-            wall_t: 0.3,
-            open_top: false,
-            floor: None,
-            walls: Vec::new(),
-            ceiling: None,
-            carve: None,
-        });
-        let t = light.calc_targets(Some(&f));
+        let id = f.add_designated_room("Office", &rect(0.0, 0.0));
+        let t = LightState::calc_targets(Some(&f));
+        assert_eq!(t.len(), 1, "designated rooms are targets from the start");
+        assert_eq!(t[0].0, "Office");
+        assert_eq!(t[0].1.len(), 4);
+        let _ = id;
+
+        // Building it keeps it a target — origin changes, footprint does not.
+        let bid = f.build_designated_room(f.rooms[0].id).unwrap();
+        let t = LightState::calc_targets(Some(&f));
         assert_eq!(t.len(), 1);
-        assert_ne!(t[0].0, "Office", "the 3D model's rooms are the authority");
+        assert_eq!(t[0].0, "Office", "the name survived the build");
+        assert_eq!(f.rooms[0].id, bid);
+        assert!(f.rooms[0].is_built());
     }
 
     #[test]
-    fn plan_rooms_survive_the_config_round_trip() {
-        let mut s = LightState::new();
-        s.plan_rooms.push(room_rec("Hall", &[[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]]));
-        let cfg = s.to_config(&Document::default());
-        let mut s2 = LightState::new();
-        s2.apply_config(cfg, &Document::default());
-        assert_eq!(s2.plan_rooms.len(), 1);
-        assert_eq!(s2.plan_rooms[0].name, "Hall");
-        assert_eq!(s2.plan_rooms[0].footprint.len(), 4);
+    fn mixed_origins_are_all_targets_in_list_order() {
+        let mut f = crate::factory::FactoryState::default();
+        f.add_designated_room("Annex", &rect(0.0, 0.0));
+        f.add_designated_room("Hall", &rect(20.0, 0.0));
+        f.add_room(&rect(40.0, 0.0)).unwrap(); // built via the standard builder
+        let t = LightState::calc_targets(Some(&f));
+        assert_eq!(t.len(), 3, "one list, every room a target");
+        assert_eq!(t[0].0, "Annex");
+        assert_eq!(t[1].0, "Hall");
+        assert_eq!(t[2].0, "Room 3");
+    }
+
+    #[test]
+    fn an_imported_layer_room_with_no_closed_ring_has_no_target() {
+        // A layer with only open lines shapes the scene but is no room.
+        let mut doc = Document::default();
+        doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Polyline(
+            cad_kernel::Polyline {
+                vertices: [(0.0, 0.0), (5.0, 0.0), (5.0, 4.0)]
+                    .iter()
+                    .map(|&(x, y)| cad_kernel::PolyVertex {
+                        pos: cad_kernel::Vec2::new(x, y),
+                        bulge: 0.0,
+                    })
+                    .collect(),
+                closed: false,
+                widths: Vec::new(),
+            },
+        )));
+        let mut f = crate::factory::FactoryState::default();
+        f.import_layer_as_room(&doc, 0);
+        assert_eq!(f.rooms.len(), 1);
+        assert!(f.rooms[0].footprint.is_empty(), "no closed ring → scene only");
+        assert_eq!(
+            LightState::calc_targets(Some(&f)).len(),
+            1,
+            "and the fallback stays a single whole-model target"
+        );
     }
 }

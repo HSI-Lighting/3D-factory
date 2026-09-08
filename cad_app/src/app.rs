@@ -6479,13 +6479,14 @@ impl CadApp {
             .collect();
         let mut open = self.light.window_open;
         let mut action = crate::light::LightAction::default();
+        let rooms = self.factory.rooms.clone();
         egui::Window::new("SIMLUX — Light")
             .open(&mut open)
             .default_width(288.0)
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    action = self.light.panel_ui(ui, &layers);
+                    action = self.light.panel_ui(ui, &layers, &rooms);
                 });
             });
         self.light.window_open = open;
@@ -6505,10 +6506,24 @@ impl CadApp {
         }
         if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
         if let Some(id) = action.import_layer {
-            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc);
-            self.light.import_layer(plan, id);
+            // A live face-sketch has its own layers; the plan is the room's home.
+            let plan = Self::plan_doc_of(self.factory.session.as_ref(), &self.doc).clone();
+            self.factory.import_layer_as_room(&plan, id);
         }
-        if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
+        if let Some((id, h)) = action.set_room_height {
+            self.factory.set_room_height(id, h);
+        }
+        if let Some(id) = action.remove_room {
+            let name = self
+                .factory
+                .rooms
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.name.clone())
+                .unwrap_or_default();
+            self.factory.delete_room(id);
+            self.history.push(format!("  room '{name}' removed"));
+        }
         if action.import_photometry {
             self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
         }
@@ -7281,22 +7296,32 @@ impl CadApp {
         if self.factory.session.is_some() {
             return;
         }
+        // Unbuilt rooms (plan designations / layer imports, footprint in
+        // METRES) paint as thin cyan outlines with their names, whether or not
+        // any SIMLUX panel is open — they are plan features. Built 3D rooms
+        // are drawn by the factory's own room-name overlay.
+        let unbuilt: Vec<&crate::factory::RoomInst> = self
+            .factory
+            .rooms
+            .iter()
+            .filter(|r| !r.is_built() && r.footprint.len() >= 3)
+            .collect();
         let show_ghost = self.light.place_mode && self.simlux_2d_layer_live();
-        if self.light.luminaires.is_empty() && !show_ghost && self.light.plan_rooms.is_empty() {
+        if self.light.luminaires.is_empty() && !show_ghost && unbuilt.is_empty() {
             return;
         }
         let clip = painter.with_clip_rect(rect);
 
-        // DESIGNATED ROOMS — thin cyan outlines with their names. Rooms are
-        // plan features (see the ROOMS section in the mode command panel), so
-        // they stay visible whether or not any SIMLUX panel is open.
-        if !self.light.plan_rooms.is_empty() {
+        if !unbuilt.is_empty() {
             let room_col = egui::Color32::from_rgb(90, 200, 230);
-            for r in &self.light.plan_rooms {
+            // (Names come from `paint_room_names_2d`, which labels EVERY room —
+            // these rings mark the unbuilt ones so the plan shows which rooms
+            // are still outline-only.)
+            for r in unbuilt {
                 let fp: Vec<egui::Pos2> = r
                     .footprint
                     .iter()
-                    .map(|p| self.w2s_m(Vec2::new(p[0] as f64, p[1] as f64), rect))
+                    .map(|p| self.w2s_m(Vec2::new(p.x as f64, p.y as f64), rect))
                     .collect();
                 if fp.len() >= 3 {
                     let mut pts = fp.clone();
@@ -7305,21 +7330,6 @@ impl CadApp {
                         pts,
                         egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(90, 200, 230, 190)),
                     ));
-                }
-                // The name above the ring's first corner, in the room's colour.
-                if let Some(first) = fp.first() {
-                    let name = if r.name.trim().is_empty() {
-                        "Room".to_string()
-                    } else {
-                        r.name.trim().to_string()
-                    };
-                    clip.text(
-                        egui::pos2(first.x + 5.0, first.y - 6.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        name,
-                        egui::FontId::proportional(10.0),
-                        room_col,
-                    );
                 }
             }
         }
@@ -8174,18 +8184,7 @@ impl CadApp {
             }
             Err(e) => {
                 self.undo_stack.pop();
-                let why = match e {
-                    crate::factory::RoomError::NoBuilding =>
-                        "make a building first — a room is carved OUT of a solid".to_string(),
-                    crate::factory::RoomError::Profile(p) => format!(
-                        "outline {}",
-                        match p {
-                            cad_solid::ProfileError::TooFewPoints => "needs at least 3 corners",
-                            cad_solid::ProfileError::Degenerate => "encloses no area",
-                            cad_solid::ProfileError::SelfIntersecting => "crosses itself",
-                        }
-                    ),
-                };
+                let why = room_error_why(e);
                 self.factory.status = format!("room: {why}");
                 self.history.push(format!("  ! room: {why}"));
             }
@@ -14010,9 +14009,11 @@ impl CadApp {
                                 return;
                             }
                             ui.label(
-                                egui::RichText::new("name · clear height — both editable")
-                                    .small()
-                                    .weak(),
+                                egui::RichText::new(
+                                    "⌂ built · ◫ plan · ⬚ layer — all rooms; all are lux targets",
+                                )
+                                .small()
+                                .weak(),
                             );
                             let u = self.factory.units.clone();
                             let mut rename: Option<(u32, String)> = None;
@@ -14025,6 +14026,11 @@ impl CadApp {
                             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                                 for r in &self.factory.rooms {
                                     ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{}", r.origin.glyph()))
+                                                .size(11.0),
+                                        )
+                                        .on_hover_text(r.origin.label());
                                         let mut name = r.name.clone();
                                         if ui
                                             .add(
@@ -14050,6 +14056,15 @@ impl CadApp {
                                             remove = Some(r.id);
                                         }
                                     });
+                                    if !r.is_built() {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "      unbuilt — only the footprint; build it from the 2D view ▸ ROOMS",
+                                            )
+                                            .small()
+                                            .weak(),
+                                        );
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.add_space(10.0);
                                         ui.label(egui::RichText::new("floor").small().weak());
@@ -14069,11 +14084,14 @@ impl CadApp {
                                             set_ceil = Some((r.id, ctk));
                                         }
                                     });
-                                    // The sum, and whether it fits. The three numbers interact, and
-                                    // the result is otherwise visible only as a picture that looks
+                                    // The sum, and whether it fits — only meaningful once the
+                                    // room owns its slabs. The three numbers interact, and the
+                                    // result is otherwise visible only as a picture that looks
                                     // wrong — which is how this was reported in the first place.
+                                    let built = r.is_built();
                                     let over = r.overall_height();
-                                    let fits = over <= self.factory.effective_building_height() + 1e-4;
+                                    let fits = built
+                                        && over <= self.factory.effective_building_height() + 1e-4;
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "      {} overall · {} openings{}",
@@ -14098,7 +14116,7 @@ impl CadApp {
                                             egui::Color32::from_rgb(230, 170, 90)
                                         }),
                                     );
-                                    if !fits && ui.small_button("      ⤓ Fit to building").clicked() {
+                                    if !fits && built && ui.small_button("      ⤓ Fit to building").clicked() {
                                         let ct = if r.open_top { 0.0 } else { r.ceiling_t };
                                         fit = Some((
                                             r.id,
@@ -14128,7 +14146,13 @@ impl CadApp {
                                 self.factory.set_room_height(id, h);
                             }
                             if let Some(id) = select {
-                                self.factory.selection = self.factory.room_features(id);
+                                let i = self.factory.room_index(id);
+                                if i.is_some_and(|i| !self.factory.rooms[i].is_built()) {
+                                    self.light.last_msg =
+                                        "Unbuilt room — nothing to select yet; build it first (2D view ▸ ROOMS ⬆).".into();
+                                } else {
+                                    self.factory.selection = self.factory.room_features(id);
+                                }
                                 ui.close_menu();
                             }
                             if let Some(id) = remove {
@@ -35829,125 +35853,168 @@ impl CadApp {
         }
         }
 
-        // ROOMS — designate closed outlines on the plan as the rooms the lux
-        // calculation reports per-room. A 2D-only project has no 3D Factory
-        // rooms, so these footprints ARE the calc targets (their own grid, Ē
-        // and U₀ each), exactly like Factory rooms.
+        // ROOMS — ONE list of every room in the project (built 3D rooms ⌂,
+        // plan-made rooms, imported layer rooms ⬚; see `factory.rooms`). Every
+        // room is a lux calc target — each footprint gets its own grid, Ē and
+        // U₀ — and rooms made here are REAL 3D rooms at once, visible in the
+        // 3D Factory view.
         if self.mode_section(ui, "2d-rooms", "ROOMS",
-            "Name the plan's rooms: select a CLOSED outline and designate it. Each designated room \
-             is calculated and reported separately (its own grid) instead of one whole-plan number")
+            "Every room here gets its own lux result and exists in the 3D Factory view. Select a              CLOSED outline on the plan and make it a room — it is built at once.")
         {
-            let n = self.light.plan_rooms.len();
-            let room_count_hint: Option<String> = if n > 0 {
-                Some(format!("{n} designated"))
+            let n = self.factory.rooms.len();
+            let count_hint: Option<String> = if n > 0 {
+                Some(format!("{n} room(s)"))
             } else {
                 None
             };
-            if Self::mode_text_row(ui, "⌂", "Designate room (selected outline)",
-                "Select a CLOSED outline (drawn walls/room perimeter) on the plan, then click this \
-                 to name it a room. Rooms are drawn cyan on the plan and each gets its own lux \
-                 result when you Calculate.",
-                room_count_hint.as_deref(),
+            if Self::mode_text_row(ui, "⌂", "Make room (from selected outline)",
+                "Select a CLOSED outline (drawn walls/room perimeter) on the plan, then click this.                  The room is BUILT at once — walls, floor and ceiling solids, visible in the 3D                  Factory view — and is a lux calculation room with its own grid from the start.",
+                count_hint.as_deref(),
                 false)
             {
                 match self.slab_outline_from_selection() {
-                    Some(outline) => self.designate_plan_room(outline),
+                    Some(outline) => self.make_room_from_selected_outline(outline),
                     None => {
-                        let msg = "select a CLOSED outline first, then designate it as a room";
+                        let msg = "select a CLOSED outline first, then make it a room";
                         self.history.push(format!("  ! room: {msg}"));
                         self.light.last_msg = msg.into();
                     }
                 }
             }
-            // The designated rooms, each with its own ✕.
-            let rooms = self.light.plan_rooms.clone();
-            let mut remove: Option<usize> = None;
-            for (i, r) in rooms.iter().enumerate() {
+            // The rooms — one row each: badge, name, height, [⬆ build when
+            // unbuilt] and ✕. Height edits the record (a built room's walls
+            // follow; an unbuilt one just remembers it).
+            let rooms = self.factory.rooms.clone();
+            let mut remove: Option<u32> = None;
+            let mut build: Option<u32> = None;
+            for r in &rooms {
+                let name = r.name.clone();
+                let origin = r.origin;
                 let pts = r.footprint.len();
-                let name = if r.name.trim().is_empty() {
-                    format!("Room {}", i + 1)
-                } else {
-                    r.name.trim().to_string()
-                };
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    let resp = ui.add(
-                        egui::Button::new(egui::RichText::new("✕").size(10.0))
-                            .frame(false)
-                            .min_size(egui::vec2(14.0, 16.0)),
+                    let badge = ui.add(
+                        egui::Label::new(egui::RichText::new(origin.glyph()).size(11.0))
+                            .sense(egui::Sense::hover()),
                     )
-                    .on_hover_text(format!("Remove '{name}' — it is no longer a calculation room"));
-                    if resp.clicked() {
-                        remove = Some(i);
-                    }
+                    .on_hover_text(origin.label());
+                    let _ = badge;
                     ui.add(
                         egui::Label::new(egui::RichText::new(&name).size(12.5))
                             .sense(egui::Sense::hover()),
                     )
-                    .on_hover_text(format!("Closed outline with {pts} corners, metres — footprint \
-                        captured at designation. The drawing it was taken from can be edited \
-                        freely; the room keeps this outline."));
+                    .on_hover_text(format!(
+                        "{} · {} · closed outline with {pts} corners (metres)",
+                        origin.label(),
+                        if origin == crate::factory::RoomOrigin::ImportedLayer {
+                            r.layer_name.clone().unwrap_or_default()
+                        } else {
+                            "footprint captured at designation; the drawing stays editable".into()
+                        }
+                    ));
+                    if !r.is_built() {
+                        let b = ui.add(
+                            egui::Button::new(egui::RichText::new("⬆").size(11.0))
+                                .frame(false)
+                                .min_size(egui::vec2(18.0, 16.0)),
+                        )
+                        .on_hover_text("Build this room into real 3D solids (walls, floor, ceiling) from its footprint");
+                        if b.clicked() {
+                            build = Some(r.id);
+                        }
+                    }
+                    let x = ui.add(
+                        egui::Button::new(egui::RichText::new("✕").size(10.0))
+                            .frame(false)
+                            .min_size(egui::vec2(14.0, 16.0)),
+                    )
+                    .on_hover_text("Remove this room — the plan drawing itself is untouched");
+                    if x.clicked() {
+                        remove = Some(r.id);
+                    }
                 });
             }
-            if let Some(i) = remove {
-                self.remove_plan_room(i);
+            if let Some(id) = remove {
+                let name = self
+                    .factory
+                    .rooms
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                self.factory.delete_room(id);
+                self.history.push(format!(
+                    "  room '{name}' removed — the drawing is untouched"
+                ));
+            }
+            if let Some(id) = build {
+                self.snapshot_factory();
+                match self.factory.build_designated_room(id) {
+                    Ok(new_id) => {
+                        let name = self
+                            .factory
+                            .rooms
+                            .iter()
+                            .find(|r| r.id == new_id)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        self.history.push(format!(
+                            "  room '{name}' built — its footprint is now walls, floor and ceiling.                              See it in the 3D Factory view."
+                        ));
+                    }
+                    Err(e) => {
+                        self.undo_stack.pop();
+                        let why = room_error_why(e);
+                        self.history.push(format!("  ! room: {why}"));
+                        self.light.last_msg = why;
+                    }
+                }
             }
             if n == 0 {
                 ui.add_space(2.0);
-                ui.label(egui::RichText::new("no rooms yet — draw each room's closed outline, \
-                    select it, and designate it above")
+                ui.label(egui::RichText::new("no rooms yet — draw a closed outline, select it and                     make it a room above (it appears in the 3D Factory view at once)")
                     .size(11.0).weak());
             }
         }
         ui.add_space(2.0);
     }
 
-    /// The next unused auto-name for a designated plan room ("Room 1", "Room 2", …).
-    fn next_plan_room_name(&self) -> String {
-        let mut i = 1;
-        loop {
-            let cand = format!("Room {i}");
-            if !self.light.plan_rooms.iter().any(|r| r.name == cand) {
-                return cand;
-            }
-            i += 1;
-        }
-    }
-
-    /// Designate a closed outline (metres) as a plan room — a calculation
-    /// target with its own grid. The outline is captured as-is; the plan
-    /// geometry it was selected from stays editable.
-    fn designate_plan_room(&mut self, outline: Vec<glam::Vec2>) {
-        let name = self.next_plan_room_name();
-        let footprint: Vec<[f32; 2]> = outline.iter().map(|p| [p.x, p.y]).collect();
-        self.light.plan_rooms.push(crate::simlux_io::PlanRoomRec {
-            name: name.clone(),
-            footprint,
-        });
-        self.history.push(format!(
-            "  room '{name}' designated on the plan — Calculate now reports it as its own room"
-        ));
-        self.light.last_msg = format!(
-            "'{name}' designated — run ⚡ Calculate and it gets its own grid and figures"
-        );
-    }
-
-    /// Drop a designated plan room.
-    fn remove_plan_room(&mut self, i: usize) {
-        let name = self
-            .light
-            .plan_rooms
-            .get(i)
-            .map(|r| r.name.clone())
-            .unwrap_or_default();
-        if self.light.plan_rooms.get(i).is_none() {
+    /// Make a REAL 3D room from a closed outline selected on the plan — the
+    /// one action a plan room needs. The record (name, footprint, height) is
+    /// created and then BUILT in the same act: walls, floor and ceiling
+    /// solids appear in the 3D Factory view, and the footprint is a lux calc
+    /// target from the start. Undoable as one step.
+    fn make_room_from_selected_outline(&mut self, outline: Vec<glam::Vec2>) {
+        // The outline lives on the PLAN; a face-sketch's document is a wall's
+        // (u, v) and must not build rooms there.
+        if self.refuse_plan_action_in_sketch("Make room") {
             return;
         }
-        self.light.plan_rooms.remove(i);
-        self.history.push(format!(
-            "  room '{}' no longer designated — the drawing is untouched",
-            if name.is_empty() { format!("Room {}", i + 1) } else { name }
-        ));
+        self.snapshot_factory();
+        let id = self.factory.add_designated_room("", &outline);
+        match self.factory.build_designated_room(id) {
+            Ok(rid) => {
+                let name = self
+                    .factory
+                    .rooms
+                    .iter()
+                    .find(|r| r.id == rid)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                self.history.push(format!(
+                    "  room '{name}' made from the plan outline — built in the 3D Factory view and a              lux room with its own grid. Select it on the plan or build another."
+                ));
+                self.light.last_msg = format!(
+                    "'{name}' built from the selected outline — see it in the 3D Factory view; ⚡              Calculate reports it as its own room"
+                );
+            }
+            Err(e) => {
+                self.undo_stack.pop(); // the designation never happened
+                let why = room_error_why(e);
+                self.history.push(format!("  ! room: {why}"));
+                self.light.last_msg = why;
+            }
+        }
     }
 
     /// SIMLUX workspace (3D lighting viewport): calculation, results and 3D
@@ -42458,7 +42525,7 @@ impl CadApp {
                 n += 1;
             }
         }
-        self.light.import_layer(&self.doc, lid); // use it for 3D straight away
+        self.factory.import_layer_as_room(&self.doc, lid); // use it for 3D straight away
         self.index_dirty = true;
         self.touch_view();
         self.history.push(format!("  moved {n} object(s) to layer 'SIMLUX' (now used for 3D)"));
@@ -42491,6 +42558,50 @@ impl CadApp {
         use base64::Engine;
         rec.rsm_b64 =
             base64::engine::general_purpose::STANDARD.encode(cad_io::rsm::write_rsm(&self.doc));
+    }
+
+    /// Fold LEGACY room storage (pre-unification files) into the ONE room list.
+    ///
+    /// - `cfg.plan_rooms` → [`crate::factory::RoomOrigin::PlanDesignated`] rooms
+    ///   (footprints were captured in metres at designation).
+    /// - `cfg.layers_3d` (name → height) → [`crate::factory::RoomOrigin::ImportedLayer`]
+    ///   rooms, resolved against the current document's layers.
+    ///
+    /// Runs only when a loaded config actually carries legacy rooms; a file
+    /// saved since the unification has none and nothing moves.
+    fn migrate_legacy_rooms(
+        &mut self,
+        plan: Vec<crate::simlux_io::PlanRoomRec>,
+        layers: std::collections::BTreeMap<String, f32>,
+    ) {
+        let mut n_plan = 0;
+        for r in &plan {
+            if r.footprint.len() < 3 {
+                continue;
+            }
+            let fp: Vec<glam::Vec2> =
+                r.footprint.iter().map(|p| glam::Vec2::new(p[0], p[1])).collect();
+            self.factory.add_designated_room(&r.name, &fp);
+            n_plan += 1;
+        }
+        let mut n_layers = 0;
+        for (name, height) in &layers {
+            let Some(lid) = self.doc.layers.find(name) else { continue };
+            self.factory.import_layer_as_room(&self.doc, lid);
+            // The import uses the project default height; restore the one the
+            // old file carried.
+            if let Some(i) = self.factory.room_index_of_layer(name) {
+                self.factory.rooms[i].height = (*height).max(0.05);
+            }
+            n_layers += 1;
+        }
+        if n_plan > 0 || n_layers > 0 {
+            self.history.push(format!(
+                "  rooms: migrated {} plan designation(s) + {} imported layer(s) into one list",
+                n_plan, n_layers
+            ));
+            self.light.last_msg = "Legacy rooms migrated into the single room list.".into();
+        }
     }
 
     /// Config with furniture geometry LEFT OUT (empty blobs) — pair with
@@ -42593,7 +42704,18 @@ impl CadApp {
                 let n_solids = fac.model.features.len();
                 let dropped = self.factory.apply_persist_prebuilt(fac, furniture, textures);
                 self.refresh_aperture_transparency();
+                // LEGACY ROOM MIGRATION — files written before the ONE-room-list
+                // unification carried rooms in two more places: `cfg.plan_rooms`
+                // (plan designations) and `cfg.layers_3d` (per-layer imports).
+                // Both fold into `factory.rooms` with their provenance; saving
+                // then writes the unified format only. Cloned before
+                // `apply_config` consumes the config.
+                let legacy_plan = cfg.plan_rooms.clone();
+                let legacy_layers = cfg.layers_3d.clone();
                 self.light.apply_config(cfg, &self.doc);
+                if !legacy_plan.is_empty() || !legacy_layers.is_empty() {
+                    self.migrate_legacy_rooms(legacy_plan, legacy_layers);
+                }
                 self.history.push("  SIMLUX setup loaded".into());
                 if had_solids {
                     // Show the building rather than leaving it invisible behind a closed
@@ -54209,6 +54331,24 @@ fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     let text_pos = rect.center() - egui::vec2(galley.size().x * 0.5, galley.size().y * 0.5);
     painter.galley(text_pos, galley, egui::Color32::from_rgb(225, 235, 245));
     resp.clicked()
+}
+
+/// One-line "why" for a room build that failed — history and status line both
+/// use it, so the plan row, the factory list and the Make-room menu agree.
+fn room_error_why(e: crate::factory::RoomError) -> String {
+    match e {
+        crate::factory::RoomError::NoBuilding =>
+            "make a building first — a built room carves OUT of a solid".to_string(),
+        crate::factory::RoomError::NoSuchRoom => "room vanished — try again".to_string(),
+        crate::factory::RoomError::Profile(p) => format!(
+            "outline {}",
+            match p {
+                cad_solid::ProfileError::TooFewPoints => "needs at least 3 corners",
+                cad_solid::ProfileError::Degenerate => "encloses no area",
+                cad_solid::ProfileError::SelfIntersecting => "crosses itself",
+            }
+        ),
+    }
 }
 
 /// Toolbar button for a ONE-SHOT command (Move, Copy, Erase, Dist, …)
@@ -76222,10 +76362,10 @@ mod mode_workspaces_are_exclusive {
         assert!(!app.simlux_2d_layer_live());
     }
 
-    /// Designation from the plan names rooms in order, and removing one frees
-    /// its name for the next designation.
+    /// Designating rooms on the plan creates unbuilt rooms in the ONE factory
+    /// list; building one promotes it in place (same name, own solids).
     #[test]
-    fn plan_rooms_are_named_in_order_and_removable() {
+    fn plan_rooms_live_in_the_one_list_and_can_be_built() {
         let mut app = CadApp::default();
         let rect = |x: f32, y: f32| {
             vec![
@@ -76235,16 +76375,63 @@ mod mode_workspaces_are_exclusive {
                 glam::Vec2::new(x, y + 4.0),
             ]
         };
-        app.designate_plan_room(rect(0.0, 0.0));
-        app.designate_plan_room(rect(20.0, 0.0));
-        assert_eq!(app.light.plan_rooms.len(), 2);
-        assert_eq!(app.light.plan_rooms[0].name, "Room 1");
-        assert_eq!(app.light.plan_rooms[1].name, "Room 2");
+        app.factory.add_designated_room("", &rect(0.0, 0.0));
+        app.factory.add_designated_room("", &rect(20.0, 0.0));
+        assert_eq!(app.factory.rooms.len(), 2);
+        assert_eq!(app.factory.rooms[0].name, "Room 1");
+        assert_eq!(app.factory.rooms[1].name, "Room 2");
+        assert!(!app.factory.rooms[0].is_built());
 
-        app.remove_plan_room(0);
-        assert_eq!(app.light.plan_rooms.len(), 1);
-        app.designate_plan_room(rect(0.0, 20.0));
-        assert_eq!(app.light.plan_rooms.last().unwrap().name, "Room 1", "the freed name is reused");
+        // Build the first — a real 3D room with the same footprint + name.
+        let built_id = app.factory.build_designated_room(app.factory.rooms[0].id).unwrap();
+        assert_eq!(app.factory.rooms.len(), 2, "built replaces the unbuilt record");
+        let built = app.factory.rooms.iter().find(|r| r.id == built_id).unwrap();
+        assert_eq!(built.name, "Room 1", "the name survived the build");
+        assert!(built.is_built());
+        assert!(built.floor.is_some() && !built.walls.is_empty(), "it owns solids now");
+
+        // Deleting any room takes its record (and its solids) with it.
+        app.factory.delete_room(built_id);
+        assert_eq!(app.factory.rooms.len(), 1);
+    }
+
+    /// Making a room from a selected plan outline builds it AT ONCE — the
+    /// walls/floor/ceiling exist in the 3D Factory view the moment the row is
+    /// clicked (a plan room listed under ▼ Rooms but invisible is the bug this
+    /// pins), and the room is a lux calc target from the start.
+    #[test]
+    fn making_a_room_from_a_plan_outline_builds_it_in_3d() {
+        let mut app = CadApp::default();
+        app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        let ring = cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex {
+                    pos: cad_kernel::Vec2::new(x, y),
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        });
+        app.doc.push(cad_kernel::DObject::new(ring));
+        app.selection.push(0);
+
+        let outline = vec![
+            glam::Vec2::new(0.0, 0.0),
+            glam::Vec2::new(10.0, 0.0),
+            glam::Vec2::new(10.0, 6.0),
+            glam::Vec2::new(0.0, 6.0),
+        ];
+        app.make_room_from_selected_outline(outline);
+        assert_eq!(app.factory.rooms.len(), 1);
+        let r = &app.factory.rooms[0];
+        assert!(r.is_built(), "the room is built, not an outline-only record");
+        assert!(r.floor.is_some(), "it owns a floor");
+        assert!(!r.walls.is_empty(), "it owns walls");
+        assert_eq!(r.name, "Room 1");
+        assert!(r.footprint.len() >= 4, "the plan outline became its footprint");
+        assert_eq!(app.undo_stack.len(), 1, "making the room is ONE undoable step");
     }
 }
 
@@ -86998,5 +87185,74 @@ mod an_embedded_project_survives_a_save_and_a_load {
         assert_eq!(app.factory.furniture.len(), 1, "the embedded copy was installed");
         assert!(app.extra_choice.is_none(), "no question when only one copy exists");
         clean(&path);
+    }
+}
+
+#[cfg(test)]
+mod rooms_unification_migration {
+    use super::*;
+
+    /// A 4000 mm closed square on the layer (doc default units are millimetres
+    /// unless declared), so the imported footprint comes out in metres.
+    fn square_ring_mm() -> cad_kernel::Geom {
+        cad_kernel::Geom::Polyline(cad_kernel::Polyline {
+            vertices: [(0.0, 0.0), (4000.0, 0.0), (4000.0, 4000.0), (0.0, 4000.0), (0.0, 0.0)]
+                .iter()
+                .map(|&(x, y)| cad_kernel::PolyVertex {
+                    pos: cad_kernel::Vec2::new(x, y),
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+            widths: Vec::new(),
+        })
+    }
+
+    /// A config written BEFORE the ONE-room-list unification carries rooms in
+    /// `layers_3d` and `plan_rooms`; loading it folds both into `factory.rooms`
+    /// with their provenance, and saving writes the unified format only.
+    #[test]
+    fn legacy_rooms_migrate_into_the_one_factory_list() {
+        let mut app = CadApp::default();
+        let lid = app
+            .doc
+            .layers
+            .add(cad_kernel::Layer { name: "WALLS".into(), ..cad_kernel::Layer::layer_zero() });
+        app.doc.push(cad_kernel::DObject::new(square_ring_mm()));
+        app.doc.dobjects[0].style.layer = lid;
+
+        let mut cfg = app.light.to_config(&app.doc);
+        cfg.layers_3d.insert("WALLS".into(), 3.2);
+        cfg.plan_rooms.push(crate::simlux_io::PlanRoomRec {
+            name: "Office".into(),
+            footprint: vec![[0.0, 0.0], [5.0, 0.0], [5.0, 4.0], [0.0, 4.0]],
+        });
+        app.install_simlux_config(cfg, Vec::new(), None);
+
+        assert_eq!(app.factory.rooms.len(), 2, "both legacy sources became rooms");
+        let layer_room = app
+            .factory
+            .rooms
+            .iter()
+            .find(|r| r.origin == crate::factory::RoomOrigin::ImportedLayer)
+            .expect("the layer import migrated");
+        assert_eq!(layer_room.name, "WALLS");
+        assert_eq!(layer_room.height, 3.2, "the per-layer height came along");
+        assert!(!layer_room.footprint.is_empty(), "the ring became the footprint");
+
+        let plan_room = app
+            .factory
+            .rooms
+            .iter()
+            .find(|r| r.origin == crate::factory::RoomOrigin::PlanDesignated)
+            .expect("the designation migrated");
+        assert_eq!(plan_room.name, "Office");
+        assert_eq!(plan_room.footprint.len(), 4);
+        assert!(!plan_room.is_built());
+
+        // The unified room list survives a save: the legacy fields go empty.
+        let saved = app.light.to_config(&app.doc);
+        assert!(saved.layers_3d.is_empty(), "no legacy layer map on save");
+        assert!(saved.plan_rooms.is_empty(), "no legacy plan rooms on save");
     }
 }

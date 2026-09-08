@@ -105,6 +105,18 @@ pub struct RoomRec {
     /// one. Removing it on delete is what returns the building to solid.
     #[serde(default)]
     pub carve: Option<u32>,
+    /// Where the room came from — one list holds built 3D rooms, plan
+    /// designations and layer imports. `Built` for any file written before
+    /// this existed.
+    #[serde(default)]
+    pub origin: crate::factory::RoomOrigin,
+    /// ImportedLayer rooms only: the doc layer name this room binds to.
+    #[serde(default)]
+    pub layer_name: Option<String>,
+    /// ImportedLayer rooms only: the doc handles whose outlines extrude into
+    /// the scene. Handles are stable across a save and a load.
+    #[serde(default)]
+    pub handles: Vec<u64>,
 }
 
 /// ONE ROOM DESIGNATED ON THE 2D PLAN — a closed outline, named by hand and
