@@ -76399,10 +76399,17 @@ mod mode_workspaces_are_exclusive {
     /// walls/floor/ceiling exist in the 3D Factory view the moment the row is
     /// clicked (a plan room listed under ▼ Rooms but invisible is the bug this
     /// pins), and the room is a lux calc target from the start.
+    ///
+    /// The outline comes through `slab_outline_from_selection` — the SAME path
+    /// the "Make room" row uses — not a hand-built vector. That path reads
+    /// `self.selection` against `doc.dobjects`, and a default app does NOT ship
+    /// an empty document (it holds seed geometry), so the fixture clears it and
+    /// selects the pushed index, exactly like `promote_tests::app_with`.
     #[test]
     fn making_a_room_from_a_plan_outline_builds_it_in_3d() {
         let mut app = CadApp::default();
         app.doc.units = cad_kernel::Units::from_metres_per_unit(1.0, cad_kernel::UnitSource::User);
+        app.doc.dobjects.clear();
         let ring = cad_kernel::Geom::Polyline(cad_kernel::Polyline {
             vertices: [(0.0, 0.0), (10.0, 0.0), (10.0, 6.0), (0.0, 6.0)]
                 .iter()
@@ -76417,12 +76424,9 @@ mod mode_workspaces_are_exclusive {
         app.doc.push(cad_kernel::DObject::new(ring));
         app.selection.push(0);
 
-        let outline = vec![
-            glam::Vec2::new(0.0, 0.0),
-            glam::Vec2::new(10.0, 0.0),
-            glam::Vec2::new(10.0, 6.0),
-            glam::Vec2::new(0.0, 6.0),
-        ];
+        let outline = app
+            .slab_outline_from_selection()
+            .expect("a selected closed polyline must yield an outline");
         app.make_room_from_selected_outline(outline);
         assert_eq!(app.factory.rooms.len(), 1);
         let r = &app.factory.rooms[0];

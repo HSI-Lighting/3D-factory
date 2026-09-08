@@ -57,8 +57,6 @@ this machine, unchanged.
 
 ## Open items for next session
 
-- `making_a_room...` test passes with a direct outline; `slab_outline_from_
-  selection` on a bare closed Polyline failed inside the test (works in the
-  app) — revisit with the debug print if it matters.
+- ~~`making_a_room...` test passes with a direct outline; `slab_outline_from_selection` on a bare closed Polyline failed inside the test~~ — RESOLVED (2026-09-08 follow-up, test-only): a default `CadApp` document is NOT empty (it ships seed dobjects), so `selection.push(0)` named a seed line, not the pushed ring; the production path was fine. The test now clears `doc.dobjects` (as `promote_tests::app_with` does) and feeds the outline through `slab_outline_from_selection` — the exact "Make room" row path (`mode_workspaces_are_exclusive` 13 tests + `promote_tests` 10 tests pass).
 - Unbuilt room rows / ImportedLayer rooms without a closed ring are scene-only
   (no calc target) by design.
