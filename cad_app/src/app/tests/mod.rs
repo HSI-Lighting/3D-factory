@@ -21,3 +21,6 @@ mod tests_io;
 
 #[cfg(test)]
 mod tests_modify;
+
+#[cfg(test)]
+mod tests_misc;
