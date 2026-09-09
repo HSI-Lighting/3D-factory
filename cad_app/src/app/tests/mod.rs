@@ -27,3 +27,6 @@ mod tests_misc;
 
 #[cfg(test)]
 mod tests_simlux;
+
+#[cfg(test)]
+mod tests_factory;
