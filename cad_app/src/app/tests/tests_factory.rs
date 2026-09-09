@@ -6228,9 +6228,12 @@ mod a_plane_shares_the_drawings_layers {
             "a plane shows its own work unless asked otherwise"
         );
 
-        let src = include_str!("../mod.rs");
+        // The projector moved with the raster/sketch projection code into
+        // ports_raster.rs (app.rs split) — inspect it where it lives.
+        let src = include_str!("../ports_raster.rs");
         let a = src
-            .find("fn draw_factory_sketches_2d")
+            .find("pub(super) fn draw_factory_sketches_2d")
+            .or_else(|| src.find("fn draw_factory_sketches_2d"))
             .expect("the projector");
         let b = src[a..]
             .find("\n    fn ")

@@ -465,7 +465,7 @@ impl CadApp {
     /// Split out of the painter so it is testable: the bug this replaced ("the FURN toggle does
     /// nothing") was in the *selection* of what to draw, not in the drawing, and there was no way
     /// to assert on it without a live egui pointer.
-    fn plan_overlay_shapes(&self) -> Vec<(PlanLayer, Vec<Vec2>)> {
+    pub(super) fn plan_overlay_shapes(&self) -> Vec<(PlanLayer, Vec<Vec2>)> {
         let mut out = Vec::new();
         if !self.factory.show_furniture_outlines_2d {
             return out;
