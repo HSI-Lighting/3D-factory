@@ -788,6 +788,15 @@ mod perf_investigation {
         }
     }
 }
+/// THE VIEW LIST — the faces actually drawn on, instead of fixed orthographic views.
+///
+/// Asked for as: "the views in cad[,] lets overhaul it. instead of showing the planes like top,
+/// left right etc, lets get rid of it. now it will show only faces as planes the user draws on, the
+/// user can even rename these view[s] so they can instantly look at a sketch they made. instead of
+/// showing the whole side view, it will only show whatever face as a plane the user is drawing on."
+/// Plus: "when i click on the face again to sketch it should show the same plane. there should be
+/// an option to delete the face."
+
 #[cfg(test)]
 mod view_planes {
     use super::*;
@@ -1088,6 +1097,17 @@ mod view_planes {
         );
     }
 }
+/// TWO UNIT SPACES, ONE APP.
+///
+/// The 2D plan is measured in whatever the drawing declares — millimetres, for an architectural
+/// DXF. A face sketch is a `Document` of its OWN and its coordinates are METRES. `self.doc`
+/// alternates between the two as a sketch is opened and closed, and anything carried across
+/// without conversion changes meaning by a factor of a thousand with nothing to report it.
+///
+/// A metre-declared plan and a face sketch are byte-identical `{1.0, Declared}`, so NOTHING ABOUT
+/// THE NUMBER can tell them apart — every fix here works from the RATIO between the plan document
+/// and the active one, which is exactly 1 when no sketch is open.
+
 #[cfg(test)]
 mod two_unit_spaces {
     use super::*;
@@ -1294,6 +1314,18 @@ mod a_debug_assert_never_does_the_work {
         }
     }
 }
+/// WHAT YOU SEE IS NOT WHAT FEEDS EXTRUDE — and both halves of that matter.
+///
+/// The 3D viewport flattened 2D geometry through `cad_solid::geom_outlines_scaled`, which knows
+/// Line, Circle, Arc, Ellipse, EllipseArc, Polyline and Point and returns nothing for anything
+/// else. A spline, a wall and an imported block therefore existed in the drawing and were simply
+/// absent from the 3D view — an imported plan made of blocks showed as very nearly nothing.
+///
+/// The fix is a SECOND flattener rather than a wider one. `geom_outlines_scaled` also answers
+/// "what may Extrude and Make-3D-wall consume?", and a block's contents are full of closed loops:
+/// widening it would make Make-building start extruding the furniture. The guard test below is
+/// the one that would catch that, and it is the reason this is two functions.
+
 #[cfg(test)]
 mod the_viewport_sees_what_the_drawing_has {
     use super::*;
@@ -1545,6 +1577,14 @@ mod the_viewport_sees_what_the_drawing_has {
         );
     }
 }
+/// THE 3D LINE CACHE MUST NEVER SHOW YOU GEOMETRY THAT IS NO LONGER THERE.
+///
+/// A stale render cache is the worst shape of bug in this file: the picture is wrong, nothing
+/// errors, and the user's own drawing is the thing lying to them. So every input to `lines_sig`
+/// gets a test that changes it and asserts the cache notices — and the general test at the end
+/// asserts the cached buffers equal what the uncached builders would have produced, which is the
+/// property all of it exists to preserve.
+
 #[cfg(test)]
 mod the_line_cache_cannot_go_stale {
     use super::*;
@@ -1813,6 +1853,12 @@ mod the_line_cache_cannot_go_stale {
         );
     }
 }
+/// THE UNDO HISTORY IS BOUNDED BY MEMORY, NOT BY A COUNT OF STEPS.
+///
+/// A step is a whole document. Measured before this existed: 15.7 MB per step at 100k dobjects —
+/// a gigabyte of history — and 240.2 MB at 1.5M, i.e. **15.4 GB** at the old 64-step cap. A count
+/// is simply the wrong unit for something whose steps vary by four orders of magnitude.
+
 #[cfg(test)]
 mod the_undo_history_is_bounded_by_memory {
     use super::*;
@@ -1939,6 +1985,13 @@ mod the_undo_history_is_bounded_by_memory {
         );
     }
 }
+/// CULLING MUST NEVER DROP SOMETHING THAT IS ON SCREEN.
+///
+/// The failure mode is the worst kind this file has: geometry vanishes, nothing errors, and it
+/// reads as data loss rather than as a rendering bug. So the governing test compares the culled
+/// output against the whole buffer for a view that covers everything — they must be equal — and
+/// the rest check that a smaller view drops only what is genuinely outside it.
+
 #[cfg(test)]
 mod the_cull_never_drops_what_you_can_see {
     use super::*;
@@ -2132,6 +2185,15 @@ mod the_cull_never_drops_what_you_can_see {
         );
     }
 }
+/// WHERE THE ZEROES ARE.
+///
+/// Reported as: "our min lux was 0 while for relux it was 133… its an obvious error. find the root
+/// cause." A minimum of exactly zero is not a low reading, it is a point that received nothing at
+/// all — which in a room with five bounces of interreflection is impossible unless the point is
+/// enclosed. This prints where they are, so the answer comes from the grid rather than a guess.
+///
+///     RESULT=<path to .simlux-result.json> cargo test -p cad_app --bin simlux where_the_zeroes_are -- --ignored --nocapture
+
 #[cfg(test)]
 mod result_forensics {
     #[test]

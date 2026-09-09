@@ -372,6 +372,12 @@ mod counts_only_tests {
         );
     }
 }
+/// 3D SNAP, and re-placing something that already exists.
+///
+/// Reported as: "when a furniture is placed inside a building the placement mechanism isnt working
+/// … how is the snapping affecting a furniture when being placed[?] where is the option to turn
+/// on/off[?]"
+
 #[cfg(test)]
 mod snap_and_replace {
     use super::*;

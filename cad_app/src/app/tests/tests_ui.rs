@@ -120,6 +120,14 @@ mod mouse_rule_tests {
         );
     }
 }
+/// Who owns a keystroke — the focused field, or the global command cascade.
+///
+/// Reported from the field: entering a wall height in a menu and pressing Enter made the drawing
+/// vanish. Enter was read from the global context with no regard for focus, so the value committed
+/// AND the cascade ran to its last branch, which repeats the previous command. With `clear` behind
+/// it that empties the document. The same hole let Delete — pressed to remove a digit — erase the
+/// current selection.
+
 #[cfg(test)]
 mod keystroke_ownership {
     use super::*;
@@ -299,6 +307,18 @@ mod the_shortcut_table_is_honest {
         );
     }
 }
+/// A WRAPPED MENU BAR MUST NOT SWITCH MENUS ON HOVER.
+///
+/// Reported as: "while selecting something from the drop down menu, when i move the cursor it
+/// opens the menu of whatever is below it." egui opens a menu on
+/// `button.clicked() || (button.hovered() && another menu is open)` — right for a single-row menu
+/// bar, wrong for one that WRAPS, because the next row sits directly beneath the one you opened
+/// and `menu_spacing` leaves a strip of it exposed above the panel.
+///
+/// The first attempt made the bar a single scrolling row. That removed the second row, and with it
+/// the symptom, by changing the layout — which is not what was asked for, and the user said so:
+/// "i asked to fix the hover selecting problem not change the layout."
+
 #[cfg(test)]
 mod the_toolbars_wrap_and_do_not_hover_switch {
     use super::*;
@@ -417,6 +437,13 @@ mod the_toolbars_wrap_and_do_not_hover_switch {
         );
     }
 }
+/// WHERE DOES THE 3D FACTORY VIEWPORT ACTUALLY GO?
+///
+/// Reported twice: "the simlux window ... only extends to a length and when extend it beyond that
+/// it goes behind the 3d factory window." The screenshots are cropped, so the geometry cannot be
+/// read off them. This measures it instead: run real headless egui frames with the SIMLUX panel
+/// widened step by step, and record what rect each panel ends up with.
+
 #[cfg(test)]
 mod panel_geometry_measurement {
     use super::*;
@@ -603,6 +630,16 @@ mod panel_geometry_measurement {
         assert!(app.two_d_open, "closing the last view must bring one back");
     }
 }
+/// THE MODE TAB BAR — EXACTLY ONE FULL-WINDOW WORKSPACE AT A TIME.
+///
+/// The tab bar (2D view | SIMLUX view | 3D Factory view) replaces the old
+/// per-view checkboxes that let all three views share the window. `mode` is
+/// the single source of truth; `switch_mode` rearranges the view open-flags,
+/// and `enforce_mode_workspaces` (frame start) repairs whatever broke the
+/// invariant mid-frame: a view opened from inside another workspace, a
+/// workspace view closed with its ✕, and a face-sketch that needs the 2D
+/// canvas the Factory workspace hides.
+
 #[cfg(test)]
 mod mode_workspaces_are_exclusive {
     use super::*;
@@ -1398,6 +1435,17 @@ mod mode_workspaces_are_exclusive {
         assert_eq!(app.scale, s1, "a user zoom never gets overridden");
     }
 }
+/// THE QUIT DIALOG MUST STAY REACHABLE.
+///
+/// Reported as: "when i close the app and the save or not windows shows, if i click accidentally
+/// outside the window the app stops responding."
+///
+/// The dimmed backdrop and the dialog were both `Order::Foreground`. Within one order egui raises
+/// an area to the top when you interact with it, so clicking the backdrop put a full-screen,
+/// click-swallowing overlay ON TOP of the dialog: the buttons became unreachable, `close_confirm`
+/// stayed true and the close stayed vetoed. The app was running and repainting the whole time —
+/// it just could not be answered or quit.
+
 #[cfg(test)]
 mod the_quit_dialog_cannot_trap_the_app {
     use super::*;
@@ -1478,6 +1526,17 @@ mod the_quit_dialog_cannot_trap_the_app {
         );
     }
 }
+/// Reported as: "when i try to import an ies/ldt file in the block to fitting tab its not
+/// detecting the ies/ldt files in the folder. instead its opening this" — with a screenshot of a
+/// window titled "Choose output folder · Radiance render", listing "(no folders or * files here)",
+/// pointed at a directory full of .ldt files.
+///
+/// Three separate things, one dialog:
+///   * `PickFolder` listed NO files at all, "folders only". Right for choosing where to WRITE,
+///     wrong for choosing a folder because of what is IN it.
+///   * the title was the Radiance one whichever of the three callers had opened it;
+///   * and the empty-list line printed the filter raw, so an empty filter read "* files".
+
 #[cfg(test)]
 mod the_folder_browser_shows_what_is_in_the_folder {
     use super::*;

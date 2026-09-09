@@ -85,6 +85,12 @@ mod autosave_tests {
         }
     }
 }
+/// What an imported drawing's scale is taken to be when the file does not say.
+///
+/// Reported from the field: a DXF with no `$INSUNITS` — the common case, since most exporters
+/// omit it — had its 4400-unit outline read as **4400 metres**. Extruded to a 3 m storey that is
+/// a sheet 4.4 km across, and nothing on screen said why.
+
 #[cfg(test)]
 mod imported_drawing_scale {
     use super::*;
@@ -218,6 +224,17 @@ mod imported_drawing_scale {
         );
     }
 }
+/// A SAVE FOLLOWED BY A LOAD GIVES BACK WHAT WAS SAVED.
+///
+/// Reported as "its not saving it properly ... when i load it, it loads an older version", with a
+/// sidecar on disk holding four features and `furniture_lib: []`, `furniture: []`, `textures: []`
+/// against a model carrying a 481,738-triangle import.
+///
+/// The pieces were tested one at a time and each was correct, which is exactly the situation where
+/// a round trip is worth more than the sum of them: this drives the REAL `save_file_worker` and
+/// `load_file_worker`, through a real file on disk, and asks the only question that matters —
+/// is what comes back what went in.
+
 #[cfg(test)]
 mod a_project_survives_a_save_and_a_load {
     use super::*;
@@ -352,6 +369,13 @@ mod a_project_survives_a_save_and_a_load {
         let _ = std::fs::remove_file(crate::simlux_io::sidecar_path(std::path::Path::new(&path)));
     }
 }
+/// THE DWG CONVERTER IS FOUND WHERE THE APP LOOKS FOR IT.
+///
+/// `dwg_converter` walks the ancestors of the running executable for
+/// `tools/dwgconv/dwgconv.cmd`. That is a fact about the REPOSITORY LAYOUT — move the wrapper,
+/// or ship a build without it, and DWG open stops working with a message about setting an
+/// environment variable, which is a support call rather than a bug report.
+
 #[cfg(test)]
 mod the_dwg_converter_is_where_the_app_looks {
     /// The wrapper is in the tree, next to where the search expects it.
@@ -391,6 +415,18 @@ mod the_dwg_converter_is_where_the_app_looks {
         );
     }
 }
+/// SAVING AS DWG.
+///
+/// Asked as "why cant i save as dwg?" and then "and fix the file saving". The save path took
+/// `.dxf` and `.rsm` and said so, which answers the question without solving it: a practice's
+/// filing, its consultants and its clients ask for `.dwg`.
+///
+/// DWG IS A CLOSED FORMAT and nothing here writes one. The drawing goes out as the DXF this app
+/// already writes, and AutoCAD's own headless core saves it on — the same tool, running the other
+/// way, that opens a DWG today. Every test below uses a STUB converter rather than looking for
+/// AutoCAD: a test that needed it would run on one machine and quietly skip on every other, which
+/// is much the same as not having one.
+
 #[cfg(test)]
 mod a_drawing_can_be_saved_as_dwg {
     use super::*;
@@ -551,6 +587,17 @@ mod a_drawing_can_be_saved_as_dwg {
         }
     }
 }
+/// A HALF-SAVE IS NOT A SAVE.
+///
+/// Reported as: *"i made a calculation and saved the file. when i closed and opened the nothing was
+/// saved."* Everything needed to catch this already existed — the rename is retried for ~1.5 s, the
+/// temp is deliberately KEPT because it holds work that exists nowhere else, and the error names it
+/// and says what to do. All of it went to the command history, which scrolls.
+///
+/// And `apply_saved` cleared `unsaved` regardless, so the app believed the project matched disk: the
+/// close guard stayed quiet and the window shut on a `.savetmp` nobody knew to look for. On the
+/// owner's project the live sidecar was two weeks older than the temp beside it.
+
 #[cfg(test)]
 mod a_failed_save_is_not_reported_as_a_save {
     use super::*;
@@ -658,6 +705,14 @@ mod a_failed_save_is_not_reported_as_a_save {
         );
     }
 }
+/// A DRAWING MAKES TWO CLAIMS ABOUT ITS SCALE and nothing checked them against each other.
+///
+/// The owner's gym plan declared MILLIMETRES and contained METRES: a 3.4-unit wall, which is an
+/// ordinary wall in metres and 3.4 mm in millimetres. Under that declaration the fittings synced to
+/// 1/1000 scale and landed 3.5 km from the building, the furniture outlines drew 3.5 million units
+/// off screen, and every calculation returned 0 lx. It cost a session to find, and the
+/// contradiction was in the file the whole time.
+
 #[cfg(test)]
 mod the_declared_unit_is_checked_against_the_drawing {
     use super::*;
@@ -777,6 +832,17 @@ mod the_declared_unit_is_checked_against_the_drawing {
         );
     }
 }
+/// "WHEN I TRIED TO OPEN A DWG FILE IN ANOTHER ITS WAS SHOWING UN RECOGNISED FORMAT."
+///
+/// SIMLUX ships the DWG converter and always has — `tools\dwgconv\dwgconv.cmd` sits beside
+/// `simlux.exe` and the package's integrity check lists it. What it cannot ship is AutoCAD:
+/// the script drives `accoreconsole.exe`, AutoCAD's own headless core, found by scanning
+/// `C:\Program Files\Autodesk`. On a machine without AutoCAD there is nothing to drive.
+///
+/// The script says so, in full sentences, on stderr — and a GUI user has no console to read it in.
+/// The app reported "converter exited 3 (no DXF produced)": an exit code where an explanation had
+/// been written and thrown away.
+
 #[cfg(test)]
 mod the_dwg_converter_explains_itself {
     use super::*;
@@ -981,6 +1047,10 @@ mod xref_wblock_tests {
         assert!(sub.dobjects.len() >= 2, "whole drawing (no selection)");
     }
 }
+/// THE 3D PROJECT CAN LIVE INSIDE THE DRAWING FILE ("Inside this file" in Save
+/// As) instead of in `.simlux.json` beside it — RSM extra-blobs / DXF XRECORDs.
+/// These tests drive the same real workers the app uses, in both directions.
+
 #[cfg(test)]
 mod an_embedded_project_survives_a_save_and_a_load {
     use super::*;

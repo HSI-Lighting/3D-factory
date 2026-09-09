@@ -145,6 +145,15 @@ mod cmd_timing_tests {
         }
     }
 }
+/// ONE command line, TWO windows.
+///
+/// Asked for as: "we will have a 3d command window. the 2d cad has a command window where the
+/// parameters of a tool can be entered. we will use the same window. the user is using the 3d
+/// factory[,] the command window's name will change to 3d command. and when the user click[s] on
+/// the 2d window it changes back to just command so now it works for the cad. the 2d command
+/// window's command won't work on the 3d factory or vice versa[;] for it to work the user ha[s] to
+/// click on the window they want access to."
+
 #[cfg(test)]
 mod command_target {
     use super::*;
@@ -499,14 +508,15 @@ mod command_target {
     }
 }
 
-/// THE VIEW LIST — the faces actually drawn on, instead of fixed orthographic views.
+/// ASK WHAT UNIT THIS IS, ONCE.
 ///
-/// Asked for as: "the views in cad[,] lets overhaul it. instead of showing the planes like top,
-/// left right etc, lets get rid of it. now it will show only faces as planes the user draws on, the
-/// user can even rename these view[s] so they can instantly look at a sketch they made. instead of
-/// showing the whole side view, it will only show whatever face as a plane the user is drawing on."
-/// Plus: "when i click on the face again to sketch it should show the same plane. there should be
-/// an option to delete the face."
+/// Asked for as: "theres a chance a user can miss it and draw with the wrong units. lets add a pop
+/// up dialogue box when the user opens 3d factory for the 1st time. this shouldn't show every time
+/// the user opens 3d factory. once set they can go in the place to change units but make sure a
+/// command window opens everytime the user opens 3d factory."
+///
+/// Two frequencies on purpose: the dialog once, the command window every time.
+
 #[cfg(test)]
 mod unit_prompt {
     use super::*;
