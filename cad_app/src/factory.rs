@@ -18430,7 +18430,7 @@ mod working_unit_coverage {
     fn no_factory_length_field_is_hard_coded_to_metres() {
         for (file, src) in [
             ("factory.rs", include_str!("factory.rs")),
-            ("app.rs", include_str!("app.rs")),
+            ("app.rs", include_str!("app/mod.rs")),
         ] {
             // Assembled at RUNTIME so this line does not contain the pattern it hunts for — a
             // literal here would make the guard fail on itself, permanently.
@@ -20140,7 +20140,7 @@ mod numeric_fields_do_not_clamp_mid_keystroke {
     fn every_numeric_field_defers_its_clamp() {
         for (name, src) in [
             ("factory.rs", include_str!("factory.rs")),
-            ("app.rs", include_str!("app.rs")),
+            ("app.rs", include_str!("app/mod.rs")),
             ("light.rs", include_str!("light.rs")),
         ] {
             // Cut this module off first: it names both literals, so a whole-file count counts the

@@ -7148,7 +7148,7 @@ mod the_simlux_view_can_be_read {
     /// far darker and nothing on screen would say why.
     #[test]
     fn hiding_the_ceiling_is_a_view_option_only() {
-        let src = include_str!("app.rs");
+        let src = include_str!("app/mod.rs");
         // `build_scene3d_verts` split in two when the SIMLUX view stopped rebuilding its whole
         // buffer every frame; the ceiling filter lives in the cached half. The end anchor was
         // `\n    /// SIMLUX 3D viewport`, which is a FIELD doc a few thousand lines EARLIER in the
@@ -9837,7 +9837,7 @@ mod the_live_mesh_rebuild {
     /// code — a mistake already made once in this file.
     #[test]
     fn the_workspace_only_rebuilds_when_the_signature_moves() {
-        let src = include_str!("app.rs");
+        let src = include_str!("app/mod.rs");
         let needle = |parts: &[&str]| -> String { parts.concat() };
         let anchor = needle(&[
             "let sig = self.light.live_mesh_",
