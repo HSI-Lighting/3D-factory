@@ -18,3 +18,6 @@ mod tests_ui;
 
 #[cfg(test)]
 mod tests_io;
+
+#[cfg(test)]
+mod tests_modify;
