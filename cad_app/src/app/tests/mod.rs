@@ -12,3 +12,6 @@ mod tests_scripts;
 
 #[cfg(test)]
 mod tests_commands;
+
+#[cfg(test)]
+mod tests_ui;
