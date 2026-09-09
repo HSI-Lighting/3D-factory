@@ -3078,8 +3078,10 @@ impl LightState {
     /// MEASURED, not chosen for looking safe — see `cad_light/tests/grid_cost.rs`, which times the
     /// real engine on a room the size of the owner's gym:
     ///
-    ///     bare room (12 tris)          0.0285 ms per point
-    ///     with clutter (12,012 tris)   0.0780 ms per point
+    /// ```text
+    /// bare room (12 tris)          0.0285 ms per point
+    /// with clutter (12,012 tris)   0.0780 ms per point
+    /// ```
     ///
     /// The cost is flat in the number of points from 1,600 to 27,456 of them, and grows only
     /// slowly with scene size because the tracer has a BVH. So this budget is about 0.5 s on a
