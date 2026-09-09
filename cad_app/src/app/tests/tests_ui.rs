@@ -11,7 +11,7 @@ mod mouse_rule_tests {
     /// egui pointer, which a unit test has no way to supply.
     #[test]
     fn factory_viewport_orbits_only_on_middle_or_alt_right() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ports_simlux.rs");
         let start = src.find("fn render_factory_panel").expect("panel exists");
         let end = src[start..]
             .find("\n    fn ")
@@ -56,13 +56,14 @@ mod mouse_rule_tests {
             src.contains("pub fn draw_viewport_active_frame"),
             "one shared impl"
         );
-        // 3D panel
-        let start = src.find("fn render_factory_panel").unwrap();
-        let end = src[start..]
+        // 3D panel — `render_factory_panel` moved to app/ports_simlux.rs.
+        let panel_src = include_str!("../ports_simlux.rs");
+        let start = panel_src.find("fn render_factory_panel").unwrap();
+        let end = panel_src[start..]
             .find("\n    fn ")
             .map(|e| start + e)
-            .unwrap_or(src.len());
-        let panel = &src[start..end];
+            .unwrap_or(panel_src.len());
+        let panel = &panel_src[start..end];
         let cb = panel
             .find("Shape::Callback")
             .expect("the 3D paint callback");
@@ -73,14 +74,17 @@ mod mouse_rule_tests {
             frame > cb,
             "the frame must be painted AFTER the GL callback, else it is hidden"
         );
-        // 2D canvas
-        let c2d = src.find("egui::CentralPanel::default().show(ctx").unwrap();
-        let e2d = src[c2d..]
+        // 2D canvas — the canvas lives in the frame shell (app/shell.rs).
+        let shell_src = include_str!("../shell.rs");
+        let c2d = shell_src
+            .find("egui::CentralPanel::default().show(ctx")
+            .unwrap();
+        let e2d = shell_src[c2d..]
             .find("\n        egui::TopBottomPanel")
             .map(|e| c2d + e)
-            .unwrap_or(src.len());
+            .unwrap_or(shell_src.len());
         assert!(
-            src[c2d..e2d].contains("draw_viewport_active_frame"),
+            shell_src[c2d..e2d].contains("draw_viewport_active_frame"),
             "the 2D canvas must show the frame too"
         );
     }
@@ -98,18 +102,20 @@ mod mouse_rule_tests {
             src.contains("pub fn draw_select_cursor"),
             "shared selection cursor exists"
         );
-        // 2D canvas uses them
+        // 2D canvas uses them — the canvas lives in the frame shell (app/shell.rs).
+        let shell_src = include_str!("../shell.rs");
         assert!(
-            src.contains("draw_draft_cursor(&painter, p);"),
+            shell_src.contains("draw_draft_cursor(&painter, p);"),
             "2D uses the shared draft cursor"
         );
-        // 3D panel uses them
-        let start = src.find("fn render_factory_panel").unwrap();
-        let end = src[start..]
+        // 3D panel uses them — `render_factory_panel` moved to app/ports_simlux.rs.
+        let panel_src = include_str!("../ports_simlux.rs");
+        let start = panel_src.find("fn render_factory_panel").unwrap();
+        let end = panel_src[start..]
             .find("\n    fn ")
             .map(|e| start + e)
-            .unwrap_or(src.len());
-        let body = &src[start..end];
+            .unwrap_or(panel_src.len());
+        let body = &panel_src[start..end];
         assert!(
             body.contains("draw_select_cursor"),
             "3D uses the shared selection cursor"
@@ -230,7 +236,7 @@ mod the_shortcut_table_is_honest {
     /// the ones this session added, checked against the handler that binds them.
     #[test]
     fn the_3d_keys_listed_are_the_3d_keys_bound() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ports_simlux.rs");
         let a = src
             .find("// ---- 3D VIEWPORT HOTKEYS")
             .expect("the handler");
@@ -351,7 +357,7 @@ mod the_toolbars_wrap_and_do_not_hover_switch {
     /// THE LAYOUT STAYS WRAPPED. Both bars stack when the panel is narrow, as they always did.
     #[test]
     fn both_bars_still_wrap() {
-        let app = include_str!("../mod.rs");
+        let app = include_str!("../ports_simlux.rs");
         let light = include_str!("../../light.rs");
         assert!(
             source_between(
@@ -394,7 +400,7 @@ mod the_toolbars_wrap_and_do_not_hover_switch {
                 "3D Factory",
                 source_between(
                     "plus Frame and Clear. Both dropdowns drive the SAME code",
-                    include_str!("../mod.rs"),
+                    include_str!("../ports_simlux.rs"),
                 ),
             ),
             (

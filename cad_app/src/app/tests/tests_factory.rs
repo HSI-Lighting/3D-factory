@@ -5616,7 +5616,7 @@ mod only_the_materials_factory_paints {
 
     /// Isolate the 3D click handler: from the paint guard to the right-click handler after it.
     fn click_path() -> &'static str {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ports_simlux.rs");
         let a = src
             .find("// NOTHING PAINTS UNLESS THE MATERIALS FACTORY IS OPEN.")
             .expect("the guard's own comment marks the start of the click path");
@@ -6064,14 +6064,18 @@ mod a_sketch_is_not_the_plan {
     /// and a millimetre plan draws at 1000x with everything else still green.
     #[test]
     fn both_plan_underlays_read_the_plan() {
-        let src = include_str!("../mod.rs");
-        for (what, anchor, end) in [
+        // The two anchored fns moved apart: `refresh_cached_lines` stayed in app/mod.rs,
+        // `paint_plan_underlay` moved to app/ports_simlux.rs — search each in its own file.
+        let mod_src = include_str!("../mod.rs");
+        let simlux_src = include_str!("../ports_simlux.rs");
+        for (what, anchor, end, src) in [
             (
                 "depth-tested",
                 "fn refresh_cached_lines",
                 "\n    /// THE DRAWING CHANGED",
+                mod_src,
             ),
-            ("x-ray", "fn paint_plan_underlay", "\n    fn "),
+            ("x-ray", "fn paint_plan_underlay", "\n    fn ", simlux_src),
         ] {
             let a = src
                 .find(anchor)

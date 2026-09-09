@@ -275,7 +275,7 @@ mod the_simlux_split_opens_at_half {
     use super::*;
 
     fn panel_source() -> &'static str {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ports_simlux.rs");
         let a = src
             .find("fn render_light_3d_panel")
             .expect("the panel exists");
@@ -4859,7 +4859,7 @@ mod the_simlux_perf_tap {
         // assertion and passes whatever happened to the code. The first version searched for the
         // tap's banner comment; renaming the banner renamed it in both places and the test sailed
         // through. Each needle below is assembled at run time so the literal is not in the file.
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../ports_simlux.rs");
         let needle = |parts: &[&str]| -> String { parts.concat() };
         // Starts ABOVE the `if recording` gate, or the slice cannot contain the gate it is asked to
         // check for — which is how the first run of this failed.
@@ -5302,15 +5302,23 @@ mod the_calculating_zone_is_shown_while_it_runs {
 
     /// A grep, because the alternative is standing up an egui context and a GL surface. Needles are
     /// assembled at run time — `include_str!` includes THIS module, so a literal would match the
-    /// assertion instead of the code. That mistake has already been made once in this file.
+    /// assertion instead of the code. That mistake has already been made once in this file. The
+    /// anchored fns now live in two files (`app/mod.rs` and `app/ports_simlux.rs`), so the search
+    /// tries both.
     fn body_of(f: &str) -> String {
-        let src = include_str!("../mod.rs");
-        let a = src.find(f).expect("the painter is gone");
-        let end = src[a..]
-            .find("\n    }\n")
-            .map(|e| a + e)
-            .expect("re-anchor if the fn moves");
-        src[a..end].to_string()
+        for src in [
+            include_str!("../mod.rs"),
+            include_str!("../ports_simlux.rs"),
+        ] {
+            if let Some(a) = src.find(f) {
+                let end = src[a..]
+                    .find("\n    }\n")
+                    .map(|e| a + e)
+                    .expect("re-anchor if the fn moves");
+                return src[a..end].to_string();
+            }
+        }
+        panic!("anchor not found in app/mod.rs or app/ports_simlux.rs: {f}");
     }
 
     /// IT IS TIED TO THE WORKER'S OWN LIFETIME, not to a flag of its own. `calc_rx` is `Some` for
@@ -5344,7 +5352,8 @@ mod the_calculating_zone_is_shown_while_it_runs {
     /// looked at, and the wash says which ground the answer coming will cover.
     #[test]
     fn it_paints_between_the_old_result_and_the_fixtures() {
-        let src = include_str!("../mod.rs");
+        // The paint call sites live in the frame shell (app/shell.rs) since the SIMLUX split.
+        let src = include_str!("../shell.rs");
         let needle = |p: &[&str]| -> String { p.concat() };
         let overlay = src.find(&needle(&["self.paint_lux_over", "lay(&painter, rect);"]));
         let zone = src.find(&needle(&[
