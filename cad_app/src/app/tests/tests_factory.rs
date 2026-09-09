@@ -5666,7 +5666,7 @@ mod only_the_materials_factory_paints {
     /// Closing the window puts the brush down, so it cannot be resumed by a later click.
     #[test]
     fn closing_the_window_disarms_the_brush() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../windows.rs");
         let a = src
             .find("// CLOSING THE WINDOW PUTS THE BRUSH DOWN.")
             .expect("it does");
@@ -5684,7 +5684,7 @@ mod only_the_materials_factory_paints {
     /// other half of the report: "i cant apply texture from clip board".
     #[test]
     fn pasting_from_the_clipboard_applies_it() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../windows.rs");
         let a = src
             .find("Paste an image from the clipboard as a new material")
             .expect("the button");
@@ -6064,16 +6064,16 @@ mod a_sketch_is_not_the_plan {
     /// and a millimetre plan draws at 1000x with everything else still green.
     #[test]
     fn both_plan_underlays_read_the_plan() {
-        // The two anchored fns moved apart: `refresh_cached_lines` stayed in app/mod.rs,
-        // `paint_plan_underlay` moved to app/ports_simlux.rs — search each in its own file.
-        let mod_src = include_str!("../mod.rs");
+        // The two anchored fns moved apart: `refresh_cached_lines` lives in app/cmd2d.rs,
+        // `paint_plan_underlay` in app/ports_simlux.rs — search each in its own file.
+        let cmd2d_src = include_str!("../cmd2d.rs");
         let simlux_src = include_str!("../ports_simlux.rs");
         for (what, anchor, end, src) in [
             (
                 "depth-tested",
                 "fn refresh_cached_lines",
                 "\n    /// THE DRAWING CHANGED",
-                mod_src,
+                cmd2d_src,
             ),
             ("x-ray", "fn paint_plan_underlay", "\n    fn ", simlux_src),
         ] {

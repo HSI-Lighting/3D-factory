@@ -1457,7 +1457,7 @@ mod the_quit_dialog_cannot_trap_the_app {
     use super::*;
 
     fn body() -> &'static str {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../windows.rs");
         let a = src.find("fn render_close_confirm").expect("the dialog");
         let b = src[a..]
             .find("\n    /// ")
@@ -1686,7 +1686,7 @@ mod the_folder_browser_shows_what_is_in_the_folder {
     /// folder to it.
     #[test]
     fn a_folder_pick_never_confirms_with_a_file_name_in_the_subfolder_field() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../windows.rs");
         let anchor = "IN A FOLDER PICK, CLICKING A FILE TAKES ITS FOLDER.";
         let a = src.find(anchor).expect("the folder-pick file row");
         // The row ends where the ordinary (non-folder) rows resume.
@@ -1714,7 +1714,7 @@ mod the_folder_browser_shows_what_is_in_the_folder {
     /// right for an Open and, in a folder pick, invites the one action that used to do nothing.
     #[test]
     fn a_folder_pick_does_not_ask_you_to_select_a_file() {
-        let src = include_str!("../mod.rs");
+        let src = include_str!("../windows.rs");
         let a = src
             .find("SAY WHAT THIS MODE ACTUALLY WANTS")
             .expect("the preview hint");

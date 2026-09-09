@@ -5303,12 +5303,13 @@ mod the_calculating_zone_is_shown_while_it_runs {
     /// A grep, because the alternative is standing up an egui context and a GL surface. Needles are
     /// assembled at run time — `include_str!` includes THIS module, so a literal would match the
     /// assertion instead of the code. That mistake has already been made once in this file. The
-    /// anchored fns now live in two files (`app/mod.rs` and `app/ports_simlux.rs`), so the search
-    /// tries both.
+    /// anchored fns now live in three files (`app/mod.rs`, `app/ports_simlux.rs` and
+    /// `app/windows.rs`), so the search tries all three.
     fn body_of(f: &str) -> String {
         for src in [
             include_str!("../mod.rs"),
             include_str!("../ports_simlux.rs"),
+            include_str!("../windows.rs"),
         ] {
             if let Some(a) = src.find(f) {
                 let end = src[a..]
@@ -5318,7 +5319,7 @@ mod the_calculating_zone_is_shown_while_it_runs {
                 return src[a..end].to_string();
             }
         }
-        panic!("anchor not found in app/mod.rs or app/ports_simlux.rs: {f}");
+        panic!("anchor not found in app/mod.rs, app/ports_simlux.rs or app/windows.rs: {f}");
     }
 
     /// IT IS TIED TO THE WORKER'S OWN LIFETIME, not to a flag of its own. `calc_rx` is `Some` for
